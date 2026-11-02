@@ -1,0 +1,401 @@
+/* GENERATED FILE -- program_binding_transport.v1.json; DO NOT EDIT. */
+import type {
+  CatalogRecordKind, ProgramBindingDocument,
+} from '../types/programBindingTransport.generated';
+
+@@TS_CONSTANTS@@
+type Row = Record<string, unknown>;
+
+export class ProgramBindingTransportError extends Error {}
+const bad = (path: string, expected: string): never => {
+  throw new ProgramBindingTransportError(`${path}: ${expected}`);
+};
+const record = (
+  value: unknown, keys: readonly string[], path: string, optional: readonly string[] = [],
+): Row => {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) bad(path, 'closed record');
+  const row = value as Row;
+  const actual = Object.keys(row);
+  if (actual.some((key) => !keys.includes(key))
+      || keys.some((key) => !optional.includes(key) && !actual.includes(key))) bad(path, 'closed record');
+  return row;
+};
+const array = (value: unknown, path: string, minimum = 0, maximum = MAX_ROWS): unknown[] => {
+  if (!Array.isArray(value)) bad(path, 'bounded array');
+  const result = value as unknown[];
+  if (result.length < minimum || result.length > maximum) bad(path, 'bounded array');
+  return result;
+};
+const text = (value: unknown, path: string, maximum = TEXT_MAX_BYTES): string => {
+  if (typeof value !== 'string') bad(path, 'bounded non-empty string');
+  const result = value as string;
+  if (result.length < 1) bad(path, 'bounded non-empty string');
+  try {
+    encodeURIComponent(result);
+  } catch {
+    bad(path, 'valid Unicode text');
+  }
+  if (new TextEncoder().encode(result).length > maximum) bad(path, 'bounded non-empty string');
+  return result;
+};
+const matchesExactly = (pattern: RegExp, value: string): boolean => (
+  pattern.exec(value)?.[0] === value
+);
+const identity = (value: unknown, path: string): string => {
+  const result = text(value, path, IDENTITY_MAX_BYTES);
+  if (!matchesExactly(IDENTITY, result)) bad(path, 'portable identity');
+  return result;
+};
+const digest = (value: unknown, path: string): string => {
+  if (typeof value !== 'string') bad(path, 'lowercase SHA-256');
+  const result = value as string;
+  if (!matchesExactly(DIGEST, result)) bad(path, 'lowercase SHA-256');
+  return result;
+};
+const number = (value: unknown, path: string): number => {
+  if (typeof value !== 'number') bad(path, 'finite number');
+  const result = value as number;
+  if (!Number.isFinite(result)) bad(path, 'finite number');
+  return result;
+};
+const sorted = <T>(rows: T[], key: (row: T) => string, path: string): void => {
+  const keys = rows.map(key);
+  if (keys.some((keyValue, i) => (i > 0 && keys[i - 1] >= keyValue))) bad(path, 'canonical sorted unique keys');
+};
+const strings = (value: unknown, path: string, asText = false): string[] => {
+  const result = array(value, path, 1).map((item, i) => (
+    asText ? text(item, `${path}[${i}]`) : identity(item, `${path}[${i}]`)
+  ));
+  if (new Set(result).size !== result.length) bad(path, 'duplicate-free values');
+  return result;
+};
+
+const policyId = (value: unknown, path: string): string => {
+  const result = identity(value, path);
+  if (!/^[a-z][a-z0-9_.-]*$/.test(result)) bad(path, 'portable lower-case ID');
+  return result;
+};
+const nodePolicy = (value: unknown, path: string): Row => {
+  const row = record(value, FIELDS.node_policy, path);
+  policyId(row.instance_id, `${path}.instance_id`);
+  const recovery = record(row.recovery_policy, FIELDS.recovery_policy,
+    `${path}.recovery_policy`, OPTIONAL_FIELDS.recovery_policy);
+  if (typeof recovery.allow_intervention !== 'boolean') {
+    bad(`${path}.recovery_policy.allow_intervention`, 'boolean');
+  }
+  const retries = recovery.max_retries;
+  if (typeof retries !== 'number' || !Number.isInteger(retries)
+      || retries < 0 || retries > RETRY_MAX) {
+    bad(`${path}.recovery_policy.max_retries`, 'bounded integer');
+  }
+  const scope = Object.hasOwn(recovery, 'intervention_stop_scope')
+    ? recovery.intervention_stop_scope : 'all';
+  if (typeof scope !== 'string' || !INTERVENTION_STOP_SCOPES.has(scope)) {
+    bad(`${path}.recovery_policy.intervention_stop_scope`, 'closed enum');
+  }
+  if (!STOP_POLICIES.has(row.operator_stop_policy as string)) {
+    bad(`${path}.operator_stop_policy`, 'closed enum');
+  }
+  if (recovery.allow_intervention === false && retries === 0
+      && scope === 'all'
+      && row.operator_stop_policy === 'inherit') {
+    bad(path, 'default node-policy rows must be omitted');
+  }
+  return row;
+};
+
+export function parseProgramBindingTransport(value: unknown, path: string): ProgramBindingDocument {
+  const root = record(value, FIELDS.binding, path);
+  if (root.api_version !== BINDING_API_VERSION) bad(`${path}.api_version`, BINDING_API_VERSION);
+  digest(root.program_binding_id, `${path}.program_binding_id`);
+  identity(root.program_id, `${path}.program_id`);
+  ['program_revision', 'retained_bundle_id', 'graph_revision'].forEach(
+    (field) => digest(root[field], `${path}.${field}`),
+  );
+  const env = record(root.node_environment,
+    FIELDS.node_environment,
+    `${path}.node_environment`);
+  identity(env.catalog_id, `${path}.node_environment.catalog_id`);
+  text(env.content_version, `${path}.node_environment.content_version`, IDENTITY_MAX_BYTES);
+  digest(env.catalog_digest, `${path}.node_environment.catalog_digest`);
+  digest(env.environment_digest, `${path}.node_environment.environment_digest`);
+
+  const components = array(root.component_role_bindings, `${path}.component_role_bindings`, 0, ROLE_MAX_ROWS).map(
+    (item, i) => {
+      const cp = `${path}.component_role_bindings[${i}]`;
+      const component = record(item, FIELDS.component, cp);
+      ['component_role_id', 'controllable_component_id', 'component_type_id'].forEach(
+        (field) => identity(component[field], `${cp}.${field}`),
+      );
+      digest(component.component_type_revision, `${cp}.component_type_revision`);
+      const models = array(component.model_role_bindings, `${cp}.model_role_bindings`).map(
+        (modelItem, mi) => {
+          const mp = `${cp}.model_role_bindings[${mi}]`;
+          const model = record(modelItem, FIELDS.model, mp);
+          identity(model.model_role_id, `${mp}.model_role_id`);
+          identity(model.model_instance_id, `${mp}.model_instance_id`);
+          digest(model.model_revision, `${mp}.model_revision`);
+          return model;
+        },
+      );
+      sorted(models, (row) => row.model_role_id as string, `${cp}.model_role_bindings`);
+      return component;
+    },
+  );
+  sorted(components, (row) => row.component_role_id as string, `${path}.component_role_bindings`);
+  const componentByRole = new Map(components.map((row) => [row.component_role_id, row]));
+
+  const targets = array(root.target_role_bindings, `${path}.target_role_bindings`, 0, ROLE_MAX_ROWS).map(
+    (item, i) => {
+      const tp = `${path}.target_role_bindings[${i}]`;
+      const target = record(item, FIELDS.target, tp, OPTIONAL_FIELDS.target);
+      ['target_role_id', 'component_role_id', 'controllable_component_id', 'command_target_id'].forEach(
+        (field) => identity(target[field], `${tp}.${field}`),
+      );
+      const component = componentByRole.get(target.component_role_id);
+      if (!component || component.controllable_component_id !== target.controllable_component_id) bad(tp, 'target/component correspondence');
+      if ('default_tcp' in target) {
+        const dp = `${tp}.default_tcp`;
+        const entry = record(target.default_tcp, FIELDS.tcp_entry, dp);
+        ['component_id', 'target_id', 'frame_role_id'].forEach((field) => identity(entry[field], `${dp}.${field}`));
+      }
+      if ('robot_tcps' in target) {
+        const tcpPath = `${tp}.robot_tcps`;
+        const robotTcps = array(target.robot_tcps, tcpPath).map((item2, j) => {
+          const rp = `${tcpPath}[${j}]`;
+          const tcp = record(item2, FIELDS.robot_tcp, rp);
+          const entryPath = `${rp}.entry`;
+          const entry = record(tcp.entry, FIELDS.tcp_entry, entryPath);
+          ['component_id', 'target_id', 'frame_role_id'].forEach((field) => identity(entry[field], `${entryPath}.${field}`));
+          const framePath = `${rp}.frame`;
+          const frame = record(tcp.frame, FIELDS.frame, framePath, OPTIONAL_FIELDS.frame);
+          identity(frame.frame_role_id, `${framePath}.frame_role_id`);
+          identity(frame.model_instance_id, `${framePath}.model_instance_id`);
+          digest(frame.model_revision, `${framePath}.model_revision`);
+          text(frame.compiled_frame_name, `${framePath}.compiled_frame_name`);
+          if (frame.frame_role_id !== entry.frame_role_id) bad(rp, 'TCP entry/frame role correspondence');
+          if ('contact_body_role_ids' in frame) {
+            const bodyRoles = array(frame.contact_body_role_ids, `${framePath}.contact_body_role_ids`)
+              .map((role) => identity(role, `${framePath}.contact_body_role_ids`));
+            sorted(bodyRoles, (role) => role, `${framePath}.contact_body_role_ids`);
+          }
+          if (typeof tcp.end_effector !== 'boolean' || typeof tcp.component_default !== 'boolean') {
+            bad(rp, 'TCP marks must be boolean');
+          }
+          return tcp;
+        });
+        sorted(robotTcps,
+          (row) => `${(row.entry as Row).component_id}\u0000${(row.entry as Row).target_id}\u0000${(row.entry as Row).frame_role_id}`,
+          tcpPath);
+      }
+      const frames = array(target.frame_role_bindings, `${tp}.frame_role_bindings`).map((item2, j) => {
+        const fp = `${tp}.frame_role_bindings[${j}]`;
+        const frame = record(item2, FIELDS.frame, fp, OPTIONAL_FIELDS.frame);
+        identity(frame.frame_role_id, `${fp}.frame_role_id`); identity(frame.model_instance_id, `${fp}.model_instance_id`);
+        digest(frame.model_revision, `${fp}.model_revision`); text(frame.compiled_frame_name, `${fp}.compiled_frame_name`);
+        if ('contact_body_role_ids' in frame) {
+          const roles = array(frame.contact_body_role_ids, `${fp}.contact_body_role_ids`).map((role) => identity(role, `${fp}.contact_body_role_ids`));
+          sorted(roles, (role) => role, `${fp}.contact_body_role_ids`);
+        }
+        return frame;
+      });
+      sorted(frames, (row) => row.frame_role_id as string, `${tp}.frame_role_bindings`);
+      const resources = array(target.resource_role_bindings, `${tp}.resource_role_bindings`).map((item2, j) => {
+        const rp = `${tp}.resource_role_bindings[${j}]`;
+        const resource = record(item2, FIELDS.resource, rp);
+        identity(resource.resource_role_id, `${rp}.resource_role_id`);
+        const ids = strings(resource.resource_ids, `${rp}.resource_ids`);
+        const names = strings(resource.compiled_resource_names, `${rp}.compiled_resource_names`, true);
+        if (ids.length !== names.length) bad(rp, 'equal correspondence vectors');
+        return resource;
+      });
+      sorted(resources, (row) => row.resource_role_id as string, `${tp}.resource_role_bindings`);
+      if ('signal_role_bindings' in target) {
+        const coordinateRoles = new Set(resources.map((row) => row.resource_role_id));
+        const signals = array(target.signal_role_bindings, `${tp}.signal_role_bindings`, 1).map((item2, j) => {
+          const sp = `${tp}.signal_role_bindings[${j}]`;
+          const signal = record(item2, FIELDS.signal, sp);
+          identity(signal.resource_role_id, `${sp}.resource_role_id`);
+          identity(signal.signal_name, `${sp}.signal_name`);
+          digest(signal.signal_descriptor_digest, `${sp}.signal_descriptor_digest`);
+          if (signal.value_type !== 'bool' || !['input', 'output'].includes(signal.direction as string)
+              || !['sampled_only', 'captured'].includes(signal.transition_capability as string)) bad(sp, 'invalid signal declaration');
+          if (coordinateRoles.has(signal.resource_role_id)) bad(sp, 'resource role cannot resolve to both coordinate and signal');
+          return signal;
+        });
+        sorted(signals, (row) => row.resource_role_id as string, `${tp}.signal_role_bindings`);
+      }
+      const collisions = array(target.collision_body_role_bindings, `${tp}.collision_body_role_bindings`).map((item2, j) => {
+        const cp = `${tp}.collision_body_role_bindings[${j}]`;
+        const collision = record(item2, FIELDS.collision, cp);
+        identity(collision.collision_body_role_id, `${cp}.collision_body_role_id`);
+        identity(collision.model_instance_id, `${cp}.model_instance_id`);
+        digest(collision.model_revision, `${cp}.model_revision`);
+        strings(collision.compiled_collision_body_names, `${cp}.compiled_collision_body_names`, true);
+        return collision;
+      });
+      sorted(collisions, (row) => row.collision_body_role_id as string, `${tp}.collision_body_role_bindings`);
+      const collisionByRole = new Map(collisions.map((row) => [row.collision_body_role_id, row]));
+      for (const frame of frames) {
+        for (const role of (frame.contact_body_role_ids ?? []) as string[]) {
+          const body = collisionByRole.get(role);
+          if (!body || body.model_instance_id !== frame.model_instance_id || body.model_revision !== frame.model_revision) bad(tp, 'endpoint body must resolve through the same target and model');
+        }
+      }
+      const capabilities = array(target.capability_bindings, `${tp}.capability_bindings`).map((item2, j) => {
+        const cp = `${tp}.capability_bindings[${j}]`;
+        const capability = record(item2, FIELDS.capability, cp);
+        identity(capability.capability_id, `${cp}.capability_id`);
+        digest(capability.capability_definition_revision, `${cp}.capability_definition_revision`);
+        type ReferenceRecord = 'control' | 'provider' | 'command_schema';
+        const refs: [string, ReferenceRecord][] = [
+          ['control_binding', 'control'],
+          ['capability_provider_binding', 'provider'],
+          ['command_schema', 'command_schema'],
+        ];
+        refs.forEach(([field, recordName]) => {
+          if (capability[field] !== null) {
+            const [id, revision] = FIELDS[recordName];
+            const ref = record(capability[field], FIELDS[recordName], `${cp}.${field}`);
+            identity(ref[id], `${cp}.${field}.${id}`); digest(ref[revision], `${cp}.${field}.${revision}`);
+          }
+        });
+        if (capability.control_binding === null && capability.capability_provider_binding === null) bad(cp, 'control or provider resolution');
+        return capability;
+      });
+      sorted(capabilities, (row) => row.capability_id as string, `${tp}.capability_bindings`);
+      return target;
+    },
+  );
+  sorted(targets, (row) => row.target_role_id as string, `${path}.target_role_bindings`);
+  const targetByRole = new Map(targets.map((row) => [row.target_role_id, row]));
+
+  targets.forEach((target, index) => {
+    if (!('pneumatic_io' in target)) return;
+    const pp = `${path}.target_role_bindings[${index}].pneumatic_io`;
+    const route = record(target.pneumatic_io, FIELDS.pneumatic_io, pp);
+    const capabilities = target.capability_bindings as Row[];
+    if (!capabilities.some((item) => item.capability_id === 'tool.gripper.command')) {
+      bad(pp, 'gripper command target');
+    }
+    const outputs = array(route.outputs, `${pp}.outputs`, 1, 2).map((item, i) => (
+      record(item, FIELDS.pneumatic_output, `${pp}.outputs[${i}]`)
+    ));
+    const inputs = array(route.inputs, `${pp}.inputs`, 0, 4).map((item, i) => (
+      record(item, FIELDS.pneumatic_input, `${pp}.inputs[${i}]`)
+    ));
+    for (const [rows, kind] of [[outputs, 'output'], [inputs, 'input']] as const) {
+      rows.forEach((row, i) => {
+        const rp = `${pp}.${kind}s[${i}]`;
+        identity(row.target_role_id, `${rp}.target_role_id`);
+        identity(row.resource_role_id, `${rp}.resource_role_id`);
+        if (kind === 'output') {
+          if (typeof row.open_value !== 'boolean' || typeof row.close_value !== 'boolean') bad(rp, 'boolean output levels');
+        } else if (!['open', 'closed', 'pressure', 'workpiece_grasped'].includes(row.input as string)) {
+          bad(rp, 'known pneumatic input');
+        }
+        const selected = targetByRole.get(row.target_role_id);
+        const signals = selected?.signal_role_bindings as Row[] | undefined;
+        const signal = signals?.find((item) => item.resource_role_id === row.resource_role_id);
+        const required = kind === 'output' ? 'io.gpio.set_output' : 'io.gpio.get_input';
+        const selectedCapabilities = selected?.capability_bindings as Row[] | undefined;
+        if (!selected || !signal || signal.direction !== kind
+          || !selectedCapabilities?.some((item) => item.capability_id === required)) {
+          bad(rp, 'exact bound I/O signal and capability');
+        }
+      });
+    }
+    sorted(outputs, (row) => `${row.target_role_id as string}\0${row.resource_role_id as string}`, `${pp}.outputs`);
+    sorted(inputs, (row) => row.input as string, `${pp}.inputs`);
+  });
+
+  const nodePolicies = array(root.node_policies, `${path}.node_policies`, 0, NODE_POLICY_MAX_ROWS)
+    .map((item, i) => nodePolicy(item, `${path}.node_policies[${i}]`));
+  sorted(nodePolicies, (row) => row.instance_id as string, `${path}.node_policies`);
+
+  const contacts = array(root.contact_grasp_bindings, `${path}.contact_grasp_bindings`, 0, ROLE_MAX_ROWS).map((item, i) => {
+    const pp = `${path}.contact_grasp_bindings[${i}]`;
+    const release = item !== null && typeof item === 'object' && 'mode' in item;
+    const policy = release
+      ? record(item, FIELDS.contact_release, pp, OPTIONAL_FIELDS.contact_release)
+      : record(item, FIELDS.contact, pp, OPTIONAL_FIELDS.contact);
+    identity(policy.contact_policy_id, `${pp}.contact_policy_id`);
+    digest(policy.contact_policy_revision, `${pp}.contact_policy_revision`);
+    identity(policy.runtime_object_id, `${pp}.runtime_object_id`);
+    if (release) {
+      if (policy.mode !== 'contact_release') bad(pp, 'unsupported contact mode');
+      if (policy.release_evidence_mode !== 'signed_penetration' && policy.release_evidence_mode !== 'binary_contact') bad(pp, 'unsupported release evidence');
+      for (const field of ['enforce_max_start_penetration', 'require_strictly_decreasing_penetration', 'require_separation_by_end', 'allow_recontact']) {
+        if (typeof policy[field] !== 'boolean') bad(pp, 'release flags must be boolean');
+      }
+      for (const field of ['max_start_penetration_m', 'min_release_progress_m', 'release_tolerance_m']) {
+        const metric = number(policy[field], `${pp}.${field}`);
+        if (metric < 0 || metric > 1000) bad(pp, 'release metric ranges');
+      }
+      if (policy.release_evidence_mode === 'binary_contact' && (
+        policy.enforce_max_start_penetration || policy.require_strictly_decreasing_penetration
+        || ['max_start_penetration_m', 'min_release_progress_m', 'release_tolerance_m'].some((field) => policy[field] !== 0)
+      )) bad(pp, 'binary contact requires neutral metric fields');
+    } else {
+      const penetration = number(policy.max_penetration_m, `${pp}.max_penetration_m`);
+      const fraction = number(policy.terminal_window_start_fraction, `${pp}.terminal_window_start_fraction`);
+      if (penetration <= 0 || fraction < 0 || fraction > 1) bad(pp, 'contact numeric ranges');
+    }
+    const endpoint = 'bodies_from_motion_endpoint' in policy;
+    if (endpoint && policy.bodies_from_motion_endpoint !== true) bad(pp, 'bodies_from_motion_endpoint must be true or omitted');
+    const bodyValues = array(policy.allowed_body_bindings, `${pp}.allowed_body_bindings`, endpoint ? 0 : 1);
+    if (endpoint !== (bodyValues.length === 0)) bad(pp, 'endpoint and explicit contact bodies are mutually exclusive');
+    const bodies = bodyValues.map((item2, j) => {
+      const bp = `${pp}.allowed_body_bindings[${j}]`;
+      const body = record(item2, FIELDS.contact_body, bp);
+      ['component_role_id', 'target_role_id', 'controllable_component_id', 'command_target_id',
+        'collision_body_role_id', 'model_instance_id'].forEach((field) => identity(body[field], `${bp}.${field}`));
+      if (body.model_role_id !== null) identity(body.model_role_id, `${bp}.model_role_id`);
+      digest(body.model_revision, `${bp}.model_revision`);
+      const ids = strings(body.collision_body_ids, `${bp}.collision_body_ids`, true);
+      const expected = ids.map((_, k) => COLLISION_BODY_ID
+        .replace('{controllable_component_id}', body.controllable_component_id as string)
+        .replace('{model_instance_id}', body.model_instance_id as string)
+        .replace('{collision_body_role_id}', body.collision_body_role_id as string)
+        .replace('{index}', String(k)));
+      if (ids.some((id, k) => id !== expected[k])) bad(bp, 'generated collision body IDs');
+      const target = targetByRole.get(body.target_role_id);
+      if (!target) bad(bp, 'exact target correspondence');
+      const resolvedTarget = target as Row;
+      if (['component_role_id', 'controllable_component_id', 'command_target_id']
+        .some((field) => resolvedTarget[field] !== body[field])) bad(bp, 'exact target correspondence');
+      const collisionRows = resolvedTarget.collision_body_role_bindings as Row[];
+      const collisions = collisionRows.filter((row) => row.collision_body_role_id === body.collision_body_role_id);
+      if (collisions.length !== 1 || collisions[0].model_instance_id !== body.model_instance_id
+          || collisions[0].model_revision !== body.model_revision
+          || (collisions[0].compiled_collision_body_names as unknown[]).length !== ids.length) bad(bp, 'collision correspondence');
+      if (body.model_role_id !== null) {
+        const component = componentByRole.get(body.component_role_id)!;
+        const models = component.model_role_bindings as Row[];
+        if (models.filter((row) => row.model_role_id === body.model_role_id
+          && row.model_instance_id === body.model_instance_id && row.model_revision === body.model_revision).length !== 1) bad(bp, 'model correspondence');
+      }
+      return body;
+    });
+    sorted(bodies, (row) => `${row.component_role_id}\u0000${row.target_role_id}\u0000${row.model_role_id === null ? '\u0000' : `\u0001${row.model_role_id}`}\u0000${row.collision_body_role_id}`, `${pp}.allowed_body_bindings`);
+    return policy;
+  });
+  sorted(contacts, (row) => row.contact_policy_id as string, `${path}.contact_grasp_bindings`);
+  const provenance = record(root.provenance, FIELDS.provenance, `${path}.provenance`);
+  ['binding_compiler_contract_digest', 'role_assignment_digest']
+    .forEach((field) => digest(provenance[field], `${path}.provenance.${field}`));
+  ['source_records', 'resolved_output_records'].forEach((field) => {
+    const records = array(provenance[field], `${path}.provenance.${field}`, 0, PROVENANCE_MAX_ROWS).map((item, i) => {
+      const rp = `${path}.provenance.${field}[${i}]`;
+      const source = record(item, FIELDS.provenance_record, rp);
+      if (typeof source.record_kind !== 'string' || !KINDS.has(source.record_kind as CatalogRecordKind)) bad(`${rp}.record_kind`, 'CatalogRecordKind');
+      identity(source.record_id, `${rp}.record_id`); digest(source.revision, `${rp}.revision`);
+      return source;
+    });
+    sorted(records, (row) => `${row.record_kind}\u0000${row.record_id}\u0000${row.revision}`, `${path}.provenance.${field}`);
+  });
+  // Deliberately no browser hash: Headless and HeadlessHttpClient verify the
+  // exact owner-issued document before forwarding; this synchronous parser is
+  // on the 500-ms polling path and enforces every self-contained wire rule.
+  return value as ProgramBindingDocument;
+}

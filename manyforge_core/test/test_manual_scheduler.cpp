@@ -1,5 +1,9 @@
 #include <gtest/gtest.h>
+
+#include <chrono>
 #include <manyforge_core/time/manual_scheduler.hpp>
+#include <manyforge_core/time/stuck_drain_wait.hpp>
+#include <string>
 
 namespace manyforge::core {
 
@@ -98,6 +102,79 @@ TEST(ManualSchedulerTest, CancelOneOfTwoSameDeadline) {
   sched.cancel(h2);
   sched.advance_to(100);
   EXPECT_EQ(count, 1);
+}
+
+TEST(ManualSchedulerTest, PriorityAdvanceLeavesOtherDueLanesPending) {
+  ManualScheduler sched;
+  std::vector<SchedulerPriority> fired;
+  sched.schedule(
+      100, [&] { fired.push_back(SchedulerPriority::Monitoring); }, SchedulerPriority::Monitoring);
+  sched.schedule(
+      100, [&] { fired.push_back(SchedulerPriority::Background); }, SchedulerPriority::Background);
+
+  sched.advance_to(100, SchedulerPriority::Background);
+  ASSERT_EQ(fired.size(), 1U);
+  EXPECT_EQ(fired.front(), SchedulerPriority::Background);
+
+  sched.advance_to(100, SchedulerPriority::Monitoring);
+  ASSERT_EQ(fired.size(), 2U);
+  EXPECT_EQ(fired.back(), SchedulerPriority::Monitoring);
+}
+
+TEST(StuckDrainWaitTest, DrainWithinBoundWritesNothing) {
+  int calls = 0;
+  int stuck_hooks = 0;
+  const char* before = FirstStuckDrainName();
+  testing::internal::CaptureStderr();
+  WaitForDrain(
+      "test.drain", std::chrono::milliseconds(5),
+      [&](std::chrono::nanoseconds bound) {
+        EXPECT_EQ(bound, std::chrono::milliseconds(5));
+        ++calls;
+        return true;
+      },
+      [&] { ++stuck_hooks; });
+  EXPECT_EQ(testing::internal::GetCapturedStderr(), "");
+  EXPECT_EQ(calls, 1);
+  EXPECT_EQ(stuck_hooks, 0);
+  EXPECT_EQ(FirstStuckDrainName(), before);
+}
+
+TEST(StuckDrainWaitTest, StuckDrainIsReportedOnceAndWaitedForInsteadOfTerminating) {
+  int calls = 0;
+  int stuck_hooks = 0;
+  const char* before = FirstStuckDrainName();
+  testing::internal::CaptureStderr();
+  WaitForDrain(
+      "test.drain", std::chrono::milliseconds(5),
+      [&](std::chrono::nanoseconds) { return ++calls == 4; },
+      [&] {
+        ++stuck_hooks;
+        ASSERT_NE(FirstStuckDrainName(), nullptr);
+        throw 1;  // A failing evidence hook never stops the wait.
+      });
+  const auto output = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(calls, 4);
+  EXPECT_EQ(stuck_hooks, 1);
+  const char* first = FirstStuckDrainName();
+  ASSERT_NE(first, nullptr);
+  if (before == nullptr) {
+    EXPECT_STREQ(first, "test.drain");
+  } else {
+    EXPECT_EQ(first, before);
+  }
+  EXPECT_EQ(output,
+            "manyforge_fault code=drain_stuck drain=test.drain bound_ms=5 "
+            "state=waiting_for_operator\n"
+            "manyforge_fault code=drain_stuck drain=test.drain state=drained_late\n");
+
+  int later_calls = 0;
+  testing::internal::CaptureStderr();
+  WaitForDrain("test.later", std::chrono::milliseconds(5),
+               [&](std::chrono::nanoseconds) { return ++later_calls == 2; });
+  static_cast<void>(testing::internal::GetCapturedStderr());
+  EXPECT_EQ(later_calls, 2);
+  EXPECT_EQ(FirstStuckDrainName(), first);
 }
 
 }  // namespace manyforge::core

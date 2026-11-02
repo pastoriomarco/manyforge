@@ -1,260 +1,62 @@
-// Cycle
-export type CycleRecoveryStatus =
-  | 'waiting'
-  | 'action_required'
-  | 'retry_ready'
-  | 'reset_required'
-  | 'unavailable';
+import type { ProgramRunEnd } from './components';
+import type { ProgramBindingDocument } from './programBindingTransport.generated';
+import type { Nanoseconds } from './nanoseconds';
+import type { AuthoringWorkspaceIdentity } from './headless';
+import type {
+  MotionPreviewReceipt,
+  RuntimeScaleControlSelector,
+  RuntimeScaleControlStatus,
+} from './robotControl';
+export type { ProgramBindingDocument } from './programBindingTransport.generated';
 
-export interface CycleRecoveryAction {
-  actionId: string;
-  labelKey: string;
-  requiresConfirmation: boolean;
-  performsBackendReset: boolean;
-  enabled: boolean;
-  disabledReasonCode?: string | null;
-}
+export type ArtifactKind = 'program' | 'deployment' | 'mesh';
+/** What a folder browse lists: one artifact kind, or folders only (`scenario`). */
+export type FileBrowseKind = ArtifactKind | 'scenario';
 
-export interface CycleRecoveryOffer {
-  schemaVersion: 'manyforge.cycle_recovery_offer.v1';
-  offerId: string;
-  offerRevision: number;
-  generatedAtNs: number;
-  validUntilNs?: number | null;
-  kernelAssessmentRevision: number;
-  controlCommandEpoch: number;
-  executionId?: number | null;
-  latchId?: string | null;
-  stopCertificateId?: string | null;
-  stopOwnerGeneration: number;
-  cycleGeneration: number;
-  programGeneration: number;
-  deploymentGeneration: number;
-  sceneAdmissionEpoch: number;
-  poseSourceApplyGeneration: number;
-  liveCollisionWorldRevision?: number | null;
-  recoveryClass: string;
-  status: CycleRecoveryStatus;
-  actions: CycleRecoveryAction[];
-  primaryAction?: string | null;
-  reasonCode: string;
-  evidenceRefs: string[];
-}
-
-export interface CycleRecoveryActionRequest {
-  requestId: string;
-  offerId: string;
-  offerRevision: number;
-  actionId: string;
-  reason?: string;
-}
-
-export interface CycleRecoveryActionResult {
-  requestId: string;
-  accepted: boolean;
-  cycleResumed: boolean;
-  resultCode: string;
-  error?: Record<string, unknown> | null;
-  recoveryOffer?: CycleRecoveryOffer | null;
-}
-
-export interface CycleStatus {
-  state: 'idle' | 'running' | 'stopping' | 'stopped' | 'direct_control';
-  motionStopState?: 'idle' | 'stopping' | 'held';
-  velocityScale: number;
-  // Structured error surface: empty when no error is active. `errorCode` is
-  // a stable machine token (e.g. "validation_collision",
-  // "motion_interrupt_backend_stop_failed"); `errorDetails` carries the
-  // kernel diagnostics map (collision pair, classification, waypoint index,
-  // fault reason code, …).
-  error?: string | null;
-  errorCode?: string | null;
-  errorDetails?: Record<string, unknown> | null;
-  recoveryOffer?: CycleRecoveryOffer | null;
-}
-
-export interface CycleCommand {
-  state: string;
-  motionStopState?: 'idle' | 'stopping' | 'held';
-  error?: string | null;
-  errorCode?: string | null;
-  errorDetails?: Record<string, unknown> | null;
-  recoveryOffer?: CycleRecoveryOffer | null;
-}
-
-export interface VelocityScaleResponse {
-  velocityScale: number;
-}
-
-export interface ExecutionChannelsResponse {
-  channels: Record<string, Array<Record<string, unknown>>>;
-  incidentSnapshots: Array<Record<string, unknown>>;
-  timestampNs: number;
-}
-
-export type OperatorAlarmLifecycleState =
-  | 'active_unacknowledged'
-  | 'active_acknowledged'
-  | 'returned_unacknowledged'
-  | 'returned_acknowledged';
-
-export interface OperatorAlarm {
-  schemaVersion: 'manyforge.operator_alarm.v2';
-  catalogSchemaVersion: string;
-  catalogVersion: string;
-  definitionVersion: number;
-  definitionId: string;
-  conditionId: string;
-  activationId: string;
-  scope: Record<string, string>;
-  alarmClass: 'motion' | 'scene' | 'runtime_health';
-  priority: 'critical' | 'high' | 'medium' | 'low';
-  title: string;
+export interface RuntimeAvailability {
+  code: string;
   message: string;
-  consequence: string;
-  operatorResponse: string;
-  requiresMotionAttention: boolean;
-  lifecycleState: OperatorAlarmLifecycleState;
-  active: boolean;
-  acknowledged: boolean;
-  activationCount: number;
-  occurrenceCount: number;
-  recordRevision: number;
-  activatedAtNs: number;
-  activatedAt: string;
-  firstSeenAtNs: number;
-  firstSeenAt: string;
-  lastSeenAtNs: number;
-  lastSeenAt: string;
-  returnedAtNs?: number | null;
-  returnedAt?: string | null;
-  acknowledgedAtNs?: number | null;
-  acknowledgedAt?: string | null;
-  acknowledgementPrincipal?: string | null;
-  acknowledgementReason?: string | null;
-  sourceId: string;
-  sourceEpoch: string;
-  sourceSequence: number;
-  sourceQuality: 'good' | 'unknown';
-  displayArgs: Record<string, unknown>;
-  details: Record<string, unknown>;
-  evidenceRefs: string[];
-  correlations: Record<string, unknown>;
+  restorationGates: string[];
 }
 
-export interface OperatorAlarmAcknowledgementMember {
-  conditionId: string;
-  activationId: string;
-  recordRevision: number;
-}
-
-export interface OperatorAlarmDomainStatus {
-  required: boolean;
-  reconciled: boolean;
-  sourceCount: number;
-  unknownSourceCount: number;
-}
-
-export interface OperatorAlarmHealth {
-  state: 'available' | 'unavailable';
-  details: Record<string, string>;
-}
-
-export interface OperatorAlarmSnapshot {
-  schemaVersion: 'manyforge.operator_alarm_snapshot.v2';
-  catalogVersion: string;
-  generation: number;
-  stateRevision: number;
-  reconciled: boolean;
-  health: OperatorAlarmHealth;
-  domains: Record<string, OperatorAlarmDomainStatus>;
-  liveCount: number;
-  unacknowledgedCount: number;
-  motionAttentionCount: number;
-  activeCount: number;
-  activeAcknowledgedCount: number;
-  unacknowledgedMembership: OperatorAlarmAcknowledgementMember[];
-  countsByState: Record<string, number>;
-  countsByPriority: Record<string, number>;
-  countsByClass: Record<string, number>;
-  alarms: OperatorAlarm[];
-  truncated: boolean;
-  timestampNs: number;
-}
-
-export interface OperatorAlarmAcknowledgeResponse {
+export interface HealthResponse {
   status: string;
-  changed: boolean;
-  acknowledgedConditionIds: string[];
-  auditEventIndices: number[];
-  snapshot: OperatorAlarmSnapshot;
+  mode: 'structural_only' | 'headless_client';
+  components: Record<string, string>;
+  runtimeAvailability: RuntimeAvailability | null;
+  headless: Record<string, unknown> | null;
+  timestamp: number;
+  workbenchSessionNotice?: WorkbenchSessionNotice | null;
+  /** The startup project was not opened; cleared by the next Load or New. */
+  startupScenarioNotice?: StartupScenarioNotice | null;
 }
 
-export interface ExecutionHistoryEvent {
-  event_index: number;
-  sequence: number;
-  timestamp_ns: number;
-  timestamp?: string | null;
-  severity?: string | null;
-  component?: string | null;
-  channel?: string | null;
-  message?: string | null;
-  run_id?: string | null;
-  execution_id: number;
-  type: string;
-  details: Record<string, unknown>;
-  [key: string]: unknown;
+export interface StartupScenarioNotice {
+  path: string;
+  code: string;
+  message: string;
 }
 
-export interface NodeStatusTransition {
-  timestamp_ns: number;
-  run_id?: string | null;
-  execution_id: number;
-  node: string;
-  from?: string | null;
-  to: string;
-}
-
-export interface ExecutionHistoryResponse {
-  runId?: string | null;
-  runIds: string[];
-  executionId: number;
-  events: ExecutionHistoryEvent[];
-  nodeStatusTransitions: NodeStatusTransition[];
-  timestampNs: number;
-}
-
-export interface ExecutionHistoryQuery {
-  limit?: number;
-  runId?: string;
-  minSeverity?: string;
-  components?: string[];
-  eventTypes?: string[];
-  executionId?: number;
-}
-
-// Catalog
-export interface CatalogEnumOption {
-  value: string;
-  label?: string | null;
-  description: string;
-  profilesMin: string;
-  requiredCapabilities: string[];
-}
-
-export interface CatalogVisibleWhen {
-  param: string;
-  equals: unknown;
+export interface WorkbenchSessionNotice {
+  schemaVersion: 'manyforge.workbench_previous_session.v1';
+  sessionId: string;
+  archiveRelativePath: string;
+  shutdown: 'clean' | 'unknown';
+  effects: 'closed' | 'unresolved' | 'unknown';
+  historyCoverage: 'not_imported';
+  journalFamilies: string[];
+  message: string;
 }
 
 export interface CatalogJsonSchema {
+  [keyword: string]: unknown;
   type?: string;
   description?: string;
   properties?: Record<string, CatalogJsonSchema>;
   required?: string[];
   additionalProperties?: boolean | CatalogJsonSchema;
   items?: CatalogJsonSchema;
-  enum?: string[];
+  enum?: unknown[];
   oneOf?: CatalogJsonSchema[];
   anyOf?: CatalogJsonSchema[];
   allOf?: CatalogJsonSchema[];
@@ -269,26 +71,35 @@ export interface CatalogJsonSchema {
   minItems?: number;
   maxItems?: number;
   default?: unknown;
+  'x-manyforge-semantic-type'?: string;
+  'x-manyforge-semantic-scope-parameter'?: string;
+  /** A `key_value` parameter: its type is the declared type of the key named by this parameter. */
+  'x-manyforge-value-type-from-key'?: string;
 }
 
 export interface CatalogParameter {
-  name: string;
-  type: string;
+  id: string;
   required: boolean;
-  default: unknown;
-  enumValues: string[];
-  enumOptions: CatalogEnumOption[];
-  constraints: Record<string, unknown>;
-  parameterizable: boolean;
-  profilesMin: string;
-  visibleWhen?: CatalogVisibleWhen | null;
-  uiEditor?: string | null;
-  blackboardRole?: string | null;
-  blackboardContract?: string | null;
-  blackboardValueType?: string | null;
-  schema?: CatalogJsonSchema | null;
-  schemaHash?: string | null;
-  description: string;
+  schema: CatalogJsonSchema;
+  schemaHash: string;
+  hasDefault: boolean;
+  default?: unknown;
+}
+
+export interface CatalogCapabilityRequirement {
+  capabilityId: string;
+  scope: string;
+  effectful: boolean;
+  targetParameter?: string;
+  componentParameter?: string;
+  whenParameter?: string;
+  whenEquals?: unknown;
+}
+
+export interface CatalogBlackboardBinding {
+  keyParameter: string;
+  valueType: string;
+  missingKey?: string;
 }
 
 export interface CatalogEntry {
@@ -296,1152 +107,2064 @@ export interface CatalogEntry {
   name: string;
   category: string;
   description: string;
-  stability: 'stable' | 'experimental' | 'deprecated';
+  stability: string;
   kind: string;
   childrenMin: number;
   childrenMax: number;
   parameters: CatalogParameter[];
-  requiredCapabilities: string[];
-  profilesMin: string;
+  requiredCapabilities: CatalogCapabilityRequirement[];
+  execution: {
+    blocking: boolean;
+    cancellable: boolean;
+    ownerApi: string;
+  };
+  runners: Record<string, string>;
+  tags: string[];
+  minProgramProfile: string | null;
+  blackboard: {
+    reads: CatalogBlackboardBinding[];
+    writes: CatalogBlackboardBinding[];
+  };
+  ownerContext: {
+    kind: string;
+    required: boolean;
+  } | null;
+  outcomes: Record<string, unknown>;
+  eventFamily: string | null;
 }
 
 export interface CatalogResponse {
-  version: string;
+  apiVersion: 'manyforge.node_catalog.v2';
+  contentVersion: string;
+  catalogId: string;
   entries: CatalogEntry[];
-  effectiveCatalogHash: string;
-  generation: number;
-  sources: NodeCatalogSource[];
+  catalogDigest: string;
+  environmentDigest: string;
 }
 
-export interface NodeCatalogSource {
-  nodeId: string;
-  kind: string;
-  path: string;
-  contentHash: string;
-  version: string;
-}
-
-// Program
-export interface Robot {
-  robotId: string;
-  groupId: string;
-  baseFrame: string;
-  tcpFrame: string;
-  basePose?: Record<string, unknown>;
-}
-
-export interface TreeNode {
-  id: string;
-  name: string;
-  params: Record<string, unknown>;
-  operatorStopPolicy?: 'inherit' | 'hold' | 'continue';
-  modificationPolicy?: Record<string, string>;
-  recoveryPolicy?: Record<string, unknown>;
-  children: TreeNode[];
-}
-
-export interface ProgramInfo {
-  name: string;
-  description: string;
-  programProfile: string;
-  robot: Robot;
-  sceneCount: number;
-  sceneResources: ProgramSceneResource[];
-  parameterCount: number;
-  parameters: ProgramParameter[];
-  blackboard: ProgramBlackboard;
-  sourcePath: string;
-  programSessionGeneration: number;
-  programTreeHash: string;
-  compatibility?: ProgramCompatibility | null;
-  viewer?: ProgramViewerSettings | null;
-}
-
-export interface ProgramCompatibility {
-  lanes: Array<'manyforge-only' | 'isaac-sim' | 'real-robot'>;
-  assistant: 'required' | 'optional' | 'forbidden';
-  requires: string[];
-  tags: string[];
-}
-
-export interface ProgramViewerSettings {
-  frameVisibility: Record<string, boolean>;
-  frameGizmoSizeM: number;
-  objectFrameVisibility: Record<string, boolean>;
-  objectAxesGizmoSizeM: number;
-}
-
-export interface ProgramSceneResource {
-  objectId: string;
-  shape: Record<string, unknown>;
-  pose: Record<string, unknown>;
-  metadata?: Record<string, unknown>;
-}
-
-export interface ProgramParameter {
-  name: string;
-  type: string;
-  default: unknown;
-  constraints: Record<string, unknown>;
-  description: string;
-}
-
-export interface BlackboardNamespace {
-  id: string;
-  contract: string;
-  prefix: string;
-  description: string;
-  fields: BlackboardNamespaceField[];
-}
-
-export interface BlackboardNamespaceField {
-  name: string;
-  type: string;
-  description: string;
-}
-
-export interface BlackboardKey {
-  id: string;
-  type: string;
-  key: string;
-  description: string;
-}
-
-export interface ProgramBlackboard {
-  namespaces: BlackboardNamespace[];
-  keys: BlackboardKey[];
-}
-
-export interface ProgramTree {
-  tree: TreeNode;
-}
-
-export interface ProgramValidationIssue {
-  path: string;
-  message: string;
-}
-
-export interface ProgramValidateResponse {
-  valid: boolean;
-  errors: ProgramValidationIssue[];
-  warnings: ProgramValidationIssue[];
-}
-
-export interface RuntimeOverrideEntry {
-  nodeName: string;
-  params: Record<string, unknown>;
-  authoritySource: string;
-  approvalMode: string;
-  reason: string;
-  sessionId?: string | null;
-  triggerNodeInstance?: string | null;
-  requestedAtNs: number;
-  activationState: 'active' | 'staged';
-  activatedAtNs?: number | null;
-}
-
-export interface RuntimeOverrideStatus {
-  active: RuntimeOverrideEntry[];
-  staged: RuntimeOverrideEntry[];
-  activeCount: number;
-  stagedCount: number;
-  hasActive: boolean;
-  hasStaged: boolean;
-  canActivateNow: boolean;
-  requiresResetToActivate: boolean;
-  currentTreeOrigin: 'saved_program' | 'runtime_override';
-  nextEffectiveTree?: TreeNode | null;
-  timestampNs: number;
-}
-
-// Deployment
-export interface AdapterConfig {
-  adapterId: string;
-  adapterVersion: string;
-  config: Record<string, unknown>;
-  supportedProfiles: string[];
-  capabilityKeys: string[];
-}
-
-export interface OrchestratorConfig {
-  engine: string;
-  config: Record<string, unknown>;
-}
-
-export interface LaunchRunner {
-  module: string;
-  args: string[];
-}
-
-export interface LaunchUiBackend {
-  module: string;
-  args: string[];
-  enabled: boolean;
-}
-
-export interface LaunchConfig {
-  runner: LaunchRunner;
-  uiBackend?: LaunchUiBackend;
-}
-
-export interface ModelAuditPolicy {
-  storeFullPrompts: boolean;
-  storeFullResponses: boolean;
-  hashAlgorithm: string;
-  redactArgumentValues: boolean;
-}
-
-export interface ModelEndpointCapabilities {
-  supportsResponseTools: boolean;
-  supportsJsonObject: boolean;
-  supportsImageInput: boolean;
-  supportedImageTransports: string[];
-  toolCallFamily: string;
-  latencyBudgetMs?: number | null;
-}
-
-export interface ModelEndpointConfig {
-  profileRef?: string;
-  provider: string;
-  modelId: string;
-  baseUrl?: string | null;
-  imageFetchBaseUrl?: string | null;
-  apiKeyEnv?: string | null;
-  defaultTimeoutS: number;
-  maxTokens: number;
-  capabilities: ModelEndpointCapabilities;
-}
-
-export interface AssistantConfig {
-  provider: string;
-  endpointAlias: string;
-  enabled: boolean;
-}
-
-export type AssistantToolEffect =
-  | 'read_only'
-  | 'proposal'
-  | 'composer_draft_mutating'
-  | 'runtime_mutating';
-
-export interface AssistantToolDefinition {
-  id: string;
-  effect: AssistantToolEffect;
-  description: string;
-  [key: string]: unknown;
-}
-
-export interface AssistantModeAuthority {
-  sessionKind: 'manual_intervention' | 'delegated_recovery' | 'not_applicable';
-  approvalMode: 'human_approved' | 'policy_granted';
-  review: 'required' | 'bounded_by_recovery_profile' | 'not_required';
-}
-
-export interface AssistantModeCatalog {
-  skills: string[];
-  tools: string[];
-  nodes: string[];
-}
-
-export interface AssistantModeDefinition {
-  enabled: boolean;
-  description: string;
-  authority: AssistantModeAuthority;
-  catalog: AssistantModeCatalog;
-}
-
-export interface AssistantToolCall {
-  name: string;
-  status: 'proposed' | 'skipped' | 'completed' | 'failed';
-  arguments: Record<string, unknown>;
-  result?: Record<string, unknown> | null;
-  error?: string | null;
-}
-
-export interface AssistantError {
-  code: string;
-  detail: string;
-}
-
-export interface AssistantChatRequest {
-  message: string;
-  mode: 'mock' | 'provider';
-  requestId?: string;
-  providerId?: string;
-  conversationId?: string;
-  assistantMode?: string;
-  context?: Record<string, unknown>;
-  requestedTools?: string[];
-  fieldPolicy?: Record<string, unknown>;
-}
-
-export interface AssistantProposal {
-  id: string;
-  type: string;
-  title: string;
-  summary: string;
-  status: 'draft';
-  reviewRequired: boolean;
-  payload: Record<string, unknown>;
-  warnings: string[];
-  source: Record<string, unknown>;
-}
-
-export interface AssistantChatResponse {
-  requestId: string;
-  conversationId: string;
-  mode: 'mock' | 'provider';
-  providerId: string;
-  assistantMode?: string | null;
-  message: string;
-  proposals: AssistantProposal[];
-  toolCalls: AssistantToolCall[];
-  warnings: string[];
-  mutated: boolean;
-  draftMutated: boolean;
-  requiresReview: boolean;
-  programLoaded: boolean;
-  cycleState: string;
-  timestampNs: number;
-  error?: AssistantError | null;
-}
-
-export interface AssistantProviderDescriptor {
-  id: string;
-  description: string;
-  configured: boolean;
-  requiresLiveModel: boolean;
-  requiresLiveIsaacSim: boolean;
-}
-
-export interface AssistantProviderCatalog {
-  providers: AssistantProviderDescriptor[];
-  configuredProviderId?: string | null;
-  // Model the configured provider's bridge is actually running, read live from
-  // the bridge /healthz. null when unavailable (degrade to deployment label).
-  liveModel?: string | null;
-  liveModelSource?: string | null;
-}
-
-export interface LiveToolCall {
-  toolId: string;
-  status: 'running' | 'completed' | 'failed';
-  startedAtNs: number;
-  finishedAtNs?: number | null;
-  argsSummary: string;
-  resultSummary: string;
-  error?: string | null;
-  draftMutated: boolean;
-}
-
-export interface AssistantRequestStatus {
-  requestId: string;
-  conversationId: string;
-  providerId: string;
-  assistantMode?: string | null;
-  status: 'running' | 'cancel_requested' | 'completed' | 'failed' | 'cancelled';
-  message: string;
-  error?: AssistantError | null;
-  warnings: string[];
-  draftMutated: boolean;
-  toolCallCount: number;
-  recentToolCalls?: LiveToolCall[];
-  startedAtNs: number;
-  updatedAtNs: number;
-  finishedAtNs?: number | null;
-}
-
-export interface AssistantCancelResponse {
-  requestId: string;
-  cancelled: boolean;
-  status: 'running' | 'cancel_requested' | 'completed' | 'failed' | 'cancelled' | 'unknown';
-  detail: string;
-  providerResponse: Record<string, unknown>;
-  timestampNs: number;
-}
-
-export interface PromptTemplateConfig {
-  version: string;
-  templateText: string;
-  outputSchema?: Record<string, unknown> | null;
-  responseTool?: Record<string, unknown> | null;
-}
-
-export interface AuthorityDomainConfig {
-  owner: string;
-  onDisconnect: string;
-  description: string;
-}
-
-export interface RobotControlJointLimit {
-  maxVelocityRadS?: number | null;
-  maxAccelerationRadS2?: number | null;
-  // Phase 4-P5.1K: per-joint jerk cap. Carried so a loaded deployment's jerk is
-  // preserved on edit/round-trip; the discrete planner rejects it as
-  // unsupported, but the value must not be silently dropped here.
-  maxJerkRadS3?: number | null;
-}
-
-export type PoseSourceKind =
-  | 'simulation_interfaces'
-  | 'pose_stamped_topic'
-  | 'pose_array_topic'
-  | 'detection3d_array_topic'
-  | 'tf';
-
-export type PoseSourceApplyPolicy =
-  | 'observe_only'
-  | 'when_idle'
-  | 'continuous'
-  | 'continuous_unattached'
-  | 'before_planning'
-  | 'between_nodes';
-
-export type PoseSourceSceneAdmissionRole =
-  | 'static_obstacle'
-  | 'snapshot_obstacle'
-  | 'observed_target'
-  | 'observed_dynamic_obstacle'
-  | 'attached_object'
-  | 'support_contact'
-  | 'visualization_only'
-  | 'robot_runtime_state';
-
-export interface PoseSourceSceneAdmissionConfig {
-  role: PoseSourceSceneAdmissionRole | string;
-  leaseMaxAgeS?: number | null;
-  targetDriftToleranceM?: number | null;
-  targetAngularToleranceRad?: number | null;
-  obstacleDriftToleranceM?: number | null;
-  obstacleAngularToleranceRad?: number | null;
-  allowRuntimeDynamicObstacle?: boolean;
-}
-
-export interface PoseSourceObjectBindingConfig {
-  entity?: string;
-  frameId?: string;
-  applyPolicy?: PoseSourceApplyPolicy;
-  confidenceMin?: number | null;
-  measuredStateGhost?: {
-    enabled?: boolean;
-    robotTcp?: boolean;
-    object?: boolean;
-    opacity?: number;
-  } | null;
-  measuredAttachmentBaseline?: {
-    capture?: 'on_attach_or_first_paired_sample' | string;
-    requireSameTimeRobotTcp?: boolean;
-  } | null;
-  attachedDriftMonitor?: {
-    enabled?: boolean;
-    translationThresholdM?: number | null;
-    rotationThresholdRad?: number | null;
-    debounceS?: number;
-    staleBehavior?: 'fault' | 'unverifiable' | 'ignore' | string;
-    action?: 'interrupt' | 'diagnostic_only' | string;
-    signalId?: string;
-    sampleTimeToleranceS?: number;
-  } | null;
-  sceneAdmission?: PoseSourceSceneAdmissionConfig | null;
-  metadata?: Record<string, unknown>;
-}
-
-export interface PoseSourceConfig {
-  id: string;
-  kind: PoseSourceKind;
-  enabled: boolean;
-  maxUpdateHz: number;
-  staleAfterS: number;
-  frameId?: string;
-  servicePrefix?: string;
-  topic?: string;
-  description?: string;
-  measuredTcp?: {
-    entity?: string;
-    tcpFrameId?: string;
-    frameId?: string;
-  } | null;
-  measuredRobot?: {
-    jointStateTopic?: string;
-  } | null;
-  objects: Record<string, PoseSourceObjectBindingConfig>;
-}
-
-export interface SimulationControlCapabilitiesConfig {
-  reset: boolean;
-  pause: boolean;
-  play: boolean;
-  step: boolean;
-  setEntityState: boolean;
-}
-
-export interface SimulationResetConfig {
-  defaultScope: 'state';
-  closeCommandGate: boolean;
-  waitReadyS: number;
-  resumePlayAfterReset: boolean;
-}
-
-export interface SimulationControlConfig {
-  kind: 'ros2_simulation_interfaces';
-  servicePrefix: string;
-  serviceTimeoutS: number;
-  capabilities: SimulationControlCapabilitiesConfig;
-  reset?: SimulationResetConfig | null;
-}
-
-export interface SimulationResetResponse {
-  success: boolean;
-  operation: 'reset';
-  controlId: string;
-  scope: 'state';
-  serviceName?: string | null;
-  durationS: number;
-  commandGateClosed: boolean;
-  commandGateReopened: boolean;
-  resumePlayAfterReset: boolean;
-  resumePlayResult?: Record<string, unknown> | null;
-  readiness?: Record<string, unknown> | null;
-}
-
-export interface SimulationSetStateRequest {
-  state: 'playing' | 'paused';
-  reason?: string;
-}
-
-export interface SimulationStepRequest {
-  steps?: number;
-  reason?: string;
-}
-
-export interface SimulationSetEntityStateRequest {
-  entity: string;
-  pose: Record<string, unknown>;
-  reason?: string;
-}
-
-export interface SimulationControlResponse {
-  success: boolean;
-  operation: string;
-  controlId: string;
-  serviceName?: string | null;
-  durationS: number;
-  resultCode?: number | null;
-  resultMessage?: string;
-  state?: string | null;
-  steps?: number | null;
-  entity?: string | null;
-}
-
-export interface RobotConfig {
-  robotId: string;
-  groupId: string;
-  urdfPath: string;
-  srdfPath: string;
-  packagePaths: string[];
-  globalMaxTcpLinearSpeedMps: number;
-  /** Per-joint validated Robot Control operator caps. Empty = all joints use engine defaults. */
-  robotControlJointLimits?: Record<string, RobotControlJointLimit>;
-}
-
-// One link in the gripper subtree, posed relative to the gripper
-// root at the URDF default joint configuration. The unreachable
-// ghost renders the full subtree so the operator sees a recognizable
-// gripper silhouette, not just the root cube.
-export interface GripperSubtreeLink {
-  name: string;
-  positionM: number[];
-  orientationXyzw: number[];
-}
-
-// Auto-discovered Move-To unreachable-ghost visualization metadata
-// (see ADR-0018 / `routes_urdf.resolve_gripper_visualization`).
-// `gripperRootLink` is the first link reachable downstream of
-// `mountFrame` that has visuals; the tcp→root SE(3) places the
-// gripper mesh at the right offset from an unreachable TCP target;
-// `subtreeLinks` enumerates the full gripper chain so the renderer
-// can draw the whole shape, not just the root link.
-// Null when the URDF graph walk does not reach a visual link — the
-// frontend renders a red-axes marker instead.
-export interface GripperVisualization {
-  gripperRootLink: string;
-  tcpToRootPositionM: number[];
-  tcpToRootOrientationXyzw: number[];
-  subtreeLinks: GripperSubtreeLink[];
-}
-
-export interface GripperConfig {
-  commandMode: string;
-  groupId: string;
-  jointName: string;
-  motionTimeS: number;
-  srdfPresets: Record<string, number>;
-  actuationKind: string;
-  stateAuthority: string;
-  completionPolicy: string;
-  graspConfirmationPolicy: string;
-  transport: Record<string, unknown>;
-  openStateRef: string;
-  closedStateRef: string;
-  semanticConfigured: boolean;
-  migrationNotes: string[];
-  description: string;
-  touchLinks: string[];
-  mountFrame: string;
-  attachFrame: string;
-  tcpFrame: string;
-  auxiliaryFrames: string[];
-  visualization?: GripperVisualization | null;
-}
-
-export interface OpenLoopGraspRiskAcceptance {
-  allowed: boolean;
-  scope: string;
-  rationale: string;
-}
-
-export interface GraspRiskPolicy {
-  openLoopGrasp: OpenLoopGraspRiskAcceptance;
-}
-
-export interface DeploymentInfo {
-  name: string;
-  description: string;
-  programProfile: string;
-  robotConfig: RobotConfig;
-  grippers: Record<string, GripperConfig>;
-  graspRiskPolicy: GraspRiskPolicy;
-  compatibility?: DeploymentCompatibility | null;
-}
-
-export interface ExternalNodesConfig {
-  enabled: string[] | null;
-  strict: boolean;
-}
-
-export interface DeploymentScenario {
-  name: string;
-  program: string;
-  description: string;
-  aliases: string[];
-}
-
-export interface DeploymentCompatibility {
-  lane: 'manyforge-only' | 'isaac-sim' | 'real-robot';
-  provides: string[];
-  tags: string[];
-  scenarios: DeploymentScenario[];
-}
-
-export interface FullDeployment {
-  apiVersion: string;
-  schemaVersion: string;
-  name: string;
-  description: string;
-  programProfile: string;
-  robotConfig: RobotConfig;
-  grippers: Record<string, GripperConfig>;
-  graspRiskPolicy: GraspRiskPolicy;
-  adapters: Record<string, AdapterConfig>;
-  orchestrator: OrchestratorConfig;
-  launch: LaunchConfig;
-  modelAuditPolicy?: ModelAuditPolicy | null;
-  modelEndpointProfileRegistry?: string | null;
-  modelEndpoints: Record<string, ModelEndpointConfig>;
-  assistant?: AssistantConfig | null;
-  assistantModes: Record<string, AssistantModeDefinition>;
-  toolCatalog: AssistantToolDefinition[];
-  promptTemplates: Record<string, PromptTemplateConfig>;
-  authorityMatrix: Record<string, AuthorityDomainConfig>;
-  poseSources: PoseSourceConfig[];
-  simulationControl?: SimulationControlConfig | null;
-  externalNodes: ExternalNodesConfig;
-  runtimeResources: Record<string, unknown>;
-  compatibility?: DeploymentCompatibility | null;
-  sourcePath: string;
-}
-
-export interface NodeDiscoveryResult {
-  path: string;
-  nodeId?: string | null;
-  version?: string | null;
-  status: 'accepted' | 'rejected' | 'warning' | string;
-  errorCode?: string | null;
-  messages: string[];
-}
-
-export interface NodeDiscoveryReport {
-  status: 'ok' | 'rejected' | 'conflict';
-  attemptedAtNs: number;
-  roots: string[];
-  strict: boolean;
-  previousCatalogHash?: string | null;
-  effectiveCatalogHash?: string | null;
-  activeEffectiveCatalogHash: string;
-  activeGeneration: number;
-  activated: boolean;
-  conflict?: string | null;
-  summary: {
-    accepted: number;
-    rejected: number;
-    added: number;
-    changed: number;
-    removed: number;
-    unchanged: number;
-  };
-  results: NodeDiscoveryResult[];
-}
-
-export interface ScenarioDescriptor {
-  name: string;
-  lane: 'manyforge-only' | 'isaac-sim' | 'real-robot';
-  assistant: 'on' | 'off';
-  programPath: string;
-  deploymentPath: string;
-  description: string;
-  aliases: string[];
-}
-
-export interface ScenarioCatalogResponse {
-  scenarios: ScenarioDescriptor[];
-}
-
-export interface ApplySessionResponse {
-  status: string;
-}
-
-// Filesystem browser
 export interface FileBrowserEntry {
   name: string;
   path: string;
   entryType: 'directory' | 'file';
   selectable: boolean;
+  /** A folder that is itself a Scenario project (`*.scenario`). */
+  scenarioProject: boolean;
 }
 
 export interface FileBrowserResponse {
   currentPath: string;
   parentPath: string | null;
   roots: string[];
+  projectRoots?: Array<{ hostPath: string; containerPath: string }>;
   entries: FileBrowserEntry[];
 }
 
-// Infrastructure
-export interface InfraComponentStatus {
-  status: string;
-  port?: number | null;
-  [key: string]: unknown;
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+export type ProgramSceneShape =
+  | { type: 'box'; box_dimensions_m: Vector3Tuple }
+  | { type: 'sphere'; sphere_radius_m: number }
+  | {
+      type: 'cylinder';
+      cylinder_radius_m: number;
+      cylinder_height_m: number;
+    }
+  | {
+      type: 'mesh';
+      mesh_resource_uri: string;
+      mesh_scale?: Vector3Tuple;
+    };
+
+export type ProgramSceneFrameRef =
+  | { kind: 'cell_frame' }
+  | {
+      kind: 'component_frame';
+      component_role: string;
+      model_role: string;
+      frame_role: string;
+    };
+
+export interface ProgramScenePose {
+  frame_ref: ProgramSceneFrameRef;
+  position_m: Vector3Tuple;
+  orientation:
+    | { xyzw: QuaternionXyzwTuple }
+    | { rpy_deg: Vector3Tuple };
 }
 
-export interface InfraStatus {
-  status: string;
-  components: Record<string, InfraComponentStatus>;
-  timestamp: number;
+export interface ProgramSceneResource {
+  scene_resource_id: string;
+  shape: ProgramSceneShape;
+  pose: ProgramScenePose;
+  resource_roles?: string[];
+  metadata?: Record<string, JsonValue>;
 }
 
-export type RuntimeReadiness = 'ready' | 'waiting' | 'degraded' | 'fault' | 'offline';
-
-export interface RuntimeComponentStatus {
-  id: string;
-  label: string;
-  kind: string;
-  status: RuntimeReadiness | 'disabled' | string;
-  requiredFor: string[];
-  detail?: string;
-  [key: string]: unknown;
+export interface ProgramViewerMetadata {
+  frame_role_visibility?: Record<string, boolean>;
+  frame_gizmo_size_m?: number;
+  resource_role_visibility?: Record<string, boolean>;
+  scene_resource_axes_visibility?: Record<string, boolean>;
+  object_axes_gizmo_size_m?: number;
+  /** Execution groups the Motion panel does not show (absent: default). */
+  hidden_execution_groups?: string[];
 }
 
-export interface RuntimeStatus {
-  schemaVersion: string;
-  profileId: string;
-  profileKind: 'composer_only' | 'commanded_sim' | 'real_robot' | string;
-  profileLabel: string;
-  authority: 'backend_authored' | 'controller_observed' | string;
-  readiness: RuntimeReadiness | string;
-  summaryLabel: string;
-  canRender: boolean;
-  canPlan: boolean;
-  canExecute: boolean;
-  userMessage: string;
-  components: RuntimeComponentStatus[];
-  externalProviders: string[];
-  supportedStopModes?: string[] | null;
-  configuredStopModes?: Record<string, string>;
-  configuredStopDecelerationTimes?: Record<string, number>;
-  stopCapabilityProfileId?: string | null;
-  hardStopLevel?: string | null;
-  derivativeProofLevel?: string | null;
-  scalingSourceVisibility?: string | null;
-  scalingSourceProbeStatus?: string | null;
-  stopProfileUnsupportedReasons?: Array<Record<string, unknown>>;
-  backendUnsupportedStopReasons?: Record<string, string>;
-  stopProfileUnsupported?: boolean;
-  stopCapabilityQueryFailed?: boolean;
-  timestampNs: number;
+/**
+ * Where one value of a node comes from, keyed in `value_sources` by the
+ * value's path (`utils/valuePaths.ts`). The literal stays in `parameters`
+ * and is restored when the source is removed.
+ */
+export type ProgramValueSource =
+  | { kind: 'program_parameter' | 'blackboard_key'; reference: string }
+  | { kind: 'blackboard_field'; reference: string; field: string }
+  | { kind: 'expression'; expression: string };
+
+export type ProgramOperatorStopPolicy = 'inherit' | 'hold' | 'continue';
+
+/** Which motion groups stop while a run waits for the operator. */
+export type ProgramInterventionStopScope = 'all' | 'own_groups';
+
+/**
+ * The captured failure-recovery policy of one node. `max_retries` 0 is
+ * Unlimited, never "disabled"; intervention stays an explicit opt-in. The
+ * stop scope is omitted when it is the default `all`.
+ */
+export interface ProgramNodeRecoveryPolicy {
+  allow_intervention: boolean;
+  max_retries: number;
+  intervention_stop_scope?: 'own_groups';
 }
 
-export type RobotLifecycleFact = 'true' | 'false' | 'unknown';
+export interface ProgramTreeNode {
+  node_id: string;
+  instance_id: string;
+  parameters: Record<string, JsonValue>;
+  value_sources?: Record<string, ProgramValueSource>;
+  children: ProgramTreeNode[];
+  metadata?: Record<string, JsonValue>;
+  recovery_policy?: ProgramNodeRecoveryPolicy;
+  operator_stop_policy?: ProgramOperatorStopPolicy;
+  execution_groups?: 'inherit' | 'all' | string[];
+}
 
-export interface RobotLifecycleCapability {
-  actionId: string;
-  label: string;
-  supported: boolean;
+export type ProgramExecutionPolicy =
+  | 'independent'
+  | 'common_start'
+  | 'common_start_and_finish'
+  | 'sync_offset_traj';
+
+export interface ProgramExecutionGroupDefinition {
+  execution_policy: ProgramExecutionPolicy;
+}
+
+/** Program types that accept an authored parameter default or key initial value. */
+export const PROGRAM_AUTHORED_VALUE_TYPES: ReadonlySet<string> = new Set([
+  'bool',
+  'float64',
+  'int64',
+  'scene_resource',
+  'stored_pose',
+  'string',
+  'string_list',
+]);
+
+export interface ProgramParameterDeclaration {
+  parameter_id: string;
+  type: string;
+  default: JsonValue;
+  constraints?: Record<string, JsonValue>;
+  description?: string;
+}
+
+export interface BlackboardNamespaceDeclaration {
+  namespace_id: string;
+  owner: 'program';
+  description?: string;
+}
+
+export interface BlackboardFieldDeclaration {
+  field: string;
+  type: string;
+}
+
+/** A pose frame a Program declares: the cell, a robot's frame role or a Scene object. */
+export type ProgramPoseFrame =
+  | { kind: 'cell_frame' }
+  | { kind: 'target_frame'; target_role: string; frame_role: string }
+  | { kind: 'scene_resource'; scene_resource_id: string };
+
+export interface BlackboardKeyDeclaration {
+  key: string;
+  type: string;
+  access: 'read' | 'write' | 'read_write';
+  persistence: 'run' | 'persistent';
+  /** Omitted for a key that is empty until written; never null. */
+  initial?: Exclude<JsonValue, null>;
+  /** A computed key's formula; never with `initial` or `persistent`. */
+  expression?: string;
+  /**
+   * Pose keys only: the declared frames a value may be stated in, non-empty
+   * and in canonical order; omitted allows every declared frame.
+   */
+  allowed_frames?: ProgramPoseFrame[];
+  fields?: BlackboardFieldDeclaration[];
+  description?: string;
+}
+
+export interface ProgramDocument {
+  api_version: 'manyforge.program.v2';
+  program_id: string;
+  program_revision: string;
+  program_profile: 'composable-cell-v1';
+  name: string;
+  description?: string;
+  catalog: {
+    api_version: 'manyforge.node_catalog.v2';
+    content_version: string;
+  };
+  compatibility?: Record<string, JsonValue>;
+  viewer?: ProgramViewerMetadata;
+  component_roles: Record<string, JsonValue>;
+  target_roles: Record<string, JsonValue>;
+  scene?: ProgramSceneResource[];
+  parameters?: ProgramParameterDeclaration[];
+  blackboard?: {
+    namespaces: BlackboardNamespaceDeclaration[];
+    keys: BlackboardKeyDeclaration[];
+  };
+  contact_policies?: JsonValue[];
+  execution_groups?: Record<string, ProgramExecutionGroupDefinition>;
+  tree: ProgramTreeNode;
+}
+
+export type ProgramAuthoringDocument = Omit<
+  ProgramDocument,
+  'program_revision' | 'tree'
+> & {
+  schema_version: 'manyforge.composer_authoring_forest.v1';
+  forest: ProgramTreeNode[];
+  positions: Record<string, { x: number; y: number }>;
+};
+
+export interface ProgramAuthoringDiagnostic {
+  code: string;
+  path: string;
+  message: string;
+  severity: 'error';
+}
+
+/**
+ * The `param.<id>` and `key.<key>` names each Draft formula reads, sorted, as
+ * the backend's expression engine resolved them. A formula that does not
+ * check is absent; its diagnostics say why.
+ */
+export interface ProgramFormulaReferences {
+  /** Computed keys by key. */
+  computedKeys: Record<string, string[]>;
+  /** Node field formulas by node instance, then value path. */
+  nodes: Record<string, Record<string, string[]>>;
+}
+
+export interface ProgramDraftProjection {
+  draftId: string;
+  draftRevision: number;
+  programLoaded: boolean;
+  authoring: ProgramAuthoringDocument | null;
+  candidateAvailable: boolean;
+  programRevision: string | null;
+  program: ProgramDocument | null;
+  diagnostics: ProgramAuthoringDiagnostic[];
+  formulaReferences: ProgramFormulaReferences;
+}
+
+export interface ProgramDraftApplicability {
+  applyReady: boolean;
+  unavailableReason: RuntimeAvailability | null;
+}
+
+export interface ProgramWorkspaceResponse {
+  schemaVersion: 'manyforge.composer_program_workspace.v2';
+  authoringWorkspace: AuthoringWorkspaceIdentity;
+  draft: ProgramDraftProjection;
+  applicability: ProgramDraftApplicability;
+  saved: {
+    available: boolean;
+    matchesDraft: boolean;
+    path: string | null;
+    programRevision: string | null;
+  };
+  applied: {
+    available: boolean;
+    matchesDraft: boolean | null;
+    programRevision: string | null;
+    unavailableReason: RuntimeAvailability | null;
+  };
+  hasUnsavedChanges: boolean;
+  hasUnappliedChanges: boolean | null;
+}
+
+export type ScenarioDocumentDisplayStatus =
+  | 'ready'
+  | 'incomplete'
+  | 'unknown'
+  | 'changed'
+  | 'version_changed'
+  | 'unsupported';
+
+export interface ScenarioDocumentEntry {
+  sourceKind: 'saved';
+  path: string;
+  scenarioId: string | null;
+  name: string;
+  /** The project folder name without `.scenario`: the name the GUI shows. */
+  folderName: string;
+  /** Its parent folder relative to the allowed root, to tell same names apart. */
+  location: string;
+  description: string;
+  savedManyforgeVersion: string | null;
+  displayStatus: ScenarioDocumentDisplayStatus;
+  statusDetail: string;
+}
+
+export interface ScenarioDocumentIndexResponse {
+  apiVersion: 'manyforge.scenario_document_index.v1';
+  directory: string;
+  entries: ScenarioDocumentEntry[];
+}
+
+export interface ScenarioDocumentSaveResponse {
+  status: 'saved';
+  path: string;
+  scenarioId: string;
+  lastKnownStatus: 'ready' | 'incomplete' | 'unknown';
+  workspace: ProgramWorkspaceResponse;
+}
+
+/** Save the Scenario as `<directory>/<name>.scenario`; the name is also its ID. */
+export interface SaveScenarioDocumentInput {
+  directory: string;
+  name: string;
+  description: string;
+  confirmOverwrite: boolean;
+}
+
+/**
+ * The retained Scenario project facts of the one shared authoring workspace.
+ *
+ * These are the facts an operator cannot re-derive from a Draft alone: the
+ * selected project path, the Saved baseline identity, the source diagnostics and
+ * the Program role assignment that was captured from the
+ * document. They are read once per observed workspace identity, together with
+ * both Draft projections, so no consumer has to combine two reads.
+ */
+export interface AuthoringWorkspaceProjectFacts {
+  documentPath: string | null;
+  /** The built-in Untitled Scenario: Save As only, never saved in place. */
+  readOnly: boolean;
+  documentId: string | null;
+  documentName: string | null;
+  documentDescription: string | null;
+  sourceDiagnostics: ScenarioSourceDiagnostic[];
+  sourceDocumentDigest: string | null;
+  programRoleAssignment: Record<string, JsonValue> | null;
+  sourceProgramDigest: string | null;
+  sourceDeploymentDigest: string | null;
+}
+
+export interface AuthoringWorkspaceProgramSaved {
   available: boolean;
-  availabilityReason: string;
-  confirmationClass: string;
-  sideEffectSummary: string;
-  expectedPostcondition: string;
-  timeoutNs: number;
+  matchesDraft: boolean;
+  path: string | null;
+  programRevision: string | null;
 }
 
-export interface RobotLifecycleTransaction {
-  generation: number;
-  requestId: string;
-  requestSequence: number;
-  actionId: string;
-  commandSource: string;
-  authoritySessionGeneration: number;
-  phase: string;
-  acceptedAtSteadyTimeNs: number;
-  deadlineSteadyTimeNs: number;
-  terminalAtSteadyTimeNs: number;
-  resultReason: string;
+export interface AuthoringWorkspaceDeploymentDraft {
+  draftId: string;
+  draftRevision: number;
+  document: Record<string, JsonValue> | null;
+  savedPath: string | null;
+  savedDocument: Record<string, JsonValue> | null;
+  differsFromSaved: boolean;
 }
 
-export interface RobotLifecycleCompositeResult {
-  operation: string;
-  success: boolean;
-  startedAtNs: number;
-  completedAtNs: number;
-  targetActionId?: string;
-  reason?: string;
-  stages: Array<{
-    actionId: string;
-    requestId: string;
-    transaction: RobotLifecycleTransaction;
+/**
+ * One atomic composite authoring snapshot.
+ *
+ * The closed response of `GET /api/authoring/workspace`: the workspace identity,
+ * the Program Draft and Saved projection, the Deployment Draft and Saved
+ * projection, and the Scenario project facts, all captured at one revision.
+ * Runtime, Applied and Manager truth is deliberately absent; those remain in
+ * their existing owner projections.
+ */
+export interface AuthoringWorkspaceSnapshot {
+  schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2';
+  workspaceEpoch: string;
+  workspaceRevision: number;
+  program: {
+    draft: ProgramDraftProjection;
+    saved: AuthoringWorkspaceProgramSaved;
+  };
+  deployment: AuthoringWorkspaceDeploymentDraft;
+  project: AuthoringWorkspaceProjectFacts;
+}
+
+export interface ScenarioSourceDiagnostic {
+  /** `edited_outside_manyforge`: a member's bytes differ from the manifest
+   * Save wrote; the project still loads with its current content. */
+  code: 'scenario_source_changed' | 'edited_outside_manyforge';
+  sourceId: string;
+  message: string;
+}
+
+export interface ScenarioDocumentExportResponse {
+  status: 'exported';
+  path: string;
+}
+
+export interface DeploymentScenarioCandidate {
+  scenarioId: string;
+  sourceDocumentDigest: string;
+  deploymentArtifactId: string;
+  deploymentRevision: string;
+  retainedBundleId: string;
+  programId: string;
+  programRevision: string;
+  programBindingId: string;
+  description: string | null;
+}
+
+export interface DeploymentWorkspaceResponse {
+  schemaVersion: 'manyforge.composer_deployment_workspace.v1';
+  authoringWorkspace: AuthoringWorkspaceIdentity;
+  draft: {
+    id: string;
+    revision: number;
+    document: Record<string, JsonValue> | null;
+    deploymentArtifactId: string | null;
+    deploymentRevision: string | null;
+    graphRevision: string | null;
+    differsFromSaved: boolean;
+  };
+  saved: {
+    path: string | null;
+    deploymentRevision: string | null;
+    /** The server's Saved-vs-Applied comparison; null while either is unknown. */
+    differsFromApplied: boolean | null;
+  };
+  managerApplied: {
+    activationOrder: {
+      retainedBundleId: string;
+      graphRevision: string;
+      componentIds: string[];
+    } | null;
+    deploymentRevision: string | null;
+    scenarioId: string | null;
+  };
+  runAdmission: {
+    ready: boolean;
+    reason: string | null;
+  };
+  binding: ProgramBindingDocument | null;
+  scenarioCandidates: DeploymentScenarioCandidate[];
+  savedScenarioCandidates: DeploymentScenarioCandidate[];
+  unavailableReasons: string[];
+}
+
+export interface PreparedActivationOrigin {
+  kind: 'scenario'; scenarioId: string; sourceDocumentDigest: string;
+  /** The Scenario project folder; it scopes persistent values. */
+  projectPath: string;
+}
+
+export interface PreparedActivationInput {
+  schemaVersion: 'manyforge.prepared_activation_input.v6';
+  preparedActivationId: string;
+  origin: PreparedActivationOrigin;
+  capturedInputDigest: string;
+  deploymentArtifactId: string;
+  deploymentRevision: string;
+  retainedBundleId: string;
+  graphRevision: string;
+  programId: string | null;
+  programRevision: string | null;
+  /** Null when no Program is selected or the preserved Program is non-executable in this
+   * candidate; the named references are in the preview impact (H1a). */
+  programBindingId: string | null;
+  nodeEnvironmentDigest: string;
+  assistantMode: 'required' | 'optional' | 'forbidden';
+}
+
+export interface DeploymentControlledStopProfile {
+  stop_mode: 'soft_on_path' | 'spring_back_hold' | 'spring_back_fast';
+  deceleration_time_s: number;
+  /** Q28/Q51 (`main`): this profile's controlled-Stop deadline from the Stop
+   * request, to start braking; absent uses the deceleration time + 0.5 s.
+   * Once sent, the Stop trajectory finishes like a normal motion (M6). */
+  max_stop_time_s?: number;
+  /** Ordered fallbacks after `stop_mode`, strictly below it in the fixed order
+   * (utils/stopFallbackSequence.ts); hard deceleration always follows and is
+   * never listed. Absent is []. */
+  fallback_stop_modes?: Array<'spring_back_hold' | 'spring_back_fast'>;
+  allow_natural_completion_on_short_path: boolean;
+  /** null is an older Draft that still requires an explicit migration choice. */
+  jerk_limits_enabled: boolean | null;
+  per_resource_limits: Array<{
+    resource_id: string;
+    max_deceleration: {
+      coordinate_kind: string;
+      value: number;
+    };
+    settle_velocity_threshold: {
+      coordinate_kind: string;
+      value: number;
+    };
+    max_jerk?: { coordinate_kind: string; value: number };
   }>;
-  cycleStop?: {
-    requested: boolean;
-    state: string;
+}
+
+export interface DeploymentControlledStopUpdate {
+  controllable_component_id: string;
+  command_target_id: string;
+  /** null keeps the selected target's profile unchanged (including non-motion targets). */
+  profile: DeploymentControlledStopProfile | null;
+}
+
+export interface CurrentScenarioSelection {
+  scenarioId: string;
+  sourceDocumentDigest: string;
+  deploymentArtifactId: string;
+  deploymentRevision: string;
+  retainedBundleId: string;
+  graphRevision: string;
+  programId: string;
+  programRevision: string;
+  programBindingId: string;
+}
+
+export interface CurrentScenarioResponse {
+  schemaVersion: 'manyforge.current_scenario.v1';
+  ready: boolean;
+  currentScenario: CurrentScenarioSelection | null;
+  unavailableReasons: string[];
+}
+
+export interface AppliedProgramSelection {
+  schemaVersion: 'manyforge.applied_program_selection.v3';
+  scenarioId: string;
+  /** The Applied Scenario project folder; it scopes persistent values. */
+  projectPath: string;
+  sourceDocumentDigest: string;
+  programId: string;
+  programRevision: string;
+  programBindingId: string;
+  retainedBundleId: string;
+  graphRevision: string;
+  nodeEnvironmentDigest: string;
+  recordDigest: string;
+  sourceOwnerId: string;
+  sourceOwnerEpoch: string;
+  sourceGeneration: number;
+  assistantProjection: Record<string, JsonValue> | null;
+  ownerIdentities: ProgramRunOwnerIdentity[];
+  program: ProgramDocument;
+  programBinding: ProgramBindingDocument;
+}
+
+export type ProgramRunStateName =
+  | 'running'
+  | 'intervention_required'
+  | 'full_stopping'
+  | 'full_stopped'
+  | 'stopping'
+  | 'finalizing'
+  | 'stopped'
+  | 'succeeded'
+  | 'failed';
+
+/** Where a failure happened (spec error contract `origin`). */
+export interface FailureOrigin {
+  kind: 'program_node' | 'owner' | 'program_runner';
+  nodeInstanceId: string | null;
+  ownerApi: string | null;
+}
+
+/** Bounded flat failure details: one scalar value per registered key. */
+export type FailureDetails = Record<string, string | number | boolean | null>;
+
+/**
+ * One failure as produced at its source: the stable code, the human message
+ * and, when carried, its bounded details and origin. Run records and API
+ * errors map into this one shape; it is for display only and never selects a
+ * recovery action.
+ */
+export interface StructuredError {
+  code: string;
+  message: string;
+  details: FailureDetails | null;
+  origin: FailureOrigin | null;
+  /** The owner that produced the error (`headless_api`, `component_manager`, ...), when reported. */
+  producer?: string;
+}
+
+/** The typed `{code, message, details}` carrier without run-origin context. */
+export type ErrorDTO = Pick<StructuredError, 'code' | 'message' | 'details'>;
+
+export interface ProgramRunOwnerIdentity {
+  ownerRole: string;
+  ownerId: string;
+  ownerEpoch: string;
+}
+
+export interface ProgramRunCapture {
+  programRunId: string;
+  appliedRecordDigest: string;
+  scenarioId: string;
+  sourceDocumentDigest: string;
+  programId: string;
+  programRevision: string;
+  programBindingId: string;
+  retainedBundleId: string;
+  graphRevision: string;
+  nodeEnvironmentDigest: string;
+  nodePolicies: JsonValue[];
+  nodePolicyDigest: string;
+  ownerIdentities: ProgramRunOwnerIdentity[];
+}
+
+/** Exact owner-published operation failure provenance; display/history data only. */
+export interface ProgramRunOperationFailure {
+  nodeInstanceId: string;
+  nodeAttemptId: string;
+  operatorFacingRunRevision: number;
+  operation: { sourceOwnerEpoch: string; operationId: string; operationRevision: number };
+  resourceIds: string[];
+  failure: { code: string; message: string };
+  recoveryClass: string;
+  terminalFacts: Array<{ kind: string; effect: string }>;
+}
+
+export interface ProgramRunStatus {
+  schemaVersion: 'manyforge.program_run_status.v3';
+  ownerId: string;
+  ownerEpoch: string;
+  runRevision: number;
+  state: ProgramRunStateName;
+  capture: ProgramRunCapture;
+  treeStatus: 'invalid' | 'running' | 'success' | 'failure';
+  nodeStatusRevision: number;
+  nodeStatuses: Record<
+    string,
+    'idle' | 'running' | 'held' | 'success' | 'failure' | 'interrupted'
+  >;
+  activeOperationCount: number | null;
+  operationFailures: ProgramRunOperationFailure[];
+  /**
+   * Why the run is in its state (a failure, a Stop or a pause), null when the
+   * owner names no reason. Its message is the status `message`.
+   */
+  reason: StructuredError | null;
+  message: string;
+  /** CONTRACTS §9: why the run ended; null while it has not. */
+  runEnd: ProgramRunEnd | null;
+}
+
+/** The immutable selectors accepted with one Program Reset intent. */
+export interface ProgramResetSelection {
+  reloadInitialScene: boolean;
+  resetRobotPosition: boolean;
+}
+
+export interface ProgramResetRobotPositionAvailability {
+  available: boolean;
+  reason: string | null;
+}
+
+export interface ProgramCycleStatus {
+  programRunnerOwnerEpoch: string;
+  cycleGeneration: number;
+  state: 'idle_after_reset' | 'starting' | 'running' | 'stopping'
+    | 'resetting' | 'terminal_awaiting_reset' | 'recovery_required';
+  programRunId: string | null;
+  cycleClaimGeneration: number | null;
+  terminalOrSettlementReference: string | null;
+  runRevision: number | null;
+  nodeStatusRevision: number | null;
+  runtimeControlRevision: number | null;
+  executionControlRevision: number;
+  causalCorrelationId: string | null;
+  causalSessionId: string | null;
+  causalClientSequence: string | null;
+  currentCommandKind: string | null;
+  failure: Record<string, JsonValue> | null;
+  /** CONTRACTS §9: why the cycle's last run ended (also on `run`). */
+  runEnd?: ProgramRunEnd | null;
+  resetPhase: string | null;
+  resetOptions: ProgramResetSelection | null;
+  resetRobotPosition: ProgramResetRobotPositionAvailability;
+  allowedCommands: Array<{
+    commandKind: string;
+    semanticTarget: Record<string, JsonValue>;
+    allowed: boolean;
+    disabledReason: string | null;
+  }>;
+  run: ProgramRunStatus | null;
+  runtimeControls: ProgramRuntimeControlProjection | null;
+}
+
+/** The value types a formula can produce (docs/authoring/EXPRESSIONS.md §3). */
+export type ExpressionValueType = 'bool' | 'int64' | 'float64' | 'string';
+
+export interface ExpressionCheckRequest {
+  expression: string;
+  destination_type: ExpressionValueType;
+  /** The computed key being edited, so its own formula is not a cycle. */
+  exclude_computed_key: string | null;
+}
+
+/** One backend finding; position and length count Unicode code points. */
+export interface ExpressionDiagnostic {
+  code: string;
+  message: string;
+  position: number | null;
+  length: number | null;
+  name: string | null;
+}
+
+export interface ExpressionCheckResult {
+  resultType: ExpressionValueType | null;
+  diagnostics: ExpressionDiagnostic[];
+  /** Computed from parameter defaults and key `initial:` values, never a runtime value. */
+  preview: { value: Exclude<JsonValue, null> } | { unavailableReason: string };
+  /** `param.` and `key.` names a formula may use, with their types. */
+  names: Array<{ name: string; type: string }>;
+}
+
+/** One declared persistent key of the Applied Program and its stored value. */
+export interface PersistentKeyValue {
+  key: string;
+  type: string;
+  access: BlackboardKeyDeclaration['access'];
+  /** Undefined for a key without `initial:`; it then starts empty. */
+  initial: Exclude<JsonValue, null> | undefined;
+  /** Whether the Program runner holds a stored value for the key. */
+  stored: boolean;
+  value: JsonValue;
+  sequence: number | null;
+}
+
+/**
+ * One attributed change: an operator request, a write from a run's node, a
+ * value dropped because the committed Program no longer keeps it, or a fault
+ * (a committed Apply the Program runner never observed).
+ */
+export interface PersistentKeyValueEdit {
+  sequence: number;
+  /** Null when a change covers every key of the Scenario. */
+  key: string | null;
+  action: 'set' | 'reset' | 'clear' | 'dropped' | 'fault';
+  requestId: string | null;
+  sourceLabel: string;
+  programRunId: string | null;
+  nodeInstanceId: string | null;
+  nodeAttemptId: string | null;
+  /** Why a value was dropped, or the fault (`applied_program_not_observed`). */
+  reason: string | null;
+  detail: string | null;
+}
+
+/** Stored persistent values of one Scenario, owned by the Program runner. */
+export interface PersistentKeyValues {
+  scenarioId: string;
+  /** The Applied Scenario project folder the values belong to. */
+  projectPath: string;
+  programRevision: string;
+  /** The live run that currently holds the values, if any. */
+  programRunId: string | null;
+  /** Register sequence when read: advances with every stored-value change. */
+  sequence: number;
+  keys: PersistentKeyValue[];
+  edits: PersistentKeyValueEdit[];
+  /**
+   * The stored values could not be brought in line with the committed Apply;
+   * until they are, no stored value is shown or restored.
+   */
+  storageFault: { code: string; message: string } | null;
+  /**
+   * Committed Applies of this Scenario the Program runner never observed.
+   * Values were kept and checked against the current Program; the missed
+   * notification is a defect to find and fix.
+   */
+  applyObservationFault: { code: string; recordDigests: string[] } | null;
+}
+
+export interface PersistentKeyValuesCleared {
+  requestId: string;
+  projectPath: string;
+  removed: number;
+}
+
+/** The facts of one automatic motion retry, parsed strictly from its audit event. */
+export interface AutomaticRetryAuditFacts {
+  nodeInstanceId: string;
+  /** 1-based attempt that is starting; the first retry is 2. */
+  attempt: number;
+  maxAttempts: number;
+  /** The cause as the runner names it, for example collision_stop_nominal. */
+  cause: string;
+  delayS: number;
+  /** The failed attempt's Kernel failure; null when the owner has none. */
+  failure: StructuredError | null;
+}
+
+export interface AutomaticRetryAuditEvent {
+  eventRevision: number;
+  kind: 'program_node_automatic_retry';
+  facts: AutomaticRetryAuditFacts;
+}
+
+/**
+ * A motion takeover that did not complete as a moving replacement: the
+ * newcomer node's Kernel decision, parsed strictly from its audit event.
+ */
+export interface TakeoverFallbackAuditFacts {
+  /** The newcomer node whose takeover fell back. */
+  nodeInstanceId: string;
+  incumbentOperationId: string;
+  path: 'spring_back_hold' | 'ordinary_containment';
+  /** The Kernel's reason; null when it named none. */
+  code: string | null;
+  message: string | null;
+  /** The stage where the preparation time ran out; null when not named. */
+  failureStage: string | null;
+  preparationMs: number;
+  budgetMs: number;
+  /** The planning cap that applied: the deadline a planning timeout trips. */
+  planningCapMs: number;
+}
+
+export interface TakeoverFallbackAuditEvent {
+  eventRevision: number;
+  kind: 'program_node_takeover_fallback';
+  facts: TakeoverFallbackAuditFacts;
+}
+
+/** Every other runtime-control event: its facts are kept as the owner sent them. */
+export interface GenericRuntimeControlAuditEvent {
+  eventRevision: number;
+  kind: string;
+  facts: Record<string, JsonValue>;
+}
+
+export type RuntimeControlAuditEvent =
+  | AutomaticRetryAuditEvent
+  | TakeoverFallbackAuditEvent
+  | GenericRuntimeControlAuditEvent;
+
+export interface ProgramRuntimeControlsSnapshot {
+  schemaVersion: 'manyforge.program_runtime_controls.v3';
+  programRunId: string;
+  runtimeControlRevision: number;
+  recoveryFences: {
+    programGeneration: number;
+    deploymentGeneration: number;
+    sceneAdmissionEpoch: number;
+    poseSourceApplyGeneration: number;
+  };
+  audit: RuntimeControlAuditEvent[];
+}
+
+export type CycleRecoveryActionId =
+  | 'retry_motion_from_current_state'
+  | 'acknowledge_and_continue'
+  | 'retry_after_scene_repair'
+  | 'replan_from_stopped_state'
+  | 'retry_runtime_step'
+  | 'continue_with_failure'
+  | 'reset_cycle';
+
+export interface CycleRecoveryAction {
+  actionId: CycleRecoveryActionId;
+  requiresConfirmation: boolean;
+  performsBackendReset: boolean;
+  enabled: boolean;
+  disabledReasonCode: string | null;
+}
+
+export interface CycleRecoveryOffer {
+  schemaVersion: 'manyforge.cycle_recovery_offer.v5';
+  offerId: string;
+  offerRevision: number;
+  generatedAtNs: Nanoseconds;
+  kernelAssessmentRevision: number;
+  controlCommandEpoch: number;
+  operationId: string | null;
+  operationRevision: number | null;
+  programRunId: string;
+  programBindingId: string;
+  nodeInstanceId: string;
+  nodeAttemptId: string;
+  participants: JsonValue[];
+  graphRevision: string;
+  retainedBundleId: string;
+  cycleGeneration: number;
+  programGeneration: number;
+  deploymentGeneration: number;
+  sceneAdmissionEpoch: number;
+  poseSourceApplyGeneration: number;
+  stopId: string | null;
+  stopGeneration: number | null;
+  stopCertificateId: string | null;
+  stopCertificateRevision: number | null;
+  status: string;
+  recoveryClass: string;
+  actions: CycleRecoveryAction[];
+  manualResult: {
+    enabled: boolean;
+    disabledReasonCode: string | null;
+  };
+  /**
+   * The held node's own failure (or the Stop that holds it). Several nodes can
+   * be held at once (see `recoveryHolds`), so each offer carries its full reason.
+   */
+  reason: StructuredError;
+  evidenceRefs: string[];
+  /** The captured node policy; `maxRetries` 0 is Unlimited. */
+  policy: {
+    allowIntervention: boolean;
+    maxRetries: number;
+    interventionStopScope?: 'own_groups';
+  };
+  /** Explicit failure retries of this node already used in the run. */
+  retriesUsed: number;
+}
+
+export interface ProgramExecutionSelectionControls {
+  selectionRevision: number;
+  /** Owner proof that every effectful node is held, with no Stop pending or faulted. */
+  motionHeld: boolean;
+  groups: Array<{
+    groupId: string;
+    nodeCount: number;
+    heldNodeCount: number;
+    /** Known ordinary held nodes, excluding never-started Ready nodes. */
+    ordinaryHeldNodeCount?: number | null;
+    state: 'ready' | 'running' | 'held' | 'mixed' | 'stopping' | 'faulted' | 'unavailable';
+    stopAllowed: boolean;
+    startAllowed: boolean;
+    startUnavailableReason: string | null;
+    resumeAllowed: boolean;
+    resumeUnavailableReason: string | null;
+    /** Exact captured motion scope used by the runtime-scale owner. */
+    runtimeScaleSelector: RuntimeScaleControlSelector | null;
+    runtimeScaleUnavailableReason: string | null;
+    /** Exact resources the Kernel reserves to release this selection. */
+    resourceIds: string[];
+  }>;
+}
+
+export interface ProgramGroupRuntimeScaleState {
+  selector: RuntimeScaleControlSelector | null;
+  status: RuntimeScaleControlStatus | null;
+  draft: number;
+  pending: boolean;
+  error: string | null;
+}
+
+/** One active failure hold: the held node's own motion groups and its offer. */
+export interface ProgramRecoveryHold {
+  /** The groups this hold owns; `['all']` for a node in no named group. */
+  motionGroupIds: string[];
+  interventionStopScope: ProgramInterventionStopScope;
+  offer: CycleRecoveryOffer;
+}
+
+export interface ProgramRuntimeControlProjection {
+  schemaVersion: 'manyforge.program_runtime_control_projection.v9';
+  ownerId: string;
+  ownerEpoch: string;
+  programRunId: string;
+  runRevision: number;
+  runtimeControls: ProgramRuntimeControlsSnapshot;
+  /** The focused offer (also covers an operator Stop); Retry/Continue use `recoveryHolds`. */
+  recoveryOffer: CycleRecoveryOffer | null;
+  /** Every active failure hold, in arrival order. */
+  recoveryHolds: ProgramRecoveryHold[];
+  executionSelections: ProgramExecutionSelectionControls;
+}
+
+export type ProgramWorkspaceTransitionStatus =
+  | 'accepted'
+  | 'applied'
+  | 'loaded'
+  | 'reverted';
+
+export interface ProgramWorkspaceTransitionResponse {
+  status: ProgramWorkspaceTransitionStatus;
+  headless: Record<string, JsonValue> | null;
+  workspace: ProgramWorkspaceResponse;
+}
+
+export interface NodeImplementationAvailability {
+  nodeId: string;
+  engineId: string;
+  implementationId: string;
+  executablePackageId: string;
+  authoringAvailable: boolean;
+  executionAvailable: boolean;
+  reasons: ErrorDTO[];
+  reasonCodes: string[];
+  restorationGates: string[];
+}
+
+export interface NodeEnvironmentResponse {
+  environmentDigest: string;
+  implementations: NodeImplementationAvailability[];
+  portableAuthoringAvailable: boolean;
+  executionAvailable: boolean;
+  reasonCodes: string[];
+  restorationGates: string[];
+  active: {
+    retainedBundleId: string;
+    graphRevision: string;
+  } | null;
+}
+
+export interface SourceModelProjectionSource {
+  available: true;
+  freshness: 'fresh';
+  known_gaps: [];
+  projection_generation: number;
+  projection_owner_epoch: string;
+  receiver_age_ns: number;
+  selection_projection_generation: number;
+  selection_source_content_digest: string;
+  selection_source_generation: number;
+  selection_source_owner_epoch: string;
+  selection_source_owner_id: string;
+  source_content_digest: string;
+  source_generation: number;
+  source_owner_epoch: string;
+  source_owner_id: string;
+  source_owner_kind: 'source_model_projection';
+}
+
+export interface SourceModelCoordinate {
+  coordinate_kind: string;
+  joint_type: string;
+  mimic: {
+    multiplier: number;
+    offset: number;
+    source_joint_name: string;
+  } | null;
+  source_child_link_name: string;
+  source_joint_index: number;
+  source_joint_name: string;
+  source_parent_link_name: string;
+  unit: string;
+  viewer_child_link_name: string;
+  viewer_joint_name: string;
+  viewer_parent_link_name: string;
+}
+
+export interface SourceModelSrdfGroup {
+  chains: Array<{
+    source_base_link_name: string;
+    source_tip_link_name: string;
+  }>;
+  source_group_name: string;
+  source_joint_names: string[];
+  source_link_names: string[];
+  source_subgroup_names: string[];
+}
+
+export interface SourceModelOccurrence {
+  component_id: string | null;
+  coordinates: SourceModelCoordinate[];
+  links: Array<{
+    source_link_name: string;
+    viewer_link_name: string;
+  }>;
+  model_asset_id: string;
+  model_instance_id: string;
+  model_revision: string;
+  model_role_id: string | null;
+  source_model_name: string;
+  source_robot_name: string;
+  srdf_end_effectors: Array<{
+    source_end_effector_name: string;
+    source_group_name: string;
+    source_parent_group_name: string | null;
+    source_parent_link_name: string;
+  }>;
+  srdf_group_states: Array<{
+    source_group_name: string;
+    source_group_state_name: string;
+    source_joint_names: string[];
+  }>;
+  srdf_groups: SourceModelSrdfGroup[];
+}
+
+export interface SourceModelTarget {
+  collision_bodies: Array<{
+    collision_body_role_id: string;
+    model_instance_id: string;
+    source_link_names: string[];
+  }>;
+  component_id: string;
+  frames: Array<{
+    frame_kind: 'cell_frame' | 'component_model_frame' | 'passive_model_frame';
+    frame_role_id: string;
+    model_instance_id: string | null;
+    source_link_name: string | null;
+  }>;
+  model_groups: Array<{
+    commandable_source_joint_names: string[];
+    model_group_role_id: string;
+    model_instance_id: string;
+    source_group_name: string;
+    source_joint_names: string[];
+    source_link_names: string[];
+  }>;
+  target_id: string;
+}
+
+/** One applied component and the parent interface it is mounted on (B6). */
+export interface SourceModelComponent {
+  component_id: string;
+  mounted_on: {
+    component_id: string;
+    interface_id: string;
+  } | null;
+}
+
+export interface SourceModelProjection {
+  schema_version: 'manyforge.source_model_projection.v3';
+  cell_id: string;
+  retained_bundle_id: string;
+  graph_revision: string;
+  model_map_contract: {
+    contract_id: string;
+    contract_revision: string;
+  } | null;
+  model_map_product_id: string | null;
+  /** Sorted by `component_id`. */
+  components: SourceModelComponent[];
+  occurrences: SourceModelOccurrence[];
+  targets: SourceModelTarget[];
+  source: SourceModelProjectionSource;
+}
+
+export interface SceneRevision {
+  scene_id: string;
+  revision_id: number;
+  content_hash: string;
+}
+
+export interface ProjectionRevision {
+  retained_bundle_id: string;
+  graph_revision: string;
+  scene_revision: SceneRevision;
+}
+
+export interface LogicalScenePose {
+  position_m: { x: number; y: number; z: number };
+  orientation_xyzw: QuaternionXyzwTuple;
+}
+
+export type LogicalSceneShape =
+  | { type: 'box'; dimensions_m: { x: number; y: number; z: number } }
+  | { type: 'sphere'; radius_m: number }
+  | { type: 'cylinder'; radius_m: number; height_m: number }
+  | { type: 'mesh'; resource_uri: string; scale: { x: number; y: number; z: number } };
+
+export interface SceneMeshAssetMetadata {
+  schema_version: 'manyforge.scene_mesh_asset.v2';
+  asset_hash: string;
+  mesh_asset_url: string;
+  mesh_asset_status: 'pending' | 'ok' | 'parse_failed';
+  last_error: string | null;
+}
+
+export interface ProgramDraftMeshAssetMetadata {
+  schema_version: 'manyforge.program_draft_mesh_asset.v1';
+  asset_hash: string;
+  mesh_asset_url: string;
+  mesh_asset_status: 'pending' | 'ok' | 'parse_failed';
+  draft_id: string;
+  draft_revision: number;
+  last_error: string | null;
+}
+
+export type LogicalScenePlacement =
+  | {
+      kind: 'cell_fixed';
+      cell_id: string;
+      pose_in_cell: LogicalScenePose;
+    }
+  | {
+      kind: 'carried';
+      carried_object_attachment_id: string;
+      carried_object_attachment_revision: string;
+    };
+
+export interface LogicalSceneObject {
+  scene_resource_id: string;
+  collision_shapes: LogicalSceneShape[];
+  placement: LogicalScenePlacement;
+  provider_evidence: Record<string, JsonValue> | null;
+  support_contacts: Array<Record<string, JsonValue>>;
+  /** Present only when positive (kg). */
+  mass_kg?: number;
+}
+
+export interface CarriedObjectAttachment {
+  carried_object_attachment_id: string;
+  carried_object_attachment_revision: string;
+  scene_resource_id: string;
+  controllable_component_id: string;
+  command_target_id: string;
+  carrier_frame_ref: {
+    kind: 'component';
+    controllable_component_id: string;
+    model_instance_id: string;
+    frame_role_id: string;
+  };
+  pose_in_carrier_frame: {
+    position_m: { x: number; y: number; z: number };
+    orientation_xyzw: QuaternionXyzwTuple;
+  };
+  touch_body_roles: string[];
+}
+
+export interface LogicalSceneProjection {
+  api_version: 'manyforge.logical_scene_source.v1';
+  access: {
+    active_projection: ProjectionRevision | null;
+    phase: string;
+    projection_leases_open: boolean;
+    scene_writes_open: boolean;
+  };
+  snapshot: {
+    carried_object_attachments: CarriedObjectAttachment[];
+    cell_id: string;
+    configured_collision_policy: Record<string, JsonValue>;
+    objects: LogicalSceneObject[];
+    policy_epoch: number;
+    revision: SceneRevision;
+    topology_epoch: number;
+    transaction_sequence: number;
+  } | null;
+}
+
+export interface SceneRuntimeObservationPose {
+  frame_id: string;
+  frame_kind: 'cell_frame';
+  orientation_xyzw: QuaternionXyzwTuple;
+  position_m: Vector3Tuple;
+  source_stamp_ns: Nanoseconds | null;
+}
+
+export interface SceneRuntimeObservationReference {
+  controllable_component_id: string;
+  command_target_id: string;
+  gripper_link: string;
+  entity: string;
+  link: string;
+  source_header_frame_id: string;
+  coherent: boolean;
+  pose_in_reference: {
+    orientation_xyzw: QuaternionXyzwTuple;
+    position_m: Vector3Tuple;
+  } | null;
+}
+
+export type SceneRuntimeGoodObservationPayload =
+  | {
+      api_version: 'manyforge.ros_pose_observation.v2';
+      joint_names: string[];
+      kind: 'joint_state';
+      positions: number[];
+      source_stamp_ns: Nanoseconds | null;
+      topic: string;
+    }
+  | {
+      api_version: 'manyforge.ros_pose_observation.v2';
+      kind: 'simulation_entity_pose';
+      pose: SceneRuntimeObservationPose;
+      source: { entity: string };
+    }
+  | {
+      api_version: 'manyforge.ros_pose_observation.v2';
+      kind: 'simulation_entity_pose_with_references.v1';
+      pose: SceneRuntimeObservationPose;
+      /** Gripper-relative samples, keyed by component and command target. */
+      references: SceneRuntimeObservationReference[];
+      source: { entity: string };
+    }
+  | {
+      api_version: 'manyforge.ros_pose_observation.v2';
+      kind: 'detection3d_pose';
+      pose: SceneRuntimeObservationPose;
+      source: {
+        class_id: string;
+        confidence: number;
+        detection_id: string;
+        max_position_variance_m2: number;
+        topic: string;
+      };
+    };
+
+export interface SceneRuntimeUnknownObservationPayload {
+  api_version: 'manyforge.ros_pose_observation.v2';
+  kind:
+    | 'joint_state'
+    | 'simulation_entity_pose'
+    | 'simulation_entity_pose_with_references.v1'
+    | 'detection3d_pose';
+  source_error: {
+    code: string;
+    detail: string;
+    source_key: string;
   };
 }
 
-export interface RobotLifecycleStatus {
-  schemaVersion: string;
-  configured: boolean;
-  providerId?: string;
-  providerInstanceId?: string;
-  providerHealthy: boolean;
-  robotId?: string;
-  supervisorInstanceId?: string;
-  authorityProfile?: string;
-  fresh: boolean;
-  readiness: RuntimeReadiness | 'disabled' | string;
-  canExecute: boolean;
-  userMessage: string;
-  snapshotGeneration?: number;
-  transportConnected?: RobotLifecycleFact;
-  identityVerified?: RobotLifecycleFact;
-  positionValid?: RobotLifecycleFact;
-  robotEnabled?: RobotLifecycleFact;
-  vendorControlReady?: RobotLifecycleFact;
-  hardwareComponentActive?: RobotLifecycleFact;
-  trajectoryControllerActive?: RobotLifecycleFact;
-  faultPresent?: RobotLifecycleFact;
-  warningPresent?: RobotLifecycleFact;
-  recoveryRequired?: RobotLifecycleFact;
-  stationary?: RobotLifecycleFact;
-  observationFresh?: boolean;
-  authorityFresh?: boolean;
-  observeReady?: boolean;
-  controllerReady?: boolean;
-  motionAdmitted?: boolean;
-  reconciliationRequired?: boolean;
-  admissionReasonCodes?: string[];
-  adapterStatus?: Record<string, string>;
-  capabilities: RobotLifecycleCapability[];
-  pendingTransaction?: RobotLifecycleTransaction | null;
-  lastTerminalTransaction?: RobotLifecycleTransaction | null;
-  commandInFlight?: {
-    operation: string;
-    startedAtNs: number;
-    stage: string;
-  } | null;
-  lastCompositeResult?: RobotLifecycleCompositeResult | null;
+export interface SceneRuntimeAttachedPoseReference {
+  holder: {
+    controllable_component_id: string;
+    command_target_id: string;
+    gripper_link: string;
+  };
+  measured_against: {
+    entity: string;
+    link: string;
+  };
+  /** Present only when this differs from the carrier frame's source link name. */
+  source_header_frame_id?: string;
+  /** The attachment carrier frame after the Manager's fixed transform. */
+  frame: {
+    kind: 'component';
+    controllable_component_id: string;
+    model_instance_id: string;
+    frame_role_id: string;
+  };
+  current_offset: {
+    position_m: { x: number; y: number; z: number };
+    orientation_xyzw: QuaternionXyzwTuple;
+  };
+  /** Omitted until the existing grasp-lost check has established a baseline. */
+  baseline_offset?: {
+    position_m: { x: number; y: number; z: number };
+    orientation_xyzw: QuaternionXyzwTuple;
+  };
+  /** Omitted with `baseline_offset`. */
+  drift?: {
+    translation_m: number;
+    rotation_rad: number;
+  };
 }
 
-export interface SceneRobotState {
-  robot_id?: string | null;
-  group_id?: string | null;
-  urdf_model_key?: string | null;
-  base_frame: string;
-  tcp_frame: string;
-  base_pose?: Record<string, unknown>;
-  joint_names: string[];
-  joint_positions: Record<string, number>;
-  tcp_pose_in_base?: Record<string, unknown> | null;
-  state_source?: string | null;
-  source_timestamp_ns?: number | null;
-  source_age_ns?: number | null;
+export interface SceneRuntimeCellPoseMeasurement {
+  measured_against: 'cell frame';
+  /** The carrier frame used by the existing grasp-loss measurement. */
+  frame: SceneRuntimeAttachedPoseReference['frame'];
+  current_offset: SceneRuntimeAttachedPoseReference['current_offset'];
+  baseline_offset?: SceneRuntimeAttachedPoseReference['baseline_offset'];
+  drift?: SceneRuntimeAttachedPoseReference['drift'];
 }
 
-export type MeshAssetStatus =
-  | 'ok'
-  | 'pending'
-  | 'missing'
-  | 'unsupported_format'
-  | 'parse_failed'
-  | 'conversion_timeout'
-  | 'too_large'
-  | 'outside_allowed_roots';
+export type SceneRuntimePoseMeasurement =
+  | SceneRuntimeAttachedPoseReference
+  | SceneRuntimeCellPoseMeasurement;
 
-export interface SceneShapeState {
-  type?: string;
-  box_dimensions_m?: number[];
-  sphere_radius_m?: number;
-  cylinder_radius_m?: number;
-  cylinder_height_m?: number;
-  mesh_resource_uri?: string;
-  mesh_scale?: number[];
-  mesh_asset_url?: string | null;
-  mesh_asset_status?: MeshAssetStatus | string | null;
-}
+export type SceneRuntimePoseMeasurementFields = Omit<
+  Partial<SceneRuntimeAttachedPoseReference>,
+  'measured_against'
+> & {
+  measured_against?: SceneRuntimeAttachedPoseReference['measured_against']
+    | SceneRuntimeCellPoseMeasurement['measured_against'];
+};
 
-export interface SceneObjectState {
+type SceneRuntimePoseSourceBase = SceneRuntimePoseMeasurementFields & {
+  buffered: boolean;
+  expires_at_ns: Nanoseconds;
   object_id: string;
-  shape?: SceneShapeState | null;
-  pose_in_universe?: Record<string, unknown> | null;
-  attached: boolean;
-  attached_to?: string | null;
-  source: 'authored' | 'runtime' | 'attached' | 'sensed';
-  persistable: boolean;
-  viewer_frame_visible: boolean;
-  support_contacts?: Record<string, unknown>[];
+  observed_at_ns: Nanoseconds;
+  policy_id: string;
+  source_epoch: string;
+  source_epoch_order: number;
+  source_id: string;
+  source_sequence: number;
 }
 
-export interface SceneGripperSubtreeLink {
-  name: string;
-  position_m: number[];
-  orientation_xyzw: number[];
-}
+export type SceneRuntimePoseSource =
+  | (SceneRuntimePoseSourceBase & {
+      eligible: boolean;
+      fresh: boolean;
+      payload: SceneRuntimeGoodObservationPayload;
+      payload_quality: 'good';
+    })
+  | (SceneRuntimePoseSourceBase & {
+      buffered: false;
+      eligible: false;
+      fresh: false;
+      payload: SceneRuntimeUnknownObservationPayload;
+      payload_quality: 'unknown';
+    });
 
-// Snake_case mirror of GripperVisualization, surfaced on the
-// scene-state gripper block so the Move-To ghost renderer can
-// consume it without an extra deployment fetch.
-export interface SceneGripperVisualization {
-  gripper_root_link: string;
-  tcp_to_root_position_m: number[];
-  tcp_to_root_orientation_xyzw: number[];
-  subtree_links: SceneGripperSubtreeLink[];
-}
-
-export interface SceneGripperState {
-  gripper_id: string;
-  joint_name: string;
-  derived_joints?: string[];
-  state: string;
-  command_id: number;
-  generation: number;
-  revision: number;
-  current_position: number | null;
-  target_position: number | null;
-  commanded_position?: number | null;
-  observed_position?: number | null;
-  commanded_state?: string;
-  actuation_kind?: string;
-  state_authority?: string;
-  completion_policy?: string;
-  grasp_confirmation_policy?: string;
-  transport_kind?: string;
-  evidence?: string[];
-  evidence_state?: string;
-  projection_state?: string;
-  projection_reason?: string;
-  limit_lower: number | null;
-  limit_upper: number | null;
-  motion_time_s: number;
-  srdf_presets: Record<string, number>;
-  visualization?: SceneGripperVisualization | null;
-  error: string | null;
-  reason_code?: string | null;
-}
-
-export interface PoseSourcePoseState {
-  frame_id: string;
-  stamp_sec?: number | null;
-  position_xyz: number[];
-  orientation_xyzw: number[];
-}
-
-export interface PoseSourceUpdateState {
-  pose_source_id: string;
+/** One configured Isaac/pose-source JointState binding from the active bundle. */
+export interface SceneRuntimeConfiguredJointState {
+  source_id: string;
   object_id: string;
-  entity: string;
-  monotonic_s: number;
-  apply_policy: string;
-  pose: PoseSourcePoseState;
+  policy_id: string;
+  topic: string;
 }
 
-export interface PoseSourceMeasuredTcpState {
-  frame_id: string;
-  tcp_frame_id: string;
-  monotonic_s: number;
-  age_s?: number | null;
-  pose: PoseSourcePoseState;
+/** One `scene.carried_object_lost` event projected with its attachment policy. */
+export interface SceneRuntimeCarriedObjectLoss {
+  carried_object_attachment_id: string;
+  code: 'scene.carried_object_lost';
+  command_target_id: string;
+  controllable_component_id: string;
+  event_id: string;
+  full_text: string;
+  on_grasp_lost: {
+    detach: boolean;
+    raise_alarm: boolean;
+    set_key: string | null;
+    stop_motion: boolean;
+  };
+  scene_resource_id: string;
+  /** The non-empty publication error code, present only when signal publication failed. */
+  signal_error?: string;
 }
 
-export interface PoseSourceMeasuredRobotState {
-  joint_state_topic: string;
-  joint_names: string[];
-  joint_positions_rad: number[];
-  monotonic_s: number;
-  age_s?: number | null;
-  stamp_sec?: number | null;
-  link_poses?: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
+export interface SceneRuntimeProjection {
+  api_version: 'manyforge.scene_runtime_source.v1';
+  cell_id: string;
+  /** Omitted by older owners; treated as empty. */
+  configured_joint_states?: SceneRuntimeConfiguredJointState[];
+  state: {
+    api_version: 'manyforge.scene_runtime_state.v2';
+    active_replay_id: number | null;
+    carried_object_losses?: SceneRuntimeCarriedObjectLoss[];
+    counters: Record<string, number>;
+    deferred: boolean;
+    error: string | null;
+    initialization_generation: number;
+    initialization_token: string | null;
+    pose_sources: SceneRuntimePoseSource[];
+    reason: string;
+    runtime_identity: {
+      deployment_generation: number;
+      graph_revision: string;
+      program_generation: number;
+      retained_bundle_id: string;
+      runtime_generation: number;
+    } | null;
+    started_at_ns: Nanoseconds;
+    state: 'open' | 'closed' | 'resetting' | 'seeding' | 'replaying' | 'failed' | 'retired';
+    updated_at_ns: Nanoseconds;
+  };
 }
 
-export interface PoseSourceAttachedDriftState {
-  status: string;
-  action: string;
-  signal_id: string;
-  baseline_captured: boolean;
-  translation_m?: number | null;
-  rotation_rad?: number | null;
-  translation_threshold_m?: number | null;
-  rotation_threshold_rad?: number | null;
-  debounce_s: number;
-  sample_time_delta_s?: number | null;
-  unverifiable_reason?: string;
-  exceeded_since_ns?: number | null;
-  condition_raised: boolean;
-  metadata?: Record<string, unknown>;
+export interface ScenePoseRequest {
+  position_m: { x_m: number; y_m: number; z_m: number };
+  orientation: { x: number; y: number; z: number; w: number };
 }
 
-export interface PoseSourceRejectionState {
-  pose_source_id: string;
-  object_id: string;
-  entity: string;
+export type SceneShapeRequest =
+  | {
+      type: 'box';
+      box_dimensions_m: { x_m: number; y_m: number; z_m: number };
+    }
+  | { type: 'sphere'; sphere_radius_m: number }
+  | {
+      type: 'cylinder';
+      cylinder_radius_m: number;
+      cylinder_height_m: number;
+    }
+  | {
+      type: 'mesh';
+      mesh_resource_uri: string;
+      mesh_scale: { x_m: number; y_m: number; z_m: number };
+    };
+
+export type SceneTransactionFrameRequest =
+  | { kind: 'cell_frame'; cell_id: string }
+  | {
+      kind: 'component_frame';
+      controllable_component_id: string;
+      model_instance_id: string;
+      frame_role_id: string;
+    }
+  | {
+      kind: 'passive_model_frame';
+      model_instance_id: string;
+      frame_role_id: string;
+    }
+  | { kind: 'scene_resource'; scene_resource_id: string };
+
+export type SceneTransactionOperation =
+  | {
+      kind: 'add_object' | 'upsert_object';
+      scene_resource_id: string;
+      shape: SceneShapeRequest;
+      pose: ScenePoseRequest;
+      frame_ref: SceneTransactionFrameRequest;
+      support_contacts: Array<Record<string, JsonValue>>;
+    }
+  | { kind: 'remove_object'; scene_resource_id: string }
+  | {
+      kind: 'set_collision_policy';
+      configured_policy: Record<string, JsonValue>;
+      expected_configured_policy_revision: { revision_id: number; content_hash: string };
+    }
+  | {
+      kind: 'update_object_pose';
+      scene_resource_id: string;
+      pose: ScenePoseRequest;
+      frame_ref: SceneTransactionFrameRequest;
+      provider_evidence: null;
+      expected_attached: false;
+    }
+  | {
+      kind: 'attach_carried_object';
+      carried_object_attachment_id: string;
+      scene_resource_id: string;
+      controllable_component_id: string;
+      command_target_id: string;
+      frame_role_id: string;
+      touch_body_roles: string[];
+      expected_component_attachment_revisions: string[];
+    }
+  | {
+      kind: 'detach_carried_object_at_current_pose';
+      carried_object_attachment_id: string;
+      expected_carried_object_attachment_revision: string;
+      expected_scene_resource_id: string;
+      expected_controllable_component_id: string;
+      expected_command_target_id: string;
+    };
+
+interface SceneTransactionRequestBase {
+  /** Opt-in composite fence for Close's carried-object detach. */
+  expected_authoring_workspace?: AuthoringWorkspaceIdentity;
+  request_context: {
+    request_id: string;
+    request_owner_epoch: string;
+    source_label: 'composer_ui';
+    correlation_id: string | null;
+  };
+  expected_projection_revision: ProjectionRevision;
+}
+
+type RuntimeOwnedSceneOperation = Extract<
+  SceneTransactionOperation,
+  { kind: 'attach_carried_object' | 'detach_carried_object_at_current_pose' }
+>;
+type AuthoredSceneOperation = Exclude<
+  SceneTransactionOperation,
+  RuntimeOwnedSceneOperation
+>;
+
+export type SceneTransactionRequest = SceneTransactionRequestBase & (
+  | {
+      expected_admission_generation: number;
+      expected_draft_id: string;
+      expected_draft_revision: number;
+      operation: AuthoredSceneOperation;
+    }
+  | {
+      expected_admission_generation?: never;
+      expected_draft_id?: never;
+      expected_draft_revision?: never;
+      operation: RuntimeOwnedSceneOperation;
+    }
+);
+
+export interface SceneTransactionResponse {
+  api_version: 'manyforge.manager_command_response.v1';
+  committed_projection_revision: ProjectionRevision;
+  error: null;
+  ok: true;
+  projection_status: string;
+  replay_status: string;
+  request_id: string;
+  request_owner_epoch: string;
+  transaction_sequence: number;
+  update_status: string;
+}
+
+export interface DraftFenceRequest {
+  draftId: string;
+  expectedDraftRevision: number;
+  expectedAdmissionGeneration: number;
+  requestOwnerEpoch: string;
+  requestId: string;
+}
+
+/**
+ * The fence every migrated ordinary authoring request sends.
+ *
+ * The composite workspace epoch/revision is mandatory, not optional: the
+ * backend rechecks it atomically with the Draft fence, so a request that
+ * omitted it would either be rejected or would leave a stale edit unguarded.
+ * Apply, Revert, runtime Scenario activation and Deployment candidate
+ * Preview/Apply/Revert stay on the external path and keep the plain
+ * `DraftFenceRequest` shape.
+ */
+export interface LocalWorkspaceFenceRequest extends DraftFenceRequest {
+  expectedWorkspaceEpoch: string;
+  expectedWorkspaceRevision: number;
+}
+
+export interface ScenarioDocumentFenceRequest extends LocalWorkspaceFenceRequest {
+  deploymentDraftId: string;
+  expectedDeploymentDraftRevision: number;
+}
+
+export interface ManagerDeploymentCandidateReceipt {
+  schema_version: 'manyforge.manager_deployment_candidate_receipt.v2';
+  deployment_artifact_id: string;
+  deployment_revision: string;
+  prepared_activation_id: string;
+  candidate_retained_bundle_id: string;
+  candidate_graph_revision: string;
+  expected_current: {
+    graph_revision: string;
+    retained_bundle_id: string;
+  };
+  expected_admission_generation: number;
+  manager_owner_epoch: string;
+  /** Digest of the Manager's authoritative impact; destructive changes or
+   * required component bring-up are accepted only by echoing it. */
+  impact_digest: string;
+  destructive_impact: boolean;
+  receipt_digest: string;
+}
+
+/** One component's runtime decision in a Deployment Apply (H1a). */
+export interface ManagerDeploymentImpactComponent {
+  controllable_component_id: string;
+  disposition: 'retain' | 'add' | 'remove' | 'replace';
+  /** The component spec sections that changed: `adapter`, `address`,
+   * `bindings`, `controllers`, `description`, `launch`, `owner`, `providers`. */
+  replacement_reasons: string[];
+}
+
+/** One authored Program role that no longer resolves in the candidate. */
+export interface ProgramUnresolvedReference {
+  component_role_id: string;
+  target_role_id: string | null;
+  controllable_component_id: string;
+  command_target_id: string | null;
   reason: string;
   detail: string;
-  monotonic_s: number;
 }
 
-export interface PoseSourceObjectState {
-  object_id: string;
-  entity: string;
-  frame_id: string;
-  apply_policy: string;
-  scene_admission?: PoseSourceSceneAdmissionConfig | null;
-  status: 'disabled' | 'fresh' | 'stale' | 'rejected' | string;
-  age_s?: number | null;
-  update?: PoseSourceUpdateState | null;
-  rejection?: PoseSourceRejectionState | null;
-  measured_state_ghost?: Record<string, unknown> | null;
-  attached_drift?: PoseSourceAttachedDriftState | null;
+/** The Applied Program's derived status (H1a). A non-executable Program is
+ * preserved as authored; the backend refuses Execute by these references. */
+export interface AppliedProgramStatus {
+  deploymentArtifactId: string;
+  deploymentRevision: string;
+  executable: boolean;
+  programId: string | null;
+  programRevision: string | null;
+  origin: PreparedActivationOrigin;
+  message: string | null;
+  unresolvedReferences: ProgramUnresolvedReference[];
+  affectedNodes: string[];
+  affectedExecutionGroups: string[];
 }
 
-export interface PoseSourceStatusState {
-  pose_source_id: string;
-  kind: string;
-  enabled: boolean;
-  status: 'disabled' | 'fresh' | 'stale' | 'rejected' | string;
-  max_update_hz: number;
-  stale_after_s: number;
-  frame_id: string;
-  description: string;
-  received_at_ns?: number | null;
-  measured_tcp?: PoseSourceMeasuredTcpState | null;
-  measured_robot?: PoseSourceMeasuredRobotState | null;
-  objects: PoseSourceObjectState[];
+/** Derived, never stored: the Manager's one authoritative Apply impact. */
+export interface ManagerDeploymentImpact {
+  destructive: boolean;
+  components: ManagerDeploymentImpactComponent[];
+  attachmentChangedComponents: string[];
+  /** Kept in the cell, detached at their authored root pose. */
+  detachedComponents: string[];
+  sharedSceneProjectionChanged: boolean;
+  componentDeltaDigest: string;
+  program: {
+    executable: boolean;
+    programId: string | null;
+    programRevision: string | null;
+    unresolvedReferences: ProgramUnresolvedReference[];
+    affectedNodes: string[];
+    affectedExecutionGroups: string[];
+  };
 }
 
-export interface PoseSourceApplyResponse {
-  policy: string;
-  success: boolean;
-  error?: string | null;
-  applied_count: number;
-  skipped_count: number;
-  rejected_count: number;
-  details: Record<string, unknown>[];
+export interface ManagerDeploymentRecordDiff {
+  added: string[];
+  changed: string[];
+  removed: string[];
 }
 
-export interface VisualStateRouteDiagnostics {
-  mode: 'visual_snapshot' | 'visual_snapshot_pending' | string;
-  served_from_visual_snapshot: boolean;
-  fallback_reason?: string | null;
-  total_ms: number;
-  timings_ms: Record<string, number>;
-  slow_steps: Record<string, number>;
-  objects_source?: 'visual_snapshot' | 'visual_snapshot_pending' | 'visual_cache_pending' | string;
-  objects_age_ms?: number | null;
-  objects_refresh_running?: boolean;
-  objects_refresh_error?: string | null;
-  snapshot_age_ms?: number | null;
-  snapshot_sequence_number?: number | null;
-  snapshot_build_ms?: number | null;
-  snapshot_publisher_running?: boolean;
-  snapshot_publisher_error?: string | null;
-  snapshot_publisher_error_detail?: string | null;
-  snapshot_stale?: boolean;
+export interface ManagerDeploymentCandidatePreviewResponse {
+  apiVersion: 'manyforge.manager_command_response.v1';
+  candidateReceipt: ManagerDeploymentCandidateReceipt;
+  converged: boolean;
+  diff: Record<string, ManagerDeploymentRecordDiff>;
+  impact: ManagerDeploymentImpact;
 }
 
-export interface VisualSceneSnapshot {
-  schema_version: string;
-  sequence_number: number;
-  timestamp_ns: number;
-  source: string;
-  world_frame: string;
-  model_key?: string | null;
-  stale: boolean;
-  robot?: SceneRobotState | null;
-  objects: SceneObjectState[];
-  link_poses: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
-  grippers: SceneGripperState[];
-  pose_sources: PoseSourceStatusState[];
+export interface ManagerSourceMetadata {
+  projectionGeneration: number;
+  projectionOwnerEpoch: string;
+  available: boolean;
+  freshness: 'fresh' | 'stale' | 'unavailable';
+  knownGaps: string[];
+  receiverAgeNs: number | null;
+  sourceGeneration: number | null;
+  sourceOwnerEpoch: string | null;
+  sourceOwnerId: string | null;
+  sourceContentDigest: string | null;
 }
 
-export interface SceneStateResponse {
-  robot?: SceneRobotState | null;
-  objects: SceneObjectState[];
-  link_poses?: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
-  grippers?: SceneGripperState[];
-  pose_sources?: PoseSourceStatusState[];
-  visual_state?: VisualSceneSnapshot | null;
-  visual_state_diagnostics?: VisualStateRouteDiagnostics | null;
-  object_axes_gizmo_size_m?: number;
-  timestamp_ns: number;
+export interface ManagerActiveProjection {
+  canonicalEmpty: boolean;
+  cellGraph: Record<string, JsonValue>;
+  graphRevision: string;
+  retainedBundleId: string;
+  publication: Record<string, JsonValue>;
 }
+
+export type ManagerApplyPhase =
+  | 'intent_persisted'
+  | 'scope_persisted'
+  | 'fence_acquire_pending'
+  | 'fence_held'
+  | 'runtime_convergence_pending'
+  | 'runtime_staged_ready'
+  | 'scene_stage_pending'
+  | 'scene_staged'
+  | 'activation_selected'
+  | 'scene_activated'
+  | 'private_materialized'
+  | 'command_surfaces_retired'
+  | 'active_bundle_published'
+  | 'scene_finalized'
+  | 'fence_release_pending'
+  | 'fence_released'
+  | 'terminal';
+
+export interface ManagerApplyRecord {
+  sceneInitialization: 'preserve' | 'initialize';
+  applyGeneration: number;
+  applyId: string;
+  candidateGraphRevision: string;
+  candidateRetainedBundleId: string;
+  committed: boolean;
+  expectedActiveProjectionRevision: ProjectionRevision;
+  fence: {
+    acceptanceDigest: string | null;
+    configurationFenceGeneration: number | null;
+    configurationFenceId: string | null;
+    fenceAttemptDigest: string | null;
+    scope: Record<string, JsonValue> | null;
+    state:
+      | 'not_requested'
+      | 'scope_persisted'
+      | 'acquire_pending'
+      | 'held'
+      | 'release_pending'
+      | 'released';
+  };
+  incomplete: boolean;
+  intentDigest: string;
+  phase: ManagerApplyPhase;
+  request: {
+    correlationId: string | null;
+    requestId: string;
+    requestOwnerEpoch: string;
+    sourceLabel: string;
+  };
+  terminalState: 'succeeded' | 'failed' | 'unknown_effect' | null;
+}
+
+export interface ManagerApplyAvailability {
+  mutationAvailable: boolean;
+  records: ManagerApplyRecord[];
+  unavailableReasonCode: string | null;
+}
+
+export interface ManagerRuntimeProjection {
+  converged: boolean;
+  desiredUnits: JsonValue[];
+  observedUnits: JsonValue[];
+}
+
+export interface ManagerStatusProjection {
+  schemaVersion: 'manyforge.manager_status_projection.v1';
+  source: ManagerSourceMetadata;
+  status: {
+    apiVersion: 'manyforge.manager_source.v1';
+    active: ManagerActiveProjection;
+    apply: ManagerApplyAvailability;
+    cellId: string;
+    managerReady: boolean;
+    runtime: ManagerRuntimeProjection;
+  };
+}
+
+export interface ManagerGraphProjection {
+  schemaVersion: 'manyforge.manager_graph_projection.v1';
+  source: ManagerSourceMetadata;
+  graphRevision: string;
+  retainedBundleId: string;
+  cellGraph: Record<string, JsonValue>;
+}
+
+export interface ManagerDiffProjection {
+  schemaVersion: 'manyforge.manager_diff_projection.v1';
+  source: ManagerSourceMetadata;
+  converged: boolean;
+  desiredUnits: JsonValue[];
+  observedUnits: JsonValue[];
+}
+
+export type ManagerApplyReplayStatus = 'accepted_new' | 'replayed_exact';
+
+export type ManagerApplyLifecyclePhase =
+  | 'accepted'
+  | 'fence_acquired'
+  | 'fence_accepted'
+  | 'runtime_converged'
+  | 'scene_staged'
+  | 'scene_activated'
+  | 'composed'
+  | 'published'
+  | 'settled';
+
+export interface ManagerApplyPreparedActivation {
+  capturedInputDigest: string;
+  deploymentArtifactId: string;
+  deploymentRevision: string;
+  /** Null exactly when the Apply left the preserved Program non-executable;
+   * reported separately from the runtime outcome in `state` (H1a). */
+  programBindingId: string | null;
+  preparedActivationId: string;
+}
+
+export interface ManagerApplyFailure {
+  /** The failed Apply step. */
+  code: string;
+  /** The producer's message. */
+  message: string;
+  phase: ManagerApplyLifecyclePhase;
+  effectDisposition: 'known' | 'unknown';
+  /** The typed inner cause: its own code (the step code when it had none). */
+  causeCode: string;
+  causeDetails: Record<string, string>;
+  /** The owner that produced the cause (`component_manager`, `kernel`, ...). */
+  producer: string;
+  /**
+   * Stated by the source. `before_effect`: the Apply made no configuration,
+   * runtime, component or Scene change; an admission claim, a Kernel fence and
+   * fail-closed readiness may still exist. Not an operator "no effect" claim.
+   */
+  effectBoundary: 'before_effect' | 'unknown';
+}
+
+export interface ManagerApplyStatus {
+  sceneInitialization: 'preserve' | 'initialize';
+  apiVersion: 'manyforge.manager_command_response.v1';
+  applyGeneration: number;
+  applyId: string;
+  candidateProjectionRevision: ProjectionRevision | null;
+  error: null;
+  failure: ManagerApplyFailure | null;
+  lastProgress: {
+    phase: ManagerApplyLifecyclePhase;
+    recordDigest: string;
+  };
+  ok: true;
+  phase: ManagerApplyLifecyclePhase;
+  preparedActivation: ManagerApplyPreparedActivation;
+  requestId: string;
+  requestOwnerEpoch: string;
+  state: 'pending' | 'succeeded' | 'failed' | 'unknown_effect';
+  failureAcknowledgement: 'available' | 'acknowledged' | 'unavailable';
+}
+
+/** Audit attribution for one operator-triggered failed-Apply acknowledgement. */
+export interface ManagerApplyAcknowledgementContext {
+  request_id: string;
+  source_label: string;
+  request_owner_epoch?: string;
+  correlation_id?: string;
+}
+
+export interface ManagerApplyPendingResponse {
+  apiVersion: 'manyforge.manager_command_response.v1';
+  applyGeneration: number;
+  applyId: string;
+  candidateProjectionRevision: null;
+  error: null;
+  ok: true;
+  replayStatus: ManagerApplyReplayStatus;
+  requestId: string;
+  requestOwnerEpoch: string;
+  state: 'pending';
+}
+
+export interface ManagerApplySucceededResponse {
+  apiVersion: 'manyforge.manager_command_response.v1';
+  applyGeneration: number;
+  applyId: string;
+  candidateProjectionRevision: ProjectionRevision;
+  error: null;
+  ok: true;
+  replayStatus: ManagerApplyReplayStatus;
+  requestId: string;
+  requestOwnerEpoch: string;
+  state: 'succeeded';
+}
+
+export interface ManagerApplyTerminalFailureResponse {
+  apiVersion: 'manyforge.manager_command_response.v1';
+  applyGeneration: number;
+  applyId: string;
+  candidateProjectionRevision: null;
+  error: null;
+  ok: true;
+  replayStatus: ManagerApplyReplayStatus;
+  requestId: string;
+  requestOwnerEpoch: string;
+  state: 'failed' | 'unknown_effect';
+}
+
+export type ManagerApplyResponse =
+  | ManagerApplyPendingResponse
+  | ManagerApplySucceededResponse
+  | ManagerApplyTerminalFailureResponse;
+
+/** One proposed value at one parameter value path of the held node. */
+export interface ProposedNodeInput {
+  path: string;
+  value: JsonValue;
+}
+
+export interface ProgramNodeCorrectionPreviewRequest {
+  schema_version: 'manyforge.program_node_correction_preview_request.v1';
+  request_id: string;
+  program_run_id: string;
+  /** The Program runner's owner epoch of the held run. */
+  expected_owner_epoch: string;
+  program_id: string;
+  program_revision: string;
+  program_binding_id: string;
+  node_instance_id: string;
+  /** The held attempt the proposal corrects. */
+  node_attempt_id: string;
+  proposed_inputs: ProposedNodeInput[];
+}
+
+/**
+ * Advisory, effect-free preview of one held motion node with proposed inputs.
+ * It grants no Retry, Reset, Draft or Apply authority (D4).
+ */
+export interface ProgramNodeCorrectionPreview {
+  schemaVersion: 'manyforge.program_node_correction_preview.v1';
+  requestId: string;
+  programRunId: string;
+  programId: string;
+  programRevision: string;
+  programBindingId: string;
+  nodeInstanceId: string;
+  nodeAttemptId: string;
+  programRunnerOwnerEpoch: string;
+  runRevision: number;
+  retainedBundleId: string;
+  graphRevision: string;
+  nodeId: string | null;
+  proposedPaths: string[];
+  parametersDigest: string | null;
+  target: {
+    targetRoleId: string;
+    componentRoleId: string;
+    controllableComponentId: string;
+    commandTargetId: string;
+  } | null;
+  unavailableReason: { code: string; message: string } | null;
+  previewCheck: 'trajectory_planned_and_collision_validated' | null;
+  /** The unchanged native motion-preview result, when one was requested. */
+  preview:
+    | { ok: true; receipt: MotionPreviewReceipt }
+    | { ok: false; error: StructuredError }
+    | null;
+}
+
+/** Composer's bounded log record of one confirmed Apply after Reset. */
+export interface ResetApplyContext {
+  schemaVersion: 'manyforge.composer_reset_apply_context.v1';
+  correlationId: string;
+  document: 'program' | 'deployment';
+  programRunId: string;
+  programRunnerOwnerEpoch: string;
+  cycleGeneration: number;
+  draftId: string;
+  draftRevision: number;
+  /** The Program revision or Deployment revision of the confirmed Draft. */
+  draftContentRevision: string | null;
+  appliedRevision: string | null;
+}
+
+export interface DraftMutationResponse {
+  mutation: string;
+  details: Record<string, JsonValue>;
+  workspace: ProgramWorkspaceResponse;
+  authoringWorkspace: AuthoringWorkspaceSnapshot;
+}
+
+export type Vector3Tuple = [number, number, number];
+export type QuaternionXyzwTuple = [number, number, number, number];
 
 export type SceneUrdfPrimitive =
-  | { type: 'box'; size_m: number[] }
+  | { type: 'box'; size_m: Vector3Tuple }
   | { type: 'cylinder'; radius_m: number; length_m: number }
   | { type: 'sphere'; radius_m: number };
+
+export interface SceneUrdfOrigin {
+  position_m: Vector3Tuple;
+  orientation_rpy_rad: Vector3Tuple;
+  orientation_xyzw: QuaternionXyzwTuple;
+}
 
 export interface SceneUrdfVisual {
   index: number;
   mesh_url: string | null;
   primitive: SceneUrdfPrimitive | null;
-  visual_origin: {
-    position_m: number[];
-    orientation_rpy_rad: number[];
-    orientation_xyzw?: number[];
-  };
+  visual_origin: SceneUrdfOrigin;
 }
 
 export interface SceneUrdfCollision {
   index: number;
   mesh_url: string | null;
   primitive: SceneUrdfPrimitive | null;
-  collision_origin: {
-    position_m: number[];
-    orientation_rpy_rad: number[];
-    orientation_xyzw?: number[];
-  };
+  collision_origin: SceneUrdfOrigin;
+}
+
+export interface RetainedNeutralTransform {
+  relative_to: string;
+  position_m: Vector3Tuple;
+  orientation_xyzw: QuaternionXyzwTuple;
 }
 
 export interface SceneUrdfLink {
   name: string;
+  neutral_transform: RetainedNeutralTransform;
   visuals: SceneUrdfVisual[];
-  collisions?: SceneUrdfCollision[];
+  collisions: SceneUrdfCollision[];
 }
 
 export type SceneUrdfJointType =
@@ -1455,354 +2178,44 @@ export type SceneUrdfJointType =
 export interface SceneUrdfJoint {
   name: string;
   type: SceneUrdfJointType | string;
-  axis: number[];
+  axis: Vector3Tuple;
   parent_link: string;
   child_link: string;
+  origin: SceneUrdfOrigin & { relative_to: string };
+  coordinate_unit: 'rad' | 'm' | null;
+  neutral_position: number | null;
   limit_lower: number | null;
   limit_upper: number | null;
   effort_limit: number | null;
   velocity_limit: number | null;
-  mimic?: { master: string; multiplier: number; offset: number } | null;
-  is_mimic_master?: boolean;
+  mimic: {
+    master: string;
+    multiplier: number;
+    offset: number;
+  } | null;
+  is_mimic_master: boolean;
 }
 
-export interface SceneRobotModelAuthorityGripper {
-  group_id: string;
-  command_joint: string;
-  derived_joints: string[];
-  presets?: Record<string, number>;
-}
-
-export interface SceneRobotModelAuthority {
-  canonical_fingerprint?: string;
-  view_fingerprint?: string;
-  view_changed?: boolean;
-  commandable_joint_names?: string[];
-  group_commandable_joint_names?: Record<string, string[]>;
-  grippers?: Record<string, SceneRobotModelAuthorityGripper>;
+export interface RetainedNeutralProjection {
+  kind: 'retained_neutral';
+  source: 'active_retained_viewer_model';
+  root_frame: string;
+  position_unit: 'm';
+  angle_unit: 'rad';
+  quaternion_order: 'xyzw';
+  joint_coordinate_policy: 'zero_independent_with_retained_mimic';
+  operational_validity: 'not_asserted';
+  runtime_state_used: false;
 }
 
 export interface SceneUrdfManifest {
-  robot_id: string | null;
-  model_key?: string | null;
-  authority?: SceneRobotModelAuthority | null;
+  cell_id: string;
+  graph_revision: string;
+  retained_bundle_id: string;
+  viewer_model_revision: string;
+  model_key: string;
   root_link: string;
+  projection: RetainedNeutralProjection;
   links: SceneUrdfLink[];
-  joints?: SceneUrdfJoint[];
-}
-
-export interface SceneEditRequest {
-  operation: 'add' | 'upsert' | 'remove' | 'update_pose' | 'attach' | 'detach';
-  object_id: string;
-  shape_type?: 'box' | 'sphere' | 'cylinder' | 'mesh';
-  box_dimensions_m?: number[];
-  sphere_radius_m?: number;
-  cylinder_radius_m?: number;
-  cylinder_height_m?: number;
-  mesh_resource_uri?: string;
-  mesh_scale?: number[];
-  pose_position_m?: number[];
-  pose_orientation_xyzw?: number[];
-  frame_id?: string;
-}
-
-export interface SceneEditResponse {
-  success: boolean;
-  error?: string | null;
-  timestamp_ns: number;
-}
-
-/**
- * Ghost-robot preview request — see /api/scene/preview-link-poses.
- * `kind: 'joint'` uses joint_names + joint_positions_rad directly;
- * `kind: 'cartesian'` runs IK against tcp_pose first (the seed
- * joint_names + joint_positions_rad are optional; if absent the
- * kernel uses the current robot state as seed).
- */
-export interface PreviewLinkPosesRequest {
-  kind: 'cartesian' | 'joint';
-  base_frame?: string;
-  link_names?: string[];
-  joint_names?: string[];
-  joint_positions_rad?: number[];
-  tcp_frame?: string;
-  tcp_position_m?: [number, number, number];
-  tcp_orientation_xyzw?: [number, number, number, number];
-}
-
-export type PreviewLinkPosesResponse =
-  | {
-      reachable: true;
-      joint_names: string[];
-      joint_positions_rad: number[];
-      link_poses: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
-    }
-  | {
-      reachable: false;
-      reason: string;
-      tcp_pose?: { position_m: number[]; orientation_xyzw: number[] };
-    };
-
-export interface SceneFrameState {
-  name: string;
-  roles: string[];
-  viewerVisible: boolean;
-  poseAvailable: boolean;
-  poseInWorld?: { position_m: number[]; orientation_xyzw: number[] } | null;
-}
-
-export interface SceneFramesResponse {
-  frames: SceneFrameState[];
-  viewerAvailable: boolean;
-  frameGizmoSizeM: number;
-  visualStateDiagnostics?: VisualStateRouteDiagnostics | null;
-  timestampNs: number;
-}
-
-export interface SceneFrameVisibilityResponse {
-  success: boolean;
-  frameName: string;
-  visible: boolean;
-  viewerAvailable: boolean;
-  timestampNs: number;
-  error?: string | null;
-}
-
-export interface SceneFrameGizmoSizeResponse {
-  success: boolean;
-  axesLengthM: number;
-  viewerAvailable: boolean;
-  timestampNs: number;
-  error?: string | null;
-}
-
-export interface SceneObjectFrameVisibilityResponse {
-  success: boolean;
-  objectId: string;
-  visible: boolean;
-  viewerAvailable: boolean;
-  timestampNs: number;
-  error?: string | null;
-}
-
-export interface SceneObjectAxesGizmoSizeResponse {
-  success: boolean;
-  axesLengthM: number;
-  timestampNs: number;
-  error?: string | null;
-}
-
-export interface SceneGripperCommandResponse {
-  accepted: boolean;
-  gripperId: string;
-  targetPosition: number;
-  commandId: number;
-  generation: number;
-  error?: string | null;
-  reasonCode?: string | null;
-  timestampNs: number;
-}
-
-export interface ModelEndpointProbe {
-  alias: string;
-  provider: string;
-  configuredModelId: string;
-  baseUrl?: string | null;
-  capabilities: ModelEndpointCapabilities;
-  probeStatus: string;
-  availableModelIds: string[];
-  error?: string | null;
-}
-
-export interface ModelEndpointCatalog {
-  endpoints: Record<string, ModelEndpointProbe>;
-  timestamp: number;
-}
-
-// WebSocket
-export interface StateUpdate {
-  state: 'idle' | 'running' | 'stopping' | 'stopped' | 'direct_control';
-  motionStopState?: 'idle' | 'stopping' | 'held';
-  velocityScale: number;
-  nodeStatuses?: Record<string, string>;
-  nativeKernelEvents?: Record<string, unknown>[];
-  runtimeOverrideStatus?: RuntimeOverrideStatus | null;
-  error?: string | null;
-  // Structured cycle-manager error surface pushed alongside the human-
-  // readable message so the viewer can render a rich cause panel without
-  // a separate poll.
-  errorCode?: string | null;
-  errorDetails?: Record<string, unknown> | null;
-  recoveryOffer?: CycleRecoveryOffer | null;
-  programLoaded?: boolean;
-  programSessionGeneration?: number;
-  timestamp: number;
-}
-
-// --- Validated Robot Control candidates (Phase 4-P5) ----------------------
-
-export type CandidateStatus =
-  | 'planning'
-  | 'ready'
-  | 'blocked'
-  | 'stale'
-  | 'superseded'
-  | 'expired'
-  | 'approving'
-  | 'executing'
-  | 'completed'
-  | 'stopped'
-  | 'interrupted'
-  | 'failed'
-  | 'reverted'
-  | 'error';
-
-export type CandidateSourceSurface =
-  | 'joint_slider'
-  | 'joint_spinner'
-  | 'joint_input'
-  | 'cartesian_gizmo'
-  | 'cartesian_input'
-  | 'move_to'
-  | 'gripper_slider'
-  | 'gripper_preset';
-
-export type CandidateInputMode = 'joint' | 'cartesian' | 'gripper';
-
-export interface CandidatePose {
-  positionM: number[];
-  orientationXyzw: number[];
-}
-
-export interface CandidateJointTarget {
-  jointNames: string[];
-  positionsRad: number[];
-}
-
-export interface CandidateCartesianTarget {
-  positionM: number[];
-  orientationXyzw: number[];
-  frameId?: string;
-  tcpFrame?: string | null;
-}
-
-export interface CandidateGripperTarget {
-  gripperId: string;
-  targetPosition: number;
-  maxEffort?: number | null;
-  durationS?: number | null;
-}
-
-export interface CandidateDiagnostics {
-  reasonCode: string;
-  summary: string;
-  details?: Record<string, unknown>;
-}
-
-export interface CandidateRobotState {
-  jointNames: string[];
-  positionsRad: number[];
-}
-
-export interface CandidateGhost {
-  blocked: boolean;
-  finalJointNames?: string[] | null;
-  finalJointPositionsRad?: number[] | null;
-  finalTcpPose?: CandidatePose | null;
-  linkPoses?: Record<string, CandidatePose> | null;
-  blockedTargetPose?: CandidatePose | null;
-}
-
-export interface CandidateTrajectorySample {
-  timeFromStartS: number;
-  positionsRad: number[];
-}
-
-export interface CandidatePreviewTrajectory {
-  jointNames: string[];
-  samples: CandidateTrajectorySample[];
-  sampleCount: number;
-  timeSpanS: number;
-}
-
-export interface CandidateSourceRevisions {
-  stateSource: string;
-  robotStateKnown: boolean;
-  programLoaded: boolean;
-  deploymentLoaded: boolean;
-  // Scene/attached-object freshness signal (see backend CandidateSourceRevisions).
-  // sceneFingerprint is opaque — compare only, never parse.
-  sceneObjectCount: number;
-  sceneFingerprint: string;
-}
-
-export interface CandidateExecution {
-  moveId?: string | null;
-  executionId: number;
-  state?: string | null;
-  progress: number;
-  sessionId?: string | null;
-  sessionStatus?: string | null;
-  sessionActualOutcome?: string | null;
-  sessionError?: string | null;
-  error?: string | null;
-  errorCode?: string | null;
-  errorDetails?: Record<string, unknown> | null;
-}
-
-export interface CandidateResponse {
-  candidateId: string;
-  generation: number;
-  sourceSurface: CandidateSourceSurface;
-  inputMode: CandidateInputMode;
-  status: CandidateStatus;
-  commitEligible: boolean;
-  jointTarget?: CandidateJointTarget | null;
-  cartesianTarget?: CandidateCartesianTarget | null;
-  gripperTarget?: CandidateGripperTarget | null;
-  normalizedJointTarget?: CandidateJointTarget | null;
-  clientRequestId?: string | null;
-  diagnostics?: CandidateDiagnostics | null;
-  startState?: CandidateRobotState | null;
-  sourceRevisions?: CandidateSourceRevisions | null;
-  ghost?: CandidateGhost | null;
-  previewTrajectory?: CandidatePreviewTrajectory | null;
-  execution?: CandidateExecution | null;
-  trajectoryDurationS?: number | null;
-  maxAgeNs: number;
-  expiresAtNs: number;
-  createdAtNs: number;
-  updatedAtNs: number;
-}
-
-export interface CandidateCreateRequest {
-  clientRequestId?: string;
-  sourceSurface: CandidateSourceSurface;
-  inputMode: CandidateInputMode;
-  jointTarget?: CandidateJointTarget;
-  cartesianTarget?: CandidateCartesianTarget;
-  gripperTarget?: CandidateGripperTarget;
-}
-
-export interface CandidateSessionSummary {
-  sessionId: string;
-  status: string;
-  entryState?: string | null;
-  actualOutcome?: string | null;
-  error?: string | null;
-}
-
-export interface CandidateExecuteResponse {
-  candidate: CandidateResponse | null;
-  // Arm candidates dispatch through an intervention session; gripper candidates
-  // dispatch a single command through the bridge and carry no session.
-  session: CandidateSessionSummary | null;
-  timestamp_ns: number;
-}
-
-export interface CandidateExecuteRejection {
-  reasonCode: string;
-  detail: string;
-  candidate: CandidateResponse | null;
-  timestamp_ns: number;
+  joints: SceneUrdfJoint[];
 }

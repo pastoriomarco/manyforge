@@ -2,16 +2,15 @@
 
 #include <array>
 #include <cstdint>
+#include <manyforge_core/collision/i_collision_query_engine.hpp>
+#include <manyforge_core/execution_collision_support.hpp>
+#include <manyforge_core/types/error_code.hpp>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
-
-#include <manyforge_core/collision/i_collision_query_engine.hpp>
-#include <manyforge_core/execution_collision_support.hpp>
-#include <manyforge_core/types/error_code.hpp>
 
 namespace manyforge::core {
 
@@ -55,23 +54,19 @@ enum class RuntimeContactGraspViolation {
   kPenetrationExceeded,
 };
 
-const char* runtime_collision_tick_reason_name(
-    RuntimeCollisionTickReason reason) noexcept;
+const char* runtime_collision_tick_reason_name(RuntimeCollisionTickReason reason) noexcept;
 const char* runtime_collision_query_failure_reason_name(
     RuntimeCollisionQueryFailureReason reason) noexcept;
 const char* runtime_collision_query_prepare_status_name(
     RuntimeCollisionQueryPrepareStatus status) noexcept;
-const char* runtime_collision_engine_status_name(
-    CollisionEngineStatus status) noexcept;
+const char* runtime_collision_engine_status_name(CollisionEngineStatus status) noexcept;
 
 struct RuntimeCollisionTickOutcome {
   RuntimeCollisionTickStatus status = RuntimeCollisionTickStatus::kInconclusive;
-  RuntimeCollisionTickReason reason =
-      RuntimeCollisionTickReason::kBundleUnavailable;
+  RuntimeCollisionTickReason reason = RuntimeCollisionTickReason::kBundleUnavailable;
   RuntimeCollisionQueryFailureReason engine_failure_reason =
       RuntimeCollisionQueryFailureReason::kNone;
-  CollisionEngineStatus engine_status =
-      CollisionEngineStatus::kDiagnosticIncomplete;
+  CollisionEngineStatus engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
   std::int64_t query_duration_ns = 0;
   bool query_executed = false;
   const CollisionPairId* pair = nullptr;
@@ -87,11 +82,9 @@ struct RuntimeCollisionTickOutcome {
   bool contact_present = false;
   std::size_t initial_contact_pair_count = 0;
   std::size_t current_contact_pair_count = 0;
-  CollisionDistanceRequestMode distance_request_mode =
-      CollisionDistanceRequestMode::kNone;
+  CollisionDistanceRequestMode distance_request_mode = CollisionDistanceRequestMode::kNone;
   std::size_t evaluated_distance_pair_count = 0;
-  RuntimeContactGraspViolation contact_grasp_violation =
-      RuntimeContactGraspViolation::kNone;
+  RuntimeContactGraspViolation contact_grasp_violation = RuntimeContactGraspViolation::kNone;
 };
 
 struct RuntimeContactReleaseStateEntry {
@@ -120,21 +113,23 @@ class RuntimeCollisionQuerySession final {
   static constexpr std::size_t kMaxSupportContacts = 64;
 
   RuntimeCollisionQuerySession(
-      RuntimeCollisionStateProjection projection,
-      ICollisionWorldSnapshotPublisher& publisher,
-      std::shared_ptr<ICollisionQueryEngine> engine,
-      std::string active_contact_policy_id,
+      RuntimeCollisionStateProjection projection, ICollisionWorldSnapshotPublisher& publisher,
+      std::shared_ptr<ICollisionQueryEngine> engine, std::string active_contact_policy_id,
       std::int64_t query_timeout_ns);
 
+  /// With keep_admitted_policy, the session keeps initial_bundle's policy (the
+  /// move's admitted operation-local policy) for its whole life, whatever the
+  /// published policy revision; acquire_bundle() pairs it with the latest
+  /// published world. Without it, every tick follows the published bundle.
   [[nodiscard]] std::optional<ErrorDTO> prepare(
-      const RuntimeCollisionQueryBundlePtr& initial_bundle);
-  [[nodiscard]] RuntimeCollisionTickOutcome tick(
-      const RuntimeCollisionQueryBundlePtr& bundle,
-      std::span<const double> observed_positions_rad,
-      std::int64_t state_time_ns) noexcept;
-  [[nodiscard]] RuntimeCollisionQueryBundlePtr acquire_bundle() const;
-  [[nodiscard]] const CollisionEngineCapabilityDescriptor& engine_capability()
-      const noexcept {
+      const RuntimeCollisionQueryBundlePtr& initial_bundle,
+      bool keep_admitted_policy = false);
+  [[nodiscard]] RuntimeCollisionTickOutcome tick(const RuntimeCollisionQueryBundlePtr& bundle,
+                                                 std::span<const double> observed_positions_rad,
+                                                 std::int64_t state_time_ns) noexcept;
+  /// Single consumer (the monitor tick).
+  [[nodiscard]] RuntimeCollisionQueryBundlePtr acquire_bundle();
+  [[nodiscard]] const CollisionEngineCapabilityDescriptor& engine_capability() const noexcept {
     return *capability_;
   }
   [[nodiscard]] const std::string& active_contact_policy_id() const noexcept {
@@ -155,8 +150,7 @@ class RuntimeCollisionQuerySession final {
   };
 
   bool bind_policy(const RuntimeCollisionQueryBundlePtr& bundle) noexcept;
-  bool bind_distance_selection(
-      const RuntimeCollisionQueryBundlePtr& bundle) noexcept;
+  bool bind_distance_selection(const RuntimeCollisionQueryBundlePtr& bundle) noexcept;
   RuntimeCollisionTickOutcome project_observed_state(
       std::span<const double> observed_positions_rad) noexcept;
   RuntimeCollisionTickOutcome classify(
@@ -177,6 +171,10 @@ class RuntimeCollisionQuerySession final {
   // sub-handles would hide their last-owner transition from NRT bundle
   // retirement and could move destruction onto RuntimeSafety during rebind.
   RuntimeCollisionQueryBundlePtr bound_bundle_;
+  // Admitted operation-local policy and the last bundle built from it with the
+  // latest published world. Empty for moves that follow the published policy.
+  std::shared_ptr<const CollisionPolicySnapshot> admitted_policy_;
+  RuntimeCollisionQueryBundlePtr admitted_policy_bundle_;
   const CollisionPolicySnapshot* bound_policy_ = nullptr;
   const CollisionPolicyIndex* bound_policy_index_ = nullptr;
   const ContactGraspPolicyEntry* active_contact_policy_ = nullptr;
@@ -185,8 +183,7 @@ class RuntimeCollisionQuerySession final {
   std::size_t initial_contact_pair_count_ = 0;
   bool initial_contact_pair_count_initialized_ = false;
   bool policy_binding_valid_ = false;
-  RuntimeCollisionTickReason policy_binding_error_ =
-      RuntimeCollisionTickReason::kPolicyUnavailable;
+  RuntimeCollisionTickReason policy_binding_error_ = RuntimeCollisionTickReason::kPolicyUnavailable;
   const char* policy_binding_required_capability_ = nullptr;
 };
 

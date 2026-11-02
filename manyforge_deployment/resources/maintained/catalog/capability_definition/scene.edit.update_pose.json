@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:2289472ab0392c94e512d8bfe65406ef7a7ffafb73b40381bd36f627248de4f3",
+  "capability_id": "scene.edit.update_pose",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

@@ -1,37 +1,20 @@
 {
   "_comment": [
-    "ManyForge Hermes lane — managed-tool-gateway matrix (build-around config injection).",
-    "Consumed by NemoClaw's agents/hermes/config/managed-tool-gateway.ts at image",
-    "build time (a SUPPORTED extension point: loadManagedToolGatewayMatrix() reads",
-    "NEMOCLAW_HERMES_TOOL_GATEWAY_MATRIX_PATH or /opt/nemoclaw-hermes-config/...).",
-    "applyManagedToolConfig() shallow-merges entry.config into the generated Hermes",
-    "config.yaml, so the 'manyforge' preset splices in mcp_servers.manyforge.",
-    "setup-hermes.sh stages this file into the build context as the agent's",
-    "host/managed-tool-gateway-matrix.json and sets BROKER=1 + PRESETS_B64=[\"manyforge\"].",
-    "NO secrets/host values: proxy is ${VAR}-interpolated by Hermes at gateway start;",
-    "composer base / lane / mode are fixed; trace path is for first-boot diagnostics.",
-    "Proven on hermes-ba2 (first-boot discovery: 25 mcp_manyforge_* tools, HTTP 200)."
+    "Non-operative record for the historical ManyForge Hermes gateway preset.",
+    "There is deliberately no 'manyforge' preset while the MCP and assistant clients are unavailable.",
+    "A consumer requesting PRESETS_B64=['manyforge'] must fail instead of receiving a stale bridge or fixed Composer endpoint."
   ],
-  "manyforge": {
-    "service": "manyforge-composer",
-    "config": {
-      "mcp_servers": {
-        "manyforge": {
-          "command": "python3",
-          "args": ["/sandbox/manyforge/scripts/manyforge-mcp-bridge.py"],
-          "env": {
-            "MANYFORGE_LANE": "hermes",
-            "MANYFORGE_ASSISTANT_MODE": "composer-assistant",
-            "MANYFORGE_COMPOSER_BASE": "http://host.openshell.internal:9000",
-            "HTTP_PROXY": "${HTTP_PROXY}",
-            "HTTPS_PROXY": "${HTTPS_PROXY}",
-            "NO_PROXY": "${NO_PROXY}",
-            "MANYFORGE_MCP_TRACE": "/sandbox/.hermes/logs/manyforge-mcp-trace.jsonl"
-          }
-        }
-      }
-    },
-    "envKey": "MANYFORGE_LANE",
-    "envValue": "hermes"
+  "_manyforge_cutover": {
+    "available": false,
+    "reason_code": "composable_cell_runtime_unavailable",
+    "historical_source": "manyforge@08222188293df8e12f90dc72e204c21f22f92ea1",
+    "historical_blob": "e4097f2777ea45bcb3e9f09700aa357bcf378ad7",
+    "restoration_gates": ["N/I6"],
+    "required_behavior": [
+      "inject only a qualified public MCP client",
+      "resolve owner-issued endpoints instead of a fixed Composer address",
+      "preserve proxy interpolation without embedding secrets",
+      "capture bounded first-boot catalog and audit evidence"
+    ]
   }
 }

@@ -1,30 +1,36 @@
 import { describe, expect, it } from 'vitest';
-
-import { accumulateJointDrafts, jointTargetFromDrafts } from './jointAuthoring';
+import {
+  accumulateJointDrafts,
+  jointDraftList,
+  type JointCoordinateDrafts,
+} from './jointAuthoring';
 
 describe('joint draft accumulation', () => {
-  it('accumulates multiple edited joints (edit A then B keeps BOTH)', () => {
-    let drafts: Record<string, number> = {};
-    drafts = accumulateJointDrafts(drafts, 'joint_a', 0.1);
-    drafts = accumulateJointDrafts(drafts, 'joint_b', 0.2);
-    const target = jointTargetFromDrafts(drafts);
-    expect(target.jointNames).toEqual(['joint_a', 'joint_b']);
-    expect(target.positionsRad).toEqual([0.1, 0.2]);
+  it('keeps multiple edits and their correct units', () => {
+    let drafts: JointCoordinateDrafts = {};
+    drafts = accumulateJointDrafts(drafts, 'joint_a', 'revolute', 0.1);
+    drafts = accumulateJointDrafts(drafts, 'finger_slide', 'prismatic', 0.02);
+    expect(jointDraftList(drafts)).toEqual([
+      { jointName: 'joint_a', kind: 'revolute', value: 0.1, unit: 'rad' },
+      { jointName: 'finger_slide', kind: 'prismatic', value: 0.02, unit: 'm' },
+    ]);
   });
 
-  it('re-editing a joint updates its value without dropping the others', () => {
-    let drafts: Record<string, number> = {};
-    drafts = accumulateJointDrafts(drafts, 'joint_a', 0.1);
-    drafts = accumulateJointDrafts(drafts, 'joint_b', 0.2);
-    drafts = accumulateJointDrafts(drafts, 'joint_a', 0.5);
-    const target = jointTargetFromDrafts(drafts);
-    expect(target.jointNames).toEqual(['joint_a', 'joint_b']);
-    expect(target.positionsRad).toEqual([0.5, 0.2]);
+  it('updates one edit without dropping the others', () => {
+    let drafts: JointCoordinateDrafts = {};
+    drafts = accumulateJointDrafts(drafts, 'joint_a', 'revolute', 0.1);
+    drafts = accumulateJointDrafts(drafts, 'finger_slide', 'prismatic', 0.02);
+    drafts = accumulateJointDrafts(drafts, 'joint_a', 'revolute', 0.5);
+    expect(jointDraftList(drafts)).toEqual([
+      { jointName: 'joint_a', kind: 'revolute', value: 0.5, unit: 'rad' },
+      { jointName: 'finger_slide', kind: 'prismatic', value: 0.02, unit: 'm' },
+    ]);
   });
 
-  it('empty drafts produce an empty target', () => {
-    const target = jointTargetFromDrafts({});
-    expect(target.jointNames).toEqual([]);
-    expect(target.positionsRad).toEqual([]);
+  it('rejects invalid coordinates before they enter retained UI state', () => {
+    expect(() => accumulateJointDrafts({}, '', 'revolute', 0)).toThrow(TypeError);
+    expect(() => accumulateJointDrafts({}, 'joint_a', 'revolute', Number.NaN)).toThrow(
+      TypeError,
+    );
   });
 });

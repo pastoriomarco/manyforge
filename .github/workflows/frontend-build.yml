@@ -4,17 +4,31 @@ on:
   pull_request:
     paths:
       - "manyforge_composer/frontend/**"
+      # Fixtures the frontend tests import from their owners.
+      - "manyforge_deployment/resources/**"
+      - "manyforge_headless_api/tests/fixtures/**"
       - ".github/workflows/frontend-build.yml"
   push:
     branches: [main, dev]
     paths:
       - "manyforge_composer/frontend/**"
+      - "manyforge_deployment/resources/**"
+      - "manyforge_headless_api/tests/fixtures/**"
+      - ".github/workflows/frontend-build.yml"
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   frontend-build:
-    name: Composer frontend build
+    name: Composer frontend type-check, tests, build
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: manyforge_composer/frontend
@@ -27,15 +41,10 @@ jobs:
           cache: "npm"
           cache-dependency-path: manyforge_composer/frontend/package-lock.json
       - name: Install dependencies
-        run: |
-          if [[ -f package-lock.json ]]; then
-            npm ci
-          else
-            npm install
-          fi
+        run: npm ci --ignore-scripts
       - name: Type-check
-        run: npx tsc --noEmit -p tsconfig.app.json
+        run: npx tsc -b --force
       - name: Unit tests
         run: npm test
-      - name: Build
-        run: npm run build
+      - name: Bundle
+        run: npx vite build

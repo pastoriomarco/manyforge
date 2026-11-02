@@ -1,13 +1,13 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
 #include <functional>
-#include <map>
-#include <string>
-
-#include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/execution_status.hpp>
+#include <manyforge_core/types/recovery.hpp>
+#include <map>
+#include <optional>
+#include <string>
 
 namespace manyforge::core {
 
@@ -18,19 +18,19 @@ enum class KernelEventType {
   kPlanCompleted,    // planning phase completed
   kCacheHit,         // trajectory found in cache
   kCacheMiss,        // cache lookup returned empty
-  kCacheRevalidationCandidate,
-  kCacheRevalidated,
-  kCacheRevalidationFailed,
+  kCacheRevalidationFailed,  // cached trajectory failed current validation; re-planned
   kCacheInvalidated, // cached trajectory invalidated
   kValidationStarted,  // validation phase started
   kValidationPassed,   // validation passed
   kValidationFailed,   // validation failed
+  kParticipantPrepared,  // immutable participant prepared; no effect dispatched
+  // The participant's execution ended; `participant_fact` says how. A fact for
+  // the addressed owner, which commits the operation outcome.
+  kParticipantSettled,
   kExecuteStarted,     // execution phase started
   kExecuteCompleted,   // execution phase completed
   kStopRequested,      // stop requested
   kStopIssued,         // stop issued to backend
-  kPauseRequested,     // pause requested
-  kResumeRequested,    // resume requested
   kRuntimeVelocityScaleChanged,  // runtime velocity scale changed
   kCompletedAcknowledged,  // completed terminal outcome acknowledged
   kFailedValidationAcknowledged,  // retryable validation failure acknowledged
@@ -41,23 +41,6 @@ enum class KernelEventType {
   kInterventionAcknowledged,
   kErrorRaised,        // error occurred
   kCollisionDetected,  // collision detected during execution
-  // Kernel-native interrupt events (spec/260 §7). Details carry the required
-  // event payload in string-normalized form.
-  kInterruptSignalIngested,
-  kInterruptSignalRejectedStale,
-  kInterruptSignalRejectedClassViolation,
-  kInterruptSignalRejected,
-  kInterruptLatched,
-  kInterruptSuppressedByActiveMask,
-  kInterruptQueued,
-  kInterruptDroppedQueueOverflow,
-  kInterruptPreemptApplied,
-  kInterruptDispositionApplied,
-  kInterruptCleared,
-  kInterruptIngestOverflow,
-  kInterruptSourceClassViolation,
-  kInterruptRecoveryHandlerStarted,
-  kInterruptRecoveryHandlerCompleted,
   // Motion-scoped interrupt outcomes (spec/260 §7).
   // `motion_interrupt_scope_armed` / `motion_interrupt_scope_reaped`
   // surface the binding lifecycle. `motion_interrupt_queued_update_dropped`
@@ -109,6 +92,13 @@ struct KernelEvent {
   /// detect event loss anywhere in the pipeline (spec 520 §2.2). Declared
   /// last so the ubiquitous positional aggregate initializers stay valid.
   uint64_t sequence = 0;
+
+  /// For kParticipantSettled: the participant's fact about the ended execution.
+  std::optional<ParticipantExecutionFact> participant_fact = std::nullopt;
+
+  /// Original local-failure proof, captured before dispatching its event.
+  /// Current recovery authority is still rechecked by the addressed owner.
+  std::optional<MotionRetryEligibilityDTO> retry_eligibility = std::nullopt;
 };
 
 /// Event callback type. Must be thread-safe.

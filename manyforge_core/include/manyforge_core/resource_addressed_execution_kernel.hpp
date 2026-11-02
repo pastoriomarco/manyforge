@@ -1,0 +1,1372 @@
+#pragma once
+
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <manyforge_core/bounded_operation_control_executor.hpp>
+#include <manyforge_core/bounded_stop_control_executor.hpp>
+#include <manyforge_core/bounded_stop_stage_attempt_executor.hpp>
+#include <manyforge_core/emergency_stop_acceptance_reserve.hpp>
+#include <manyforge_core/kernel_cell_admission_owner.hpp>
+#include <manyforge_core/ports/i_manager_liveness_fail_safe_port.hpp>
+#include <manyforge_core/ports/iaddressed_motion_preview.hpp>
+#include <manyforge_core/ports/iaddressed_operation_owner.hpp>
+#include <manyforge_core/ports/icontrol_domain_execution_port.hpp>
+#include <manyforge_core/ports/ioperation_journal.hpp>
+#include <manyforge_core/ports/iio_signal_service.hpp>
+#include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
+#include <manyforge_core/ports/iresolved_prepared_participant_execution_engine.hpp>
+#include <manyforge_core/resource_slot_table.hpp>
+#include <manyforge_core/runtime_route_configuration.hpp>
+#include <manyforge_core/runtime_participant_policy.hpp>
+#include <manyforge_core/runtime_participant_registry.hpp>
+#include <manyforge_core/runtime_participant_stop_readiness.hpp>
+#include <manyforge_core/stop_scope_resolver.hpp>
+#include <manyforge_core/time/iclock.hpp>
+#include <manyforge_core/time/ischeduler.hpp>
+#include <manyforge_core/types/component_lifecycle.hpp>
+#include <manyforge_core/types/component_state.hpp>
+#include <manyforge_core/types/io_activation_rule.hpp>
+#include <manyforge_core/types/io_rule_service_configuration.hpp>
+#include <manyforge_core/types/io_rule_state.hpp>
+#include <manyforge_core/types/prepared_participant_stop_plan.hpp>
+#include <manyforge_core/types/program_blackboard_context.hpp>
+#include <manyforge_core/types/program_execution_control.hpp>
+#include <manyforge_core/types/program_io.hpp>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <span>
+#include <set>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace manyforge::core {
+
+struct ActiveOperationParticipant;
+
+inline constexpr std::size_t kMaxI6OperationReplayEntries = 4096U;
+
+/// A2a-2: an immediate component step. A short direct Kernel call: admitted
+/// like an operation of its component, then the adapter's atomic step runs
+/// synchronously, outside the Kernel locks, and nothing is stored (no
+/// operation record, journal entry or acknowledgement). No Stop ends it.
+/// Users: Set TCP (A2a); the tool payload update (`set_tcp_load`, A2b).
+struct ImmediateComponentStep final {
+  /// Hold the component's engine for the step: refused (`participant_engine_busy`)
+  /// while an operation of that engine is admitted, and no operation of that
+  /// engine is admitted while the step runs.
+  bool holds_engine{};
+  /// The adapter's atomic step; its result is the call's result.
+  std::function<Result<void>()> run;
+};
+
+/// Active TCP (M7, T-MQ15, T-A2): a robot's Set TCP, an immediate component
+/// step. The resolver supplies it with the robot's motion-target registration;
+/// the resolved entry is `tcp_entry_of(*binding.motion_endpoint,
+/// motion_endpoint_owner.value_or(binding.controllable_component_id))`.
+struct SetTcpStep final {
+  /// "Send TCP offset to controller" on: Set TCP holds the robot
+  /// (`ImmediateComponentStep::holds_engine`). Off: it holds nothing and may
+  /// run during a move (T-A2b).
+  bool holds_robot{};
+  /// The robot's confirmed TCP step, then the commit. Ok once the robot's
+  /// Active TCP is `entry` (also when it already was, and while the robot is
+  /// not enabled: A2a-1). `robot_control`: the registration's
+  /// `intrinsic_direct_control` (Robot control's Set TCP, else a Program's),
+  /// recorded with the change (A2a-2).
+  std::function<Result<void>(const TcpEntryDTO& entry, bool robot_control)> apply;
+};
+
+struct RuntimeParticipantExecutionRegistration final {
+  RuntimeParticipantBinding binding;
+
+  /// Independently verified current lifecycle/configuration/base-plan facts.
+  /// Registration without this value remains observable but cannot admit a
+  /// new operation because the Kernel could not prepare a truthful Stop plan.
+  std::optional<RuntimeParticipantStopReadiness> stop_readiness;
+
+  /// Complete retained deployment defaults used only while preparing the
+  /// immutable ordinary participant Stop plan before operation dispatch.
+  std::vector<HardStopResourceLimitDTO> retained_default_stop_limits;
+
+  MotionInterruptNodeCategory stop_node_category{MotionInterruptNodeCategory::kGeneric};
+
+  /// Non-owning. The engine must remain alive through addressed-owner
+  /// destruction while the owner closes, unsubscribes and drains callback
+  /// ingress.
+  IResolvedParticipantExecutionEngine* engine{};
+
+  /// Exact prepared-stage realization boundary. This is deliberately
+  /// separate from the historical subordinate engine: StopControl never
+  /// calls that engine's deployment-wide Stop surface.
+  IControlDomainExecutionPort* stop_execution_port{};
+
+  /// Exact motion policy sealed against this participant binding.
+  /// Absence remains observable but motion admission fails closed.
+  std::optional<RuntimeParticipantPolicySelection> participant_policy{};
+
+  /// Exact two-phase motion preparation boundary. Motion registrations must
+  /// provide it; capability-command registrations leave it absent.
+  IResolvedPreparedParticipantExecutionEngine* prepared_motion_engine{};
+
+  /// Optional deployment-owned operator profile prepared into every exact
+  /// ordinary motion Stop plan. Non-motion participants leave it absent.
+  std::optional<MotionInterruptStopProfileDTO> default_operator_stop_profile;
+
+  /// Optional deployment-owned fault profile used to prepare a second exact
+  /// Stop plan for runtime-collision containment. It is sealed with the same
+  /// operation/goal as the ordinary plan and never selected by caller input.
+  std::optional<MotionInterruptStopProfileDTO> default_fault_stop_profile;
+
+  /// Sole configured TCP linear-speed ceiling for this exact applied
+  /// Deployment target. Motion admission fails closed when it is absent.
+  std::optional<double> deployment_maximum_tcp_linear_speed_mps;
+
+  /// Composition-owned classification from an exact compiler-direct product,
+  /// never inferred from missing Program origin or a caller's source label.
+  bool intrinsic_direct_control{};
+
+  /// Retained Deployment ceilings for this exact target's manual moves.
+  /// Applied by the shared preview/execute builder only for intrinsic direct
+  /// control; caller omission cannot remove an owner-held ceiling.
+  PerJointDynamicsLimitsDTO direct_control_joint_limits{};
+
+  /// Cell-level policy from the currently applied Deployment. Absence leaves
+  /// moving takeover unavailable; ordinary motion has no preparation budget.
+  std::optional<double> motion_takeover_preparation_budget_s{};
+  /// Exact existing sealed policy-catalog bindings for this participant.
+  std::vector<IoMotionRulePolicyBindingDTO> io_motion_rule_policies{};
+  /// Server-derived overlay from the exact current captured Program node.
+  /// Never copied into the public operation intent or its replay digest.
+  std::optional<MotionInterruptScopeDTO> captured_node_interrupt_scope{};
+  /// Optional earlier suffix-planning deadline from the applied Deployment.
+  std::optional<double> motion_takeover_planning_budget_s{};
+  /// B7: the owner of this operation's motion-endpoint frame (the motion
+  /// component or a tool mounted on it), resolved from the cell kinematic
+  /// index. It stamps the request's TCP frame; absent means the motion
+  /// component itself.
+  std::optional<ControllableComponentId> motion_endpoint_owner{};
+  /// Active TCP (M7): present on a robot's motion-target registration that
+  /// can set its Active TCP. Absent: Set TCP is refused (`set_tcp_unavailable`).
+  std::optional<SetTcpStep> set_tcp{};
+};
+
+using RuntimeParticipantAdmissionResolver =
+    std::function<Result<RuntimeParticipantExecutionRegistration>(const OperationIntentDTO&,
+                                                                  std::size_t)>;
+
+/// Bounded canonical-safe infrastructure diagnostic. Valid NFC text retains
+/// its bytes; otherwise an explicit reversible ASCII-byte representation is
+/// used. This text never grants fault or recovery authority.
+[[nodiscard]] std::string bounded_operation_journal_diagnostic_text(
+    std::string_view value, std::size_t maximum_bytes);
+
+/// First ordinary operation-journal write failure in this Workbench owner.
+/// Independent of journal readability and retained until owner destruction.
+/// This fact grants no Stop, recovery or physical-effect authority.
+struct OperationJournalWriteFaultDTO final {
+  RequestOwnerEpoch request_owner_epoch;
+  std::string write_kind;
+  /// Bounded code/message only; arbitrary backend details are not retained.
+  ErrorDTO error;
+  std::optional<OperationId> operation_id{};
+  std::optional<OperationRevision> operation_revision{};
+  std::optional<RequestId> request_id{};
+  std::optional<ProgramRunId> program_run_id{};
+  std::optional<ProgramNodeExecutionScopeDTO> execution_scope{};
+
+  friend bool operator==(const OperationJournalWriteFaultDTO&,
+                         const OperationJournalWriteFaultDTO&) = default;
+};
+
+/// First contained internal fault (D3: a callback threw on the Stop/safety
+/// path) in this Workbench owner. Motion admission stays closed while it is
+/// held; it is retained until owner destruction (Workbench restart), like the
+/// operation-journal write fault. Later throws only increase `later_count`.
+struct KernelInternalFaultDTO final {
+  RequestOwnerEpoch request_owner_epoch;
+  /// Typed code of the first cause, e.g. `scheduler_runtime_safety_callback_exception`.
+  std::string reason_code;
+  /// Whether the Kernel accepted (or joined) its one containment Full Stop.
+  /// It is not retried: the same refusal would repeat.
+  bool stop_accepted{};
+  /// Typed refusal reason of that Full Stop when it was not accepted, e.g.
+  /// `stop_operation_not_fenceable`; `containment_stop_exception` if it threw.
+  std::optional<std::string> stop_refusal_code;
+  /// Contained throws after the first one; they request no further Full Stop.
+  std::uint64_t later_count{};
+
+  friend bool operator==(const KernelInternalFaultDTO&, const KernelInternalFaultDTO&) = default;
+};
+
+/// Atomic read-only projection of one retained operation. `resident` is the
+/// exact Kernel-owned distinction between the active set and retained history;
+/// separate admission and recovery projections retain their own authority.
+struct OperationReadProjectionDTO final {
+  OperationStateDTO operation;
+  /// True while the Kernel retains any authority over the operation: it is
+  /// active, or its retired manual operation still holds a cell-admission
+  /// claim. False only after that claim's release is visible in admission.
+  bool resident{};
+  RequestOwnerEpoch request_owner_epoch;
+  std::optional<OperationControlAcceptedDTO> last_control{};
+  bool control_pending{};
+
+  friend bool operator==(const OperationReadProjectionDTO&,
+                         const OperationReadProjectionDTO&) = default;
+};
+
+/// Private, read-only orchestration input. Shared verified products and node
+/// indices identify the tasks to retire; this is not a motion admission offer.
+struct ResolvedManualProgramHandover final {
+  ProgramRunExecutionCaptureDTO capture;
+  std::uint64_t selection_revision{};
+  std::vector<std::uint32_t> producer_node_indices;
+};
+
+/// Current eligibility to prepare direct control, not a dispatch permission.
+/// A held Program may first require existing stopped-task cleanup.
+struct ResolvedManualControlAvailability final {
+  bool available{};
+  std::optional<std::string> unavailable_reason;
+  std::optional<ResolvedManualProgramHandover> handover;
+  bool cleanup_required{};
+};
+
+/// Compact owner projection for the existing full-cell Stop command. Detailed
+/// evidence remains in the Stop certificate/history APIs; this status value
+/// carries only the exact action fence and the latest outcome summary needed
+/// by operators.
+struct CellStopStageSummaryDTO final {
+  OperationId operation_id;
+  OperationParticipantId participant_id;
+  StopEscalationStageId stage_id;
+  std::size_t stage_index{};
+  StopActionClass action_class{StopActionClass::kControlled};
+  ParticipantStopStageOutcomeDTO outcome{ParticipantStopStageOutcomeDTO::kFailed};
+  std::optional<MotionControlledStopMode> executed_mode;
+  std::optional<std::string> substitution_reason;
+
+  friend bool operator==(const CellStopStageSummaryDTO&, const CellStopStageSummaryDTO&) = default;
+};
+
+struct CellStopTerminalSummaryDTO final {
+  StopCertificateRefDTO certificate;
+  StopCertificateResultDTO result{StopCertificateResultDTO::kFailedUncontained};
+  bool escalated{};
+  bool hard_stop_floor_used{};
+  std::vector<CellStopStageSummaryDTO> executed_stages;
+
+  friend bool operator==(const CellStopTerminalSummaryDTO&,
+                         const CellStopTerminalSummaryDTO&) = default;
+};
+
+struct CellStopActionProjectionDTO final {
+  StopGeneration expected_stop_generation{0U};
+  std::optional<CellStopTerminalSummaryDTO> latest_terminal;
+
+  friend bool operator==(const CellStopActionProjectionDTO&,
+                         const CellStopActionProjectionDTO&) = default;
+};
+
+struct ResourceAddressedExecutionKernelConfig final {
+  ResourceAddressedExecutionKernelConfig() = default;
+  ResourceAddressedExecutionKernelConfig(
+      RequestOwnerEpoch owner_epoch, CellId cell_identity, std::size_t replay_capacity,
+      RuntimeParticipantAdmissionResolver resolver = {},
+      IResourceOperationAdmissionGate* admission_gate = nullptr,
+      std::optional<GraphRevision> current_graph_revision = {},
+      std::size_t stop_correlation_capacity = kMaximumEmergencyStopCorrelationEntries,
+      std::size_t maximum_live_stop_participants = 0U,
+      std::size_t forensic_projection_capacity = 0U)
+      : request_owner_epoch(std::move(owner_epoch)),
+        cell_id(std::move(cell_identity)),
+        request_replay_capacity(replay_capacity),
+        participant_resolver(std::move(resolver)),
+        operation_admission_gate(admission_gate),
+        graph_revision(std::move(current_graph_revision)),
+        emergency_stop_correlation_capacity(stop_correlation_capacity),
+        prequalified_max_live_stop_participants(maximum_live_stop_participants),
+        stop_forensic_projection_capacity(forensic_projection_capacity) {}
+
+  RequestOwnerEpoch request_owner_epoch;
+  CellId cell_id;
+  std::size_t request_replay_capacity{1024U};
+  /// Optional exact product-backed lookup. The Kernel revalidates the sealed
+  /// binding against the request and accepts only a lifetime-pinned engine
+  /// already present in registrations.
+  RuntimeParticipantAdmissionResolver participant_resolver;
+  /// Optional process-local configuration-fence interlock. It must outlive
+  /// this Kernel. The interlock serializes the real slot-table reservation;
+  /// it owns no duplicate operation counters or resource state.
+  IResourceOperationAdmissionGate* operation_admission_gate{};
+  /// Exact current cell graph used by component/resource Stop resolution. If
+  /// omitted, construction derives it only when every registered participant
+  /// names one identical non-empty graph revision.
+  std::optional<GraphRevision> graph_revision;
+  std::size_t emergency_stop_correlation_capacity{kMaximumEmergencyStopCorrelationEntries};
+  /// Maximum number of participants whose Stop cascades may be live at once.
+  /// Zero derives the exact bound from the initially registered execution
+  /// engines. A nonzero value permits later reconfiguration growth without
+  /// allocating attempt isolation after Stop ingress opens.
+  std::size_t prequalified_max_live_stop_participants{};
+  /// Fixed asynchronous acceptance/terminal forensic-projection slots. Zero
+  /// derives the normal correlation-plus-terminal-history bound. A smaller
+  /// positive bound is legal: exhaustion degrades persistence and closes
+  /// admission, but cannot reject or pin an already accepted Stop.
+  std::size_t stop_forensic_projection_capacity{};
+  /// Exact retained descriptor identity used only when the Kernel is
+  /// bootstrapped with no runtime participants. It must be supplied together
+  /// with `empty_runtime_graph_revision`; participant-backed configurations
+  /// derive both identities from the verified registrations.
+  std::optional<RetainedBundleId> empty_runtime_retained_bundle_id;
+  /// Exact graph identity paired with `empty_runtime_retained_bundle_id` for
+  /// an empty-runtime bootstrap. It is never a constraint on later non-empty
+  /// participant reconfiguration.
+  std::optional<GraphRevision> empty_runtime_graph_revision;
+  /// Verified selected resource inventory before physical engines exist.
+  /// Only valid with the paired empty-runtime bundle/graph identities. These
+  /// are ordinary slot-table entries, not ready participants or rest evidence.
+  std::vector<ResourceId> empty_runtime_resource_inventory;
+  std::size_t cell_admission_claim_capacity{1024U};
+  CellAdmissionInterventionValidator cell_admission_intervention_validator;
+  CellAdmissionSettlementValidator cell_admission_settlement_validator;
+  CellAdmissionReconcileValidator cell_admission_reconcile_validator;
+  std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set;
+  /// Present exactly in compositions that host the Headless Alarm Lifecycle
+  /// Owner. Program Run/Resume, motion-producing recovery and the final
+  /// pre-dispatch recheck then evaluate the published motion-attention
+  /// projection and fail closed while it is missing, unreconciled or stale.
+  std::optional<OperatorAlarmAttentionPolicyDTO> operator_alarm_attention;
+  CellAdmissionProgramResetStatusSource cell_admission_program_reset_status_source;
+  /// Queue existing rule processing for this exact affected service after
+  /// owner/state locks unwind. This lifetime pin grants no health/currentness.
+  std::function<void(const std::shared_ptr<IIoSignalService>&)>
+      io_rule_evidence_processing_notification{};
+};
+
+/// Private no-effect result used to project a capability-command preview at a
+/// trusted transport boundary. The public receipt is minted by that boundary;
+/// this value carries no reusable admission or reservation.
+struct CapabilityCommandPreviewResultDTO final {
+  RuntimeParticipantBindingDTO binding;
+  GripperCommandRequestDTO command_request;
+};
+
+struct OperationRecoveryParticipantDTO final {
+  OperationParticipantId operation_participant_id;
+  ControllableComponentId controllable_component_id;
+  CommandTargetId command_target_id;
+  CapabilityId capability_id;
+  ControlDomainId control_domain_id;
+  ControlBindingId control_binding_id;
+  std::optional<CapabilityProviderBindingId> capability_provider_binding_id;
+  ControlRouteId control_route_id;
+  ActiveControlConfigurationId active_control_configuration_id;
+  ActiveControlConfigurationGeneration active_control_configuration_generation;
+  std::vector<ResourceId> resource_ids;
+};
+
+struct OperationRecoveryProjectionDTO final {
+  OperationRevision operation_revision{0U};
+  std::optional<StopId> stop_id;
+  std::optional<StopGeneration> stop_generation;
+  KernelRecoveryAssessmentDTO assessment;
+  std::vector<OperationRecoveryParticipantDTO> participants;
+};
+
+/// Resource-addressed Kernel owner.
+///
+/// Independent operations own exact resource scopes and may remain active
+/// concurrently when those scopes are disjoint. Existing ExecutionKernel
+/// instances remain private single-participant subordinate mechanisms.
+class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
+                                               public IAddressedMotionPreviewOwner,
+                                               public IKernelCellAdmissionPort,
+                                               public IManagerLivenessObservationPort,
+                                               public IManagerLivenessFailSafePort,
+                                               private IStopControlWorkReceiver,
+                                               private IStopStageAttemptCompletionReceiver,
+                                               private IOperationControlEffectCompletionReceiver {
+ public:
+  ResourceAddressedExecutionKernel(
+      std::vector<RuntimeParticipantExecutionRegistration> registrations, IClock& clock,
+      IScheduler& scheduler, IOperationJournal& journal,
+      ResourceAddressedExecutionKernelConfig config);
+  ~ResourceAddressedExecutionKernel();
+
+  ResourceAddressedExecutionKernel(const ResourceAddressedExecutionKernel&) = delete;
+  ResourceAddressedExecutionKernel& operator=(const ResourceAddressedExecutionKernel&) = delete;
+
+  /// Lock-only first-fault snapshot; it never consults or writes the journal.
+  /// Reset and successful reads/writes do not clear this Workbench fault;
+  /// motion admission stays closed until restart.
+  [[nodiscard]] std::optional<OperationJournalWriteFaultDTO>
+  get_operation_journal_write_fault() const;
+  /// Lock-only snapshot of the contained internal fault (see ContainInternalFault),
+  /// published once the outcome of its containment Full Stop is recorded.
+  [[nodiscard]] std::optional<KernelInternalFaultDTO> get_internal_fault() const;
+
+  /// Resolve, reserve, and submit one portable operation. Exact replay returns
+  /// the original owner-minted identities and performs no subordinate call.
+  ///
+  /// Active TCP (M7, T-MQ15, A2a-2): a Set TCP intent
+  /// (`SetTcpParticipantIntentDTO`) runs as an immediate component step
+  /// (`execute_immediate_step`). The call returns when the step finished:
+  /// Ok = the robot's Active TCP is the resolved entry; Err = typed refusal or
+  /// step failure. Its operation id is not readable afterwards; there is
+  /// nothing to acknowledge.
+  [[nodiscard]] Result<OperationAcceptedDTO> execute(const OperationIntentDTO& intent) override;
+
+  [[nodiscard]] Result<std::unique_ptr<IAddressedMotionPreviewSession>>
+  begin_motion_preview_session(const OperationIntentDTO& primary_motion) override;
+
+  /// Resolve and validate one capability command without reserving,
+  /// journaling, changing observed state, or dispatching a command.
+  [[nodiscard]] Result<CapabilityCommandPreviewResultDTO> preview_capability_command(
+      const OperationIntentDTO& intent);
+
+  [[nodiscard]] Result<OperationControlAcceptedDTO> reset(
+      const OperationControlRequestDTO& request);
+  [[nodiscard]] Result<OperationControlAcceptedDTO> acknowledge_completed(
+      const OperationControlRequestDTO& request) override;
+
+  [[nodiscard]] Result<StopAcceptedDTO> stop(const StopIntentDTO& intent);
+  [[nodiscard]] Result<StopAcceptedDTO> full_stop(const FullStopIntentDTO& intent);
+  /// Install the sealed immutable Program association before any node effect.
+  /// Repeated exact registration preserves current admission holds. This is
+  /// process-local composition, not a public caller-supplied table interface.
+  [[nodiscard]] Result<void> register_program_run_capture(ProgramRunExecutionCaptureDTO capture);
+  [[nodiscard]] Result<std::optional<ResolvedManualProgramHandover>> get_manual_program_handover(
+      const OperationIntentDTO& intent);
+  [[nodiscard]] Result<ResolvedManualControlAvailability> get_manual_control_availability(
+      const OperationIntentDTO& intent);
+  [[nodiscard]] Result<ProgramExecutionSelectionAcceptedDTO> stop_program_selection(
+      const ProgramExecutionSelectionRequestDTO& request);
+  [[nodiscard]] Result<ProgramExecutionScopeStateDTO> get_program_execution_scope(
+      const ProgramRunId& program_run_id) const;
+  /// Release only after the selected effects are settled and retired. The
+  /// Program owner performs exact recovery/cleanup before this final release.
+  /// Any intervening selection change invalidates the entire requested batch.
+  [[nodiscard]] Result<ProgramExecutionScopeStateDTO> release_program_selection(
+      const ProgramExecutionSelectionRequestDTO& request,
+      std::uint64_t expected_selection_revision);
+  [[nodiscard]] Result<ProgramExecutionScopeStateDTO> start_program_selection(
+      const ProgramExecutionSelectionRequestDTO& request,
+      std::uint64_t expected_selection_revision);
+  /// Reopen one exact Program-run admission fence after its accepted Stop has
+  /// settled and the Program owner has explicitly chosen recovery/resume.
+  [[nodiscard]] Result<void> release_program_run_stop_fence(const ProgramRunId& program_run_id,
+                                                            const StopId& stop_id,
+                                                            StopGeneration stop_generation);
+  [[nodiscard]] Result<StopAcceptedDTO> recognized_malformed_stop(
+      const MalformedStopIngressDTO& ingress);
+
+  [[nodiscard]] CellStopActionProjectionDTO cell_stop_action_projection() const;
+
+  [[nodiscard]] Result<StopStatusDTO> get_stop_status(const StopId& stop_id) const;
+  [[nodiscard]] Result<StopCertificateDTO> get_stop_certificate(
+      const StopCertificateId& certificate_id) const;
+  /// Component model v2 (CONTRACTS §5): the execution host passes the
+  /// current state of every component in the cell on every change. Components
+  /// absent from `states` no longer count. Nothing is stored or journaled.
+  void observe_component_states(std::vector<ComponentState> states);
+  /// The cell latch, derived from the last observed component states and the
+  /// Kernel's own Stops and execution. While latched, Program dispatch, node
+  /// commands, manual motion and manual I/O are refused with `cell_latched`
+  /// and interrupt evaluation is paused.
+  [[nodiscard]] CellLatch get_cell_latch() const;
+  /// Readiness reasons the Kernel owns that belong to no component: the
+  /// internal fault (`execution_host_internal_fault`, until host restart) and
+  /// a lost Manager (`manager_unavailable`, until it is alive again), a
+  /// restart waiting for the first component report
+  /// (`execution_host_restart_awaiting_components`) or for every component
+  /// to be idle (`execution_host_restart_settling`, when no latch cause shows
+  /// it). Each
+  /// blocks motion; nothing blocks invisibly (CONTRACTS §10).
+  [[nodiscard]] std::vector<ErrorDTO> ReadExecutionBlocks() const;
+  /// CONTRACTS §2: called once for every newly accepted Stop (operator Stop
+  /// and Halt, a rule's Stop, Reset's Stop, a containment Stop), outside the
+  /// Kernel's locks, so the host interrupts every component action in
+  /// progress. Set once by the execution host before the Kernel runs.
+  void set_stop_listener(std::function<void()> on_stop_accepted);
+  [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale(
+      const RuntimeScaleRequestDTO& request);
+  [[nodiscard]] Result<RuntimeScaleStatusDTO> get_runtime_scale(
+      const OperationId& operation_id) const;
+  [[nodiscard]] Result<RuntimeScaleControlAcceptedDTO> set_runtime_scale_control(
+      const RuntimeScaleControlRequestDTO& request);
+  [[nodiscard]] Result<RuntimeScaleControlStatusDTO> get_runtime_scale_control(
+      const RuntimeScaleControlSelectorDTO& selector) const;
+  /// Presentation query: expose the complete active synchronized scope for a
+  /// selected target. Setters still require that explicit returned selector.
+  [[nodiscard]] Result<RuntimeScaleControlStatusDTO> present_runtime_scale_control(
+      const RuntimeScaleControlSelectorDTO& selector) const;
+
+  [[nodiscard]] Result<std::unique_ptr<ICellCloseAdmissionLease>>
+  AcquireCellCloseAdmissionLease() override;
+  [[nodiscard]] AuthoringAdmissionDTO GetAuthoringAdmission() const override;
+  [[nodiscard]] Result<void> SetRouteRecoveryPending(bool pending);
+  [[nodiscard]] Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
+      const CellAdmissionReadinessSnapshotDTO& snapshot,
+      std::shared_ptr<IIoSignalService>* actual_retired_service = nullptr) override;
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
+      const CellAdmissionClaimIntentDTO& intent) override;
+  /// Trusted ordinary Apply convergence on this Kernel's existing claim owner.
+  /// The host supplies actual installed-state and immutable terminal checks;
+  /// no public request can provide or skip this process-local validator.
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireConfigurationApplyCellAdmissionClaim(
+      const CellAdmissionClaimIntentDTO& intent,
+      const CellAdmissionConfigurationApplyValidator& validate);
+  /// Fresh ordinary Apply success, after every exact old fence is released.
+  [[nodiscard]] Result<AuthoringAdmissionDTO> ReleaseTerminalApplyClaimsAfterSuccess(
+      const CellAdmissionClaimDTO& fresh_claim,
+      const CellAdmissionClaimReleaseDTO& fresh_success_release,
+      const CellAdmissionConfigurationApplySuccessValidator& validate);
+  [[nodiscard]] Result<AuthoringAdmissionDTO> ReleaseCellAdmissionClaim(
+      const CellAdmissionClaimReleaseDTO& release) override;
+  [[nodiscard]] Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
+      const CellAdmissionReconcileDTO& reconcile) override;
+  [[nodiscard]] Result<CellAdmissionRecoveryReceiptDTO> GetCellAdmissionRecoveryReceipt(
+      const CellAdmissionRecoveryReceiptQueryDTO& query) const override;
+  /// Copy the current held ledger entry for a subsequent exact recovery query.
+  /// The observation itself grants no acquisition, effects or release.
+  [[nodiscard]] std::optional<CellAdmissionClaimDTO> ReadHeldCellAdmissionClaim(
+      CellAdmissionClaimKindDTO kind) const;
+  [[nodiscard]] std::optional<CellAdmissionClaimDTO> ReadHeldCellAdmissionClaim(
+      CellAdmissionClaimKindDTO kind, const std::string& owner_transaction_id) const;
+  [[nodiscard]] std::vector<CellAdmissionClaimDTO> ReadHeldCellAdmissionClaims(
+      CellAdmissionClaimKindDTO kind) const;
+  [[nodiscard]] Result<void> ValidateProgramResetSceneAuthorization(
+      const ProgramResetSceneAuthorizationDTO& authorization) const override;
+  /// Exact selected Reset grant; no motion or target is accepted here.
+  [[nodiscard]] Result<void> ValidateProgramResetPositionAuthorization(
+      const ProgramResetPositionAuthorizationDTO& authorization) const;
+  [[nodiscard]] std::optional<ProgramRunnerContactLossDTO> get_program_runner_loss() const;
+  [[nodiscard]] Result<void> Publish(const ManagerLivenessObservationDTO& observation) override;
+  /// Retain the newest generation of one Alarm Lifecycle Owner epoch. A new
+  /// owner epoch replaces the retained one only with a strictly greater
+  /// incarnation from this host boot. A projection from another host boot, an
+  /// equal or smaller incarnation under another epoch, a lower generation, or
+  /// different content under the retained generation is refused; identical
+  /// content refreshes the receipt time (heartbeat).
+  [[nodiscard]] Result<OperatorAlarmAttentionAcceptedDTO> PublishOperatorAlarmAttention(
+      const OperatorAlarmAttentionSnapshotDTO& snapshot) override;
+  /// No-effect evaluation of the operator-alarm attention test against one
+  /// captured node's effectful target resources. The Program owner uses it
+  /// before a motion-producing recovery of that held node takes effect.
+  [[nodiscard]] Result<void> check_program_node_motion_attention(
+      const ProgramNodeMotionAttentionCheckDTO& request) const;
+  /// Existing activation owner installs the same immutable service published
+  /// by the host, after exact reconfiguration and before composition publication.
+  /// Candidate-only installation under the original held Apply effect and
+  /// composition pin. No registration, active catalog or state event is exposed.
+  [[nodiscard]] Result<void> StageGlobalIoRuleCatalog(
+      IoRuleAppliedContextDTO context,
+      std::shared_ptr<const IoActivationRuleCatalogDTO> catalog,
+      std::shared_ptr<IIoSignalService> service,
+      const ConfigurationFenceStatusQueryDTO& held_fence,
+      const CellAdmissionClaimDTO& actual_parent_claim,
+      std::shared_ptr<const IoRuleWaitingForProgramCatalogDTO> waiting_for_program = {});
+  /// Trusted host calls only after actual successful NamedApply proof, holding
+  /// the current composition pin. A candidate head alone is not this proof.
+  [[nodiscard]] Result<void> ActivateGlobalIoRuleCatalog(
+      const IoRuleAppliedContextDTO& actual_applied_context,
+      const std::shared_ptr<IIoSignalService>& expected_service);
+  /// Reconstruct the same owner from actual successful current Applied proof
+  /// during the existing route-recovery exclusion, without inventing an Apply
+  /// fence. The host retains its final current composition/publication pin.
+  [[nodiscard]] Result<void> RestoreGlobalIoRuleCatalog(
+      IoRuleAppliedContextDTO actual_applied_context,
+      std::shared_ptr<const IoActivationRuleCatalogDTO> catalog,
+      std::shared_ptr<IIoSignalService> service,
+      std::shared_ptr<const IoRuleWaitingForProgramCatalogDTO> waiting_for_program = {});
+  [[nodiscard]] Result<void> DiscardStagedGlobalIoRuleCatalog(
+      const ConfigurationFenceStatusQueryDTO& held_fence,
+      const CellAdmissionClaimDTO& actual_parent_claim);
+  [[nodiscard]] std::shared_ptr<const IoActivationRuleCatalogDTO>
+  installed_global_io_rule_catalog() const;
+  [[nodiscard]] std::optional<IoRuleStateProjectionDTO> ReadInterruptRuleStateBaseline() const;
+
+  /// CONTRACTS §8 activation (node `rules.set_active`): succeeds at once; an
+  /// unknown rule id is refused with `rule_unknown`. Activating a rule whose
+  /// condition holds trips it at once.
+  [[nodiscard]] Result<void> set_rule_active(const InterruptPolicyId& rule_id, bool active);
+  /// Every rule back to its `active_at_start` (run end, Load).
+  [[nodiscard]] Result<void> reset_rule_activation();
+  /// The rules gating their scope now (`rule_holds`, with `rule_id`): a
+  /// `stop` rule whose condition holds after its trip, or any active rule
+  /// that can't watch its signals. Readiness reads this; nothing recomputes it.
+  [[nodiscard]] std::vector<ErrorDTO> ReadRuleHolds() const;
+  /// CONTRACTS §7 (node `io.clear_outside_change`): clears the core-held
+  /// `<signal_id>.changed_outside` flag of one output; writes nothing.
+  [[nodiscard]] Result<void> clear_outside_change(const IoSignalId& output);
+  /// CONTRACTS §7 (one write path): admission of every output write, manual
+  /// or Program, made through the execution host's `set_io_output`. Refused
+  /// `cell_latched` while the cell latch holds, and `rule_holds` (with
+  /// `rule_id`) while an active rule whose scope covers the signal
+  /// (`everything`) gates it. A `manual` write is refused
+  /// `io_manual_write_motion_executing` while any motion executes in the
+  /// cell; otherwise allowed (idle, pause, Program without motion). Effect-free.
+  [[nodiscard]] Result<void> admit_output_write(const IoSignalId& output, bool manual) const;
+
+
+  [[nodiscard]] Result<void> InstallProgramIoSignalService(
+      std::shared_ptr<IIoSignalService> service,
+      const RetainedBundleId& expected_retained_bundle_id,
+      const GraphRevision& expected_graph_revision);
+  /// Trusted Applied owner proof, constructed outside locks by the host. The
+  /// host retains its shared composition lock through this exact recheck.
+  [[nodiscard]] Result<void> InstallAppliedProgramBlackboardContext(
+      AppliedProgramBlackboardContextDTO context,
+      const std::shared_ptr<IIoSignalService>& expected_service);
+  /// Trusted no-effect scope observation only. Host must first prove the
+  /// actual pending NamedApply/qualified candidate and retain its composition
+  /// pin. This grants no context/source/value admission or acknowledgement.
+  [[nodiscard]] Result<void> ValidatePendingProgramBlackboardScope(
+      const IoProgramBlackboardScopeDTO& scope, const ProgramBindingDTO& actual_candidate_binding,
+      ActiveBundlePublicationGeneration actual_candidate_publication,
+      const std::shared_ptr<IIoSignalService>& expected_service);
+  /// The host retains its actual shared composition currentness guard through
+  /// this call and verifies the retained context against that publication.
+  /// Public fields never establish Applied ownership or receiver time.
+  /// BBK-1: an accepted frame is evaluated by the rules before the ACK
+  /// returns, so the Runner's next admission sees it.
+  [[nodiscard]] Result<IoProgramBlackboardAcknowledgementDTO> PublishProgramBlackboard(
+      const IoProgramBlackboardPublicationDTO& publication);
+  [[nodiscard]] std::shared_ptr<const AppliedProgramBlackboardContextDTO>
+  applied_program_blackboard_context() const;
+  /// The host first matches rows to this SAME sealed Program node's literal
+  /// simulation data under its product lease. This joins actual current Run,
+  /// claim, Binding and inputs, then calls the same service under state_mutex_.
+  [[nodiscard]] Result<ProgramNodeMockSimulationAcknowledgementDTO>
+  StartProgramNodeMockSimulation(const ProgramNodeMockSimulationRequestDTO& request);
+  [[nodiscard]] Result<void> SetProgramRunMockSimulationPaused(
+      const ProgramRunMockSimulationPauseRequestDTO& request);
+  [[nodiscard]] Result<void> EndProgramNodeMockSimulation(
+      const ProgramNodeMockSimulationScopeDTO& scope);
+  [[nodiscard]] Result<IoWatchRegistrationDTO> RegisterProgramIoWatch(
+      const ProgramIoWatchRequestDTO& request);
+  [[nodiscard]] Result<IoWatchResultDTO> ReadProgramIoWatch(
+      const IoWatchRegistrationDTO& registration) const;
+  [[nodiscard]] Result<void> ReleaseProgramIoWatch(const IoWatchRegistrationDTO& registration);
+  [[nodiscard]] Result<void> ReleaseProgramIoWatchScope(
+      const ProgramIoWatchScopeReleaseRequestDTO& request);
+  /// Existing host scheduling calls after ingress drain and at NextIoRuleExpiry.
+  [[nodiscard]] Result<void> ProcessIoRuleEvidence();
+  /// Local managed I/O lifecycle boundary, before input Pause/Resume. Disabling
+  /// requires an idle cell.
+  [[nodiscard]] Result<void> SetGlobalIoSourcesPlannedDisabled(
+      const std::shared_ptr<IIoSignalService>& expected_service,
+      std::span<const InterruptSourceId> sources, bool disabled);
+  [[nodiscard]] Result<std::optional<TimePoint>> NextIoRuleExpiry() const;
+  void LatchAndContain(const ManagerLivenessLossIntentDTO& intent) noexcept override;
+  /// A callback threw on the Stop/safety path (scheduler lane or runtime-
+  /// collision lookahead). The first call records `reason_code` as the
+  /// internal fault, closes motion admission until a Workbench restart and
+  /// attempts one Full Stop under
+  /// this Kernel's own request identity, with `reason_code` as its
+  /// correlation; it records whether that Stop was accepted (or its refusal
+  /// reason; no retry) and writes one typed line. Later calls only count.
+  void ContainInternalFault(std::string_view reason_code) noexcept;
+  [[nodiscard]] Result<void> PublishComponentStreamHold(
+      const ControllableComponentId& component, const std::optional<ErrorDTO>& hold,
+      bool cell_wide = false) override;
+  [[nodiscard]] Result<AuthoringAdmissionDTO> ReplaceManagerLivenessRequiredSet(
+      const ManagerLivenessRequiredSetDTO& required_set);
+
+  /// Read-only owner projection. Subordinate polling and state advancement are
+  /// performed only by reconcile_subordinate_state(), never by this method.
+  [[nodiscard]] Result<OperationStateDTO> get_operation_state(
+      const OperationId& operation_id) const override;
+
+  /// Read-only owner projection that atomically distinguishes an active
+  /// resident operation from retained history.
+  [[nodiscard]] Result<OperationReadProjectionDTO> get_operation_projection(
+      const OperationId& operation_id) const;
+
+  /// Coherent, deterministic projection of every still-resident operation
+  /// owned by one of the exact Program-run identities. This lets a successor
+  /// client recover an operation without guessing its owner-minted identity.
+  [[nodiscard]] std::vector<OperationStateDTO> get_resident_operations(
+      const std::vector<ProgramRunId>& program_run_ids) const;
+
+  /// One coherent current-result projection per requested run scope: every
+  /// resident operation, or its latest retained result when none is resident.
+  /// Reuses bounded owner history; reads never settle/release operations.
+  [[nodiscard]] std::vector<OperationReadProjectionDTO> get_latest_run_operations(
+      const std::vector<ProgramRunId>& program_run_ids) const;
+
+  [[nodiscard]] Result<OperationRecoveryProjectionDTO> get_operation_recovery_assessment(
+      const OperationId& operation_id) const;
+
+  [[nodiscard]] Result<KernelRecoveryActionResultDTO> apply_operation_recovery_action(
+      const OperationId& operation_id, OperationRevision expected_operation_revision,
+      const KernelRecoveryActionRequestDTO& request);
+
+  /// NRT owner-scheduler reconciliation point. This closes event-loss windows
+  /// and advances capability-command completion without making public reads
+  /// effectful.
+  [[nodiscard]] Result<void> reconcile_subordinate_state() override;
+
+  /// Retire the exclusive manual claim only after exact operation cleanup.
+  /// Reuses the ordinary owner reconciliation lane; Stop never waits for it.
+  [[nodiscard]] Result<void> reconcile_manual_operation_admission();
+
+  [[nodiscard]] std::vector<ResourceSlotSnapshotDTO> resource_snapshot() const;
+
+  /// One coherent generation-stamped read used by the private runtime
+  /// reconciliation owner. Public callers cannot mutate or release slots from
+  /// this projection.
+  [[nodiscard]] ResourceSlotTableSnapshotDTO resource_table_snapshot() const;
+
+  /// Atomically select a verified candidate participant set while preserving
+  /// the stable addressed owner, operation journal, replay ledgers, and any
+  /// unaffected in-flight operation. The caller must hold the exact durable
+  /// configuration fence for every changed resource.
+  [[nodiscard]] Result<void> reconfigure_runtime_participants(
+      std::vector<RuntimeParticipantExecutionRegistration> registrations,
+      RuntimeParticipantAdmissionResolver participant_resolver = {});
+
+  /// Select one verified runtime product before route readiness is published.
+  [[nodiscard]] Result<void> reconfigure_runtime_product(
+      std::vector<RuntimeParticipantExecutionRegistration> registrations,
+      RuntimeParticipantAdmissionResolver participant_resolver,
+      std::function<Result<void>()> commit_publication = {});
+
+  /// Install an exact component-set transition beneath one held Manager Apply
+  /// fence. Unchanged registrations retain their engines and route facts. An
+  /// optional prevalidated commit callback runs at the inventory/registration
+  /// publication boundary while admission and state remain locked; it must not
+  /// call back into the Kernel.
+  [[nodiscard]] Result<void> reconfigure_runtime_component_set(
+      std::vector<RuntimeParticipantExecutionRegistration> registrations,
+      RuntimeParticipantAdmissionResolver participant_resolver,
+      RetainedBundleId candidate_retained_bundle_id, GraphRevision candidate_graph_revision,
+      const ConfigurationFenceId& apply_fence_id, const ConfigurationFenceScopeDTO& scope,
+      const std::vector<ControllableComponentId>& retained_components = {},
+      std::function<Result<void>()> commit_publication = {});
+
+  /// Publish the candidate-side active-configuration identities already
+  /// declared by the installed registrations while the exact durable Apply
+  /// fence still closes every affected resource. This does not publish Stop
+  /// readiness or create a CCLC route predecessor: route-fence admission sees
+  /// the separately tracked authoritative publication inventory. CCLC must
+  /// replace these staged facts with independently verified readiness before
+  /// addressed command admission can reopen.
+  [[nodiscard]] Result<void> stage_current_runtime_configuration_facts_under_apply_fence(
+      const ConfigurationFenceScopeDTO& scope);
+
+  /// Rehydrate one exact durable route predecessor after execution-host
+  /// replacement without claiming that the new provider incarnation is
+  /// Stop-ready. The supplied registrations must name the predecessor's
+  /// domain/configuration but carry no readiness for that domain. This keeps
+  /// operation admission closed while allowing CCLC to acquire the exact
+  /// route fence and publish a freshly observed successor configuration.
+  [[nodiscard]] Result<RuntimeRouteConfigurationReadbackDTO>
+  adopt_runtime_route_configuration_predecessor(
+      ActiveControlConfigurationDTO configuration,
+      std::vector<RuntimeParticipantExecutionRegistration> registrations,
+      RuntimeParticipantAdmissionResolver participant_resolver = {});
+
+  /// Atomically install one reconciled domain's complete runtime
+  /// registrations and independently retained readiness projection. An
+  /// unreconciled publication carries no candidate registrations and closes
+  /// admission for that domain while leaving its observable old runtime
+  /// inventory intact under the held route fence. Route readiness says only
+  /// that the domain route and its Stop readiness are coherent; it never
+  /// grants or removes a component's command eligibility.
+  [[nodiscard]] Result<RuntimeRouteConfigurationReadbackDTO> publish_runtime_route_configuration(
+      ActiveControlConfigurationDTO configuration,
+      std::vector<RuntimeParticipantExecutionRegistration> registrations = {},
+      RuntimeParticipantAdmissionResolver participant_resolver = {});
+
+  /// Read back only the exact current domain/configuration generation.
+  [[nodiscard]] Result<RuntimeRouteConfigurationReadbackDTO> runtime_route_configuration_readback(
+      const ControlDomainId& control_domain_id,
+      const ActiveControlConfigurationId& active_configuration_id,
+      ActiveControlConfigurationGeneration active_configuration_generation) const;
+
+  /// Current Kernel-owned route publication fact for one domain. Absence is
+  /// the exact pre-publication state; this performs no mutation or provider
+  /// I/O.
+  [[nodiscard]] Result<std::optional<RuntimeRouteConfigurationReadbackDTO>>
+  current_runtime_route_configuration(const ControlDomainId& control_domain_id) const;
+
+
+  /// A removed subordinate engine stays lifetime-pinned while an operation
+  /// still references it. Once this returns false, release_retired_engine()
+  /// removes the remaining event subscription before the caller destroys the
+  /// engine.
+  [[nodiscard]] bool participant_engine_in_use(
+      const IResolvedParticipantExecutionEngine* engine) const;
+  [[nodiscard]] Result<void> release_retired_engine(IResolvedParticipantExecutionEngine* engine);
+
+  [[nodiscard]] std::shared_ptr<const ResourceSlotTable> resource_admission_table() const noexcept {
+    return resource_slots_;
+  }
+  [[nodiscard]] const RequestOwnerEpoch& request_owner_epoch() const noexcept override {
+    return config_.request_owner_epoch;
+  }
+
+ private:
+  friend class StopControlExecutorTestAccess;
+  [[nodiscard]] Result<std::optional<ResolvedManualProgramHandover>>
+  resolve_manual_program_handover(const OperationIntentDTO& intent);
+  [[nodiscard]] Result<std::optional<ResolvedManualProgramHandover>>
+  resolve_manual_program_handover(const RuntimeParticipantExecutionRegistration& registration);
+  [[nodiscard]] Result<void> validate_manual_program_handover_locked(
+      const ResolvedManualProgramHandover& handover) const;
+  struct ReplayEntry;
+  struct ControlReplayEntry;
+  struct StopReplayEntry;
+  struct RuntimeScaleReplayEntry;
+  struct RuntimeScaleControlReplayEntry;
+  struct RuntimeScaleControlSetting;
+  struct RuntimeScaleControlResolution;
+  struct RuntimeScaleControlScope;
+  class CellCloseAdmissionLease;
+  struct ActiveOperation;
+  [[nodiscard]] MotionRetryEligibilityDTO operation_retry_eligibility_locked(
+      const ActiveOperation& operation, const std::vector<KernelRecoveryAssessmentDTO>& assessments,
+      bool recovery_owner = false) const;
+  [[nodiscard]] bool operation_close_eligible_locked(
+      const ActiveOperation& operation, const std::vector<KernelRecoveryAssessmentDTO>& assessments,
+      bool closure_owner = false) const;
+  [[nodiscard]] Result<KernelRecoveryActionResultDTO> close_operation(
+      const OperationId& operation_id, OperationRevision expected_operation_revision,
+      const KernelRecoveryActionRequestDTO& request);
+  [[nodiscard]] Result<void> retire_preempted_motion_operations();
+  [[nodiscard]] Result<void> retire_operation_ownership_locked(
+      const OperationId& operation_id, bool clear_continuation,
+      bool discard_node_continuations = false);
+  [[nodiscard]] std::optional<std::vector<std::size_t>> fresh_motion_node_indices_locked(
+      const ActiveOperation& operation) const;
+  void mark_motion_retry_run_end_locked(const ProgramRunId& run_id);
+  class OperationCommitGuard;
+  struct StopTransaction;
+  struct StopTerminalRecord;
+  struct StopProjectionJob;
+  struct PartialDispatchStopScope;
+  struct EngineEventIngress;
+  class StopProjectionWorker;
+  struct EngineSubscription;
+  struct PreviewSession;
+
+  [[nodiscard]] bool operation_control_reconfiguration_busy_locked() const;
+  /// Spec 450 §5.2 attention test for Program work over exact resources.
+  /// No refusal when the composition carries no alarm-attention policy.
+  [[nodiscard]] std::optional<ErrorDTO> operator_alarm_attention_refusal_locked(
+      const std::vector<ResourceId>& reserved_resources) const;
+  /// Union of the resources that the captured Program Binding binds to every
+  /// effectful target of the selected captured Program nodes.
+  [[nodiscard]] std::vector<ResourceId> program_selection_resources_locked(
+      const std::vector<std::uint32_t>& node_indices) const;
+  /// The one eligibility predicate shared by single, coordinated, manual,
+  /// Program, arm, gripper and output dispatch: the component must report
+  /// `enabled` (`component_not_enabled`). A domain without route authority has
+  /// no component to consult. Returns the refusal, if any.
+  [[nodiscard]] std::optional<ErrorDTO> component_command_refusal_locked(
+      const RuntimeParticipantExecutionRegistration& registration) const;
+  /// The component's last observed state is `enabled` (state_mutex_).
+  [[nodiscard]] bool component_enabled_locked(const ControllableComponentId& component) const;
+  [[nodiscard]] Result<void> require_idle_for_component_readiness_locked() const;
+  [[nodiscard]] std::vector<IResolvedParticipantExecutionEngine*> operation_control_engines_locked(
+      const std::vector<RuntimeParticipantExecutionRegistration>& registrations) const;
+  [[nodiscard]] const RuntimeParticipantExecutionRegistration* registration_for(
+      const RuntimeParticipantBinding& binding) const noexcept;
+  [[nodiscard]] Result<RuntimeParticipantExecutionRegistration> resolve_registration(
+      const OperationIntentDTO& operation, std::size_t participant_index) const;
+  [[nodiscard]] Result<RuntimeParticipantExecutionRegistration> bind_captured_node_io_rule(
+      const OperationIntentDTO& operation, std::size_t participant_index,
+      RuntimeParticipantExecutionRegistration registration) const;
+  [[nodiscard]] Result<void> validate_preview_participant(
+      const OperationIntentDTO& intent,
+      const RuntimeParticipantExecutionRegistration& registration);
+  [[nodiscard]] StopScopeResolverSnapshotDTO capture_stop_scope_locked(
+      const ResourceSlotTableSnapshotDTO& slots) const;
+  [[nodiscard]] Result<void> validate_program_node_claim(
+      const ProgramNodeAdmissionEvidenceDTO& evidence) const;
+  [[nodiscard]] Result<void> validate_program_execution_scope_locked(
+      const OperationIntentDTO& intent, std::optional<bool> non_motion_only = {},
+      bool intrinsic_direct_control = false) const;
+  [[nodiscard]] bool program_node_effectively_running_locked(
+      const ProgramRunId& program_run_id, std::size_t index) const;
+  [[nodiscard]] bool program_node_non_motion_locked(
+      const ProgramRunId& program_run_id, std::size_t index) const;
+  void fence_held_prepared_program_commands_locked(const ProgramRunId& program_run_id);
+  [[nodiscard]] Result<void> reconcile_manual_operation_admission_locked();
+  [[nodiscard]] Result<void> validate_manual_operation_settlement(
+      const CellAdmissionClaimDTO& claim, const CellAdmissionClaimReleaseDTO& release) const;
+  [[nodiscard]] Result<CellAdmissionReconcileValidationDTO> validate_manual_owner_reconciliation(
+      const std::vector<CellAdmissionClaimDTO>& held,
+      const std::vector<CellAdmissionCurrentOwnerEpochDTO>& current,
+      const CellAdmissionReconcileDTO& request) const;
+  [[nodiscard]] Result<std::optional<CellAdmissionSettlementEvidenceDTO>>
+  manual_operation_settlement_locked(const CellAdmissionClaimDTO& claim) const;
+  void refresh_execution_claims();  // caller holds admission_mutex_
+  [[nodiscard]] ActiveOperation* find_active_operation_locked(
+      const OperationId& operation_id) noexcept;
+  [[nodiscard]] const ActiveOperation* find_active_operation_locked(
+      const OperationId& operation_id) const noexcept;
+  [[nodiscard]] OperationReadProjectionDTO operation_projection_locked(
+      const OperationStateDTO& state, bool active, bool control_pending) const;
+  [[nodiscard]] std::optional<OperationId> find_event_operation_locked(
+      const IResolvedParticipantExecutionEngine* engine, std::uint64_t subordinate_id) const;
+  void on_engine_event(IResolvedParticipantExecutionEngine* engine, const KernelEvent& event);
+  [[nodiscard]] Result<void> apply_subordinate_state(
+      const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine,
+      std::uint64_t subordinate_id, OperationStateKind state, double progress,
+      std::optional<ErrorDTO> terminal_error, bool observe_current_motion = false,
+      std::optional<ParticipantExecutionFact> terminal_fact = std::nullopt);
+  void stamp_operation_capture_locked(ActiveOperation& operation, OperationStateDTO& state);
+  void retain_operation_journal_write_fault_locked(
+      std::string_view write_kind, const ErrorDTO& failure,
+      const OperationStateDTO* state = nullptr, std::optional<RequestId> request_id = std::nullopt);
+
+  [[nodiscard]] Result<bool> record_operation_state_locked(
+      std::unique_lock<std::mutex>& state_lock, OperationStateDTO& state,
+      const RuntimeScaleStatusDTO* scale, const char* reason,
+      std::span<const PreparedMotionDiagnosticsDTO> diagnostics = {},
+      std::optional<RequestId> request_id = std::nullopt);
+  [[nodiscard]] Result<bool> confirm_prepared_command_no_effect(
+      const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine,
+      std::uint64_t preparation_id);
+  [[nodiscard]] Result<void> discard_uncommitted_ordinary_preparations(
+      const OperationId& operation_id, IResolvedParticipantExecutionEngine* failing_engine = nullptr,
+      std::optional<ErrorDTO> failure = {});
+  using ActiveOperationNode = std::map<OperationId, std::unique_ptr<ActiveOperation>>::node_type;
+  [[nodiscard]] Result<std::optional<OperationAcceptedDTO>> try_accept_motion_takeover(
+      ActiveOperationNode& prepared_operation, ReplayEntry& prepared_replay,
+      const RuntimeParticipantExecutionRegistration& registration);
+  [[nodiscard]] Result<void> advance_motion_takeover(const OperationId& incumbent_id);
+  [[nodiscard]] Result<void> advance_motion_takeover_impl(const OperationId& incumbent_id);
+  [[nodiscard]] Result<void> commit_motion_takeover_owner_locked(
+      ActiveOperation& incumbent, ActiveOperation& candidate, ResourceSlotOwnerTransferMode mode,
+      std::pair<OperationStateDTO, OperationStateDTO>& captures);
+
+  [[nodiscard]] Result<bool> commit_settled_motion_takeover(
+      const OperationId& incumbent_id, const OperationId& candidate_id,
+      const StopCertificateDTO& certificate);
+  [[nodiscard]] Result<bool> fail_pending_motion_takeover(
+      const OperationId& incumbent_id, const OperationId& candidate_id, ErrorDTO cause);
+  [[nodiscard]] Result<bool> end_pending_motion_takeover(
+      const OperationId& incumbent_id, const OperationId& candidate_id,
+      std::optional<ErrorDTO> failure);
+  [[nodiscard]] Result<void> advance_unsent_motion_takeover(const OperationId& incumbent_id);
+  [[nodiscard]] Result<void> reserve_cold_motion_takeover_goal_locked(ActiveOperation& candidate);
+
+  [[nodiscard]] Result<void> begin_motion_takeover_fallback(
+      const OperationId& incumbent_id, const OperationId& candidate_id, ErrorDTO cause);
+  [[nodiscard]] Result<void> advance_motion_takeover_fallback(
+      const OperationId& incumbent_id, const OperationId& candidate_id);
+  [[nodiscard]] ActiveOperation* find_pending_motion_operation_locked(
+      const OperationId& operation_id) noexcept;
+  [[nodiscard]] const ActiveOperation* find_pending_motion_operation_locked(
+      const OperationId& operation_id) const noexcept;
+  [[nodiscard]] Result<void> advance_prepared_motion(const OperationId& operation_id,
+                                                     IResolvedParticipantExecutionEngine* engine);
+  [[nodiscard]] Result<void> advance_prepared_capability_command(
+      const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine);
+  [[nodiscard]] Result<void> arm_io_rules_locked(ActiveOperation& operation);
+  [[nodiscard]] bool io_rule_scope_current_locked(const ActiveOperation& operation,
+                                                  const ActiveOperationParticipant& participant,
+                                                  const IoRuleRegistrationDTO& registration) const;
+  [[nodiscard]] StopTransaction* io_rule_response_owner_locked(
+      const ActiveOperation& operation, const ActiveOperationParticipant& participant) const;
+  [[nodiscard]] Result<void> retire_io_rules_locked(ActiveOperation& operation);
+  [[nodiscard]] Result<void> retire_participant_io_rules_locked(
+      ActiveOperationParticipant& participant);
+  struct GlobalIoRuleRuntime;
+  struct StagedGlobalIoRuleCatalog;
+  [[nodiscard]] Result<void> retire_global_io_rules_locked();
+  [[nodiscard]] Result<void> retire_staged_global_io_rules_locked();
+  [[nodiscard]] Result<void> install_global_io_rule_catalog_locked(
+      StagedGlobalIoRuleCatalog& candidate);
+  void set_global_io_rule_state_locked(std::size_t index, IoGlobalRuleState state,
+      std::optional<IoRuleAcquisitionKeyDTO> acquisition = {},
+      std::optional<ErrorDTO> unavailable_reason = {});
+  /// The row can't watch: retire its registration, withdraw its key, gate.
+  [[nodiscard]] Result<void> unwatch_global_io_rule_locked(std::size_t index, ErrorDTO reason);
+  [[nodiscard]] std::optional<ErrorDTO> global_io_rule_hold_locked(std::size_t index,
+                                                                   bool output_write) const;
+  [[nodiscard]] Result<void> set_global_io_rule_active_locked(std::size_t index, bool active);
+  void ProjectGlobalIoRuleStates() noexcept;
+  void retire_all_io_rules_locked();
+  [[nodiscard]] bool has_active_io_rules_locked() const;
+  struct StopWorkHandoff;
+  struct GlobalInterruptStopParticipant;
+  struct GlobalInterruptStopSelection;
+  [[nodiscard]] bool global_io_rule_applies_locked(
+      const IoActivationRulePolicyBindingDTO& rule, const RuntimeParticipantBindingDTO& binding) const;
+  [[nodiscard]] std::optional<ErrorDTO> global_io_rule_command_refusal_locked(
+      const RuntimeParticipantBindingDTO& binding, const ActiveOperation* operation = nullptr) const;
+  [[nodiscard]] bool program_blackboard_source_matches_operation_locked(
+      const ActiveOperation& operation) const;
+  [[nodiscard]] Result<void> arm_pending_global_io_rules_locked();
+  [[nodiscard]] Result<IoRuleRegistrationDTO> arm_global_io_rule_locked(
+      const IoActivationRulePolicyBindingDTO& rule, const IoRuleStateContextDTO& context,
+      const std::shared_ptr<IIoSignalService>& service);
+  [[nodiscard]] Result<bool> global_io_rule_supersedes_node_locked(
+      const IoMotionRulePolicyBindingDTO& policy, const IoRuleEvidenceDTO& evidence,
+      const ActiveOperationParticipant& participant) const;
+  [[nodiscard]] Result<void> process_global_io_rule_evidence_locked(
+      StopWorkHandoff& handoff, const OperationId* dispatch_boundary = nullptr);
+  [[nodiscard]] Result<void> validate_global_io_rule_stop_locked(
+      const GlobalInterruptStopSelection& selection) const;
+  struct InterruptStopSelection;
+  [[nodiscard]] Result<void> process_io_rule_evidence_locked(
+      StopWorkHandoff& handoff, const OperationId* selected_operation = nullptr);
+  void finalize_io_rule_stop_locked(StopTransaction& transaction,
+                                    const StopCertificateDTO& certificate);
+  [[nodiscard]] Result<void> release_prepared_dispatch_barrier(
+      const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine,
+      std::uint64_t preparation_id, const PreparedOperationParticipantDTO& participant_product);
+  /// Q58: the exact local settlement a completed Stop handed to this
+  /// command's dispatch return. A failed settlement fails closed.
+  void settle_deferred_capability_stop(const OperationId& operation_id,
+                                       IResolvedParticipantExecutionEngine* participant_engine,
+                                       IResolvedParticipantExecutionEngine* settlement_engine,
+                                       const AddressedParticipantStopSettlementRequestDTO& request);
+  /// Q60: perform, on the Stop lane, the exact settlements that closed Stops
+  /// deferred to their never-dispatched participants' late cancellation
+  /// terminals. A late failure is retained on the participant; one not proved
+  /// an already-failed preparation fails closed (as a failed Stop settlement).
+  void settle_deferred_pre_dispatch_cancellations() noexcept;
+  [[nodiscard]] Result<OperationAcceptedDTO> execute_coordinated_motion_after_preflight(
+      const OperationIntentDTO& intent);
+  /// A2a-2: run one immediate component step. Validates and resolves the
+  /// single-participant intent, asks `step_for` for the step of the resolved
+  /// registration (its refusal is returned), admits it (origin: Program node
+  /// scope as a non-motion transaction, or manual readiness unless Robot
+  /// control's own manual claim already covers the component; the
+  /// `holds_engine` busy rule; no "enabled" or "motion admission open" check,
+  /// A2a-1), then runs it outside the Kernel locks. Nothing is stored.
+  [[nodiscard]] Result<OperationAcceptedDTO> execute_immediate_step(
+      const OperationIntentDTO& intent,
+      const std::function<Result<ImmediateComponentStep>(
+          const RuntimeParticipantExecutionRegistration&)>& step_for);
+  /// Active TCP (M7): the Set TCP user of `execute_immediate_step`.
+  [[nodiscard]] Result<OperationAcceptedDTO> execute_set_tcp(const OperationIntentDTO& intent);
+  /// Dispatch none, cancel every prepared participant and release the
+  /// reservation. A coordinated participant failure names its engine; a null
+  /// engine is a whole-operation admission refusal (single or coordinated)
+  /// that ends every participant InterventionRequired with `failure`.
+  [[nodiscard]] Result<void> fail_pre_dispatch(const OperationId& operation_id,
+                                               IResolvedParticipantExecutionEngine* failing_engine,
+                                               ErrorDTO failure);
+  [[nodiscard]] Result<OperationControlAcceptedDTO> apply_control(
+      const OperationControlRequestDTO& request, OperationControlKind control,
+      bool automatic_manual_retirement = false);
+  [[nodiscard]] Result<KernelRecoveryActionResultDTO> apply_coordinated_operation_recovery_action(
+      const OperationId& operation_id, OperationRevision expected_operation_revision,
+      const KernelRecoveryActionRequestDTO& request);
+  void CompleteOperationControlEffect(OperationControlEffectResult result) noexcept;
+  [[nodiscard]] OperationStateDTO publish_settlement_fault_locked(ActiveOperation& operation);
+  [[nodiscard]] Result<void> settle_control_operation_locked(const OperationId& operation_id,
+                                                             OperationControlKind control);
+  void clear_motion_continuation_locked(const ActiveOperation& operation);
+  [[nodiscard]] std::vector<OperationId> durable_operation_retention_ids_locked() const;
+  [[nodiscard]] bool evict_oldest_historical_operation_locked(
+      std::span<const OperationId> protected_operation_ids);
+  [[nodiscard]] std::size_t resident_operation_count_locked() const noexcept;
+  [[nodiscard]] bool make_operation_admission_capacity_locked();
+  void retain_historical_operation_locked(OperationStateDTO state);
+  [[nodiscard]] Result<void> reconfigure_runtime_participants_impl(
+      std::vector<RuntimeParticipantExecutionRegistration> registrations,
+      RuntimeParticipantAdmissionResolver participant_resolver,
+      bool retain_unready_configuration_facts, const ConfigurationFenceId* apply_fence_id = nullptr,
+      const ConfigurationFenceScopeDTO* apply_scope = nullptr,
+      const std::vector<ControllableComponentId>* retained_components = nullptr,
+      const RetainedBundleId* candidate_retained_bundle_id = nullptr,
+      const GraphRevision* candidate_graph_revision = nullptr,
+      const std::function<Result<void>()>* commit_publication = nullptr);
+  [[nodiscard]] StopIntentDTO internal_control_stop_intent_locked(
+      const ActiveOperation& operation, const OperationControlAcceptedDTO& accepted,
+      std::string_view reason) const;
+  [[nodiscard]] Result<void> apply_runtime_scale_status(
+      IResolvedParticipantExecutionEngine* engine,
+      const ResolvedRuntimeScaleStatusDTO& resolved_status);
+  [[nodiscard]] Result<void> retain_runtime_scale_observation_locked(
+      std::unique_lock<std::mutex>& state_lock, ActiveOperation& operation,
+      RuntimeScaleStatusDTO status, const char* reason);
+  [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale_impl(
+      const RuntimeScaleRequestDTO& request, bool retain_public_replay);
+  [[nodiscard]] Result<RuntimeScaleControlResolution> resolve_runtime_scale_control_target_locked(
+      const RuntimeScaleControlSelectorDTO& selector) const;
+  [[nodiscard]] Result<RuntimeScaleControlScope> resolve_runtime_scale_control_locked(
+      const RuntimeScaleControlSelectorDTO& selector) const;
+  [[nodiscard]] Result<RuntimeScaleControlStatusDTO> runtime_scale_control_locked(
+      const RuntimeScaleControlSelectorDTO& selector, bool present_group) const;
+  [[nodiscard]] double runtime_scale_setting_for_binding_locked(
+      const RuntimeParticipantBindingDTO& binding) const noexcept;
+  void ProgressStop(StopControlWorkToken token) noexcept override;
+  void StageAttemptCompleted(StopStageAttemptHandle handle) noexcept override;
+  void OperationControlEffectCompleted(BoundedOperationControlExecutor& executor,
+                                       OperationControlEffectHandle handle) noexcept override;
+  void settle_completed_control_locked(const OperationId& operation_id);
+  void wake_stop_after_preparation_borrow_locked(const OperationId& operation_id) noexcept;
+  OperationStateDTO capture_control_failure_locked(ActiveOperation& operation);
+  void ProjectStop(StopControlWorkToken token) noexcept;
+  [[nodiscard]] std::optional<StopControlWorkToken> allocate_stop_projection_job_locked() noexcept;
+  [[nodiscard]] Result<CellAdmissionClaimDTO> acquire_cell_admission_claim(
+      const CellAdmissionClaimIntentDTO& intent);
+  /// Cell latch (CONTRACTS §5), state_mutex_ held. `arm` arms the latch
+  /// condition; the arm clears when every component is healthy and idle.
+  void observe_component_states_locked(std::vector<ComponentState> states);
+  void refresh_cell_latch_locked(bool arm);
+  /// Every component in the cell is healthy and idle (or latch-exempt).
+  [[nodiscard]] bool cell_settled_locked() const;
+  [[nodiscard]] bool cell_latched_locked() const;
+  /// `cell_latched` while latched (R1), else nothing.
+  [[nodiscard]] std::optional<ErrorDTO> cell_latch_refusal_locked() const;
+  /// A run, a node, manual motion or I/O is executing.
+  [[nodiscard]] bool execution_in_progress_locked() const;
+  [[nodiscard]] bool commit_stop_terminal_locked(StopTransaction& transaction,
+                                                 std::int64_t completed_at_ns) noexcept;
+  struct MotionTakeoverStopSelection final {
+    OperationId incumbent_id;
+    OperationId candidate_id;
+    bool force_spring_return{};
+  };
+  [[nodiscard]] Result<StopAcceptedDTO> accept_stop(
+      EmergencyStopProjectedIntentDTO intent,
+      const PartialDispatchStopScope* partial_dispatch_scope = nullptr,
+      const MalformedStopIngressDTO* malformed_ingress = nullptr,
+      const MotionTakeoverStopSelection* takeover_selection = nullptr,
+      const InterruptStopSelection* interrupt_selection = nullptr,
+      std::span<const InterruptStopSelection> disjoint_interrupt_selections = {});
+  // One acceptance boundary shared by physical and captured-node selections.
+  // Publish only after state_mutex_ is released; the existing workers own all
+  // provider effects and journal projection.
+  struct StopWorkHandoff final {
+    std::optional<StopControlWorkToken> control;
+    std::optional<StopControlWorkToken> projection;
+    /// A new Stop was accepted: `publish_stop_work` calls the Stop listener.
+    bool accepted{};
+  };
+  [[nodiscard]] Result<StopAcceptedDTO> accept_stop_locked(
+      EmergencyStopProjectedIntentDTO intent, StopWorkHandoff& handoff, TimePoint accepted_at_ns,
+      const PartialDispatchStopScope* partial_dispatch_scope = nullptr,
+      const MalformedStopIngressDTO* malformed_ingress = nullptr,
+      const MotionTakeoverStopSelection* takeover_selection = nullptr,
+      const InterruptStopSelection* interrupt_selection = nullptr,
+      std::span<const InterruptStopSelection> disjoint_interrupt_selections = {},
+      const GlobalInterruptStopSelection* global_selection = nullptr);
+  void publish_stop_work(const StopWorkHandoff& handoff) noexcept;
+  void refresh_manager_liveness_inhibition();
+  /// The operator's Program Stop (`stop_program_selection`) under the lock;
+  /// a global `stop`/`hold` rule trip issues the same (CONTRACTS §8).
+  [[nodiscard]] Result<ProgramExecutionSelectionAcceptedDTO> stop_program_selection_locked(
+      const ProgramExecutionSelectionRequestDTO& request, StopWorkHandoff& handoff,
+      TimePoint accepted_at_ns);
+  /// AUD-6: the Program run hold of global rule `index` (`hold_run`).
+  [[nodiscard]] Result<void> hold_program_run_for_rule_locked(std::size_t index,
+                                                              StopWorkHandoff& handoff);
+  [[nodiscard]] bool ordinary_request_id_retained_locked(const RequestId& request_id) const;
+
+  RuntimeParticipantRegistry registry_;
+  std::shared_ptr<std::recursive_mutex> admission_mutex_;
+  std::shared_ptr<ResourceSlotTable> resource_slots_;
+  std::vector<RuntimeParticipantExecutionRegistration> registrations_;
+  std::map<ControlDomainId, RuntimeRouteConfigurationReadbackDTO>
+      runtime_route_configuration_readbacks_;
+  std::set<ControlDomainId> runtime_route_configuration_publication_required_;
+  /// CP9 stream holds (state_mutex_): refusal of new commands per component.
+  std::map<ControllableComponentId, ErrorDTO> component_stream_holds_;
+  /// CP9 holds of components without motion: refusal of every component.
+  std::map<ControllableComponentId, ErrorDTO> cell_stream_holds_;
+  IClock& clock_;
+  IScheduler& scheduler_;
+  IOperationJournal& journal_;
+  ResourceAddressedExecutionKernelConfig config_;
+  // Activation-pinned; changed only under state_mutex_, never a mutable forwarder.
+  std::shared_ptr<IIoSignalService> io_signal_service_;
+  // One activation owner, independent of Run watch lifetime. Candidate state
+  // remains private until actual successful Applied publication is proven.
+  std::shared_ptr<const IoActivationRuleCatalogDTO> global_io_rule_catalog_;
+  // Mutually exclusive no-service alternative of this same Applied owner.
+  std::shared_ptr<const IoRuleWaitingForProgramCatalogDTO> global_io_rule_waiting_for_program_;
+  std::optional<IoRuleAppliedContextDTO> global_io_rule_applied_context_;
+  std::shared_ptr<IIoSignalService> global_io_rule_service_;
+  std::vector<GlobalIoRuleRuntime> global_io_rules_;
+  std::set<InterruptSourceId> planned_disabled_io_sources_;
+  std::unique_ptr<StagedGlobalIoRuleCatalog> staged_global_io_rule_catalog_;
+  // Existing bounded forensic history budget; no second event cursor.
+  std::vector<IoRuleStateChangeDTO> global_io_rule_projection_queue_;
+  bool global_io_rule_projection_in_flight_{};
+  bool global_io_rule_projection_gap_{};
+  std::optional<ErrorDTO> global_io_rule_projection_error_;
+  std::uint64_t global_io_rule_through_sequence_{};
+  // Applied Program source lifetime is independent of a held Run/watch record.
+  // Actual typed values live only in the installed shared signal subsystem.
+  std::shared_ptr<const AppliedProgramBlackboardContextDTO> applied_program_blackboard_context_;
+  std::optional<IoProgramBlackboardSourceBindingDTO> program_blackboard_source_;
+  bool program_blackboard_source_retired_{};
+  [[nodiscard]] Result<void> notify_io_rule_evidence_processing(
+      const std::shared_ptr<IIoSignalService>& affected_service) const;
+  [[nodiscard]] Result<void> retire_program_blackboard_source_locked(
+      std::shared_ptr<IIoSignalService>* actual_retired_service = nullptr);
+  [[nodiscard]] Result<IoProgramBlackboardAcknowledgementDTO> admit_program_blackboard_frame(
+      const IoProgramBlackboardPublicationDTO& publication);
+  [[nodiscard]] Result<void> reconcile_program_blackboard_cycle_locked(
+      const std::optional<ProgramCycleStatusDTO>& cycle,
+      std::shared_ptr<IIoSignalService>* actual_retired_service = nullptr);
+  [[nodiscard]] bool program_blackboard_runner_loss_locked(const ProgramCycleStatusDTO& cycle) const;
+  [[nodiscard]] bool program_blackboard_scope_current_locked(
+      const IoProgramBlackboardScopeDTO& scope, const ProgramCycleStatusDTO& cycle,
+      const AppliedProgramBlackboardContextDTO& context) const;
+  [[nodiscard]] bool program_blackboard_scope_current_locked(
+      const IoProgramBlackboardScopeDTO& scope, const ProgramCycleStatusDTO& cycle,
+      const RequestOwnerEpoch& expected_owner,
+      ActiveBundlePublicationGeneration expected_publication,
+      const ProgramBindingDTO& actual_binding) const;
+  std::unique_ptr<KernelCellAdmissionOwner> cell_admission_owner_;
+
+  // Serializes public Execute admission while permitting synchronous engine
+  // callbacks to take state_mutex_. The subordinate execute call is required
+  // to be prompt/non-blocking by its port contract.
+  mutable std::mutex submission_mutex_;
+  mutable std::mutex operation_recovery_mutex_;
+  mutable std::mutex state_mutex_;
+  struct ProgramRunStopFence final {
+    ProgramRunId program_run_id;
+    std::optional<StopId> stop_id;
+    StopGeneration stop_generation;
+    bool releasable{};
+    std::uint64_t selection_revision{};
+    std::uint64_t legacy_selection_revision{};
+    std::vector<ProgramNodeHoldStateDTO> node_states{};
+    std::vector<ProgramNodeStopEffectDTO> pending_effects{};
+    /// The global rule whose `hold` trip held this run (stopped_by: rule).
+    std::optional<InterruptPolicyId> held_by_rule{};
+  };
+  struct ProgramCycleClaimRun final {
+    ProgramRunId program_run_id;
+    CellAdmissionClaimGeneration claim_generation{0U};
+    RequestOwnerEpoch program_runner_owner_epoch;
+    ProgramRevision program_revision;
+    std::optional<ProgramRunExecutionCaptureDTO> capture{};
+    struct MotionContinuation;
+    // Aligned with the immutable captured node table, bounded by that table.
+    std::vector<std::shared_ptr<const MotionContinuation>> motion_continuations{};
+    bool io_watches_retired{};
+    struct IoWatchScope final {
+      ProgramNodeExecutionScopeDTO node;
+      // Live reservations are released only by their exact known token.
+      // A missing token is a cancelled uncertain scope, retained to Run end.
+      std::optional<IoWatchRegistrationDTO> registration;
+    };
+    // Live reservations plus cancelled uncertain scopes share the captured
+    // node-count bound. Ordinary known-token releases recycle their slots.
+    std::vector<IoWatchScope> io_watch_scopes{};
+    bool io_watch_admission_closed{};
+  };
+  void retire_program_io_watches_locked(const ProgramRunId& run_id);
+  [[nodiscard]] Result<void> validate_current_program_io_run_scope_locked(
+      const ProgramRunMockSimulationScopeDTO& request) const;
+  [[nodiscard]] Result<void> validate_current_program_io_node_scope_locked(
+      const ProgramIoWatchScopeReleaseRequestDTO& request) const;
+  [[nodiscard]] Result<void> validate_program_io_watch_scope_locked(
+      const ProgramIoWatchScopeReleaseRequestDTO& request) const;
+  [[nodiscard]] Result<std::vector<std::uint32_t>> resolve_program_selection_locked(
+      const ProgramExecutionSelectionRequestDTO& request,
+      bool allow_node_release = false) const;
+  [[nodiscard]] ProgramExecutionScopeStateDTO program_execution_scope_locked(
+      const ProgramRunStopFence& fence) const;
+  [[nodiscard]] std::optional<ProgramSelectionReleaseBlockReasonDTO>
+  program_selection_release_block_reason_locked(const ProgramRunStopFence& fence) const;
+  // Whether a captured node can have physical effects. Unknown capture or
+  // index is treated as effectful, so containment is never skipped.
+  [[nodiscard]] bool program_node_effectful_locked(const ProgramRunId& program_run_id,
+                                                   std::size_t index) const;
+  void reduce_program_selection_stop_locked(const StopCertificateDTO& certificate);
+  std::vector<ReplayEntry> replay_ledger_;
+  std::vector<ControlReplayEntry> control_replay_ledger_;
+  std::vector<StopReplayEntry> stop_replay_ledger_;
+  std::vector<RuntimeScaleReplayEntry> runtime_scale_replay_ledger_;
+  std::vector<RuntimeScaleControlReplayEntry> runtime_scale_control_replay_ledger_;
+  std::vector<RuntimeScaleControlSetting> runtime_scale_control_settings_;
+  struct OperationRecoveryReplayEntry;
+  std::vector<OperationRecoveryReplayEntry> operation_recovery_replay_ledger_;
+  std::vector<OperationStateDTO> historical_operations_;
+  std::vector<ProgramRunStopFence> program_run_stop_fences_;
+  std::optional<ProgramRunId> pending_program_run_admission_;
+  // Program-cycle acquisition is synchronous and precedes all Run effects.
+  // Its transaction identity is the exact ProgramRunId, so Stop never waits
+  // for the asynchronously refreshed Manager status projection to know a run.
+  std::optional<ProgramCycleClaimRun> program_cycle_claim_run_;
+  // Same ledger's current exact manual claim; also protects its operation
+  // from diagnostic-history retirement until settlement/reconciliation.
+  std::optional<CellAdmissionClaimDTO> manual_operation_claim_;
+  // Retained only as a compatibility/readiness source for a predecessor run
+  // admitted before Program-cycle transaction and ProgramRunId were unified.
+  std::optional<ProgramRunId> current_program_run_id_;
+  std::optional<ProgramRunnerContactLossDTO> program_runner_loss_;
+  /// Canonical bounded resident operation table. Unresolved operations are
+  /// never evicted; resolved history rotates before new admission.
+  std::map<OperationId, std::unique_ptr<ActiveOperation>> active_operations_;
+  // Shared with every engine callback snapshot. The ingress owns the only
+  // callback-visible Kernel pointer and drains entered callbacks before any
+  // Kernel state or asynchronous lane is retired.
+  std::shared_ptr<EngineEventIngress> engine_event_ingress_;
+  std::vector<EngineSubscription> engine_subscriptions_;
+  // Engaged exactly once during successful construction and replaced only by
+  // a fully validated runtime reconfiguration.
+  std::optional<GraphRevision> stop_graph_revision_;
+  std::optional<RetainedBundleId> stop_retained_bundle_id_;
+  std::vector<StopScopeComponentSnapshotDTO> stop_component_scope_;
+  EmergencyStopAcceptanceReserve emergency_stop_reserve_;
+  std::vector<std::unique_ptr<StopTransaction>> stop_transactions_;
+  std::vector<std::unique_ptr<StopTerminalRecord>> stop_terminal_history_;
+  std::vector<std::optional<StopAcceptedDTO>> stop_correlations_;
+  std::vector<std::unique_ptr<StopProjectionJob>> stop_projection_jobs_;
+  std::vector<std::uint64_t> stop_projection_generations_;
+  std::unique_ptr<StopProjectionWorker> stop_projection_worker_;
+  std::unique_ptr<BoundedStopControlExecutor> stop_control_executor_;
+  std::unique_ptr<BoundedStopStageAttemptExecutor> stop_stage_attempt_executor_;
+  std::unique_ptr<BoundedOperationControlExecutor> operation_control_executor_;
+  bool operation_control_reconfiguration_in_progress_{};
+  std::size_t prequalified_max_live_stop_participants_{};
+  // A restart found its predecessor unclosed (an unterminated Stop, an
+  // unclosed owner epoch or orphan resources). It counts as a Stop for the
+  // cell latch (every unhealthy component shows) and ends once every
+  // component reports healthy and idle: the orphan resources are released
+  // (R2; no Force close).
+  bool motion_admission_unreconciled_{};
+  std::vector<ResourceId> recovered_orphan_resources_;
+  std::uint64_t next_operation_id_{1U};
+  std::uint64_t next_stop_id_{1U};
+  StopGeneration cell_stop_generation_{0U};
+  /// Cell latch inputs (CONTRACTS §5): the last observed state of every
+  /// component in the cell, and whether a latch condition is armed.
+  std::vector<ComponentState> component_states_;
+  bool cell_latch_armed_{};
+  std::function<void()> stop_listener_;
+  // Mirrors the cell-admission owner's Manager-liveness loss: set by
+  // `LatchAndContain`, cleared when the Manager is alive again (`Publish`,
+  // `ReplaceManagerLivenessRequiredSet`). `manager_liveness_mutex_` orders
+  // the owner update with this mirror.
+  bool manager_liveness_motion_inhibited_{};
+  std::mutex manager_liveness_mutex_;
+  /// A2a-2: engines held by a running immediate component step
+  /// (`ImmediateComponentStep::holds_engine`). Guarded by `state_mutex_`.
+  std::set<IResolvedParticipantExecutionEngine*> immediate_step_engines_;
+  std::optional<OperationJournalWriteFaultDTO> operation_journal_write_fault_{};
+  std::optional<KernelInternalFaultDTO> internal_fault_{};
+  // New motion admission stays closed only for the Kernel's internal fault
+  // (until host restart) and while the Manager is lost (until it is alive
+  // again); both belong to no component and show in readiness
+  // (`ReadExecutionBlocks`). A journal write fault blocks nothing. Every
+  // other cause is component state the cell latch derives (CONTRACTS §5, R2).
+  [[nodiscard]] bool motion_admission_closed_locked() const noexcept {
+    return internal_fault_.has_value() || manager_liveness_motion_inhibited_;
+  }
+  std::optional<RetainedOperatorAlarmAttentionDTO> operator_alarm_attention_;
+};
+
+}  // namespace manyforge::core

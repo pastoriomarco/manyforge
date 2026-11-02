@@ -1,126 +1,204 @@
-import { afterEach, describe, expect, it } from 'vitest';
-
+import { DEFAULT_COMPOSER_SETTINGS } from '../state/composerSettings';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  recordViewerFrameGap,
-  recordViewerMaterialization,
+  VIEWER_QUALIFICATION_GLOBAL,
+  VIEWER_QUALIFICATION_QUERY_KEY,
+  connectViewerQualification,
+  inspectViewerRenderer,
+  isSoftwareRenderer,
+  pageViewerRendererInspection,
+  recordViewerModelBuild,
+  recordViewerObservationApplied,
+  recordViewerObservationReceived,
   recordViewerReactCommit,
   recordViewerRenderFrame,
   recordViewerRenderWork,
-  recordViewerEffectiveDpr,
-  recordViewerTopologyRebuild,
-  recordViewerTransformApply,
-  recordViewerWebSocketMessage,
+  rememberViewerRendererInspection,
+  resetViewerRendererInspectionForTest,
+  selectViewerPresentationProfile,
   startViewerPerformanceMonitoring,
   stopViewerPerformanceMonitoring,
   takeViewerPerformanceWindow,
-  publishViewerRendererProfile,
-  getAutomaticViewerRateHz,
-  getViewerRatePreferenceHz,
-  selectViewerPresentationProfile,
-  setViewerRatePreferenceHz,
-  subscribeViewerRendererProfile,
 } from './viewerPerformance';
 
-describe('viewer performance windows', () => {
+describe('viewer presentation and performance', () => {
   afterEach(() => {
     stopViewerPerformanceMonitoring();
-    setViewerRatePreferenceHz(null);
+    vi.unstubAllGlobals();
   });
 
-  it('reports bounded work that actually occurred and resets the window', () => {
+  it('selects a bounded software or hardware presentation profile', () => {
+    expect(isSoftwareRenderer('llvmpipe (LLVM 20.1.2)')).toBe(true);
+    expect(isSoftwareRenderer('NVIDIA Tegra')).toBe(false);
+    // The defaults reproduce the former fixed software and GPU choices.
+    expect(selectViewerPresentationProfile(2, DEFAULT_COMPOSER_SETTINGS.viewerGraphics.software)).toEqual({
+      effectiveDpr: 1,
+      antialias: false,
+    });
+    expect(selectViewerPresentationProfile(2, DEFAULT_COMPOSER_SETTINGS.viewerGraphics.gpu)).toEqual({
+      effectiveDpr: 1.5,
+      antialias: true,
+    });
+    // The cap never raises the resolution above the screen's own.
+    expect(selectViewerPresentationProfile(1, { maxPixelRatio: 2, antialias: true }).effectiveDpr).toBe(1);
+  });
+
+  it('detects Firefox software rendering beneath a sanitized debug identity', () => {
+    const debugInfo = {
+      UNMASKED_VENDOR_WEBGL: 1,
+      UNMASKED_RENDERER_WEBGL: 2,
+    };
+    const context = {
+      VENDOR: 3,
+      RENDERER: 4,
+      getExtension: vi.fn(() => debugInfo),
+      getParameter: vi.fn((parameter: number) => ({
+        1: 'NVIDIA Corporation',
+        2: 'NVIDIA GeForce GTX 980, or similar',
+        4: 'llvmpipe, or similar',
+      })[parameter] ?? ''),
+    };
+    const gl = {
+      getContext: () => context,
+    } as never;
+
+    expect(inspectViewerRenderer(gl)).toEqual({
+      vendor: 'NVIDIA Corporation',
+      renderer: 'llvmpipe, or similar',
+      software: true,
+    });
+  });
+
+  it('inspects the page renderer once, before any viewer Canvas exists', () => {
+    resetViewerRendererInspectionForTest();
+    const context = {
+      VENDOR: 3,
+      RENDERER: 4,
+      getExtension: vi.fn(() => null),
+      getParameter: vi.fn((parameter: number) => ({
+        3: 'Mesa',
+        4: 'llvmpipe (LLVM 15.0.7, 128 bits)',
+      })[parameter] ?? ''),
+    };
+    const getContext = vi.fn(() => context);
+    const createCanvas = vi.fn(() => ({ getContext }) as never);
+
+    const first = pageViewerRendererInspection(createCanvas);
+    expect(first).toEqual({
+      vendor: 'Mesa',
+      renderer: 'llvmpipe (LLVM 15.0.7, 128 bits)',
+      software: true,
+    });
+    // Later mounts reuse the page result: no second probe context.
+    expect(pageViewerRendererInspection(createCanvas)).toBe(first);
+    expect(createCanvas).toHaveBeenCalledTimes(1);
+    expect(getContext).toHaveBeenCalledWith('webgl2', expect.objectContaining({ alpha: false }));
+    // An equal Canvas inspection keeps the cached identity (no state flip).
+    expect(rememberViewerRendererInspection({ ...first! })).toBe(first);
+
+    resetViewerRendererInspectionForTest();
+    expect(pageViewerRendererInspection(() => ({ getContext: () => null }) as never)).toBeNull();
+    const created = rememberViewerRendererInspection({
+      vendor: 'NVIDIA', renderer: 'Tegra', software: false,
+    });
+    expect(pageViewerRendererInspection(createCanvas)).toBe(created);
+    expect(createCanvas).toHaveBeenCalledTimes(1);
+    resetViewerRendererInspectionForTest();
+  });
+
+  it('reports only local render work and resets the window', () => {
     startViewerPerformanceMonitoring();
-    const message = '{"type":"frame","label":"caf\u00e9"}';
-    recordViewerWebSocketMessage(message, 'frame');
-    recordViewerFrameGap(3);
-    recordViewerMaterialization(2.5);
+    recordViewerModelBuild(2.5);
     recordViewerReactCommit(1.25);
     recordViewerRenderFrame(100);
     recordViewerRenderFrame(116);
     recordViewerRenderWork(17, 12_345, 640_000);
-    recordViewerTopologyRebuild(2);
-    recordViewerTransformApply(7);
 
-    const first = takeViewerPerformanceWindow('focused');
-    expect(first.websocket_messages).toBe(1);
-    expect(first.websocket_bytes).toBe(new TextEncoder().encode(message).byteLength);
-    expect(first.frame_messages).toBe(1);
-    expect(first.dropped_frame_gaps).toBe(3);
-    expect(first.materialization_total_ms).toBe(2.5);
-    expect(first.react_commit_total_ms).toBe(1.25);
-    expect(first.rendered_frames).toBe(2);
-    expect(first.render_interval_p95_ms).toBe(16);
-    expect(first.draw_calls_max).toBe(17);
-    expect(first.triangles_max).toBe(12_345);
-    expect(first.canvas_pixels_max).toBe(640_000);
-    expect(first.topology_rebuilds).toBe(2);
-    expect(first.transform_applies).toBe(7);
+    const first = takeViewerPerformanceWindow();
+    expect(first.modelBuildTotalMs).toBe(2.5);
+    expect(first.reactCommitTotalMs).toBe(1.25);
+    expect(first.renderedFrames).toBe(2);
+    expect(first.renderIntervalP95Ms).toBe(16);
+    expect(first.drawCallsMax).toBe(17);
+    expect(first.trianglesMax).toBe(12_345);
+    expect(first.canvasPixelsMax).toBe(640_000);
 
-    const second = takeViewerPerformanceWindow('visible');
-    expect(second.websocket_messages).toBe(0);
-    expect(second.rendered_frames).toBe(0);
-    expect(second.render_interval_p95_ms).toBeNull();
+    const second = takeViewerPerformanceWindow();
+    expect(second.modelBuilds).toBe(0);
+    expect(second.renderedFrames).toBe(0);
+    expect(second.renderIntervalP95Ms).toBeNull();
   });
 
-  it('preserves the automatic cadence without permitting incomplete low-resolution frames', () => {
-    const softwarePresentation = selectViewerPresentationProfile(true, 2);
-    expect(softwarePresentation).toEqual({
-      effectiveDpr: 1,
-      antialias: true,
-      preserveDrawingBuffer: true,
-    });
-    const software = publishViewerRendererProfile({
-      vendor: 'Mesa',
-      renderer: 'llvmpipe (LLVM 20.1.2)',
-      software: true,
-      ...softwarePresentation,
-    });
-    expect(software.requestedRateHz).toBe(15);
-    recordViewerEffectiveDpr(0.8);
-    expect(takeViewerPerformanceWindow('focused').effective_dpr).toBe(0.8);
+  it('installs one frozen qualification object only for the exact URL opt-in', () => {
+    const fakeWindow = {
+      location: { href: `http://composer.test/?${VIEWER_QUALIFICATION_QUERY_KEY}=1` },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as Window & Record<string, unknown>;
+    vi.stubGlobal('window', fakeWindow);
 
-    const hardwarePresentation = selectViewerPresentationProfile(false, 2);
-    expect(hardwarePresentation).toEqual({
-      effectiveDpr: 1.5,
-      antialias: true,
-      preserveDrawingBuffer: false,
+    const disconnect = connectViewerQualification();
+    const qualification = fakeWindow[VIEWER_QUALIFICATION_GLOBAL] as {
+      schemaVersion: string;
+      status: () => unknown;
+      snapshot: () => unknown;
+      take: () => unknown;
+      reset: () => void;
+      observationFlow: () => unknown;
+      resetObservationFlow: () => void;
+    };
+    expect(qualification.schemaVersion).toBe('manyforge.viewer.qualification.v1');
+    expect(Object.isFrozen(qualification)).toBe(true);
+    expect(qualification.status()).toEqual(
+      expect.objectContaining({
+        wireframeDefault: false,
+        canvasCount: 0,
+      }),
+    );
+    expect(qualification.snapshot()).toEqual(
+      expect.objectContaining({
+        schemaVersion: 'manyforge.viewer.qualification.v1',
+        performance: expect.any(Object),
+      }),
+    );
+    qualification.reset();
+    qualification.resetObservationFlow();
+    recordViewerObservationReceived({
+      ownerEpoch: 'owner.1',
+      sourceEpoch: 'source.1',
+      sourceSequence: 7,
+      receivedAtComposerMonotonicUs: 123,
+    }, false);
+    recordViewerObservationApplied({
+      ownerEpoch: 'owner.1',
+      sourceEpoch: 'source.1',
+      sourceSequence: 7,
+      receivedAtComposerMonotonicUs: 123,
     });
-    const hardware = publishViewerRendererProfile({
-      vendor: 'NVIDIA',
-      renderer: 'NVIDIA Tegra',
-      software: false,
-      ...hardwarePresentation,
-    });
-    expect(hardware.requestedRateHz).toBe(15);
-  });
+    expect(qualification.observationFlow()).toEqual(expect.objectContaining({
+      receivedFrames: 1,
+      appliedFrames: 1,
+      replacedBeforeApply: 0,
+      maxUnappliedFrames: 1,
+      lastApplied: expect.objectContaining({ sourceSequence: 7 }),
+    }));
+    disconnect();
+    expect(fakeWindow[VIEWER_QUALIFICATION_GLOBAL]).toBeUndefined();
 
-  it('supports an explicit bounded client rate without changing renderer selection', () => {
-    let profileNotifications = 0;
-    const unsubscribe = subscribeViewerRendererProfile(() => {
-      profileNotifications += 1;
-    });
-    const softwarePresentation = selectViewerPresentationProfile(true, 2);
-    publishViewerRendererProfile({
-      vendor: 'Mesa',
-      renderer: 'llvmpipe',
-      software: true,
-      ...softwarePresentation,
-    });
-    expect(getAutomaticViewerRateHz()).toBe(15);
-
-    setViewerRatePreferenceHz(10);
-    expect(getViewerRatePreferenceHz()).toBe(10);
-    expect(profileNotifications).toBe(2);
-    expect(publishViewerRendererProfile({
-      vendor: 'Mesa',
-      renderer: 'llvmpipe',
-      software: true,
-      ...softwarePresentation,
-    }).requestedRateHz).toBe(10);
-
-    setViewerRatePreferenceHz(null);
-    expect(getViewerRatePreferenceHz()).toBeNull();
-    expect(getAutomaticViewerRateHz()).toBe(15);
-    expect(() => setViewerRatePreferenceHz(31)).toThrow(RangeError);
-    unsubscribe();
+    vi.stubGlobal(
+      'window',
+      {
+        location: {
+          href: `http://composer.test/?${VIEWER_QUALIFICATION_QUERY_KEY}=1&${VIEWER_QUALIFICATION_QUERY_KEY}=1`,
+        },
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      },
+    );
+    const noDuplicateOptIn = connectViewerQualification();
+    expect((window as unknown as Record<string, unknown>)[
+      VIEWER_QUALIFICATION_GLOBAL
+    ]).toBeUndefined();
+    noDuplicateOptIn();
   });
 });

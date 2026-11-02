@@ -1,0 +1,88 @@
+{
+  "api_version": "manyforge.site_overlay.v1",
+  "site_overlay_id": "manyforge_local_examples",
+  "site_overlay_revision": "sha256:5b6086efa0a3c81f39b213aeba2395234eca2b22a8842c0ddec27e9d962eb3f8",
+  "values": [
+    {
+      "resource_kind": "service_endpoint",
+      "semantic_kind": "external_resource",
+      "site_overlay_value_ref": "resources.assistant_scene_authoring.assistant_bridge",
+      "value": {
+        "value": "http://127.0.0.1:8100/v1/manyforge/assistant",
+        "value_kind": "string"
+      }
+    },
+    {
+      "resource_kind": "model_endpoint",
+      "semantic_kind": "external_resource",
+      "site_overlay_value_ref": "resources.assistant_scene_authoring.assistant_model",
+      "value": {
+        "value": "http://127.0.0.1:8100/v1/manyforge/assistant",
+        "value_kind": "string"
+      }
+    },
+    {
+      "resource_kind": "service_endpoint",
+      "semantic_kind": "external_resource",
+      "site_overlay_value_ref": "resources.semantic_shape_selection.assistant_bridge",
+      "value": {
+        "value": "http://127.0.0.1:8200/v1/manyforge/assistant",
+        "value_kind": "string"
+      }
+    },
+    {
+      "resource_kind": "model_endpoint",
+      "semantic_kind": "external_resource",
+      "site_overlay_value_ref": "resources.semantic_shape_selection.assistant_model",
+      "value": {
+        "value": "http://127.0.0.1:8200/v1/manyforge/assistant",
+        "value_kind": "string"
+      }
+    },
+    {
+      "resource_kind": "model_endpoint",
+      "semantic_kind": "external_resource",
+      "site_overlay_value_ref": "resources.semantic_shape_selection.selection_model",
+      "value": {
+        "value": "http://127.0.0.1:8000/v1",
+        "value_kind": "string"
+      }
+    },
+    {
+      "resource_kind": "model_endpoint",
+      "semantic_kind": "external_resource",
+      "site_overlay_value_ref": "resources.vision_bin_selection.vision_model",
+      "value": {
+        "value": "http://127.0.0.1:8000/v1",
+        "value_kind": "string"
+      }
+    },
+    {
+      "resource_kind": "service_endpoint",
+      "semantic_kind": "external_resource",
+      "site_overlay_value_ref": "resources.vision_pose_selection.assistant_bridge",
+      "value": {
+        "value": "http://127.0.0.1:8200/v1/manyforge/assistant",
+        "value_kind": "string"
+      }
+    },
+    {
+      "resource_kind": "model_endpoint",
+      "semantic_kind": "external_resource",
+      "site_overlay_value_ref": "resources.vision_pose_selection.assistant_model",
+      "value": {
+        "value": "http://127.0.0.1:8200/v1/manyforge/assistant",
+        "value_kind": "string"
+      }
+    },
+    {
+      "resource_kind": "model_endpoint",
+      "semantic_kind": "external_resource",
+      "site_overlay_value_ref": "resources.vision_pose_selection.vision_model",
+      "value": {
+        "value": "http://127.0.0.1:8000/v1",
+        "value_kind": "string"
+      }
+    }
+  ]
+}

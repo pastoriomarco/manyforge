@@ -1,978 +1,1094 @@
-"""Tests for the node catalog loader and validator."""
+"""Contract tests for the sole v2 node-catalog runtime input."""
 
-import os
-import re
-import tempfile
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
-import yaml
+import rfc8785
 
+import manyforge_behavior.catalog as catalog_module
 from manyforge_behavior.catalog import (
+    EXPECTED_API_VERSION,
+    EXPECTED_BUILTIN_CATALOG_DIGEST,
+    EXPECTED_CONTENT_VERSION,
     CatalogValidationError,
     NodeCatalog,
+    profile_satisfied,
 )
 from manyforge_behavior.catalog_schema import validate_value
-from manyforge_behavior.catalog_schema import CatalogSchemaRegistry, parse_schema
+from manyforge_behavior.node_registry import build_node_registry
+
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
 
 
-class TestCatalogLoading:
-    def test_loads_shipped_catalog(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        assert len(catalog.entries) > 0
-        assert catalog.version == "0.5.0"
-        assert catalog.api_version == "manyforge.node_catalog.v1"
-        assert all(
-            param.schema is not None
-            for entry in catalog.entries
-            for param in entry.parameters
-        )
+def _catalog_data() -> dict[str, object]:
+    return NodeCatalog(CATALOG_PATH).raw_data
 
-    def test_adding_robot_recipe_tracks_shipped_catalog_version(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        recipe = (
-            CATALOG_PATH.parents[2] / "docs" / "operations" / "ADDING_A_ROBOT.md"
-        ).read_text(encoding="utf-8")
-        match = re.search(
-            r"catalog_version:\s*([0-9]+\.[0-9]+\.[0-9]+)"
-            r"\s+# exact value from manyforge_behavior/resources/node_catalog\.yaml",
-            recipe,
-        )
-        assert match is not None
-        assert match.group(1) == catalog.version
 
-    def test_all_entries_have_ids(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        for entry in catalog.entries:
-            assert entry.id
-            assert entry.name
+def _write_recomputed(tmp_path: Path, mutation) -> Path:
+    data = copy.deepcopy(_catalog_data())
+    mutation(data)
+    payload = dict(data)
+    payload.pop("catalog_digest", None)
+    data["catalog_digest"] = "sha256:" + hashlib.sha256(rfc8785.dumps(payload)).hexdigest()
+    path = tmp_path / "catalog.yaml"
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, allow_nan=False),
+        encoding="utf-8",
+    )
+    return path
 
-    def test_get_sequence(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        seq = catalog.get("sequence")
-        assert seq.name == "Sequence"
-        assert seq.kind == "composite"
-        assert seq.children_min == 1
-        assert seq.children_max == -1  # unbounded
-        assert "py_trees" in seq.runners
 
-    def test_parallel_exposes_success_policy_without_failure_thresholds(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        parallel = catalog.get("parallel")
-        success_policy = next(
-            param for param in parallel.parameters if param.name == "success_policy"
-        )
+def test_shipped_catalog_is_exact_frozen_v2_packet() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
 
-        assert success_policy.default == "success_on_all"
-        assert success_policy.profiles_min == "v0.1"
-        assert success_policy.enum_values == ["success_on_all", "success_on_one"]
-        assert "fail-on-any-child-failure" in success_policy.description
+    assert catalog.api_version == EXPECTED_API_VERSION
+    assert catalog.content_version == EXPECTED_CONTENT_VERSION
+    assert catalog.catalog_id == "manyforge_builtin"
+    assert catalog.catalog_digest == EXPECTED_BUILTIN_CATALOG_DIGEST
+    # Presence, not cardinality: the required nodes are present and every
+    # entry has a runner implementation; extra entries are accepted.
+    entry_ids = {entry.id for entry in catalog.entries}
+    assert {
+        "gripper.command_position",
+        "motion.move_to_joint_target",
+        "motion.move_to_pose",
+        "motion.set_tcp",
+        "planning.plan_pick_sequence",
+        "planning.plan_place_sequence",
+    } <= entry_ids
+    assert len(entry_ids) == len(catalog.entries)
+    assert all(entry.runner_implementation_ids for entry in catalog.entries)
 
-    def test_get_move_manipulator(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        move = catalog.get("move_manipulator_action")
-        assert move.kind == "leaf"
-        assert move.children_max == 0
-        assert move.stability == "stable"
-        assert len(move.parameters) > 0
-        move_id_param = next(p for p in move.parameters if p.name == "move_id")
-        assert move_id_param.required is True
-        target_mode_param = next(p for p in move.parameters if p.name == "target_mode")
-        relative_option = next(
-            option
-            for option in target_mode_param.enum_options
-            if option.value == "relative"
-        )
-        assert relative_option.profiles_min == "v0.1"
-        assert relative_option.required_capabilities == []
-        planning_profile_param = next(
-            p for p in move.parameters if p.name == "planning_profile"
-        )
-        assert {
-            option.value: option.required_capabilities
-            for option in planning_profile_param.enum_options
-        } == {
-            "first_feasible": ["planning.profile.first_feasible"],
-            "balanced": ["planning.profile.balanced"],
-            "quality_bounded": ["planning.profile.quality_bounded"],
-        }
-        target_reference = next(
-            p for p in move.parameters if p.name == "target_reference"
-        )
-        assert target_reference.profiles_min == "v0.1"
-        assert target_reference.visible_when is not None
-        assert target_reference.visible_when.param == "target_mode"
-        assert target_reference.visible_when.equals == "relative"
 
-    def test_move_manipulator_per_joint_dynamics_schema_is_strict(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        move = catalog.get("move_manipulator_action")
-        parameter = next(
-            p for p in move.parameters if p.name == "per_joint_dynamics_limits"
-        )
-        assert parameter.schema is not None
+@pytest.mark.parametrize("node_id,parameter_id", [
+    ("gripper.command_position", "position"),
+    ("planning.plan_pick_sequence", "tool_position"),
+    ("planning.plan_place_sequence", "tool_position"),
+])
+@pytest.mark.parametrize("value,valid", [
+    ({"kind": "named_preset", "name": "open"}, True),
+    ({"kind": "named_preset", "name": "closed"}, True),
+    ({"kind": "angular_rad", "value_rad": 0.2}, True),
+    ({"kind": "linear_m", "value_m": 0.008}, True),
+    ({"kind": "named_preset"}, False),
+    ({"kind": "named_preset", "name": "released"}, False),
+    ({"kind": "named_preset", "name": "open", "value_m": 0.0}, False),
+    ({"kind": "linear_m", "value_m": 0.0, "name": "open"}, False),
+    ({"kind": "angular_rad", "value_rad": 0.1, "value_m": 0.0}, False),
+])
+def test_gripper_position_schema_keeps_numeric_and_strict_semantic_aliases(
+    node_id, parameter_id, value, valid,
+) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    parameter = next(row for row in catalog.get(node_id).parameters if row.id == parameter_id)
+    issues = validate_value(parameter.schema, value, registry=catalog.schema_registry)
+    assert (not issues) is valid
 
-        valid = validate_value(
-            parameter.schema,
-            {
-                "joint_1": {
-                    "max_velocity_rad_s": 0.4,
-                    "max_acceleration_rad_s2": 1.5,
-                }
-            },
+
+def test_gripper_program_dwell_policy_is_optional_pause_default() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    assert catalog.content_version == EXPECTED_CONTENT_VERSION
+    gripper = catalog.get("gripper.command_position")
+    policy = next(parameter for parameter in gripper.parameters if parameter.id == "dwell_while_held")
+    assert policy.required is False
+    assert policy.has_default is True
+    assert policy.default == "pause"
+    assert catalog.schema_registry.resolve(policy.schema).enum_values == ("count", "pause")
+    duration = next(parameter for parameter in gripper.parameters if parameter.id == "command_duration_s")
+    assert duration.required is False
+    assert duration.has_default is False
+    assert not validate_value(duration.schema, 0.0, registry=catalog.schema_registry)
+
+
+@pytest.mark.parametrize("value,valid", [
+    ("count", True), ("pause", True), ("continue", False), ("", False),
+    (None, False), (False, False), (0, False), (1.0, False),
+])
+def test_gripper_dwell_policy_uses_the_closed_enum(value, valid) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    policy = next(parameter for parameter in catalog.get("gripper.command_position").parameters
+                  if parameter.id == "dwell_while_held")
+    assert (not validate_value(policy.schema, value, registry=catalog.schema_registry)) is valid
+
+
+@pytest.mark.parametrize("node_id", [
+    "motion.move_to_joint_target",
+    "motion.move_to_pose",
+    "motion.follow_cartesian_path",
+])
+def test_motion_automatic_retry_parameters_are_optional_with_bounded_defaults(node_id) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    parameters = {parameter.id: parameter for parameter in catalog.get(node_id).parameters}
+    retries = parameters["automatic_retries"]
+    delay = parameters["automatic_retry_delay_s"]
+    assert (retries.required, retries.has_default, retries.default) == (False, True, 3)
+    assert (delay.required, delay.has_default, delay.default) == (False, True, 1.0)
+    for value, valid in ((0, True), (10, True), (11, False), (-1, False)):
+        assert (not validate_value(retries.schema, value, registry=catalog.schema_registry)) is valid
+    for value, valid in ((0.0, True), (60.0, True), (60.5, False), (-0.1, False)):
+        assert (not validate_value(delay.schema, value, registry=catalog.schema_registry)) is valid
+
+
+@pytest.mark.parametrize("node_id", [
+    "motion.move_to_joint_target",
+    "motion.move_to_pose",
+    "motion.follow_cartesian_path",
+])
+def test_motion_preemption_parameters_are_optional_with_closed_values(node_id) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    parameters = {parameter.id: parameter for parameter in catalog.get(node_id).parameters}
+    priority = parameters["preemption_priority"]
+    result = parameters["preempted_result"]
+    # The outcome lives in the system-owned node_outcome.<instance_id> key.
+    assert "outcome_key" not in parameters
+    assert (priority.required, priority.has_default, priority.default) == (False, True, 0)
+    assert (result.required, result.has_default, result.default) == (False, True, "failure")
+    for value, valid in ((0, True), (100, True), (101, False), (-1, False)):
+        assert (not validate_value(priority.schema, value, registry=catalog.schema_registry)) is valid
+    for value, valid in (("success", True), ("failure", True), ("aborted", False)):
+        assert (not validate_value(result.schema, value, registry=catalog.schema_registry)) is valid
+
+
+def test_recomputed_previous_catalog_version_is_not_an_alias(tmp_path: Path) -> None:
+    path = _write_recomputed(tmp_path, lambda data: data.__setitem__("content_version", "2.7.0"))
+    with pytest.raises(CatalogValidationError, match=f"content_version must be '{EXPECTED_CONTENT_VERSION}'"):
+        NodeCatalog(path)
+
+
+def test_catalog_exposes_structured_v2_semantics() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    move = catalog.get("motion.move_to_pose")
+
+    assert move.kind == "leaf"
+    assert move.category == "motion"
+    assert move.min_program_profile == "composable-cell-v1"
+    assert move.execution.owner_api == "kernel.operation"
+    assert move.runner_implementation_ids == {"py_trees": "motion_move_to_pose_v1"}
+    assert {parameter.id for parameter in move.parameters} == {
+        "acceleration_scale",
+        "automatic_retries",
+        "automatic_retry_delay_s",
+        "base_frame_role",
+        "cache_mode",
+        "clearance_m",
+        "contact_scene_resource_id",
+        "contact_policy_id",
+        "execution_timeout_s",
+        "goal",
+        "joint_position_tol_rad",
+        "max_tcp_linear_speed_mps",
+        "offset_reference",
+        "per_joint_dynamics_limits",
+        "planner",
+        "planning_timeout_s",
+        "preempted_result",
+        "preemption_priority",
+        "rotation_tol_rad",
+        "target_reference",
+        "target_mode",
+        "target_role",
+        "tcp_endpoint",
+        "translation_tol_m",
+        "velocity_scale",
+    }
+    parameters = {parameter.id: parameter for parameter in move.parameters}
+    for parameter_id, default in {
+        "automatic_retries": 3,
+        "automatic_retry_delay_s": 1.0,
+        "preemption_priority": 0,
+        "preempted_result": "failure",
+    }.items():
+        assert parameters[parameter_id].required is False
+        assert parameters[parameter_id].has_default is True
+        assert parameters[parameter_id].default == default
+    assert "outcome_key" not in parameters
+    assert {
+        (requirement.capability_id, requirement.scope) for requirement in move.required_capabilities
+    } >= {
+        ("planning.motion.pose_goal", "target_binding"),
+        ("execution.trajectory.execute", "target_binding"),
+    }
+    assert {
+        requirement.capability_id
+        for requirement in move.required_capabilities
+        if requirement.effectful
+    } == {"execution.trajectory.execute"}
+
+
+def test_pose_source_observation_is_target_scoped() -> None:
+    assert catalog_module.CAPABILITY_SCOPES["scene.pose.observe"] == "target_binding"
+
+
+def test_effectful_requirements_are_explicit_target_commands() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    expected = {
+        "execution.reset",
+        "execution.runtime_scale.operation_scoped",
+        "execution.stop.soft",
+        "execution.trajectory.execute",
+        "io.gpio.set_output",
+        "tool.gripper.command",
+    }
+    declared = {
+        requirement.capability_id
+        for entry in catalog.entries
+        for requirement in entry.required_capabilities
+        if requirement.effectful
+    }
+    assert declared == expected
+    assert all(
+        requirement.scope == "target_binding"
+        for entry in catalog.entries
+        for requirement in entry.required_capabilities
+        if requirement.effectful
+    )
+
+
+def test_profile_comparison_has_no_legacy_profile_family() -> None:
+    assert profile_satisfied("composable-cell-v1", "composable-cell-v2")
+    assert not profile_satisfied("composable-cell-v2", "composable-cell-v1")
+    assert not profile_satisfied("v0.1", "v0.2")
+
+
+def test_catalog_schema_retains_semantic_role_and_validates_defaults() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    move = catalog.get("motion.move_to_pose")
+    joint_target = catalog.schema_registry.types["joint_target"]
+    target_role = next(parameter for parameter in move.parameters if parameter.id == "target_role")
+    planner = next(parameter for parameter in move.parameters if parameter.id == "planner")
+    joint_name = catalog.schema_registry.resolve(joint_target.properties["joint_name"])
+
+    assert catalog.schema_registry.resolve(target_role.schema).semantic_type == "target_role"
+    assert joint_target.required == ("joint_name", "position_rad")
+    assert joint_name.semantic_type == "source_joint"
+    # Planner block: optional, no default (the Deployment's applies); any
+    # subset of its members, each range-checked.
+    assert planner.has_default is False
+    for value in ({}, {"search": "rrt"}, {"optimize": "best_of_n", "n": 8},
+                  {"collision_check_step_rad": 0.02, "max_nodes": 20000}):
+        assert validate_value(planner.schema, value, registry=catalog.schema_registry) == []
+    for value in ({"search": "prm"}, {"optimize": "balanced"}, {"n": 1},
+                  {"max_nodes": 10}, {"collision_check_step_rad": 0.0}, {"extra": 1}):
+        assert validate_value(planner.schema, value, registry=catalog.schema_registry) != []
+
+    dynamics = catalog.schema_registry.types["per_joint_dynamics_limits"]
+    assert (
+        validate_value(
+            dynamics,
+            {"shoulder_pan_joint": {"max_velocity_rad_s": 1.0}},
             registry=catalog.schema_registry,
-            path="params.per_joint_dynamics_limits",
         )
-        assert valid == []
+        == []
+    )
+    assert validate_value(
+        dynamics,
+        {"shoulder_pan_joint": {"max_velocity_rad_s": 0.0}},
+        registry=catalog.schema_registry,
+    )
 
-        invalid = validate_value(
-            parameter.schema,
-            {
-                "joint_1": {
-                    "max_velocity_rad_s": 0.0,
-                    "unknown_cap": 1.0,
-                }
-            },
+
+def test_reference_frames_name_any_declared_robot_while_effect_frames_stay_scoped() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    registry = catalog.schema_registry
+    reference = registry.resolve(registry.types["motion_reference"])
+    assert reference.properties["type"].enum_values[-1] == "cell_frame"
+    target = registry.resolve(reference.properties["target_role"])
+    assert target.semantic_type == "target_role"
+    assert dict(target.allowed_when) == {"type": "frame_role"}
+    # The unqualified form stays the moving robot's own frame role.
+    frame = registry.resolve(reference.properties["frame_role_id"])
+    assert frame.semantic_scope_parameter == "target_role"
+    # Pick and approach offsets accept every motion-reference form, including
+    # the cell frame and another robot's frame: one shared schema.
+    assert "pick_offset_reference" not in registry.types
+    synthesis = registry.resolve(registry.types["pick_synthesis"])
+    for offset in ("pick_offset_reference", "approach_offset_reference"):
+        assert synthesis.properties[offset].ref == "#/schema_types/motion_reference"
+    move = {parameter.id: parameter for parameter in catalog.get("motion.move_to_pose").parameters}
+    assert registry.resolve(move["base_frame_role"].schema).semantic_scope_parameter == "target_role"
+    assert move["tcp_endpoint"].required is False and move["tcp_endpoint"].has_default
+    endpoint = registry.resolve(move["tcp_endpoint"].schema)
+    assert endpoint.required == ("kind",)
+    assert endpoint.properties["kind"].enum_values == ("current", "default_of_role", "entry")
+    assert registry.resolve(endpoint.properties["target_role"]).semantic_type == "target_role"
+    assert registry.resolve(endpoint.properties["frame_role"]).semantic_type == "frame_role"
+    assert move["tcp_endpoint"].default == {"kind": "current"}
+    for node_id in (
+        "motion.move_to_joint_target",
+        "motion.move_to_pose",
+        "motion.follow_cartesian_path",
+        "motion.move_until_signal",
+        "motion.probe_search",
+    ):
+        selector = next(
+            row for row in catalog.get(node_id).parameters if row.id == "tcp_endpoint"
+        )
+        assert selector.required is False
+        assert selector.default == {"kind": "current"}
+        assert selector.schema.ref == "#/schema_types/tcp_selector"
+
+    set_tcp = catalog.get("motion.set_tcp")
+    assert set_tcp.execution.owner_api == "kernel.operation"
+    assert set_tcp.execution.blocking and set_tcp.execution.cancellable
+    set_tcp_selector = next(row for row in set_tcp.parameters if row.id == "tcp")
+    assert set_tcp_selector.schema.ref == "#/schema_types/tcp_selector"
+    assert {
+        (row.capability_id, row.scope, row.effectful)
+        for row in set_tcp.required_capabilities
+    } == {("execution.trajectory.execute", "target_binding", True)}
+
+    for node_id in ("planning.plan_pick_sequence", "planning.plan_place_sequence"):
+        selector = next(
+            row for row in catalog.get(node_id).parameters if row.id == "tcp_endpoint"
+        )
+        assert selector.required is False
+        assert selector.default == {"kind": "current"}
+        assert selector.schema.ref == "#/schema_types/tcp_selector"
+
+    attach = {
+        row.id: row for row in catalog.get("scene.attach_carried_object").parameters
+    }
+    assert attach["carrier_frame_role"].required is False
+    assert attach["carrier_frame"].schema.ref == "#/schema_types/active_tcp_carrier_frame"
+    # Geometry and Scene nodes choose any declared frame.
+    offset = {
+        parameter.id: parameter
+        for parameter in catalog.get("geometry.offset_pose").parameters
+    }
+    assert offset["offset_frame"].required is False and not offset["offset_frame"].has_default
+    assert offset["offset_frame"].schema.ref == "#/schema_types/pose_frame_ref"
+    object_pose = {
+        parameter.id: parameter for parameter in catalog.get("scene.get_object_pose").parameters
+    }
+    assert object_pose["frame"].schema.ref == "#/schema_types/pose_frame_ref"
+    for node_id, phrase in (
+        ("geometry.offset_pose", "in the pose's own frame"),
+        ("geometry.check_pose_bounds", "first expressed in frame_ref"),
+        ("geometry.check_pose_distance", "Pose B is first expressed in pose A's frame"),
+        ("scene.get_object_pose", "the cell frame when absent"),
+    ):
+        assert phrase in catalog.get(node_id).description
+
+
+@pytest.mark.parametrize(
+    "value,valid",
+    [
+        ({"kind": "current"}, True),
+        ({"kind": "default_of_role", "role": "tool"}, True),
+        ({"kind": "entry", "target_role": "tool", "frame_role": "tcp"}, True),
+        ({"kind": "entry", "target_role": "tool"}, False),
+        ({"kind": "default_of_role", "target_role": "tool", "frame_role": "tcp"}, False),
+        ({"kind": "current", "role": "tool"}, False),
+        ({"kind": "unknown"}, False),
+    ],
+)
+def test_tcp_selector_schema_has_three_closed_forms(value, valid) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    selector = catalog.schema_registry.types["tcp_selector"]
+
+    assert (not validate_value(selector, value, registry=catalog.schema_registry)) is valid
+
+
+@pytest.mark.parametrize(
+    "value,valid",
+    [
+        ({"kind": "active_tcp"}, True),
+        ({"kind": "frame_role", "frame_role": "flange"}, False),
+        ({"kind": "active_tcp", "extra": True}, False),
+    ],
+)
+def test_attach_active_tcp_frame_schema_is_explicit(value, valid) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    attach = {row.id: row for row in catalog.get("scene.attach_carried_object").parameters}
+
+    assert (
+        not validate_value(
+            attach["carrier_frame"].schema,
+            value,
             registry=catalog.schema_registry,
-            path="params.per_joint_dynamics_limits",
         )
-        assert any(
-            issue.path.endswith(".max_velocity_rad_s")
-            and "must be > 0.0" in issue.message
-            for issue in invalid
+    ) is valid
+
+
+@pytest.mark.parametrize(
+    "value,valid",
+    [
+        ({"component_id": "arm", "target_id": "robot", "frame_role_id": "flange"}, True),
+        ({"component_id": "arm", "target_id": "robot"}, False),
+        (
+            {
+                "component_id": "arm",
+                "target_id": "robot",
+                "frame_role_id": "flange",
+                "extra": 1,
+            },
+            False,
+        ),
+    ],
+)
+def test_tcp_entry_schema_is_the_structured_runtime_identity(value, valid) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+
+    assert (
+        not validate_value(
+            catalog.schema_registry.types["tcp_entry"],
+            value,
+            registry=catalog.schema_registry,
         )
-        assert any("must not contain unknown fields" in issue.message for issue in invalid)
-
-    def test_blackboard_metadata_loaded_for_shipped_entries(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        set_key = catalog.get("set_key_bool_value")
-        check_pose = catalog.get("check_pose_distance")
-
-        assert set_key.bb_writer_params == ["key"]
-        assert set_key.bb_reader_params == []
-        assert check_pose.bb_reader_params == ["pose_key_a", "pose_key_b"]
-        assert check_pose.bb_writer_params == []
-
-    def test_shipped_catalog_open_object_params_are_intentional(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        open_params = []
-        for entry in catalog.entries:
-            for param in entry.parameters:
-                if param.schema is None:
-                    continue
-                resolved = catalog.schema_registry.resolve(param.schema)
-                if (
-                    resolved.schema_type == "object"
-                    and resolved.additional_properties is True
-                    and resolved.additional_property_schema is None
-                ):
-                    open_params.append(f"{entry.id}.{param.name}")
-
-        assert open_params == [
-            "fallback_override_node.fallback_params",
-            "recovery_skill_node.recovery_params",
-        ]
-
-    def test_interrupt_metadata_loaded_for_shipped_entries(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        move = catalog.get("move_manipulator_action")
-        wait_signal = catalog.get("wait_for_signal_edge")
-
-        assert move.interruptible is True
-        assert move.default_interrupt_scope == "kernel_motion"
-        assert wait_signal.interruptible is True
-        assert wait_signal.default_interrupt_scope == "active_node"
-
-    def test_get_nonexistent_raises(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        with pytest.raises(KeyError):
-            catalog.get("nonexistent_node_xyz")
-
-    def test_filter_by_profile_v0(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        v0_entries = catalog.filter_by_profile("v0.0")
-        assert all(entry.profiles_min == "v0.0" for entry in v0_entries)
-        v0_ids = {entry.id for entry in v0_entries}
-        # v0.1 entries (post-v0.0)
-        assert "command_gripper" not in v0_ids
-        assert "upsert_collision_object" not in v0_ids
-        assert "attach_object_to_link" not in v0_ids
-        assert "detach_object_from_link" not in v0_ids
-        assert "reset_simulation" not in v0_ids
-        assert "set_simulation_state" not in v0_ids
-        assert "step_simulation" not in v0_ids
-        assert "set_entity_state" not in v0_ids
-        # v0.2 entries: motion-scoped trip nodes
-        assert "move_until_signal" not in v0_ids
-        assert "probe_search_move" not in v0_ids
-        assert "confirm_gripper_grasp" not in v0_ids
-        assert "pick_plan_subtree" not in v0_ids
-        assert len(v0_entries) == len(catalog.entries) - 12
-
-    def test_command_gripper_is_marked_experimental(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        command_gripper = catalog.get("command_gripper")
-        assert command_gripper.stability == "experimental"
-
-    def test_all_entries_have_py_trees_runner(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        for entry in catalog.entries:
-            if entry.kind == "authoring_macro":
-                assert entry.runners == {}
-                continue
-            assert "py_trees" in entry.runners, (
-                f"Entry '{entry.id}' missing py_trees runner"
-            )
-
-    def test_runtime_pause_service_injection_matches_builtin_contract(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        injected = {
-            entry.id
-            for entry in catalog.entries
-            if "runtime_pause_registry" in entry.runtime_injections
-        }
-
-        # Runtime services are catalog-owned metadata after the registry cutover.
-        # Pin the complete migrated set so a permissive **kwargs constructor cannot
-        # silently hide a missing pause/fault channel again.
-        assert injected == {
-            "add_collision_object",
-            "attach_object_to_link",
-            "build_scene_selection_context",
-            "command_gripper",
-            "confirm_gripper_grasp",
-            "detach_object_from_link",
-            "move_manipulator_action",
-            "move_until_signal",
-            "plan_pick_sequence",
-            "probe_search_move",
-            "query_model",
-            "remove_collision_object",
-            "reset_simulation",
-            "set_entity_state",
-            "set_simulation_state",
-            "step_simulation",
-            "update_collision_object_pose",
-            "upsert_collision_object",
-        }
-
-    def test_pick_plan_subtree_is_authoring_only(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        macro = catalog.get("pick_plan_subtree")
-        assert macro.kind == "authoring_macro"
-        assert macro.children_min == 0
-        assert macro.children_max == 0
-        assert macro.runners == {}
+    ) is valid
 
 
-class TestCatalogValidation:
-    def _write_catalog(self, data: dict) -> str:
-        f = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
+def test_catalog_projects_declared_semantic_scope_for_fields_and_array_items() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    attach = catalog.get("scene.attach_carried_object")
+    detach = catalog.get("scene.detach_carried_object")
+    parameters = {parameter.id: parameter for parameter in attach.parameters}
+
+    # ``carried`` is the internal owner/API placement kind.  The operator
+    # vocabulary remains the historical Attached/Detached workflow.
+    assert attach.name == "Attach object"
+    assert detach.name == "Detach object"
+    assert "Attached" in detach.description
+    assert "Detached" in detach.description
+
+    carrier_schema = catalog.schema_registry.to_json_schema(parameters["carrier_frame_role"].schema)
+    touch_schema = catalog.schema_registry.to_json_schema(parameters["touch_body_roles"].schema)
+
+    assert carrier_schema["x-manyforge-semantic-scope-parameter"] == "target_role"
+    assert touch_schema["items"]["x-manyforge-semantic-scope-parameter"] == ("target_role")
+
+
+def test_attach_node_grasp_lost_bound_parameters_have_defaults() -> None:
+    attach = NodeCatalog(CATALOG_PATH).get("scene.attach_carried_object")
+    parameters = {parameter.id: parameter for parameter in attach.parameters}
+    for parameter_id, default in (
+        ("grasp_lost_translation_m", 0.03),
+        ("grasp_lost_rotation_rad", 0.26),
+    ):
+        parameter = parameters[parameter_id]
+        assert parameter.required is False
+        assert parameter.has_default is True
+        assert parameter.default == default
+
+
+def test_attach_node_on_grasp_lost_defaults_and_nullable_key_schema() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    parameter = next(
+        row
+        for row in catalog.get("scene.attach_carried_object").parameters
+        if row.id == "on_grasp_lost"
+    )
+    assert parameter.required is False
+    assert parameter.default == {
+        "raise_alarm": True,
+        "stop_motion": True,
+        "set_key": None,
+        "detach": True,
+    }
+    assert not validate_value(
+        parameter.schema,
+        {"set_key": None},
+        registry=catalog.schema_registry,
+    )
+    assert validate_value(
+        parameter.schema,
+        {"set_key": 12},
+        registry=catalog.schema_registry,
+    )
+    schema = catalog.schema_registry.to_json_schema(parameter.schema)
+    assert schema["properties"]["set_key"]["anyOf"] == [
+        {
+            "type": "string",
+            "x-manyforge-semantic-type": "blackboard_key",
+        },
+        {"type": "null"},
+    ]
+
+
+@pytest.mark.parametrize("parameter_id", [
+    "grasp_lost_translation_m",
+    "grasp_lost_rotation_rad",
+])
+@pytest.mark.parametrize("value,valid", [
+    (-0.01, False),
+    (0.0, False),
+    (0.01, True),
+])
+def test_attach_node_grasp_lost_bounds_require_positive_values(
+    parameter_id, value, valid,
+) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    attach = catalog.get("scene.attach_carried_object")
+    parameter = next(row for row in attach.parameters if row.id == parameter_id)
+    assert (not validate_value(parameter.schema, value, registry=catalog.schema_registry)) is valid
+
+
+def test_recomputed_catalog_rejects_unknown_semantic_scope_parameter(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        attach = next(
+            entry for entry in data["entries"] if entry["id"] == "scene.attach_carried_object"
         )
-        yaml.dump(data, f)
-        f.close()
-        return f.name
+        carrier = next(
+            parameter
+            for parameter in attach["parameters"]
+            if parameter["id"] == "carrier_frame_role"
+        )
+        carrier["schema"]["semantic_scope_parameter"] = "missing_target"
 
-    def _minimal_v1_catalog(self) -> dict:
-        return {
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "schema_types": {
-                "stored_pose": {
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(CatalogValidationError, match="semantic scope references unknown"):
+        NodeCatalog(path)
+
+
+
+def test_key_typed_value_parameters_declare_their_key_and_closed_types() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    registry = catalog.schema_registry
+    setter = {parameter.id: parameter for parameter in catalog.get("logic.set_value").parameters}
+    checker = {parameter.id: parameter for parameter in catalog.get("logic.check_value").parameters}
+
+    assert setter["value"].schema.value_type_from_key == "key"
+    assert setter["value"].schema.value_types == (
+        "bool",
+        "float64",
+        "int64",
+        "stored_pose",
+        "string",
+    )
+    assert checker["value"].schema.value_types == ("bool", "float64", "int64", "string")
+    projected = registry.to_json_schema(setter["value"].schema)
+    assert projected["x-manyforge-value-type-from-key"] == "key"
+    assert [branch.get("type") for branch in projected["anyOf"]] == [
+        "boolean",
+        "number",
+        "integer",
+        "object",
+        "string",
+    ]
+    # Context-free validation is the closed union; the Program narrows it.
+    pose = {
+        "frame_ref": {"kind": "cell_frame"},
+        "position_m": [0.0, 0.0, 0.0],
+        "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+    }
+    for value in (True, 3, 2.5, "text", pose):
+        assert validate_value(setter["value"].schema, value, registry=registry) == []
+    for value in ({"x": 1.0}, [1, 2], None, float("inf")):
+        assert validate_value(setter["value"].schema, value, registry=registry)
+    assert validate_value(checker["value"].schema, pose, registry=registry)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda value, entry: value["schema"].update(value_types=["bool", "int64"]),
+            "value_types must equal the blackboard binding types of 'key'",
+        ),
+        (
+            lambda value, entry: value["schema"].update(value_type_from_key="missing"),
+            "references unknown parameter 'missing'",
+        ),
+        (
+            lambda value, entry: value.update(default=True),
+            "typed by a key and cannot declare a default",
+        ),
+        (
+            lambda value, entry: value["schema"].update(value_types=["stored_pose", "bool"]),
+            "value_types must be sorted",
+        ),
+        (
+            lambda value, entry: value["schema"].update(value_types=["model_response"]),
+            "value_types must be a non-empty subset",
+        ),
+        (
+            lambda value, entry: value.update(
+                schema={"type": "bool", "value_type_from_key": "key"}
+            ),
+            "require type=key_value",
+        ),
+        (
+            lambda value, entry: value.update(
+                schema={
                     "type": "object",
-                    "additional_properties": False,
-                    "required": ["frame_id", "position_m"],
-                    "properties": {
-                        "frame_id": {"type": "string"},
-                        "position_m": {"type": "array", "items": "float", "length": 3},
-                        "orientation_xyzw": {"type": "array", "items": "float", "length": 4},
-                        "orientation_rpy_deg": {"type": "array", "items": "float", "length": 3},
-                    },
-                    "exactly_one": [["orientation_xyzw", "orientation_rpy_deg"]],
-                },
-                "shape": {
-                    "type": "object",
-                    "additional_properties": False,
-                    "required": ["type"],
-                    "properties": {
-                        "type": {"type": "enum", "values": ["box", "sphere"]},
-                        "box_dimensions_m": {
-                            "type": "array",
-                            "items": "float",
-                            "length": 3,
-                            "required_when": {"type": "box"},
-                            "allowed_when": {"type": "box"},
-                        },
-                        "sphere_radius_m": {
-                            "type": "float",
-                            "constraints": {"min_exclusive": 0.0},
-                            "required_when": {"type": "sphere"},
-                            "allowed_when": {"type": "sphere"},
-                        },
-                    },
-                },
-            },
-            "entries": [
-                {
-                    "id": "upsert_collision_object",
-                    "name": "UpsertCollisionObject",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {
-                            "name": "object_id",
-                            "required": True,
-                            "schema": {"type": "string"},
-                        },
-                        {
-                            "name": "pose",
-                            "required": True,
-                            "schema_ref": "#/schema_types/stored_pose",
-                            "ui_editor": "pose",
-                        },
-                        {
-                            "name": "shape",
-                            "required": True,
-                            "schema_ref": "#/schema_types/shape",
-                            "ui_editor": "shape",
-                        },
-                    ],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
+                    "properties": {"nested": dict(value["schema"])},
+                }
+            ),
+            "nests a key-typed value",
+        ),
+        (
+            lambda value, entry: value["schema"].pop("value_type_from_key"),
+            "key_value parameter needs value_type_from_key",
+        ),
+    ],
+)
+def test_recomputed_catalog_rejects_inconsistent_key_typed_declarations(
+    tmp_path: Path, mutation, message
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        entry = next(entry for entry in data["entries"] if entry["id"] == "logic.set_value")
+        value = next(parameter for parameter in entry["parameters"] if parameter["id"] == "value")
+        mutation(value, entry)
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(CatalogValidationError, match=message):
+        NodeCatalog(path)
+
+def test_boolean_logic_is_one_condition_check_over_typed_values() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    ids = {entry.id for entry in catalog.entries}
+
+    assert not ids & {"logic.check_bool", "logic.set_bool", "logic.wait_for_bool"}
+    condition = catalog.get("logic.check_condition")
+    assert (condition.name, condition.category) == ("Check condition", "logic")
+    assert [(parameter.id, parameter.required) for parameter in condition.parameters] == [
+        ("condition", True)
+    ]
+    assert condition.parameters[0].schema.schema_type == "bool"
+    assert condition.execution.owner_api == "orchestration.blackboard"
+    assert condition.runner_implementation_ids == {"py_trees": "logic_check_condition_v1"}
+
+
+def test_check_input_reads_one_input_like_get_input() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    check = catalog.get("io.check_input")
+    get = catalog.get("io.get_input")
+
+    assert (check.name, check.category) == ("Check input", "io")
+    assert [parameter.id for parameter in check.parameters] == [
+        "target_role",
+        "resource_role",
+        "expected_value",
+        "mock_simulation",
+    ]
+    assert check.parameters[2].schema.schema_type == "bool"
+    assert check.required_capabilities == get.required_capabilities
+    assert check.execution.owner_api == get.execution.owner_api
+    assert not check.blackboard_writes
+
+
+def test_query_model_template_variables_are_a_map_of_typed_values() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    registry = catalog.schema_registry
+    parameter = next(
+        parameter
+        for parameter in catalog.get("assistant.query_model").parameters
+        if parameter.id == "template_variables"
+    )
+    schema = registry.resolve(parameter.schema)
+
+    assert {"value_source", "template_variable_binding"}.isdisjoint(registry.types)
+    assert parameter.default == {}
+    assert schema.schema_type == "object" and not schema.properties
+    entry = schema.additional_property_schema
+    assert entry.schema_type == "key_value" and entry.value_type_from_key is None
+    assert entry.value_types == ("bool", "float64", "int64", "string", "string_list")
+    for value in ({}, {"text": "a", "ids": ["a", "b"], "count": 2, "flag": True}):
+        assert validate_value(parameter.schema, value, registry=registry) == []
+    for value in ([], {"pose": {"x": 1.0}}, {"ids": ["a", 1]}):
+        assert validate_value(parameter.schema, value, registry=registry)
+
+
+def test_catalog_preserves_assistant_and_planning_only_pick_place_contracts() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+
+    query = catalog.get("assistant.query_model")
+    assert {
+        "model_endpoint_alias",
+        "prompt_template_id",
+        "template_variables",
+        "scene_attachment",
+        "output_key",
+        "timeout_s",
+        "min_confidence",
+    } <= {parameter.id for parameter in query.parameters}
+
+    for node_id, owner_api in (
+        ("planning.plan_pick_sequence", "planning.pick_sequence"),
+        ("planning.plan_place_sequence", "planning.place_sequence"),
+    ):
+        preview = catalog.get(node_id)
+        assert preview.execution.owner_api == owner_api
+        assert preview.blackboard_writes[0].value_type == "pick_planning_result"
+        selected_object = next(
+            parameter
+            for parameter in preview.parameters
+            if parameter.id == "selected_object_id"
+        )
+        assert (
+            catalog.schema_registry.resolve(selected_object.schema).semantic_type
+            == "scene_resource"
+        )
+
+    with pytest.raises(KeyError):
+        catalog.get("motion.pick_object")
+    with pytest.raises(KeyError):
+        catalog.get("motion.place_object")
+
+    with pytest.raises(KeyError):
+        catalog.get("motion.invalidate_cached_plans")
+
+
+@pytest.mark.parametrize(
+    "api_version",
+    ["manyforge.node_catalog.v0", "manyforge.node_catalog.v1"],
+)
+def test_old_catalog_apis_are_not_runtime_inputs(
+    tmp_path: Path,
+    api_version: str,
+) -> None:
+    path = _write_recomputed(
+        tmp_path,
+        lambda data: data.__setitem__("api_version", api_version),
+    )
+
+    with pytest.raises(
+        CatalogValidationError,
+        match="api_version must be 'manyforge.node_catalog.v2'",
+    ):
+        NodeCatalog(path)
+
+
+def test_catalog_digest_is_computed_over_rfc8785_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert NodeCatalog(CATALOG_PATH).diagnostics == ()
+    data = _catalog_data()
+    data["entries"][0]["name"] = "Changed without digest"
+    stale = data["catalog_digest"]
+    payload = dict(data)
+    payload.pop("catalog_digest")
+    computed = "sha256:" + hashlib.sha256(rfc8785.dumps(payload)).hexdigest()
+    # The frozen-packet pin (if still present) is a separate check.
+    monkeypatch.setattr(
+        catalog_module, "EXPECTED_BUILTIN_CATALOG_DIGEST", computed, raising=False
+    )
+    path = tmp_path / "catalog.yaml"
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    catalog = NodeCatalog(path)
+
+    assert catalog.catalog_digest == computed != stale
+    assert catalog.raw_data["catalog_digest"] == computed
+    assert [row["code"] for row in catalog.diagnostics] == ["edited_outside_manyforge"]
+
+
+def test_recomputed_packet_change_cannot_reuse_frozen_content_version(
+    tmp_path: Path,
+) -> None:
+    path = _write_recomputed(
+        tmp_path,
+        lambda data: data["entries"][0].__setitem__(
+            "name",
+            "Semantically valid but not the frozen packet",
+        ),
+    )
+
+    with pytest.raises(
+        CatalogValidationError,
+        match="does not match the frozen built-in",
+    ):
+        NodeCatalog(path)
+
+
+def test_strict_loader_rejects_duplicate_keys(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate.yaml"
+    path.write_text(
+        "api_version: manyforge.node_catalog.v2\n" "api_version: manyforge.node_catalog.v2\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CatalogValidationError, match="duplicate mapping key"):
+        NodeCatalog(path)
+
+
+def test_strict_loader_rejects_excessive_nesting(tmp_path: Path) -> None:
+    path = tmp_path / "deep.yaml"
+    path.write_text(("[" * 140) + "null" + ("]" * 140), encoding="utf-8")
+
+    with pytest.raises(CatalogValidationError, match="nesting exceeds"):
+        NodeCatalog(path)
+
+
+def test_recomputed_catalog_cannot_add_runner_import_metadata(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        data["entries"][0]["runners"]["py_trees"]["module"] = "unsafe.module"
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(CatalogValidationError, match="unknown fields.*module"):
+        NodeCatalog(path)
+
+
+def test_distinct_nodes_may_share_one_registered_implementation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        data["entries"][1]["runners"]["py_trees"]["implementation_id"] = data["entries"][0][
+            "runners"
+        ]["py_trees"]["implementation_id"]
+
+    path = _write_recomputed(tmp_path, mutate)
+    digest = json.loads(path.read_text(encoding="utf-8"))["catalog_digest"]
+    monkeypatch.setattr(
+        catalog_module,
+        "EXPECTED_BUILTIN_CATALOG_DIGEST",
+        digest,
+    )
+    catalog = NodeCatalog(path)
+    registry = build_node_registry(catalog)
+    node_ids = [
+        entry["id"] for entry in json.loads(path.read_text(encoding="utf-8"))["entries"][:2]
+    ]
+
+    assert (
+        registry.record(node_ids[0]).implementation_id
+        == registry.record(node_ids[1]).implementation_id
+    )
+
+
+def test_recomputed_catalog_rejects_wrong_capability_scope(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        move = next(entry for entry in data["entries"] if entry["id"] == "motion.move_to_pose")
+        move["required_capabilities"][0]["scope"] = "cell_global"
+        move["required_capabilities"][0].pop("target_parameter")
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(CatalogValidationError, match="scope must be 'target_binding'"):
+        NodeCatalog(path)
+
+
+def test_recomputed_catalog_rejects_effectful_non_target_requirement(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        move = next(entry for entry in data["entries"] if entry["id"] == "motion.move_to_pose")
+        collision = next(
+            requirement
+            for requirement in move["required_capabilities"]
+            if requirement["capability_id"] == "collision.query.pre_execution"
+        )
+        collision["effectful"] = True
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(CatalogValidationError, match="valid only for target_binding"):
+        NodeCatalog(path)
+
+
+def test_recomputed_catalog_rejects_source_joint_without_one_target_scope(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        move = next(
+            entry for entry in data["entries"] if entry["id"] == "motion.move_to_joint_target"
+        )
+        target = next(
+            parameter for parameter in move["parameters"] if parameter["id"] == "target_role"
+        )
+        target["schema"]["semantic_type"] = "component_role"
+        # Frame roles are scoped by target_role; unscope them so this
+        # mutation reaches the source_joint rule under test.
+        for parameter in move["parameters"]:
+            parameter.get("schema", {}).pop("semantic_scope_parameter", None)
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(
+        CatalogValidationError,
+        match="source_joint semantics require exactly one target_role parameter",
+    ):
+        NodeCatalog(path)
+
+
+def test_recomputed_catalog_rejects_runtime_identity_parameter(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        timer = next(entry for entry in data["entries"] if entry["id"] == "timer")
+        timer["parameters"][0]["id"] = "controller_name"
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(
+        CatalogValidationError,
+        match="forbidden runtime identity",
+    ):
+        NodeCatalog(path)
+
+
+def test_cancellable_leaves_declare_interrupted_and_others_never_do() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    leaves = [entry for entry in catalog.entries if entry.kind == "leaf"]
+
+    assert leaves
+    for entry in leaves:
+        # The timer's own work cannot fail: it succeeds or is interrupted.
+        expected = ({"success"} if entry.id == "timer" else {"success", "failure"}) | (
+            {"interrupted"} if entry.execution.cancellable else set()
+        )
+        assert set(entry.outcomes) == expected, entry.id
+    assert catalog.get("gripper.wait_for_status").outcomes["interrupted"] == "cancelled"
+    assert dict(catalog.get("timer").outcomes) == {
+        "success": "elapsed",
+        "interrupted": "cancelled",
+    }
+
+
+def test_recomputed_catalog_requires_a_leaf_success_outcome(tmp_path: Path) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        entry = next(row for row in data["entries"] if row["id"] == "timer")
+        entry["outcomes"] = {"failure": "timer_failed", "interrupted": "cancelled"}
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(
+        CatalogValidationError,
+        match=r"outcomes is missing required fields \['success'\]",
+    ):
+        NodeCatalog(path)
+
+
+@pytest.mark.parametrize("node_id", ["gripper.wait_for_status", "timer"])
+@pytest.mark.parametrize("mutation", ["omit_interrupted", "omit_outcomes"])
+def test_recomputed_catalog_rejects_cancellable_leaf_without_interrupted(
+    tmp_path: Path, node_id: str, mutation: str
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        entry = next(row for row in data["entries"] if row["id"] == node_id)
+        if mutation == "omit_outcomes":
+            entry.pop("outcomes")
+        else:
+            entry["outcomes"].pop("interrupted")
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(
+        CatalogValidationError,
+        match=r"outcomes is missing required fields \[.*'interrupted'.*\]",
+    ):
+        NodeCatalog(path)
+
+
+def test_recomputed_catalog_rejects_interrupted_on_non_cancellable_leaf(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        entry = next(row for row in data["entries"] if row["id"] == "gripper.check_status")
+        assert entry["execution"]["cancellable"] is False
+        entry["outcomes"]["interrupted"] = "cancelled"
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(
+        CatalogValidationError,
+        match=r"outcomes has unknown fields \['interrupted'\]",
+    ):
+        NodeCatalog(path)
+
+
+def test_recomputed_catalog_rejects_authoring_schema_as_persisted_parameter(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        timer = next(entry for entry in data["entries"] if entry["id"] == "timer")
+        timer["parameters"][0].pop("schema")
+        timer["parameters"][0]["schema_ref"] = "#/schema_types/pose_authoring_input"
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(CatalogValidationError, match="authoring-only schema"):
+        NodeCatalog(path)
+
+
+def test_recomputed_catalog_rejects_blackboard_control_protocol(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        getter = next(entry for entry in data["entries"] if entry["id"] == "io.get_input")
+        getter["parameters"][2]["id"] = "stop_requested"
+        getter["blackboard"]["writes"][0]["key_parameter"] = "stop_requested"
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(
+        CatalogValidationError,
+        match="forbidden execution-control blackboard protocol",
+    ):
+        NodeCatalog(path)
+
+
+def test_legacy_catalog_model_fields_are_removed() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    parameter = catalog.get("timer").parameters[0]
+
+    assert not hasattr(catalog, "version")
+    assert not hasattr(parameter, "name")
+    assert not hasattr(parameter, "type")
+    assert not hasattr(parameter, "enum_values")
+    assert not hasattr(catalog.get("timer"), "runtime_injections")
+
+
+def test_parsed_schema_maps_are_deeply_read_only() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    stored_pose = catalog.schema_registry.types["stored_pose"]
+
+    with pytest.raises(TypeError):
+        catalog.schema_registry.types["forged"] = stored_pose  # type: ignore[index]
+    with pytest.raises(TypeError):
+        stored_pose.properties["forged"] = stored_pose  # type: ignore[index]
+
+    shape = catalog.schema_registry.types["shape"]
+    box_dimensions = shape.properties["box_dimensions_m"]
+    with pytest.raises(TypeError):
+        box_dimensions.required_when["type"] = "mesh"  # type: ignore[index]
+
+    timer = catalog.get("timer")
+    with pytest.raises(TypeError):
+        timer.outcomes["success"] = "forged"  # type: ignore[index]
+
+
+def test_nested_parameter_defaults_are_transitively_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        add = next(entry for entry in data["entries"] if entry["id"] == "scene.add_object")
+        shape = next(parameter for parameter in add["parameters"] if parameter["id"] == "shape")
+        shape["default"] = {
+            "type": "box",
+            "box_dimensions_m": [1.0, 2.0, 3.0],
         }
 
-    def test_loads_v1_schema_catalog_and_derives_legacy_labels(self):
-        path = self._write_catalog(self._minimal_v1_catalog())
-        try:
-            catalog = NodeCatalog(path)
-            assert catalog.api_version == "manyforge.node_catalog.v1"
-            assert catalog.version == "0.2.0"
-            entry = catalog.get("upsert_collision_object")
-            pose_param = next(param for param in entry.parameters if param.name == "pose")
-            shape_param = next(param for param in entry.parameters if param.name == "shape")
-            assert pose_param.schema is not None
-            assert pose_param.type == "dict"
-            assert shape_param.type == "dict"
-            projected = catalog.schema_registry.to_json_schema(shape_param.schema)
-            assert projected["type"] == "object"
-            assert projected["additionalProperties"] is False
-            assert "allOf" in projected
-        finally:
-            os.unlink(path)
+    path = _write_recomputed(tmp_path, mutate)
+    digest = json.loads(path.read_text(encoding="utf-8"))["catalog_digest"]
+    monkeypatch.setattr(
+        catalog_module,
+        "EXPECTED_BUILTIN_CATALOG_DIGEST",
+        digest,
+    )
+    catalog = NodeCatalog(path)
+    default = next(
+        parameter.default
+        for parameter in catalog.get("scene.add_object").parameters
+        if parameter.id == "shape"
+    )
 
-    def test_v1_rejects_legacy_parameter_keys(self):
-        data = self._minimal_v1_catalog()
-        data["entries"][0]["parameters"][0]["type"] = "string"
-        path = self._write_catalog(data)
-        try:
-            with pytest.raises(CatalogValidationError, match="remove legacy keys"):
-                NodeCatalog(path)
-        finally:
-            os.unlink(path)
+    with pytest.raises(TypeError):
+        default["type"] = "sphere"
+    with pytest.raises(TypeError):
+        default["box_dimensions_m"][0] = 99.0
 
-    def test_rejects_non_boolean_required_flag(self):
-        data = self._minimal_v1_catalog()
-        data["entries"][0]["parameters"][0]["required"] = "false - stray"
-        path = self._write_catalog(data)
-        try:
-            with pytest.raises(CatalogValidationError, match="required must be a boolean"):
-                NodeCatalog(path)
-        finally:
-            os.unlink(path)
 
-    def test_schema_hash_preserves_description_property_name(self):
-        registry = CatalogSchemaRegistry()
-        empty_schema = parse_schema(
-            {
-                "type": "object",
-                "additional_properties": False,
-                "properties": {},
-            },
-            path="empty",
-        )
-        description_string_schema = parse_schema(
-            {
-                "type": "object",
-                "additional_properties": False,
-                "properties": {
-                    "description": {"type": "string", "description": "prose"},
-                },
-            },
-            path="with_description",
-        )
-        description_int_schema = parse_schema(
-            {
-                "type": "object",
-                "additional_properties": False,
-                "properties": {
-                    "description": {"type": "int", "description": "prose"},
-                },
-            },
-            path="with_description",
-        )
-
-        assert registry.schema_hash(empty_schema) != registry.schema_hash(
-            description_string_schema
-        )
-        assert registry.schema_hash(description_string_schema) != registry.schema_hash(
-            description_int_schema
-        )
-
-    def test_v1_schema_validator_rejects_unknown_and_missing_pose_fields(self):
-        path = self._write_catalog(self._minimal_v1_catalog())
-        try:
-            catalog = NodeCatalog(path)
-            pose_schema = catalog.get("upsert_collision_object").parameters[1].schema
-            assert pose_schema is not None
-            issues = validate_value(
-                pose_schema,
-                {
-                    "frame_id": "base_link",
-                    "position_m": [0.0, 0.0, 0.0],
-                    "unexpected": True,
-                },
-                registry=catalog.schema_registry,
-                path="params.pose",
-            )
-            messages = [issue.message for issue in issues]
-            assert any("unknown fields" in message for message in messages)
-            assert any("exactly one" in message for message in messages)
-        finally:
-            os.unlink(path)
-
-    def test_v1_requires_parameter_schema(self):
-        data = self._minimal_v1_catalog()
-        del data["entries"][0]["parameters"][0]["schema"]
-        path = self._write_catalog(data)
-        try:
-            with pytest.raises(CatalogValidationError, match="v1 parameters require schema"):
-                NodeCatalog(path)
-        finally:
-            os.unlink(path)
-
-    def test_v1_rejects_invalid_schema_ref(self):
-        data = self._minimal_v1_catalog()
-        data["entries"][0]["parameters"][1]["schema_ref"] = "#/schema_types/missing"
-        path = self._write_catalog(data)
-        try:
-            with pytest.raises(CatalogValidationError, match="Unknown schema reference"):
-                NodeCatalog(path)
-        finally:
-            os.unlink(path)
-
-    def test_v1_rejects_invalid_schema_default(self):
-        data = self._minimal_v1_catalog()
-        data["entries"][0]["parameters"][0]["default"] = 123
-        path = self._write_catalog(data)
-        try:
-            with pytest.raises(CatalogValidationError, match="default.*must be a string"):
-                NodeCatalog(path)
-        finally:
-            os.unlink(path)
-
-    def test_v1_rejects_unknown_schema_keys(self):
-        data = self._minimal_v1_catalog()
-        data["schema_types"]["stored_pose"]["additionalProperties"] = False
-        path = self._write_catalog(data)
-        try:
-            with pytest.raises(CatalogValidationError, match="unsupported schema keys"):
-                NodeCatalog(path)
-        finally:
-            os.unlink(path)
-
-    def test_v1_rejects_invalid_allowed_when_ref(self):
-        data = self._minimal_v1_catalog()
-        data["schema_types"]["shape"]["properties"]["sphere_radius_m"]["allowed_when"] = {
-            "missing": "sphere",
-        }
-        path = self._write_catalog(data)
-        try:
-            with pytest.raises(CatalogValidationError, match="allowed_when references unknown field"):
-                NodeCatalog(path)
-        finally:
-            os.unlink(path)
-
-    def test_v1_schema_validator_rejects_disallowed_conditional_fields(self):
-        path = self._write_catalog(self._minimal_v1_catalog())
-        try:
-            catalog = NodeCatalog(path)
-            shape_schema = catalog.get("upsert_collision_object").parameters[2].schema
-            assert shape_schema is not None
-            issues = validate_value(
-                shape_schema,
-                {
-                    "type": "box",
-                    "box_dimensions_m": [0.1, 0.2, 0.3],
-                    "sphere_radius_m": 0.05,
-                },
-                registry=catalog.schema_registry,
-                path="params.shape",
-            )
-            assert any(
-                issue.path == "params.shape.sphere_radius_m"
-                and "only allowed when type=sphere" in issue.message
-                for issue in issues
-            )
-            projected = catalog.schema_registry.to_json_schema(shape_schema)
-            assert any(
-                branch.get("then") == {"not": {"required": ["sphere_radius_m"]}}
-                for branch in projected.get("allOf", [])
-            )
-        finally:
-            os.unlink(path)
-
-    def test_v1_schema_validator_checks_additional_property_schema(self):
-        data = self._minimal_v1_catalog()
-        data["entries"][0]["parameters"].append(
-            {
-                "name": "per_joint_limits",
-                "required": False,
-                "schema": {
-                    "type": "object",
-                    "additional_properties": {
-                        "type": "float",
-                        "constraints": {"min_exclusive": 0.0},
-                    },
-                },
-            }
-        )
-        path = self._write_catalog(data)
-        try:
-            catalog = NodeCatalog(path)
-            schema = catalog.get("upsert_collision_object").parameters[3].schema
-            assert schema is not None
-            issues = validate_value(
-                schema,
-                {"joint_1": 1.0, "joint_2": -0.1},
-                registry=catalog.schema_registry,
-                path="params.per_joint_limits",
-            )
-            assert any(
-                issue.path == "params.per_joint_limits.joint_2"
-                and "must be > 0.0" in issue.message
-                for issue in issues
-            )
-            projected = catalog.schema_registry.to_json_schema(schema)
-            assert projected["additionalProperties"] == {
-                "type": "number",
-                "exclusiveMinimum": 0.0,
-            }
-        finally:
-            os.unlink(path)
-
-    def test_rejects_bad_api_version(self):
-        path = self._write_catalog({
-            "api_version": "wrong.version",
-            "catalog_version": "0.2.0",
-            "entries": [],
-        })
-        with pytest.raises(CatalogValidationError, match="api_version"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_v0_runtime_catalog(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
-            "entries": [],
-        })
-        with pytest.raises(CatalogValidationError, match="api_version"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_bad_catalog_version(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "not-semver",
-            "entries": [],
-        })
-        with pytest.raises(CatalogValidationError, match="catalog_version"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_duplicate_ids(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "dup",
-                    "name": "Dup1",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-                {
-                    "id": "dup",
-                    "name": "Dup2",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="Duplicate"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_leaf_with_children(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_leaf",
-                    "name": "BadLeaf",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 5},
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="leaf"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_decorator_wrong_children(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_dec",
-                    "name": "BadDec",
-                    "kind": "decorator",
-                    "children": {"min": 0, "max": 3},
-                    "runners": {"py_trees": {"implementation_kind": "native"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="decorator"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_enum_without_values(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_enum",
-                    "name": "BadEnum",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {"name": "mode", "schema": {"type": "enum"}, "required": True},
-                    ],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="enum"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_derives_enum_values_from_enum_options(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "enum_options_node",
-                    "name": "EnumOptionsNode",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {
-                            "name": "mode",
-                            "schema": {"type": "enum", "values": ["a", "b"]},
-                            "required": True,
-                            "enum_options": [
-                                {"value": "a"},
-                                {"value": "b", "profiles": {"min_profile": "v0.1"}},
-                            ],
-                        },
-                    ],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        try:
-            param = NodeCatalog(path).get("enum_options_node").parameters[0]
-            assert param.enum_values == ["a", "b"]
-            assert [option.value for option in param.enum_options] == ["a", "b"]
-            assert param.enum_options[1].profiles_min == "v0.1"
-        finally:
-            os.unlink(path)
-
-    def test_rejects_enum_values_that_do_not_match_enum_options(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_enum_options",
-                    "name": "BadEnumOptions",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {
-                            "name": "mode",
-                            "schema": {"type": "enum", "values": ["a", "b"]},
-                            "required": True,
-                            "enum_options": [{"value": "a"}, {"value": "c"}],
-                        },
-                    ],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="enum_options values must match"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_duplicate_enum_options(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_duplicate_enum_options",
-                    "name": "BadDuplicateEnumOptions",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {
-                            "name": "mode",
-                            "schema": {"type": "enum", "values": ["a", "b"]},
-                            "required": True,
-                            "enum_options": [{"value": "a"}, {"value": "a"}],
-                        },
-                    ],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="enum_options values must match"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_unknown_enum_option_required_capability(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_enum_option_capability",
-                    "name": "BadEnumOptionCapability",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {
-                            "name": "mode",
-                            "schema": {"type": "enum", "values": ["a"]},
-                            "required": True,
-                            "enum_options": [
-                                {
-                                    "value": "a",
-                                    "required_capabilities": ["unknown.capability.key"],
-                                },
-                            ],
-                        },
-                    ],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="unknown required_capabilities"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_visible_when_unknown_parameter(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_visible_when",
-                    "name": "BadVisibleWhen",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {
-                            "name": "value",
-                            "schema": {"type": "string"},
-                            "required": False,
-                            "visible_when": {"param": "missing", "equals": "x"},
-                        },
-                    ],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="visible_when.param"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_missing_py_trees_runner(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "no_runner",
-                    "name": "NoRunner",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "runners": {"btcpp": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="py_trees"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_authoring_macro_requires_no_runtime_runner(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "authoring_template",
-                    "name": "AuthoringTemplate",
-                    "kind": "authoring_macro",
-                    "children": {"min": 0, "max": 0},
-                    "runners": {},
-                },
-            ],
-        })
-        try:
-            catalog = NodeCatalog(path)
-            assert catalog.get("authoring_template").runners == {}
-        finally:
-            os.unlink(path)
-
-    def test_rejects_runtime_runner_on_authoring_macro(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_authoring_template",
-                    "name": "BadAuthoringTemplate",
-                    "kind": "authoring_macro",
-                    "children": {"min": 0, "max": 0},
-                    "runners": {
-                        "py_trees": {"implementation_kind": "plugin"},
-                    },
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="must not declare runtime runners"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_unknown_required_capability(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_capability",
-                    "name": "BadCapability",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "required_capabilities": ["unknown.capability.key"],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="unknown required_capabilities"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_unknown_stability(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_stability",
-                    "name": "BadStability",
-                    "stability": "preview",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="stability"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_blackboard_metadata_for_unknown_parameter(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bb_bad",
-                    "name": "BadBlackboardNode",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {"name": "known", "schema": {"type": "string"}, "required": True},
-                    ],
-                    "bb_reader_params": ["missing"],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="unknown parameter 'missing'"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_duplicate_blackboard_metadata_names(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bb_dup",
-                    "name": "DuplicateBlackboardNode",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {"name": "key", "schema": {"type": "string"}, "required": True},
-                    ],
-                    "bb_writer_params": ["key", "key"],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="duplicate parameter names"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_default_interrupt_scope_without_interruptible(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "interrupt_bad",
-                    "name": "InterruptBad",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "default_interrupt_scope": "active_node",
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="requires interruptible=true"):
-            NodeCatalog(path)
-        os.unlink(path)
+def test_joint_goal_exposes_the_same_explicit_contact_inputs_as_pose_goal() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    joint = {row.id: row for row in catalog.get('motion.move_to_joint_target').parameters}
+    pose = {row.id: row for row in catalog.get('motion.move_to_pose').parameters}
+    for name in ('contact_policy_id', 'contact_scene_resource_id'):
+        assert joint[name].required is False
+        assert joint[name].has_default is False
+        assert joint[name].schema == pose[name].schema

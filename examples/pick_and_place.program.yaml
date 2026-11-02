@@ -1,41 +1,68 @@
-api_version: manyforge.program.v0
-program_profile: v0.1
+api_version: manyforge.program.v2
+program_id: pick_and_place_demo
+program_revision: sha256:4957202661013f282df3b08857fa6a88d10071425fc3f9905a0fd41c486dc3b8
+program_profile: composable-cell-v1
 name: pick_and_place_demo
-description: "Pick-and-place demo with UR5 + RoboPlan: approach/pick/retreat/drop\
-  \ sequence using backend-resolved relative pick goals, collision-aware motion planning\
-  \ (RRT + TOPPRA), gripper simulation, and cache invalidation. Sequence follows manymove\
-  \ pattern: approach \u2192 pick \u2192 retreat \u2192 approach drop \u2192 drop\
-  \ \u2192 retreat \u2192 rest."
+description: Pick-and-place demo for the UR5 source model. It preserves the original approach, pick, retreat,
+  drop, detach, and rest motion sequence while keeping the intentionally simulated gripper state as ordinary
+  Program data. Exact scene and attachment revisions now invalidate planning automatically.
+catalog:
+  api_version: manyforge.node_catalog.v2
+  content_version: 2.9.0
 compatibility:
-  lanes: [manyforge-only]
+  lanes:
+  - manyforge-only
   assistant: forbidden
   requires: []
-  tags: [pick-and-place, ur5]
-catalog_version: "0.5.0"
-robot:
-  robot_id: ur5
-  group_id: arm
-  base_frame: base_link
-  tcp_frame: tool0
+  tags:
+  - pick-and-place
+  - ur5
+component_roles:
+  robot:
+    required_component_type_tags:
+    - articulated-arm
+    required_model_roles:
+    - arm_model
+target_roles:
+  arm:
+    component_role: robot
+    required_capabilities:
+    - capability_id: execution.feedback.phase_events
+      parameters: {}
+      disposition: required
+    - capability_id: execution.trajectory.execute
+      parameters: {}
+      disposition: required
+    - capability_id: model.kinematics.fk
+      parameters: {}
+      disposition: required
+    - capability_id: planning.motion.joint_goal
+      parameters: {}
+      disposition: required
+    - capability_id: planning.motion.pose_goal
+      parameters: {}
+      disposition: required
+    - capability_id: planning.trajectory.time_parameterized
+      parameters: {}
+      disposition: required
+    - capability_id: state.observed.current
+      parameters: {}
+      disposition: required
+    - capability_id: validation.trajectory.non_collision
+      parameters: {}
+      disposition: required
+    required_frame_roles:
+    - base
+    - tcp
+    required_resource_roles:
+    - arm_joints
+    required_collision_body_roles:
+    - arm_collision
+    - tool_collision
+    required_model_roles:
+    - arm_model
 scene:
-- object_id: ground
-  shape:
-    type: box
-    box_dimensions_m:
-    - 1
-    - 1
-    - 0.2
-  pose:
-    frame_id: universe
-    position_m:
-    - 0
-    - 0
-    - -0.11
-    orientation_rpy_deg:
-    - 0
-    - 0
-    - 0
-- object_id: graspable
+- scene_resource_id: graspable
   shape:
     type: box
     box_dimensions_m:
@@ -43,226 +70,310 @@ scene:
     - 0.01
     - 0.01
   pose:
-    frame_id: universe
+    frame_ref:
+      kind: cell_frame
     position_m:
     - 0.3
     - -0.3
     - 0.15
-    orientation_rpy_deg:
-    - 0
-    - 0
-    - -45
+    orientation:
+      rpy_deg:
+      - 0.0
+      - 0.0
+      - -45.0
+  resource_roles:
+  - pick_object
+- scene_resource_id: ground
+  shape:
+    type: box
+    box_dimensions_m:
+    - 1.0
+    - 1.0
+    - 0.2
+  pose:
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - 0.0
+    - 0.0
+    - -0.11
+    orientation:
+      rpy_deg:
+      - 0.0
+      - 0.0
+      - 0.0
 parameters:
-- name: velocity_scale
-  type: float
+- parameter_id: velocity_scale
+  type: float64
   default: 0.5
   constraints:
-    min_exclusive: 0
-    max_inclusive: 1
+    min_exclusive: 0.0
+    max_inclusive: 1.0
   description: Velocity scale for all moves.
 blackboard:
+  namespaces: []
   keys:
-  - id: gripper_closed
+  - key: gripper_closed
     type: bool
-    key: gripper_closed
-    description: Simulated gripper closed/open flag.
+    access: read_write
+    persistence: run
+    description: Intentionally simulated gripper closed/open state.
 tree:
-  id: sequence
-  name: pick_and_place
+  node_id: sequence
+  instance_id: pick_and_place
+  parameters: {}
   children:
-  - id: move_manipulator_action
-    name: move_to_pick_approach
-    params:
-      move_id: pick_approach
-      motion_type: pose
+  - node_id: motion.move_to_pose
+    instance_id: move_to_pick_approach
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
       target_mode: relative
       target_reference:
-        type: object
-        id: graspable
-      pose_goal:
+        type: scene_resource
+        scene_resource_id: graspable
+      goal:
         position_m:
-        - 0
-        - 0
+        - 0.0
+        - 0.0
         - 0.1
-        orientation_rpy_deg:
-        - 180
-        - 0
-        - -90
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: move_manipulator_action
-    name: move_to_pick
-    params:
-      move_id: pick_down
-      motion_type: pose
+        orientation:
+          rpy_deg:
+          - 180.0
+          - 0.0
+          - -90.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: motion.move_to_pose
+    instance_id: move_to_pick
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
       target_mode: relative
       target_reference:
-        type: object
-        id: graspable
-      pose_goal:
+        type: scene_resource
+        scene_resource_id: graspable
+      goal:
         position_m:
-        - 0
-        - 0
+        - 0.0
+        - 0.0
         - 0.05
-        orientation_rpy_deg:
-        - 180
-        - 0
-        - -90
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: set_gripper_state
-    name: close_gripper
-    params:
-      state_key:
-        key_ref: gripper_closed
-      state: closed
-  - id: attach_object_to_link
-    name: attach_graspable
-    params:
-      object_id: graspable
-      link_frame: tool0
-  - id: move_manipulator_action
-    name: pick_retreat
-    params:
-      move_id: pick_retreat
-      motion_type: pose
+        orientation:
+          rpy_deg:
+          - 180.0
+          - 0.0
+          - -90.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: logic.set_value
+    instance_id: close_gripper
+    parameters:
+      key: gripper_closed
+      value: true
+    children: []
+  - node_id: scene.attach_carried_object
+    instance_id: attach_graspable
+    parameters:
+      scene_resource_id: graspable
+      target_role: arm
+      carrier_frame_role: tcp
+      touch_body_roles:
+      - tool_collision
+    children: []
+  - node_id: motion.move_to_pose
+    instance_id: pick_retreat
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
       target_mode: relative
       target_reference:
-        type: robot_link
-        id: tool0
-      pose_goal:
+        type: frame_role
+        frame_role_id: tcp
+      goal:
         position_m:
-        - 0
-        - 0
+        - 0.0
+        - 0.0
         - -0.05
-        orientation_rpy_deg:
-        - 0
-        - 0
-        - 0
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: reset_trajectories
-    name: invalidate_after_pick
-  - id: move_manipulator_action
-    name: move_to_drop_approach
-    params:
-      move_id: drop_approach
-      motion_type: pose
+        orientation:
+          rpy_deg:
+          - 0.0
+          - 0.0
+          - 0.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: motion.move_to_pose
+    instance_id: move_to_drop_approach
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
       target_mode: relative
       target_reference:
         type: pose
         pose:
+          frame_ref:
+            kind: target_frame
+            target_role: arm
+            frame_role: base
           position_m:
           - 0.3
           - 0.3
           - 0.2
-          orientation_rpy_deg:
-          - 180
-          - 0
-          - -90
+          orientation:
+            rpy_deg:
+            - 180.0
+            - 0.0
+            - -90.0
       offset_reference:
-        type: frame
-        id: base_link
-      pose_goal:
+        type: frame_role
+        frame_role_id: base
+      goal:
         position_m:
-        - 0
-        - 0
+        - 0.0
+        - 0.0
         - 0.05
-        orientation_rpy_deg:
-        - 180
-        - 0
-        - -90
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: move_manipulator_action
-    name: move_to_drop
-    params:
-      move_id: drop_down
-      motion_type: pose
-      pose_goal:
-        frame_id: base_link
+        orientation:
+          rpy_deg:
+          - 180.0
+          - 0.0
+          - -90.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: motion.move_to_pose
+    instance_id: move_to_drop
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
+      goal:
+        frame_ref:
+          kind: target_frame
+          target_role: arm
+          frame_role: base
         position_m:
         - 0.3
         - 0.3
         - 0.2
-        orientation_rpy_deg:
-        - 180
-        - 0
-        - -90
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: set_gripper_state
-    name: open_gripper
-    params:
-      state_key:
-        key_ref: gripper_closed
-      state: open
-  - id: detach_object_from_link
-    name: detach_graspable
-    params:
-      object_id: graspable
-      link_frame: tool0
-  - id: move_manipulator_action
-    name: drop_retreat
-    params:
-      move_id: drop_retreat
-      motion_type: pose
+        orientation:
+          rpy_deg:
+          - 180.0
+          - 0.0
+          - -90.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: logic.set_value
+    instance_id: open_gripper
+    parameters:
+      key: gripper_closed
+      value: false
+    children: []
+  - node_id: scene.detach_carried_object
+    instance_id: detach_graspable
+    parameters:
+      scene_resource_id: graspable
+      target_role: arm
+    children: []
+  - node_id: motion.move_to_pose
+    instance_id: drop_retreat
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
       target_mode: relative
       target_reference:
         type: pose
         pose:
+          frame_ref:
+            kind: target_frame
+            target_role: arm
+            frame_role: base
           position_m:
           - 0.3
           - 0.3
           - 0.2
-          orientation_rpy_deg:
-          - 180
-          - 0
-          - -90
+          orientation:
+            rpy_deg:
+            - 180.0
+            - 0.0
+            - -90.0
       offset_reference:
-        type: frame
-        id: base_link
-      pose_goal:
+        type: frame_role
+        frame_role_id: base
+      goal:
         position_m:
-        - 0
-        - 0
+        - 0.0
+        - 0.0
         - 0.05
-        orientation_rpy_deg:
-        - 180
-        - 0
-        - -90
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: reset_trajectories
-    name: invalidate_after_drop
-  - id: move_manipulator_action
-    name: return_rest
-    params:
-      move_id: return_rest
-      motion_type: joint
-      joint_goal_names:
-      - shoulder_pan_joint
-      - shoulder_lift_joint
-      - elbow_joint
-      - wrist_1_joint
-      - wrist_2_joint
-      - wrist_3_joint
-      joint_goal_positions_rad:
-      - 0
-      - -1.57
-      - 1.57
-      - -1.57
-      - -1.57
-      - 0
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-    modification_policy:
-      runtime_override: human_approval
-      persistent_edit: human_approval
+        orientation:
+          rpy_deg:
+          - 180.0
+          - 0.0
+          - -90.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: motion.move_to_joint_target
+    instance_id: return_rest
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
+      goal:
+      - joint_name: shoulder_pan_joint
+        position_rad: 0.0
+      - joint_name: shoulder_lift_joint
+        position_rad: -1.57
+      - joint_name: elbow_joint
+        position_rad: 1.57
+      - joint_name: wrist_1_joint
+        position_rad: -1.57
+      - joint_name: wrist_2_joint
+        position_rad: -1.57
+      - joint_name: wrist_3_joint
+        position_rad: 0.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale

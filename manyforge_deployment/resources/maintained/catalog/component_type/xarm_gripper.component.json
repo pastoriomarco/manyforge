@@ -1,0 +1,85 @@
+{
+  "api_version": "manyforge.component_type.v1",
+  "attachment_interfaces": [
+    {
+      "accepts_tags": [
+        "articulated-arm"
+      ],
+      "attachment_interface_id": "mount",
+      "frame_role_id": "mount",
+      "max_attachments": 1,
+      "model_role_id": "tool_model"
+    }
+  ],
+  "command_targets": [
+    {
+      "capabilities": [
+        {
+          "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
+          "capability_id": "model.kinematics.fk"
+        },
+        {
+          "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
+          "capability_id": "model.limits.joint"
+        },
+        {
+          "capability_definition_revision": "sha256:a24b841e7c0323815a3576869d5819340bc6a98f1c2ffd5b47131e26698e9392",
+          "capability_id": "tool.gripper.command"
+        },
+        {
+          "capability_definition_revision": "sha256:53cebcf32900bf3fab41aeb490a9176d3130ae53c1a289c954f1eb8d07738e23",
+          "capability_id": "tool.gripper.feedback"
+        }
+      ],
+      "collision_body_roles": [
+        {
+          "asset_collision_body_role_id": "gripper_collision",
+          "collision_body_role_id": "gripper_collision",
+          "model_role_id": "tool_model"
+        }
+      ],
+      "command_target_id": "gripper",
+      "default_tcp_frame_role_id": "tcp",
+      "frame_roles": [
+        {
+          "asset_frame_role_id": "tcp",
+          "frame_role_id": "tcp",
+          "model_role_id": "tool_model",
+          "tcp": true
+        }
+      ],
+      "model_group_roles": [
+        {
+          "asset_model_group_role_id": "gripper",
+          "model_group_role_id": "planning_group",
+          "model_role_id": "tool_model"
+        }
+      ],
+      "resource_roles": [
+        {
+          "asset_resource_role_id": "fingers",
+          "model_role_id": "tool_model",
+          "resource_role_id": "fingers",
+          "source_kind": "model_role"
+        }
+      ]
+    }
+  ],
+  "component_root": {
+    "frame_role_id": "mount",
+    "model_role_id": "tool_model"
+  },
+  "component_type_id": "xarm_gripper.component",
+  "component_type_revision": "sha256:b97dc3ec3ed026922444d2987258e2cb747222ca8d398dffe776f600992247da",
+  "model_mounts": [],
+  "model_roles": [
+    {
+      "cardinality": "exactly_one",
+      "model_role_id": "tool_model"
+    }
+  ],
+  "tags": [
+    "gripper",
+    "tool"
+  ]
+}

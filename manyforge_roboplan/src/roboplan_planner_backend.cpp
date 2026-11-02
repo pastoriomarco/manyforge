@@ -1,1503 +1,529 @@
-#include <manyforge_roboplan/roboplan_planner_backend.hpp>
-
-#include <manyforge_roboplan/roboplan_focused_adapters.hpp>
-#include <manyforge_roboplan/roboplan_cartesian_path_adapter.hpp>
-#include <manyforge_roboplan/roboplan_planner_options.hpp>
-
-#include <manyforge_roboplan/collision_diagnostics_capture.hpp>
-
-#include <roboplan/core/collision_context.hpp>
-
-#include <Eigen/Dense>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdlib>
-#include <fmt/format.h>
-#include <iostream>
-#include <limits>
+#include <manyforge_roboplan/roboplan_planner_backend.hpp>
 #include <map>
 #include <mutex>
 #include <optional>
-#include <sstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
-#include <variant>
-#include <vector>
 
+namespace manyforge::roboplan_backend {
 namespace {
-bool planner_debug_enabled() {
-  static const bool enabled = [] {
-    const char* value = std::getenv("MANYFORGE_ROBOPLAN_PLANNER_DEBUG");
-    if (value == nullptr) {
+
+using core::ErrorCode;
+using core::ErrorDTO;
+
+[[nodiscard]] ErrorDTO error(ErrorCode code, std::string message,
+                             std::string reason,
+                             std::map<std::string, std::string> details = {}) {
+  details["reason"] = std::move(reason);
+  return ErrorDTO{std::string(core::to_string(code)), std::move(message),
+                  std::move(details)};
+}
+
+[[nodiscard]] core::PlanResultDTO plan_error(ErrorDTO value) {
+  return {std::nullopt, std::move(value), {}};
+}
+
+[[nodiscard]] core::IkResultDTO ik_error(ErrorDTO value) {
+  return {false, {}, {}, {}, std::move(value)};
+}
+
+[[nodiscard]] std::optional<ErrorDTO> validate_retained_projection(
+    const core::ProjectionLeaseBindingDTO &binding,
+    const core::CollisionWorldSnapshotPtr &world,
+    const std::shared_ptr<const core::CollisionPolicySnapshot> &policy) {
+  if (!binding.valid() || !world || !policy ||
+      world->revision.revision_id == 0U ||
+      !core::IsExactLowercaseSha256Digest(world->revision.content_hash) ||
+      policy->revision.revision_id == 0U ||
+      !core::IsExactLowercaseSha256Digest(policy->revision.content_hash)) {
+    return error(ErrorCode::kInvalidRequest,
+                 "RoboPlan requires one exact retained world and policy",
+                 "native_planner_projection_inventory_invalid");
+  }
+  return std::nullopt;
+}
+
+template <typename Value>
+[[nodiscard]] bool unique_nonempty(const std::vector<Value> &values) {
+  return !values.empty() &&
+         std::set<Value>(values.begin(), values.end()).size() == values.size();
+}
+
+[[nodiscard]] bool
+unique_nonempty_strings(const std::vector<std::string> &values) {
+  return !values.empty() &&
+         std::all_of(values.begin(), values.end(),
+                     [](const std::string &value) { return !value.empty(); }) &&
+         std::set<std::string>(values.begin(), values.end()).size() ==
+             values.size();
+}
+
+[[nodiscard]] bool
+frame_matches_binding(const core::ResolvedFrameDTO &frame,
+                      const RoboPlanCandidateBindingDTO &binding) {
+  if (core::compiled_frame_name(frame).empty()) {
+    return false;
+  }
+  if (const auto *component =
+          std::get_if<core::ResolvedComponentModelFrameDTO>(&frame)) {
+    // A shape check only: the owner-issued inventory
+    // (retained_motion_planner_frames) holds each frame once, owner-stamped,
+    // so a tool mounted on the motion component keeps its own component and
+    // model identity; motion-model frames keep its revision. Requests match
+    // the inventory exactly (contains_frame).
+    return !component->controllable_component_id.empty() &&
+           !component->model_instance_id.empty() &&
+           !component->model_revision.empty() &&
+           !component->frame_role_id.empty() &&
+           (component->model_instance_id != binding.model_instance_id ||
+            component->model_revision == binding.model_revision);
+  }
+  if (const auto *passive =
+          std::get_if<core::ResolvedPassiveModelFrameDTO>(&frame)) {
+    return passive->model_instance_id == binding.model_instance_id &&
+           passive->model_revision == binding.model_revision &&
+           !passive->frame_role_id.empty();
+  }
+  return !std::get<core::ResolvedCellFrameDTO>(frame).cell_id.empty();
+}
+
+[[nodiscard]] bool contains_frame(const RoboPlanCandidateBindingDTO &binding,
+                                  const core::ResolvedFrameDTO &frame) {
+  return std::count(binding.permitted_frames.begin(),
+                    binding.permitted_frames.end(), frame) == 1;
+}
+
+[[nodiscard]] bool
+frame_inventory_valid(const RoboPlanCandidateBindingDTO &binding) {
+  if (binding.permitted_frames.empty() ||
+      binding.permitted_frames.size() > 4096U) {
+    return false;
+  }
+  return std::all_of(binding.permitted_frames.begin(),
+                     binding.permitted_frames.end(), [&](const auto &frame) {
+                       return frame_matches_binding(frame, binding) &&
+                              contains_frame(binding, frame);
+                     });
+}
+
+[[nodiscard]] bool
+binding_shape_valid(const RoboPlanCandidateBindingDTO &binding) {
+  return !binding.controllable_component_id.empty() &&
+         !binding.command_target_id.empty() &&
+         !binding.model_instance_id.empty() &&
+         !binding.model_revision.empty() &&
+         !binding.compiled_group_name.empty() &&
+         unique_nonempty(binding.resources) &&
+         unique_nonempty_strings(binding.compiled_joint_names) &&
+         binding.resources.size() == binding.compiled_joint_names.size() &&
+         frame_inventory_valid(binding);
+}
+
+[[nodiscard]] bool contains_exact_model_binding(
+    const std::vector<core::PlannerModelBindingDTO> &models,
+    const RoboPlanCandidateBindingDTO &binding) {
+  return std::count(models.begin(), models.end(),
+                    core::PlannerModelBindingDTO{binding.model_instance_id,
+                                                 binding.model_revision}) == 1;
+}
+
+[[nodiscard]] bool runtime_units_valid(
+    const std::vector<core::PlannerRuntimeUnitBindingDTO> &units) {
+  std::set<std::pair<core::RuntimeUnitId, core::RuntimeEpoch>> identities;
+  for (const auto &unit : units) {
+    if (unit.runtime_unit_id.empty() || unit.runtime_epoch.empty() ||
+        !identities.emplace(unit.runtime_unit_id, unit.runtime_epoch).second) {
       return false;
     }
-    const std::string flag(value);
-    return !(flag.empty() || flag == "0" || flag == "false" || flag == "FALSE");
-  }();
-  return enabled;
-}
-
-template <typename... Args>
-void planner_debug(fmt::format_string<Args...> format, Args&&... args) {
-  if (!planner_debug_enabled()) {
-    return;
   }
-  fmt::print(stderr, format, std::forward<Args>(args)...);
-}
-
-struct CollisionDiagnostics {
-  std::vector<std::string> pairs;
-  std::string raw_output;
-};
-
-struct TcpSpeedCheck {
-  double max_speed_mps = 0.0;
-  size_t segment_index = 0;
-  double segment_dt_s = 0.0;
-};
-
-std::string join_strings(const std::vector<std::string>& values,
-                         const std::string& separator) {
-  std::string result;
-  for (const auto& value : values) {
-    if (!result.empty()) {
-      result += separator;
-    }
-    result += value;
-  }
-  return result;
-}
-
-CollisionDiagnostics collect_collision_diagnostics(
-    const std::shared_ptr<roboplan::Scene>& scene,
-    const Eigen::VectorXd& q) {
-  CollisionDiagnostics diagnostics;
-
-  diagnostics.raw_output =
-      manyforge::roboplan_backend::capture_collision_diagnostics_stdout([&]() {
-        scene->hasCollisions(q, true);
-      });
-  if (!diagnostics.raw_output.empty()) {
-    std::lock_guard<std::mutex> lock(
-        manyforge::roboplan_backend::collision_diagnostics_stdout_mutex());
-    std::cout << diagnostics.raw_output;
-  }
-
-  std::istringstream lines(diagnostics.raw_output);
-  std::string line;
-  const std::string prefix = "Collision detected between ";
-  while (std::getline(lines, line)) {
-    if (line.rfind(prefix, 0) != 0) {
-      continue;
-    }
-    std::string pair = line.substr(prefix.size());
-    const std::string needle = " and ";
-    const auto split = pair.find(needle);
-    if (split != std::string::npos) {
-      pair.replace(split, needle.size(), " <-> ");
-    }
-    diagnostics.pairs.push_back(pair);
-  }
-  return diagnostics;
-}
-
-std::string collision_message_with_pairs(
-    const std::string& message,
-    const CollisionDiagnostics& diagnostics) {
-  if (diagnostics.pairs.empty()) {
-    return message;
-  }
-  return message + ": " + join_strings(diagnostics.pairs, "; ");
-}
-
-std::map<std::string, std::string> collision_details(
-    std::string failure_stage,
-    bool start_in_collision,
-    bool goal_in_collision,
-    const CollisionDiagnostics& diagnostics) {
-  std::map<std::string, std::string> details;
-  details["failure_stage"] = std::move(failure_stage);
-  details["start_in_collision"] = start_in_collision ? "true" : "false";
-  details["goal_in_collision"] = goal_in_collision ? "true" : "false";
-  details["collision_pair_count"] = std::to_string(diagnostics.pairs.size());
-  if (!diagnostics.pairs.empty()) {
-    details["collision_pairs"] = join_strings(diagnostics.pairs, "; ");
-  }
-  for (size_t i = 0; i < diagnostics.pairs.size(); ++i) {
-    details["collision_pair_" + std::to_string(i + 1)] = diagnostics.pairs[i];
-  }
-  return details;
-}
-
-TcpSpeedCheck compute_tcp_speed_check(
-    const std::shared_ptr<roboplan::Scene>& scene,
-    const std::string& group_name,
-    const roboplan::JointTrajectory& trajectory,
-    const std::string& tcp_frame) {
-  TcpSpeedCheck check;
-  Eigen::Vector3d prev_pos = Eigen::Vector3d::Zero();
-  bool have_prev = false;
-
-  for (size_t i = 0; i < trajectory.times.size(); ++i) {
-    const Eigen::VectorXd q_full =
-        scene->toFullJointPositions(group_name, trajectory.positions[i]);
-    Eigen::Matrix4d tform = scene->forwardKinematics(q_full, tcp_frame);
-    Eigen::Vector3d pos = tform.block<3, 1>(0, 3);
-
-    if (have_prev && i > 0) {
-      const double dt = trajectory.times[i] - trajectory.times[i - 1];
-      if (dt > 1e-9) {
-        const double speed = (pos - prev_pos).norm() / dt;
-        if (speed > check.max_speed_mps) {
-          check.max_speed_mps = speed;
-          check.segment_index = i - 1;
-          check.segment_dt_s = dt;
-        }
-      }
-    }
-
-    prev_pos = pos;
-    have_prev = true;
-  }
-
-  return check;
-}
-
-// Rotation matrix to RPY (ZYX convention, in degrees)
-void matrix_to_rpy_deg(const Eigen::Matrix4d& tform, double& roll, double& pitch, double& yaw) {
-  pitch = std::atan2(-tform(2,0), std::sqrt(tform(0,0)*tform(0,0) + tform(1,0)*tform(1,0)));
-  if (std::abs(std::cos(pitch)) > 1e-6) {
-    roll  = std::atan2(tform(2,1), tform(2,2));
-    yaw   = std::atan2(tform(1,0), tform(0,0));
-  } else {
-    roll  = std::atan2(-tform(1,2), tform(1,1));
-    yaw   = 0.0;
-  }
-  roll  *= 180.0 / M_PI;
-  pitch *= 180.0 / M_PI;
-  yaw   *= 180.0 / M_PI;
-}
-
-double normalize_equivalent_revolute_angle_for_rrt(
-    double value,
-    double seed,
-    double lower,
-    double upper) {
-  constexpr double kTwoPi = 2.0 * M_PI;
-  constexpr double kWrapLimitTolerance = 1e-6;
-
-  if (!std::isfinite(value) || !std::isfinite(seed) ||
-      !std::isfinite(lower) || !std::isfinite(upper) || lower >= upper) {
-    return value;
-  }
-
-  const double width = upper - lower;
-  if (width < kTwoPi - kWrapLimitTolerance) {
-    return value;
-  }
-
-  const int k_min = static_cast<int>(std::ceil((lower - value) / kTwoPi));
-  const int k_max = static_cast<int>(std::floor((upper - value) / kTwoPi));
-  if (k_min > k_max) {
-    return value;
-  }
-
-  double best = value + static_cast<double>(k_min) * kTwoPi;
-  double best_distance = std::abs(best - seed);
-  for (int k = k_min + 1; k <= k_max; ++k) {
-    const double candidate = value + static_cast<double>(k) * kTwoPi;
-    const double distance = std::abs(candidate - seed);
-    if (distance < best_distance) {
-      best = candidate;
-      best_distance = distance;
-    }
-  }
-  return best;
-}
-
-void normalize_ik_goal_for_rrt_limits(
-    const std::shared_ptr<roboplan::Scene>& scene,
-    const std::string& group_name,
-    const Eigen::VectorXd& start_positions,
-    Eigen::VectorXd& goal_positions) {
-  auto pos_limits = scene->getPositionLimitVectors(group_name, /*collapsed=*/false);
-  if (!pos_limits.has_value()) {
-    return;
-  }
-
-  const auto& [lower, upper] = pos_limits.value();
-  if (lower.size() != goal_positions.size() ||
-      upper.size() != goal_positions.size() ||
-      start_positions.size() != goal_positions.size()) {
-    return;
-  }
-
-  for (Eigen::Index i = 0; i < goal_positions.size(); ++i) {
-    const double before = goal_positions[i];
-    const double after = normalize_equivalent_revolute_angle_for_rrt(
-        before, start_positions[i], lower[i], upper[i]);
-    if (std::abs(after - before) > 1e-9) {
-      planner_debug(
-          "[PLANNER] normalized IK joint {} from {:.4f} to {:.4f} within [{:.4f}, {:.4f}]\n",
-          i, before, after, lower[i], upper[i]);
-      goal_positions[i] = after;
-    }
-  }
-}
-
-void anchor_trajectory_endpoints(
-    roboplan::JointTrajectory& trajectory,
-    const Eigen::VectorXd& start_positions,
-    const Eigen::VectorXd& goal_positions) {
-  if (trajectory.positions.empty()) {
-    return;
-  }
-
-  auto assign_if_same_size = [](Eigen::VectorXd& target, const Eigen::VectorXd& value) {
-    if (target.size() == value.size()) {
-      target = value;
-    }
-  };
-  auto zero_if_present = [](std::vector<Eigen::VectorXd>& values, size_t index) {
-    if (index < values.size()) {
-      values[index].setZero();
-    }
-  };
-
-  assign_if_same_size(trajectory.positions.front(), start_positions);
-  if (!trajectory.times.empty()) {
-    trajectory.times.front() = 0.0;
-  }
-  zero_if_present(trajectory.velocities, 0);
-  zero_if_present(trajectory.accelerations, 0);
-
-  if (trajectory.positions.size() > 1) {
-    const size_t last = trajectory.positions.size() - 1;
-    assign_if_same_size(trajectory.positions.back(), goal_positions);
-    zero_if_present(trajectory.velocities, last);
-    zero_if_present(trajectory.accelerations, last);
-  }
-}
-
-using PlanningMetrics =
-    manyforge::roboplan_backend::RoboPlanPlanningPipelineMetrics;
-using PlanningObserver =
-    manyforge::roboplan_backend::IRoboPlanPlanningPerformanceObserver;
-using CollisionProbeSnapshot =
-    manyforge::roboplan_backend::RoboPlanCollisionProbeSnapshot;
-using AllocationProbeSnapshot =
-    manyforge::roboplan_backend::RoboPlanAllocationProbeSnapshot;
-
-CollisionProbeSnapshot read_collision_probe(
-    const std::shared_ptr<PlanningObserver>& observer) noexcept {
-  return observer ? observer->collision_probe_snapshot()
-                  : CollisionProbeSnapshot{};
-}
-
-AllocationProbeSnapshot read_allocation_probe(
-    const std::shared_ptr<PlanningObserver>& observer) noexcept {
-  return observer ? observer->allocation_probe_snapshot()
-                  : AllocationProbeSnapshot{};
-}
-
-std::uint32_t effective_planner_seed(
-    std::uint32_t base_seed, std::uint32_t attempt_index) noexcept {
-  if (attempt_index == 0) {
-    return base_seed;
-  }
-  // SplitMix64 finalization gives adjacent retry ordinals well-dispersed,
-  // reproducible MT19937 seeds without keeping mutable planner RNG state.
-  std::uint64_t value =
-      (static_cast<std::uint64_t>(base_seed) << 32U) | attempt_index;
-  value += 0x9e3779b97f4a7c15ULL;
-  value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
-  value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
-  value ^= value >> 31U;
-  return static_cast<std::uint32_t>(value ^ (value >> 32U));
-}
-
-void accumulate_probe_delta(
-    manyforge::roboplan_backend::RoboPlanPlanningStageMetrics& metrics,
-    const CollisionProbeSnapshot& before,
-    const CollisionProbeSnapshot& after) noexcept {
-  if (!before.available || !after.available ||
-      after.query_count < before.query_count ||
-      after.query_duration_ns < before.query_duration_ns) {
-    return;
-  }
-  metrics.collision_query_count += after.query_count - before.query_count;
-  metrics.collision_query_duration_ns +=
-      after.query_duration_ns - before.query_duration_ns;
-}
-
-bool accumulate_allocation_delta(
-    manyforge::roboplan_backend::RoboPlanPlanningStageMetrics& metrics,
-    const AllocationProbeSnapshot& before,
-    const AllocationProbeSnapshot& after) noexcept {
-  if (before.available != after.available) {
-    return false;
-  }
-  if (!before.available) {
-    return true;
-  }
-  if (after.allocation_count < before.allocation_count ||
-      after.allocation_bytes < before.allocation_bytes) {
-    return false;
-  }
-  metrics.allocation_count +=
-      after.allocation_count - before.allocation_count;
-  metrics.allocation_bytes +=
-      after.allocation_bytes - before.allocation_bytes;
   return true;
 }
 
-class PlanningStageMeasurement final {
- public:
-  PlanningStageMeasurement(
-      PlanningMetrics& metrics,
-      std::shared_ptr<PlanningObserver> observer,
-      std::string_view stage_name) noexcept
-      : metrics_(metrics),
-        observer_(std::move(observer)),
-        stage_name_(stage_name),
-        enabled_(observer_ != nullptr) {
-    if (enabled_) {
-      started_at_ = std::chrono::steady_clock::now();
-      collision_before_ = read_collision_probe(observer_);
-      allocation_before_ = read_allocation_probe(observer_);
-    }
-  }
-
-  PlanningStageMeasurement(const PlanningStageMeasurement&) = delete;
-  PlanningStageMeasurement& operator=(const PlanningStageMeasurement&) = delete;
-
-  ~PlanningStageMeasurement() {
-    if (!enabled_) {
-      return;
-    }
-    try {
-      auto& stage = metrics_.stages[std::string(stage_name_)];
-      stage.duration_ns += static_cast<std::uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - started_at_)
-              .count());
-      accumulate_probe_delta(
-          stage, collision_before_, read_collision_probe(observer_));
-      if (!accumulate_allocation_delta(
-              stage, allocation_before_, read_allocation_probe(observer_))) {
-        metrics_.measurement_complete = false;
-      }
-    } catch (...) {
-      metrics_.measurement_complete = false;
-    }
-  }
-
- private:
-  PlanningMetrics& metrics_;
-  std::shared_ptr<PlanningObserver> observer_;
-  std::string_view stage_name_;
-  bool enabled_ = false;
-  std::chrono::steady_clock::time_point started_at_{};
-  CollisionProbeSnapshot collision_before_;
-  AllocationProbeSnapshot allocation_before_;
-};
-
-class PlanningInvocationMeasurement final {
- public:
-  PlanningInvocationMeasurement(
-      std::shared_ptr<PlanningObserver> observer,
-      const manyforge::core::PlanRequestDTO& request,
-      const manyforge::core::PlanResultDTO& result,
-      PlanningMetrics& metrics) noexcept
-      : observer_(std::move(observer)),
-        request_(request),
-        result_(result),
-        metrics_(metrics),
-        enabled_(observer_ != nullptr &&
-                 observer_->try_begin_invocation(request_)) {
-    if (enabled_) {
-      started_at_ = std::chrono::steady_clock::now();
-      collision_before_ = read_collision_probe(observer_);
-    }
-  }
-
-  PlanningInvocationMeasurement(const PlanningInvocationMeasurement&) = delete;
-  PlanningInvocationMeasurement& operator=(
-      const PlanningInvocationMeasurement&) = delete;
-
-  ~PlanningInvocationMeasurement() noexcept {
-    if (!enabled_) {
-      return;
-    }
-    try {
-      metrics_.total_duration_ns = static_cast<std::uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - started_at_)
-              .count());
-      const auto collision_after = read_collision_probe(observer_);
-      metrics_.collision_probe_available =
-          collision_before_.available && collision_after.available;
-      if (metrics_.collision_probe_available &&
-          collision_after.query_count >= collision_before_.query_count &&
-          collision_after.query_duration_ns >=
-              collision_before_.query_duration_ns) {
-        metrics_.total_collision_query_count =
-            collision_after.query_count - collision_before_.query_count;
-        metrics_.total_collision_query_duration_ns =
-            collision_after.query_duration_ns -
-            collision_before_.query_duration_ns;
-      }
-      metrics_.succeeded = result_.trajectory.has_value() && !result_.error;
-      if (result_.error) {
-        metrics_.error_code = result_.error->code;
-      }
-      if (result_.trajectory) {
-        metrics_.waypoint_count = result_.trajectory->waypoints.size();
-        if (!result_.trajectory->waypoints.empty()) {
-          metrics_.trajectory_duration_s =
-              result_.trajectory->waypoints.back().time_from_start_s;
-        }
-      }
-    } catch (...) {
-      // Qualification is evidence-only. Decoration failure invalidates the
-      // record but must never terminate or alter planning behavior.
-      metrics_.measurement_complete = false;
-    }
-    observer_->record(request_, result_, metrics_);
-  }
-
- private:
-  std::shared_ptr<PlanningObserver> observer_;
-  const manyforge::core::PlanRequestDTO& request_;
-  const manyforge::core::PlanResultDTO& result_;
-  PlanningMetrics& metrics_;
-  bool enabled_ = false;
-  std::chrono::steady_clock::time_point started_at_{};
-  CollisionProbeSnapshot collision_before_;
-};
-}  // namespace
-
-namespace manyforge::roboplan_backend {
-
-JointCapMeasurement measure_joint_cap_peaks(
-    const roboplan::JointTrajectory& traj,
-    const std::map<std::string, double>& vel_cap_by_name,
-    const std::map<std::string, double>& acc_cap_by_name) {
-  JointCapMeasurement m;
-  const size_t n = traj.times.size();
-  // Every capped joint MUST be present in the trajectory's joint set, otherwise
-  // its cap is never measured and would falsely report as satisfied. A capped
-  // joint absent from the trajectory cannot be verified -> fail closed. (The
-  // planner also rejects non-active-group cap names up front; this is the
-  // measurement-layer backstop against any trajectory/group-name divergence.)
-  auto trajectory_has_joint = [&](const std::string& jn) {
-    return std::find(traj.joint_names.begin(), traj.joint_names.end(), jn) !=
-           traj.joint_names.end();
-  };
-  for (const auto& [jn, cap] : vel_cap_by_name) {
-    (void)cap;
-    if (!trajectory_has_joint(jn)) {
-      m.samples_complete = false;
-      m.incomplete_dimension = "velocity";
-      m.incomplete_joint = jn;
-      return m;
-    }
-  }
-  for (const auto& [jn, cap] : acc_cap_by_name) {
-    (void)cap;
-    if (!trajectory_has_joint(jn)) {
-      m.samples_complete = false;
-      m.incomplete_dimension = "acceleration";
-      m.incomplete_joint = jn;
-      return m;
-    }
-  }
-  for (size_t j = 0; j < traj.joint_names.size(); ++j) {
-    const std::string& jn = traj.joint_names[j];
-    const auto v_it = vel_cap_by_name.find(jn);
-    const auto a_it = acc_cap_by_name.find(jn);
-    const bool want_v = v_it != vel_cap_by_name.end();
-    const bool want_a = a_it != acc_cap_by_name.end();
-    if (!want_v && !want_a) {
-      continue;  // joint not capped by this deployment (e.g. other group)
-    }
-    // A capped joint with no waypoints cannot be verified -> fail closed.
-    if (n == 0) {
-      m.samples_complete = false;
-      m.incomplete_dimension = want_v ? "velocity" : "acceleration";
-      m.incomplete_joint = jn;
-      return m;
-    }
-    double peak_v = 0.0;
-    double peak_a = 0.0;
-    for (size_t w = 0; w < n; ++w) {
-      if (want_v) {
-        if (w >= traj.velocities.size() ||
-            j >= static_cast<size_t>(traj.velocities[w].size())) {
-          m.samples_complete = false;
-          m.incomplete_dimension = "velocity";
-          m.incomplete_joint = jn;
-          return m;
-        }
-        peak_v = std::max(peak_v, std::abs(traj.velocities[w][j]));
-      }
-      if (want_a) {
-        if (w >= traj.accelerations.size() ||
-            j >= static_cast<size_t>(traj.accelerations[w].size())) {
-          m.samples_complete = false;
-          m.incomplete_dimension = "acceleration";
-          m.incomplete_joint = jn;
-          return m;
-        }
-        peak_a = std::max(peak_a, std::abs(traj.accelerations[w][j]));
-      }
-    }
-    if (want_v && peak_v > v_it->second) {
-      const double r = peak_v / v_it->second;
-      if (r > m.worst_vel_ratio) {
-        m.worst_vel_ratio = r;
-        m.worst_vel_joint = jn;
-        m.worst_vel_peak = peak_v;
-      }
-    }
-    if (want_a && peak_a > a_it->second) {
-      const double r = peak_a / a_it->second;
-      if (r > m.worst_acc_ratio) {
-        m.worst_acc_ratio = r;
-        m.worst_acc_joint = jn;
-        m.worst_acc_peak = peak_a;
-      }
-    }
-  }
-  return m;
+[[nodiscard]] bool state_matches_request(const core::PlanRequestDTO &request) {
+  const auto &state = request.start_state;
+  return state.controllable_component_id == request.controllable_component_id &&
+         state.command_target_id == request.command_target_id &&
+         state.control_domain_id == request.control_domain_id &&
+         state.control_domain_revision == request.control_domain_revision &&
+         state.control_binding_id == request.control_binding_id &&
+         state.control_binding_revision == request.control_binding_revision &&
+         state.controller_topology_id == request.controller_topology_id &&
+         state.topology_revision == request.topology_revision &&
+         state.control_route_id == request.control_route_id &&
+         state.active_control_configuration_id ==
+             request.active_control_configuration_id &&
+         state.active_control_configuration_generation ==
+             request.active_control_configuration_generation &&
+         state.resources == request.resources &&
+         state.joint_names == request.model_group_binding.compiled_joint_names;
 }
 
+[[nodiscard]] std::optional<ErrorDTO>
+validate_plan_binding(const core::PlanRequestDTO &request,
+                      const core::ProjectionLeaseBindingDTO &projection,
+                      const RoboPlanCandidateBindingDTO &binding) {
+  const auto &requested_revision =
+      request.projection_binding.projection_revision;
+  const auto &anchored_revision = projection.projection_revision;
+  if (!request.projection_binding.valid() ||
+      requested_revision.retained_bundle_id !=
+          anchored_revision.retained_bundle_id ||
+      requested_revision.graph_revision != anchored_revision.graph_revision ||
+      requested_revision.scene_revision.scene_id !=
+          anchored_revision.scene_revision.scene_id) {
+    return error(ErrorCode::kInvalidRequest,
+                 "Planning request crosses the retained projection lineage",
+                 "native_planner_projection_binding_mismatch");
+  }
+  if (request.operation_id.empty() || request.participant_id.empty() ||
+      request.program_id.empty() || request.program_revision.empty() ||
+      request.program_binding_id.empty() || request.program_run_id.empty() ||
+      request.move_id.empty() || request.component_type_id.empty() ||
+      request.component_type_revision.empty() ||
+      request.capability_id.empty() ||
+      request.capability_definition_revision.empty() ||
+      request.control_domain_id.empty() ||
+      request.control_domain_revision.empty() ||
+      request.control_binding_id.empty() ||
+      request.control_binding_revision.empty() ||
+      request.control_interface_contract_id.empty() ||
+      request.control_interface_revision.empty() ||
+      request.controller_topology_id.empty() ||
+      request.topology_revision.empty() || request.control_route_id.empty() ||
+      request.activation_set_id.empty() ||
+      request.active_control_configuration_id.empty() ||
+      !request.active_control_configuration_generation.nonzero() ||
+      request.provider_instance_id.empty() ||
+      request.provider_manifest_id.empty() ||
+      request.provider_manifest_revision.empty() ||
+      request.provider_runtime_epoch.empty() ||
+      !runtime_units_valid(request.runtime_unit_bindings)) {
+    return error(
+        ErrorCode::kInvalidRequest,
+        "Planning request lacks complete owner-issued runtime identity",
+        "native_planner_runtime_identity_incomplete");
+  }
+  if (request.controllable_component_id != binding.controllable_component_id ||
+      request.command_target_id != binding.command_target_id ||
+      request.model_group_binding.model_instance_id !=
+          binding.model_instance_id ||
+      request.model_group_binding.model_revision != binding.model_revision ||
+      request.model_group_binding.model_group_role_id.empty() ||
+      request.model_group_binding.compiled_group_name !=
+          binding.compiled_group_name ||
+      request.model_group_binding.compiled_joint_names !=
+          binding.compiled_joint_names ||
+      !contains_exact_model_binding(request.model_bindings, binding) ||
+      request.resources != binding.resources ||
+      !contains_frame(binding, request.base_frame) ||
+      !contains_frame(binding, request.tcp_frame)) {
+    return error(ErrorCode::kInvalidRequest,
+                 "Planning request crosses its exact participant binding",
+                 "native_planner_participant_binding_mismatch");
+  }
+  const auto state = core::validate_controlled_state(request.start_state);
+  if (!state.ok() || !state_matches_request(request)) {
+    return error(ErrorCode::kStartStateMismatch,
+                 "Planning start state crosses its active control binding",
+                 "native_planner_start_state_binding_mismatch");
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] bool ik_state_matches_request(const core::IkRequestDTO &request) {
+  const auto &state = request.seed_state;
+  return state.controllable_component_id == request.controllable_component_id &&
+         state.command_target_id == request.command_target_id &&
+         state.resources == request.resources;
+}
+
+[[nodiscard]] std::optional<ErrorDTO>
+validate_ik_binding(const core::IkRequestDTO &request,
+                    const core::ProjectionLeaseBindingDTO &projection,
+                    const RoboPlanCandidateBindingDTO &binding) {
+  const auto &requested_revision =
+      request.projection_binding.projection_revision;
+  const auto &anchored_revision = projection.projection_revision;
+  if (!request.projection_binding.valid() ||
+      requested_revision.retained_bundle_id !=
+          anchored_revision.retained_bundle_id ||
+      requested_revision.graph_revision != anchored_revision.graph_revision ||
+      requested_revision.scene_revision.scene_id !=
+          anchored_revision.scene_revision.scene_id) {
+    return error(ErrorCode::kInvalidRequest,
+                 "IK request crosses the retained projection lineage",
+                 "native_ik_projection_binding_mismatch");
+  }
+  if (request.controllable_component_id != binding.controllable_component_id ||
+      request.command_target_id != binding.command_target_id ||
+      !contains_exact_model_binding(request.model_bindings, binding) ||
+      request.resources != binding.resources ||
+      !contains_frame(binding, request.base_frame) ||
+      !contains_frame(binding, request.tcp_frame) ||
+      request.seed_state.joint_names != binding.compiled_joint_names) {
+    return error(ErrorCode::kInvalidRequest,
+                 "IK request crosses its exact participant binding",
+                 "native_ik_participant_binding_mismatch");
+  }
+  const auto state = core::validate_controlled_state(request.seed_state);
+  if (!state.ok() || !ik_state_matches_request(request)) {
+    return error(ErrorCode::kStartStateMismatch,
+                 "IK seed crosses its exact participant binding",
+                 "native_ik_seed_binding_mismatch");
+  }
+  if (!std::isfinite(request.timeout_s)) {
+    return error(ErrorCode::kInvalidRequest, "IK timeout must be finite",
+                 "native_ik_timeout_invalid");
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] bool
+trajectory_shape_valid(const core::TrajectoryDTO &trajectory,
+                       const RoboPlanCandidateBindingDTO &binding) {
+  if (trajectory.resources != binding.resources ||
+      trajectory.joint_names != binding.compiled_joint_names ||
+      trajectory.waypoints.size() < 2U) {
+    return false;
+  }
+  double previous = -1.0;
+  for (const auto &waypoint : trajectory.waypoints) {
+    const auto dimension = binding.resources.size();
+    if (!std::isfinite(waypoint.time_from_start_s) ||
+        waypoint.time_from_start_s < 0.0 ||
+        waypoint.time_from_start_s <= previous ||
+        waypoint.positions_rad.size() != dimension ||
+        (!waypoint.velocities_rad_s.empty() &&
+         waypoint.velocities_rad_s.size() != dimension) ||
+        (!waypoint.accelerations_rad_s2.empty() &&
+         waypoint.accelerations_rad_s2.size() != dimension) ||
+        !std::all_of(waypoint.positions_rad.begin(),
+                     waypoint.positions_rad.end(),
+                     [](double value) { return std::isfinite(value); }) ||
+        !std::all_of(waypoint.velocities_rad_s.begin(),
+                     waypoint.velocities_rad_s.end(),
+                     [](double value) { return std::isfinite(value); }) ||
+        !std::all_of(waypoint.accelerations_rad_s2.begin(),
+                     waypoint.accelerations_rad_s2.end(),
+                     [](double value) { return std::isfinite(value); })) {
+      return false;
+    }
+    previous = waypoint.time_from_start_s;
+  }
+  return trajectory.waypoints.front().time_from_start_s == 0.0;
+}
+
+} // namespace
+
 RoboPlanPlannerBackend::RoboPlanPlannerBackend(
-    std::shared_ptr<RoboPlanSceneProjection> projection,
-    std::shared_ptr<roboplan::Scene> live_scene,
-    const roboplan::RRTOptions& rrt_options,
-    std::shared_ptr<std::mutex> scene_mutex,
-    std::optional<roboplan::SimpleIkOptions> ik_options,
-    std::optional<roboplan::SimpleIkOptions> single_shot_ik_options,
-    std::optional<std::uint32_t> rng_seed,
-    std::shared_ptr<IRoboPlanPlanningPerformanceObserver>
-        performance_observer)
-    : projection_(std::move(projection)),
-      live_scene_(std::move(live_scene)),
-      rrt_options_(rrt_options),
-      scene_mutex_(std::move(scene_mutex)),
-      rng_seed_(rng_seed),
-      performance_observer_(std::move(performance_observer)) {
-  if (!projection_) {
-    throw std::invalid_argument("RoboPlan planner projection must not be null");
+    core::ProjectionLeaseBindingDTO projection_binding,
+    RoboPlanCandidateBindingDTO candidate_binding,
+    std::unique_ptr<IRoboPlanCandidateClient> candidate_client,
+    RoboPlanPlannerBackendConfig config)
+    : projection_binding_(std::move(projection_binding)),
+      candidate_binding_(std::move(candidate_binding)),
+      candidate_client_(std::move(candidate_client)), config_(config) {
+  if (!projection_binding_.valid() ||
+      !binding_shape_valid(candidate_binding_) || !candidate_client_ ||
+      candidate_client_->binding() != candidate_binding_ ||
+      !std::isfinite(config_.default_single_shot_ik_timeout_s) ||
+      config_.default_single_shot_ik_timeout_s <= 0.0) {
+    throw std::invalid_argument(
+        "RoboPlan addressed planner construction is inconsistent");
   }
-  if (!live_scene_) {
-    throw std::invalid_argument("RoboPlan live IK scene must not be null");
+}
+
+core::Result<void> RoboPlanPlannerBackend::RebindProjection(
+    const core::ProjectionLeaseBindingDTO& expected_predecessor,
+    core::ProjectionLeaseBindingDTO candidate) {
+  if (!expected_predecessor.valid() || !candidate.valid()) {
+    return core::Result<void>::Err(error(
+        ErrorCode::kInvalidRequest, "planner product rebind has an invalid lease",
+        "native_planner_product_rebind_invalid"));
   }
-  if (!scene_mutex_) {
-    scene_mutex_ = std::make_shared<std::mutex>();
+  std::unique_lock lock(projection_mutex_);
+  if (projection_binding_ != expected_predecessor) {
+    return core::Result<void>::Err(error(
+        ErrorCode::kInvalidStateTransition,
+        "planner product rebind crossed its exact predecessor",
+        "native_planner_product_rebind_stale_predecessor"));
   }
-  ik_options_ = ik_options.value_or([&] {
-    roboplan::SimpleIkOptions opts;
-    opts.group_name = rrt_options_.group_name;
-    return opts;
-  }());
-  single_shot_ik_options_ =
-      single_shot_ik_options.value_or(ik_options_);
+  // The candidate client selects the exact retained Scene lease per request.
+  // Re-anchor the unchanged worker without replacing its engine or model.
+  projection_binding_ = std::move(candidate);
+  return core::Result<void>::Ok();
+}
+
+core::Result<void> IRoboPlanCandidateClient::replace_retained_model(
+    const RoboPlanWorkerModelDTO &) {
+  return core::Result<void>::Err(error(
+      ErrorCode::kInvalidStateTransition,
+      "Fixed RoboPlan candidate client cannot replace its planning model",
+      "native_planner_model_replacement_unavailable"));
+}
+
+core::Result<void>
+RoboPlanPlannerBackend::ReplaceRetainedModel(const RoboPlanWorkerModelDTO &model) {
+  std::unique_lock lock(projection_mutex_);
+  return candidate_client_->replace_retained_model(model);
+}
+
+core::Result<void> RoboPlanPlannerBackend::ReplaceRetainedSettings(
+    const RoboPlanCandidateComputerConfig &settings) {
+  std::unique_lock lock(projection_mutex_);
+  return candidate_client_->replace_retained_settings(settings);
+}
+
+core::PlanResultDTO
+RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
+  const auto setup_started = std::chrono::steady_clock::now();
+  // Select and consume one operation's worker allowances atomically. Another
+  // plan or IK request must not replace them between selection and computation.
+  std::unique_lock projection_lock(projection_mutex_);
+  if (auto invalid = validate_plan_binding(request, projection_binding_,
+                                           candidate_binding_);
+      invalid.has_value()) {
+    return plan_error(std::move(*invalid));
+  }
+  if (candidate_client_->requires_retained_projection()) {
+    if (auto invalid = validate_retained_projection(
+            request.projection_binding, request.retained_collision_world,
+            request.retained_collision_policy);
+        invalid.has_value()) {
+      return plan_error(std::move(*invalid));
+    }
+    auto selected = candidate_client_->select_retained_projection(
+        RoboPlanCandidateProjectionDTO{request.projection_binding,
+                                       request.retained_collision_world,
+                                       request.retained_collision_policy,
+                                       request.contact_policy_id,
+                                       request.retained_clearance_margins});
+    if (!selected.ok()) {
+      return plan_error(selected.error());
+    }
+  }
+
+  RoboPlanCandidateRequestDTO candidate{request.controllable_component_id,
+                                        request.command_target_id,
+                                        candidate_binding_.model_instance_id,
+                                        candidate_binding_.model_revision,
+                                        request.resources,
+                                        request.base_frame,
+                                        request.tcp_frame,
+                                        request.start_state,
+                                        request.motion,
+                                        request.tolerances,
+                                        request.speed_profile,
+                                        request.planner,
+                                        request.per_resource_dynamics_limits,
+                                        request.planning_timeout_s,
+                                        request.planning_attempt_index,
+                                        request.action_span,
+                                        request.moving_replacement};
+  if (candidate.moving_replacement) {
+    const auto setup_elapsed = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - setup_started)
+                                   .count();
+    auto &remaining =
+        candidate.moving_replacement->remaining_preparation_budget_s;
+    remaining -= setup_elapsed;
+    auto &planning = candidate.moving_replacement->remaining_planning_budget_s;
+    if (planning) *planning -= setup_elapsed;
+    if ((std::isfinite(remaining) && remaining <= 0.0) ||
+        (planning && std::isfinite(*planning) && *planning <= 0.0)) {
+      return plan_error(error(ErrorCode::kPlanningTimeout,
+                              "Moving replacement preparation timed out",
+                              "planning_timeout"));
+    }
+  }
+  try {
+    auto result = candidate_client_->compute(candidate);
+    if (!result.ok()) {
+      return plan_error(result.error());
+    }
+    if (!trajectory_shape_valid(result.value(), candidate_binding_)) {
+      return plan_error(
+          error(ErrorCode::kInvariantViolation,
+                "RoboPlan candidate returned a malformed portable trajectory",
+                "native_planner_result_invalid"));
+    }
+    return {std::move(result.value()), std::nullopt,
+            request.projection_binding.projection_revision};
+  } catch (const std::exception &exception) {
+    return plan_error(error(ErrorCode::kPlanningFailed,
+                            "RoboPlan candidate transport failed: " +
+                                std::string(exception.what()),
+                            "native_planner_transport_failure"));
+  } catch (...) {
+    return plan_error(error(ErrorCode::kPlanningFailed,
+                            "RoboPlan candidate transport failed",
+                            "native_planner_transport_failure"));
+  }
 }
 
 void RoboPlanPlannerBackend::request_cancel() {
-  cancel_requested_.store(true, std::memory_order_release);
+  candidate_client_->request_cancel();
 }
 
-void RoboPlanPlannerBackend::set_performance_observer(
-    std::shared_ptr<IRoboPlanPlanningPerformanceObserver> observer) noexcept {
-  performance_observer_.store(std::move(observer), std::memory_order_release);
-}
-
-core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& request) {
-  core::PlanResultDTO result;
-  RoboPlanPlanningPipelineMetrics performance_metrics;
-  performance_metrics.rng_base_seed = rng_seed_;
-  performance_metrics.planning_attempt_index = request.planning_attempt_index;
-  if (rng_seed_) {
-    performance_metrics.rng_seed = effective_planner_seed(
-        *rng_seed_, request.planning_attempt_index);
+core::IkResultDTO
+RoboPlanPlannerBackend::solve_ik(const core::IkRequestDTO &request) {
+  std::unique_lock projection_lock(projection_mutex_);
+  if (auto invalid =
+          validate_ik_binding(request, projection_binding_, candidate_binding_);
+      invalid.has_value()) {
+    return ik_error(std::move(*invalid));
   }
-  const auto performance_observer =
-      performance_observer_.load(std::memory_order_acquire);
-  PlanningInvocationMeasurement invocation(
-      performance_observer, request, result, performance_metrics);
-  cancel_requested_.store(false, std::memory_order_release);
-  const auto plan_started_at = std::chrono::steady_clock::now();
-  const bool has_planning_deadline =
-      std::isfinite(request.planning_timeout_s) && request.planning_timeout_s > 0.0;
-
+  if (candidate_client_->requires_retained_projection()) {
+    if (auto invalid = validate_retained_projection(
+            request.projection_binding, request.retained_collision_world,
+            request.retained_collision_policy);
+        invalid.has_value()) {
+      return ik_error(std::move(*invalid));
+    }
+    auto selected = candidate_client_->select_retained_projection(
+        RoboPlanCandidateProjectionDTO{request.projection_binding,
+                                       request.retained_collision_world,
+                                       request.retained_collision_policy});
+    if (!selected.ok()) {
+      return ik_error(selected.error());
+    }
+  }
+  const double timeout = request.timeout_s > 0.0
+                             ? request.timeout_s
+                             : config_.default_single_shot_ik_timeout_s;
   try {
-    if (!request.scene_binding.valid()) {
-      result.error = core::ErrorDTO{
-          core::kErrorInvalidRequest,
-          "Planning request does not carry a valid scene projection binding",
-          {{"reason", "planner_scene_binding_invalid"}}};
-      return result;
+    auto result = candidate_client_->solve_ik(
+        request.goal_pose, request.base_frame, request.tcp_frame,
+        request.seed_state, timeout);
+    if (!result.ok()) {
+      return ik_error(result.error());
     }
-    std::shared_ptr<const roboplan::Scene> retained_scene;
-    {
-      PlanningStageMeasurement stage(
-          performance_metrics, performance_observer, "projection_acquire");
-      retained_scene =
-          projection_->acquire_native_projection(request.scene_binding);
+    if (result.value().size() != candidate_binding_.resources.size() ||
+        !std::all_of(result.value().begin(), result.value().end(),
+                     [](double value) { return std::isfinite(value); })) {
+      return ik_error(
+          error(ErrorCode::kInvariantViolation,
+                "RoboPlan candidate returned a malformed IK solution",
+                "native_ik_result_invalid"));
     }
-    if (!retained_scene) {
-      result.error = core::ErrorDTO{
-          core::kErrorSceneChangedDuringValidation,
-          "The retained planner scene projection is unavailable",
-          {{"reason", "planner_projection_lease_unavailable"},
-           {"projection_lease_id",
-            request.scene_binding.projection_lease_id},
-           {"requested_revision_id",
-            std::to_string(request.scene_binding.revision.revision_id)}}};
-      return result;
-    }
-    std::shared_ptr<roboplan::Scene> planning_scene;
-    std::shared_ptr<roboplan::SimpleIk> planning_ik;
-    std::shared_ptr<roboplan::PathShortcutter> planning_shortcutter;
-    std::shared_ptr<roboplan::PathParameterizerTOPPRA> planning_toppra;
-    std::optional<roboplan::CollisionQueryView> planning_collision_query;
-    const bool is_cartesian_path =
-        std::holds_alternative<core::CartesianPathDTO>(request.motion);
-    {
-      PlanningStageMeasurement stage(
-          performance_metrics, performance_observer, "context_construction");
-      // Retained projections are immutable evidence. Planner algorithms own a
-      // request-local working copy because IK and sampling advance Scene RNG
-      // state even when geometry is unchanged.
-      planning_scene = retained_scene->clone();
-      if (performance_metrics.rng_seed.has_value()) {
-        planning_scene->setRngSeed(*performance_metrics.rng_seed);
-      }
-      if (!is_cartesian_path) {
-        // Joint/pose planning exclusively owns this request-local scene and
-        // executes its stages serially. Select that Scene generation's existing
-        // collision workspace explicitly, avoiding a redundant broadphase copy
-        // while preserving isolated CollisionContext defaults for callers that
-        // may query one Scene concurrently.
-        planning_collision_query.emplace(
-            roboplan::CollisionQueryView::forSerializedScene(planning_scene));
-        auto request_ik_options = planning_profile_ik_options(
-            ik_options_, request.planning_profile);
-        planning_ik = std::make_shared<roboplan::SimpleIk>(
-            planning_scene, request_ik_options);
-        const auto shortcutting_options = production_shortcutting_options(
-            rrt_options_.group_name, performance_metrics.rng_seed);
-        performance_metrics.shortcut_rng_seed_argument =
-            shortcutting_options.seed;
-        planning_shortcutter =
-            std::make_shared<roboplan::PathShortcutter>(
-                planning_scene, shortcutting_options);
-        planning_toppra =
-            std::make_shared<roboplan::PathParameterizerTOPPRA>(
-                planning_scene, rrt_options_.group_name);
-      }
-    }
-
-    const auto fail_if_cancelled = [&](const std::string& stage) {
-      if (!cancel_requested_.load(std::memory_order_acquire)) {
-        return false;
-      }
-      result.error = core::ErrorDTO{
-          core::kErrorPlanningFailed,
-          "planning cancelled by interrupt",
-          {{"reason", "planning_cancelled_by_interrupt"},
-           {"failure_stage", stage}}};
-      return true;
-    };
-    const auto fail_if_timed_out = [&](const std::string& stage) {
-      if (!has_planning_deadline) {
-        return false;
-      }
-      const auto elapsed = std::chrono::duration<double>(
-          std::chrono::steady_clock::now() - plan_started_at);
-      if (elapsed.count() < request.planning_timeout_s) {
-        return false;
-      }
-      result.error = core::ErrorDTO{
-          core::kErrorPlanningTimeout,
-          "planning timed out",
-          {{"reason", "planning_timeout"},
-           {"failure_stage", stage},
-           {"timeout_s", std::to_string(request.planning_timeout_s)},
-           {"elapsed_s", std::to_string(elapsed.count())}}};
-      return true;
-    };
-    const auto fail_if_cancelled_or_timed_out = [&](const std::string& stage) {
-      return fail_if_cancelled(stage) || fail_if_timed_out(stage);
-    };
-
-    const char* motion_type =
-        std::holds_alternative<core::JointGoalDTO>(request.motion)
-            ? "joint"
-            : (std::holds_alternative<core::PoseGoalDTO>(request.motion)
-                   ? "pose"
-                   : (is_cartesian_path ? "cartesian_path" : "unsupported"));
-    planner_debug("[PLANNER] plan() called, move_id={}, motion_type={}\n",
-                  request.move_id, motion_type);
-
-    // Extract start state
-    const auto& start = request.start_state;
-    Eigen::VectorXd start_positions(start.positions_rad.size());
-    for (size_t i = 0; i < start.positions_rad.size(); ++i) {
-      start_positions[i] = start.positions_rad[i];
-    }
-
-    planner_debug("[PLANNER] start joints: [");
-    for (size_t i = 0; i < start.positions_rad.size(); ++i)
-      planner_debug("{}{:.4f}", (i ? ", " : ""), start.positions_rad[i]);
-    planner_debug("]\n");
-
-    roboplan::JointConfiguration start_config;
-    start_config.joint_names = start.joint_names;
-    start_config.positions = start_positions;
-
-    const Eigen::VectorXd start_positions_full =
-        planning_scene->toFullJointPositions(rrt_options_.group_name,
-                                             start_positions);
-
-    // Check start for self-collision
-    bool start_collision = false;
-    {
-      PlanningStageMeasurement stage(
-          performance_metrics, performance_observer,
-          "start_collision_query");
-      start_collision = is_cartesian_path
-                            ? planning_scene->hasCollisions(start_positions_full)
-                            : planning_collision_query->hasCollisions(
-                                  start_positions_full);
-    }
-    bool goal_collision = false;
-    if (fail_if_cancelled_or_timed_out("start_collision_check")) {
-      return result;
-    }
-
-    // Cartesian requests validate both frames and the start pose inside the
-    // adapter before using either. Keep this diagnostic off that path so an
-    // unknown frame cannot bypass the structured request error.
-    if (!is_cartesian_path) {
-      PlanningStageMeasurement stage(
-          performance_metrics, performance_observer, "start_fk");
-      Eigen::Matrix4d start_fk = planning_scene->forwardKinematics(
-          start_positions_full, request.tcp_frame);
-      double r, p, ya;
-      matrix_to_rpy_deg(start_fk, r, p, ya);
-      planner_debug(
-          "[PLANNER] start pose:  pos=({:.3f}, {:.3f}, {:.3f}) rpy=({:.1f}, {:.1f}, {:.1f}) collision={}\n",
-          start_fk(0, 3), start_fk(1, 3), start_fk(2, 3), r, p, ya,
-          start_collision ? "YES" : "no");
-    }
-
-    if (start_collision) {
-      auto diagnostics =
-          collect_collision_diagnostics(planning_scene, start_positions_full);
-      const std::string message = collision_message_with_pairs(
-          "Planning preview rejected: start state is already in collision",
-          diagnostics);
-      result.error = core::ErrorDTO{
-          core::kErrorPlanningFailed,
-          message,
-          collision_details("start_state", true, false, diagnostics),
-      };
-      return result;
-    }
-
-    if (const auto* cartesian =
-            std::get_if<core::CartesianPathDTO>(&request.motion)) {
-      auto cartesian_result = [&]() {
-        PlanningStageMeasurement stage(
-            performance_metrics, performance_observer, "cartesian_path");
-        return plan_cartesian_path(
-            request, *cartesian, planning_scene,
-            CartesianPlanningControl{
-                .cancellation_requested = [this] {
-                  return cancel_requested_.load(std::memory_order_acquire);
-                },
-                .deadline_expired = [&] {
-                  if (!has_planning_deadline) {
-                    return false;
-                  }
-                  return std::chrono::duration<double>(
-                             std::chrono::steady_clock::now() - plan_started_at)
-                             .count() >= request.planning_timeout_s;
-                }});
-      }();
-      if (!cartesian_result.ok()) {
-        result.error = cartesian_result.error();
-        return result;
-      }
-      if (fail_if_cancelled_or_timed_out("cartesian_output_conversion")) {
-        return result;
-      }
-      result.trajectory = convert_trajectory(cartesian_result.value());
-      result.scene_revision = request.scene_binding.revision;
-      return result;
-    }
-
-    // Determine goal configuration based on motion type
-    roboplan::JointConfiguration goal_config;
-
-    if (auto* joint_goal = std::get_if<core::JointGoalDTO>(&request.motion)) {
-      // Joint goal — direct conversion
-      Eigen::VectorXd goal_positions(joint_goal->positions_rad.size());
-      for (size_t i = 0; i < joint_goal->positions_rad.size(); ++i) {
-        goal_positions[i] = joint_goal->positions_rad[i];
-      }
-      goal_config.joint_names = joint_goal->joint_names;
-      goal_config.positions = goal_positions;
-
-    } else if (auto* pose_goal = std::get_if<core::PoseGoalDTO>(&request.motion)) {
-      Eigen::Matrix4d tform = Eigen::Matrix4d::Identity();
-      tform(0, 3) = pose_goal->goal.position_m.x_m;
-      tform(1, 3) = pose_goal->goal.position_m.y_m;
-      tform(2, 3) = pose_goal->goal.position_m.z_m;
-
-      // Quaternion to rotation matrix
-      double x = pose_goal->goal.orientation.x;
-      double y = pose_goal->goal.orientation.y;
-      double z = pose_goal->goal.orientation.z;
-      double w = pose_goal->goal.orientation.w;
-      tform(0, 0) = 1 - 2*y*y - 2*z*z;
-      tform(0, 1) = 2*x*y - 2*z*w;
-      tform(0, 2) = 2*x*z + 2*y*w;
-      tform(1, 0) = 2*x*y + 2*z*w;
-      tform(1, 1) = 1 - 2*x*x - 2*z*z;
-      tform(1, 2) = 2*y*z - 2*x*w;
-      tform(2, 0) = 2*x*z - 2*y*w;
-      tform(2, 1) = 2*y*z + 2*x*w;
-      tform(2, 2) = 1 - 2*x*x - 2*y*y;
-
-      {
-        double r, p, ya;
-        matrix_to_rpy_deg(tform, r, p, ya);
-        planner_debug(
-            "[PLANNER] goal pose:   pos=({:.3f}, {:.3f}, {:.3f}) rpy=({:.1f}, {:.1f}, {:.1f})\n",
-            tform(0, 3), tform(1, 3), tform(2, 3), r, p, ya);
-      }
-
-      roboplan::CartesianConfiguration cart_config;
-      cart_config.base_frame = request.base_frame;
-      cart_config.tip_frame = request.tcp_frame;
-      cart_config.tform = tform;
-
-      goal_config.joint_names = start.joint_names;
-      goal_config.positions = start_positions;  // seed with current
-
-      bool ik_succeeded = false;
-      {
-        PlanningStageMeasurement stage(
-            performance_metrics, performance_observer, "ik");
-        ik_succeeded =
-            planning_ik->solveIk(
-                cart_config, start_config, goal_config,
-                *planning_collision_query);
-      }
-      if (!ik_succeeded) {
-        double r, p, ya;
-        matrix_to_rpy_deg(tform, r, p, ya);
-        auto str = fmt::format(
-            "IK failed: goal pos=({:.3f},{:.3f},{:.3f}) rpy=({:.1f},{:.1f},{:.1f}) frame={}->{}",
-            tform(0, 3), tform(1, 3), tform(2, 3), r, p, ya,
-            request.base_frame, request.tcp_frame);
-        result.error = core::ErrorDTO{core::kErrorIkFailed, str, {}};
-        planner_debug("[PLANNER] IK FAILED\n");
-        return result;
-      }
-      if (fail_if_cancelled_or_timed_out("ik")) {
-        return result;
-      }
-
-      planner_debug("[PLANNER] IK solved. goal: [");
-      for (int i = 0; i < goal_config.positions.size(); ++i)
-        planner_debug("{}{:.4f}", (i ? ", " : ""), goal_config.positions[i]);
-      planner_debug("]\n");
-
-      normalize_ik_goal_for_rrt_limits(
-          planning_scene, rrt_options_.group_name, start_config.positions,
-          goal_config.positions);
-
-      // Check goal for self-collision
-      const Eigen::VectorXd goal_positions_full =
-          planning_scene->toFullJointPositions(
-              rrt_options_.group_name, goal_config.positions);
-      {
-        PlanningStageMeasurement stage(
-            performance_metrics, performance_observer,
-            "goal_collision_query");
-        goal_collision = planning_collision_query->hasCollisions(
-            goal_positions_full);
-      }
-      planner_debug("[PLANNER] goal in collision: {}\n",
-                    goal_collision ? "YES" : "no");
-      if (fail_if_cancelled_or_timed_out("goal_collision_check")) {
-        return result;
-      }
-
-      if (goal_collision) {
-        auto diagnostics =
-            collect_collision_diagnostics(planning_scene, goal_positions_full);
-        const std::string message = collision_message_with_pairs(
-            "Planning preview rejected: goal state is in collision",
-            diagnostics);
-        result.error = core::ErrorDTO{
-            core::kErrorPlanningFailed,
-            message,
-            collision_details("goal_state", false, true, diagnostics),
-        };
-        return result;
-      }
-
-      // Compute joint-space distance
-      double jdist = (goal_config.positions - start_config.positions).norm();
-      planner_debug("[PLANNER] joint-space distance start->goal: {:.4f} rad\n", jdist);
-
-    } else {
-      result.error = core::ErrorDTO{core::kErrorInvalidRequest,
-                                     "Unsupported motion type for native planner", {}};
-      return result;
-    }
-
-    // Per-joint dynamics caps (Phase 4-P5.1K). The deployment/operator caps in
-    // request.per_joint_dynamics_limits are ONE source only; the conservative
-    // effective limit is min(model, cap) per joint per dimension. This backend
-    // does NOT feed per-joint vectors into TOPP-RA: TOPP-RA receives only scalar
-    // velocity/acceleration scales. Instead we enforce the absolute caps with a
-    // conservative GLOBAL retiming loop (below) that slows the whole trajectory
-    // and then VERIFIES the result by sampling per-joint peak velocity and
-    // acceleration against the caps. This is approximate-but-conservative
-    // (the retiming can only make motion slower, never exceed a cap), and it
-    // fails closed when a cap cannot be met or verified. We validate the cap
-    // map up front and fail closed before spending the RRT budget.
-    //
-    // The active planning group's joint names: the kernel populates start_state
-    // with exactly the joints this plan drives, and the produced trajectory is
-    // over the same set. A cap keyed by a joint outside this set (a typo, or a
-    // joint that belongs to a different group) cannot be enforced by this plan,
-    // so we reject it rather than silently ignoring it.
-    const std::vector<std::string>& group_joint_names = start.joint_names;
-    auto is_active_group_joint = [&](const std::string& jn) {
-      return std::find(group_joint_names.begin(), group_joint_names.end(), jn) !=
-             group_joint_names.end();
-    };
-    std::map<std::string, double> vel_cap_by_name;  // rad/s, strictly positive
-    std::map<std::string, double> acc_cap_by_name;  // rad/s^2, strictly positive
-    for (const auto& [joint_name, limit] : request.per_joint_dynamics_limits) {
-      // Unknown / non-active joint name -> fail closed (never a silent no-op).
-      if (!is_active_group_joint(joint_name)) {
-        result.error = core::ErrorDTO{
-            core::kErrorUnsupportedCapability,
-            "per-joint dynamics cap names a joint that is not in the active "
-            "planning group",
-            {{"reason", "unsupported_joint_dynamics_limit"},
-             {"joint", joint_name},
-             {"group", rrt_options_.group_name},
-             {"failure_stage", "request_validation"}}};
-        return result;
-      }
-      // Jerk caps: validate the value first, THEN report enforceability. A
-      // malformed jerk (NaN/inf/<=0) is an invalid request regardless of
-      // whether the active path could enforce it; only a finite, strictly
-      // positive jerk cap is "well-formed but unsupported" on the discrete
-      // TOPP-RA path (this backend constrains jerk for no joint).
-      if (limit.max_jerk_rad_s3.has_value()) {
-        const double j = *limit.max_jerk_rad_s3;
-        if (!std::isfinite(j) || j <= 0.0) {
-          result.error = core::ErrorDTO{
-              core::kErrorInvalidRequest,
-              "per-joint max_jerk_rad_s3 must be finite and strictly positive",
-              {{"reason", "invalid_joint_dynamics_limit"},
-               {"joint", joint_name},
-               {"dimension", "jerk"}}};
-          return result;
-        }
-        result.error = core::ErrorDTO{
-            core::kErrorUnsupportedCapability,
-            "per-joint jerk caps are not enforceable by the discrete TOPP-RA "
-            "time-parameterization path",
-            {{"reason", "unsupported_joint_dynamics_limit"},
-             {"joint", joint_name},
-             {"dimension", "jerk"},
-             {"backend", "roboplan_toppra"}}};
-        return result;
-      }
-      if (limit.max_velocity_rad_s.has_value()) {
-        const double v = *limit.max_velocity_rad_s;
-        if (!std::isfinite(v) || v <= 0.0) {
-          result.error = core::ErrorDTO{
-              core::kErrorInvalidRequest,
-              "per-joint max_velocity_rad_s must be finite and strictly positive",
-              {{"reason", "invalid_joint_dynamics_limit"},
-               {"joint", joint_name},
-               {"dimension", "velocity"}}};
-          return result;
-        }
-        vel_cap_by_name[joint_name] = v;
-      }
-      if (limit.max_acceleration_rad_s2.has_value()) {
-        const double a = *limit.max_acceleration_rad_s2;
-        if (!std::isfinite(a) || a <= 0.0) {
-          result.error = core::ErrorDTO{
-              core::kErrorInvalidRequest,
-              "per-joint max_acceleration_rad_s2 must be finite and strictly "
-              "positive",
-              {{"reason", "invalid_joint_dynamics_limit"},
-               {"joint", joint_name},
-               {"dimension", "acceleration"}}};
-          return result;
-        }
-        acc_cap_by_name[joint_name] = a;
-      }
-    }
-    const bool has_joint_dynamics_caps =
-        !vel_cap_by_name.empty() || !acc_cap_by_name.empty();
-
-    // Plan path with an RRT instance configured for this request's timeout.
-    // This gives the native backend a hard, cooperative planning bound instead
-    // of relying only on a post-hoc stop request in the kernel.
-    auto request_rrt_options = planning_profile_rrt_options(
-        rrt_options_, request.planning_profile);
-    if (request.planning_timeout_s > 0.0) {
-      if (request_rrt_options.max_planning_time > 0.0) {
-        request_rrt_options.max_planning_time =
-            std::min(request_rrt_options.max_planning_time,
-                     request.planning_timeout_s);
-      } else {
-        request_rrt_options.max_planning_time = request.planning_timeout_s;
-      }
-    }
-    roboplan::RRT request_rrt(planning_scene, request_rrt_options);
-    if (performance_metrics.rng_seed.has_value()) {
-      request_rrt.setRngSeed(*performance_metrics.rng_seed);
-    }
-
-    // Plan path with RRT
-    if (fail_if_cancelled_or_timed_out("before_rrt")) {
-      return result;
-    }
-    planner_debug("[PLANNER] calling RRT...\n");
-    auto path_result = [&]() {
-      PlanningStageMeasurement stage(
-          performance_metrics, performance_observer, "rrt");
-      return request_rrt.plan(
-          start_config, goal_config, *planning_collision_query);
-    }();
-    if (fail_if_cancelled_or_timed_out("rrt")) {
-      return result;
-    }
-    if (!path_result.has_value()) {
-      planner_debug("[PLANNER] RRT FAILED: {}\n", path_result.error());
-
-      // Build detailed error message
-      std::string err_msg = "RRT failed: " + path_result.error();
-      err_msg += " | start=[";
-      for (int i = 0; i < start_config.positions.size(); ++i) {
-        if (i) err_msg += ",";
-        err_msg += fmt::format("{:.3f}", start_config.positions[i]);
-      }
-      err_msg += "] goal=[";
-      for (int i = 0; i < goal_config.positions.size(); ++i) {
-        if (i) err_msg += ",";
-        err_msg += fmt::format("{:.3f}", goal_config.positions[i]);
-      }
-      err_msg += "]";
-
-      result.error = core::ErrorDTO{
-          core::kErrorPlanningFailed,
-          err_msg,
-          {
-              {"failure_stage", "rrt"},
-              {"start_in_collision", start_collision ? "true" : "false"},
-              {"goal_in_collision", goal_collision ? "true" : "false"},
-          },
-      };
-      return result;
-    }
-    planner_debug("[PLANNER] RRT succeeded\n");
-
-    // Shortcut the path
-    if (fail_if_cancelled_or_timed_out("before_shortcut")) {
-      return result;
-    }
-    auto smoothed_path = [&]() {
-      PlanningStageMeasurement stage(
-          performance_metrics, performance_observer, "shortcut");
-      return planning_shortcutter->shortcut(
-          path_result.value(), *planning_collision_query);
-    }();
-    if (fail_if_cancelled_or_timed_out("shortcut")) {
-      return result;
-    }
-
-    // Time-parameterize with TOPPRA. TOPP-RA itself takes only SCALAR velocity
-    // and acceleration scales — there is no per-joint vector-limit input on this
-    // path. We therefore enforce the global TCP linear-speed limit and the
-    // per-joint velocity/acceleration caps (Phase 4-P5.1K) with a conservative
-    // GLOBAL retiming loop: each pass generates a trajectory, then VERIFIES it
-    // by sampling per-joint peak velocity/acceleration (and TCP speed) and, if
-    // any cap is exceeded, slows the whole trajectory and regenerates. TCP speed
-    // and per-joint velocity caps pull down velocity_scale; per-joint
-    // acceleration caps pull down acceleration_scale and (for the velocity²
-    // centripetal component) velocity_scale by sqrt(ratio). velocity_scale
-    // starts at the operator value and is only ever reduced, so the resolved
-    // absolute caps bind regardless of the operator scale (cap resolved first;
-    // velocity_scale applies on top); the acceleration cap is never multiplied
-    // by the velocity scale. This is approximate-but-conservative (retiming only
-    // ever slows motion) and fails closed if a cap cannot be met within the
-    // iteration budget or cannot be verified for lack of samples.
-    const double tcp_limit = request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0);
-    const std::string& tcp_frame = request.tcp_frame;
-    const bool has_tcp_limit = tcp_limit > 0.0 && !tcp_frame.empty();
-    // TOPPRA's spline samples can overshoot a nominal model limit by a small
-    // interpolation/numerical amount at scale 1.0. Keep the producer inside
-    // the authoritative post-plan validator instead of adding a permissive
-    // validation tolerance. This margin applies to the model envelope before
-    // any stricter request-level cap retiming below.
-    constexpr double kModelLimitQualificationMargin = 0.995;
-    double vel_scale = request.speed_profile.velocity_scale *
-                       kModelLimitQualificationMargin;
-    double acc_scale = request.speed_profile.acceleration_scale *
-                       kModelLimitQualificationMargin;
-    constexpr int kMaxRetimeIterations = 32;
-    constexpr double kSpeedMargin = 0.99;  // aim slightly under each limit
-
-    roboplan::JointTrajectory final_traj;
-    TcpSpeedCheck final_tcp_check;
-    int retime_iterations_used = 0;
-    // Worst measured/cap ratios on the final pass (> 1.0 == still violating).
-    double final_vel_cap_ratio = 1.0;
-    double final_acc_cap_ratio = 1.0;
-    std::string final_vel_cap_joint;
-    std::string final_acc_cap_joint;
-    double final_vel_cap_peak = 0.0;
-    double final_acc_cap_peak = 0.0;
-
-    {
-      PlanningStageMeasurement stage(
-          performance_metrics, performance_observer, "retime");
-      for (int iter = 0; iter < kMaxRetimeIterations; ++iter) {
-        if (fail_if_cancelled_or_timed_out("retime")) {
-          return result;
-        }
-        retime_iterations_used = iter + 1;
-        roboplan::TOPPRAOptions toppra_options;
-        toppra_options.dt = 0.01;
-        toppra_options.mode = roboplan::SplineFittingMode::Hermite;
-        toppra_options.velocity_scale = vel_scale;
-        toppra_options.acceleration_scale = acc_scale;
-        auto traj_result =
-            planning_toppra->generate(
-                smoothed_path, toppra_options,
-                *planning_collision_query);
-
-        if (!traj_result.has_value()) {
-          result.error = core::ErrorDTO{core::kErrorPlanningFailed,
-                                         "TOPPRA failed: " + traj_result.error(), {}};
-          return result;
-        }
-        if (fail_if_cancelled_or_timed_out("retime_generate")) {
-          return result;
-        }
-
-        final_traj = traj_result.value();
-        anchor_trajectory_endpoints(
-            final_traj, start_config.positions, goal_config.positions);
-        if (fail_if_cancelled_or_timed_out("retime_verify")) {
-          return result;
-        }
-
-        // --- Global TCP linear speed ---
-        bool tcp_ok = true;
-        if (has_tcp_limit) {
-          final_tcp_check = compute_tcp_speed_check(
-              planning_scene, rrt_options_.group_name, final_traj, tcp_frame);
-          if (fail_if_cancelled_or_timed_out("tcp_speed_verify")) {
-            return result;
-          }
-          tcp_ok = final_tcp_check.max_speed_mps <= tcp_limit;
-        }
-
-        // --- Per-joint velocity / acceleration caps ---
-        // Sample the generated trajectory and compare peaks against the caps. If a
-        // capped dimension lacks samples for a capped joint, the cap cannot be
-        // verified -> fail closed (do NOT treat the missing peak as zero, which
-        // would falsely pass the cap).
-        double vel_cap_ratio = 1.0;
-        double acc_cap_ratio = 1.0;
-        final_vel_cap_joint.clear();
-        final_acc_cap_joint.clear();
-        final_vel_cap_peak = 0.0;
-        final_acc_cap_peak = 0.0;
-        if (has_joint_dynamics_caps) {
-          const JointCapMeasurement meas =
-              measure_joint_cap_peaks(final_traj, vel_cap_by_name, acc_cap_by_name);
-          if (fail_if_cancelled_or_timed_out("joint_dynamics_verify")) {
-            return result;
-          }
-          if (!meas.samples_complete) {
-            result.error = core::ErrorDTO{
-                core::kErrorUnsupportedCapability,
-                "trajectory lacks the samples required to verify a per-joint "
-                "dynamics cap; cannot prove enforcement",
-                {{"reason", "unsupported_joint_dynamics_limit"},
-                 {"failure_stage", "time_parameterization"},
-                 {"dimension", meas.incomplete_dimension},
-                 {"joint", meas.incomplete_joint}}};
-            return result;
-          }
-          vel_cap_ratio = meas.worst_vel_ratio;
-          acc_cap_ratio = meas.worst_acc_ratio;
-          final_vel_cap_joint = meas.worst_vel_joint;
-          final_acc_cap_joint = meas.worst_acc_joint;
-          final_vel_cap_peak = meas.worst_vel_peak;
-          final_acc_cap_peak = meas.worst_acc_peak;
-        }
-        final_vel_cap_ratio = vel_cap_ratio;
-        final_acc_cap_ratio = acc_cap_ratio;
-        const bool joints_ok = vel_cap_ratio <= 1.0 && acc_cap_ratio <= 1.0;
-
-        if (tcp_ok && joints_ok) {
-          break;
-        }
-
-        // Reduce scales conservatively so every constraint moves toward
-        // satisfaction together; take the most aggressive factor on each lever.
-        // TCP speed and per-joint velocity act ~linearly on vel_scale. Per-joint
-        // acceleration has a tangential component (∝ acc_scale) and a centripetal
-        // component (∝ traversal speed²), so an acceleration violation pulls down
-        // acc_scale (tangential) AND vel_scale by sqrt(ratio) (centripetal) — the
-        // square root because the velocity-squared term scales the peak by
-        // vel_scale².
-        double vel_factor = 1.0;
-        double acc_factor = 1.0;
-        if (has_tcp_limit && !tcp_ok) {
-          vel_factor = std::min(
-              vel_factor, (tcp_limit * kSpeedMargin) / final_tcp_check.max_speed_mps);
-        }
-        if (vel_cap_ratio > 1.0) {
-          vel_factor = std::min(vel_factor, kSpeedMargin / vel_cap_ratio);
-        }
-        if (acc_cap_ratio > 1.0) {
-          acc_factor = std::min(acc_factor, kSpeedMargin / acc_cap_ratio);
-          vel_factor =
-              std::min(vel_factor, kSpeedMargin / std::sqrt(acc_cap_ratio));
-        }
-        if (vel_factor < 1.0) {
-          vel_scale *= vel_factor;
-        }
-        if (acc_factor < 1.0) {
-          acc_scale *= acc_factor;
-        }
-        if (vel_scale < 0.001) vel_scale = 0.001;
-        if (acc_scale < 0.001) acc_scale = 0.001;
-      }
-    }
-
-    if (has_tcp_limit && final_tcp_check.max_speed_mps > tcp_limit) {
-      std::map<std::string, std::string> details;
-      details["failure_stage"] = "time_parameterization";
-      details["limit_type"] = "tcp_linear_speed";
-      details["measured"] = std::to_string(final_tcp_check.max_speed_mps);
-      details["limit"] = std::to_string(tcp_limit);
-      details["units"] = "m/s";
-      details["tcp_frame"] = tcp_frame;
-      details["waypoint_count"] = std::to_string(final_traj.times.size());
-      details["trajectory_duration_s"] =
-          final_traj.times.empty() ? "0.000000" : std::to_string(final_traj.times.back());
-      details["max_segment_index"] = std::to_string(final_tcp_check.segment_index);
-      details["max_segment_dt_s"] = std::to_string(final_tcp_check.segment_dt_s);
-      details["toppra_iterations"] = std::to_string(retime_iterations_used);
-      details["final_velocity_scale"] = std::to_string(vel_scale);
-      result.error = core::ErrorDTO{
-          core::kErrorValidationLimitsViolation,
-          "TCP linear speed exceeds limit after time-parameterization",
-          details};
-      return result;
-    }
-
-    if (has_joint_dynamics_caps &&
-        (final_vel_cap_ratio > 1.0 || final_acc_cap_ratio > 1.0)) {
-      std::map<std::string, std::string> details;
-      details["failure_stage"] = "time_parameterization";
-      details["reason"] = "unsupported_joint_dynamics_limit";
-      details["toppra_iterations"] = std::to_string(retime_iterations_used);
-      details["final_velocity_scale"] = std::to_string(vel_scale);
-      details["final_acceleration_scale"] = std::to_string(acc_scale);
-      details["trajectory_duration_s"] =
-          final_traj.times.empty() ? "0.000000" : std::to_string(final_traj.times.back());
-      if (final_vel_cap_ratio >= final_acc_cap_ratio) {
-        details["limit_type"] = "joint_velocity";
-        details["joint"] = final_vel_cap_joint;
-        details["measured"] = std::to_string(final_vel_cap_peak);
-        details["limit"] = std::to_string(vel_cap_by_name[final_vel_cap_joint]);
-        details["units"] = "rad/s";
-      } else {
-        details["limit_type"] = "joint_acceleration";
-        details["joint"] = final_acc_cap_joint;
-        details["measured"] = std::to_string(final_acc_cap_peak);
-        details["limit"] = std::to_string(acc_cap_by_name[final_acc_cap_joint]);
-        details["units"] = "rad/s^2";
-      }
-      result.error = core::ErrorDTO{
-          core::kErrorUnsupportedCapability,
-          "per-joint dynamics cap could not be enforced by conservative "
-          "retiming within the iteration budget",
-          details};
-      return result;
-    }
-
-    if (fail_if_cancelled_or_timed_out("trajectory_conversion")) {
-      return result;
-    }
-
-    // Convert to TrajectoryDTO
-    {
-      PlanningStageMeasurement stage(
-          performance_metrics, performance_observer,
-          "trajectory_conversion");
-      result.trajectory = convert_trajectory(final_traj);
-    }
-    result.scene_revision = request.scene_binding.revision;
-
-  } catch (const std::exception& e) {
-    result.error = core::ErrorDTO{core::kErrorPlanningFailed, e.what(), {}};
+    return {true, candidate_binding_.resources,
+            candidate_binding_.compiled_joint_names, std::move(result.value()),
+            std::nullopt};
+  } catch (const std::exception &exception) {
+    return ik_error(
+        error(ErrorCode::kIkFailed,
+              "RoboPlan IK transport failed: " + std::string(exception.what()),
+              "native_ik_transport_failure"));
+  } catch (...) {
+    return ik_error(error(ErrorCode::kIkFailed, "RoboPlan IK transport failed",
+                          "native_ik_transport_failure"));
   }
-
-  return result;
 }
 
-core::TrajectoryDTO RoboPlanPlannerBackend::convert_trajectory(
-    const roboplan::JointTrajectory& traj) {
-  core::TrajectoryDTO dto;
-  dto.joint_names = traj.joint_names;
-
-  for (size_t i = 0; i < traj.times.size(); ++i) {
-    core::TrajectoryWaypointDTO wp;
-    wp.time_from_start_s = traj.times[i];
-
-    wp.positions_rad.resize(traj.positions[i].size());
-    for (Eigen::Index j = 0; j < traj.positions[i].size(); ++j) {
-      wp.positions_rad[j] = traj.positions[i][j];
-    }
-
-    if (i < traj.velocities.size()) {
-      wp.velocities_rad_s.resize(traj.velocities[i].size());
-      for (Eigen::Index j = 0; j < traj.velocities[i].size(); ++j) {
-        wp.velocities_rad_s[j] = traj.velocities[i][j];
-      }
-    }
-
-    if (i < traj.accelerations.size()) {
-      wp.accelerations_rad_s2.resize(traj.accelerations[i].size());
-      for (Eigen::Index j = 0; j < traj.accelerations[i].size(); ++j) {
-        wp.accelerations_rad_s2[j] = traj.accelerations[i][j];
-      }
-    }
-
-    dto.waypoints.push_back(std::move(wp));
-  }
-
-  return dto;
-}
-
-// =================================================================
-// Single-shot IK (IPlannerBackend::solve_ik).
-//
-// Uses a separate low-budget SimpleIk solver when configured. Full plan()
-// keeps the planning IK budget; solve_ik() is bounded for interactive
-// (e.g. validated candidate Cartesian authoring) responsiveness.
-// Distinct from plan(): no trajectory shaping, no collision check, no
-// RRT — just a pose-to-joint resolve with the previous-frame joints as
-// seed for continuity across streamed frames.
-// =================================================================
-core::IkResultDTO RoboPlanPlannerBackend::solve_ik(
-    const core::IkRequestDTO& request) {
-  core::IkResultDTO result;
-
-  // Build the 4x4 target transform from the requested pose. Same conversion
-  // used in plan() above; factored inline to avoid lifting a helper.
-  Eigen::Matrix4d tform = Eigen::Matrix4d::Identity();
-  tform(0, 3) = request.goal_pose.position_m.x_m;
-  tform(1, 3) = request.goal_pose.position_m.y_m;
-  tform(2, 3) = request.goal_pose.position_m.z_m;
-  const double x = request.goal_pose.orientation.x;
-  const double y = request.goal_pose.orientation.y;
-  const double z = request.goal_pose.orientation.z;
-  const double w = request.goal_pose.orientation.w;
-  tform(0, 0) = 1 - 2 * y * y - 2 * z * z;
-  tform(0, 1) = 2 * x * y - 2 * z * w;
-  tform(0, 2) = 2 * x * z + 2 * y * w;
-  tform(1, 0) = 2 * x * y + 2 * z * w;
-  tform(1, 1) = 1 - 2 * x * x - 2 * z * z;
-  tform(1, 2) = 2 * y * z - 2 * x * w;
-  tform(2, 0) = 2 * x * z - 2 * y * w;
-  tform(2, 1) = 2 * y * z + 2 * x * w;
-  tform(2, 2) = 1 - 2 * x * x - 2 * y * y;
-
-  roboplan::CartesianConfiguration cart_config;
-  cart_config.base_frame = request.base_frame;
-  cart_config.tip_frame = request.tcp_frame;
-  cart_config.tform = tform;
-
-  // Seed must come from the caller. The kernel populates request.seed_state
-  // from the live observed-state provider before invoking solve_ik. Empty seeds
-  // fail fast — the IK solver needs a starting configuration for continuity.
-  if (request.seed_state.joint_names.empty() ||
-      request.seed_state.joint_names.size() !=
-          request.seed_state.positions_rad.size()) {
-    result.ok = false;
-    result.error = core::ErrorDTO{
-        std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
-        "solve_ik requires a non-empty seed_state with matching joint names "
-        "and positions; the kernel supplies the selected observed state",
-        {}};
-    return result;
-  }
-
-  roboplan::JointConfiguration start_config;
-  roboplan::JointConfiguration goal_config;
-  Eigen::VectorXd seed_positions(request.seed_state.positions_rad.size());
-  for (size_t i = 0; i < request.seed_state.positions_rad.size(); ++i) {
-    seed_positions[i] = request.seed_state.positions_rad[i];
-  }
-  start_config.joint_names = request.seed_state.joint_names;
-  start_config.positions = seed_positions;
-  goal_config.joint_names = start_config.joint_names;
-  goal_config.positions = start_config.positions;  // seed with start
-
-  std::shared_ptr<roboplan::Scene> ik_scene;
-  {
-    std::lock_guard<std::mutex> lock(*scene_mutex_);
-    ik_scene = live_scene_->clone();
-  }
-  auto single_shot_ik =
-      std::make_shared<roboplan::SimpleIk>(ik_scene, single_shot_ik_options_);
-  if (!single_shot_ik->solveIk(cart_config, start_config, goal_config)) {
-    result.ok = false;
-    result.error = core::ErrorDTO{
-        std::string(core::to_string(core::ErrorCode::kIkFailed)),
-        "IK failed for requested target",
-        {{"base_frame", request.base_frame},
-         {"tcp_frame", request.tcp_frame}}};
-    return result;
-  }
-
-  result.ok = true;
-  result.joint_names = goal_config.joint_names;
-  result.positions_rad.resize(goal_config.positions.size());
-  for (Eigen::Index i = 0; i < goal_config.positions.size(); ++i) {
-    result.positions_rad[i] = goal_config.positions[i];
-  }
-  return result;
-}
-
-}  // namespace manyforge::roboplan_backend
+} // namespace manyforge::roboplan_backend

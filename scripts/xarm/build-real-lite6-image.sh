@@ -8,7 +8,8 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 XARM_SOURCE=${MANYFORGE_XARM_SOURCE_CONTEXT:-}
 IMAGE_NAME=${MANYFORGE_REAL_LITE6_IMAGE:-manyforge-ros-jazzy-real-lite6:experimental}
-BASE_IMAGE=${MANYFORGE_ROS_FULL_BASE_IMAGE:-manyforge-ros-jazzy-full}
+# Keep the existing explicit base override as a compatibility fallback.
+BASE_IMAGE=${MANYFORGE_REAL_LITE6_ROS_BASE_IMAGE:-${MANYFORGE_ROS_FULL_BASE_IMAGE:-manyforge-ros-jazzy-full:q44-20261010}}
 XC4_BASE_COMMIT=50064477f39ecd69ab006488630c837cdcb8d83e
 XC4_BASE_TREE=5b7ab25ecf7f5d030b891824f2cd308ea72c3a57
 SUPERVISED_CONTRACT_MIN_COMMIT=b951ad1f4ce7f1bceb077c74778327f2155e42b7

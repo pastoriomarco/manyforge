@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:4ffc860d1851db9b3a7fd82f5e9bd88eb1eca624dba372852fb2912fab9e34d5",
+  "capability_id": "scene.shape.cylinder",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

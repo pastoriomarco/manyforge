@@ -1,0 +1,50 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
+# `scripts/manyforge component check manyforge_example_models/models/robotiq_2f_140`.
+# The model is the `.structural` projection the family row reads (README.md).
+# Mounts on a robot's `flange` interface as its own component (merge 6).
+api_version: manyforge.component_package.v1
+kind: tool
+id: robotiq.robotiq_2f_140
+version: 1.0.0
+title: Robotiq 2F-140
+license: BSD-3-Clause
+model:
+  urdf: robotiq_2f_140.structural.urdf
+  srdf: robotiq_2f_140.structural.srdf
+mount:
+  frame: robotiq_2f_140_mount
+tcps:                             # the first is the default TCP
+  - {id: tcp, frame: grasp_frame}
+roles:
+  groups: {gripper: gripper}
+  joints: {fingers: [finger_joint]}
+  collision_bodies:
+    gripper_collision: [left_inner_finger, left_inner_finger_pad, left_inner_knuckle, left_outer_finger, left_outer_knuckle, right_inner_finger, right_inner_finger_pad, right_inner_knuckle, right_outer_finger, right_outer_knuckle, robotiq_base_link]
+gripper:
+  actuation: position_commanded
+  states: {open: open, closed: closed}
+  attach_frame: grasp_frame
+  touch_links: [left_inner_finger, left_inner_finger_pad, left_inner_knuckle, left_outer_finger, left_outer_knuckle, right_inner_finger, right_inner_finger_pad, right_inner_knuckle, right_outer_finger, right_outer_knuckle, robotiq_base_link]
+lanes:
+  mock:                           # Mock lane adapter (manyforge_ros2_control_execution/lane/)
+    adapter: mock
+    controller: robotiq_gripper_controller
+    controllers_file: mock_controllers.yaml
+    hard_stop_completion_timeout_s: 0.5
+    gripper_result_timeout_s: 15.0
+    gripper_stop_finish_tolerance: 0.035  # rad of knuckle travel (5% of the 0.7 stroke): a Stop this close lets the command finish
+  isaac:                          # Isaac lane adapter: GripperCommand through the lane's bridge
+    adapter: isaac
+    gripper_transport: ros_gripper_command
+    controller: robotiq_gripper_controller   # its GripperCommand action is <controller>/gripper_cmd
+    command_topic: /isaac_gripper_state
+    state_topic: /isaac_joint_states
+    completion_policy: position_reached
+    open_position: 0.0
+    closed_position: 0.55
+    open_effort: 0.0
+    close_effort: 40.0
+    publish_nominal_position: false
+    gripper_result_timeout_s: 15.0
+    gripper_stop_finish_tolerance: 0.035  # rad of knuckle travel (5% of the 0.7 stroke): a Stop this close lets the command finish
+    gripper_bridge: robotiq_2f_140.yaml   # in the lane folder's gripper_bridges/

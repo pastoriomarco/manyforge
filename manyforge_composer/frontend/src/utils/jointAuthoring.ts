@@ -1,33 +1,42 @@
-export interface JointTargetDraft {
-  jointNames: string[];
-  positionsRad: number[];
+import {
+  coordinateUnitForKind,
+  type ActuatedCoordinateKind,
+  type CoordinateUnit,
+} from './gripperAuthoring';
+
+export interface JointCoordinateDraft {
+  jointName: string;
+  kind: ActuatedCoordinateKind;
+  value: number;
+  unit: CoordinateUnit;
 }
 
-/**
- * Accumulate an edited joint into the running set of authored joint drafts.
- *
- * Joint candidates are authored as a PARTIAL target that the backend overlays
- * onto the live joint vector. Authoring only the most-recently-edited joint
- * would silently drop earlier edits (the backend would use the live value for
- * them) while the UI still showed them as amber targets. Accumulating every
- * edited joint keeps the authored candidate consistent with what the operator
- * sees and approves.
- */
+export type JointCoordinateDrafts = Record<string, JointCoordinateDraft>;
+
+/** Keep all edited coordinates and preserve their authored coordinate kinds. */
 export function accumulateJointDrafts(
-  prev: Record<string, number>,
+  previous: JointCoordinateDrafts,
   jointName: string,
-  valueRad: number,
-): Record<string, number> {
-  return { ...prev, [jointName]: valueRad };
+  kind: ActuatedCoordinateKind,
+  value: number,
+): JointCoordinateDrafts {
+  const name = jointName.trim();
+  if (!name) throw new TypeError('Joint name must not be empty');
+  if (!Number.isFinite(value)) throw new TypeError('Joint value must be finite');
+  return {
+    ...previous,
+    [name]: {
+      jointName: name,
+      kind,
+      value,
+      unit: coordinateUnitForKind(kind),
+    },
+  };
 }
 
-/** Build the partial joint target (names + positions) from accumulated drafts. */
-export function jointTargetFromDrafts(
-  drafts: Record<string, number>,
-): JointTargetDraft {
-  const jointNames = Object.keys(drafts);
-  return {
-    jointNames,
-    positionsRad: jointNames.map((name) => drafts[name]),
-  };
+/** A deterministic local list, intentionally not an I6 command payload. */
+export function jointDraftList(
+  drafts: JointCoordinateDrafts,
+): JointCoordinateDraft[] {
+  return Object.keys(drafts).map((name) => drafts[name]);
 }

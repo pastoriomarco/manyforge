@@ -1,537 +1,618 @@
-"""Skill catalog loader and expander for ManyForge behavior trees."""
+"""Build-owned skill artifacts: bounded authoring expansion, never execution.
+
+Whole-value substitutions preserve typed values. Expanded trees use the
+ordinary Program validator and still require Binding compilation/admission.
+No runtime imports, callbacks, queues, or skill executor exist.
+"""
 
 from __future__ import annotations
 
 from copy import deepcopy
-import logging
-import re
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+import re
+from typing import Any
 
-import yaml
-
-from manyforge_behavior.capabilities import CAPABILITY_REGISTRY
-from manyforge_behavior.catalog import NodeCatalog
-from manyforge_behavior.parameters import PARAM_REF_RE
-
-logger = logging.getLogger(__name__)
-
-_EXPECTED_API_VERSION = "manyforge.skill.v0"
-_MAX_NESTING_DEPTH = 2
-_INLINE_PARAM_RE = re.compile(r"\$\{param:([^}]+)\}")
-
-
-@dataclass(frozen=True)
-class SkillParameter:
-    """A single parameter in a skill definition."""
-
-    name: str
-    type: str
-    required: bool
-    default: Any = None
-    description: str = ""
+from .canonical_artifact import (
+    canonical_json_bytes,
+    compute_content_identity,
+    load_strict_json_yaml,
+    raw_sha256_digest,
+)
+from .catalog import NodeCatalog
+from .catalog_schema import parse_schema, validate_value
+from .value_path import ValuePathError, parse_value_path
 
 
-@dataclass(frozen=True)
-class SkillDefinition:
-    """A loaded skill definition."""
+SKILL_API_VERSION = "manyforge.skill.v1"
+MAX_SKILLS = 64
+MAX_SKILL_BYTES = 65_536
+MAX_EXPANDED_NODES = 256
+MAX_EXPANDED_BYTES = 262_144
+MAX_SKILL_DEPTH = 2
+_ID = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
+_REFERENCE = re.compile(r"^\$\{(param|component|target):([a-z][a-z0-9_.-]*)\}$")
+_FIELDS = {
+    "api_version",
+    "skill_id",
+    "version",
+    "name",
+    "description",
+    "compatible_profiles",
+    "component_roles",
+    "target_roles",
+    "parameters",
+    "requires",
+    "provides",
+    "modifies",
+    "body",
+    "example",
+}
+_PROGRAM_MOTION_DEFAULTS = frozenset(
+    {
+        "velocity_scale",
+        "acceleration_scale",
+        "translation_tol_m",
+        "blend_radius_m",
+    }
+)
 
-    skill_id: str
-    version: str
-    name: str
-    description: str
-    compatible_profiles: list[str]
-    requires: list[str]
-    provides: list[str]
-    modifies: list[str]
-    requires_capabilities: list[str]
-    requires_tools: list[str]
-    parameters: list[SkillParameter]
-    body: dict[str, Any]
-    example: dict[str, Any]
-    validated_by: str = ""
 
-    @property
-    def id(self) -> str:
-        """Compatibility alias for legacy callers."""
-        return self.skill_id
+class SkillValidationError(ValueError):
+    """A skill or composition violates the portable, bounded contract."""
 
 
-@dataclass
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise SkillValidationError(message)
+
+
+def _identifier(value: Any) -> str:
+    _require(
+        type(value) is str and _ID.fullmatch(value) is not None,
+        "skill identities must be bounded portable identifiers",
+    )
+    return value
+
+
+def _bounded_document(value: Any) -> None:
+    remaining = 8192
+
+    def visit(item: Any, depth: int) -> None:
+        nonlocal remaining
+        remaining -= 1
+        _require(remaining >= 0 and depth <= 32, "skill value exceeds structural bounds")
+        if type(item) is dict:
+            _require(len(item) <= 256, "skill mapping exceeds bound")
+            for key, child in item.items():
+                _require(type(key) is str and len(key) <= 256, "invalid skill field")
+                visit(child, depth + 1)
+        elif type(item) is list:
+            _require(len(item) <= 256, "skill array exceeds bound")
+            for child in item:
+                visit(child, depth + 1)
+        elif type(item) is str:
+            _require(len(item) <= 8192, "skill text exceeds bound")
+        else:
+            _require(item is None or type(item) in (bool, int, float), "non-JSON skill value")
+
+    visit(value, 0)
+    _require(len(canonical_json_bytes(value)) <= MAX_SKILL_BYTES, "skill exceeds byte bound")
+
+
+def _covers(required: Any, actual: Any) -> bool:
+    if type(required) is dict:
+        return type(actual) is dict and all(
+            key in actual and _covers(value, actual[key]) for key, value in required.items()
+        )
+    if type(required) is list:
+        return type(actual) is list and all(value in actual for value in required)
+    return type(required) is type(actual) and required == actual
+
+
+def _identified_program(value: dict[str, Any]) -> dict[str, Any]:
+    value["program_revision"] = "sha256:" + "0" * 64
+    value["program_revision"] = compute_content_identity(
+        value,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v2",
+    )
+    return value
+
+
 class SkillCatalog:
-    """Collection of loaded and validated skill definitions."""
+    """Immutable compilation input, with no environment/execution authority."""
 
-    skills: list[SkillDefinition] = field(default_factory=list)
-    _by_id: dict[str, SkillDefinition] = field(default_factory=dict, repr=False)
-
-    def get(self, skill_id: str) -> Optional[SkillDefinition]:
-        """Look up a skill by ID."""
-        return self._by_id.get(skill_id)
-
-    def contains(self, skill_id: str) -> bool:
-        """Return True when the catalog contains the given skill."""
-        return skill_id in self._by_id
-
-    @property
-    def skill_ids(self) -> list[str]:
-        return [s.skill_id for s in self.skills]
-
-    def expand_node_dict(
+    def __init__(
         self,
-        node: dict[str, Any],
+        artifacts: list[dict[str, Any]],
         *,
-        max_depth: int = _MAX_NESTING_DEPTH,
-    ) -> dict[str, Any]:
-        """Expand a tree node dict if it refers to a skill invocation."""
-        return self._expand_node_dict(node, depth=0, max_depth=max_depth)
+        catalog: NodeCatalog,
+        tool_ids: frozenset[str] | set[str] = frozenset(),
+    ) -> None:
+        _require(
+            type(artifacts) is list and len(artifacts) <= MAX_SKILLS,
+            "skill catalog exceeds bound",
+        )
+        self._catalog = catalog
+        self._skills: dict[str, dict[str, Any]] = {}
+        self._parameters: dict[str, dict[str, tuple[dict, Any]]] = {}
+        for artifact in artifacts:
+            _bounded_document(artifact)
+            _require(
+                type(artifact) is dict
+                and _FIELDS <= set(artifact)
+                and not set(artifact) - _FIELDS - {"requires_tools", "tags"},
+                "skill artifact has missing or unknown fields",
+            )
+            _require(
+                artifact["api_version"] == SKILL_API_VERSION,
+                "unsupported skill version",
+            )
+            skill_id = _identifier(artifact["skill_id"])
+            _require(skill_id not in self._skills, "duplicate skill identity")
+            for field in ("version", "name", "description"):
+                _require(
+                    type(artifact[field]) is str and bool(artifact[field]),
+                    f"skill {field} must be non-empty text",
+                )
+            _require(
+                artifact["compatible_profiles"] == ["composable-cell-v1"],
+                "unsupported skill profile",
+            )
+            for field in ("requires", "provides", "modifies", "requires_tools", "tags"):
+                rows = artifact.get(field, [])
+                _require(
+                    type(rows) is list
+                    and len(rows) <= 64
+                    and all(type(row) is str and row for row in rows)
+                    and len(rows) == len(set(rows)),
+                    f"invalid skill {field}",
+                )
+            _require(
+                set(artifact.get("requires_tools", [])) <= tool_ids,
+                "skill requires an unknown tool",
+            )
+            for field in ("component_roles", "target_roles"):
+                _require(
+                    type(artifact[field]) is dict and len(artifact[field]) <= 32,
+                    f"invalid skill {field}",
+                )
+                for role, declaration in artifact[field].items():
+                    _identifier(role)
+                    _require(type(declaration) is dict, "invalid skill role declaration")
+                    if field == "target_roles":
+                        _require(
+                            type(declaration.get("component_role")) is str
+                            and declaration["component_role"] in artifact["component_roles"],
+                            "skill target requires a declared component role",
+                        )
+            parameters = artifact["parameters"]
+            _require(
+                type(parameters) is list and len(parameters) <= 32,
+                "invalid skill parameters",
+            )
+            parsed = {}
+            for parameter in parameters:
+                _require(
+                    type(parameter) is dict
+                    and {"id", "schema", "required"} <= set(parameter)
+                    and not set(parameter) - {"id", "schema", "required", "default"},
+                    "invalid skill parameter declaration",
+                )
+                key = _identifier(parameter["id"])
+                _require(
+                    key not in parsed and type(parameter["required"]) is bool,
+                    "duplicate or invalid skill parameter",
+                )
+                schema = parse_schema(parameter["schema"], path=f"{skill_id}.{key}")
+                catalog.schema_registry.resolve(schema)
+                if "default" in parameter:
+                    _require(
+                        not validate_value(
+                            schema,
+                            parameter["default"],
+                            registry=catalog.schema_registry,
+                        ),
+                        "invalid skill parameter default",
+                    )
+                parsed[key] = (deepcopy(parameter), schema)
+            self._skills[skill_id] = deepcopy(artifact)
+            self._parameters[skill_id] = parsed
+        for skill_id, artifact in self._skills.items():
+            self._check_body(artifact["body"], skill_id, (skill_id,), [MAX_EXPANDED_NODES])
+        # Examples supply the declarations for typed values/scene references and
+        # are compiled here, not merely exposed as decorative prose.
+        for skill_id, artifact in self._skills.items():
+            example = artifact["example"]
+            _require(
+                type(example) is dict
+                and set(example) == {"arguments", "program_declarations", "effect"}
+                and type(example["effect"]) is str
+                and bool(example["effect"]),
+                "skill requires one executable example",
+            )
+            declarations = example["program_declarations"]
+            _require(
+                type(declarations) is dict
+                and not set(declarations)
+                - {"parameters", "blackboard", "scene", "contact_policies"},
+                "invalid skill example declarations",
+            )
+            host = {
+                "api_version": "manyforge.program.v2",
+                "program_id": "skill_example",
+                "program_revision": "sha256:" + "0" * 64,
+                "program_profile": "composable-cell-v1",
+                "name": "Skill example",
+                "catalog": {
+                    "api_version": catalog.api_version,
+                    "content_version": catalog.content_version,
+                },
+                "component_roles": deepcopy(artifact["component_roles"]),
+                "target_roles": deepcopy(artifact["target_roles"]),
+                "parameters": [],
+                "scene": [],
+                **deepcopy(declarations),
+            }
+            self._expand_checked(
+                skill_id,
+                example["arguments"],
+                {key: key for key in artifact["component_roles"]},
+                {key: key for key in artifact["target_roles"]},
+                "example",
+                host,
+            )
 
-    def validate_invocation(
+    def artifacts(self) -> list[dict[str, Any]]:
+        return [deepcopy(self._skills[key]) for key in sorted(self._skills)]
+
+    def _check_body(
+        self, node: Any, skill_id: str, stack: tuple[str, ...], budget: list[int]
+    ) -> None:
+        budget[0] -= 1
+        _require(budget[0] >= 0 and type(node) is dict, "invalid or oversized skill body")
+        _identifier(node.get("instance_id"))
+        artifact = self._skills[skill_id]
+
+        def check_reference(value: Any) -> None:
+            if type(value) is str and "${" in value:
+                match = _REFERENCE.fullmatch(value)
+                _require(match is not None, "skill substitutions must occupy the whole value")
+                kind, key = match.groups()
+                declared = {
+                    "param": self._parameters[skill_id],
+                    "component": artifact["component_roles"],
+                    "target": artifact["target_roles"],
+                }[kind]
+                _require(key in declared, "skill template references an undeclared value")
+            elif type(value) is dict:
+                for item in value.values():
+                    check_reference(item)
+            elif type(value) is list:
+                for item in value:
+                    check_reference(item)
+
+        check_reference(node)
+        if "skill_id" in node:
+            _require(
+                set(node)
+                == {
+                    "skill_id",
+                    "instance_id",
+                    "arguments",
+                    "component_roles",
+                    "target_roles",
+                },
+                "invalid nested skill invocation",
+            )
+            nested = node["skill_id"]
+            _require(
+                type(nested) is str
+                and nested in self._skills
+                and nested not in stack
+                and len(stack) < MAX_SKILL_DEPTH,
+                "unknown, cyclic or too-deep nested skill",
+            )
+            _require(
+                type(node["arguments"]) is dict
+                and not set(node["arguments"]) - set(self._parameters[nested]),
+                "unknown nested skill parameter",
+            )
+            self._check_body(self._skills[nested]["body"], nested, (*stack, nested), budget)
+            return
+        _require(
+            {"node_id", "instance_id", "parameters", "children"} <= set(node)
+            and not set(node)
+            - {
+                "node_id",
+                "instance_id",
+                "parameters",
+                "children",
+                "value_sources",
+                "metadata",
+            },
+            "invalid primitive skill template",
+        )
+        try:
+            entry = self._catalog.get(node["node_id"])
+        except (KeyError, TypeError) as error:
+            raise SkillValidationError("unknown skill primitive") from error
+        _require(
+            type(node["parameters"]) is dict
+            and type(node["children"]) is list
+            and entry.children_min <= len(node["children"]) <= entry.children_max
+            and type(node.get("value_sources", {})) is dict,
+            "invalid skill node parameters/cardinality",
+        )
+        metadata = node.get("metadata", {})
+        _require(
+            type(metadata) is dict and "skill_expansions" not in metadata,
+            "skill expansion provenance is generated, not supplied by the template",
+        )
+        try:
+            source_roots = {
+                str(parse_value_path(path)[0]) for path in node.get("value_sources", {})
+            }
+        except ValuePathError as error:
+            raise SkillValidationError(f"invalid skill value-source path: {error}") from error
+        supplied = set(node["parameters"]) | source_roots
+        _require(
+            supplied <= {parameter.id for parameter in entry.parameters},
+            "unknown primitive parameter",
+        )
+        for child in node["children"]:
+            self._check_body(child, skill_id, stack, budget)
+
+    def expand(
+        self,
+        *,
+        skill_id: str,
+        arguments: dict[str, Any],
+        component_roles: dict[str, str],
+        target_roles: dict[str, str],
+        instance_prefix: str,
+        program_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        # Declaration-only context works for an empty/incomplete Draft as well
+        # as an existing Program; no throwaway runnable tree is required.
+        _bounded_document(program_context)
+        _require(
+            type(program_context) is dict
+            and not {
+                "tree",
+                "program_revision",
+                "forest",
+                "positions",
+                "schema_version",
+            }
+            & set(program_context)
+            and type(program_context.get("component_roles")) is dict
+            and type(program_context.get("target_roles")) is dict
+            and program_context.get("program_profile") == "composable-cell-v1",
+            "skill expansion requires portable Program declarations, not a tree or binding",
+        )
+        host = deepcopy(program_context)
+        return self._expand_checked(
+            skill_id, arguments, component_roles, target_roles, instance_prefix, host
+        )
+
+    def _expand_checked(
         self,
         skill_id: str,
-        params: dict[str, Any],
+        arguments: dict,
+        component_roles: dict,
+        target_roles: dict,
+        prefix: str,
+        host: dict,
     ) -> dict[str, Any]:
-        """Validate skill invocation parameters and return merged args."""
-        skill = self.get(skill_id)
-        if skill is None:
-            raise ValueError(f"Unknown skill: '{skill_id}'")
+        from .program import Program
 
-        merged = {
-            parameter.name: deepcopy(parameter.default)
-            for parameter in skill.parameters
-            if parameter.default is not None
-        }
-        for key, value in params.items():
-            if key not in {parameter.name for parameter in skill.parameters}:
-                raise ValueError(
-                    f"Unknown parameter '{key}' for skill '{skill_id}'"
-                )
-            merged[key] = deepcopy(value)
-
-        for parameter in skill.parameters:
-            if parameter.required and parameter.name not in merged:
-                raise ValueError(
-                    f"Missing required parameter '{parameter.name}' for skill '{skill_id}'"
-                )
-            if parameter.name in merged:
-                type_error = _validate_skill_param_type(
-                    parameter.type,
-                    merged[parameter.name],
-                )
-                if type_error is not None:
-                    raise ValueError(
-                        f"Parameter '{parameter.name}' for skill '{skill_id}' {type_error}"
-                    )
-
-        return merged
-
-    def _expand_node_dict(
-        self,
-        node: dict[str, Any],
-        *,
-        depth: int,
-        max_depth: int,
-        prefix: str = "",
-    ) -> dict[str, Any]:
-        if not isinstance(node, dict):
-            raise ValueError("Skill expansion expects dict nodes")
-
-        node_id = node.get("id")
-        node_name = node.get("name", node_id)
-        if not isinstance(node_name, str) or not node_name:
-            raise ValueError("Expanded skill node name must be a non-empty string")
-
-        full_name = f"{prefix}{node_name}" if prefix else node_name
-
-        if self.contains(node_id):
-            if depth >= max_depth:
-                raise ValueError(
-                    f"Skill nesting exceeds maximum depth {max_depth}: '{node_id}'"
-                )
-            if node.get("children"):
-                raise ValueError(
-                    f"Skill '{node_id}' may not define explicit children at invocation time"
-                )
-            invocation_args = self.validate_invocation(node_id, dict(node.get("params", {})))
-            skill = self._by_id[node_id]
-            rendered = _render_value(deepcopy(skill.body), invocation_args)
-            if not isinstance(rendered, dict):
-                raise ValueError(f"Skill '{node_id}' body must expand to a mapping")
-            rendered["name"] = full_name
-            return self._expand_non_skill_node(
-                rendered,
-                depth=depth + 1,
-                max_depth=max_depth,
-                child_prefix=f"{full_name}/",
-            )
-
-        return self._expand_non_skill_node(
-            deepcopy(node),
-            depth=depth,
-            max_depth=max_depth,
-            child_prefix=f"{full_name}/",
-            rename_to=full_name,
-        )
-
-    def _expand_non_skill_node(
-        self,
-        node: dict[str, Any],
-        *,
-        depth: int,
-        max_depth: int,
-        child_prefix: str,
-        rename_to: str | None = None,
-    ) -> dict[str, Any]:
-        expanded = deepcopy(node)
-        if rename_to is not None:
-            expanded["name"] = rename_to
-
-        children = expanded.get("children", []) or []
-        expanded["children"] = [
-            self._expand_node_dict(
-                child,
-                depth=depth,
-                max_depth=max_depth,
-                prefix=child_prefix,
-            )
-            for child in children
-        ]
-        return expanded
-
-
-def _parse_parameter(raw: dict[str, Any]) -> SkillParameter:
-    return SkillParameter(
-        name=raw["name"],
-        type=raw.get("type", "string"),
-        required=raw.get("required", False),
-        default=raw.get("default"),
-        description=raw.get("description", ""),
-    )
-
-
-def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def _number_list_error(value: Any, *, expected_len: int | None = None) -> str | None:
-    if not isinstance(value, list) or not all(_is_number(item) for item in value):
-        return "must be a list of numeric values"
-    if expected_len is not None and len(value) != expected_len:
-        return f"must contain exactly {expected_len} numeric values"
-    return None
-
-
-def _validate_skill_pose(value: Any) -> str | None:
-    if not isinstance(value, dict):
-        return f"must be a pose mapping, got {type(value).__name__}"
-    if "position_m" not in value:
-        return "must include position_m"
-    position_error = _number_list_error(value.get("position_m"), expected_len=3)
-    if position_error is not None:
-        return f"position_m {position_error}"
-    has_xyzw = "orientation_xyzw" in value
-    has_rpy = "orientation_rpy_deg" in value
-    if has_xyzw == has_rpy:
-        return "must include exactly one of orientation_xyzw or orientation_rpy_deg"
-    if has_xyzw:
-        orientation_error = _number_list_error(value.get("orientation_xyzw"), expected_len=4)
-        if orientation_error is not None:
-            return f"orientation_xyzw {orientation_error}"
-    if has_rpy:
-        orientation_error = _number_list_error(value.get("orientation_rpy_deg"), expected_len=3)
-        if orientation_error is not None:
-            return f"orientation_rpy_deg {orientation_error}"
-    frame_id = value.get("frame_id")
-    if frame_id is not None and not isinstance(frame_id, str):
-        return "frame_id must be a string when provided"
-    return None
-
-
-def _validate_skill_param_type(param_type: str, value: Any) -> str | None:
-    if param_type == "string":
-        if not isinstance(value, str):
-            return f"must be a string, got {type(value).__name__}"
-        return None
-    if param_type == "float":
-        if not _is_number(value):
-            return f"must be a number, got {type(value).__name__}"
-        return None
-    if param_type == "int":
-        if not isinstance(value, int) or isinstance(value, bool):
-            return f"must be an integer, got {type(value).__name__}"
-        return None
-    if param_type == "bool":
-        if not isinstance(value, bool):
-            return f"must be a boolean, got {type(value).__name__}"
-        return None
-    if param_type == "pose":
-        return _validate_skill_pose(value)
-    if param_type == "float_list":
-        return _number_list_error(value)
-    if param_type == "string_list":
-        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-            return "must be a list of strings"
-        return None
-    if param_type in {"dict", "object"}:
-        if not isinstance(value, dict):
-            return f"must be a mapping, got {type(value).__name__}"
-        return None
-    return None
-
-
-def _validate_requires_capabilities(value: Any, path_name: str) -> list[str]:
-    if value is None:
-        return []
-    if not isinstance(value, list) or not all(
-        isinstance(capability, str) and capability.strip()
-        for capability in value
-    ):
-        raise ValueError(
-            f"{path_name}: requires_capabilities must be a list of non-empty strings"
-        )
-    unknown_capabilities = sorted(
-        capability
-        for capability in value
-        if capability not in CAPABILITY_REGISTRY
-    )
-    if unknown_capabilities:
-        raise ValueError(
-            f"{path_name}: unknown requires_capabilities {unknown_capabilities}"
-        )
-    return list(value)
-
-
-def _validate_requires_tools(value: Any, path_name: str) -> list[str]:
-    if value is None:
-        return []
-    if not isinstance(value, list) or not all(
-        isinstance(tool_id, str) and tool_id.strip()
-        for tool_id in value
-    ):
-        raise ValueError(
-            f"{path_name}: requires_tools must be a list of non-empty strings"
-        )
-    normalized = [tool_id.strip() for tool_id in value]
-    duplicates = sorted({tool_id for tool_id in normalized if normalized.count(tool_id) > 1})
-    if duplicates:
-        raise ValueError(f"{path_name}: duplicate requires_tools {duplicates}")
-    return normalized
-
-
-def _render_string(template: str, args: dict[str, Any]) -> Any:
-    exact_match = PARAM_REF_RE.match(template)
-    if exact_match:
-        parameter_name = exact_match.group(1)
-        if parameter_name not in args:
-            raise ValueError(f"Unknown skill parameter reference: '{parameter_name}'")
-        return deepcopy(args[parameter_name])
-
-    def repl(match: re.Match[str]) -> str:
-        parameter_name = match.group(1)
-        if parameter_name not in args:
-            raise ValueError(f"Unknown skill parameter reference: '{parameter_name}'")
-        return str(args[parameter_name])
-
-    return _INLINE_PARAM_RE.sub(repl, template)
-
-
-def _render_value(value: Any, args: dict[str, Any]) -> Any:
-    if isinstance(value, str):
-        return _render_string(value, args)
-    if isinstance(value, list):
-        return [_render_value(item, args) for item in value]
-    if isinstance(value, dict):
-        return {key: _render_value(item, args) for key, item in value.items()}
-    return deepcopy(value)
-
-
-def load_skill(path: Path) -> SkillDefinition:
-    """Load a single skill YAML file. Raises ValueError on schema issues."""
-    with open(path, encoding="utf-8") as handle:
-        data = yaml.safe_load(handle)
-
-    if not isinstance(data, dict):
-        raise ValueError(f"{path.name}: skill file must be a YAML mapping")
-
-    api_version = data.get("api_version", "")
-    if api_version != _EXPECTED_API_VERSION:
-        raise ValueError(
-            f"{path.name}: expected api_version={_EXPECTED_API_VERSION}, got {api_version}"
-        )
-
-    skill_id = data.get("skill_id") or data.get("id")
-    if not skill_id:
-        raise ValueError(f"{path.name}: missing required field 'skill_id'")
-
-    body = data.get("body")
-    if body is None:
-        raise ValueError(f"{path.name}: missing required field 'body'")
-    if not isinstance(body, dict):
-        raise ValueError(f"{path.name}: body must be a mapping")
-
-    parameters = [_parse_parameter(p) for p in data.get("parameters", [])]
-    requires_capabilities = _validate_requires_capabilities(
-        data.get("requires_capabilities", []),
-        path.name,
-    )
-    requires_tools = _validate_requires_tools(
-        data.get("requires_tools", []),
-        path.name,
-    )
-
-    return SkillDefinition(
-        skill_id=skill_id,
-        version=data.get("version", "0.0.0"),
-        name=data.get("name", skill_id),
-        description=data.get("description", ""),
-        compatible_profiles=list(data.get("compatible_profiles", [])),
-        requires=list(data.get("requires", [])),
-        provides=list(data.get("provides", [])),
-        modifies=list(data.get("modifies", [])),
-        requires_capabilities=requires_capabilities,
-        requires_tools=requires_tools,
-        parameters=parameters,
-        body=body,
-        example=dict(data.get("example", {})),
-        validated_by=data.get("validated_by", ""),
-    )
-
-
-def _validate_skill_node(
-    node: dict[str, Any],
-    *,
-    catalog: NodeCatalog,
-    skills: SkillCatalog,
-    path: str,
-    depth: int,
-) -> None:
-    if not isinstance(node, dict):
-        raise ValueError(f"{path}: node must be a mapping")
-    if "id" not in node:
-        raise ValueError(f"{path}: missing required field 'id'")
-    if "name" not in node:
-        raise ValueError(f"{path}: missing required field 'name'")
-
-    node_id = node["id"]
-    params = node.get("params", {}) or {}
-    children = node.get("children", []) or []
-    if not isinstance(params, dict):
-        raise ValueError(f"{path}.params must be a mapping")
-    if not isinstance(children, list):
-        raise ValueError(f"{path}.children must be a list")
-
-    if skills.contains(node_id):
-        if depth >= _MAX_NESTING_DEPTH:
-            raise ValueError(
-                f"{path}: nested skill '{node_id}' exceeds maximum depth {_MAX_NESTING_DEPTH}"
-            )
-        nested = skills.get(node_id)
-        assert nested is not None
-        declared_params = {parameter.name for parameter in nested.parameters}
-        for param_name in params:
-            if param_name not in declared_params:
-                raise ValueError(
-                    f"{path}.params.{param_name}: unknown parameter for skill '{node_id}'"
-                )
-        if children:
-            raise ValueError(
-                f"{path}: skill invocations may not define explicit children"
-            )
-        _validate_skill_node(
-            nested.body,
-            catalog=catalog,
-            skills=skills,
-            path=f"{path}.body",
-            depth=depth + 1,
-        )
-        return
-
-    try:
-        entry = catalog.get(node_id)
-    except KeyError as exc:
-        raise ValueError(f"{path}: unknown catalog entry '{node_id}'") from exc
-
-    declared_params = {parameter.name for parameter in entry.parameters}
-    for param_name in params:
-        if param_name not in declared_params:
-            raise ValueError(
-                f"{path}.params.{param_name}: unknown parameter for node '{node_id}'"
-            )
-
-    for index, child in enumerate(children):
-        _validate_skill_node(
-            child,
-            catalog=catalog,
-            skills=skills,
-            path=f"{path}.children[{index}]",
-            depth=depth,
-        )
-
-
-def _validate_skill_catalog(
-    skill_catalog: SkillCatalog,
-    *,
-    catalog: NodeCatalog,
-) -> None:
-    for skill in skill_catalog.skills:
-        _validate_skill_node(
-            skill.body,
-            catalog=catalog,
-            skills=skill_catalog,
-            path=f"skills.{skill.skill_id}.body",
-            depth=0,
-        )
-        skill_catalog.expand_node_dict(
+        _bounded_document(
             {
-                "id": skill.skill_id,
-                "name": skill.skill_id,
-                "params": skill.example,
+                "arguments": arguments,
+                "component_roles": component_roles,
+                "target_roles": target_roles,
+                "prefix": prefix,
             }
         )
+        trace: list[dict[str, Any]] = []
+        budget = [MAX_EXPANDED_NODES]
+        rendered_items, rendered_bytes = 8192, MAX_EXPANDED_BYTES
+        program_motion_defaults = _PROGRAM_MOTION_DEFAULTS & {
+            declaration.get("parameter_id")
+            for declaration in host.get("parameters", [])
+            if type(declaration) is dict
+        }
+
+        def copy_value(value: Any, substitutions: dict | None = None) -> Any:
+            nonlocal rendered_items, rendered_bytes
+            if (
+                substitutions is not None
+                and type(value) is str
+                and (match := _REFERENCE.fullmatch(value))
+            ):
+                kind, key = match.groups()
+                _require(key in substitutions[kind], "missing skill substitution")
+                # An argument is data, never another substitution template.
+                return copy_value(substitutions[kind][key])
+            rendered_items -= 1
+            _require(rendered_items >= 0, "expanded skill exceeds value bound")
+            if type(value) is dict:
+                rendered_bytes -= 2 + len(value) * 2
+                _require(rendered_bytes >= 0, "expanded skill exceeds byte bound")
+                return {
+                    copy_value(key): copy_value(item, substitutions) for key, item in value.items()
+                }
+            if type(value) is list:
+                rendered_bytes -= 2 + len(value)
+                _require(rendered_bytes >= 0, "expanded skill exceeds byte bound")
+                return [copy_value(item, substitutions) for item in value]
+            rendered_bytes -= len(canonical_json_bytes(value))
+            _require(rendered_bytes >= 0, "expanded skill exceeds byte bound")
+            return value
+
+        def expand_skill(
+            identity: str,
+            values: dict,
+            components: dict,
+            targets: dict,
+            scope: str,
+            stack: tuple[str, ...],
+        ) -> dict:
+            _identifier(identity)
+            _identifier(scope)
+            _require(
+                identity in self._skills and identity not in stack and len(stack) < MAX_SKILL_DEPTH,
+                "invalid skill selection or nesting",
+            )
+            artifact = self._skills[identity]
+            _require(
+                host["program_profile"] in artifact["compatible_profiles"],
+                "skill excludes the Program profile",
+            )
+            params = self._parameters[identity]
+            _require(
+                type(values) is dict and not set(values) - set(params),
+                "unknown skill arguments",
+            )
+            effective = {}
+            for key, (parameter, schema) in params.items():
+                if key not in values and "default" not in parameter:
+                    _require(not parameter["required"], "missing skill argument")
+                    continue
+                value = values[key] if key in values else parameter["default"]
+                _require(
+                    not validate_value(schema, value, registry=self._catalog.schema_registry),
+                    f"invalid skill argument {key}",
+                )
+                effective[key] = value  # copied only when emitted, under the shared output budget
+            for field, mapping in (
+                ("component_roles", components),
+                ("target_roles", targets),
+            ):
+                _require(
+                    type(mapping) is dict and set(mapping) == set(artifact[field]),
+                    "skill role mapping must be exact",
+                )
+                for local, mapped in mapping.items():
+                    _identifier(mapped)
+                    requirement = deepcopy(artifact[field][local])
+                    if field == "target_roles":
+                        requirement["component_role"] = components[requirement["component_role"]]
+                    _require(
+                        mapped in host[field] and _covers(requirement, host[field][mapped]),
+                        f"incompatible mapped skill role {local}",
+                    )
+            substitutions = {
+                "param": effective,
+                "component": components,
+                "target": targets,
+            }
+            created = []
+
+            def expand_node(template: dict) -> dict:
+                budget[0] -= 1
+                _require(budget[0] >= 0, "skill expansion exceeds node bound")
+                # Each child is rendered once by its own expansion, not once
+                # here and again recursively below.
+                node = copy_value(
+                    {key: value for key, value in template.items() if key != "children"},
+                    substitutions,
+                )
+                instance = _identifier(f"{scope}.{node['instance_id']}")
+                if "skill_id" in node:
+                    expanded = expand_skill(
+                        node["skill_id"],
+                        node["arguments"],
+                        node["component_roles"],
+                        node["target_roles"],
+                        instance,
+                        (*stack, identity),
+                    )
+                    created.extend(trace[-1]["instance_ids"])
+                    return expanded
+                entry = self._catalog.get(node["node_id"])
+                applicable_defaults = program_motion_defaults & {
+                    parameter.id for parameter in entry.parameters
+                }
+                sources = node.setdefault("value_sources", {})
+                for parameter_id in sorted(
+                    applicable_defaults - set(node["parameters"]) - set(sources)
+                ):
+                    sources[parameter_id] = {
+                        "kind": "program_parameter",
+                        "reference": parameter_id,
+                    }
+                if sources:
+                    node["value_sources"] = {
+                        key: sources[key] for key in sorted(sources)
+                    }
+                else:
+                    node.pop("value_sources", None)
+                node["instance_id"] = copy_value(instance)
+                node["children"] = [expand_node(child) for child in template["children"]]
+                created.append(instance)
+                return node
+
+            subtree = expand_node(artifact["body"])
+            provenance = {
+                "skill_id": identity,
+                "version": artifact["version"],
+                "artifact_digest": raw_sha256_digest(canonical_json_bytes(artifact)),
+                "component_roles": deepcopy(components),
+                "target_roles": deepcopy(targets),
+                "instance_ids": sorted(created),
+            }
+            subtree.setdefault("metadata", {}).setdefault("skill_expansions", []).append(
+                copy_value(provenance)
+            )
+            trace.append(copy_value(provenance))
+            return subtree
+
+        tree = expand_skill(skill_id, arguments, component_roles, target_roles, prefix, ())
+        candidate = deepcopy(host)
+        candidate["tree"] = tree
+        Program.from_dict(_identified_program(candidate), self._catalog)
+        return {
+            "schema_version": "manyforge.skill_expansion.v1",
+            "tree": tree,
+            "trace": trace,
+        }
+
+
+def default_skills_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "resources" / "skills"
+
+
+def load_skill(path: str | Path) -> dict[str, Any]:
+    source = Path(path)
+    _require(
+        not source.is_symlink() and source.is_file() and source.stat().st_size <= MAX_SKILL_BYTES,
+        "skill must be one bounded plain file",
+    )
+    artifact = load_strict_json_yaml(source)
+    _bounded_document(artifact)
+    return artifact
 
 
 def load_skill_catalog(
     skills_dir: str | Path,
     *,
-    catalog: NodeCatalog | None = None,
-    strict: bool = False,
+    catalog: NodeCatalog,
+    tool_ids: frozenset[str] | set[str] = frozenset(),
 ) -> SkillCatalog:
-    """Load all ``*.skill.yaml`` files from a directory."""
-    skills_path = Path(skills_dir)
-    if not skills_path.is_dir():
-        logger.warning("Skills directory not found: %s", skills_path)
-        return SkillCatalog()
-
-    skills: list[SkillDefinition] = []
-    by_id: dict[str, SkillDefinition] = {}
-
-    for path in sorted(skills_path.glob("*.skill.yaml")):
-        try:
-            skill = load_skill(path)
-            if skill.skill_id in by_id:
-                raise ValueError(f"duplicate skill ID '{skill.skill_id}'")
-            skills.append(skill)
-            by_id[skill.skill_id] = skill
-            logger.debug("Loaded skill: %s (%s)", skill.skill_id, skill.version)
-        except Exception as exc:
-            if strict:
-                raise ValueError(f"Failed to load skill {path.name}: {exc}") from exc
-            logger.warning("Skipping malformed skill %s: %s", path.name, exc)
-
-    skill_catalog = SkillCatalog(skills=skills, _by_id=by_id)
-
-    if catalog is not None and skill_catalog.skills:
-        try:
-            _validate_skill_catalog(skill_catalog, catalog=catalog)
-        except Exception as exc:
-            if strict:
-                raise ValueError(f"Invalid skill catalog: {exc}") from exc
-            logger.warning("Skill catalog validation failed: %s", exc)
-
-    logger.info("Loaded %d skill(s) from %s", len(skill_catalog.skills), skills_path)
-    return skill_catalog
-
-
-def default_skills_dir() -> Path:
-    """Return the default skills directory."""
-    return Path(__file__).parent.parent / "resources" / "skills"
+    directory = Path(skills_dir)
+    _require(
+        directory.is_dir() and not directory.is_symlink(),
+        "invalid build-owned skill directory",
+    )
+    paths = sorted(directory.glob("*.skill.yaml"))
+    _require(len(paths) <= MAX_SKILLS, "skill catalog exceeds artifact bound")
+    artifacts = [load_skill(path) for path in paths]
+    for path, artifact in zip(paths, artifacts, strict=True):
+        _require(
+            type(artifact) is dict and path.name == f"{artifact.get('skill_id')}.skill.yaml",
+            "skill filename/identity mismatch",
+        )
+    return SkillCatalog(artifacts, catalog=catalog, tool_ids=tool_ids)

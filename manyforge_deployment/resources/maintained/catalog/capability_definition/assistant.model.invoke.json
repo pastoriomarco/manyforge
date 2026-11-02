@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:f900f43ad7bbc61f49c09295a2a63e5fabe93eb57bc9c5f44c26e3c4eeeac158",
+  "capability_id": "assistant.model.invoke",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

@@ -1,0 +1,133 @@
+{
+  "api_version": "manyforge.component_type.v1",
+  "attachment_interfaces": [
+    {
+      "accepts_tags": [
+        "tool"
+      ],
+      "attachment_interface_id": "flange",
+      "frame_role_id": "flange",
+      "max_attachments": 1,
+      "model_role_id": "arm_model"
+    }
+  ],
+  "command_targets": [
+    {
+      "capabilities": [
+        {
+          "capability_definition_revision": "sha256:63a3d877d78d71a5932cce5c92d2932b740fbba6e88d00ca3b5dd94429e3eb3d",
+          "capability_id": "execution.contact.geometric"
+        },
+        {
+          "capability_definition_revision": "sha256:b2f0e892d401460c6b43b1c1b8b39a0cad5fcc130ba694c2c5e32d6cc2d8c323",
+          "capability_id": "execution.contact.geometric_signed_penetration"
+        },
+        {
+          "capability_definition_revision": "sha256:37a4b6d145a96b0336ad03680c3222a63da28168764663cee7f5185fcbd467da",
+          "capability_id": "execution.feedback.phase_events"
+        },
+        {
+          "capability_definition_revision": "sha256:bdcd8c70d34d34bba3735e6e1b191cade422d9b50223afed895465e0062be85a",
+          "capability_id": "execution.feedback.state_snapshots"
+        },
+        {
+          "capability_definition_revision": "sha256:24fa527d5e81814f8a395d1d3eeae3c3236c1249b05d84d2cd48abf3f2a27ebb",
+          "capability_id": "execution.reset"
+        },
+        {
+          "capability_definition_revision": "sha256:3ed811803c31726c758e227fc52bd57854cc6e7fa09dff0fd117d41800d4f8b9",
+          "capability_id": "execution.stop.soft"
+        },
+        {
+          "capability_definition_revision": "sha256:7e5958db0906b84cb4e5c68ab0ef896f74dc0ba49a9ceb4d918b386abaf9f28c",
+          "capability_id": "execution.trajectory.execute"
+        },
+        {
+          "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
+          "capability_id": "model.kinematics.fk"
+        },
+        {
+          "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
+          "capability_id": "model.limits.joint"
+        },
+        {
+          "capability_definition_revision": "sha256:be53c54ff0aa662db108113e9273e847e790d1b6f0adbba591d50f2237134a00",
+          "capability_id": "planning.motion.cartesian_path"
+        },
+        {
+          "capability_definition_revision": "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
+          "capability_id": "planning.motion.joint_goal"
+        },
+        {
+          "capability_definition_revision": "sha256:422c7d9025d46e0fc660705a4f05171a235279872f91c820e952cf16792b8148",
+          "capability_id": "planning.motion.pose_goal"
+        },
+        {
+          "capability_definition_revision": "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
+          "capability_id": "planning.trajectory.time_parameterized"
+        },
+        {
+          "capability_definition_revision": "sha256:c1ec4dacead10e33176830d634e9b2287e4b96322a54700c1c3910bcba461c02",
+          "capability_id": "state.observed.current"
+        },
+        {
+          "capability_definition_revision": "sha256:3cd04895527038906ddcb9c6ca9fd87f4535eba41e5014b04917c66603f26653",
+          "capability_id": "validation.trajectory.non_collision"
+        }
+      ],
+      "collision_body_roles": [
+        {
+          "asset_collision_body_role_id": "arm_collision",
+          "collision_body_role_id": "arm_collision",
+          "model_role_id": "arm_model"
+        }
+      ],
+      "command_target_id": "arm",
+      "default_tcp_frame_role_id": "flange",
+      "frame_roles": [
+        {
+          "asset_frame_role_id": "base",
+          "frame_role_id": "base",
+          "model_role_id": "arm_model"
+        },
+        {
+          "asset_frame_role_id": "flange",
+          "frame_role_id": "flange",
+          "model_role_id": "arm_model",
+          "tcp": true
+        }
+      ],
+      "model_group_roles": [
+        {
+          "asset_model_group_role_id": "arm",
+          "model_group_role_id": "planning_group",
+          "model_role_id": "arm_model"
+        }
+      ],
+      "resource_roles": [
+        {
+          "asset_resource_role_id": "arm_joints",
+          "model_role_id": "arm_model",
+          "resource_role_id": "arm_joints",
+          "source_kind": "model_role"
+        }
+      ]
+    }
+  ],
+  "component_root": {
+    "frame_role_id": "root",
+    "model_role_id": "arm_model"
+  },
+  "component_type_id": "uf850.fixed_scale.component",
+  "component_type_revision": "sha256:9461c7a8d2c57c50aebb299c72844e9eaab1201f56e04df5980b6d6887b40fa9",
+  "model_mounts": [],
+  "model_roles": [
+    {
+      "cardinality": "exactly_one",
+      "model_role_id": "arm_model"
+    }
+  ],
+  "tags": [
+    "articulated-arm"
+  ]
+}

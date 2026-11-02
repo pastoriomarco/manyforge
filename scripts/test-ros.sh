@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run ROS adapter tests in the ROS Jazzy image.
+# Run ROS adapter tests in the official full ROS Lyrical image.
 #
 # Intended usage:
 #   docker compose --profile ros run --rm ros-jazzy ./scripts/test-ros.sh
@@ -7,7 +7,7 @@
 set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-/workspace}"
-ROS_DISTRO="${ROS_DISTRO:-jazzy}"
+ROS_DISTRO="${ROS_DISTRO:-lyrical}"
 
 if [ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]; then
     # shellcheck disable=SC1090
@@ -16,15 +16,17 @@ if [ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]; then
     set -u
 fi
 
-if [ -f "${WORKSPACE}/install/setup.bash" ]; then
-    # shellcheck disable=SC1091
-    set +u
-    source "${WORKSPACE}/install/setup.bash"
-    set -u
+if env | grep -Fq "${WORKSPACE}/install"; then
+    echo "Canonical ROS tests refuse the source-mounted workspace install overlay." >&2
+    env | grep -F "${WORKSPACE}/install" >&2
+    exit 2
 fi
 
 export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/manyforge-pycache}"
 export PYTHONPATH="${WORKSPACE}/manyforge_ros:${WORKSPACE}/manyforge_behavior:${WORKSPACE}/manyforge_medkit_adapter:${WORKSPACE}:${PYTHONPATH:-}"
 
 cd "$WORKSPACE"
-pytest manyforge_ros/tests/ manyforge_medkit_adapter/tests/ -v
+# The run gets its own ROS domain (Fast DDS #6599, N16).
+ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
+    "/opt/ros/${ROS_DISTRO}/lib/rmw_test_fixture_implementation/run_rmw_isolated" \
+    pytest manyforge_ros/tests/ manyforge_medkit_adapter/tests/ -v

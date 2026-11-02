@@ -1,0 +1,132 @@
+import * as THREE from 'three';
+
+import type { QuaternionXyzwTuple, Vector3Tuple } from '../types/api';
+import type { Nanoseconds } from '../types/nanoseconds';
+import { normalizeQuaternion } from '../utils/structuralTransforms';
+
+/**
+ * Viewer interpolation is deliberately short and presentation-only. A long
+ * source gap must converge to the newest authoritative sample rather than
+ * extending a visual trajectory into an unobserved future.
+ */
+// Keep delayed samples responsive. Old main's hardware viewer established
+// 50 ms as the useful upper bound; longer source gaps snap toward current
+// authority within that same short window rather than replaying old motion.
+export const MAX_AUTHORITATIVE_INTERPOLATION_MS = 50;
+
+export interface AuthoritativeTransformFrame {
+  streamIdentity: string;
+  sourceSequence: number;
+  observedAtNs: Nanoseconds | null;
+  positionM: Vector3Tuple;
+  orientationXyzw: QuaternionXyzwTuple;
+}
+
+export interface AuthoritativeTransformTransition {
+  fromPosition: THREE.Vector3;
+  fromQuaternion: THREE.Quaternion;
+  toPosition: THREE.Vector3;
+  toQuaternion: THREE.Quaternion;
+  startedAtMs: number;
+  durationMs: number;
+}
+
+function tupleEqual(
+  left: readonly number[],
+  right: readonly number[],
+): boolean {
+  return left.every((value, index) => Object.is(value, right[index]));
+}
+
+export function sameAuthoritativeTransformFrame(
+  left: AuthoritativeTransformFrame,
+  right: AuthoritativeTransformFrame,
+): boolean {
+  return left.streamIdentity === right.streamIdentity
+    && left.sourceSequence === right.sourceSequence
+    && left.observedAtNs === right.observedAtNs
+    && sameAuthoritativeTransformPose(left, right);
+}
+
+export function sameAuthoritativeTransformPose(
+  left: AuthoritativeTransformFrame,
+  right: AuthoritativeTransformFrame,
+): boolean {
+  return tupleEqual(left.positionM, right.positionM)
+    && tupleEqual(left.orientationXyzw, right.orientationXyzw);
+}
+
+/**
+ * Return a bounded interpolation interval only for a strictly advancing frame
+ * from the same authoritative stream. Epoch changes, duplicate/conflicting
+ * samples, sequence regressions, and timestamp regressions all snap.
+ */
+export function authoritativeInterpolationDurationMs(
+  previous: AuthoritativeTransformFrame | null,
+  next: AuthoritativeTransformFrame,
+): number {
+  if (
+    previous === null
+    || previous.streamIdentity !== next.streamIdentity
+    || !Number.isSafeInteger(previous.sourceSequence)
+    || !Number.isSafeInteger(next.sourceSequence)
+    || next.sourceSequence <= previous.sourceSequence
+    || previous.observedAtNs === null
+    || next.observedAtNs === null
+  ) return 0;
+
+  // Subtract exact clocks before converting the bounded presentation duration.
+  const sourceDeltaNs = BigInt(next.observedAtNs) - BigInt(previous.observedAtNs);
+  if (sourceDeltaNs <= 0n) return 0;
+  if (sourceDeltaNs >= 50_000_000n) return MAX_AUTHORITATIVE_INTERPOLATION_MS;
+  return Number(sourceDeltaNs) / 1e6;
+}
+
+export function createAuthoritativeTransformTransition(
+  previous: AuthoritativeTransformFrame | null,
+  next: AuthoritativeTransformFrame,
+  renderedPosition: THREE.Vector3,
+  renderedQuaternion: THREE.Quaternion,
+  startedAtMs: number,
+): AuthoritativeTransformTransition | null {
+  const durationMs = authoritativeInterpolationDurationMs(previous, next);
+  if (durationMs === 0) return null;
+  const orientation = normalizeQuaternion(next.orientationXyzw);
+  return {
+    fromPosition: renderedPosition.clone(),
+    fromQuaternion: renderedQuaternion.clone().normalize(),
+    toPosition: new THREE.Vector3(...next.positionM),
+    toQuaternion: new THREE.Quaternion(...orientation),
+    startedAtMs,
+    durationMs,
+  };
+}
+
+/**
+ * Apply one visual sample without allocating. Time is clamped at both ends, so
+ * this function can interpolate between authoritative frames but can never
+ * extrapolate beyond either frame.
+ */
+export function applyAuthoritativeTransformTransition(
+  transition: AuthoritativeTransformTransition,
+  nowMs: number,
+  targetPosition: THREE.Vector3,
+  targetQuaternion: THREE.Quaternion,
+): boolean {
+  const alpha = THREE.MathUtils.clamp(
+    (nowMs - transition.startedAtMs) / transition.durationMs,
+    0,
+    1,
+  );
+  targetPosition.lerpVectors(
+    transition.fromPosition,
+    transition.toPosition,
+    alpha,
+  );
+  targetQuaternion.slerpQuaternions(
+    transition.fromQuaternion,
+    transition.toQuaternion,
+    alpha,
+  );
+  return alpha === 1;
+}

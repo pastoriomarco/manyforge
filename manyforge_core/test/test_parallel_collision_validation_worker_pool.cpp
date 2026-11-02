@@ -814,9 +814,9 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
 
 TEST(ParallelCollisionValidationWorkerPoolTest,
      MixedSignedBinaryAndBoundedContactsMatchSerialAcrossChunkBoundary) {
-  const CollisionPairId signed_pair{"object/signed", "robot/tool"};
-  const CollisionPairId binary_pair{"fixture/table", "object/binary"};
-  const CollisionPairId bounded_pair{"fixture/socket", "object/insert"};
+  const CollisionPairId signed_pair{"component/arm/model/arm_model/body/tool/collision/0", "scene/signed/shape/0"};
+  const CollisionPairId binary_pair{"scene/binary/shape/0", "scene/table/shape/0"};
+  const CollisionPairId bounded_pair{"scene/insert/shape/0", "scene/socket/shape/0"};
 
   auto policy = contact_release_snapshot(signed_pair);
   SupportContactPolicyEntry binary;

@@ -4,28 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "manyforge_composer"
-version = "0.1.0"
-description = "ManyForge Composer — FastAPI backend + React frontend for behavior-tree authoring and assistant modes"
+version = "0.2.0"
+description = "ManyForge Composer structural and Program-authoring shell during the composable-cell runtime cutover"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Marco Pastorio" }]
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi>=0.111",
+    "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "httpx>=0.27",
-    "mcp==1.27.0",
     "pyyaml>=6.0",
     "trimesh>=4.0",
     "yourdfpy>=0.0.60",
 ]
 
 [project.optional-dependencies]
-# The observer-safe visual snapshot publisher uses Pinocchio FK when the
-# runtime supports native robot visualization. Lightweight Composer installs
-# may omit this extra and will expose a structured pinocchio_unavailable
-# diagnostic instead of calling the legacy planning-scene FK path.
+mcp = [
+    "mcp==1.27.0",
+]
+# Retained compiled-model structural/FK parity qualification uses Pinocchio.
+# This extra does not enable the removed live scene or runtime authority.
 visual = [
     "pin==3.9.0",
+]
+headless = [
+    "manyforge_headless_api>=0.2.0,<0.3.0",
 ]
 
 [tool.setuptools]
@@ -36,6 +39,7 @@ packages = ["manyforge_composer", "manyforge_composer.backend"]
 
 [tool.setuptools.package-data]
 manyforge_composer = ["resources/*.yaml"]
+"manyforge_composer.backend" = ["resources/Untitled.scenario/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

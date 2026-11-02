@@ -1,0 +1,20 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md): a point-cloud
+# source. Its adapter (family `pointcloud`) runs the point-cloud bridge as the
+# component's own process: it reads one sensor_msgs/PointCloud2 topic, bounds
+# it and sends it to the Composer's 3D view while a viewer is open. Display
+# only: planning and collision don't use it. A sensor has no lane (no lane
+# rows, none in the Deployment): the Deployment row names the topic and the source frame
+# (both required) and the limits; until something publishes the topic, its
+# `pointcloud` stream shows none (e.g. on Mock).
+api_version: manyforge.component_package.v1
+kind: sensor
+id: manyforge.pointcloud_source
+version: 1.0.0
+title: Point-cloud source (PointCloud2 to the 3D view)
+license: Apache-2.0
+sensor: pointcloud
+# Its one adapter row. stream_budget_s: the `pointcloud` stream is
+# fresh while a cloud arrived within this time; a camera publishes several
+# clouds per second, so 1 s only reads a stalled camera as stale (freshness
+# only, never a fault).
+adapter_row: {adapter: pointcloud, stream_budget_s: 1.0}

@@ -1,639 +1,65 @@
-import { useEffect, useId, useState } from 'react';
+import { humanizeReasonCode } from '../state/structuredError';
 
-/**
- * KernelErrorPanel — renders kernel/cycle-manager errors with their full
- * structured cause instead of a single generic banner.
- *
- * Phase: issues #1 (runtime fault during execution) and #3 (restart blocked
- * because kernel is in InterventionRequired). Both surface a kernel ErrorDTO
- * via the cycle command 409 detail or via the cycle status payload. The
- * panel maps the stable `errorCode` to a human-readable headline plus an
- * optional "what to do" hint, and exposes the full `errorDetails` map in a
- * collapsible diagnostics block so the operator can see exactly what the
- * kernel saw (collision pair, waypoint index, snapshot revision, …).
- *
- * Fallback: when `errorCode` and `errorDetails` are missing (legacy
- * string-only errors, frontend-only validation errors), only the headline
- * message is rendered — the panel is still useful as a structured banner.
- */
-
-export interface KernelErrorPanelProps {
-  /** Top-line human-readable message (the cause string). */
+export interface KernelErrorView {
+  code: string;
   message: string;
-  /** Stable machine token for viewer mapping, when known. */
-  errorCode?: string | null;
-  /** Kernel diagnostics map, when known. */
-  errorDetails?: Record<string, unknown> | null;
-  /** Captured event snapshot for the latest fault/stop incident, when known. */
-  incidentSnapshot?: Record<string, unknown> | null;
-  /** Stable identity used to reset presentation for a genuinely new incident. */
-  presentationKey?: string;
-  /** Optional operator-facing headline supplied by a typed condition surface. */
-  headlineOverride?: string;
-  /** Optional response guidance supplied by a typed condition definition. */
-  hintOverride?: string;
-  /** Acknowledge this browser notification without mutating runtime authority. */
-  onAcknowledge?: () => void;
-  /** Terminology for the acknowledgement control. */
-  acknowledgeLabel?: string;
-  /** Exact acknowledgement semantics for the control tooltip. */
-  acknowledgeTitle?: string;
-  /** Reduce the notification to the persistent header icon. */
-  onMinimize?: () => void;
+  details?: Record<string, unknown> | null;
 }
 
-interface HeadlineMapping {
-  /** Operator-facing one-line cause. May reference errorDetails. */
-  headline: (details: Record<string, unknown> | null) => string;
-  /** Optional "what to do next" hint shown under the headline. */
-  hint?: string | ((details: Record<string, unknown> | null) => string);
-  /** Severity chip color (Tailwind class fragment). */
-  severity?: 'fault' | 'config' | 'state' | 'unknown';
+export interface KernelErrorPresentation {
+  /** The cause: what went wrong. */
+  headline: string;
+  /** Category, scope and lifecycle under the headline, joined with " · ". */
+  status?: string;
+  /** What to do; omitted when empty. */
+  hint: string;
+  severity: 'warning' | 'error' | 'critical';
 }
 
-const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
-  validation_deferred: {
-    headline: (d) => {
-      const reason = stringField(d, 'reason') || stringField(d, 'reason_code');
-      const conflict = stringField(d, 'resource_conflict_reason');
-      if (reason === 'validation_deferred_runtime_monitor_active') {
-        return conflict
-          ? `Pre-dispatch validation deferred: runtime collision monitor owns the collision resource (${conflict})`
-          : 'Pre-dispatch validation deferred: runtime collision monitor owns the collision resource';
-      }
-      return 'Pre-dispatch validation deferred';
-    },
-    hint: (d) => {
-      const guidance = stringField(d, 'operator_guidance');
-      return guidance
-        || 'Runtime collision monitoring is active, so this validation pass was not allowed to borrow its collision engine. Retry after motion/stop completes or configure an independent validation collision resource.';
-    },
-    severity: 'state',
-  },
-  scene_snapshot_lease_missing: {
-    headline: () => 'Scene snapshot lease missing at dispatch',
-    hint: 'The trajectory could not be tied to a retained validation scene snapshot. Re-plan and retry; if this repeats, inspect the collision snapshot retention diagnostics.',
-    severity: 'state',
-  },
-  live_scene_snapshot_unavailable: {
-    headline: () => 'Live collision scene unavailable at dispatch',
-    hint: 'The kernel could not read a live collision-scene snapshot to verify the validation lease. Retry after the scene publisher is healthy.',
-    severity: 'state',
-  },
-  scene_snapshot_lease_expired: {
-    headline: (d) => {
-      const ageMs = numberFieldAsMs(d, 'scene_snapshot_lease_age_ns');
-      const budgetMs = numberFieldAsMs(d, 'scene_snapshot_lease_max_age_ns')
-        ?? numberFieldAsMs(d, 'lease_max_age_ns');
-      if (ageMs && budgetMs) {
-        return `Collision validation lease expired before dispatch (${ageMs} ms > ${budgetMs} ms)`;
-      }
-      if (ageMs) {
-        return `Collision validation lease expired before dispatch (${ageMs} ms old)`;
-      }
-      return 'Collision validation lease expired before dispatch';
-    },
-    hint: 'The scene changed or dispatch waited too long after validation. Re-plan from a fresh scene snapshot.',
-    severity: 'state',
-  },
-  observed_scene_source_stale: {
-    headline: (d) => {
-      const source = sceneLeaseActorText(d);
-      const ageMs = numberFieldAsMs(d, 'observed_scene_source_age_ns');
-      const budgetMs = numberFieldAsMs(d, 'source_freshness_budget_ns')
-        ?? numberFieldAsMs(d, 'observed_scene_source_freshness_budget_ns');
-      const subject = source ? `: ${source}` : '';
-      if (ageMs && budgetMs) {
-        return `Observed scene source stale${subject} (${ageMs} ms > ${budgetMs} ms)`;
-      }
-      return `Observed scene source stale${subject}`;
-    },
-    hint: 'The pose source behind this collision-scene object was not fresh enough at dispatch. Restore the source stream or wait for a fresh observation, then re-plan.',
-    severity: 'state',
-  },
-  scene_topology_changed_after_validation: {
-    headline: (d) => {
-      const object = sceneLeaseActorText(d);
-      return object
-        ? `Scene topology changed after validation: ${object}`
-        : 'Scene topology changed after validation';
-    },
-    hint: 'A collision object was added, removed, attached, detached, or otherwise changed outside the validation lease. Re-plan against the current scene.',
-    severity: 'state',
-  },
-  collision_policy_changed_after_validation: {
-    headline: () => 'Collision policy changed after validation',
-    hint: 'Allowed-contact or runtime-collision policy changed between validation and dispatch. Re-plan so the trajectory is checked under the active policy.',
-    severity: 'state',
-  },
-  target_moved_after_validation: {
-    headline: (d) => {
-      const target = sceneLeaseActorText(d);
-      const drift = sceneLeaseDriftText(d, 'target');
-      return `Observed target moved after validation${target ? `: ${target}` : ''}${drift ? ` (${drift})` : ''}`;
-    },
-    hint: 'The selected target moved beyond its configured safe-point tolerance after validation. Re-plan from the latest observation.',
-    severity: 'fault',
-  },
-  obstacle_moved_after_validation: {
-    headline: (d) => {
-      const obstacle = sceneLeaseActorText(d);
-      const drift = sceneLeaseDriftText(d, 'obstacle');
-      return `Observed obstacle moved after validation${obstacle ? `: ${obstacle}` : ''}${drift ? ` (${drift})` : ''}`;
-    },
-    hint: 'A live obstacle moved beyond its admitted tolerance before dispatch. Re-plan from the latest scene, or qualify runtime dynamic-obstacle coverage before allowing this drift.',
-    severity: 'fault',
-  },
-  runtime_dynamic_scene_not_qualified: {
-    headline: (d) => {
-      const object = sceneLeaseActorText(d);
-      return object
-        ? `Runtime dynamic-obstacle coverage not qualified: ${object}`
-        : 'Runtime dynamic-obstacle coverage not qualified';
-    },
-    hint: 'The object was allowed to move as a runtime dynamic obstacle only if qualified runtime coverage was armed and fresh. The kernel failed closed before dispatch.',
-    severity: 'fault',
-  },
-  scene_snapshot_lease_missing_collision_coverage: {
-    headline: () => 'Collision scene changed without lease-covered objects',
-    hint: 'The world revision changed after validation, but the lease did not cover any collision objects. Re-plan; if this repeats, inspect the pose-source admission policy for the moving object.',
-    severity: 'state',
-  },
-  validation_collision: {
-    headline: (d) => {
-      // Pre-execute validation rejection: the planned trajectory was
-      // checked against the scene snapshot before dispatch and failed.
-      // Engine-status failures are not necessarily geometric collisions:
-      // a timeout, unsupported geometry, diagnostic gap, cancellation, or
-      // engine exception means the validator failed closed before proving
-      // the trajectory dispatchable.
-      const engineStatus = stringField(d, 'collision_result_engine_status');
-      const reason = stringField(d, 'reason');
-      const contactPolicy = supportContactPolicyText(d);
-      if (engineStatus === 'timeout') {
-        const timeoutReason = collisionTimeoutReason(d);
-        const observedMs = numberFieldAsMs(
-          d,
-          'collision_result_raw_timeout_observed_duration_ns',
-        )
-          ?? numberFieldAsMs(d, 'collision_result_raw_total_call_duration_ns')
-          ?? numberFieldAsMs(d, 'collision_result_raw_elapsed_ns');
-        const budgetMs = numberFieldAsMs(
-          d,
-          'collision_result_raw_timeout_budget_ns',
-        ) ?? numberFieldAsMs(d, 'collision_result_raw_timeout_ns');
-        if (observedMs !== null && budgetMs !== null) {
-          if (timeoutReason === 'collision_validation_wall_timeout') {
-            return `Pre-dispatch collision validation exceeded wall budget (${observedMs} ms > ${budgetMs} ms)`;
-          }
-          return `Pre-dispatch collision validation timed out (${observedMs} ms > ${budgetMs} ms)`;
-        }
-        if (timeoutReason === 'collision_validation_wall_timeout') {
-          return 'Pre-dispatch collision validation exceeded wall budget';
-        }
-        return 'Pre-dispatch collision validation timed out';
-      }
-      if (engineStatus === 'unsupported_geometry') {
-        const reason = stringField(d, 'collision_result_raw_snapshot_sync_error');
-        return reason
-          ? `Collision validation unsupported geometry: ${reason}`
-          : 'Collision validation hit unsupported scene geometry';
-      }
-      if (engineStatus === 'diagnostic_incomplete') {
-        if (contactPolicy) {
-          const pair = stringField(d, 'collision_result_first_failure_pair');
-          const pairText = pair ? ` for ${prettyPair(pair)}` : '';
-          return `Contact-policy diagnostics incomplete${pairText} (${contactPolicy})`;
-        }
-        const capability = stringField(d, 'required_capability')
-          || stringField(d, 'collision_result_raw_required_capability');
-        const syncError = stringField(d, 'collision_result_raw_snapshot_sync_error');
-        const reason = capability || syncError;
-        return reason
-          ? `Collision validation diagnostics incomplete: ${reason}`
-          : 'Collision validation diagnostics incomplete';
-      }
-      if (engineStatus === 'cancelled' || reason === 'collision_validation_cancelled') {
-        const cancelReason = stringField(d, 'cancellation_reason')
-          || stringField(d, 'collision_result_raw_cancel_reason');
-        return cancelReason
-          ? `Pre-dispatch collision validation cancelled: ${cancelReason}`
-          : 'Pre-dispatch collision validation cancelled';
-      }
-      if (engineStatus === 'engine_error') {
-        const exception = stringField(d, 'collision_result_raw_engine_exception');
-        return exception
-          ? `Collision validation engine error: ${exception}`
-          : 'Collision validation engine error';
-      }
-      const pair = stringField(d, 'collision_result_first_failure_pair');
-      const wp = stringField(d, 'collision_result_waypoint_index');
-      const classification = stringField(d, 'collision_result_first_failure_classification');
-      const suffix = contactPolicy ? ` (${contactPolicy})` : '';
-      if (classification === 'support_contact_start' && pair && wp) {
-        return `Trajectory rejected: support contact ${prettyPair(pair)} at waypoint ${wp}${suffix}`;
-      }
-      if (pair && wp) {
-        return `Trajectory rejected: ${prettyPair(pair)} at waypoint ${wp}${suffix}`;
-      }
-      if (pair) {
-        return `Trajectory rejected: ${prettyPair(pair)}${suffix}`;
-      }
-      if (engineStatus && engineStatus !== 'ok') {
-        return `Pre-dispatch collision validation inconclusive: ${engineStatus}`;
-      }
-      return 'Trajectory rejected: pre-dispatch collision validation failed';
-    },
-    hint: (d) => {
-      const engineStatus = stringField(d, 'collision_result_engine_status');
-      const reason = stringField(d, 'reason');
-      const policy = supportContactPolicyText(d);
-      if (engineStatus === 'timeout') {
-        const timeoutReason = collisionTimeoutReason(d);
-        const syncMs = numberFieldAsMs(
-          d,
-          'collision_result_raw_snapshot_sync_duration_ns',
-        );
-        const syncText = syncMs !== null ? ` Snapshot sync took ${syncMs} ms.` : '';
-        if (timeoutReason === 'collision_validation_wall_timeout') {
-          return `No collision pair was reported. The validator exceeded its whole-validation wall budget before proving the trajectory safe.${syncText} Increase validation_collision_wall_timeout_ms for this deployment, reduce validation workload, or retry after the validator has a warm snapshot.`;
-        }
-        return `No collision pair was reported. The validator exceeded its pre-dispatch budget while synchronizing or querying the collision world.${syncText} Increase validation_collision_query_timeout_ms for this deployment, reduce collision-scene complexity, or retry after the validator has a warm snapshot.`;
-      }
-      if (engineStatus === 'unsupported_geometry') {
-        return 'The active collision engine could not ingest one of the scene or robot geometries. Inspect the diagnostic details, simplify or replace the unsupported geometry, then re-plan.';
-      }
-      if (engineStatus === 'diagnostic_incomplete') {
-        if (policy) {
-          return `${supportContactPolicyHint(d)} The collision engine could not produce the required contact-pair evidence; inspect the missing capability or pair diagnostic before retrying.`;
-        }
-        return 'The collision engine could not produce the diagnostics required to prove the trajectory safe. Inspect the missing capability or snapshot diagnostic below before retrying.';
-      }
-      if (engineStatus === 'cancelled' || reason === 'collision_validation_cancelled') {
-        return 'Validation was cancelled by a newer stop, reset, or fault path. Retry only after the kernel returns to a stable state.';
-      }
-      if (engineStatus === 'engine_error') {
-        return 'The collision engine threw while validating the trajectory. Inspect the exception and collision-world diagnostics before retrying.';
-      }
-      if (policy) {
-        return supportContactPolicyHint(d);
-      }
-      const pair = stringField(d, 'collision_result_first_failure_pair');
-      if (pair) {
-        return 'The trajectory failed pre-dispatch validation. Inspect the colliding pair below, adjust the scene or re-plan, then retry.';
-      }
-      return 'The trajectory failed pre-dispatch validation without a colliding pair. Inspect the engine-status diagnostics below, adjust the scene/configuration, then retry.';
-    },
-    severity: 'fault',
-  },
-  runtime_collision: {
-    headline: (d) => {
-      // Runtime monitor stopped motion DURING execution. This may be a
-      // geometric collision, but it may also be a fail-closed monitor fault
-      // such as a stale dynamic collision-world body. Keep those distinct in
-      // the viewer so operators do not hunt for a non-existent contact pair.
-      const reason = stringField(d, 'reason');
-      const body = stringField(d, 'dynamic_body_id');
-      const ageMs = numberFieldAsMs(d, 'dynamic_body_age_ns');
-      const budgetMs = numberFieldAsMs(d, 'dynamic_body_effective_freshness_budget_ns');
-      if (reason === 'runtime_collision_required_capability_unsupported') {
-        const capability = stringField(d, 'required_capability');
-        return capability
-          ? `Runtime collision monitor missing required capability: ${capability}`
-          : 'Runtime collision monitor missing a required capability';
-      }
-      if (reason === 'stale_dynamic_collision_body') {
-        const bodyLabel = body ? `: ${prettyBodyId(body)}` : '';
-        if (ageMs !== null && budgetMs !== null) {
-          return `Dynamic collision-world pose stale${bodyLabel} (${ageMs} ms > ${budgetMs} ms)`;
-        }
-        return `Dynamic collision-world pose stale${bodyLabel}`;
-      }
-      if (reason === 'dynamic_body_missing_source_timestamp') {
-        return body
-          ? `Dynamic collision-world pose missing timestamp: ${prettyBodyId(body)}`
-          : 'Dynamic collision-world pose missing timestamp';
-      }
-      const pair = stringField(d, 'collision_result_first_failure_pair');
-      const wp = stringField(d, 'collision_result_waypoint_index');
-      if (pair && wp) {
-        return `Runtime collision: ${prettyPair(pair)} at waypoint ${wp}`;
-      }
-      if (pair) {
-        return `Runtime collision: ${prettyPair(pair)}`;
-      }
-      if (reason) {
-        return `Runtime collision monitor stopped execution: ${reason}`;
-      }
-      return 'Runtime collision detected during execution';
-    },
-    hint: (d) => {
-      const reason = stringField(d, 'reason');
-      if (reason === 'runtime_collision_required_capability_unsupported') {
-        const capability = stringField(d, 'required_capability');
-        const capabilityText = capability ? ` (${capability})` : '';
-        return `The active contact policy requires collision evidence that this runtime engine does not provide${capabilityText}. The monitor failed closed; select a qualified collision engine or change the policy before retrying.`;
-      }
-      if (
-        reason === 'stale_dynamic_collision_body' ||
-        reason === 'dynamic_body_missing_source_timestamp'
-      ) {
-        return 'No geometric collision pair was reported. The runtime monitor stopped before collision query because a dynamic collision-world body was not fresh enough.';
-      }
-      return 'A dynamic body intersected the trajectory during execution. Inspect the colliding pair below, clear the runtime obstacle (Reset removes runtime-added scene objects), then retry.';
-    },
-    severity: 'fault',
-  },
-  tracking_error_exceeded: {
-    headline: (d) => {
-      const joint = stringField(d, 'joint_name');
-      const error = stringField(d, 'peak_tracking_error_rad')
-        || stringField(d, 'tracking_error_rad');
-      const tolerance = stringField(d, 'tracking_error_tolerance_rad');
-      if (joint && error && tolerance) {
-        return `Controller tracking error: ${joint} ${error} rad > ${tolerance} rad`;
-      }
-      if (error && tolerance) {
-        return `Controller tracking error exceeded tolerance (${error} rad > ${tolerance} rad)`;
-      }
-      return 'Controller tracking error exceeded tolerance';
-    },
-    hint: 'The controller deviated from the commanded trajectory. Inspect the measured joint error, clear the fault, and re-plan from the current robot state.',
-    severity: 'fault',
-  },
-  stale_controller_state: {
-    headline: () => 'Controller state was not fresh enough before dispatch',
-    hint: 'Check the ROS joint/controller-state publishers and retry after fresh complete state is available.',
-    severity: 'state',
-  },
-  start_state_mismatch: {
-    headline: (d) => {
-      const joint = stringField(d, 'joint_name');
-      const error = stringField(d, 'max_joint_error_rad');
-      const tolerance = stringField(d, 'start_tolerance_rad');
-      if (joint && error && tolerance) {
-        return `Start state mismatch: ${joint} ${error} rad > ${tolerance} rad`;
-      }
-      if (error && tolerance) {
-        return `Start state mismatch exceeded tolerance (${error} rad > ${tolerance} rad)`;
-      }
-      return 'Start state does not match the trajectory';
-    },
-    hint: 'The measured robot state does not match the first trajectory point. Re-plan from the current measured state before retrying.',
-    severity: 'fault',
-  },
-  action_server_unavailable: {
-    headline: (d) => {
-      const action = stringField(d, 'action_name');
-      return action
-        ? `FollowJointTrajectory action server unavailable: ${action}`
-        : 'FollowJointTrajectory action server unavailable';
-    },
-    hint: 'Check that the ros2_control controller is active and the action name matches the deployment.',
-    severity: 'state',
-  },
-  controller_cancel_timeout: {
-    headline: () => 'Controller cancel did not complete before the timeout',
-    hint: 'The backend entered operator intervention because software stop completion was not observed. If the robot is stopped and the controller is healthy, acknowledge and continue; otherwise reset when safe.',
-    severity: 'fault',
-  },
-  controller_feedback_timeout: {
-    headline: () => 'Controller feedback did not arrive after dispatch',
-    hint: 'Check the FollowJointTrajectory feedback stream and controller health before retrying.',
-    severity: 'state',
-  },
-  controller_goal_response_timeout: {
-    headline: () => 'Controller did not respond to the trajectory goal',
-    hint: 'Check the FollowJointTrajectory action server and controller executor.',
-    severity: 'state',
-  },
-  controller_goal_dispatch_failed: {
-    headline: (d) => stringField(d, 'exception') || 'Trajectory goal dispatch failed',
-    hint: 'Inspect the dispatch exception and controller action server state.',
-    severity: 'fault',
-  },
-  controller_goal_rejected: {
-    headline: () => 'Controller rejected the trajectory goal',
-    hint: 'Inspect controller constraints and active controller state before retrying.',
-    severity: 'fault',
-  },
-  controller_result_failed: {
-    headline: (d) => stringField(d, 'controller_error') || 'Controller reported trajectory failure',
-    hint: 'Inspect the controller result and tracking diagnostics, then re-plan from current state.',
-    severity: 'fault',
-  },
-  empty_trajectory: {
-    headline: () => 'Execution rejected an empty trajectory',
-    hint: 'This indicates an upstream planning/adapter bug; re-plan and inspect planner output.',
-    severity: 'fault',
-  },
-  monitor_thread_still_shutting_down: {
-    headline: () => 'Previous controller monitor thread is still shutting down',
-    hint: 'Wait for the backend to settle or reset before dispatching another trajectory.',
-    severity: 'state',
-  },
-  motion_interrupt_backend_stop_failed: {
-    headline: (d) => {
-      const reason = stringField(d, 'reason') || stringField(d, 'reason_code');
-      if (reason === 'soft_on_path_escalated_to_hard_deceleration') {
-        // Not a failure: the path-preserving soft stop was infeasible, so the
-        // backend escalated to a hard deceleration. The robot is at rest.
-        return 'On-path soft stop infeasible — escalated to a hard stop (robot stopped)';
-      }
-      return reason
-        ? `Backend stop failed: ${reason}`
-        : 'Backend stop failed during motion-scoped interrupt';
-    },
-    hint: (d) => {
-      const reason = stringField(d, 'reason') || stringField(d, 'reason_code');
-      if (reason === 'soft_on_path_escalated_to_hard_deceleration') {
-        return 'The path-preserving soft stop could not be produced within the configured stop limits, so the robot was brought to rest on a hard deceleration. Review the stop diagnostics below, then press Run or Reset to clear the kernel intervention and continue.';
-      }
-      return 'Reset the cycle to clear the kernel intervention state.';
-    },
-    severity: 'fault',
-  },
-  motion_interrupt_latched: {
-    headline: (d) => {
-      // Fault-session interrupt latched (e.g. runtime collision fault).
-      // The policy id usually tells the operator which fault category
-      // fired, and `preemption_action` says how the kernel responded.
-      const policy = stringField(d, 'policy_id');
-      const action = stringField(d, 'preemption_action');
-      if (policy && action) {
-        return `Motion interrupted by ${prettyPolicyId(policy)} (${action})`;
-      }
-      if (policy) {
-        return `Motion interrupted by ${prettyPolicyId(policy)}`;
-      }
-      return 'Motion interrupted by an active fault policy';
-    },
-    hint: 'Inspect the latch diagnostics for the cause; click Reset to clear the kernel intervention state.',
-    severity: 'fault',
-  },
-  validation_limits_violation: {
-    headline: () => 'Trajectory exceeds joint/TCP limits',
-    hint: 'Adjust velocity/acceleration scale or limits and re-plan.',
-    severity: 'config',
-  },
-  planning_failed: {
-    headline: (d) => stringField(d, 'reason') || 'Planning failed',
-    hint: 'Inspect the planner reason; common causes are unreachable poses or scene collisions.',
-    severity: 'fault',
-  },
-  intervention_session_running: {
-    headline: () => 'Kernel is in InterventionRequired',
-    hint: 'Clear the intervention before starting again. Click Reset to return to Idle.',
-    severity: 'state',
-  },
-  no_program_loaded: {
-    headline: () => 'No program loaded',
-    hint: 'Load or apply a program before running.',
-    severity: 'state',
-  },
-  staged_overrides_blocked_resume: {
-    headline: () => 'Staged runtime overrides cannot resume from STOPPED',
-    hint: 'Reset the cycle first; the staged overrides will be activated on the next Run from IDLE.',
-    severity: 'state',
-  },
-};
-
-// Configured contact-envelope failures carry their normative ErrorDTO code,
-// while preserving the same pre-dispatch collision/policy diagnostics and
-// operator guidance previously rendered under validation_collision.
-ERROR_CODE_MAPPING.contact_policy_violation =
-  ERROR_CODE_MAPPING.validation_collision;
-
-const GENERIC_BACKEND_ERROR_CODES = new Set([
-  'execution_aborted',
-  'execution_rejected',
-  'invalid_request',
-  'scene_changed_during_validation',
-  'stop_failed',
-]);
-
-function stringField(
-  details: Record<string, unknown> | null | undefined,
-  key: string,
-): string {
-  if (!details) {
-    return '';
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, nested]) => [key, stableValue(nested)]),
+    );
   }
-  const value = details[key];
-  return typeof value === 'string' ? value : '';
+  return value;
 }
 
-function numberFieldAsMs(
-  details: Record<string, unknown> | null | undefined,
-  key: string,
-): string | null {
-  if (!details) {
-    return null;
-  }
-  const value = details[key];
-  const raw = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
-  if (!Number.isFinite(raw)) {
-    return null;
-  }
-  const ms = raw / 1_000_000;
-  if (ms >= 100) {
-    return ms.toFixed(0);
-  }
-  if (ms >= 10) {
-    return ms.toFixed(1);
-  }
-  return ms.toFixed(2);
-}
-
-function sceneLeaseActorText(
-  details: Record<string, unknown> | null | undefined,
-): string {
-  const object = stringField(details, 'object_id');
-  const source = stringField(details, 'source_id');
-  if (object && source) {
-    return `${object} from ${source}`;
-  }
-  return object || source;
-}
-
-function sceneLeaseDriftText(
-  details: Record<string, unknown> | null | undefined,
-  prefix: 'target' | 'obstacle',
-): string {
-  const linear = numberField(details, `${prefix}_drift_m`);
-  const angular = numberField(details, `${prefix}_angular_drift_rad`);
-  const parts: string[] = [];
-  if (linear !== null) {
-    parts.push(`${linear.toFixed(4)} m`);
-  }
-  if (angular !== null) {
-    parts.push(`${angular.toFixed(4)} rad`);
-  }
-  return parts.join(', ');
-}
-
-function collisionTimeoutReason(
-  details: Record<string, unknown> | null | undefined,
-): string {
-  return stringField(details, 'reason')
-    || stringField(details, 'cancellation_reason')
-    || stringField(details, 'collision_result_raw_reason_code');
-}
+const ERROR_PRESENTATION_IDENTITY_KEYS = [
+  'runtime_fault_id',
+  'execution_id',
+  'action_span_id',
+  'node_attempt_id',
+] as const;
 
 /**
- * Convert the kernel's verbose policy id into an operator-friendly token.
- * Example: "manyforge.kernel.runtime_collision_fault.preempt_trajectory"
- * -> "runtime_collision_fault".
+ * Keep one incident stable across incremental diagnostic enrichment. Retained
+ * from source blob aaa1d7fd40e2692773cf46b2c9549bb639104d61 and test blob
+ * fc9a9d1ad41db46dc8d9aafe6e2593977652a4ce; interpreting the diagnostic code
+ * and choosing remediation copy remain an I8 projection job.
  */
-function prettyPolicyId(policy: string): string {
-  const segments = policy.split('.').filter(Boolean);
-  if (segments.length === 0) {
-    return policy;
+export function errorPresentationKey(error: KernelErrorView): string {
+  const identities = ERROR_PRESENTATION_IDENTITY_KEYS.flatMap((key) => {
+    const value = error.details?.[key];
+    return value === null || value === undefined || value === ''
+      ? []
+      : [`${key}=${String(value)}`];
+  });
+  if (identities.length > 0) {
+    return `${error.code}|${identities.join('|')}`;
   }
-  // Drop the kernel/manyforge prefixes; pick the most informative segment.
-  // Heuristic: pick the longest segment that doesn't look like an action verb.
-  const actionWords = new Set([
-    'preempt_trajectory',
-    'preempt',
-    'pause',
-    'fail',
-  ]);
-  const candidates = segments.filter((s) => !actionWords.has(s));
-  if (candidates.length === 0) {
-    return segments[segments.length - 1];
-  }
-  return candidates[candidates.length - 1];
+  return JSON.stringify(stableValue({
+    code: error.code,
+    message: error.message,
+    details: error.details ?? null,
+  }));
 }
 
-/**
- * Convert the kernel's verbose collision-pair token into an operator-friendly
- * short form. Exported so the mapping logic can be unit-tested without
- * rendering the React tree.
- */
-export function prettyPair(pair: string): string {
-  // Kernel format: "object/wall/shape/0 <-> robot/robot0/link/left_outer_finger/collision/0"
-  // Operator-friendly: "wall ↔ left_outer_finger"
-  const parts = pair.split(/\s*<->\s*/);
-  if (parts.length !== 2) {
-    return pair;
-  }
-  const short = (token: string) => {
-    const segments = token.split('/').filter(Boolean);
-    if (segments.length === 0) {
-      return token;
-    }
-    if (segments[0] === 'object' && segments.length >= 2) {
-      return segments[1];
-    }
-    if (segments[0] === 'robot' && segments.length >= 4 && segments[2] === 'link') {
-      return segments[3];
-    }
-    if (segments[0] === 'robot' && segments.length >= 4 && segments[2] === 'attached') {
-      return `attached ${segments[3]}`;
-    }
-    return segments[segments.length - 1];
-  };
-  return `${short(parts[0])} ↔ ${short(parts[1])}`;
+export function readableErrorCode(code: string): string {
+  return humanizeReasonCode(code) || 'Runtime error';
 }
 
 export function prettyBodyId(bodyId: string): string {
@@ -641,762 +67,95 @@ export function prettyBodyId(bodyId: string): string {
   if (segments[0] === 'object' && segments.length >= 2) {
     return segments[1];
   }
-  if (segments[0] === 'robot' && segments.length >= 4 && segments[2] === 'link') {
-    return segments[3];
-  }
-  if (segments[0] === 'robot' && segments.length >= 4 && segments[2] === 'attached') {
+  if (
+    segments[0] === 'robot'
+    && segments.length >= 4
+    && (segments[2] === 'link' || segments[2] === 'attached')
+  ) {
     return segments[3];
   }
   return segments[segments.length - 1] || bodyId;
 }
 
-function numberField(
-  details: Record<string, unknown> | null | undefined,
-  key: string,
-): number | null {
-  if (!details) {
-    return null;
-  }
-  const value = details[key];
-  const raw = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
-  return Number.isFinite(raw) ? raw : null;
-}
-
-type SupportContactPresentationMode =
-  | 'signed_penetration'
-  | 'binary_contact'
-  | 'bounded_penetration'
-  | 'legacy_signed';
-
-interface SupportContactPresentation {
-  mode: SupportContactPresentationMode;
-  text: string;
-}
-
-function formatMeters(value: number): string {
-  const absolute = Math.abs(value);
-  const digits = absolute > 0 && absolute < 0.001 ? 6 : 3;
-  return `${value.toFixed(digits)} m`;
-}
-
-function contactCountText(
-  details: Record<string, unknown> | null | undefined,
-): string {
-  const initial = numberField(details, 'initial_contact_pair_count');
-  const current = numberField(details, 'current_contact_pair_count');
-  if (initial !== null && current !== null) {
-    return `contacts ${initial} → ${current}`;
-  }
-  if (current !== null) {
-    return `contacts now ${current}`;
-  }
-  return '';
-}
-
-function distanceEvidenceText(
-  details: Record<string, unknown> | null | undefined,
-  mode: SupportContactPresentationMode,
-): string {
-  const requestMode = stringField(details, 'distance_request_mode');
-  const evaluatedCount = numberField(details, 'evaluated_distance_pair_count');
-  const scope = (() => {
-    switch (requestMode) {
-      case 'none':
-        return 'none';
-      case 'selected_colliding_pairs':
-        return 'selected colliding pairs';
-      case 'all_colliding_pairs':
-        return 'all colliding pairs';
-      case 'all_active_pairs':
-        return 'all active pairs';
-      default:
-        return requestMode || 'unspecified scope';
+export function prettyPair(pair: string): string {
+  const parts = pair.split(/\s*<->\s*/);
+  if (parts.length !== 2) return pair;
+  const short = (token: string): string => {
+    const segments = token.split('/').filter(Boolean);
+    if (segments[0] === 'object' && segments.length >= 2) {
+      return segments[1];
     }
-  })();
-  if (mode === 'binary_contact') {
-    if (
-      (requestMode === 'none' || requestMode === '')
-      && (evaluatedCount === 0 || evaluatedCount === null)
-    ) {
-      return requestMode === 'none' || evaluatedCount === 0
-        ? 'no distance measurements'
-        : '';
+    if (segments[0] === 'robot' && segments.length >= 4) {
+      if (segments[2] === 'link') return segments[3];
+      if (segments[2] === 'attached') return `attached ${segments[3]}`;
     }
-    const count = evaluatedCount === null
-      ? ''
-      : `, ${evaluatedCount} pair${evaluatedCount === 1 ? '' : 's'} evaluated`;
-    return `unexpected distance evidence: ${scope}${count}`;
-  }
-  if (!requestMode && evaluatedCount === null) {
-    return '';
-  }
-  const count = evaluatedCount === null
-    ? ''
-    : `, ${evaluatedCount} pair${evaluatedCount === 1 ? '' : 's'} evaluated`;
-  return `distance ${scope}${count}`;
+    return segments[segments.length - 1] || token;
+  };
+  return `${short(parts[0])} ↔ ${short(parts[1])}`;
 }
 
-function supportContactPolicyPresentation(
-  details: Record<string, unknown> | null | undefined,
-): SupportContactPresentation | null {
-  const policyMode = stringField(details, 'policy_mode');
-  const releaseEvidence = stringField(details, 'release_evidence_mode');
-  const hasStep18ContactPolicy =
-    policyMode === 'contact_release'
-    || policyMode === 'bounded_penetration'
-    || releaseEvidence === 'signed_penetration'
-    || releaseEvidence === 'binary_contact';
-
-  if (hasStep18ContactPolicy) {
-    const mode: SupportContactPresentationMode = policyMode === 'bounded_penetration'
-      ? 'bounded_penetration'
-      : releaseEvidence === 'binary_contact'
-        ? 'binary_contact'
-        : 'signed_penetration';
-    const values: string[] = [];
-    if (mode === 'signed_penetration') {
-      values.push('Precise - signed penetration');
-    } else if (mode === 'binary_contact') {
-      values.push('Lightweight - binary contact');
-    } else {
-      values.push('Contact-tolerant - bounded penetration');
-    }
-
-    const contactPresent = stringField(details, 'contact_present');
-    if (contactPresent === 'true') {
-      values.push('contact present');
-    } else if (contactPresent === 'false') {
-      values.push('contact absent');
-    }
-    const counts = contactCountText(details);
-    if (counts) {
-      values.push(counts);
-    }
-
-    // Metric fields are valid only for a configured metric mode while the
-    // pair is reported colliding. In particular, never turn stray binary or
-    // absent-pair fields into an operator-facing penetration claim.
-    const metricIsApplicable =
-      mode !== 'binary_contact' && contactPresent !== 'false';
-    const penetration = metricIsApplicable
-      ? numberField(details, 'penetration_depth_m')
-      : null;
-    if (mode === 'bounded_penetration') {
-      const maximum = numberField(details, 'max_contact_penetration_m');
-      const withinBound = stringField(details, 'within_penetration_bound');
-      if (penetration !== null && maximum !== null && withinBound === 'false') {
-        values.push(
-          `penetration ${formatMeters(penetration)} > max ${formatMeters(maximum)}`,
-        );
-      } else {
-        if (penetration !== null) {
-          values.push(`penetration ${formatMeters(penetration)}`);
-        }
-        if (maximum !== null) {
-          values.push(`max ${formatMeters(maximum)}`);
-        }
-      }
-    } else if (mode === 'signed_penetration') {
-      const maximum = numberField(details, 'max_penetration_m');
-      if (penetration !== null) {
-        values.push(`penetration ${formatMeters(penetration)}`);
-      }
-      if (maximum !== null) {
-        values.push(`max ${formatMeters(maximum)}`);
-      }
-    }
-
-    const distance = distanceEvidenceText(details, mode);
-    if (distance) {
-      values.push(distance);
-    }
-    return { mode, text: values.join('; ') };
-  }
-
-  // General validation records emitted before the mode-aware details were
-  // attached can still carry these signed-release raw diagnostics. Keep this
-  // fallback narrow: it must not infer binary or bounded metric evidence.
-  const current = numberField(details, 'collision_result_raw_contact_release_current_penetration_m');
-  const initial = numberField(details, 'collision_result_raw_contact_release_initial_penetration_m');
-  const maxStart = numberField(details, 'collision_result_raw_contact_release_max_start_penetration_m');
-  const enforce = stringField(details, 'collision_result_raw_contact_release_enforce_max_start_penetration');
-  const values: string[] = [];
-  if (current !== null) {
-    values.push(`current ${formatMeters(current)}`);
-  } else if (initial !== null) {
-    values.push(`initial ${formatMeters(initial)}`);
-  }
-  if (maxStart !== null) {
-    values.push(`max ${formatMeters(maxStart)}`);
-  }
-  if (enforce === 'false') {
-    values.push('start cap disabled');
-  }
-  return values.length > 0
-    ? { mode: 'legacy_signed', text: values.join(', ') }
-    : null;
+function detailRows(details: Record<string, unknown> | null | undefined) {
+  return Object.entries(details ?? {}).map(([key, value]) => ({
+    key,
+    value: typeof value === 'string' ? value : JSON.stringify(value),
+  }));
 }
 
-function supportContactPolicyText(
-  details: Record<string, unknown> | null | undefined,
-): string {
-  return supportContactPolicyPresentation(details)?.text ?? '';
-}
-
-function supportContactPolicyHint(
-  details: Record<string, unknown> | null | undefined,
-): string {
-  const presentation = supportContactPolicyPresentation(details);
-  if (!presentation) {
-    return '';
-  }
-  if (presentation.mode === 'binary_contact') {
-    return `The trajectory failed support-contact validation (${presentation.text}). Lightweight mode uses contact-pair identity and set transitions only; it does not measure penetration. Inspect the new, re-contacting, or final contact pair, then adjust the release policy or re-plan.`;
-  }
-  if (presentation.mode === 'bounded_penetration') {
-    return `The trajectory failed support-contact validation (${presentation.text}). Contact-tolerant mode permits the configured contact only while its measured geometric penetration remains within the authored maximum. Inspect the pair and threshold, then adjust the contact envelope or re-plan.`;
-  }
-  if (presentation.mode === 'signed_penetration') {
-    return `The trajectory failed support-contact validation (${presentation.text}). Precise mode measures signed penetration only while the configured pair is colliding. Inspect the depth/progress evidence, then adjust the release policy or re-plan.`;
-  }
-  return `The trajectory failed support-contact validation with ${presentation.text}. Verify the active Support contacts row in Scene, adjust the contact policy or re-plan from a less penetrating pose, then retry.`;
-}
-
-function mappingForError(
-  errorCode: string | null | undefined,
-  errorDetails: Record<string, unknown> | null | undefined,
-): HeadlineMapping | undefined {
-  const reasonCode =
-    stringField(errorDetails, 'reason_code') || stringField(errorDetails, 'reason');
-  if (
-    reasonCode
-    && ERROR_CODE_MAPPING[reasonCode]
-    && (!errorCode || GENERIC_BACKEND_ERROR_CODES.has(errorCode))
-  ) {
-    return ERROR_CODE_MAPPING[reasonCode];
-  }
-  if (errorCode && ERROR_CODE_MAPPING[errorCode]) {
-    return ERROR_CODE_MAPPING[errorCode];
-  }
-  return reasonCode ? ERROR_CODE_MAPPING[reasonCode] : undefined;
+interface KernelErrorPanelProps {
+  error: KernelErrorView;
+  presentation?: KernelErrorPresentation;
+  presentationKey?: string;
+  onDismiss?: () => void;
+  eyebrow?: string;
 }
 
 /**
- * Resolve an (errorCode, errorDetails, fallbackMessage) tuple to the
- * operator-facing headline. Exported so the mapping can be unit-tested.
+ * Retained diagnostic presentation shell. I8 owns the exact Kernel projection,
+ * code taxonomy, Stop-chain interpretation, and remediation text; this client
+ * does not preserve the deleted browser-side error-policy table.
  */
-export function headlineForError(
-  errorCode: string | null | undefined,
-  errorDetails: Record<string, unknown> | null | undefined,
-  fallbackMessage: string,
-): string {
-  const mapping = mappingForError(errorCode, errorDetails);
-  if (!mapping) {
-    return fallbackMessage;
-  }
-  return mapping.headline(errorDetails ?? null);
-}
-
-export function hintForError(
-  errorCode: string | null | undefined,
-  errorDetails: Record<string, unknown> | null | undefined,
-): string | undefined {
-  const mapping = mappingForError(errorCode, errorDetails);
-  const hint = mapping?.hint;
-  if (!hint) {
-    return undefined;
-  }
-  return typeof hint === 'function' ? hint(errorDetails ?? null) : hint;
-}
-
-const ERROR_PRESENTATION_IDENTITY_KEYS = [
-  'runtime_fault_id',
-  'latch_id',
-  'execution_id',
-  'action_span_id',
-  'node_attempt_id',
-] as const;
-
-/** Keep one incident collapsed/minimized across incremental diagnostic updates. */
-export function errorPresentationKey(
-  message: string,
-  errorCode: string | null | undefined,
-  errorDetails: Record<string, unknown> | null | undefined,
-): string {
-  const identities = ERROR_PRESENTATION_IDENTITY_KEYS.flatMap((key) => {
-    const value = errorDetails?.[key];
-    return value === null || value === undefined || value === ''
-      ? []
-      : [`${key}=${String(value)}`];
-  });
-  if (identities.length > 0) {
-    return `${errorCode ?? ''}|${identities.join('|')}`;
-  }
-  return `${errorCode ?? ''}|${message}|${JSON.stringify(errorDetails ?? null)}`;
-}
-
-function severityClasses(severity: HeadlineMapping['severity']): {
-  border: string;
-  chipBg: string;
-  chipText: string;
-} {
-  switch (severity) {
-    case 'fault':
-      return { border: 'border-red-700 bg-red-950/50', chipBg: 'bg-red-800', chipText: 'text-red-100' };
-    case 'config':
-      return { border: 'border-yellow-700 bg-yellow-950/50', chipBg: 'bg-yellow-800', chipText: 'text-yellow-100' };
-    case 'state':
-      return { border: 'border-amber-700 bg-amber-950/50', chipBg: 'bg-amber-800', chipText: 'text-amber-100' };
-    default:
-      return { border: 'border-red-700 bg-red-950/50', chipBg: 'bg-gray-700', chipText: 'text-gray-100' };
-  }
-}
-
-const STOP_CHAIN_KEYS = [
-  'requested_stop_mode',
-  'executed_stop_mode',
-  'configured_stop_mode',
-  'fallback_pair',
-  'fallback_reason',
-  'hard_stop_floor',
-  'hard_stop_level',
-  'hard_stop_floor_command_source',
-  'command_source',
-  'stop_command_source',
-  'phase',
-  'reason_code',
-  'reason',
-  'controlled_stop_error_reason',
-  'wait_s',
-  'max_stop_time_s',
-  'stop_completion_timeout_s',
-  'deceleration_time_s',
-];
-
-const INCIDENT_DETAIL_KEYS = [
-  'action_span_id',
-  'node_instance_id',
-  'node_attempt_id',
-  'parent_node_attempt_id',
-  'move_id',
-  'contact_policy_id',
-  'requested_stop_mode',
-  'executed_stop_mode',
-  'fallback_pair',
-  'fallback_reason',
-  'hard_stop_floor',
-  'hard_stop_level',
-  'hard_stop_floor_command_source',
-  'controlled_stop_error_reason',
-  'reason_code',
-  'reason',
-  'phase',
-  'command_source',
-  'stop_command_source',
-  'emergency_fallback',
-  'hard_stop_transitioned',
-];
-
-function hasStopChain(details: Record<string, unknown> | null | undefined): boolean {
-  if (!details) {
-    return false;
-  }
-  return STOP_CHAIN_KEYS.some((key) => details[key] !== undefined && details[key] !== null);
-}
-
-function stopChainRows(details: Record<string, unknown>): Array<[string, string]> {
-  const requested =
-    stringField(details, 'requested_stop_mode') ||
-    stringField(details, 'configured_stop_mode');
-  const executed = stringField(details, 'executed_stop_mode');
-  const fallbackPair = stringField(details, 'fallback_pair');
-  const fallbackReason = stringField(details, 'fallback_reason');
-  const command =
-    stringField(details, 'stop_command_source') ||
-    stringField(details, 'command_source') ||
-    stringField(details, 'surface');
-  const hardStopFloor = stringField(details, 'hard_stop_floor');
-  const hardStopLevel = stringField(details, 'hard_stop_level');
-  const hardStopCommand =
-    stringField(details, 'hard_stop_floor_command_source');
-  const phase = stringField(details, 'phase');
-  const reason =
-    stringField(details, 'controlled_stop_error_reason') ||
-    stringField(details, 'reason_code') ||
-    stringField(details, 'reason');
-  const timing = [
-    stringField(details, 'deceleration_time_s')
-      ? `decel ${stringField(details, 'deceleration_time_s')}s`
-      : '',
-    stringField(details, 'wait_s') ? `wait ${stringField(details, 'wait_s')}s` : '',
-    stringField(details, 'max_stop_time_s')
-      ? `max ${stringField(details, 'max_stop_time_s')}s`
-      : '',
-    stringField(details, 'stop_completion_timeout_s')
-      ? `completion/cancel tolerance ${stringField(details, 'stop_completion_timeout_s')}s`
-      : '',
-  ].filter(Boolean).join(', ');
-
-  const rows: Array<[string, string]> = [];
-  if (requested) {
-    rows.push(['Requested', requested]);
-  }
-  if (executed) {
-    rows.push(['Executed', executed]);
-  }
-  if (fallbackPair || fallbackReason) {
-    rows.push(['Fallback', [fallbackPair, fallbackReason].filter(Boolean).join(' — ')]);
-  }
-  if (hardStopFloor || hardStopLevel || hardStopCommand) {
-    rows.push([
-      'Hard stop floor',
-      [hardStopFloor, hardStopLevel, hardStopCommand].filter(Boolean).join(' — '),
-    ]);
-  }
-  if (command) {
-    rows.push(['Backend action', command]);
-  }
-  if (phase) {
-    rows.push(['Phase', phase]);
-  }
-  if (reason) {
-    rows.push(['Reason', reason]);
-  }
-  if (timing) {
-    rows.push(['Timing', timing]);
-  }
-  return rows;
-}
-
-function StopChainSummary({
-  details,
-}: {
-  details: Record<string, unknown>;
-}) {
-  const rows = stopChainRows(details);
-  if (rows.length === 0) {
-    return null;
-  }
-  return (
-    <details className="mt-2 rounded border border-red-800/70 bg-black/25 p-2 text-xs text-red-100/90">
-      <summary className="cursor-pointer font-semibold text-red-100">Stop chain</summary>
-      <div className="grid gap-1 sm:grid-cols-[7rem_1fr]">
-        {rows.map(([label, value]) => (
-          <div key={label} className="contents">
-            <span className="text-red-300/80">{label}</span>
-            <span className="break-words font-mono">{value}</span>
-          </div>
-        ))}
-      </div>
-    </details>
-  );
-}
-
-function objectField(
-  details: Record<string, unknown> | null | undefined,
-  key: string,
-): Record<string, unknown> | null {
-  if (!details) {
-    return null;
-  }
-  const value = details[key];
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
-function objectArrayField(
-  details: Record<string, unknown> | null | undefined,
-  key: string,
-): Array<Record<string, unknown>> {
-  if (!details) {
-    return [];
-  }
-  const value = details[key];
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.filter(
-    (item): item is Record<string, unknown> =>
-      item !== null && typeof item === 'object' && !Array.isArray(item),
-  );
-}
-
-function incidentEventDetails(event: Record<string, unknown>): string {
-  const details = objectField(event, 'details');
-  if (!details) {
-    return '';
-  }
-  return INCIDENT_DETAIL_KEYS
-    .map((key) => {
-      const value = details[key];
-      if (value === undefined || value === null || value === '') {
-        return '';
-      }
-      return `${key}=${String(value)}`;
-    })
-    .filter(Boolean)
-    .join('  ');
-}
-
-function stageReportSummaries(event: Record<string, unknown>): string[] {
-  const details = objectField(event, 'details');
-  if (!details) {
-    return [];
-  }
-  const reports = objectArrayField(details, 'candidate_stage_reports');
-  const single = objectField(details, 'candidate_stage_report');
-  const selectedReports = reports.length > 0 ? reports : single ? [single] : [];
-  return selectedReports.slice(-3).map((report) => {
-    const candidateValue =
-      report.candidate_index ??
-      report.candidate_id ??
-      report.candidate;
-    const candidate =
-      candidateValue !== undefined && candidateValue !== null
-        ? String(candidateValue)
-        : '';
-    const fallbackCandidate =
-      stringField(report, 'candidate_index') ||
-      stringField(report, 'candidate_id') ||
-      stringField(report, 'candidate');
-    const stages = objectArrayField(report, 'stages');
-    const failures = stages
-      .filter((stage) => stringField(stage, 'status') === 'failure')
-      .map((stage) => {
-        const stageName = stringField(stage, 'stage') || 'stage';
-        const failuresList = objectArrayField(stage, 'failures');
-        const firstFailure = failuresList[0] ?? null;
-        const cause =
-          stringField(firstFailure, 'cause') ||
-          stringField(stage, 'cause') ||
-          stringField(stage, 'collision_check') ||
-          'failed';
-        return `${stageName}:${cause}`;
-      });
-    const prefix = candidate || fallbackCandidate
-      ? `candidate ${candidate || fallbackCandidate}`
-      : 'candidate';
-    return failures.length > 0
-      ? `${prefix} ${failures.join(', ')}`
-      : `${prefix} stage report`;
-  });
-}
-
-export function incidentEventSummary(event: Record<string, unknown>): string {
-  const type = stringField(event, 'type') || stringField(event, 'event') || 'event';
-  const message = stringField(event, 'message');
-  const details = incidentEventDetails(event);
-  const stageReports = stageReportSummaries(event);
-  const stageText = stageReports.length > 0 ? `stages: ${stageReports.join(' ; ')}` : '';
-  return [type, message, details, stageText].filter(Boolean).join(' | ');
-}
-
-function IncidentSnapshotSummary({
-  snapshot,
-}: {
-  snapshot: Record<string, unknown> | null | undefined;
-}) {
-  if (!snapshot) {
-    return null;
-  }
-  const allEvents = objectArrayField(snapshot, 'allEvents');
-  const spanEvents = objectArrayField(snapshot, 'spanEvents');
-  const eventsByChannel = objectField(snapshot, 'eventsByChannel');
-  const faultEvents = objectArrayField(eventsByChannel, 'fault_safety_stop');
-  const spanScope = objectField(snapshot, 'spanScope');
-  const headlineCause = objectField(snapshot, 'headlineCause');
-  const headlineSummary = stringField(headlineCause, 'summary');
-  const scopeLabel =
-    stringField(spanScope, 'label') ||
-    'Span-local chain scoped by strongest available identity';
-  const timeline = allEvents.slice(-16);
-  const triggerType = stringField(snapshot, 'triggerType');
-  const triggerChannel = stringField(snapshot, 'triggerChannel');
-  const triggerSeverity = stringField(snapshot, 'triggerSeverity');
-  if (timeline.length === 0 && faultEvents.length === 0 && spanEvents.length === 0) {
-    return null;
-  }
-  return (
-    <details className="mt-2 rounded border border-red-800/70 bg-black/25 p-2 text-xs text-red-100/90">
-      <summary className="cursor-pointer font-semibold text-red-100">
-        Captured incident chain
-        {triggerType ? `: ${triggerType}` : ''}
-        {triggerChannel ? ` (${triggerChannel}${triggerSeverity ? `, ${triggerSeverity}` : ''})` : ''}
-      </summary>
-      {headlineSummary && (
-        <div className="mt-2 rounded border border-red-900/70 bg-red-950/30 p-2">
-          <div className="text-red-300/80">Headline cause</div>
-          <div className="break-words font-mono">{headlineSummary}</div>
-        </div>
-      )}
-      {spanEvents.length > 0 && (
-        <div className="mt-2">
-          <div className="mb-1 text-red-300/80">{scopeLabel}</div>
-          <ol className="space-y-1">
-            {spanEvents.slice(-14).map((event, index) => (
-              <li
-                key={`${stringField(event, 'event_index') || stringField(event, 'sequence') || index}`}
-                className="break-words font-mono"
-              >
-                {incidentEventSummary(event)}
-              </li>
-            ))}
-          </ol>
-        </div>
-      )}
-      {faultEvents.length > 0 && (
-        <div className="mt-2">
-          <div className="mb-1 text-red-300/80">Stop/fault context channel</div>
-          <ol className="space-y-1">
-            {faultEvents.slice(-12).map((event, index) => (
-              <li
-                key={`${stringField(event, 'event_index') || stringField(event, 'sequence') || index}`}
-                className="break-words font-mono"
-              >
-                {incidentEventSummary(event)}
-              </li>
-            ))}
-          </ol>
-        </div>
-      )}
-      {timeline.length > 0 && (
-        <div className="mt-2">
-          <div className="mb-1 text-red-300/80">All-events context window</div>
-          <ol className="space-y-1">
-            {timeline.map((event, index) => (
-              <li
-                key={`${stringField(event, 'event_index') || stringField(event, 'sequence') || index}`}
-                className="break-words font-mono"
-              >
-                {incidentEventSummary(event)}
-              </li>
-            ))}
-          </ol>
-        </div>
-      )}
-    </details>
-  );
-}
-
 export function KernelErrorPanel({
-  message,
-  errorCode,
-  errorDetails,
-  incidentSnapshot,
+  error,
+  presentation,
   presentationKey,
-  headlineOverride,
-  hintOverride,
-  onAcknowledge,
-  acknowledgeLabel = 'Acknowledge alert',
-  acknowledgeTitle = 'Acknowledge this notification. Runtime fault and recovery authority are unchanged.',
-  onMinimize,
+  onDismiss,
+  eyebrow = 'Kernel diagnostic',
 }: KernelErrorPanelProps) {
-  const [expanded, setExpanded] = useState(false);
-  const bodyId = useId();
-  useEffect(() => {
-    setExpanded(false);
-  }, [presentationKey]);
-  const mapping = mappingForError(errorCode, errorDetails);
-  const severity = mapping?.severity ?? 'unknown';
-  const classes = severityClasses(severity);
-  const headline = headlineOverride ?? (mapping
-    ? mapping.headline(errorDetails ?? null)
-    : message);
-  const hint = hintOverride ?? hintForError(errorCode, errorDetails);
-  const subline =
-    headline !== message ? message : undefined;
-  const detailEntries = errorDetails
-    ? Object.entries(errorDetails).filter(([, v]) => v !== null && v !== undefined)
-    : [];
-  const showStopChain = hasStopChain(errorDetails);
+  const rows = detailRows(error.details);
+  const headline = presentation?.headline || readableErrorCode(error.code);
+  const hint = presentation === undefined ? error.message : presentation.hint;
+  const severity = presentation?.severity ?? 'error';
   return (
-    <div
+    <section
+      className={`kernel-error-panel severity-${severity}`}
       role="alert"
-      className={`pointer-events-auto max-h-[70vh] overflow-hidden rounded border text-sm text-red-200 shadow-xl shadow-black/60 backdrop-blur-sm ${classes.border}`}
+      data-presentation-key={presentationKey ?? errorPresentationKey(error)}
     >
-      <div className="flex min-h-10 items-center gap-2 px-3 py-2">
-        <button
-          type="button"
-          aria-expanded={expanded}
-          aria-controls={bodyId}
-          aria-label={expanded ? 'Collapse error details' : 'Expand error details'}
-          onClick={() => setExpanded((value) => !value)}
-          className="flex min-w-0 flex-1 items-center gap-2 text-left text-red-100 hover:text-white"
-        >
-          <svg
-            viewBox="0 0 16 16"
-            className={`h-3.5 w-3.5 shrink-0 fill-none stroke-current transition-transform ${expanded ? 'rotate-90' : ''}`}
-            strokeWidth="1.8"
-            aria-hidden
-          >
-            <path d="m6 3 5 5-5 5" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-          <span className="truncate font-semibold" title={headline}>{headline}</span>
-        </button>
-        {onAcknowledge && (
-          <button
-            type="button"
-            onClick={onAcknowledge}
-            className="shrink-0 rounded border border-red-400/50 bg-black/25 px-2 py-1 text-xs font-medium text-red-100 hover:bg-red-900/50"
-            title={acknowledgeTitle}
-          >
-            {acknowledgeLabel}
-          </button>
-        )}
-        {onMinimize && (
-          <button
-            type="button"
-            onClick={onMinimize}
-            className="shrink-0 rounded p-1 text-red-200/80 hover:bg-red-900/50 hover:text-red-100"
-            aria-label="Minimize error to header icon"
-            title="Minimize to header icon"
-          >
-            <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.6" aria-hidden>
-              <path d="M3 8h10" strokeLinecap="round" />
-            </svg>
-          </button>
-        )}
-      </div>
-      {expanded && (
-        <div id={bodyId} className="max-h-[calc(70vh-2.75rem)] overflow-y-auto border-t border-red-300/20 px-3 py-2">
-          {subline && (
-            <div className="mt-0.5 break-words text-xs text-red-300/90">{subline}</div>
-          )}
-          <div className="mt-1 flex flex-wrap items-center gap-1.5">
-            {errorCode && (
-              <span
-                className={`rounded px-1.5 py-0.5 text-xs font-mono ${classes.chipBg} ${classes.chipText}`}
-                title="kernel error code"
-              >
-                {errorCode}
-              </span>
-            )}
-            {hint && (
-              <span className="text-xs text-red-200/90">{hint}</span>
-            )}
-          </div>
-          {showStopChain && errorDetails && (
-            <StopChainSummary details={errorDetails} />
-          )}
-          <IncidentSnapshotSummary snapshot={incidentSnapshot} />
-          {detailEntries.length > 0 && (
-            <details className="mt-2 rounded border border-red-800/70 bg-black/25 p-2 text-xs text-red-100/90">
-              <summary className="cursor-pointer font-semibold text-red-100">
-                Diagnostic details ({detailEntries.length})
-              </summary>
-              <div className="mt-2 max-h-48 overflow-auto rounded bg-black/40 p-2 font-mono text-[11px] text-red-100/90">
-                {detailEntries.map(([k, v]) => (
-                  <div key={k} className="flex gap-2">
-                    <span className="text-red-300/80">{k}:</span>
-                    <span className="break-all">{String(v)}</span>
-                  </div>
-                ))}
-              </div>
-            </details>
-          )}
+      <header>
+        <div>
+          <p className="eyebrow">{eyebrow}</p>
+          <h2>{headline}</h2>
+          {presentation?.status && <p className="kernel-error-status">{presentation.status}</p>}
         </div>
-      )}
-    </div>
+        {onDismiss && (
+          <button type="button" onClick={onDismiss}>Dismiss</button>
+        )}
+      </header>
+      {hint && <p>{hint}</p>}
+      <details className="kernel-error-technical">
+        <summary>Technical details</summary>
+        <code>{error.code || 'unclassified'}</code>
+        {rows.length > 0 && (
+          <dl>
+            {rows.map((row) => (
+              <div key={row.key}>
+                <dt>{row.key.replaceAll('_', ' ')}</dt>
+                <dd>{row.value}</dd>
+              </div>
+            ))}
+          </dl>
+        )}
+      </details>
+    </section>
   );
 }

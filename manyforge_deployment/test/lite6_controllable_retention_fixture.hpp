@@ -1,0 +1,3263 @@
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <functional>
+#include <manyforge_deployment/capability_definition_codec.hpp>
+#include <manyforge_deployment/cell_graph_codec.hpp>
+#include <manyforge_deployment/command_schema_codec.hpp>
+#include <manyforge_deployment/component_type_codec.hpp>
+#include <manyforge_deployment/control_interface_contract_codec.hpp>
+#include <manyforge_deployment/controller_topology_codec.hpp>
+#include <manyforge_deployment/provider_manifest_codec.hpp>
+#include <manyforge_deployment/runtime_profile_codec.hpp>
+#include <manyforge_deployment/site_overlay_resolution.hpp>
+#include <manyforge_deployment/stop_evidence_policy_codec.hpp>
+#include <map>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "lite6_structural_retention_fixture.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
+
+namespace manyforge::deployment::test {
+
+/// Any non-empty `lifecycle_semantic_digest` argument makes the fixture's
+/// providers offer the component lifecycle capabilities.
+inline constexpr std::string_view kWithLifecycleOffers = "lifecycle";
+
+inline constexpr std::string_view kLite6ControllableComponentId = "lite6_arm";
+inline constexpr std::string_view kLite6ControllableModelInstanceId =
+    "lite6_fixture_instance";
+inline constexpr std::string_view kLite6ArmTargetId = "arm";
+inline constexpr std::string_view kLite6ArmBindingId = "lite6_arm_binding";
+inline constexpr std::string_view kLite6ArmDomainId = "lite6_arm_domain";
+inline constexpr std::string_view kLite6GripperTargetId = "gripper";
+inline constexpr std::string_view kLite6GripperBindingId =
+    "lite6_gripper_binding";
+inline constexpr std::string_view kLite6GripperDomainId =
+    "lite6_gripper_domain";
+inline constexpr std::string_view kLite6Ros2ControlExecutionRuntimeId =
+    "lite6_ros2_control_execution";
+
+struct Lite6ControllableRetentionFixture final {
+  Lite6StructuralRetentionFixture structural;
+  QualifiedCapabilityDefinition capability;
+  QualifiedComponentType component_type;
+  QualifiedControlInterfaceContract control_contract;
+  QualifiedControllerTopology topology;
+  QualifiedProviderManifest provider_manifest;
+  QualifiedStopEvidencePolicy stop_policy;
+  std::vector<Lite6InputArtifact> control_catalog_artifacts;
+  RetentionQualifiedDeployment qualified;
+  std::optional<QualifiedCapabilityDefinition> gripper_capability;
+  std::optional<QualifiedCommandSchema> gripper_command_schema;
+  std::optional<QualifiedControlInterfaceContract> gripper_control_contract;
+  std::optional<QualifiedControllerTopology> gripper_topology;
+  std::optional<QualifiedProviderManifest> gripper_provider_manifest;
+  std::vector<QualifiedCapabilityDefinition> planner_capabilities;
+  std::optional<QualifiedProviderManifest> planner_provider_manifest;
+  std::optional<QualifiedRuntimeProfile> ros2_control_execution_runtime_profile;
+
+  [[nodiscard]] std::span<const BuildQualifiedStructuralModelPreparation>
+  structural_preparations() const noexcept {
+    if (qualified.deployment().graph().graph().model_instances.empty())
+      return {};
+    return structural.structural_preparations();
+  }
+};
+
+namespace lite6_controllable_fixture_detail {
+
+inline constexpr std::string_view kZeroDigest =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+inline constexpr std::string_view kEmptyProviderContractSchemaRevision =
+    "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270";
+
+[[nodiscard]] inline CanonicalValue
+text_array(std::initializer_list<std::string_view> values) {
+  CanonicalValue::Array result;
+  result.reserve(values.size());
+  for (const auto value : values) {
+    result.emplace_back(std::string(value));
+  }
+  return CanonicalValue(std::move(result));
+}
+
+// Native defaults keep Observe/Prepare/Enable/Disable. The ROS product fixture
+// explicitly includes its real Recover plan in both records and offers.
+inline std::vector<std::string_view>
+lifecycle_capability_ids(bool include_recover = false) {
+  std::vector<std::string_view> ids{
+      "component.lifecycle.disable", "component.lifecycle.enable",
+      "component.lifecycle.observe", "component.lifecycle.prepare"};
+  if (include_recover)
+    ids.push_back("component.lifecycle.recover");
+  return ids;
+}
+
+inline void append_lifecycle_capability_offers(CanonicalValue::Array &offers,
+                                              bool include_recover = false) {
+  for (const auto capability_id : lifecycle_capability_ids(include_recover)) {
+    const auto *definition =
+        core::find_builtin_capability_definition(capability_id);
+    if (definition == nullptr) {
+      throw std::logic_error(
+          "Lite6 fixture requires built-in lifecycle capabilities");
+    }
+    offers.emplace_back(CanonicalValue::Object{
+        {"capability_id", CanonicalValue(std::string(capability_id))},
+        {"capability_definition_revision",
+         CanonicalValue(
+             std::string(definition->capability_definition_revision))},
+        {"required_endpoint_role_ids", CanonicalValue(CanonicalValue::Array{})},
+    });
+  }
+}
+
+inline void sort_capability_offers(CanonicalValue::Array &offers) {
+  std::sort(offers.begin(), offers.end(),
+            [](const auto &left, const auto &right) {
+              return left.find_object_member("capability_id")->as_string() <
+                     right.find_object_member("capability_id")->as_string();
+            });
+}
+
+[[nodiscard]] inline const std::string &
+provider_contract_role_id(const CanonicalValue &declaration) {
+  const auto *reference =
+      declaration.find_object_member("provider_contract_ref");
+  const auto *role =
+      reference == nullptr
+          ? nullptr
+          : reference->find_object_member("provider_contract_role_id");
+  if (role == nullptr ||
+      !std::holds_alternative<std::string>(role->storage())) {
+    throw std::logic_error(
+        "provider-contract fixture declaration has no role identity");
+  }
+  return std::get<std::string>(role->storage());
+}
+
+[[nodiscard]] inline CanonicalValue software_hard_provider_contract_ref() {
+  return CanonicalValue(CanonicalValue::Object{
+      {"provider_contract_role_id", CanonicalValue("software_hard_stop")},
+      {"contract_schema_id",
+       CanonicalValue("manyforge.value_schema.provider_contract.empty.v1")},
+      {"contract_schema_revision",
+       CanonicalValue(
+           "sha256:"
+           "fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270")},
+  });
+}
+
+/// The Lite6 arm target's `flange` frame role, a TCP as on the maintained
+/// Lite6 types (C-P3).
+[[nodiscard]] inline CanonicalValue lite6_arm_flange_frame() {
+  return CanonicalValue(CanonicalValue::Object{
+      {"frame_role_id", CanonicalValue("flange")},
+      {"model_role_id", CanonicalValue("arm_model")},
+      {"asset_frame_role_id", CanonicalValue("flange")},
+      {"tcp", CanonicalValue(true)},
+  });
+}
+
+[[nodiscard]] inline CanonicalValue gripper_target_configuration(
+    std::string_view controllable_component_id) {
+  CanonicalValue::Object gripper_configuration{
+        {"actuation_kind", CanonicalValue("pneumatic")},
+        {"attach_frame", CanonicalValue("link_tcp")},
+        {"auxiliary_frames", CanonicalValue(CanonicalValue::Array{
+                                 CanonicalValue("lite_gripper_base_link")})},
+        {"closed_state_ref", CanonicalValue("closed")},
+        {"command_duration_s", CanonicalValue(0.8)},
+        {"command_target_id",
+         CanonicalValue(std::string(kLite6GripperTargetId))},
+        {"controllable_component_id",
+         CanonicalValue(std::string(controllable_component_id))},
+        {"description",
+         CanonicalValue("ROS mock UFACTORY lite pneumatic gripper.")},
+        {"mount_frame", CanonicalValue("link_eef")},
+        {"open_state_ref", CanonicalValue("open")},
+        {"tcp_frame", CanonicalValue("link_tcp")},
+        {"touch_links", CanonicalValue(CanonicalValue::Array{
+                            CanonicalValue("lite_gripper_base_link"),
+                            CanonicalValue("lite_gripper_left_finger"),
+                            CanonicalValue("lite_gripper_right_finger")})},
+    };
+  gripper_configuration.emplace_back("output_mode", CanonicalValue("commanded"));
+  return CanonicalValue(std::move(gripper_configuration));
+}
+
+/// CP9 stream defaults of one ROS component: the Isaac arm's measured joints
+/// (or a gripper-only component's, at the gripper feedback budget) and, with a
+/// gripper target, its gripper feedback.
+[[nodiscard]] inline CanonicalValue component_stream_rows(
+    std::string_view component_id, bool include_gripper, bool motion) {
+  const auto row = [&](std::string_view stream, double budget_ns) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"budget_ns", CanonicalValue(budget_ns)},
+        {"controllable_component_id", CanonicalValue(std::string(component_id))},
+        {"stream_id", CanonicalValue(std::string(stream))},
+    });
+  };
+  CanonicalValue::Array rows;
+  rows.reserve(2U);
+  if (include_gripper)
+    rows.push_back(row("gripper_feedback", 1e9));
+  rows.push_back(row("measured_joints", motion ? 2.5e8 : 1e9));
+  return CanonicalValue(std::move(rows));
+}
+
+// The fixture model's URDF: the description its controller profile carries.
+[[nodiscard]] inline std::string
+fixture_model_urdf(const Lite6StructuralRetentionFixture &structural) {
+  for (const auto &artifact : structural.source_artifacts)
+    if (artifact.logical_uri.ends_with("/model.urdf")) return artifact.bytes;
+  throw std::logic_error("Lite6 fixture has no model URDF");
+}
+
+[[nodiscard]] inline CanonicalValue ros2_control_execution_configuration(
+    std::string_view description,
+    std::string_view motion_limit_target_id = kLite6ArmTargetId,
+    const std::optional<CanonicalValue> &default_fault_stop_profiles =
+        std::nullopt, std::string_view component_id = kLite6ControllableComponentId,
+    std::string_view frame_prefix = {},
+    std::optional<double> initial_joint1_position_rad = std::nullopt,
+    bool include_gripper = false, bool motion = true) {
+  // N17: an arm's row carries its joints and operator Stop decelerations
+  // (Q48, the fixture's Stop row values), a tool's its gripper joint, and
+  // both their launched description.
+  CanonicalValue::Object profile{
+      {"controllable_component_id", CanonicalValue(std::string(component_id))},
+      {"frame_prefix", CanonicalValue(std::string(frame_prefix))},
+      {"lane", CanonicalValue("isaac")},
+      {"lane_row", CanonicalValue(R"({"adapter":"isaac"})")},
+      {"model_family_id", CanonicalValue("lite6")},
+      {"description", CanonicalValue(std::string(description))},
+  };
+  if (motion) {
+    CanonicalValue::Array joints;
+    CanonicalValue::Array cancel;
+    for (const auto *joint : {"joint1", "joint2", "joint3", "joint4", "joint5", "joint6"}) {
+      joints.emplace_back(CanonicalValue(joint));
+      cancel.emplace_back(CanonicalValue::Object{
+          {"max_deceleration_rad_s2", CanonicalValue(4.0)},
+          {"source_joint_name", CanonicalValue(joint)},
+      });
+    }
+    profile.emplace_back("joint_names", CanonicalValue(std::move(joints)));
+    profile.emplace_back("max_deceleration_on_cancel_rad_s2", CanonicalValue(std::move(cancel)));
+  } else {
+    profile.emplace_back("gripper_joint_name", CanonicalValue("right_finger_joint"));
+  }
+  CanonicalValue::Object configuration{
+      {"controller_profiles",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(std::move(profile))})},
+      {"motion_target_limits",
+       CanonicalValue(
+           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+               {"controllable_component_id",
+                CanonicalValue(std::string(component_id))},
+               {"command_target_id",
+                CanonicalValue(std::string(motion_limit_target_id))},
+               {"maximum_tcp_linear_speed_mps", CanonicalValue(0.15)},
+           })})},
+      {"planner_rng_seed", CanonicalValue(12345.0)},
+      {"initial_joint_positions_rad",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(initial_joint1_position_rad.value_or(0.0)),
+           CanonicalValue(0.0),
+           CanonicalValue(1.57),
+           CanonicalValue(0.0),
+           CanonicalValue(0.0),
+           CanonicalValue(0.0),
+       })},
+      {"execution_tick_hz", CanonicalValue(100.0)},
+      {"collision_monitor_period_ms", CanonicalValue(100.0)},
+      {"runtime_collision_immediate_query_budget_ms", CanonicalValue(75.0)},
+      {"runtime_collision_lookahead_query_budget_ms", CanonicalValue(75.0)},
+      {"runtime_collision_lookahead_cycle_budget_ms", CanonicalValue(350.0)},
+      {"runtime_collision_lookahead_s", CanonicalValue(2.0)},
+      {"runtime_collision_lookahead_max_samples", CanonicalValue(32.0)},
+      {"runtime_collision_lookahead_workers", CanonicalValue(4.0)},
+      {"runtime_dynamic_body_max_age_cap_ms", CanonicalValue(1000.0)},
+      {"validation_collision_workers", CanonicalValue(4.0)},
+  };
+  if (!motion) {
+    for (auto &[name, value] : configuration) {
+      if (name == "initial_joint_positions_rad" ||
+          name == "motion_target_limits") {
+        value = CanonicalValue(CanonicalValue::Array{});
+      }
+    }
+  }
+  if (default_fault_stop_profiles.has_value()) {
+    configuration.emplace_back("default_fault_stop_profiles",
+                               *default_fault_stop_profiles);
+  }
+  if (include_gripper) {
+    configuration.emplace_back(
+        "gripper_target_configurations",
+        CanonicalValue(CanonicalValue::Array{
+            gripper_target_configuration(component_id)}));
+  }
+  configuration.emplace_back(
+      "component_streams",
+      component_stream_rows(component_id, include_gripper, motion));
+  return CanonicalValue(std::move(configuration));
+}
+
+[[nodiscard]] inline CanonicalValue translated_pose(double x_m) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"position_m",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(x_m), CanonicalValue(0.0), CanonicalValue(0.0)})},
+      {"orientation_xyzw", CanonicalValue(CanonicalValue::Array{
+                               CanonicalValue(0.0), CanonicalValue(0.0),
+                               CanonicalValue(0.0), CanonicalValue(1.0)})},
+  });
+}
+
+[[nodiscard]] inline std::string indexed_id(std::string_view base,
+                                            std::size_t index) {
+  return index == 0U ? std::string(base)
+                     : std::string(base) + "_" + std::to_string(index + 1U);
+}
+
+[[nodiscard]] inline std::string
+revisioned_document(CanonicalValue identity, std::string_view identity_domain,
+                    std::string_view api_version,
+                    std::string_view revision_field) {
+  std::string preimage{"manyforge.content-identity.v1"};
+  preimage.push_back('\0');
+  preimage.append(identity_domain);
+  preimage.push_back('\0');
+  preimage.append(api_version);
+  preimage.push_back('\0');
+  preimage.append(canonical_json(identity));
+  auto root = identity.as_object();
+  root.emplace_back(std::string(revision_field),
+                    CanonicalValue(sha256_digest(preimage)));
+  return canonical_json(CanonicalValue(std::move(root)));
+}
+
+[[nodiscard]] inline std::string
+revision_from_document(std::string_view document, std::string_view field) {
+  const auto parsed = parse_strict_json_model_yaml(document);
+  const auto *value = parsed.root().find_object_member(field);
+  const auto *text =
+      value == nullptr ? nullptr : std::get_if<std::string>(&value->storage());
+  if (text == nullptr) {
+    throw std::logic_error(
+        "Lite6 control catalog fixture omitted its revision");
+  }
+  return *text;
+}
+
+[[nodiscard]] inline core::SchemaRevision
+schema_revision_for(core::CatalogRecordKind kind) {
+  const auto *entry =
+      build_qualified_closed_schema_registry().find_catalog_schema_family(kind);
+  if (entry == nullptr ||
+      entry->qualification() != CatalogSchemaQualification::kQualified ||
+      entry->compiled_schema() == nullptr) {
+    throw std::logic_error(
+        "Lite6 control fixture requires a build-qualified catalog schema");
+  }
+  return entry->compiled_schema()->schema_revision();
+}
+
+template <typename Qualified>
+[[nodiscard]] inline Lite6InputArtifact
+catalog_artifact(std::string logical_uri, std::string bytes,
+                 const Qualified &qualified) {
+  const auto &reference = qualified.reference();
+  if (sha256_digest(bytes) != reference.content_digest.value()) {
+    throw std::logic_error(
+        "Lite6 control fixture catalog bytes differ from their reference");
+  }
+  return Lite6InputArtifact{
+      std::move(logical_uri),
+      "application/json",
+      reference.content_addressed_store_key,
+      reference.content_digest,
+      std::move(bytes),
+  };
+}
+
+[[nodiscard]] inline std::string catalog_key(std::string_view kind,
+                                             std::string_view digest) {
+  return "catalog/i3-lite6/" + std::string(kind) + "/" +
+         std::string(digest.substr(std::string_view("sha256:").size()));
+}
+
+struct QualifiedControlCatalog final {
+  QualifiedCapabilityDefinition capability;
+  QualifiedComponentType component_type;
+  QualifiedControlInterfaceContract contract;
+  QualifiedControllerTopology topology;
+  QualifiedProviderManifest provider;
+  QualifiedStopEvidencePolicy stop;
+  std::vector<Lite6InputArtifact> artifacts;
+  std::optional<QualifiedCapabilityDefinition> gripper_capability;
+  std::optional<QualifiedCommandSchema> gripper_command_schema;
+  std::optional<QualifiedControlInterfaceContract> gripper_contract;
+  std::optional<QualifiedControllerTopology> gripper_topology;
+  std::optional<QualifiedProviderManifest> gripper_provider;
+  std::vector<QualifiedCapabilityDefinition> planner_capabilities;
+  std::vector<QualifiedCapabilityDefinition> lifecycle_capabilities;
+  std::optional<QualifiedProviderManifest> planner_provider;
+  std::optional<QualifiedRuntimeProfile> ros2_control_execution_runtime_profile;
+  /// Aggregate arm/tool fixtures retain a goal-cancel policy for the gripper
+  /// when the arm selects the independently qualified controlled-Stop policy.
+  std::optional<QualifiedStopEvidencePolicy> gripper_stop;
+  std::optional<QualifiedCapabilityDefinition> gripper_feedback{};
+  std::optional<QualifiedCapabilityDefinition> observed_state_capability{};
+};
+
+struct AssistantOverlayFixture final {
+  core::SiteOverlayRefDTO reference;
+  std::string bytes;
+};
+
+[[nodiscard]] inline CanonicalValue assistant_external_resource(
+    std::string_view alias, std::string_view resource_kind,
+    std::string_view overlay_ref, const QualifiedProviderManifest &provider) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"endpoint_role_id", CanonicalValue("state")},
+      {"external_resource_alias", CanonicalValue(std::string(alias))},
+      {"provider_instance_id", CanonicalValue("assistant_provider_instance")},
+      {"provider_manifest_id",
+       CanonicalValue(provider.value().provider_manifest_id.value())},
+      {"provider_manifest_revision",
+       CanonicalValue(provider.value().provider_manifest_revision.value())},
+      {"resource_kind", CanonicalValue(std::string(resource_kind))},
+      {"site_overlay_value_ref", CanonicalValue(std::string(overlay_ref))},
+  });
+}
+
+[[nodiscard]] inline AssistantOverlayFixture make_assistant_overlay() {
+  CanonicalValue::Array values{
+      CanonicalValue(CanonicalValue::Object{
+          {"resource_kind", CanonicalValue("service_endpoint")},
+          {"semantic_kind", CanonicalValue("external_resource")},
+          {"site_overlay_value_ref",
+           CanonicalValue("resources.assistant_bridge")},
+          {"value", CanonicalValue(CanonicalValue::Object{
+                        {"value", CanonicalValue("http://assistant.invalid")},
+                        {"value_kind", CanonicalValue("string")},
+                    })},
+      }),
+      CanonicalValue(CanonicalValue::Object{
+          {"resource_kind", CanonicalValue("model_endpoint")},
+          {"semantic_kind", CanonicalValue("external_resource")},
+          {"site_overlay_value_ref",
+           CanonicalValue("resources.assistant_model")},
+          {"value", CanonicalValue(CanonicalValue::Object{
+                        {"value", CanonicalValue("http://model.invalid")},
+                        {"value_kind", CanonicalValue("string")},
+                    })},
+      }),
+  };
+  const std::string bytes = revisioned_document(
+      CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue("manyforge.site_overlay.v1")},
+          {"site_overlay_id", CanonicalValue("i5_assistant_site")},
+          {"values", CanonicalValue(std::move(values))},
+      }),
+      "site-overlay-revision", "manyforge.site_overlay.v1",
+      "site_overlay_revision");
+  return {
+      core::SiteOverlayRefDTO{
+          core::SiteOverlayId("i5_assistant_site"),
+          core::SiteOverlayRevision(
+              revision_from_document(bytes, "site_overlay_revision")),
+          core::ContentDigest(sha256_digest(bytes)),
+      },
+      bytes,
+  };
+}
+
+[[nodiscard]] inline CanonicalValue
+assistant_source(const bool composer_draft_enabled = false) {
+  CanonicalValue::Object modes{
+      {"query",
+       CanonicalValue(CanonicalValue::Object{
+           {"catalog",
+            CanonicalValue(CanonicalValue::Object{
+                {"nodes", CanonicalValue(CanonicalValue::Array{})},
+                {"skills", CanonicalValue(CanonicalValue::Array{})},
+                {"tools", text_array({"inspect_isaac_scene", "scene_inspect",
+                                      "status_read"})},
+            })},
+           {"description", CanonicalValue("Read-only H0 query")},
+           {"enabled", CanonicalValue(true)},
+           {"grant_policy",
+            CanonicalValue(CanonicalValue::Object{
+                {"approval_mode", CanonicalValue(nullptr)},
+                {"review_policy", CanonicalValue("not_required")},
+                {"session_kind", CanonicalValue(nullptr)},
+            })},
+           {"model_endpoint_alias", CanonicalValue("primary_model")},
+           {"provider_alias", CanonicalValue("direct_local")},
+       })},
+  };
+  if (composer_draft_enabled) {
+    modes.emplace_back(
+        "composer-assistant",
+        CanonicalValue(CanonicalValue::Object{
+            {"catalog", CanonicalValue(CanonicalValue::Object{
+                            {"nodes", CanonicalValue(CanonicalValue::Array{})},
+                            {"skills", CanonicalValue(CanonicalValue::Array{})},
+                            {"tools", text_array({"program_read",
+                                                  "scene_draft_add_object"})},
+                        })},
+            {"description", CanonicalValue("Bounded Composer Draft authoring")},
+            {"enabled", CanonicalValue(true)},
+            {"grant_policy", CanonicalValue(CanonicalValue::Object{
+                                 {"approval_mode", CanonicalValue(nullptr)},
+                                 {"review_policy", CanonicalValue("required")},
+                                 {"session_kind", CanonicalValue(nullptr)},
+                             })},
+            {"model_endpoint_alias", CanonicalValue("primary_model")},
+            {"provider_alias", CanonicalValue("direct_local")},
+        }));
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"audit_policy", CanonicalValue(CanonicalValue::Object{
+                           {"redact_argument_values", CanonicalValue(true)},
+                           {"store_full_prompts", CanonicalValue(false)},
+                           {"store_full_responses", CanonicalValue(false)},
+                       })},
+      {"model_endpoint_aliases",
+       CanonicalValue(CanonicalValue::Object{
+           {"primary_model",
+            CanonicalValue(CanonicalValue::Object{
+                {"external_resource_alias", CanonicalValue("assistant_model")},
+                {"model_id", CanonicalValue("i5-test-model")},
+                {"request_contract",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"default_timeout_s", CanonicalValue(30.0)},
+                     {"max_output_tokens", CanonicalValue(512.0)},
+                     {"supported_image_transports",
+                      text_array({"http_url", "inline_data_url"})},
+                     {"supports_image_input", CanonicalValue(true)},
+                     {"supports_json_object", CanonicalValue(true)},
+                     {"supports_response_tools", CanonicalValue(true)},
+                     {"tool_call_family", CanonicalValue("openai_chat_tools")},
+                 })},
+            })},
+       })},
+      {"modes", CanonicalValue(std::move(modes))},
+      {"provider_aliases",
+       CanonicalValue(CanonicalValue::Object{
+           {"direct_local", CanonicalValue(CanonicalValue::Object{
+                                {"bridge_external_resource_alias",
+                                 CanonicalValue("assistant_bridge")},
+                                {"provider_kind", CanonicalValue("direct")},
+                            })},
+       })},
+      {"prompt_templates", CanonicalValue(CanonicalValue::Object{})},
+  });
+}
+
+[[nodiscard]] inline QualifiedControlCatalog qualify_control_catalog(
+    bool chained, bool stoppable = false,
+    std::string_view containment_granularity = "resource",
+    bool qualified_motion_controlled_stop = false,
+    std::string_view lifecycle_semantic_digest = {},
+    std::string_view provider_id = "lite6_arm_provider",
+    bool include_lifecycle_recover = false, bool include_observed_state = false,
+    bool associate_arm_tcp_contact_bodies = false,
+    bool shared_arm_endpoint_bodies = false) {
+  const std::string_view primary_capability_id = "execution.trajectory.execute";
+  const auto *descriptor =
+      core::find_builtin_capability_definition(primary_capability_id);
+  if (descriptor == nullptr) {
+    throw std::logic_error(
+        "Lite6 control fixture requires its primary capability");
+  }
+  CanonicalValue::Object capability_root{
+      {"api_version",
+       CanonicalValue(std::string(core::kCapabilityDefinitionApiVersion))},
+      {"capability_id", CanonicalValue(std::string(primary_capability_id))},
+      {"scope",
+       CanonicalValue(std::string(core::to_string(descriptor->scope)))},
+      {"provider_binding_kind", CanonicalValue(std::string(core::to_string(
+                                    descriptor->provider_binding_kind)))},
+      {"capability_definition_revision",
+       CanonicalValue(std::string(descriptor->capability_definition_revision))},
+  };
+  const std::string capability_bytes =
+      canonical_json(CanonicalValue(std::move(capability_root)));
+  const core::ContentDigest capability_digest(sha256_digest(capability_bytes));
+  const core::ContentAddressedStoreKey capability_key(
+      catalog_key("capability", capability_digest.value()));
+  const core::CapabilityDefinitionCatalogRecordRefDTO capability_ref{
+      core::CapabilityId(std::string(primary_capability_id)),
+      core::CapabilityDefinitionRevision(
+          std::string(descriptor->capability_definition_revision)),
+      core::SchemaId(std::string(core::kCapabilityDefinitionApiVersion)),
+      schema_revision_for(core::CatalogRecordKind::kCapabilityDefinition),
+      capability_digest,
+      capability_key,
+  };
+  auto capability = resolve_and_qualify_capability_definition(
+      capability_ref, capability_key, capability_bytes);
+
+  std::optional<QualifiedCapabilityDefinition> observed_state_capability;
+  std::optional<std::string> observed_state_bytes;
+  if (include_observed_state) {
+    const auto *descriptor =
+        core::find_builtin_capability_definition("state.observed.current");
+    if (descriptor == nullptr) {
+      throw std::logic_error(
+          "Lite6 control fixture requires its primary capability");
+    }
+    CanonicalValue::Object observed_capability_root{
+        {"api_version",
+         CanonicalValue(std::string(core::kCapabilityDefinitionApiVersion))},
+        {"capability_id", CanonicalValue(std::string("state.observed.current"))},
+        {"scope",
+         CanonicalValue(std::string(core::to_string(descriptor->scope)))},
+        {"provider_binding_kind", CanonicalValue(std::string(core::to_string(
+                                      descriptor->provider_binding_kind)))},
+        {"capability_definition_revision",
+         CanonicalValue(std::string(descriptor->capability_definition_revision))},
+    };
+    const std::string observed_capability_bytes =
+        canonical_json(CanonicalValue(std::move(observed_capability_root)));
+    const core::ContentDigest observed_capability_digest(sha256_digest(observed_capability_bytes));
+    const core::ContentAddressedStoreKey observed_capability_key(
+        catalog_key("capability", observed_capability_digest.value()));
+    const core::CapabilityDefinitionCatalogRecordRefDTO observed_capability_ref{
+        core::CapabilityId(std::string("state.observed.current")),
+        core::CapabilityDefinitionRevision(
+            std::string(descriptor->capability_definition_revision)),
+        core::SchemaId(std::string(core::kCapabilityDefinitionApiVersion)),
+        schema_revision_for(core::CatalogRecordKind::kCapabilityDefinition),
+        observed_capability_digest,
+        observed_capability_key,
+    };
+    observed_state_capability = resolve_and_qualify_capability_definition(
+        observed_capability_ref, observed_capability_key, observed_capability_bytes);
+
+    observed_state_bytes = observed_capability_bytes;
+  }
+
+  std::vector<QualifiedCapabilityDefinition> lifecycle_capabilities;
+  std::vector<std::string> lifecycle_capability_bytes;
+  if (!lifecycle_semantic_digest.empty()) {
+    const auto ids = lifecycle_capability_ids(include_lifecycle_recover);
+    lifecycle_capabilities.reserve(ids.size());
+    lifecycle_capability_bytes.reserve(ids.size());
+    for (const auto capability_id : ids) {
+      const auto *lifecycle_descriptor =
+          core::find_builtin_capability_definition(capability_id);
+      if (lifecycle_descriptor == nullptr) {
+        throw std::logic_error(
+            "Lite6 lifecycle fixture requires its built-in capabilities");
+      }
+      std::string bytes = canonical_json(CanonicalValue(CanonicalValue::Object{
+          {"api_version",
+           CanonicalValue(std::string(core::kCapabilityDefinitionApiVersion))},
+          {"capability_id", CanonicalValue(std::string(capability_id))},
+          {"scope", CanonicalValue(std::string(
+                        core::to_string(lifecycle_descriptor->scope)))},
+          {"provider_binding_kind",
+           CanonicalValue(std::string(
+               core::to_string(lifecycle_descriptor->provider_binding_kind)))},
+          {"capability_definition_revision",
+           CanonicalValue(std::string(
+               lifecycle_descriptor->capability_definition_revision))},
+      }));
+      const core::ContentDigest digest(sha256_digest(bytes));
+      const core::ContentAddressedStoreKey key(
+          catalog_key("capability", digest.value()));
+      const core::CapabilityDefinitionCatalogRecordRefDTO reference{
+          core::CapabilityId(std::string(capability_id)),
+          core::CapabilityDefinitionRevision(std::string(
+              lifecycle_descriptor->capability_definition_revision)),
+          core::SchemaId(std::string(core::kCapabilityDefinitionApiVersion)),
+          schema_revision_for(core::CatalogRecordKind::kCapabilityDefinition),
+          digest,
+          key,
+      };
+      lifecycle_capabilities.push_back(
+          resolve_and_qualify_capability_definition(reference, key, bytes));
+      lifecycle_capability_bytes.push_back(std::move(bytes));
+    }
+  }
+
+  std::vector<QualifiedCapabilityDefinition> planner_capabilities;
+  std::vector<std::string> planner_capability_bytes;
+  {
+    constexpr std::array<std::string_view, 3U> kPlannerCapabilities{
+        "planning.motion.cartesian_path",
+        "planning.motion.joint_goal",
+        "planning.motion.pose_goal",
+    };
+    planner_capabilities.reserve(kPlannerCapabilities.size());
+    planner_capability_bytes.reserve(kPlannerCapabilities.size());
+    for (const auto capability_id : kPlannerCapabilities) {
+      const auto *planner_descriptor =
+          core::find_builtin_capability_definition(capability_id);
+      if (planner_descriptor == nullptr) {
+        throw std::logic_error(
+            "Lite6 motion fixture requires its maintained planning "
+            "capabilities");
+      }
+      std::string bytes = canonical_json(CanonicalValue(CanonicalValue::Object{
+          {"api_version",
+           CanonicalValue(std::string(core::kCapabilityDefinitionApiVersion))},
+          {"capability_id", CanonicalValue(std::string(capability_id))},
+          {"scope", CanonicalValue(std::string(
+                        core::to_string(planner_descriptor->scope)))},
+          {"provider_binding_kind",
+           CanonicalValue(std::string(
+               core::to_string(planner_descriptor->provider_binding_kind)))},
+          {"capability_definition_revision",
+           CanonicalValue(std::string(
+               planner_descriptor->capability_definition_revision))},
+      }));
+      const core::ContentDigest planner_digest(sha256_digest(bytes));
+      const core::ContentAddressedStoreKey planner_key(
+          catalog_key("capability", planner_digest.value()));
+      const core::CapabilityDefinitionCatalogRecordRefDTO planner_ref{
+          core::CapabilityId(std::string(capability_id)),
+          core::CapabilityDefinitionRevision(
+              std::string(planner_descriptor->capability_definition_revision)),
+          core::SchemaId(std::string(core::kCapabilityDefinitionApiVersion)),
+          schema_revision_for(core::CatalogRecordKind::kCapabilityDefinition),
+          planner_digest,
+          planner_key,
+      };
+      planner_capabilities.push_back(resolve_and_qualify_capability_definition(
+          planner_ref, planner_key, bytes));
+      planner_capability_bytes.push_back(std::move(bytes));
+    }
+  }
+
+  const std::string ros2_control_execution_runtime_profile_bytes =
+      detail::ros2_control_execution_runtime_profile_document();
+  const core::ContentDigest profile_digest(
+      sha256_digest(ros2_control_execution_runtime_profile_bytes));
+  const core::ContentAddressedStoreKey profile_key(
+      catalog_key("runtime_profile", profile_digest.value()));
+  const core::RuntimeProfileCatalogRecordRefDTO profile_ref{
+      core::RuntimeProfileId(
+          std::string(detail::kRos2ControlExecutionRuntimeProfileId)),
+      core::RuntimeProfileRevision(
+          detail::ros2_control_execution_runtime_profile_revision()),
+      core::SchemaId(std::string(core::kRuntimeProfileApiVersion)),
+      schema_revision_for(core::CatalogRecordKind::kRuntimeProfile),
+      profile_digest,
+      profile_key,
+  };
+  auto ros2_control_execution_runtime_profile =
+      resolve_and_qualify_runtime_profile(
+          profile_ref, profile_key,
+          ros2_control_execution_runtime_profile_bytes);
+
+  CanonicalValue::Array target_capabilities{
+      CanonicalValue(CanonicalValue::Object{
+          {"capability_id",
+           CanonicalValue(capability.value().capability_id.value())},
+          {"capability_definition_revision",
+           CanonicalValue(
+               capability.value().capability_definition_revision.value())},
+      })};
+  for (const auto &planner_capability : planner_capabilities) {
+    target_capabilities.emplace_back(CanonicalValue::Object{
+        {"capability_id",
+         CanonicalValue(planner_capability.value().capability_id.value())},
+        {"capability_definition_revision",
+         CanonicalValue(planner_capability.value()
+                            .capability_definition_revision.value())},
+    });
+  }
+
+  if (observed_state_capability.has_value()) {
+    target_capabilities.emplace_back(CanonicalValue::Object{
+        {"capability_id", CanonicalValue(observed_state_capability->value().capability_id.value())},
+        {"capability_definition_revision", CanonicalValue(observed_state_capability->value().capability_definition_revision.value())},
+    });
+  }
+
+  // C-P3: TCPs are tagged, as on the maintained Lite6 arm target
+  // (`lite6_lite_gripper`): `flange` and `tcp`, with `tcp` the default.
+  CanonicalValue::Object arm_tcp_frame{
+      {"frame_role_id", CanonicalValue("tcp")},
+      {"model_role_id", CanonicalValue("arm_model")},
+      {"asset_frame_role_id", CanonicalValue("tcp")},
+      {"tcp", CanonicalValue(true)},
+  };
+  if (associate_arm_tcp_contact_bodies) {
+    arm_tcp_frame.emplace_back(
+        "contact_body_role_ids",
+        CanonicalValue(CanonicalValue::Array{CanonicalValue("arm_collision")}));
+  }
+  CanonicalValue::Array arm_frame_roles{
+      CanonicalValue(CanonicalValue::Object{
+          {"frame_role_id", CanonicalValue("base")},
+          {"model_role_id", CanonicalValue("arm_model")},
+          {"asset_frame_role_id", CanonicalValue("base")},
+      }),
+      lite6_arm_flange_frame(),
+      CanonicalValue(std::move(arm_tcp_frame)),
+  };
+
+  if (shared_arm_endpoint_bodies) {
+    auto base = arm_frame_roles.front().as_object();
+    base.emplace_back("contact_body_role_ids", text_array({"arm_collision"}));
+    arm_frame_roles.front() = CanonicalValue(std::move(base));
+  }
+
+  const std::string component_bytes = revisioned_document(
+      CanonicalValue(CanonicalValue::Object{
+          {"api_version",
+           CanonicalValue(std::string(core::kComponentTypeApiVersion))},
+          {"component_type_id", CanonicalValue("lite6_arm_component")},
+          {"tags", CanonicalValue(CanonicalValue::Array{})},
+          {"model_roles",
+           CanonicalValue(
+               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                   {"model_role_id", CanonicalValue("arm_model")},
+                   {"cardinality", CanonicalValue("exactly_one")},
+               })})},
+          {"component_root", CanonicalValue(CanonicalValue::Object{
+                                 {"model_role_id", CanonicalValue("arm_model")},
+                                 {"frame_role_id", CanonicalValue("root")},
+                             })},
+          {"model_mounts", CanonicalValue(CanonicalValue::Array{})},
+          {"command_targets",
+           CanonicalValue(
+               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                   {"command_target_id",
+                    CanonicalValue(std::string(kLite6ArmTargetId))},
+                   {"model_group_roles",
+                    CanonicalValue(CanonicalValue::Array{
+                        CanonicalValue(CanonicalValue::Object{
+                            {"model_group_role_id",
+                             CanonicalValue("planning_group")},
+                            {"model_role_id", CanonicalValue("arm_model")},
+                            {"asset_model_group_role_id",
+                             CanonicalValue("arm")},
+                        })})},
+                   {"resource_roles",
+                    CanonicalValue(CanonicalValue::Array{
+                        CanonicalValue(CanonicalValue::Object{
+                            {"resource_role_id", CanonicalValue("joints")},
+                            {"source_kind", CanonicalValue("model_role")},
+                            {"model_role_id", CanonicalValue("arm_model")},
+                            {"asset_resource_role_id",
+                             CanonicalValue("arm_joints")},
+                        })})},
+                   {"frame_roles",
+                    CanonicalValue(std::move(arm_frame_roles))},
+                   {"collision_body_roles",
+                    CanonicalValue(CanonicalValue::Array{
+                        CanonicalValue(CanonicalValue::Object{
+                            {"collision_body_role_id",
+                             CanonicalValue("arm_collision")},
+                            {"model_role_id", CanonicalValue("arm_model")},
+                            {"asset_collision_body_role_id",
+                             CanonicalValue("arm_collision")},
+                        })})},
+                   {"capabilities",
+                    CanonicalValue(std::move(target_capabilities))},
+                   {"default_tcp_frame_role_id", CanonicalValue("tcp")},
+               })})},
+          {"attachment_interfaces", CanonicalValue(CanonicalValue::Array{})},
+      }),
+      "catalog-record-revision/component_type", core::kComponentTypeApiVersion,
+      "component_type_revision");
+  const core::ContentDigest component_digest(sha256_digest(component_bytes));
+  const core::ContentAddressedStoreKey component_key(
+      catalog_key("component", component_digest.value()));
+  const core::ComponentTypeCatalogRecordRefDTO component_ref{
+      core::ComponentTypeId("lite6_arm_component"),
+      core::ComponentTypeRevision(
+          revision_from_document(component_bytes, "component_type_revision")),
+      core::SchemaId(std::string(core::kComponentTypeApiVersion)),
+      schema_revision_for(core::CatalogRecordKind::kComponentType),
+      component_digest,
+      component_key,
+  };
+  std::vector<QualifiedCapabilityDefinition> component_capabilities{capability};
+  component_capabilities.insert(component_capabilities.end(),
+                                planner_capabilities.begin(),
+                                planner_capabilities.end());
+  if (observed_state_capability.has_value())
+    component_capabilities.push_back(*observed_state_capability);
+  auto component_type = resolve_and_qualify_component_type(
+      component_ref, component_key, component_bytes, component_capabilities);
+
+  const std::string contract_bytes = revisioned_document(
+      CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(
+                              core::kControlInterfaceContractApiVersion))},
+          {"control_interface_contract_id",
+           CanonicalValue("lite6_arm_position")},
+          {"command_interfaces",
+           CanonicalValue(
+               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                   {"resource_role_id", CanonicalValue("joints")},
+                   {"interface_name", CanonicalValue("position")},
+               })})},
+          {"state_interfaces",
+           CanonicalValue(
+               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                   {"resource_role_id", CanonicalValue("joints")},
+                   {"interface_name", CanonicalValue("position")},
+               })})},
+          {"ordering", text_array({"joints"})},
+      }),
+      "catalog-record-revision/control_interface_contract",
+      core::kControlInterfaceContractApiVersion, "control_interface_revision");
+  const core::ContentDigest contract_digest(sha256_digest(contract_bytes));
+  const core::ContentAddressedStoreKey contract_key(
+      catalog_key("contract", contract_digest.value()));
+  const core::ControlInterfaceContractCatalogRecordRefDTO contract_ref{
+      core::ControlInterfaceContractId("lite6_arm_position"),
+      core::ControlInterfaceRevision(
+          revision_from_document(contract_bytes, "control_interface_revision")),
+      core::SchemaId(std::string(core::kControlInterfaceContractApiVersion)),
+      schema_revision_for(core::CatalogRecordKind::kControlInterfaceContract),
+      contract_digest,
+      contract_key,
+  };
+  auto contract = resolve_and_qualify_control_interface_contract(
+      contract_ref, contract_key, contract_bytes);
+
+  const CanonicalValue topology_contract_claim(CanonicalValue::Object{
+      {"control_interface_contract_id",
+       CanonicalValue(contract.value().control_interface_contract_id.value())},
+      {"control_interface_revision",
+       CanonicalValue(contract.value().control_interface_revision.value())},
+      {"claimed_directions", text_array({"command", "state"})},
+  });
+  const CanonicalValue topology_interface_claim(CanonicalValue::Object{
+      {"resource_role_id", CanonicalValue("joints")},
+      {"interface_name", CanonicalValue("position")},
+  });
+  const std::string topology_id = chained ? "lite6_arm_jtc_admittance_topology"
+                                          : "lite6_arm_direct_topology";
+  CanonicalValue::Array controllers;
+  CanonicalValue::Array chain_edges;
+  CanonicalValue::Array activation_sets;
+  CanonicalValue::Array legal_routes;
+  if (chained) {
+    controllers = CanonicalValue::Array{
+        CanonicalValue(CanonicalValue::Object{
+            {"controller_role_id", CanonicalValue("admittance")},
+            {"control_interface_claims",
+             CanonicalValue(CanonicalValue::Array{topology_contract_claim})},
+            {"exported_reference_interfaces",
+             CanonicalValue(CanonicalValue::Array{topology_interface_claim})},
+            {"exported_state_interfaces",
+             CanonicalValue(CanonicalValue::Array{topology_interface_claim})},
+        }),
+        CanonicalValue(CanonicalValue::Object{
+            {"controller_role_id", CanonicalValue("trajectory")},
+            {"control_interface_claims",
+             CanonicalValue(CanonicalValue::Array{})},
+            {"exported_reference_interfaces",
+             CanonicalValue(CanonicalValue::Array{})},
+            {"exported_state_interfaces",
+             CanonicalValue(CanonicalValue::Array{})},
+        }),
+    };
+    chain_edges = CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+        {"upstream_controller_role_id", CanonicalValue("trajectory")},
+        {"downstream_controller_role_id", CanonicalValue("admittance")},
+        {"reference_interfaces",
+         CanonicalValue(CanonicalValue::Array{topology_interface_claim})},
+        {"state_interfaces",
+         CanonicalValue(CanonicalValue::Array{topology_interface_claim})},
+    })};
+    activation_sets =
+        CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+            {"activation_set_id", CanonicalValue("arm_chain")},
+            {"active_controller_role_ids",
+             text_array({"admittance", "trajectory"})},
+            {"active_chain_edges", CanonicalValue(CanonicalValue::Array{
+                                       CanonicalValue(CanonicalValue::Object{
+                                           {"upstream_controller_role_id",
+                                            CanonicalValue("trajectory")},
+                                           {"downstream_controller_role_id",
+                                            CanonicalValue("admittance")},
+                                       })})},
+        })};
+    legal_routes = CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+        {"control_route_id", CanonicalValue("arm_position")},
+        {"control_interface_contract_id",
+         CanonicalValue(
+             contract.value().control_interface_contract_id.value())},
+        {"control_interface_revision",
+         CanonicalValue(contract.value().control_interface_revision.value())},
+        {"ordered_controller_role_ids",
+         text_array({"trajectory", "admittance"})},
+        {"compatible_activation_set_ids", text_array({"arm_chain"})},
+    })};
+  } else {
+    controllers = CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+        {"controller_role_id", CanonicalValue("hardware")},
+        {"control_interface_claims",
+         CanonicalValue(CanonicalValue::Array{topology_contract_claim})},
+        {"exported_reference_interfaces",
+         CanonicalValue(CanonicalValue::Array{})},
+        {"exported_state_interfaces", CanonicalValue(CanonicalValue::Array{})},
+    })};
+    activation_sets =
+        CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+            {"activation_set_id", CanonicalValue("arm_direct")},
+            {"active_controller_role_ids", text_array({"hardware"})},
+            {"active_chain_edges", CanonicalValue(CanonicalValue::Array{})},
+        })};
+    legal_routes = CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+        {"control_route_id", CanonicalValue("arm_position")},
+        {"control_interface_contract_id",
+         CanonicalValue(
+             contract.value().control_interface_contract_id.value())},
+        {"control_interface_revision",
+         CanonicalValue(contract.value().control_interface_revision.value())},
+        {"ordered_controller_role_ids", text_array({"hardware"})},
+        {"compatible_activation_set_ids", text_array({"arm_direct"})},
+    })};
+  }
+  const std::string topology_bytes = revisioned_document(
+      CanonicalValue(CanonicalValue::Object{
+          {"api_version",
+           CanonicalValue(std::string(core::kControllerTopologyApiVersion))},
+          {"controller_topology_id", CanonicalValue(topology_id)},
+          {"controllers", CanonicalValue(std::move(controllers))},
+          {"chain_edges", CanonicalValue(std::move(chain_edges))},
+          {"activation_sets", CanonicalValue(std::move(activation_sets))},
+          {"legal_routes", CanonicalValue(std::move(legal_routes))},
+      }),
+      "catalog-record-revision/controller_topology",
+      core::kControllerTopologyApiVersion, "topology_revision");
+  const core::ContentDigest topology_digest(sha256_digest(topology_bytes));
+  const core::ContentAddressedStoreKey topology_key(
+      catalog_key("topology", topology_digest.value()));
+  const core::ControllerTopologyCatalogRecordRefDTO topology_ref{
+      core::ControllerTopologyId(topology_id),
+      core::TopologyRevision(
+          revision_from_document(topology_bytes, "topology_revision")),
+      core::SchemaId(std::string(core::kControllerTopologyApiVersion)),
+      schema_revision_for(core::CatalogRecordKind::kControllerTopology),
+      topology_digest,
+      topology_key,
+  };
+  auto topology = resolve_and_qualify_controller_topology(
+      topology_ref, topology_key, topology_bytes,
+      std::span<const QualifiedControlInterfaceContract>(&contract, 1U));
+
+  const auto stop_provider_contract_ref = [qualified_motion_controlled_stop] {
+    return CanonicalValue(CanonicalValue::Object{
+        {"provider_contract_role_id", CanonicalValue("stop_contract")},
+        {"contract_schema_id",
+         CanonicalValue(
+             qualified_motion_controlled_stop
+                 ? std::string(core::kMotionControlledStopContractSchemaId)
+                 : "manyforge.value_schema.provider_contract.empty.v1")},
+        {"contract_schema_revision",
+         CanonicalValue(
+             qualified_motion_controlled_stop
+                 ? std::string(
+                       core::kMotionControlledStopContractSchemaRevision)
+                 : std::string(kEmptyProviderContractSchemaRevision))},
+    });
+  };
+  const auto software_hard_contract_ref = [] {
+    return CanonicalValue(CanonicalValue::Object{
+        {"provider_contract_role_id", CanonicalValue("software_hard_stop")},
+        {"contract_schema_id",
+         CanonicalValue("manyforge.value_schema.provider_contract.empty.v1")},
+        {"contract_schema_revision",
+         CanonicalValue(std::string(kEmptyProviderContractSchemaRevision))},
+    });
+  };
+  CanonicalValue::Array provider_contracts;
+  if (stoppable) {
+    CanonicalValue::Object nominal_contract{
+        {"provider_contract_ref", stop_provider_contract_ref()},
+        {"stop_evidence_support",
+         CanonicalValue(CanonicalValue::Object{
+             {"evidence_kind", CanonicalValue("motion_rest")},
+             {"evidence_endpoint_role_ids", text_array({"state"})},
+         })},
+    };
+    if (qualified_motion_controlled_stop) {
+      nominal_contract.emplace_back(
+          "stop_command_support",
+          CanonicalValue(CanonicalValue::Object{
+              {"command_kind", CanonicalValue("motion_controlled_stop")},
+              {"command_endpoint_role_ids", text_array({"command"})},
+          }));
+    }
+    provider_contracts.emplace_back(std::move(nominal_contract));
+    provider_contracts.emplace_back(CanonicalValue::Object{
+        {"provider_contract_ref", software_hard_contract_ref()},
+        {"stop_command_support",
+         CanonicalValue(CanonicalValue::Object{
+             {"command_kind", CanonicalValue("registered")},
+             {"registered_command_kind_id",
+              CanonicalValue("manyforge.stop.software_hard")},
+             {"command_endpoint_role_ids",
+              CanonicalValue(CanonicalValue::Array{})},
+         })},
+        {"stop_evidence_support",
+         CanonicalValue(CanonicalValue::Object{
+             {"evidence_kind", CanonicalValue("motion_rest")},
+             {"evidence_endpoint_role_ids", text_array({"state"})},
+         })},
+    });
+  }
+  std::sort(provider_contracts.begin(), provider_contracts.end(),
+            [](const auto &left, const auto &right) {
+              return provider_contract_role_id(left) <
+                     provider_contract_role_id(right);
+            });
+
+  CanonicalValue::Array offered_capabilities{
+      CanonicalValue(CanonicalValue::Object{
+          {"capability_id",
+           CanonicalValue(capability.value().capability_id.value())},
+          {"capability_definition_revision",
+           CanonicalValue(
+               capability.value().capability_definition_revision.value())},
+          {"required_endpoint_role_ids", text_array({"command", "state"})},
+      })};
+  if (observed_state_capability.has_value()) {
+    offered_capabilities.emplace_back(CanonicalValue::Object{
+        {"capability_id", CanonicalValue(observed_state_capability->value().capability_id.value())},
+        {"capability_definition_revision", CanonicalValue(observed_state_capability->value().capability_definition_revision.value())},
+        {"required_endpoint_role_ids", text_array({"command", "state"})},
+    });
+  }
+  if (!lifecycle_semantic_digest.empty()) {
+    append_lifecycle_capability_offers(offered_capabilities,
+                                      include_lifecycle_recover);
+  }
+  sort_capability_offers(offered_capabilities);
+  CanonicalValue::Object provider_root{
+      {"api_version",
+       CanonicalValue(std::string(core::kProviderManifestApiVersion))},
+      {"provider_manifest_id", CanonicalValue(std::string(provider_id))},
+      {"offered_capabilities", CanonicalValue(std::move(offered_capabilities))},
+      {"provider_contracts", CanonicalValue(std::move(provider_contracts))},
+  };
+  const std::string provider_bytes = revisioned_document(
+      CanonicalValue(std::move(provider_root)),
+      "catalog-record-revision/provider_manifest",
+      core::kProviderManifestApiVersion, "provider_manifest_revision");
+  const core::ContentDigest provider_digest(sha256_digest(provider_bytes));
+  const core::ContentAddressedStoreKey provider_key(
+      catalog_key("provider", provider_digest.value()));
+  const core::ProviderManifestCatalogRecordRefDTO provider_ref{
+      core::ProviderManifestId(std::string(provider_id)),
+      core::ProviderManifestRevision(
+          revision_from_document(provider_bytes, "provider_manifest_revision")),
+      core::SchemaId(std::string(core::kProviderManifestApiVersion)),
+      schema_revision_for(core::CatalogRecordKind::kProviderManifest),
+      provider_digest,
+      provider_key,
+  };
+  auto provider = resolve_and_qualify_provider_manifest(
+      provider_ref, provider_key, provider_bytes);
+
+  std::optional<QualifiedProviderManifest> planner_provider;
+  std::optional<std::string> planner_provider_bytes;
+  if (!planner_capabilities.empty()) {
+    const std::string_view planner_provider_id =
+        "lite6_ros2_control_joint_planner";
+    const std::string_view projection_endpoint_role =
+        detail::kRos2ControlExecutionRuntimeProjectionEndpointRoleId;
+    CanonicalValue::Array offered_capabilities;
+    offered_capabilities.reserve(planner_capabilities.size());
+    for (const auto &planner_capability : planner_capabilities) {
+      offered_capabilities.emplace_back(CanonicalValue::Object{
+          {"capability_id",
+           CanonicalValue(planner_capability.value().capability_id.value())},
+          {"capability_definition_revision",
+           CanonicalValue(planner_capability.value()
+                              .capability_definition_revision.value())},
+          {"required_endpoint_role_ids",
+           text_array({projection_endpoint_role})},
+      });
+    }
+    planner_provider_bytes = revisioned_document(
+        CanonicalValue(CanonicalValue::Object{
+            {"api_version",
+             CanonicalValue(std::string(core::kProviderManifestApiVersion))},
+            {"provider_manifest_id",
+             CanonicalValue(std::string(planner_provider_id))},
+            {"offered_capabilities",
+             CanonicalValue(std::move(offered_capabilities))},
+            {"provider_contracts", CanonicalValue(CanonicalValue::Array{})},
+        }),
+        "catalog-record-revision/provider_manifest",
+        core::kProviderManifestApiVersion, "provider_manifest_revision");
+    const core::ContentDigest planner_provider_digest(
+        sha256_digest(*planner_provider_bytes));
+    const core::ContentAddressedStoreKey planner_provider_key(
+        catalog_key("provider", planner_provider_digest.value()));
+    const core::ProviderManifestCatalogRecordRefDTO planner_provider_ref{
+        core::ProviderManifestId(std::string(planner_provider_id)),
+        core::ProviderManifestRevision(revision_from_document(
+            *planner_provider_bytes, "provider_manifest_revision")),
+        core::SchemaId(std::string(core::kProviderManifestApiVersion)),
+        schema_revision_for(core::CatalogRecordKind::kProviderManifest),
+        planner_provider_digest,
+        planner_provider_key,
+    };
+    planner_provider = resolve_and_qualify_provider_manifest(
+        planner_provider_ref, planner_provider_key, *planner_provider_bytes);
+  }
+
+  const std::string stop_policy_id =
+      !stoppable                         ? "lite6_not_stoppable"
+      : qualified_motion_controlled_stop ? "lite6_motion_controlled_stop"
+                                         : "lite6_controller_goal_terminal_stop";
+  const CanonicalValue nominal_evidence_requirement =
+      qualified_motion_controlled_stop
+          ? CanonicalValue(CanonicalValue::Object{
+                {"evidence_item_id", CanonicalValue("nominal_rest")},
+                {"evidence",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"evidence_kind", CanonicalValue("motion_rest")},
+                     {"provider_contract_ref", stop_provider_contract_ref()},
+                 })},
+                {"source_requirement",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"source_kind", CanonicalValue("binding_state_authority")},
+                     {"freshness_budget_ns", CanonicalValue(100'000'000.0)},
+                     {"state_endpoint_role_id", CanonicalValue("state")},
+                     {"allowed_authority_classes",
+                      text_array({"commanded", "measured", "predicted"})},
+                 })},
+                {"observation_semantics",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"observation_kind", CanonicalValue("post_command_dwell")},
+                     {"minimum_dwell_ns", CanonicalValue(10.0)},
+                 })},
+            })
+          : CanonicalValue(CanonicalValue::Object{
+                {"evidence_item_id", CanonicalValue("goal_terminal")},
+                {"evidence", CanonicalValue(CanonicalValue::Object{
+                                 {"evidence_kind",
+                                  CanonicalValue("controller_goal_terminal")},
+                             })},
+                {"source_requirement",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"source_kind", CanonicalValue("controller_goal_status")},
+                     {"freshness_budget_ns", CanonicalValue(100'000'000.0)},
+                 })},
+                {"observation_semantics",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"observation_kind",
+                      CanonicalValue("post_command_sample")},
+                 })},
+            });
+  const CanonicalValue stop_identity = [&]() {
+    if (!stoppable) {
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version",
+           CanonicalValue(std::string(core::kStopEvidencePolicyApiVersion))},
+          {"stop_evidence_policy_id", CanonicalValue(stop_policy_id)},
+          {"disposition", CanonicalValue("not_stoppable")},
+          {"containment_granularity",
+           CanonicalValue(std::string(containment_granularity))},
+      });
+    }
+    return CanonicalValue(CanonicalValue::Object{
+        {"api_version",
+         CanonicalValue(std::string(core::kStopEvidencePolicyApiVersion))},
+        {"stop_evidence_policy_id", CanonicalValue(stop_policy_id)},
+        {"disposition", CanonicalValue("stoppable")},
+        {"containment_granularity",
+         CanonicalValue(std::string(containment_granularity))},
+        {"escalation_stages",
+         CanonicalValue(CanonicalValue::Array{
+             CanonicalValue(CanonicalValue::Object{
+                 {"stop_escalation_stage_id", CanonicalValue("nominal")},
+                 {"stage_kind", CanonicalValue("nominal")},
+                 {"containment_granularity",
+                  CanonicalValue(std::string(containment_granularity))},
+                 {"containment_command",
+                  CanonicalValue(CanonicalValue::Object{
+                      {"command",
+                       qualified_motion_controlled_stop
+                           ? CanonicalValue(CanonicalValue::Object{
+                                 {"command_kind",
+                                  CanonicalValue("motion_controlled_stop")},
+                                 {"provider_contract_ref",
+                                  stop_provider_contract_ref()},
+                             })
+                           : CanonicalValue(CanonicalValue::Object{
+                                 {"command_kind",
+                                  CanonicalValue("controller_goal_cancel")},
+                             })},
+                  })},
+                 {"evidence_conjunction", CanonicalValue("all_of")},
+                 {"evidence_requirements", CanonicalValue(CanonicalValue::Array{
+                                               nominal_evidence_requirement,
+                                           })},
+             }),
+             CanonicalValue(CanonicalValue::Object{
+                 {"stop_escalation_stage_id", CanonicalValue("software_hard")},
+                 {"stage_kind", CanonicalValue("software_hard")},
+                 {"containment_granularity",
+                  CanonicalValue(std::string(containment_granularity))},
+                 {"containment_command",
+                  CanonicalValue(CanonicalValue::Object{
+                      {"command",
+                       CanonicalValue(CanonicalValue::Object{
+                           {"command_kind", CanonicalValue("registered")},
+                           {"provider_contract_ref",
+                            software_hard_contract_ref()},
+                           {"registered_command_kind_id",
+                            CanonicalValue("manyforge.stop.software_hard")},
+                       })},
+                  })},
+                 {"evidence_conjunction", CanonicalValue("all_of")},
+                 {"evidence_requirements",
+                  CanonicalValue(CanonicalValue::Array{
+                      CanonicalValue(CanonicalValue::Object{
+                          {"evidence_item_id", CanonicalValue("hard_rest")},
+                          {"evidence",
+                           CanonicalValue(CanonicalValue::Object{
+                               {"evidence_kind", CanonicalValue("motion_rest")},
+                               {"provider_contract_ref",
+                                software_hard_contract_ref()},
+                           })},
+                          {"source_requirement",
+                           CanonicalValue(CanonicalValue::Object{
+                               {"source_kind",
+                                CanonicalValue("binding_state_authority")},
+                               {"freshness_budget_ns",
+                                CanonicalValue(100'000'000.0)},
+                               {"state_endpoint_role_id",
+                                CanonicalValue("state")},
+                               {"allowed_authority_classes",
+                                text_array(
+                                    {"commanded", "measured", "predicted"})},
+                           })},
+                          {"observation_semantics",
+                           CanonicalValue(CanonicalValue::Object{
+                               {"observation_kind",
+                                CanonicalValue("post_command_dwell")},
+                               {"minimum_dwell_ns", CanonicalValue(10.0)},
+                           })},
+                      }),
+                  })},
+             }),
+         })},
+    });
+  }();
+  const std::string stop_bytes = revisioned_document(
+      stop_identity, "catalog-record-revision/stop_evidence_policy",
+      core::kStopEvidencePolicyApiVersion, "stop_evidence_policy_revision");
+  const core::ContentDigest stop_digest(sha256_digest(stop_bytes));
+  const core::ContentAddressedStoreKey stop_key(
+      catalog_key("stop", stop_digest.value()));
+  const core::StopEvidencePolicyCatalogRecordRefDTO stop_ref{
+      core::StopEvidencePolicyId(stop_policy_id),
+      core::StopEvidencePolicyRevision(
+          revision_from_document(stop_bytes, "stop_evidence_policy_revision")),
+      core::SchemaId(std::string(core::kStopEvidencePolicyApiVersion)),
+      schema_revision_for(core::CatalogRecordKind::kStopEvidencePolicy),
+      stop_digest,
+      stop_key,
+  };
+  auto stop =
+      resolve_and_qualify_stop_evidence_policy(stop_ref, stop_key, stop_bytes);
+
+  std::vector<Lite6InputArtifact> artifacts;
+  artifacts.reserve(12U);
+  artifacts.push_back(catalog_artifact("catalog://capability/" +
+                                           std::string(primary_capability_id),
+                                       capability_bytes, capability));
+  if (observed_state_capability.has_value()) {
+    artifacts.push_back(catalog_artifact("catalog://capability/state.observed.current",
+                                         *observed_state_bytes, *observed_state_capability));
+  }
+  artifacts.push_back(
+      catalog_artifact("catalog://component_type/lite6_arm_component",
+                       component_bytes, component_type));
+  artifacts.push_back(
+      catalog_artifact("catalog://control_interface/lite6_arm_position",
+                       contract_bytes, contract));
+  artifacts.push_back(
+      catalog_artifact("catalog://controller_topology/" + topology_id,
+                       topology_bytes, topology));
+  artifacts.push_back(
+      catalog_artifact("catalog://provider_manifest/" + std::string(provider_id),
+                       provider_bytes, provider));
+  for (std::size_t index = 0U; index < lifecycle_capabilities.size(); ++index) {
+    artifacts.push_back(catalog_artifact(
+        "catalog://capability/" +
+            lifecycle_capabilities[index].value().capability_id.value(),
+        lifecycle_capability_bytes[index], lifecycle_capabilities[index]));
+  }
+  if (!planner_capabilities.empty() &&
+      planner_capabilities.size() == planner_capability_bytes.size() &&
+      planner_provider.has_value() && planner_provider_bytes.has_value()) {
+    for (std::size_t index = 0U; index < planner_capabilities.size(); ++index) {
+      artifacts.push_back(catalog_artifact(
+          "catalog://capability/" +
+              planner_capabilities[index].value().capability_id.value(),
+          planner_capability_bytes[index], planner_capabilities[index]));
+    }
+    artifacts.push_back(catalog_artifact(
+        "catalog://provider_manifest/" +
+            planner_provider->value().provider_manifest_id.value(),
+        *planner_provider_bytes, *planner_provider));
+  }
+  artifacts.push_back(
+      catalog_artifact("catalog://runtime_profile/"
+                       "manyforge.ros2_control_execution_runtime_unit",
+                       ros2_control_execution_runtime_profile_bytes,
+                       ros2_control_execution_runtime_profile));
+  artifacts.push_back(catalog_artifact(
+      "catalog://stop_policy/" + stop_policy_id, stop_bytes, stop));
+
+  return {
+      std::move(capability),
+      std::move(component_type),
+      std::move(contract),
+      std::move(topology),
+      std::move(provider),
+      std::move(stop),
+      std::move(artifacts),
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::move(planner_capabilities),
+      std::move(lifecycle_capabilities),
+      std::move(planner_provider),
+      std::move(ros2_control_execution_runtime_profile),
+      std::nullopt,
+      std::nullopt,
+      std::move(observed_state_capability),
+  };
+}
+
+[[nodiscard]] inline QualifiedControlCatalog add_gripper_only_catalog(
+    QualifiedControlCatalog catalog, bool stoppable,
+    std::string_view lifecycle_semantic_digest, bool gripper_feedback,
+    std::string_view ros_gripper_actuation_kind,
+    void (*component_input_mapper)(CanonicalValue::Object &)) {
+  const std::string_view gripper_provider_id =
+      "manyforge.provider.ros2_control";
+  const auto qualify_gripper_capability = [&](std::string_view id) {
+    const auto *descriptor = core::find_builtin_capability_definition(id);
+    if (descriptor == nullptr) {
+      throw std::logic_error(
+          "gripper-only fixture requires tool.gripper.command");
+    }
+    const std::string capability_bytes =
+        canonical_json(CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(
+                                core::kCapabilityDefinitionApiVersion))},
+            {"capability_id", CanonicalValue(std::string(id))},
+            {"scope",
+             CanonicalValue(std::string(core::to_string(descriptor->scope)))},
+            {"provider_binding_kind",
+             CanonicalValue(std::string(
+                 core::to_string(descriptor->provider_binding_kind)))},
+            {"capability_definition_revision",
+             CanonicalValue(
+                 std::string(descriptor->capability_definition_revision))},
+        }));
+    const core::ContentDigest capability_digest(
+        sha256_digest(capability_bytes));
+    const core::ContentAddressedStoreKey capability_key(
+        catalog_key("capability", capability_digest.value()));
+    const core::CapabilityDefinitionCatalogRecordRefDTO capability_ref{
+        core::CapabilityId(std::string(id)),
+        core::CapabilityDefinitionRevision(
+            std::string(descriptor->capability_definition_revision)),
+        core::SchemaId(std::string(core::kCapabilityDefinitionApiVersion)),
+        schema_revision_for(core::CatalogRecordKind::kCapabilityDefinition),
+        capability_digest,
+        capability_key,
+    };
+    auto qualified = resolve_and_qualify_capability_definition(
+        capability_ref, capability_key, capability_bytes);
+    catalog.artifacts.push_back(
+        catalog_artifact("catalog://capability/" + std::string(id),
+                         capability_bytes, qualified));
+    return qualified;
+  };
+  auto gripper_capability = qualify_gripper_capability("tool.gripper.command");
+  if (gripper_feedback) {
+    catalog.gripper_feedback =
+        qualify_gripper_capability("tool.gripper.feedback");
+  }
+
+  const std::string command_schema_bytes =
+      canonical_json(CanonicalValue(CanonicalValue::Object{
+          {"api_version",
+           CanonicalValue(std::string(core::kCommandSchemaApiVersion))},
+          {"command_schema_id",
+           CanonicalValue(std::string(core::kGripperPositionCommandSchemaId))},
+          {"command_schema_revision",
+           CanonicalValue(
+               std::string(core::kGripperPositionCommandSchemaRevision))},
+          {"compatible_capabilities",
+           CanonicalValue(
+               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                   {"capability_id",
+                    CanonicalValue(
+                        gripper_capability.value().capability_id.value())},
+                   {"capability_definition_revision",
+                    CanonicalValue(
+                        gripper_capability.value()
+                            .capability_definition_revision.value())},
+               })})},
+          {"command_value",
+           CanonicalValue(CanonicalValue::Object{
+               {"value_kind", CanonicalValue("gripper_position")},
+               {"accepted_position_kinds", text_array({"angular", "linear"})},
+               {"minimum_resource_count", CanonicalValue(1.0)},
+               {"maximum_resource_count", CanonicalValue(4096.0)},
+               {"max_effort_contract",
+                CanonicalValue("optional_nonnegative_matching_coordinate")},
+           })},
+          {"resource_role_selectors", CanonicalValue(CanonicalValue::Array{})},
+          {"channel_role_selectors", CanonicalValue(CanonicalValue::Array{})},
+          {"caller_options",
+           CanonicalValue(
+               CanonicalValue::Array{
+                   CanonicalValue(CanonicalValue::Object{
+                       {"option_id", CanonicalValue("command_duration_s")},
+                       {"value_kind",
+                        CanonicalValue("nonnegative_duration_seconds")},
+                       {"required", CanonicalValue(false)},
+                   }),
+                   CanonicalValue(CanonicalValue::Object{
+                       {"option_id", CanonicalValue("wait_for_duration")},
+                       {"value_kind", CanonicalValue("bool")},
+                       {"required", CanonicalValue(false)},
+                   })})},
+          {"completion_rule", CanonicalValue("goal_fenced_target_reached")},
+          {"confirmation_rule", CanonicalValue("binding_feedback_required")},
+          {"stop_evidence_requirements", text_array({"command_terminal"})},
+      }));
+  const core::ContentDigest command_schema_digest(
+      sha256_digest(command_schema_bytes));
+  const core::ContentAddressedStoreKey command_schema_key(
+      catalog_key("command_schema", command_schema_digest.value()));
+  const core::CommandSchemaCatalogRecordRefDTO command_schema_ref{
+      core::CommandSchemaId(std::string(core::kGripperPositionCommandSchemaId)),
+      core::CommandSchemaRevision(
+          std::string(core::kGripperPositionCommandSchemaRevision)),
+      core::SchemaId(std::string(core::kCommandSchemaApiVersion)),
+      schema_revision_for(core::CatalogRecordKind::kCommandSchema),
+      command_schema_digest,
+      command_schema_key,
+  };
+  auto command_schema = resolve_and_qualify_command_schema(
+      command_schema_ref, command_schema_key, command_schema_bytes);
+
+  std::vector<QualifiedCapabilityDefinition> capabilities{gripper_capability};
+  CanonicalValue::Array gripper_capabilities;
+  const auto append_gripper_capability = [&](const auto &capability) {
+    gripper_capabilities.emplace_back(CanonicalValue::Object{
+        {"capability_id",
+         CanonicalValue(capability.value().capability_id.value())},
+        {"capability_definition_revision",
+         CanonicalValue(
+             capability.value().capability_definition_revision.value())},
+    });
+  };
+  append_gripper_capability(gripper_capability);
+  if (catalog.gripper_feedback.has_value()) {
+    capabilities.push_back(*catalog.gripper_feedback);
+    append_gripper_capability(*catalog.gripper_feedback);
+  }
+  // The tool's own component type: one gripper target over its own model.
+  // The caller's mapper renames the roles to its model asset's roles.
+  CanonicalValue component_document(CanonicalValue::Object{
+          {"api_version",
+           CanonicalValue(std::string(core::kComponentTypeApiVersion))},
+          {"component_type_id", CanonicalValue("lite6_gripper_component")},
+          {"tags", text_array({"articulated-gripper"})},
+          {"model_roles",
+           CanonicalValue(
+               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                   {"model_role_id", CanonicalValue("arm_model")},
+                   {"cardinality", CanonicalValue("exactly_one")},
+               })})},
+          {"component_root", CanonicalValue(CanonicalValue::Object{
+                                 {"model_role_id", CanonicalValue("arm_model")},
+                                 {"frame_role_id", CanonicalValue("root")},
+                             })},
+          {"model_mounts", CanonicalValue(CanonicalValue::Array{})},
+          {"command_targets",
+           CanonicalValue(CanonicalValue::Array{
+               CanonicalValue(CanonicalValue::Object{
+                   {"command_target_id",
+                    CanonicalValue(std::string(kLite6GripperTargetId))},
+                   {"model_group_roles",
+                    CanonicalValue(CanonicalValue::Array{
+                        CanonicalValue(CanonicalValue::Object{
+                            {"model_group_role_id",
+                             CanonicalValue("planning_group")},
+                            {"model_role_id", CanonicalValue("arm_model")},
+                            {"asset_model_group_role_id",
+                             CanonicalValue("gripper")},
+                        })})},
+                   {"resource_roles",
+                    CanonicalValue(CanonicalValue::Array{
+                        CanonicalValue(CanonicalValue::Object{
+                            {"resource_role_id", CanonicalValue("fingers")},
+                            {"source_kind", CanonicalValue("model_role")},
+                            {"model_role_id", CanonicalValue("arm_model")},
+                            {"asset_resource_role_id",
+                             CanonicalValue("gripper_joint")},
+                        })})},
+                   {"frame_roles",
+                    CanonicalValue(CanonicalValue::Array{
+                        CanonicalValue(CanonicalValue::Object{
+                            {"frame_role_id", CanonicalValue("tcp")},
+                            {"model_role_id", CanonicalValue("arm_model")},
+                            {"asset_frame_role_id", CanonicalValue("tcp")},
+                        })})},
+                   {"collision_body_roles",
+                    CanonicalValue(CanonicalValue::Array{
+                        CanonicalValue(CanonicalValue::Object{
+                            {"collision_body_role_id",
+                             CanonicalValue("gripper_collision")},
+                            {"model_role_id", CanonicalValue("arm_model")},
+                            {"asset_collision_body_role_id",
+                             CanonicalValue("gripper_collision")},
+                        })})},
+                   {"capabilities",
+                    CanonicalValue(std::move(gripper_capabilities))},
+               }),
+           })},
+          {"attachment_interfaces", CanonicalValue(CanonicalValue::Array{})},
+      });
+  {
+    auto members = component_document.as_object();
+    component_input_mapper(members);
+    component_document = CanonicalValue(std::move(members));
+  }
+  const std::string component_id =
+      component_document.find_object_member("component_type_id")->as_string();
+  const std::string component_bytes = revisioned_document(
+      component_document,
+      "catalog-record-revision/component_type", core::kComponentTypeApiVersion,
+      "component_type_revision");
+  const core::ContentDigest component_digest(sha256_digest(component_bytes));
+  const core::ContentAddressedStoreKey component_key(
+      catalog_key("component", component_digest.value()));
+  const core::ComponentTypeCatalogRecordRefDTO component_ref{
+      core::ComponentTypeId(component_id),
+      core::ComponentTypeRevision(
+          revision_from_document(component_bytes, "component_type_revision")),
+      core::SchemaId(std::string(core::kComponentTypeApiVersion)),
+      schema_revision_for(core::CatalogRecordKind::kComponentType),
+      component_digest,
+      component_key,
+  };
+  auto component_type = resolve_and_qualify_component_type(
+      component_ref, component_key, component_bytes, capabilities);
+
+  const std::string contract_bytes = revisioned_document(
+      CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(
+                              core::kControlInterfaceContractApiVersion))},
+          {"control_interface_contract_id",
+           CanonicalValue("lite6_gripper_position")},
+          {"command_interfaces",
+           CanonicalValue(
+               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                   {"resource_role_id", CanonicalValue("fingers")},
+                   {"interface_name", CanonicalValue("position")},
+               })})},
+          {"state_interfaces",
+           CanonicalValue(
+               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                   {"resource_role_id", CanonicalValue("fingers")},
+                   {"interface_name", CanonicalValue("position")},
+               })})},
+          {"ordering", text_array({"fingers"})},
+      }),
+      "catalog-record-revision/control_interface_contract",
+      core::kControlInterfaceContractApiVersion, "control_interface_revision");
+  const core::ContentDigest contract_digest(sha256_digest(contract_bytes));
+  const core::ContentAddressedStoreKey contract_key(
+      catalog_key("contract", contract_digest.value()));
+  const core::ControlInterfaceContractCatalogRecordRefDTO contract_ref{
+      core::ControlInterfaceContractId("lite6_gripper_position"),
+      core::ControlInterfaceRevision(
+          revision_from_document(contract_bytes, "control_interface_revision")),
+      core::SchemaId(std::string(core::kControlInterfaceContractApiVersion)),
+      schema_revision_for(core::CatalogRecordKind::kControlInterfaceContract),
+      contract_digest,
+      contract_key,
+  };
+  auto contract = resolve_and_qualify_control_interface_contract(
+      contract_ref, contract_key, contract_bytes);
+
+  const CanonicalValue interface_claim(CanonicalValue::Object{
+      {"resource_role_id", CanonicalValue("fingers")},
+      {"interface_name", CanonicalValue("position")},
+  });
+  const CanonicalValue contract_claim(CanonicalValue::Object{
+      {"control_interface_contract_id",
+       CanonicalValue(contract.value().control_interface_contract_id.value())},
+      {"control_interface_revision",
+       CanonicalValue(contract.value().control_interface_revision.value())},
+      {"claimed_directions", text_array({"command", "state"})},
+  });
+  const std::string topology_bytes = revisioned_document(
+      CanonicalValue(CanonicalValue::Object{
+          {"api_version",
+           CanonicalValue(std::string(core::kControllerTopologyApiVersion))},
+          {"controller_topology_id",
+           CanonicalValue("lite6_gripper_direct_topology")},
+          {"controllers",
+           CanonicalValue(
+               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                   {"controller_role_id", CanonicalValue("hardware")},
+                   {"control_interface_claims",
+                    CanonicalValue(CanonicalValue::Array{contract_claim})},
+                   {"exported_reference_interfaces",
+                    CanonicalValue(CanonicalValue::Array{})},
+                   {"exported_state_interfaces",
+                    CanonicalValue(CanonicalValue::Array{})},
+               })})},
+          {"chain_edges", CanonicalValue(CanonicalValue::Array{})},
+          {"activation_sets",
+           CanonicalValue(
+               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                   {"activation_set_id", CanonicalValue("gripper_direct")},
+                   {"active_controller_role_ids", text_array({"hardware"})},
+                   {"active_chain_edges",
+                    CanonicalValue(CanonicalValue::Array{})},
+               })})},
+          {"legal_routes",
+           CanonicalValue(
+               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                   {"control_route_id", CanonicalValue("gripper_position")},
+                   {"control_interface_contract_id",
+                    CanonicalValue(contract.value()
+                                       .control_interface_contract_id.value())},
+                   {"control_interface_revision",
+                    CanonicalValue(
+                        contract.value().control_interface_revision.value())},
+                   {"ordered_controller_role_ids", text_array({"hardware"})},
+                   {"compatible_activation_set_ids",
+                    text_array({"gripper_direct"})},
+               })})},
+      }),
+      "catalog-record-revision/controller_topology",
+      core::kControllerTopologyApiVersion, "topology_revision");
+  const core::ContentDigest topology_digest(sha256_digest(topology_bytes));
+  const core::ContentAddressedStoreKey topology_key(
+      catalog_key("topology", topology_digest.value()));
+  const core::ControllerTopologyCatalogRecordRefDTO topology_ref{
+      core::ControllerTopologyId("lite6_gripper_direct_topology"),
+      core::TopologyRevision(
+          revision_from_document(topology_bytes, "topology_revision")),
+      core::SchemaId(std::string(core::kControllerTopologyApiVersion)),
+      schema_revision_for(core::CatalogRecordKind::kControllerTopology),
+      topology_digest,
+      topology_key,
+  };
+  auto topology = resolve_and_qualify_controller_topology(
+      topology_ref, topology_key, topology_bytes,
+      std::span<const QualifiedControlInterfaceContract>(&contract, 1U));
+  (void)interface_claim;
+
+  CanonicalValue::Array gripper_offers{CanonicalValue(CanonicalValue::Object{
+      {"capability_id",
+       CanonicalValue(gripper_capability.value().capability_id.value())},
+      {"capability_definition_revision",
+       CanonicalValue(
+           gripper_capability.value().capability_definition_revision.value())},
+      {"required_endpoint_role_ids", text_array({"command", "state"})},
+  })};
+  if (catalog.gripper_feedback.has_value()) {
+    gripper_offers.emplace_back(CanonicalValue::Object{
+        {"capability_id",
+         CanonicalValue(catalog.gripper_feedback->value().capability_id.value())},
+        {"capability_definition_revision",
+         CanonicalValue(catalog.gripper_feedback->value()
+                            .capability_definition_revision.value())},
+        {"required_endpoint_role_ids", text_array({"command", "state"})},
+    });
+  }
+  if (!lifecycle_semantic_digest.empty()) {
+    append_lifecycle_capability_offers(gripper_offers, true);
+  }
+  sort_capability_offers(gripper_offers);
+  const auto logical_cancel_contract_ref = [] {
+    return CanonicalValue(CanonicalValue::Object{
+        {"provider_contract_role_id", CanonicalValue("gripper_logical_cancel")},
+        {"contract_schema_id", CanonicalValue("manyforge.value_schema.provider_contract.empty.v1")},
+        {"contract_schema_revision", CanonicalValue(std::string(kEmptyProviderContractSchemaRevision))},
+    });
+  };
+  CanonicalValue::Array gripper_contracts;
+  if (stoppable) {
+    {
+      // DX768: the genuine A1 logical-cancellation policy is approved.
+      gripper_contracts.emplace_back(CanonicalValue::Object{
+          {"provider_contract_ref", logical_cancel_contract_ref()},
+          {"stop_command_support", CanonicalValue(CanonicalValue::Object{
+              {"command_kind", CanonicalValue("logical_cancel")},
+              {"command_endpoint_role_ids", CanonicalValue(CanonicalValue::Array{})},
+          })},
+          {"stop_evidence_support", CanonicalValue(CanonicalValue::Object{
+              {"evidence_kind", CanonicalValue("logical_cancellation_no_continuing_effect")},
+              {"evidence_endpoint_role_ids", CanonicalValue(CanonicalValue::Array{})},
+          })},
+      });
+    }
+    gripper_contracts.emplace_back(CanonicalValue::Object{
+        {"provider_contract_ref",
+         CanonicalValue(CanonicalValue::Object{
+             {"provider_contract_role_id", CanonicalValue("stop_contract")},
+             {"contract_schema_id",
+              CanonicalValue(
+                  "manyforge.value_schema.provider_contract.empty.v1")},
+             {"contract_schema_revision",
+              CanonicalValue(
+                  std::string(kEmptyProviderContractSchemaRevision))},
+         })},
+        {"stop_evidence_support",
+         CanonicalValue(CanonicalValue::Object{
+             {"evidence_kind", CanonicalValue("motion_rest")},
+             {"evidence_endpoint_role_ids", text_array({"state"})},
+         })},
+    });
+    gripper_contracts.emplace_back(CanonicalValue::Object{
+        {"provider_contract_ref",
+         CanonicalValue(CanonicalValue::Object{
+             {"provider_contract_role_id",
+              CanonicalValue("software_hard_stop")},
+             {"contract_schema_id",
+              CanonicalValue(
+                  "manyforge.value_schema.provider_contract.empty.v1")},
+             {"contract_schema_revision",
+              CanonicalValue(
+                  std::string(kEmptyProviderContractSchemaRevision))},
+         })},
+        {"stop_command_support",
+         CanonicalValue(CanonicalValue::Object{
+             {"command_kind", CanonicalValue("registered")},
+             {"registered_command_kind_id",
+              CanonicalValue("manyforge.stop.software_hard")},
+             {"command_endpoint_role_ids",
+              CanonicalValue(CanonicalValue::Array{})},
+         })},
+        {"stop_evidence_support",
+         CanonicalValue(CanonicalValue::Object{
+             {"evidence_kind", CanonicalValue("motion_rest")},
+             {"evidence_endpoint_role_ids", text_array({"state"})},
+         })},
+    });
+    std::sort(gripper_contracts.begin(), gripper_contracts.end(),
+              [](const auto &left, const auto &right) {
+                return provider_contract_role_id(left) <
+                       provider_contract_role_id(right);
+              });
+  }
+  CanonicalValue::Object gripper_provider_root{
+      {"api_version",
+       CanonicalValue(std::string(core::kProviderManifestApiVersion))},
+      {"provider_manifest_id", CanonicalValue(std::string(gripper_provider_id))},
+      {"offered_capabilities", CanonicalValue(std::move(gripper_offers))},
+      {"provider_contracts", CanonicalValue(std::move(gripper_contracts))},
+  };
+  const std::string provider_bytes = revisioned_document(
+      CanonicalValue(std::move(gripper_provider_root)),
+      "catalog-record-revision/provider_manifest",
+      core::kProviderManifestApiVersion, "provider_manifest_revision");
+  const core::ContentDigest provider_digest(sha256_digest(provider_bytes));
+  const core::ContentAddressedStoreKey provider_key(
+      catalog_key("provider", provider_digest.value()));
+  const core::ProviderManifestCatalogRecordRefDTO provider_ref{
+      core::ProviderManifestId(std::string(gripper_provider_id)),
+      core::ProviderManifestRevision(
+          revision_from_document(provider_bytes, "provider_manifest_revision")),
+      core::SchemaId(std::string(core::kProviderManifestApiVersion)),
+      schema_revision_for(core::CatalogRecordKind::kProviderManifest),
+      provider_digest,
+      provider_key,
+  };
+  auto provider = resolve_and_qualify_provider_manifest(
+      provider_ref, provider_key, provider_bytes);
+
+  if (stoppable) {
+    // DX768: qualify the approved A1 policy through the ordinary catalog path.
+    const auto identity = parse_strict_json_model_yaml(R"POLICY({"api_version":"manyforge.stop_evidence_policy.v2","containment_granularity":"resource","disposition":"stoppable","escalation_stages":[{"containment_command":{"command":{"command_kind":"logical_cancel","provider_contract_ref":{"contract_schema_id":"manyforge.value_schema.provider_contract.empty.v1","contract_schema_revision":"sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270","provider_contract_role_id":"gripper_logical_cancel"}}},"containment_granularity":"resource","evidence_conjunction":"all_of","evidence_requirements":[{"evidence":{"evidence_kind":"logical_cancellation_no_continuing_effect","provider_contract_ref":{"contract_schema_id":"manyforge.value_schema.provider_contract.empty.v1","contract_schema_revision":"sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270","provider_contract_role_id":"gripper_logical_cancel"}},"evidence_item_id":"logical_cancel_fenced","observation_semantics":{"observation_kind":"command_result"},"source_requirement":{"freshness_budget_ns":100000000,"source_kind":"command_target_status"}}],"stage_kind":"nominal","stop_escalation_stage_id":"gripper_logical_cancel"}],"stop_evidence_policy_id":"manyforge.gripper_logical_cancellation"})POLICY");
+    const bool position_gripper = ros_gripper_actuation_kind == "position_commanded";
+    if (!position_gripper && ros_gripper_actuation_kind != "pneumatic")
+      throw std::logic_error("ROS gripper fixture has unknown authored actuation");
+    const std::string_view policy_id = position_gripper
+        ? "manyforge.gripper_position_cancellation"
+        : "manyforge.gripper_logical_cancellation";
+    auto policy_root = identity.root().as_object();
+    for (auto &[name, value] : policy_root) {
+      if (name == "stop_evidence_policy_id") value = CanonicalValue(std::string(policy_id));
+      if (name != "escalation_stages" || !position_gripper) continue;
+      auto stages = value.as_array();
+      auto hard = stages.front().as_object();
+      for (auto &[field, selected] : hard) {
+        if (field == "stage_kind" || field == "stop_escalation_stage_id")
+          selected = CanonicalValue("software_hard");
+        else if (field == "containment_command")
+          selected = CanonicalValue(CanonicalValue::Object{{"command", CanonicalValue(CanonicalValue::Object{
+              {"command_kind", CanonicalValue("registered")},
+              {"registered_command_kind_id", CanonicalValue("manyforge.stop.software_hard")},
+              {"provider_contract_ref", CanonicalValue(CanonicalValue::Object{
+                  {"provider_contract_role_id", CanonicalValue("software_hard_stop")},
+                  {"contract_schema_id", CanonicalValue("manyforge.value_schema.provider_contract.empty.v1")},
+                  {"contract_schema_revision", CanonicalValue(std::string(kEmptyProviderContractSchemaRevision))},
+              })},
+          })}});
+        else if (field == "evidence_requirements") {
+          auto requirements = selected.as_array();
+          auto requirement = requirements.front().as_object();
+          for (auto &[key, setting] : requirement)
+            if (key == "evidence_item_id") setting = CanonicalValue("hard_cancel_fenced");
+          requirements.front() = CanonicalValue(std::move(requirement));
+          selected = CanonicalValue(std::move(requirements));
+        }
+      }
+      stages.emplace_back(std::move(hard));
+      value = CanonicalValue(std::move(stages));
+    }
+    const auto stop_bytes = revisioned_document(
+        CanonicalValue(std::move(policy_root)), "catalog-record-revision/stop_evidence_policy",
+        core::kStopEvidencePolicyApiVersion, "stop_evidence_policy_revision");
+    const core::ContentDigest digest(sha256_digest(stop_bytes));
+    const core::ContentAddressedStoreKey key(catalog_key("stop", digest.value()));
+    const core::StopEvidencePolicyCatalogRecordRefDTO reference{
+        core::StopEvidencePolicyId(std::string(policy_id)),
+        core::StopEvidencePolicyRevision(revision_from_document(stop_bytes, "stop_evidence_policy_revision")),
+        core::SchemaId(std::string(core::kStopEvidencePolicyApiVersion)),
+        schema_revision_for(core::CatalogRecordKind::kStopEvidencePolicy), digest, key,
+    };
+    auto stop = resolve_and_qualify_stop_evidence_policy(reference, key, stop_bytes);
+    if (catalog.gripper_stop.has_value()) {
+      const auto old_key = catalog.gripper_stop->reference().content_addressed_store_key;
+      std::erase_if(catalog.artifacts, [&](const auto &artifact) { return artifact.store_key == old_key; });
+    }
+    catalog.artifacts.push_back(catalog_artifact(
+        "catalog://stop_policy/" + std::string(policy_id), stop_bytes, stop));
+    catalog.gripper_stop = std::move(stop);
+  }
+
+  const auto old_component_key =
+      catalog.component_type.reference().content_addressed_store_key;
+  catalog.artifacts.erase(
+      std::remove_if(catalog.artifacts.begin(), catalog.artifacts.end(),
+                     [&](const auto &artifact) {
+                       return artifact.store_key == old_component_key;
+                     }),
+      catalog.artifacts.end());
+  catalog.artifacts.push_back(
+      catalog_artifact("catalog://command_schema/gripper.command_position",
+                       command_schema_bytes, command_schema));
+  catalog.artifacts.push_back(
+      catalog_artifact("catalog://component_type/" + component_id,
+                       component_bytes, component_type));
+  catalog.artifacts.push_back(
+      catalog_artifact("catalog://control_interface/lite6_gripper_position",
+                       contract_bytes, contract));
+  catalog.artifacts.push_back(catalog_artifact(
+      "catalog://controller_topology/lite6_gripper_direct_topology",
+      topology_bytes, topology));
+  catalog.artifacts.push_back(
+      catalog_artifact("catalog://provider_manifest/" + std::string(gripper_provider_id),
+                       provider_bytes, provider));
+  catalog.component_type = std::move(component_type);
+  catalog.gripper_capability = std::move(gripper_capability);
+  catalog.gripper_command_schema = std::move(command_schema);
+  catalog.gripper_contract = std::move(contract);
+  catalog.gripper_topology = std::move(topology);
+  catalog.gripper_provider = std::move(provider);
+  return catalog;
+}
+
+[[nodiscard]] inline GraphRevisionVerifiedCellGraph make_graph(
+    const Lite6StructuralRetentionFixture &structural,
+    const QualifiedControlCatalog &catalog, std::size_t instance_count = 1U,
+    std::string_view cell_id = {},
+    std::string_view containment_granularity = "resource",
+    bool gripper_only = false,
+    std::optional<double> initial_joint1_position_rad = std::nullopt,
+    std::string_view ros_motion_limit_target_id = kLite6ArmTargetId,
+    const std::optional<CanonicalValue> &ros_default_fault_stop_profiles =
+        std::nullopt,
+    std::string_view first_ros_frame_prefix = {},
+    bool ros_mock_peers = true,
+    std::string_view empty_ros_configuration_field = {},
+    bool ros_mock_first = false,
+    void (*graph_input_mapper)(CanonicalValue::Object &) = nullptr,
+    std::string_view ros_gripper_actuation_kind = "pneumatic",
+    std::optional<double> ros_gripper_dwell_s = std::nullopt,
+    std::string_view ros_gripper_output_mode = "commanded") {
+  if (instance_count > 32U) {
+    throw std::logic_error(
+        "Lite6 control fixture instance count is outside its test bound");
+  }
+
+  CanonicalValue::Array model_instances;
+  CanonicalValue::Array runtime_units;
+  CanonicalValue::Array components;
+  CanonicalValue::Array domains;
+  CanonicalValue::Array bindings;
+  model_instances.reserve(instance_count);
+  runtime_units.reserve(instance_count);
+  components.reserve(instance_count);
+  domains.reserve(instance_count);
+  bindings.reserve(instance_count);
+
+  for (std::size_t instance = 0U; instance < instance_count; ++instance) {
+    const auto &component_type = catalog.component_type;
+    const std::string model_instance_id =
+        indexed_id(kLite6ControllableModelInstanceId, instance);
+    const std::string component_id =
+        indexed_id(kLite6ControllableComponentId, instance);
+    const std::string domain_id = indexed_id(kLite6ArmDomainId, instance);
+    const std::string binding_id = indexed_id(kLite6ArmBindingId, instance);
+    const std::string runtime_unit_id(kLite6Ros2ControlExecutionRuntimeId);
+    const std::string resource_prefix =
+        instance == 0U ? "lite6" : "lite6_" + std::to_string(instance + 1U);
+
+    CanonicalValue::Array resource_bindings;
+    for (std::size_t coordinate = 0U; coordinate < 6U; ++coordinate) {
+      resource_bindings.emplace_back(CanonicalValue::Object{
+          {"resource_role_id", CanonicalValue("joints")},
+          {"resource_id", CanonicalValue(resource_prefix + "_joint_" +
+                                         std::to_string(coordinate + 1U))},
+      });
+    }
+
+    model_instances.emplace_back(CanonicalValue::Object{
+        {"model_instance_id", CanonicalValue(model_instance_id)},
+        {"model_asset_id",
+         CanonicalValue(structural.catalog_reference.record_id.value())},
+        {"model_revision",
+         CanonicalValue(structural.catalog_reference.record_revision.value())},
+    });
+    runtime_units.emplace_back(CanonicalValue::Object{
+        {"runtime_unit_id", CanonicalValue(runtime_unit_id)},
+        {"runtime_profile_id",
+         CanonicalValue(
+             std::string(detail::kRos2ControlExecutionRuntimeProfileId))},
+        {"runtime_profile_revision",
+         CanonicalValue(
+             detail::ros2_control_execution_runtime_profile_revision())},
+        {"dependency_runtime_unit_ids",
+         CanonicalValue(CanonicalValue::Array{})},
+        {"configuration",
+         ros2_control_execution_configuration(
+             fixture_model_urdf(structural), ros_motion_limit_target_id, ros_default_fault_stop_profiles,
+             component_id, instance == 0U ? first_ros_frame_prefix : component_id + "/",
+             instance == 0U ? initial_joint1_position_rad : std::nullopt,
+             gripper_only, !gripper_only)},
+    });
+    CanonicalValue::Object component_row{
+        {"controllable_component_id", CanonicalValue(component_id)},
+        {"component_type_id",
+         CanonicalValue(
+             component_type.value().component_type_id.value())},
+        {"component_type_revision",
+         CanonicalValue(
+             component_type.value().component_type_revision.value())},
+        {"model_role_bindings",
+         CanonicalValue(
+             CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                 {"model_role_id", CanonicalValue("arm_model")},
+                 {"model_instance_id", CanonicalValue(model_instance_id)},
+             })})},
+        {"runtime_unit_ids", text_array({runtime_unit_id})},
+        {"root_pose_in_cell",
+         translated_pose(static_cast<double>(instance) * 2.0)},
+    };
+    // B5: the compiled default TCP, as the activation compiler writes it for
+    // a type whose one target declares a default.
+    std::vector<CanonicalValue> declared_defaults;
+    for (const auto &target : component_type.value().command_targets) {
+      if (target.default_tcp_frame_role_id.has_value())
+        declared_defaults.emplace_back(CanonicalValue::Object{
+            {"command_target_id",
+             CanonicalValue(target.command_target_id.value())},
+            {"frame_role_id",
+             CanonicalValue(target.default_tcp_frame_role_id->value())},
+        });
+    }
+    if (declared_defaults.size() == 1U)
+      component_row.emplace_back("default_tcp",
+                                 std::move(declared_defaults.front()));
+    components.emplace_back(std::move(component_row));
+    // A gripper-only cell installs the same component type with its arm
+    // target unbound: no arm domain, binding, route or planner.
+    if (!gripper_only) domains.emplace_back(CanonicalValue::Object{
+        {"control_domain_id", CanonicalValue(domain_id)},
+        {"control_domain_revision", CanonicalValue(std::string(kZeroDigest))},
+        {"runtime_unit_ids", text_array({runtime_unit_id})},
+        {"control_coordinator_endpoint_role", CanonicalValue("coordinator")},
+        {"controller_topology_id",
+         CanonicalValue(
+             catalog.topology.value().controller_topology_id.value())},
+        {"topology_revision",
+         CanonicalValue(catalog.topology.value().topology_revision.value())},
+        {"containment_granularity",
+         CanonicalValue(std::string(containment_granularity))},
+    });
+    CanonicalValue::Object arm_binding{
+        {"control_binding_id", CanonicalValue(binding_id)},
+        {"control_binding_revision", CanonicalValue(std::string(kZeroDigest))},
+        {"controllable_component_id", CanonicalValue(component_id)},
+        {"command_target_id", CanonicalValue(std::string(kLite6ArmTargetId))},
+        {"capability_id",
+         CanonicalValue(catalog.capability.value().capability_id.value())},
+        {"capability_definition_revision",
+         CanonicalValue(catalog.capability.value()
+                            .capability_definition_revision.value())},
+        {"control_domain_id", CanonicalValue(domain_id)},
+        {"resource_bindings", CanonicalValue(std::move(resource_bindings))},
+        {"control_interface_contract_id",
+         CanonicalValue(
+             catalog.contract.value().control_interface_contract_id.value())},
+        {"control_interface_revision",
+         CanonicalValue(
+             catalog.contract.value().control_interface_revision.value())},
+        {"controller_topology_id",
+         CanonicalValue(
+             catalog.topology.value().controller_topology_id.value())},
+        {"topology_revision",
+         CanonicalValue(catalog.topology.value().topology_revision.value())},
+        {"legal_control_route_ids", text_array({"arm_position"})},
+        {"route_endpoint_projections",
+         CanonicalValue(
+             CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                 {"control_route_id", CanonicalValue("arm_position")},
+                 {"command_endpoint_role_ids", text_array({"command"})},
+                 {"state_endpoint_role_ids", text_array({"state"})},
+             })})},
+        {"provider_instance_id",
+         CanonicalValue(indexed_id("lite6_arm_provider_instance", instance))},
+        {"provider_runtime_unit_id", CanonicalValue(runtime_unit_id)},
+        {"provider_manifest_id",
+         CanonicalValue(catalog.provider.value().provider_manifest_id.value())},
+        {"provider_manifest_revision",
+         CanonicalValue(
+             catalog.provider.value().provider_manifest_revision.value())},
+        {"state_authority_id",
+         CanonicalValue(indexed_id("lite6_commanded_sim_state", instance))},
+        {"state_authority_class", CanonicalValue("commanded")},
+        {"stop_evidence_policy_id",
+         CanonicalValue(catalog.stop.value().stop_evidence_policy_id.value())},
+        {"stop_evidence_policy_revision",
+         CanonicalValue(
+             catalog.stop.value().stop_evidence_policy_revision.value())},
+        {"containment_granularity",
+         CanonicalValue(std::string(containment_granularity))},
+    };
+    if (catalog.observed_state_capability.has_value() && !gripper_only) {
+      auto observed_binding = arm_binding;
+      for (auto &[name, value] : observed_binding) {
+        if (name == "control_binding_id") value = CanonicalValue(binding_id + "_observed_state");
+        else if (name == "capability_id") value = CanonicalValue(catalog.observed_state_capability->value().capability_id.value());
+        else if (name == "capability_definition_revision") value = CanonicalValue(catalog.observed_state_capability->value().capability_definition_revision.value());
+      }
+      bindings.emplace_back(std::move(observed_binding));
+    }
+    {
+      arm_binding.emplace_back(
+          "runtime_scale_route_qualifications",
+          CanonicalValue(
+              CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                  {"control_route_id", CanonicalValue("arm_position")},
+                  {"scaling_domain_id",
+                   CanonicalValue(indexed_id("lite6_native_scale", instance))},
+                  {"command_endpoint_role_id", CanonicalValue("command")},
+                  {"applied_state_endpoint_role_id", CanonicalValue("state")},
+                  {"acknowledgement_kind", CanonicalValue("applied_state")},
+                  {"maximum_slew_per_second", CanonicalValue(4.0)},
+                  {"freshness_budget_ns", CanonicalValue(100'000'000.0)},
+              })}));
+    }
+    if (!gripper_only) bindings.emplace_back(std::move(arm_binding));
+    if (gripper_only) {
+      const auto &gripper_capability = *catalog.gripper_capability;
+      const auto &gripper_contract = *catalog.gripper_contract;
+      const auto &gripper_topology = *catalog.gripper_topology;
+      const auto &gripper_provider = *catalog.gripper_provider;
+      const auto &gripper_stop = catalog.gripper_stop.has_value()
+                                     ? *catalog.gripper_stop
+                                     : catalog.stop;
+      domains.emplace_back(CanonicalValue::Object{
+          {"control_domain_id",
+           CanonicalValue(indexed_id(kLite6GripperDomainId, instance))},
+          {"control_domain_revision", CanonicalValue(std::string(kZeroDigest))},
+          {"runtime_unit_ids", text_array({runtime_unit_id})},
+          {"control_coordinator_endpoint_role", CanonicalValue("coordinator")},
+          {"controller_topology_id",
+           CanonicalValue(
+               gripper_topology.value().controller_topology_id.value())},
+          {"topology_revision",
+           CanonicalValue(gripper_topology.value().topology_revision.value())},
+          {"containment_granularity", CanonicalValue("resource")},
+      });
+      bindings.emplace_back(CanonicalValue::Object{
+          {"control_binding_id",
+           CanonicalValue(indexed_id(kLite6GripperBindingId, instance))},
+          {"control_binding_revision",
+           CanonicalValue(std::string(kZeroDigest))},
+          {"controllable_component_id", CanonicalValue(component_id)},
+          {"command_target_id",
+           CanonicalValue(std::string(kLite6GripperTargetId))},
+          {"capability_id",
+           CanonicalValue(gripper_capability.value().capability_id.value())},
+          {"capability_definition_revision",
+           CanonicalValue(gripper_capability.value()
+                              .capability_definition_revision.value())},
+          {"control_domain_id",
+           CanonicalValue(indexed_id(kLite6GripperDomainId, instance))},
+          {"resource_bindings",
+           CanonicalValue(
+               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                   {"resource_role_id", CanonicalValue("fingers")},
+                   {"resource_id", CanonicalValue(resource_prefix + "_gripper_joint")},
+               })})},
+          {"control_interface_contract_id",
+           CanonicalValue(
+               gripper_contract.value().control_interface_contract_id.value())},
+          {"control_interface_revision",
+           CanonicalValue(
+               gripper_contract.value().control_interface_revision.value())},
+          {"controller_topology_id",
+           CanonicalValue(
+               gripper_topology.value().controller_topology_id.value())},
+          {"topology_revision",
+           CanonicalValue(gripper_topology.value().topology_revision.value())},
+          {"legal_control_route_ids", text_array({"gripper_position"})},
+          {"route_endpoint_projections",
+           CanonicalValue(
+               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                   {"control_route_id", CanonicalValue("gripper_position")},
+                   {"command_endpoint_role_ids", text_array({"command"})},
+                   {"state_endpoint_role_ids", text_array({"state"})},
+               })})},
+          {"provider_instance_id",
+           CanonicalValue(indexed_id("lite6_gripper_provider_instance", instance))},
+          {"provider_runtime_unit_id", CanonicalValue(runtime_unit_id)},
+          {"provider_manifest_id",
+           CanonicalValue(
+               gripper_provider.value().provider_manifest_id.value())},
+          {"provider_manifest_revision",
+           CanonicalValue(
+               gripper_provider.value().provider_manifest_revision.value())},
+          {"state_authority_id",
+           CanonicalValue(indexed_id("lite6_gripper_commanded_state", instance))},
+          {"state_authority_class", CanonicalValue("commanded")},
+          {"stop_evidence_policy_id",
+           CanonicalValue(
+               gripper_stop.value().stop_evidence_policy_id.value())},
+          {"stop_evidence_policy_revision",
+           CanonicalValue(
+               gripper_stop.value().stop_evidence_policy_revision.value())},
+          {"containment_granularity", CanonicalValue("resource")},
+      });
+      if (catalog.gripper_feedback.has_value()) {
+        // The same physical owner/route, with a separately qualified source
+        // capability. No new actuator, worker or readiness bypass.
+        const auto &feedback = *catalog.gripper_feedback;
+        auto feedback_binding = bindings.back().as_object();
+        for (auto &[name, value] : feedback_binding) {
+          if (name == "control_binding_id") {
+            value = CanonicalValue(indexed_id("lite6_gripper_feedback", instance));
+          } else if (name == "capability_id") {
+            value = CanonicalValue(feedback.value().capability_id.value());
+          } else if (name == "capability_definition_revision") {
+            value = CanonicalValue(
+                feedback.value().capability_definition_revision.value());
+          }
+        }
+        bindings.emplace_back(std::move(feedback_binding));
+      }
+    }
+  }
+
+  {
+    for (std::size_t index = 0; index < runtime_units.size(); ++index) {
+      auto unit = runtime_units[index].as_object();
+      for (auto &[name, value] : unit) {
+        if (name != "configuration")
+          continue;
+        auto configuration = value.as_object();
+        for (auto &[field, selected] : configuration) {
+          if (field == empty_ros_configuration_field)
+            selected = CanonicalValue(CanonicalValue::Array{});
+          if (field == "gripper_target_configurations") {
+            auto rows = selected.as_array();
+            for (auto &row : rows) {
+              auto fields = row.as_object();
+              for (auto &[key, setting] : fields) {
+                if (key == "actuation_kind") setting = CanonicalValue(std::string(ros_gripper_actuation_kind));
+                if (key == "output_mode") setting = CanonicalValue(std::string(ros_gripper_output_mode));
+                if (key == "command_duration_s" && ros_gripper_dwell_s.has_value())
+                  setting = CanonicalValue(*ros_gripper_dwell_s);
+              }
+              row = CanonicalValue(std::move(fields));
+            }
+            selected = CanonicalValue(std::move(rows));
+          }
+          if (field == "controller_profiles" &&
+              ((ros_mock_peers && index > 0U) ||
+               (ros_mock_first && index == 0U))) {
+            auto profile = selected.as_array().front().as_object();
+            for (auto &[key, setting] : profile) {
+              if (key == "lane") setting = CanonicalValue("mock");
+              // The model's own `lanes.mock` row, as the compiler emits it.
+              if (key == "lane_row")
+                setting = CanonicalValue(
+                    R"({"adapter":"mock","arrival_tolerance_rad":0.01,"controller":"lite6_traj_controller",)"
+                    R"("gripper_result_timeout_s":5,"hard_stop_completion_timeout_s":1.5,)"
+                    R"("vendor":"xarm","vendor_model":"lite6"})");
+              if (key == "model_family_id") setting = CanonicalValue("lite6");
+            }
+            selected = CanonicalValue(
+                CanonicalValue::Array{CanonicalValue(std::move(profile))});
+          }
+        }
+        value = CanonicalValue(std::move(configuration));
+      }
+      runtime_units[index] = CanonicalValue(std::move(unit));
+    }
+  }
+
+  if (runtime_units.size() > 1U) {
+    auto grouped = runtime_units.front().as_object();
+    auto configuration = runtime_units.front().find_object_member("configuration")->as_object();
+    for (auto &[name, value] : configuration) {
+      if (name != "initial_joint_positions_rad" && name != "controller_profiles" &&
+          name != "motion_target_limits" && name != "default_fault_stop_profiles" &&
+          name != "gripper_target_configurations" && name != "component_streams") continue;
+      CanonicalValue::Array rows;
+      for (const auto &unit : runtime_units) {
+        const auto *items = unit.find_object_member("configuration")->find_object_member(name);
+        if (items != nullptr) rows.insert(rows.end(), items->as_array().begin(), items->as_array().end());
+      }
+      value = CanonicalValue(std::move(rows));
+    }
+    for (auto &[name, value] : grouped) {
+      if (name == "configuration") value = CanonicalValue(std::move(configuration));
+    }
+    runtime_units.clear();
+    runtime_units.emplace_back(std::move(grouped));
+  }
+
+  const std::string selected_cell_id =
+      cell_id.empty()
+          ? (gripper_only ? "i6_lite6_gripper_only_cell" : "i6_lite6_motion_cell")
+          : std::string(cell_id);
+  if (instance_count == 0U) {
+    const auto &profile = *catalog.ros2_control_execution_runtime_profile;
+    runtime_units.emplace_back(CanonicalValue::Object{
+        {"runtime_unit_id", CanonicalValue(std::string(kLite6Ros2ControlExecutionRuntimeId))},
+        {"runtime_profile_id", CanonicalValue(profile.value().runtime_profile_id.value())},
+        {"runtime_profile_revision", CanonicalValue(profile.value().runtime_profile_revision.value())},
+        {"dependency_runtime_unit_ids", CanonicalValue(CanonicalValue::Array{})},
+        {"configuration", ros2_control_execution_runtime_contract::empty_host_configuration()},
+    });
+  }
+  CanonicalValue::Object graph_members{
+      {"api_version", CanonicalValue(std::string(core::kCellGraphApiVersion))},
+      {"graph_revision", CanonicalValue(std::string(kZeroDigest))},
+      {"cell_id", CanonicalValue(selected_cell_id)},
+      {"runtime_units", CanonicalValue(std::move(runtime_units))},
+      {"model_instances", CanonicalValue(std::move(model_instances))},
+      {"controllable_components", CanonicalValue(std::move(components))},
+      {"control_domains", CanonicalValue(std::move(domains))},
+      {"control_bindings", CanonicalValue(std::move(bindings))},
+      {"component_attachments", CanonicalValue(CanonicalValue::Array{})},
+  };
+  if (graph_input_mapper != nullptr)
+    graph_input_mapper(graph_members);
+  const CanonicalValue graph(std::move(graph_members));
+  const auto intrinsic =
+      validate_intrinsic_cell_graph_candidate(decode_cell_graph_candidate(
+          parse_strict_json_model_yaml(canonical_json(graph))));
+  const QualifiedRuntimeProfile &execution_runtime_profile =
+      *catalog.ros2_control_execution_runtime_profile;
+  const std::span<const QualifiedRuntimeProfile> runtime_profiles(
+      &execution_runtime_profile, 1U);
+  return compute_graph_revision(
+      prepare_cell_graph_identity(intrinsic, runtime_profiles));
+}
+
+[[nodiscard]] inline RevisionVerifiedDeploymentApplicabilityInputs
+make_applicability_inputs(
+    const GraphRevisionVerifiedCellGraph &graph,
+    const QualifiedProviderManifest &provider,
+    std::span<const QualifiedCapabilityDefinition> planner_capabilities,
+    const QualifiedProviderManifest *planner_provider,
+    const AssistantOverlayFixture *assistant_overlay,
+    const bool composer_draft_enabled = false, const bool stoppable = false,
+    const bool qualified_motion_controlled_stop = false,
+    const std::optional<double> arm_max_stop_time_s = std::nullopt) {
+  CanonicalValue::Array desired_configurations;
+  desired_configurations.reserve(graph.graph().control_domains.size());
+  for (const auto &domain : graph.graph().control_domains) {
+    CanonicalValue::Array binding_routes;
+    for (const auto &binding : graph.graph().control_bindings) {
+      if (binding.control_domain_id != domain.control_domain_id) {
+        continue;
+      }
+      binding_routes.emplace_back(CanonicalValue::Object{
+          {"control_binding_id",
+           CanonicalValue(binding.control_binding_id.value())},
+          {"control_binding_revision",
+           CanonicalValue(binding.control_binding_revision.value())},
+          {"control_route_id",
+           CanonicalValue(binding.command_target_id.value() ==
+                                  kLite6GripperTargetId
+                              ? "gripper_position"
+                              : "arm_position")},
+      });
+    }
+    if (binding_routes.empty()) {
+      throw std::logic_error(
+          "Lite6 control fixture domain has no control binding");
+    }
+    desired_configurations.emplace_back(CanonicalValue::Object{
+        {"control_domain_id", CanonicalValue(domain.control_domain_id.value())},
+        {"control_domain_revision", CanonicalValue(domain.control_domain_revision.value())},
+        {"controller_topology_id",
+         CanonicalValue(domain.controller().controller_topology_id.value())},
+        {"topology_revision", CanonicalValue(domain.controller().topology_revision.value())},
+        {"activation_set_id",
+         CanonicalValue(
+             domain.controller().controller_topology_id.value() == "lite6_gripper_direct_topology"
+                 ? "gripper_direct"
+             : domain.controller().controller_topology_id.value() == "lite6_arm_direct_topology"
+                 ? "arm_direct"
+                 : "arm_chain")},
+        {"binding_routes", CanonicalValue(std::move(binding_routes))},
+    });
+  }
+  CanonicalValue::Array capability_provider_bindings;
+  if (planner_capabilities.empty() != (planner_provider == nullptr)) {
+    throw std::logic_error(
+        "Lite6 motion provider fixture is incomplete");
+  }
+  for (const auto &planner_capability : planner_capabilities) {
+    const std::string_view capability_id =
+        planner_capability.value().capability_id.value();
+    const std::string_view binding_id =
+        capability_id == "planning.motion.cartesian_path"
+            ? "lite6_cartesian_planner_binding"
+        : capability_id == "planning.motion.joint_goal"
+            ? "lite6_joint_planner_binding"
+        : capability_id == "planning.motion.pose_goal"
+            ? "lite6_pose_planner_binding"
+            : throw std::logic_error(
+                  "Lite6 motion fixture selected an unknown planner "
+                  "capability");
+    for (std::size_t index = 0U; index < graph.graph().control_bindings.size();
+         ++index) {
+      const auto &binding = graph.graph().control_bindings[index];
+      if (binding.command_target_id.value() != kLite6ArmTargetId ||
+          binding.capability_id.value() != "execution.trajectory.execute") {
+        continue;
+      }
+      const auto component =
+          std::find_if(graph.graph().controllable_components.begin(),
+                       graph.graph().controllable_components.end(),
+                       [&](const auto &candidate) {
+                         return candidate.controllable_component_id ==
+                                binding.controllable_component_id;
+                       });
+      if (component == graph.graph().controllable_components.end()) {
+        throw std::logic_error("Lite6 motion binding has no component");
+      }
+      if (component->runtime_unit_ids.size() != 1U) {
+        throw std::logic_error(
+            "Lite6 motion planner requires one exact execution "
+            "runtime owner");
+      }
+      const auto execution_runtime = std::find_if(
+          graph.graph().runtime_units.begin(),
+          graph.graph().runtime_units.end(), [&](const auto &candidate) {
+            return candidate.runtime_unit_id ==
+                   component->runtime_unit_ids.front();
+          });
+      if (execution_runtime == graph.graph().runtime_units.end()) {
+        throw std::logic_error(
+            "Lite6 motion planner has no exact execution runtime");
+      }
+      const std::string_view projection_endpoint_role =
+          detail::kRos2ControlExecutionRuntimeProjectionEndpointRoleId;
+      capability_provider_bindings.emplace_back(CanonicalValue::Object{
+          {"capability_provider_binding_id",
+           CanonicalValue(indexed_id(binding_id, index))},
+          {"capability_provider_binding_revision",
+           CanonicalValue(std::string(kZeroDigest))},
+          {"capability_id",
+           CanonicalValue(planner_capability.value().capability_id.value())},
+          {"capability_definition_revision",
+           CanonicalValue(planner_capability.value()
+                              .capability_definition_revision.value())},
+          {"scope", CanonicalValue("target_binding")},
+          {"target",
+           CanonicalValue(CanonicalValue::Object{
+               {"controllable_component_id",
+                CanonicalValue(binding.controllable_component_id.value())},
+               {"component_type_revision",
+                CanonicalValue(component->component_type_revision.value())},
+               {"command_target_id",
+                CanonicalValue(binding.command_target_id.value())},
+               {"control_binding_id",
+                CanonicalValue(binding.control_binding_id.value())},
+               {"control_binding_revision",
+                CanonicalValue(binding.control_binding_revision.value())},
+           })},
+          {"provider_instance_id",
+           CanonicalValue(indexed_id(
+               planner_provider->value().provider_manifest_id.value(), index))},
+          {"provider_manifest_id",
+           CanonicalValue(
+               planner_provider->value().provider_manifest_id.value())},
+          {"provider_manifest_revision",
+           CanonicalValue(
+               planner_provider->value().provider_manifest_revision.value())},
+          {"endpoint_bindings",
+           CanonicalValue(CanonicalValue::Array{
+               CanonicalValue(CanonicalValue::Object{
+                   {"endpoint_role_id",
+                    CanonicalValue(std::string(projection_endpoint_role))},
+                   {"source_kind", CanonicalValue("runtime_unit")},
+                   {"source_id",
+                    CanonicalValue(
+                        component->runtime_unit_ids.front().value())},
+                   {"source_endpoint_role_id",
+                    CanonicalValue(std::string(projection_endpoint_role))},
+               }),
+           })},
+      });
+    }
+  }
+
+  CanonicalValue::Object root_members{
+      {"api_version", CanonicalValue("manyforge.deployment.v1")},
+      {"desired_control_configurations",
+       CanonicalValue(std::move(desired_configurations))},
+      {"capability_provider_bindings",
+       CanonicalValue(std::move(capability_provider_bindings))},
+  };
+  if (stoppable) {
+    CanonicalValue::Array stop_stage_parameters;
+    if (stoppable) {
+      for (const auto &binding : graph.graph().control_bindings) {
+        const auto domain = std::find_if(
+            graph.graph().control_domains.begin(),
+            graph.graph().control_domains.end(), [&](const auto &candidate) {
+              return candidate.control_domain_id == binding.control_domain_id;
+            });
+        if (domain == graph.graph().control_domains.end()) {
+          throw std::logic_error(
+              "Lite6 Stop parameter binding has no exact control domain");
+        }
+        for (const auto &route_id : binding.legal_control_route_ids) {
+          if (binding.stop_evidence_policy_id.value() == "manyforge.gripper_logical_cancellation" ||
+              binding.stop_evidence_policy_id.value() == "manyforge.gripper_position_cancellation") {
+            stop_stage_parameters.emplace_back(CanonicalValue::Object{
+                {"control_domain_id", CanonicalValue(domain->control_domain_id.value())},
+                {"control_domain_revision", CanonicalValue(domain->control_domain_revision.value())},
+                {"control_binding_id", CanonicalValue(binding.control_binding_id.value())},
+                {"control_binding_revision", CanonicalValue(binding.control_binding_revision.value())},
+                {"controller_topology_id", CanonicalValue(binding.controller_topology_id.value())},
+                {"topology_revision", CanonicalValue(binding.topology_revision.value())},
+                {"control_route_id", CanonicalValue(route_id.value())},
+                {"stop_evidence_policy_id", CanonicalValue(binding.stop_evidence_policy_id.value())},
+                {"stop_evidence_policy_revision", CanonicalValue(binding.stop_evidence_policy_revision.value())},
+                {"stop_escalation_stage_id", CanonicalValue("gripper_logical_cancel")},
+                {"provider_contract_ref", CanonicalValue(CanonicalValue::Object{
+                    {"provider_contract_role_id", CanonicalValue("gripper_logical_cancel")},
+                    {"contract_schema_id", CanonicalValue("manyforge.value_schema.provider_contract.empty.v1")},
+                    {"contract_schema_revision", CanonicalValue(std::string(kEmptyProviderContractSchemaRevision))},
+                })},
+                {"default_contract_parameters", CanonicalValue(CanonicalValue::Object{})},
+            });
+            if (binding.stop_evidence_policy_id.value() == "manyforge.gripper_position_cancellation") {
+              auto hard = stop_stage_parameters.back().as_object();
+              for (auto &[name, value] : hard) {
+                if (name == "stop_escalation_stage_id") value = CanonicalValue("software_hard");
+                if (name == "provider_contract_ref") {
+                  auto contract = value.as_object();
+                  for (auto &[field, selected] : contract)
+                    if (field == "provider_contract_role_id") selected = CanonicalValue("software_hard_stop");
+                  value = CanonicalValue(std::move(contract));
+                }
+              }
+              stop_stage_parameters.emplace_back(std::move(hard));
+            }
+            continue;
+          }
+          if (qualified_motion_controlled_stop &&
+              binding.command_target_id.value() == kLite6ArmTargetId) {
+            CanonicalValue::Array resource_limits;
+            resource_limits.reserve(binding.resource_bindings.size());
+            for (const auto &resource : binding.resource_bindings) {
+              resource_limits.emplace_back(CanonicalValue::Object{
+                  {"resource_id", CanonicalValue(resource.resource_id.value())},
+                  {"max_deceleration",
+                   CanonicalValue(CanonicalValue::Object{
+                       {"coordinate_kind", CanonicalValue("angular_rad_s2")},
+                       {"value_rad_s2", CanonicalValue(4.0)},
+                   })},
+                  {"settle_velocity_threshold",
+                   CanonicalValue(CanonicalValue::Object{
+                       {"coordinate_kind", CanonicalValue("angular_rad_s")},
+                       {"value_rad_s", CanonicalValue(0.01)},
+                   })},
+              });
+            }
+            CanonicalValue::Object arm_parameters{
+                {"stop_mode", CanonicalValue("soft_on_path")},
+                {"jerk_limits_enabled", CanonicalValue(true)},
+                {"deceleration_time_s", CanonicalValue(1.0)},
+                {"recoverable_substitution_mode",
+                 CanonicalValue("spring_back_hold")},
+                {"per_resource_limits",
+                 CanonicalValue(std::move(resource_limits))},
+                {"allow_natural_completion_on_short_path",
+                 CanonicalValue(true)},
+            };
+            // Q51: the robot's own explicit maximum Stop time, when authored.
+            if (arm_max_stop_time_s.has_value()) {
+              arm_parameters.emplace_back("max_stop_time_s",
+                                          CanonicalValue(*arm_max_stop_time_s));
+            }
+            stop_stage_parameters.emplace_back(CanonicalValue::Object{
+                {"control_domain_id",
+                 CanonicalValue(binding.control_domain_id.value())},
+                {"control_domain_revision",
+                 CanonicalValue(domain->control_domain_revision.value())},
+                {"control_binding_id",
+                 CanonicalValue(binding.control_binding_id.value())},
+                {"control_binding_revision",
+                 CanonicalValue(binding.control_binding_revision.value())},
+                {"controller_topology_id",
+                 CanonicalValue(binding.controller_topology_id.value())},
+                {"topology_revision",
+                 CanonicalValue(binding.topology_revision.value())},
+                {"control_route_id", CanonicalValue(route_id.value())},
+                {"stop_evidence_policy_id",
+                 CanonicalValue(binding.stop_evidence_policy_id.value())},
+                {"stop_evidence_policy_revision",
+                 CanonicalValue(binding.stop_evidence_policy_revision.value())},
+                {"stop_escalation_stage_id", CanonicalValue("nominal")},
+                {"provider_contract_ref",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"provider_contract_role_id",
+                      CanonicalValue("stop_contract")},
+                     {"contract_schema_id",
+                      CanonicalValue(std::string(
+                          core::kMotionControlledStopContractSchemaId))},
+                     {"contract_schema_revision",
+                      CanonicalValue(std::string(
+                          core::kMotionControlledStopContractSchemaRevision))},
+                 })},
+                {"default_contract_parameters",
+                 CanonicalValue(std::move(arm_parameters))},
+            });
+          }
+          stop_stage_parameters.emplace_back(CanonicalValue::Object{
+              {"control_domain_id",
+               CanonicalValue(binding.control_domain_id.value())},
+              {"control_domain_revision",
+               CanonicalValue(domain->control_domain_revision.value())},
+              {"control_binding_id",
+               CanonicalValue(binding.control_binding_id.value())},
+              {"control_binding_revision",
+               CanonicalValue(binding.control_binding_revision.value())},
+              {"controller_topology_id",
+               CanonicalValue(binding.controller_topology_id.value())},
+              {"topology_revision",
+               CanonicalValue(binding.topology_revision.value())},
+              {"control_route_id", CanonicalValue(route_id.value())},
+              {"stop_evidence_policy_id",
+               CanonicalValue(binding.stop_evidence_policy_id.value())},
+              {"stop_evidence_policy_revision",
+               CanonicalValue(binding.stop_evidence_policy_revision.value())},
+              {"stop_escalation_stage_id", CanonicalValue("software_hard")},
+              {"provider_contract_ref", software_hard_provider_contract_ref()},
+              {"default_contract_parameters",
+               CanonicalValue(CanonicalValue::Object{})},
+          });
+        }
+      }
+    }
+    root_members.emplace_back(
+        "policies",
+        CanonicalValue(CanonicalValue::Object{
+            {"retained_policy_records", CanonicalValue(CanonicalValue::Array{})},
+            {"stop_stage_parameters",
+             CanonicalValue(std::move(stop_stage_parameters))},
+            {"commissioned_stop_interfaces",
+             CanonicalValue(CanonicalValue::Array{})},
+        }));
+  }
+  if (assistant_overlay != nullptr) {
+    root_members.emplace_back("assistant",
+                              assistant_source(composer_draft_enabled));
+    root_members.emplace_back(
+        "external_resources",
+        CanonicalValue(CanonicalValue::Array{
+            assistant_external_resource("assistant_bridge", "service_endpoint",
+                                        "resources.assistant_bridge", provider),
+            assistant_external_resource("assistant_model", "model_endpoint",
+                                        "resources.assistant_model", provider),
+        }));
+    root_members.emplace_back(
+        "site_overlay_ref",
+        CanonicalValue(CanonicalValue::Object{
+            {"non_secret_digest",
+             CanonicalValue(
+                 assistant_overlay->reference.non_secret_digest.value())},
+            {"site_overlay_id",
+             CanonicalValue(
+                 assistant_overlay->reference.site_overlay_id.value())},
+            {"site_overlay_revision",
+             CanonicalValue(
+                 assistant_overlay->reference.site_overlay_revision.value())},
+        }));
+  }
+  const CanonicalValue root(std::move(root_members));
+  return compute_capability_provider_binding_revisions(
+      decode_deployment_applicability_inputs_candidate(
+          parse_strict_json_model_yaml(canonical_json(root))));
+}
+
+} // namespace lite6_controllable_fixture_detail
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_controllable_retention_fixture(
+    bool chained = false, bool assistant_enabled = false,
+    std::size_t instance_count = 1U, std::string_view cell_id = {},
+    bool composer_draft_enabled = false, bool stoppable = false,
+    std::string_view containment_granularity = "resource",
+    bool qualified_motion_controlled_stop = false,
+    std::string_view arm_lifecycle_semantic_digest = {},
+    std::string_view gripper_lifecycle_semantic_digest = {},
+    bool gripper_feedback = false, bool gripper_only = false,
+    std::optional<double> initial_joint1_position_rad = std::nullopt,
+    std::string_view ros_motion_limit_target_id = kLite6ArmTargetId,
+    const std::optional<CanonicalValue> &ros_default_fault_stop_profiles =
+        std::nullopt,
+    const std::optional<double> arm_max_stop_time_s = std::nullopt,
+    std::string_view first_ros_frame_prefix = {},
+    bool ros_mock_peers = true,
+    std::string_view empty_ros_configuration_field = {},
+    std::string_view direct_provider_id = "lite6_arm_provider",
+    bool include_lifecycle_recover = false, bool ros_mock_first = false,
+    const Lite6StructuralRetentionFixture *structural_override = nullptr,
+    void (*graph_input_mapper)(CanonicalValue::Object &) = nullptr,
+    bool include_observed_state = false,
+    std::string_view ros_gripper_actuation_kind = "pneumatic",
+    std::optional<double> ros_gripper_dwell_s = std::nullopt,
+    std::string_view ros_gripper_output_mode = "commanded",
+    void (*component_input_mapper)(CanonicalValue::Object &) = nullptr,
+    const CanonicalValue *interrupt_policy_configuration = nullptr,
+    bool associate_arm_tcp_contact_bodies = false,
+    bool shared_arm_endpoint_bodies = false) {
+  namespace fixture_detail = lite6_controllable_fixture_detail;
+  // A gripper-only component is a separate tool with its own model: it
+  // always comes with its own structural override and role mapping.
+  if (gripper_only != (component_input_mapper != nullptr) ||
+      (gripper_only && (structural_override == nullptr || chained ||
+                        instance_count != 1U || !stoppable ||
+                        !qualified_motion_controlled_stop))) {
+    throw std::logic_error(
+        "gripper-only fixture requires one stoppable tool with its own model");
+  }
+  if (composer_draft_enabled && !assistant_enabled) {
+    throw std::logic_error(
+        "Composer Draft fixture requires assistant settings");
+  }
+  if (gripper_feedback && !gripper_only) {
+    throw std::logic_error(
+        "gripper feedback fixture requires the gripper-only owner");
+  }
+  // DX823: the existing chained catalog can qualify retained metadata on a
+  // genuine ROS source. This fixture does not qualify chained runtime Stop.
+  if (chained && stoppable) {
+    throw std::logic_error(
+        "ROS chained catalog fixture does not qualify runtime Stop");
+  }
+  if (qualified_motion_controlled_stop &&
+      (!stoppable || chained || instance_count != 1U)) {
+    throw std::logic_error(
+        "qualified controlled-Stop fixture requires one direct stoppable "
+        "arm");
+  }
+  auto structural = structural_override == nullptr
+                        ? make_lite6_structural_retention_fixture()
+                        : *structural_override;
+  auto catalog = fixture_detail::qualify_control_catalog(
+      chained, stoppable, containment_granularity,
+      qualified_motion_controlled_stop, arm_lifecycle_semantic_digest,
+      direct_provider_id,
+      include_lifecycle_recover, include_observed_state,
+      associate_arm_tcp_contact_bodies, shared_arm_endpoint_bodies);
+  if (gripper_only) {
+    catalog = fixture_detail::add_gripper_only_catalog(
+        std::move(catalog), stoppable, gripper_lifecycle_semantic_digest,
+        gripper_feedback, ros_gripper_actuation_kind, component_input_mapper);
+  }
+  const auto graph = fixture_detail::make_graph(
+      structural, catalog, instance_count, cell_id, containment_granularity,
+      gripper_only, initial_joint1_position_rad,
+      ros_motion_limit_target_id, ros_default_fault_stop_profiles,
+      first_ros_frame_prefix, ros_mock_peers,
+      empty_ros_configuration_field, ros_mock_first, graph_input_mapper,
+      ros_gripper_actuation_kind, ros_gripper_dwell_s, ros_gripper_output_mode);
+  const std::optional<fixture_detail::AssistantOverlayFixture>
+      assistant_overlay =
+          assistant_enabled
+              ? std::optional<fixture_detail::AssistantOverlayFixture>(
+                    fixture_detail::make_assistant_overlay())
+              : std::nullopt;
+  const auto inputs = fixture_detail::make_applicability_inputs(
+      graph, catalog.provider,
+      gripper_only ? std::span<const QualifiedCapabilityDefinition>{}
+                   : std::span<const QualifiedCapabilityDefinition>{
+                         catalog.planner_capabilities},
+      !gripper_only && catalog.planner_provider.has_value()
+          ? &*catalog.planner_provider
+          : nullptr,
+      assistant_overlay.has_value() ? &*assistant_overlay : nullptr,
+      composer_draft_enabled, stoppable, qualified_motion_controlled_stop,
+      arm_max_stop_time_s);
+
+  // A gripper-only component type declares only its gripper target. Arm and
+  // planner capabilities have no selected provider or graph binding here.
+  std::vector<core::CatalogRecordRefDTO> catalog_records{
+      structural.catalog_reference, catalog.component_type.reference()};
+  if (!gripper_only) {
+    catalog_records.push_back(catalog.capability.reference());
+    catalog_records.push_back(catalog.contract.reference());
+    catalog_records.push_back(catalog.topology.reference());
+    catalog_records.push_back(catalog.provider.reference());
+    catalog_records.push_back(catalog.stop.reference());
+  }
+  if (catalog.gripper_capability.has_value()) {
+    catalog_records.push_back(catalog.gripper_capability->reference());
+    catalog_records.push_back(catalog.gripper_command_schema->reference());
+    catalog_records.push_back(catalog.gripper_contract->reference());
+    catalog_records.push_back(catalog.gripper_topology->reference());
+    catalog_records.push_back(catalog.gripper_provider->reference());
+  }
+  if (catalog.gripper_stop.has_value()) {
+    catalog_records.push_back(catalog.gripper_stop->reference());
+  }
+  if (catalog.gripper_feedback.has_value())
+    catalog_records.push_back(catalog.gripper_feedback->reference());
+  if (catalog.observed_state_capability.has_value())
+    catalog_records.push_back(catalog.observed_state_capability->reference());
+  if (!gripper_only) {
+    for (const auto &planner_capability : catalog.planner_capabilities) {
+      catalog_records.push_back(planner_capability.reference());
+    }
+  }
+  for (const auto &lifecycle_capability : catalog.lifecycle_capabilities) {
+    catalog_records.push_back(lifecycle_capability.reference());
+  }
+  if (!catalog.planner_capabilities.empty() && !gripper_only) {
+    catalog_records.push_back(catalog.planner_provider->reference());
+  }
+  if (catalog.ros2_control_execution_runtime_profile.has_value()) {
+    catalog_records.push_back(
+        catalog.ros2_control_execution_runtime_profile->reference());
+  }
+  if (instance_count == 0U) {
+    catalog_records = {catalog.ros2_control_execution_runtime_profile->reference()};
+  }
+  CanonicalValue::Object deployment_graph = graph.normalized_root().as_object();
+  deployment_graph.erase(
+      std::remove_if(deployment_graph.begin(), deployment_graph.end(),
+                     [](const auto &member) {
+                       return member.first == "api_version" ||
+                              member.first == "graph_revision" ||
+                              member.first == "cell_id";
+                     }),
+      deployment_graph.end());
+  CanonicalValue::Object deployment_members{
+      {"api_version", CanonicalValue("manyforge.deployment.v1")},
+      {"deployment_artifact_id",
+       CanonicalValue(gripper_only ? "i6_lite6_gripper_only_fixture"
+                                   : "i6_lite6_motion_fixture")},
+      {"deployment_revision",
+       CanonicalValue(std::string(fixture_detail::kZeroDigest))},
+      {"cell_id", CanonicalValue(graph.graph().cell_id.value())},
+      {"name",
+       CanonicalValue(gripper_only ? "I6 Lite6 gripper-only fixture"
+                                   : "I6 Lite6 addressed motion fixture")},
+      {"catalogs", detail::encode_deployment_catalogs(catalog_records)},
+      {"graph", CanonicalValue(std::move(deployment_graph))},
+      {"desired_control_configurations",
+       inputs.normalized_desired_control_configurations()},
+      {"capability_provider_bindings",
+       inputs.normalized_capability_provider_bindings()},
+  };
+  if (structural_override != nullptr) {
+    for (auto &[name, value] : deployment_members) {
+      if (name == "deployment_artifact_id")
+        value = CanonicalValue(structural.catalog_reference.record_id.value() +
+                               (gripper_only ? "_gripper_only_ros_fixture"
+                                             : "_arm_only_ros_fixture"));
+      else if (name == "name")
+        value = CanonicalValue(structural.catalog_reference.record_id.value() +
+                               (gripper_only ? " gripper-only ROS fixture"
+                                             : " arm-only ROS fixture"));
+    }
+  }
+  if (inputs.normalized_policies().has_value()) {
+    deployment_members.emplace_back("policies", *inputs.normalized_policies());
+  }
+  if (assistant_enabled) {
+    deployment_members.emplace_back(
+        "assistant", inputs.assistant_settings().normalized_source());
+    deployment_members.emplace_back("external_resources",
+                                    inputs.normalized_external_resources());
+    deployment_members.emplace_back("site_overlay_ref",
+                                    *inputs.normalized_site_overlay_ref());
+  }
+  if (interrupt_policy_configuration != nullptr) {
+    for (auto &[name, value] : deployment_members) {
+      if (name != "policies")
+        continue;
+      auto policies = value.as_object();
+      if (const auto *rules =
+              interrupt_policy_configuration->find_object_member(
+                  "interrupt_rules")) {
+        const auto existing = std::find_if(
+            policies.begin(), policies.end(),
+            [](const auto &field) { return field.first == "interrupt_rules"; });
+        if (existing == policies.end())
+          policies.emplace_back("interrupt_rules", *rules);
+        else
+          existing->second = *rules;
+      }
+      value = CanonicalValue(std::move(policies));
+    }
+  }
+  const CanonicalValue deployment_value(std::move(deployment_members));
+  std::vector<QualifiedRuntimeProfile> runtime_profiles;
+  if (catalog.ros2_control_execution_runtime_profile.has_value()) {
+    runtime_profiles.push_back(*catalog.ros2_control_execution_runtime_profile);
+  }
+  const auto deployment = compute_deployment_artifact_revision(
+      parse_strict_json_model_yaml(canonical_json(deployment_value)),
+      runtime_profiles);
+
+  const std::array<SourceVerifiedModelAsset, 1U> assets{
+      structural.verified_asset};
+  std::vector<QualifiedComponentType> component_types{catalog.component_type};
+  const auto composition =
+      compose_cell_occurrences(
+          deployment.graph(),
+          instance_count == 0U
+              ? std::span<const SourceVerifiedModelAsset>{}
+              : std::span<const SourceVerifiedModelAsset>{assets},
+          instance_count == 0U
+              ? std::span<const QualifiedComponentType>{}
+              : std::span<const QualifiedComponentType>{component_types});
+  const std::optional<VerifiedSiteOverlayArtifactProjection>
+      verified_assistant_overlay =
+          assistant_overlay.has_value()
+              ? std::optional<VerifiedSiteOverlayArtifactProjection>(
+                    resolve_and_verify_site_overlay_artifact_projection(
+                        assistant_overlay->reference, assistant_overlay->bytes))
+              : std::nullopt;
+  const auto overlay = select_site_overlay_for_deployment(
+      deployment.applicability_inputs().value().site_overlay_ref,
+      deployment.applicability_inputs().value().external_resources,
+      verified_assistant_overlay.has_value() ? &*verified_assistant_overlay
+                                             : nullptr);
+  std::vector<QualifiedCommandSchema> command_schemas;
+  std::vector<QualifiedCapabilityDefinition> capabilities;
+  if (!gripper_only) capabilities.push_back(catalog.capability);
+  if (!gripper_only && catalog.observed_state_capability.has_value())
+    capabilities.push_back(*catalog.observed_state_capability);
+  std::vector<QualifiedControlInterfaceContract> contracts;
+  std::vector<QualifiedControllerTopology> topologies;
+  std::vector<QualifiedProviderManifest> providers;
+  if (!gripper_only) {
+    contracts.push_back(catalog.contract);
+    topologies.push_back(catalog.topology);
+    providers.push_back(catalog.provider);
+  }
+  if (catalog.gripper_feedback.has_value())
+    capabilities.push_back(*catalog.gripper_feedback);
+  if (catalog.gripper_capability.has_value()) {
+    command_schemas.push_back(*catalog.gripper_command_schema);
+    capabilities.push_back(*catalog.gripper_capability);
+    contracts.push_back(*catalog.gripper_contract);
+    topologies.push_back(*catalog.gripper_topology);
+    providers.push_back(*catalog.gripper_provider);
+  }
+  if (!gripper_only) {
+    capabilities.insert(capabilities.end(), catalog.planner_capabilities.begin(),
+                        catalog.planner_capabilities.end());
+  }
+  capabilities.insert(capabilities.end(),
+                      catalog.lifecycle_capabilities.begin(),
+                      catalog.lifecycle_capabilities.end());
+  if (!catalog.planner_capabilities.empty() && !gripper_only) {
+    providers.push_back(*catalog.planner_provider);
+  }
+  std::vector<QualifiedStopEvidencePolicy> stop_policies;
+  if (!gripper_only) {
+    stop_policies.push_back(catalog.stop);
+  }
+  if (catalog.gripper_stop.has_value()) {
+    stop_policies.push_back(*catalog.gripper_stop);
+  }
+  if (instance_count == 0U) {
+    command_schemas.clear();
+    capabilities.clear();
+    contracts.clear();
+    topologies.clear();
+    providers.clear();
+    stop_policies.clear();
+  }
+  std::map<std::pair<std::string, std::string>, BuildQualifiedValueSchemaEntry>
+      selected_value_schema_map;
+  const auto &applicability_inputs = deployment.applicability_inputs().value();
+  const auto &schema_registry = build_qualified_closed_schema_registry();
+  for (const auto &row : applicability_inputs.stop_stage_parameters) {
+    const auto &contract = row.provider_contract_ref;
+    const auto *schema = schema_registry.find_qualified_value_schema(
+        contract.contract_schema_id, contract.contract_schema_revision);
+    if (schema == nullptr) {
+      throw std::logic_error("Lite6 control fixture has no exact "
+                             "build-qualified Stop value schema");
+    }
+    selected_value_schema_map.emplace(
+        std::pair{contract.contract_schema_id.value(),
+                  contract.contract_schema_revision.value()},
+        *schema);
+  }
+  std::vector<BuildQualifiedValueSchemaEntry> selected_value_schemas;
+  selected_value_schemas.reserve(selected_value_schema_map.size());
+  for (const auto &[_, schema] : selected_value_schema_map) {
+    selected_value_schemas.push_back(schema);
+  }
+  if (!applicability_inputs.commissioned_stop_interfaces.empty()) {
+    throw std::logic_error("Lite6 control fixture does not declare a "
+                           "commissioned safety Stop stage");
+  }
+  const auto applicability = qualify_cell_applicability(
+      composition, deployment.applicability_inputs(), runtime_profiles,
+      command_schemas, capabilities, contracts, topologies,
+      providers, stop_policies, selected_value_schemas,
+      std::span<const QualifiedCommissioningEvidenceRef>{}, overlay);
+  auto qualified = qualify_deployment_for_retention(
+      deployment, compile_cell_ir(applicability));
+
+  return {
+      std::move(structural),
+      std::move(catalog.capability),
+      std::move(catalog.component_type),
+      std::move(catalog.contract),
+      std::move(catalog.topology),
+      std::move(catalog.provider),
+      std::move(catalog.stop),
+      std::move(catalog.artifacts),
+      std::move(qualified),
+      std::move(catalog.gripper_capability),
+      std::move(catalog.gripper_command_schema),
+      std::move(catalog.gripper_contract),
+      std::move(catalog.gripper_topology),
+      std::move(catalog.gripper_provider),
+      std::move(catalog.planner_capabilities),
+      std::move(catalog.planner_provider),
+      std::move(catalog.ros2_control_execution_runtime_profile),
+  };
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_chained_controllable_retention_fixture() {
+  return make_lite6_controllable_retention_fixture(true);
+}
+
+/// DX823: genuine ROS source plus existing two-controller catalog/sealer data.
+/// No controller launch, chained runtime, or Stop qualification is claimed.
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_ros2_control_chained_catalog_retention_fixture() {
+  return make_lite6_controllable_retention_fixture(
+      true, false, 1U, {}, false, false, "resource", false, {}, {}, false, false, std::nullopt, kLite6ArmTargetId, std::nullopt,
+      std::nullopt, {}, true, {}, "manyforge.provider.ros2_control", false,
+      true);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_stoppable_controllable_retention_fixture(
+    std::string_view containment_granularity = "resource") {
+  return make_lite6_controllable_retention_fixture(
+      false, false, 1U, {}, false, true, containment_granularity);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_two_lite6_same_type_controllable_retention_fixture() {
+  return make_lite6_controllable_retention_fixture(false, false, 2U);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_assistant_retention_fixture() {
+  return make_lite6_controllable_retention_fixture(false, true);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_composer_assistant_retention_fixture() {
+  return make_lite6_controllable_retention_fixture(false, true, 2U, {}, true);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_ros2_control_motion_retention_fixture(
+    bool stoppable = false,
+    std::string_view motion_limit_target_id = kLite6ArmTargetId,
+    const std::optional<CanonicalValue> &default_fault_stop_profiles =
+        std::nullopt,
+    std::string_view lifecycle_semantic_digest = {},
+    std::string_view provider_id = "lite6_arm_provider",
+    bool include_lifecycle_recover = false) {
+  return make_lite6_controllable_retention_fixture(
+      false, false, 1U, {}, false, stoppable, "resource", false,
+      lifecycle_semantic_digest, {}, false, false, std::nullopt,
+      motion_limit_target_id, default_fault_stop_profiles, std::nullopt, {},
+      true, {}, provider_id, include_lifecycle_recover);
+}
+
+/// Actual ROS controlled-Stop arm.
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_stop_qualified_ros_motion_retention_fixture(
+    const std::optional<double> arm_max_stop_time_s = std::nullopt) {
+  return make_lite6_controllable_retention_fixture(
+      false, false, 1U, {}, false, true, "resource", true, {}, {}, false, false, std::nullopt, kLite6ArmTargetId, std::nullopt,
+      arm_max_stop_time_s, {}, true, {}, "manyforge.provider.ros2_control",
+      false, true);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_ros2_control_composer_assistant_retention_fixture() {
+  return make_lite6_controllable_retention_fixture(
+      false, true, 1U, {}, true, false, "resource", false,
+      {}, {}, false, false, std::nullopt, kLite6ArmTargetId,
+      std::nullopt, std::nullopt, {}, true, {},
+      "lite6_arm_provider", false, true);
+}
+
+/// Explicit offline ROS compiler fixture for shared retained consumers.
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_ros2_control_shared_consumer_retention_fixture(
+    std::string_view cell_id = {}, std::size_t instance_count = 1U,
+    bool stoppable = false) {
+  return make_lite6_controllable_retention_fixture(
+      false, false, instance_count, cell_id, false,
+      stoppable, "resource", stoppable, {}, {}, false, false,
+      std::nullopt, kLite6ArmTargetId, std::nullopt, std::nullopt,
+      {}, true, {}, "manyforge.provider.ros2_control", false, true);
+}
+
+/// Genuine ROS execution owner with a distinct retained read-only StateObserved binding.
+/// This qualifies compiler/binding inputs, not actual state transport.
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_ros2_control_observed_consumer_retention_fixture(
+    bool associate_tcp_contact_bodies = false,
+    bool shared_arm_endpoint_bodies = false) {
+  return make_lite6_controllable_retention_fixture(
+      false, false, 1U, {}, false, false, "resource",
+      false, {}, {}, false, false, std::nullopt, kLite6ArmTargetId,
+      std::nullopt, std::nullopt, {}, true, {},
+      "manyforge.provider.ros2_control", false, true, nullptr, nullptr, true,
+      "pneumatic", std::nullopt, "commanded", nullptr, nullptr,
+      associate_tcp_contact_bodies, shared_arm_endpoint_bodies);
+}
+
+/// Same retained observed-state fixture with endpoint-associated contact body
+/// metadata on its model TCP, for compiler compatibility tests.
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_ros2_control_observed_endpoint_consumer_retention_fixture(
+    bool shared_arm_endpoint_bodies = false) {
+  return make_lite6_ros2_control_observed_consumer_retention_fixture(
+      true, shared_arm_endpoint_bodies);
+}
+
+class Lite6ControllableCompilerInputArtifactSource final
+    : public detail::ICompilerInputArtifactSource {
+public:
+  explicit Lite6ControllableCompilerInputArtifactSource(
+      const Lite6ControllableRetentionFixture &fixture) {
+    add(fixture.structural.catalog_reference.content_addressed_store_key,
+        fixture.structural.catalog_reference.content_digest,
+        fixture.structural.catalog_bytes);
+    for (const auto &artifact : fixture.structural.source_artifacts) {
+      add(artifact.store_key, artifact.content_digest, artifact.bytes);
+    }
+    for (const auto &artifact : fixture.control_catalog_artifacts) {
+      add(artifact.store_key, artifact.content_digest, artifact.bytes);
+    }
+  }
+
+  [[nodiscard]] std::optional<std::string>
+  get_verified(const core::ContentAddressedStoreKey &key,
+               const core::ContentDigest &expected_digest,
+               std::optional<std::uint64_t> expected_size) const override {
+    const auto found = inputs_.find(key.value());
+    if (found == inputs_.end() || found->second.digest != expected_digest ||
+        (expected_size.has_value() &&
+         static_cast<std::uint64_t>(found->second.bytes.size()) !=
+             *expected_size) ||
+        sha256_digest(found->second.bytes) != expected_digest.value()) {
+      return std::nullopt;
+    }
+    return found->second.bytes;
+  }
+
+private:
+  struct Entry final {
+    core::ContentDigest digest;
+    std::string bytes;
+  };
+
+  void add(const core::ContentAddressedStoreKey &key,
+           const core::ContentDigest &digest, std::string bytes) {
+    const auto [position, inserted] =
+        inputs_.emplace(key.value(), Entry{digest, std::move(bytes)});
+    if (!inserted && position->second.digest != digest) {
+      throw std::logic_error(
+          "Lite6 controllable input source contains a key collision");
+    }
+  }
+
+  std::map<std::string, Entry, std::less<>> inputs_;
+};
+
+} // namespace manyforge::deployment::test

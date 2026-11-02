@@ -133,17 +133,14 @@ void emit_cubic(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b,
   const double s2 = s * s;
   const double s3 = s2 * s;
 
-  const double H00 = 1.0 - 3.0 * s2 + 2.0 * s3;
   const double H10 = s - 2.0 * s2 + s3;
   const double H01 = 3.0 * s2 - 2.0 * s3;
   const double H11 = -s2 + s3;
 
-  const double dH00 = -6.0 * s + 6.0 * s2;
   const double dH10 = 1.0 - 4.0 * s + 3.0 * s2;
   const double dH01 = 6.0 * s - 6.0 * s2;
   const double dH11 = -2.0 * s + 3.0 * s2;
 
-  const double ddH00 = -6.0 + 12.0 * s;
   const double ddH10 = -4.0 + 6.0 * s;
   const double ddH01 = 6.0 - 12.0 * s;
   const double ddH11 = -2.0 + 6.0 * s;
@@ -154,23 +151,42 @@ void emit_cubic(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b,
   for (std::size_t j = 0; j < joint_count; ++j) {
     const double pa = a.positions_rad[j];
     const double pb = b.positions_rad[j];
+    const double delta = pb - pa;
     const double va = a.velocities_rad_s[j];
     const double vb = b.velocities_rad_s[j];
     const double Tva = T * va;
     const double Tvb = T * vb;
 
-    out.positions_rad[j] = pa * H00 + Tva * H10 + pb * H01 + Tvb * H11;
-    out.velocities_rad_s[j] =
-        (pa * dH00 + Tva * dH10 + pb * dH01 + Tvb * dH11) * inv_T;
-    out.accelerations_rad_s2[j] =
-        (pa * ddH00 + Tva * ddH10 + pb * ddH01 + Tvb * ddH11) * inv_T2;
+    if (pa == pb && va == 0.0 && vb == 0.0) {
+      out.positions_rad[j] = pa;
+      out.velocities_rad_s[j] = out.accelerations_rad_s2[j] = 0.0;
+      continue;
+    }
+    // H00 + H01 = 1, while their derivatives sum to zero. Work in
+    // displacement coordinates so a joint origin cannot pollute derivatives.
+    out.positions_rad[j] = s == 0.0   ? pa
+                           : s == 1.0 ? pb
+                                      : pa + (Tva * H10 + delta * H01 + Tvb * H11);
+    out.velocities_rad_s[j] = s == 0.0   ? va
+                              : s == 1.0 ? vb
+                                         : (Tva * dH10 + delta * dH01 + Tvb * dH11) * inv_T;
+    out.accelerations_rad_s2[j] = (Tva * ddH10 + delta * ddH01 + Tvb * ddH11) * inv_T2;
   }
   out.degree = 3;
 }
 
-void emit_quintic(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b,
-                  double s, double T, std::size_t joint_count,
-                  TrajectorySampleResult& out) {
+void emit_quintic(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b, double s,
+                  double T, std::size_t joint_count, TrajectorySampleResult& out) {
+  // Endpoint P/V/A is authoritative even when the displacement of extreme
+  // finite endpoints is not representable (avoid infinity multiplied by zero).
+  if (s == 0.0 || s == 1.0) {
+    const auto& point = s == 0.0 ? a : b;
+    out.positions_rad = point.positions_rad;
+    out.velocities_rad_s = point.velocities_rad_s;
+    out.accelerations_rad_s2 = point.accelerations_rad_s2;
+    out.degree = 5;
+    return;
+  }
   out.positions_rad.resize(joint_count);
   out.velocities_rad_s.resize(joint_count);
   out.accelerations_rad_s2.resize(joint_count);
@@ -180,21 +196,18 @@ void emit_quintic(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b
   const double s4 = s3 * s;
   const double s5 = s4 * s;
 
-  const double N0 = 1.0 - 10.0 * s3 + 15.0 * s4 - 6.0 * s5;
   const double N1 = s - 6.0 * s3 + 8.0 * s4 - 3.0 * s5;
   const double N2 = 0.5 * s2 - 1.5 * s3 + 1.5 * s4 - 0.5 * s5;
   const double N3 = 10.0 * s3 - 15.0 * s4 + 6.0 * s5;
   const double N4 = -4.0 * s3 + 7.0 * s4 - 3.0 * s5;
   const double N5 = 0.5 * s3 - s4 + 0.5 * s5;
 
-  const double dN0 = -30.0 * s2 + 60.0 * s3 - 30.0 * s4;
   const double dN1 = 1.0 - 18.0 * s2 + 32.0 * s3 - 15.0 * s4;
   const double dN2 = s - 4.5 * s2 + 6.0 * s3 - 2.5 * s4;
   const double dN3 = 30.0 * s2 - 60.0 * s3 + 30.0 * s4;
   const double dN4 = -12.0 * s2 + 28.0 * s3 - 15.0 * s4;
   const double dN5 = 1.5 * s2 - 4.0 * s3 + 2.5 * s4;
 
-  const double ddN0 = -60.0 * s + 180.0 * s2 - 120.0 * s3;
   const double ddN1 = -36.0 * s + 96.0 * s2 - 60.0 * s3;
   const double ddN2 = 1.0 - 9.0 * s + 18.0 * s2 - 10.0 * s3;
   const double ddN3 = 60.0 * s - 180.0 * s2 + 120.0 * s3;
@@ -208,6 +221,7 @@ void emit_quintic(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b
   for (std::size_t j = 0; j < joint_count; ++j) {
     const double pa = a.positions_rad[j];
     const double pb = b.positions_rad[j];
+    const double delta = pb - pa;
     const double va = a.velocities_rad_s[j];
     const double vb = b.velocities_rad_s[j];
     const double aa = a.accelerations_rad_s2[j];
@@ -217,14 +231,17 @@ void emit_quintic(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b
     const double T2aa = T2 * aa;
     const double T2ab = T2 * ab;
 
-    out.positions_rad[j] = pa * N0 + Tva * N1 + T2aa * N2 +
-                           pb * N3 + Tvb * N4 + T2ab * N5;
+    if (pa == pb && va == 0.0 && vb == 0.0 && aa == 0.0 && ab == 0.0) {
+      out.positions_rad[j] = pa;
+      out.velocities_rad_s[j] = out.accelerations_rad_s2[j] = 0.0;
+      continue;
+    }
+    // N0 + N3 = 1; differentiate only the local displacement.
+    out.positions_rad[j] = pa + (Tva * N1 + T2aa * N2 + delta * N3 + Tvb * N4 + T2ab * N5);
     out.velocities_rad_s[j] =
-        (pa * dN0 + Tva * dN1 + T2aa * dN2 +
-         pb * dN3 + Tvb * dN4 + T2ab * dN5) * inv_T;
+        (Tva * dN1 + T2aa * dN2 + delta * dN3 + Tvb * dN4 + T2ab * dN5) * inv_T;
     out.accelerations_rad_s2[j] =
-        (pa * ddN0 + Tva * ddN1 + T2aa * ddN2 +
-         pb * ddN3 + Tvb * ddN4 + T2ab * ddN5) * inv_T2;
+        (Tva * ddN1 + T2aa * ddN2 + delta * ddN3 + Tvb * ddN4 + T2ab * ddN5) * inv_T2;
   }
   out.degree = 5;
 }

@@ -1,88 +1,182 @@
 name: python-tests
 
+# ROS-free Python suites on the runner, one parallel job per package. The same
+# test sets as scripts/test-all.sh python / bridge / composer, plus the
+# headless API and Program runner unit tests (their process tests need ROS).
+# Tests marked `slow` run nightly in python-nightly.yml; the frontend half of
+# `test-all.sh composer` is frontend-build.yml. The nightly schedule runs this
+# on dev and seeds the ccache that pushes and PRs restore.
 on:
   pull_request:
     paths:
       - "manyforge_behavior/**"
+      - "manyforge_operator/**"
+      - "manyforge_example_nodes/**"
+      - "manyforge_example_models/**"
       - "manyforge_composer/**"
-      - "manyforge_supervision/**"
       - "manyforge_assistant_bridge/**"
+      - "manyforge_headless/**"
+      - "manyforge_headless_api/**"
+      - "manyforge_program_runner/**"
+      - "manyforge_core/**"
+      - "manyforge_content_identity/**"
+      - "manyforge_persistence/**"
+      - "manyforge_deployment/**"
+      - "manyforge_component_manager/**"
+      - "manyforge_scene/**"
+      - "manyforge_ros/manyforge_ros/diagnostics_bridge.py"
+      - "manyforge_ros/tests/test_diagnostics_bridge.py"
+      - "manyforge_medkit_adapter/manyforge_medkit_adapter/**"
+      - "manyforge_medkit_adapter/tests/test_forwarder.py"
+      - "scripts/qualification/**"
+      - "scripts/lib/**"
+      - "tests/**"
+      - "verification/composable_cell_i4/**"
+      - "pytest.ini"
       - ".github/workflows/python-tests.yml"
   push:
     branches: [main, dev]
     paths:
       - "manyforge_behavior/**"
+      - "manyforge_operator/**"
+      - "manyforge_example_nodes/**"
+      - "manyforge_example_models/**"
       - "manyforge_composer/**"
-      - "manyforge_supervision/**"
       - "manyforge_assistant_bridge/**"
+      - "manyforge_headless/**"
+      - "manyforge_headless_api/**"
+      - "manyforge_program_runner/**"
+      - "manyforge_core/**"
+      - "manyforge_content_identity/**"
+      - "manyforge_persistence/**"
+      - "manyforge_deployment/**"
+      - "manyforge_component_manager/**"
+      - "manyforge_scene/**"
+      - "manyforge_ros/manyforge_ros/diagnostics_bridge.py"
+      - "manyforge_ros/tests/test_diagnostics_bridge.py"
+      - "manyforge_medkit_adapter/manyforge_medkit_adapter/**"
+      - "manyforge_medkit_adapter/tests/test_forwarder.py"
+      - "scripts/qualification/**"
+      - "scripts/lib/**"
+      - "tests/**"
+      - "verification/composable_cell_i4/**"
+      - "pytest.ini"
+      - ".github/workflows/python-tests.yml"
+  schedule:
+    - cron: "0 2 * * *"
   workflow_dispatch:
 
-# Note: manyforge_hmi and manyforge_ros have tests that need heavy
-# environments (Viser + a live HMI socket for HMI; ROS Jazzy distro for
-# ros). They run in dedicated lanes — HMI tests via the Composer
-# integration tests (covered above through manyforge_composer/**), and
-# ros tests in the Docker-based scripts/test-ros.sh and
-# scripts/test-ros-full.sh lanes (not currently a GitHub Action).
-# Triggering on those paths here would
-# pass while actually skipping the relevant packages — false-green CI.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   python-tests:
-    name: Python unit tests
+    name: Python ${{ matrix.suite }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Root pytest.ini (-c) where test-all.sh passes several roots at once.
+          - suite: behavior
+            binding: true
+            pytest: -c pytest.ini --rootdir . -n auto -m "not slow" manyforge_behavior/tests
+          - suite: headless_api
+            binding: true
+            pytest: -c pytest.ini --rootdir . -n auto manyforge_headless_api/tests
+          - suite: program_runner
+            binding: true
+            pytest: -c pytest.ini --rootdir . -n auto manyforge_program_runner/tests
+          - suite: composer
+            binding: true
+            pytest: -n auto manyforge_composer/tests
+          - suite: bridge
+            binding: false
+            pytest: manyforge_assistant_bridge/tests
+          # The rest of test-all.sh python: small, in-repo subprocess tests; serial.
+          - suite: other
+            binding: true
+            pytest: >-
+              -c pytest.ini --rootdir .
+              manyforge_operator/tests scripts/qualification/tests tests/composable_cell_i4
+              tests/test_benchmark.py tests/test_public_contract_entrypoint_reconciliation.py
+              tests/test_regen.py tests/test_qualification_wrapper_entrypoints.py
+              tests/test_ros_qualification_helpers.py tests/test_grouped_gtest_runner.py
+              tests/test_release_golden_workflow.py tests/test_test_all_script_contract.py
+    env:
+      HEADLESS_BUILD: ${{ github.workspace }}/build/headless
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_MAXSIZE: 600M
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
     steps:
       - uses: actions/checkout@v4
         with:
-          # Step 18 qualification tests verify artifacts against a pinned
-          # historical source commit, so the default one-commit checkout is
-          # insufficient for their source-identity checks.
-          fetch-depth: 0
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+          ref: ${{ github.event_name == 'schedule' && 'dev' || '' }}
+      - name: Install native build dependencies
+        if: matrix.binding
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build ccache pkg-config \
+            libsqlite3-dev libssl-dev libexpat1-dev zlib1g-dev libyaml-dev \
+            libdouble-conversion-dev libutf8proc-dev
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install native visual-FK dependencies
+          cache: pip
+          cache-dependency-path: .github/workflows/python-tests.yml
+      - name: Install Python dependencies (dev-image pins)
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          # The Pinocchio wheel used by the observer-safe visual snapshot
-          # path dynamically links against Ubuntu's URDFDOM runtime
-          # libraries, including liburdfdom_sensor.so.4.0.  The dev package
-          # depends on the complete runtime set and keeps the FK test lane
-          # close to the production/dev-container native dependency shape.
-          sudo apt-get install -y --no-install-recommends liburdfdom-dev
-      - name: Install test dependencies
+          python -m pip install \
+            pytest==9.0.3 pytest-xdist==3.8.0 numpy==2.3.5 py_trees==2.4.0 \
+            pybind11==3.0.3 pyyaml==6.0.3 rfc8785==0.1.4 pillow==10.2.0 \
+            trimesh==4.11.5 yourdfpy==0.0.60 fastapi==0.135.3 \
+            "uvicorn[standard]==0.44.0" httpx==0.28.1 httpx2==2.12.0 \
+            websockets==16.0 mcp==1.27.0
+      # One cache for the expression binding: every job restores it, the
+      # behavior job saves it on push and on the nightly run.
+      - name: Restore ccache
+        if: matrix.binding
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-headless-py-${{ github.run_id }}
+          restore-keys: ccache-headless-py-
+      # Same configuration as setup_expression_binding in scripts/test-all.sh.
+      - name: Build the expression binding (manyforge_headless_py)
+        if: matrix.binding
         run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install pytest httpx
-          # Per-package install would require RoboPlan bindings (C++). For
-          # CI we install the pure-Python packages and run their unit tests
-          # directly; integration tests that need the C++ kernel run in the
-          # cpp-tsan / dev-container lanes.
-          pip install -e manyforge_behavior
-          # Exercise the production visual-state FK path. Lightweight
-          # deployments may omit this extra and receive structured
-          # pinocchio_unavailable diagnostics, but CI must keep the native
-          # snapshot path covered.
-          pip install -e "manyforge_composer[visual]"
-          pip install -e manyforge_assistant_bridge
-          pip install py_trees pyyaml fastapi uvicorn
-          pip check
-          python - <<'PY'
-          import pinocchio
-          print(f"pinocchio {pinocchio.__version__} import ok")
-          PY
-      - name: Run pytest
+          cmake -S manyforge_headless -B "$HEADLESS_BUILD" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL=ON \
+            -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
+            -Dpybind11_DIR="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')"
+          cmake --build "$HEADLESS_BUILD" --parallel 4 --target manyforge_headless_py
+          ccache --show-stats
+      - name: Save ccache
+        if: ${{ !cancelled() && matrix.suite == 'behavior' && github.event_name != 'pull_request' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-headless-py-${{ github.run_id }}
+      - name: pytest ${{ matrix.suite }}
         env:
-          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/manyforge_behavior:${{ github.workspace }}/manyforge_composer:${{ github.workspace }}/manyforge_assistant_bridge
+          PYTEST_SELECTION: ${{ matrix.pytest }}
         run: |
-          set -euo pipefail
-          # Each package runs from its own dir so it picks up its own
-          # pyproject.toml / pytest config.
-          for pkg in manyforge_behavior manyforge_composer manyforge_assistant_bridge; do
-            if [[ -d "${pkg}/tests" ]]; then
-              echo "=== pytest ${pkg} ==="
-              ( cd "${pkg}" && pytest -x --tb=short ) || exit 1
-            fi
-          done
+          export PYTHONPATH="$HEADLESS_BUILD:$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/manyforge_behavior"
+          eval "pytest -p no:cacheprovider -p no:launch_testing -p no:launch_ros \
+            --durations=25 -v $PYTEST_SELECTION"
+      - name: Diagnostics and Medkit client tests
+        if: matrix.suite == 'other'
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE/manyforge_ros:$GITHUB_WORKSPACE/manyforge_medkit_adapter:$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/manyforge_behavior"
+          pytest manyforge_ros/tests/test_diagnostics_bridge.py \
+            manyforge_medkit_adapter/tests/test_forwarder.py \
+            -k 'not statuses_to_msg_builds_diagnostic_array' -v

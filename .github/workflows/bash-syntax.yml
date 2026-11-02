@@ -9,12 +9,21 @@ on:
     branches: [main, dev]
     paths:
       - "scripts/**/*.sh"
+      - ".github/workflows/bash-syntax.yml"
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   bash-syntax:
     name: bash -n on all shell scripts
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Syntax-check every shell script

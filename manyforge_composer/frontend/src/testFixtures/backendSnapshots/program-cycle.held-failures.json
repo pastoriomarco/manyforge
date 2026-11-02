@@ -1,0 +1,685 @@
+{
+  "allowed_commands": [
+    {
+      "allowed": true,
+      "command_kind": "cell_full_stop",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "execution_recovery",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "operation_acknowledge_completed",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "operation_reset",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "operation_start",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "operation_stop",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "program_discard_full_stop",
+      "disabled_reason": "program_run_state_intervention_required",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "program_full_stop",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "program_manual_handover",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "program_manual_result_stage",
+      "disabled_reason": "program_run_state_intervention_required",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "program_motion_resume",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "program_motion_start",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "program_motion_stop",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "program_reset",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "program_resume_full_stop",
+      "disabled_reason": "program_run_state_intervention_required",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "program_run",
+      "disabled_reason": "program_cycle_state_running",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "program_runtime_blackboard_write",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "program_stop",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "runtime_scale",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": "program-cycle.1",
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    }
+  ],
+  "causal_client_sequence": null,
+  "causal_correlation_id": "request.start.1",
+  "causal_session_id": null,
+  "current_command_kind": "program_run",
+  "cycle_claim_generation": 1,
+  "cycle_generation": 1,
+  "execution_control_revision": 3,
+  "failure": null,
+  "node_status_revision": 2,
+  "program_run_id": "program-cycle.1",
+  "program_runner_owner_epoch": "program-runner.epoch.1",
+  "recovery_offer": {
+    "actions": [
+      {
+        "action_id": "continue_with_failure",
+        "disabled_reason_code": "recovery_close_not_eligible",
+        "enabled": false,
+        "performs_backend_reset": false,
+        "requires_confirmation": true
+      },
+      {
+        "action_id": "reset_cycle",
+        "disabled_reason_code": "cycle_not_terminal",
+        "enabled": false,
+        "performs_backend_reset": true,
+        "requires_confirmation": true
+      }
+    ],
+    "control_command_epoch": 0,
+    "cycle_generation": 1,
+    "deployment_generation": 1,
+    "details": null,
+    "evidence_refs": [],
+    "generated_at_ns": 1000000000,
+    "graph_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+    "kernel_assessment_revision": 0,
+    "manual_result": {
+      "disabled_reason_code": "manual_result_owner_not_acknowledged",
+      "enabled": false
+    },
+    "message": "No pick candidate is feasible",
+    "node_attempt_id": "attempt:00000000000000000000000000000001",
+    "node_instance_id": "arm_move",
+    "offer_id": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+    "offer_revision": 1,
+    "operation_id": "task-1",
+    "operation_revision": null,
+    "origin": {
+      "kind": "owner",
+      "node_instance_id": "arm_move",
+      "owner_api": "kernel.operation"
+    },
+    "participants": [],
+    "policy": {
+      "allow_intervention": true,
+      "intervention_stop_scope": "own_groups",
+      "max_retries": 2
+    },
+    "pose_source_apply_generation": 0,
+    "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+    "program_generation": 1,
+    "program_run_id": "program-cycle.1",
+    "reason_code": "no_feasible_candidate",
+    "recovery_class": "failed_validation",
+    "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
+    "retries_used": 0,
+    "scene_admission_epoch": 1,
+    "schema_version": "manyforge.cycle_recovery_offer.v5",
+    "status": "action_required",
+    "stop_certificate_id": null,
+    "stop_certificate_revision": null,
+    "stop_generation": null,
+    "stop_id": null
+  },
+  "reset_options": null,
+  "reset_phase": null,
+  "reset_robot_position": {
+    "available": false,
+    "reason": "The active Deployment has no qualified simulator position-reset capability"
+  },
+  "run": {
+    "active_operation_count": null,
+    "capture": {
+      "applied_record_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000004",
+      "graph_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000006",
+      "node_environment_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000007",
+      "node_policies": [
+        {
+          "instance_id": "arm_move",
+          "operator_stop_policy": "inherit",
+          "recovery_policy": {
+            "allow_intervention": true,
+            "intervention_stop_scope": "own_groups",
+            "max_retries": 2
+          }
+        },
+        {
+          "instance_id": "tool_move",
+          "operator_stop_policy": "inherit",
+          "recovery_policy": {
+            "allow_intervention": true,
+            "intervention_stop_scope": "own_groups",
+            "max_retries": 2
+          }
+        }
+      ],
+      "node_policy_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000008",
+      "owner_identities": [
+        {
+          "owner_epoch": "kernel.epoch.1",
+          "owner_id": "kernel.cell-a",
+          "owner_role": "kernel_operations"
+        },
+        {
+          "owner_epoch": "program-runner.epoch.1",
+          "owner_id": "program-runner.cell-a",
+          "owner_role": "program_runner"
+        }
+      ],
+      "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
+      "program_id": "pick_and_place_minimal",
+      "program_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000005",
+      "program_run_id": "program-cycle.1",
+      "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "scenario_id": "ur5-pick-place",
+      "schema_version": "manyforge.program_run_capture.v2",
+      "source_document_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000003"
+    },
+    "details": null,
+    "message": "No pick candidate is feasible",
+    "node_status_revision": 2,
+    "node_statuses": {
+      "arm_move": "running",
+      "parallel": "running",
+      "tool_move": "running"
+    },
+    "operation_failures": [
+      {
+        "failure": {
+          "code": "no_feasible_candidate",
+          "message": "No pick candidate is feasible"
+        },
+        "node_attempt_id": "attempt:00000000000000000000000000000001",
+        "node_instance_id": "arm_move",
+        "operation": {
+          "operation_id": "op",
+          "operation_revision": 2,
+          "source_owner_epoch": "kernel.epoch.1"
+        },
+        "operator_facing_run_revision": 4,
+        "recovery_class": "failed_validation",
+        "resource_ids": [
+          "arm.joints"
+        ],
+        "terminal_facts": [
+          {
+            "effect": "no_effect",
+            "kind": "local_failure"
+          }
+        ]
+      },
+      {
+        "failure": {
+          "code": "no_feasible_candidate",
+          "message": "No pick candidate is feasible"
+        },
+        "node_attempt_id": "attempt:00000000000000000000000000000002",
+        "node_instance_id": "tool_move",
+        "operation": {
+          "operation_id": "op",
+          "operation_revision": 2,
+          "source_owner_epoch": "kernel.epoch.1"
+        },
+        "operator_facing_run_revision": 4,
+        "recovery_class": "failed_validation",
+        "resource_ids": [
+          "arm.joints"
+        ],
+        "terminal_facts": [
+          {
+            "effect": "no_effect",
+            "kind": "local_failure"
+          }
+        ]
+      }
+    ],
+    "origin": {
+      "kind": "owner",
+      "node_instance_id": "arm_move",
+      "owner_api": "kernel.operation"
+    },
+    "owner_epoch": "program-runner.epoch.1",
+    "owner_id": "program-runner.cell-a",
+    "reason_code": "no_feasible_candidate",
+    "run_end": null,
+    "run_revision": 5,
+    "schema_version": "manyforge.program_run_status.v3",
+    "state": "intervention_required",
+    "tree_status": "running"
+  },
+  "run_end": null,
+  "run_revision": 5,
+  "runtime_control_revision": 1,
+  "runtime_controls": {
+    "execution_selections": {
+      "groups": [
+        {
+          "group_id": "all",
+          "held_node_count": 3,
+          "node_count": 3,
+          "ordinary_held_node_count": 3,
+          "resource_ids": [],
+          "resume_allowed": false,
+          "resume_unavailable_reason": "selected_owner_recovery_unavailable",
+          "runtime_scale_selector": {
+            "component_role_id": "robot",
+            "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
+            "target_role_id": "arm"
+          },
+          "runtime_scale_unavailable_reason": null,
+          "start_allowed": false,
+          "start_unavailable_reason": "selected_owner_recovery_unavailable",
+          "state": "held",
+          "stop_allowed": false
+        },
+        {
+          "group_id": "arm",
+          "held_node_count": 1,
+          "node_count": 1,
+          "ordinary_held_node_count": 1,
+          "resource_ids": [],
+          "resume_allowed": false,
+          "resume_unavailable_reason": "selected_owner_recovery_unavailable",
+          "runtime_scale_selector": {
+            "component_role_id": "robot",
+            "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
+            "target_role_id": "arm"
+          },
+          "runtime_scale_unavailable_reason": null,
+          "start_allowed": false,
+          "start_unavailable_reason": "selected_owner_recovery_unavailable",
+          "state": "held",
+          "stop_allowed": false
+        },
+        {
+          "group_id": "tools",
+          "held_node_count": 1,
+          "node_count": 1,
+          "ordinary_held_node_count": 1,
+          "resource_ids": [],
+          "resume_allowed": false,
+          "resume_unavailable_reason": "selected_owner_recovery_unavailable",
+          "runtime_scale_selector": {
+            "component_role_id": "robot",
+            "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
+            "target_role_id": "arm"
+          },
+          "runtime_scale_unavailable_reason": null,
+          "start_allowed": false,
+          "start_unavailable_reason": "selected_owner_recovery_unavailable",
+          "state": "held",
+          "stop_allowed": false
+        }
+      ],
+      "motion_held": false,
+      "selection_revision": 1
+    },
+    "owner_epoch": "program-runner.epoch.1",
+    "owner_id": "program-runner",
+    "program_run_id": "program-cycle.1",
+    "recovery_offer": {
+      "actions": [
+        {
+          "action_id": "continue_with_failure",
+          "disabled_reason_code": "recovery_close_not_eligible",
+          "enabled": false,
+          "performs_backend_reset": false,
+          "requires_confirmation": true
+        },
+        {
+          "action_id": "reset_cycle",
+          "disabled_reason_code": "cycle_not_terminal",
+          "enabled": false,
+          "performs_backend_reset": true,
+          "requires_confirmation": true
+        }
+      ],
+      "control_command_epoch": 0,
+      "cycle_generation": 1,
+      "deployment_generation": 1,
+      "details": null,
+      "evidence_refs": [],
+      "generated_at_ns": 1000000000,
+      "graph_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "kernel_assessment_revision": 0,
+      "manual_result": {
+        "disabled_reason_code": "manual_result_owner_not_acknowledged",
+        "enabled": false
+      },
+      "message": "No pick candidate is feasible",
+      "node_attempt_id": "attempt:00000000000000000000000000000001",
+      "node_instance_id": "arm_move",
+      "offer_id": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+      "offer_revision": 1,
+      "operation_id": "task-1",
+      "operation_revision": null,
+      "origin": {
+        "kind": "owner",
+        "node_instance_id": "arm_move",
+        "owner_api": "kernel.operation"
+      },
+      "participants": [],
+      "policy": {
+        "allow_intervention": true,
+        "intervention_stop_scope": "own_groups",
+        "max_retries": 2
+      },
+      "pose_source_apply_generation": 0,
+      "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "program_generation": 1,
+      "program_run_id": "program-cycle.1",
+      "reason_code": "no_feasible_candidate",
+      "recovery_class": "failed_validation",
+      "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
+      "retries_used": 0,
+      "scene_admission_epoch": 1,
+      "schema_version": "manyforge.cycle_recovery_offer.v5",
+      "status": "action_required",
+      "stop_certificate_id": null,
+      "stop_certificate_revision": null,
+      "stop_generation": null,
+      "stop_id": null
+    },
+    "recovery_offers": [
+      {
+        "intervention_stop_scope": "own_groups",
+        "motion_group_ids": [
+          "arm"
+        ],
+        "offer": {
+          "actions": [
+            {
+              "action_id": "continue_with_failure",
+              "disabled_reason_code": "recovery_close_not_eligible",
+              "enabled": false,
+              "performs_backend_reset": false,
+              "requires_confirmation": true
+            },
+            {
+              "action_id": "reset_cycle",
+              "disabled_reason_code": "cycle_not_terminal",
+              "enabled": false,
+              "performs_backend_reset": true,
+              "requires_confirmation": true
+            }
+          ],
+          "control_command_epoch": 0,
+          "cycle_generation": 1,
+          "deployment_generation": 1,
+          "details": null,
+          "evidence_refs": [],
+          "generated_at_ns": 1000000000,
+          "graph_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+          "kernel_assessment_revision": 0,
+          "manual_result": {
+            "disabled_reason_code": "manual_result_owner_not_acknowledged",
+            "enabled": false
+          },
+          "message": "No pick candidate is feasible",
+          "node_attempt_id": "attempt:00000000000000000000000000000001",
+          "node_instance_id": "arm_move",
+          "offer_id": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+          "offer_revision": 1,
+          "operation_id": "task-1",
+          "operation_revision": null,
+          "origin": {
+            "kind": "owner",
+            "node_instance_id": "arm_move",
+            "owner_api": "kernel.operation"
+          },
+          "participants": [],
+          "policy": {
+            "allow_intervention": true,
+            "intervention_stop_scope": "own_groups",
+            "max_retries": 2
+          },
+          "pose_source_apply_generation": 0,
+          "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+          "program_generation": 1,
+          "program_run_id": "program-cycle.1",
+          "reason_code": "no_feasible_candidate",
+          "recovery_class": "failed_validation",
+          "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
+          "retries_used": 0,
+          "scene_admission_epoch": 1,
+          "schema_version": "manyforge.cycle_recovery_offer.v5",
+          "status": "action_required",
+          "stop_certificate_id": null,
+          "stop_certificate_revision": null,
+          "stop_generation": null,
+          "stop_id": null
+        }
+      },
+      {
+        "intervention_stop_scope": "own_groups",
+        "motion_group_ids": [
+          "tools"
+        ],
+        "offer": {
+          "actions": [
+            {
+              "action_id": "continue_with_failure",
+              "disabled_reason_code": "recovery_close_not_eligible",
+              "enabled": false,
+              "performs_backend_reset": false,
+              "requires_confirmation": true
+            },
+            {
+              "action_id": "reset_cycle",
+              "disabled_reason_code": "cycle_not_terminal",
+              "enabled": false,
+              "performs_backend_reset": true,
+              "requires_confirmation": true
+            }
+          ],
+          "control_command_epoch": 0,
+          "cycle_generation": 1,
+          "deployment_generation": 1,
+          "details": null,
+          "evidence_refs": [],
+          "generated_at_ns": 1000000000,
+          "graph_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+          "kernel_assessment_revision": 0,
+          "manual_result": {
+            "disabled_reason_code": "manual_result_owner_not_acknowledged",
+            "enabled": false
+          },
+          "message": "No pick candidate is feasible",
+          "node_attempt_id": "attempt:00000000000000000000000000000002",
+          "node_instance_id": "tool_move",
+          "offer_id": "sha256:0000000000000000000000000000000000000000000000000000000000000009",
+          "offer_revision": 2,
+          "operation_id": "task-2",
+          "operation_revision": null,
+          "origin": {
+            "kind": "owner",
+            "node_instance_id": "tool_move",
+            "owner_api": "kernel.operation"
+          },
+          "participants": [],
+          "policy": {
+            "allow_intervention": true,
+            "intervention_stop_scope": "own_groups",
+            "max_retries": 2
+          },
+          "pose_source_apply_generation": 0,
+          "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+          "program_generation": 1,
+          "program_run_id": "program-cycle.1",
+          "reason_code": "no_feasible_candidate",
+          "recovery_class": "failed_validation",
+          "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
+          "retries_used": 0,
+          "scene_admission_epoch": 1,
+          "schema_version": "manyforge.cycle_recovery_offer.v5",
+          "status": "action_required",
+          "stop_certificate_id": null,
+          "stop_certificate_revision": null,
+          "stop_generation": null,
+          "stop_id": null
+        }
+      }
+    ],
+    "run_revision": 5,
+    "runtime_controls": {
+      "audit": [],
+      "program_run_id": "program-cycle.1",
+      "recovery_fences": {
+        "deployment_generation": 1,
+        "pose_source_apply_generation": 0,
+        "program_generation": 1,
+        "scene_admission_epoch": 1
+      },
+      "retry_counts": {},
+      "runtime_control_revision": 1,
+      "schema_version": "manyforge.program_runtime_controls.v3"
+    },
+    "schema_version": "manyforge.program_runtime_control_projection.v9"
+  },
+  "state": "running",
+  "terminal_or_settlement_reference": null
+}

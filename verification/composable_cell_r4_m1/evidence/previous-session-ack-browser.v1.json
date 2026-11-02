@@ -1,0 +1,40 @@
+{
+  "schema_version": "manyforge.previous_session_ack_browser.v1",
+  "scope": "DX1016-DX1024 actual private GUI acknowledgement qualification",
+  "outcome": "pass",
+  "verified_at_utc": "2026-10-16T07:41:32.043216+00:00",
+  "source_freeze": "previous-session ACK freeze02; original merged Close+ACK source",
+  "image_id": "sha256:712e576565aad0f9982d3305efd7cad1f04c0a18d644442f2419101839ee6773",
+  "owned_private_predecessor": {
+    "session_id": "1887bc9b588b47d7a9d9a649ad31a3cf",
+    "trigger": "Controlled SIGKILL only after fresh idle_after_reset/no Program run, both components declared, all profiles Mock.",
+    "archive_regular_files_byte_exact": 316,
+    "history_coverage": "not_imported"
+  },
+  "gui_acknowledgement": {
+    "clicks": 1,
+    "definition_id": "manyforge.runtime.previous_session_unclean",
+    "condition_id": "condition-db534054ecdb517f0daeebcd",
+    "activation_id": "headless-api-cfb527bb78fce2b74fab7b7c5185e9c1-activation-1",
+    "history_event_id": "event-ec2fa035b5ec2554a8e38199f6725681",
+    "history_sequence": 16,
+    "live_alarms_after": 0,
+    "warning_stayed_absent_after_reload": true,
+    "settled_browser_errors": [],
+    "empty_workspace": true
+  },
+  "limits": [
+    "Single-archive GUI acknowledgement and browser reload verified; no additional Headless replacement was induced.",
+    "Existing asynchronous acknowledgement crash window and retained-History pruning recurrence remain accepted limits.",
+    "No user-runtime acknowledgement was sent; current user stack unchanged."
+  ],
+  "runtime_commands": {
+    "private_load": 1,
+    "private_activate": 0,
+    "private_run": 0,
+    "private_reset": 0,
+    "private_close_attempt": 1,
+    "private_close_attempt_outcome": "refused before effects by unrelated CCLC-versus-Manager owner-domain comparison; separate correction pending"
+  },
+  "raw_receipt_identifier": "dx1026-dualrobot-load-20261016/private-gui-gate01"
+}

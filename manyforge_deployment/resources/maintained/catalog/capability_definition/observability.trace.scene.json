@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:aa079df5821ad6ad0fdfc15f15368ca6682cd17dd1c804998e4e954fe1979180",
+  "capability_id": "observability.trace.scene",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

@@ -1,284 +1,240 @@
-/**
- * Move-To target computation (Robot panel → Move To tab, ADR-0015).
- * Feeds validated Robot Control candidate / Move-To preview authoring; it
- * computes a target only and does not move the robot.
- *
- * Resolves a user-picked entity (scene object, named frame, or
- * stored move-node target) and a set of orientation/offset overrides
- * into a concrete cartesian-jog or joint-jog target. Shared between:
- *   - RobotControlPanel's MoveToBody (renders picker + authors candidate)
- *   - SceneViewer's MoveToTargetGhost (renders the 3D ghost preview)
- *
- * Both call into the same `computeMoveToTarget` so the preview the
- * operator sees is what the validated candidate can execute on Approve.
- */
-import { Quaternion, Vector3 } from 'three';
+import { Euler, Matrix4, Quaternion, Vector3 } from 'three';
+import type { ProgramBindingDocument } from '../types/api';
+import type { PoseTuple } from './poseTransforms';
+import { rpyDegToXyzw } from './orientation';
 
-import type {
-  MoveToOrientationMode,
-  MoveToState,
-} from '../store/viewerSelectionStore';
-import type {
-  SceneFrameState,
-  SceneObjectState,
-  SceneRobotState,
-} from '../types/api';
+export type MoveToOrientationMode = 'keep-current' | 'face-down' | 'use-entity';
 
-export interface CartesianMoveTarget {
-  kind: 'cartesian';
-  /** Position in the same frame as `tcpPose` (base frame). */
-  position: [number, number, number];
-  /** xyzw quaternion in the base frame. */
-  quaternion: [number, number, number, number];
-  /** Short label used in the panel status row. */
-  label: string;
+export interface CartesianMoveDraftOptions {
+  orientationMode: MoveToOrientationMode;
+  offsetXyzM: [number, number, number];
+  offsetRpyRad: [number, number, number];
 }
 
-export interface JointMoveTarget {
-  kind: 'joint';
-  jointNames: string[];
-  jointPositionsRad: number[];
-  label: string;
+export const DEFAULT_MOVE_TO_OPTIONS: CartesianMoveDraftOptions = {
+  orientationMode: 'keep-current', offsetXyzM: [0, 0, 0], offsetRpyRad: [0, 0, 0],
+};
+
+export type MoveToDraftSource =
+  | { id: string; kind: 'pose'; pose: PoseTuple }
+  | { id: string; kind: 'joint'; positionsRad: number[] };
+
+export interface MoveToDraft {
+  source: MoveToDraftSource;
+  /** Capture once; live observations must not rotate an authored offset. */
+  currentTcpPose: PoseTuple;
+  options: CartesianMoveDraftOptions;
 }
 
-export type MoveToTarget = CartesianMoveTarget | JointMoveTarget;
-
-export interface StoredPoseTarget {
-  /** Move node name (uniquely identifies it within the program tree). */
-  nodeName: string;
-  motionType: 'pose' | 'joint';
-  params: Record<string, unknown>;
+export interface StoredPoseResolutionContext {
+  programTargetRoleId: string;
+  baseFrameRoleId: string;
+  sceneResourcePoses: ReadonlyMap<string, PoseTuple>;
+  frameRolePoses: ReadonlyMap<string, PoseTuple>;
 }
 
-export interface ComputeMoveToTargetArgs {
-  moveTo: MoveToState;
-  objects: SceneObjectState[];
-  frames: SceneFrameState[];
-  storedPoses: StoredPoseTarget[];
-  tcpPose: { position_m?: number[]; orientation_xyzw?: number[] } | null;
-  robot?: SceneRobotState | null;
+function finitePose(pose: PoseTuple | null): pose is PoseTuple {
+  return pose !== null
+    && pose.position.every(Number.isFinite)
+    && pose.quaternion.every(Number.isFinite)
+    && new Quaternion(...pose.quaternion).lengthSq() > 1e-12;
 }
 
-/**
- * Resolve the Move-To selection into a concrete target. Returns null
- * when the selection is incomplete or the underlying data is missing
- * (e.g. operator picked an object that has been removed since).
- */
-export function computeMoveToTarget(
-  args: ComputeMoveToTargetArgs,
-): MoveToTarget | null {
-  const { moveTo, objects, frames, storedPoses, tcpPose } = args;
-
-  if (moveTo.source === 'pose') {
-    return resolveStoredPoseTarget(moveTo, storedPoses, tcpPose);
-  }
-
-  // Object / frame sources reduce to "entity has a pose in base frame".
-  const entityPose = resolveEntityBasePose(moveTo, objects, frames);
-  if (entityPose === null) return null;
-  return assembleCartesian(moveTo, entityPose, tcpPose, entityLabel(moveTo, objects, frames));
-}
-
-function resolveEntityBasePose(
-  moveTo: MoveToState,
-  objects: SceneObjectState[],
-  frames: SceneFrameState[],
-): { position: Vector3; quaternion: Quaternion } | null {
-  if (moveTo.source === 'object') {
-    if (moveTo.objectId === null) return null;
-    const obj = objects.find((o) => o.object_id === moveTo.objectId);
-    if (obj === undefined) return null;
-    const pose = (obj.pose_in_universe ?? {}) as Record<string, unknown>;
-    const position = readTriple(pose.position_m);
-    const quaternion = readQuad(pose.orientation_xyzw) ?? [0, 0, 0, 1];
-    if (position === null) return null;
-    return {
-      position: new Vector3(...position),
-      quaternion: new Quaternion(...quaternion),
-    };
-  }
-  if (moveTo.source === 'frame') {
-    if (moveTo.frameName === null) return null;
-    const frame = frames.find((f) => f.name === moveTo.frameName);
-    if (frame === undefined || !frame.poseAvailable || frame.poseInWorld == null) return null;
-    const position = readTriple(frame.poseInWorld.position_m);
-    const quaternion = readQuad(frame.poseInWorld.orientation_xyzw);
-    if (position === null || quaternion === null) return null;
-    return {
-      position: new Vector3(...position),
-      quaternion: new Quaternion(...quaternion),
-    };
-  }
-  return null;
-}
-
-function entityLabel(
-  moveTo: MoveToState,
-  objects: SceneObjectState[],
-  frames: SceneFrameState[],
-): string {
-  if (moveTo.source === 'object' && moveTo.objectId !== null) {
-    const obj = objects.find((o) => o.object_id === moveTo.objectId);
-    return obj ? `object ${obj.object_id}` : `object ${moveTo.objectId}`;
-  }
-  if (moveTo.source === 'frame' && moveTo.frameName !== null) {
-    const f = frames.find((fr) => fr.name === moveTo.frameName);
-    return f ? `frame ${f.name}` : `frame ${moveTo.frameName}`;
-  }
-  return 'entity';
-}
-
-function assembleCartesian(
-  moveTo: MoveToState,
-  entityPose: { position: Vector3; quaternion: Quaternion },
-  tcpPose: { position_m?: number[]; orientation_xyzw?: number[] } | null,
-  label: string,
-): CartesianMoveTarget | null {
-  // 1. Orientation mode picks the base orientation before offset.
-  const baseOrientation = pickBaseOrientation(
-    moveTo.orientationMode,
-    entityPose,
-    tcpPose,
-  );
-  if (baseOrientation === null) return null;
-
-  // 2. Offset rpy applied as a local delta on top of the base
-  //    orientation. The operator types degrees; convert to radians.
-  const rpyRad: [number, number, number] = [
-    (moveTo.offsetRpyDeg[0] * Math.PI) / 180,
-    (moveTo.offsetRpyDeg[1] * Math.PI) / 180,
-    (moveTo.offsetRpyDeg[2] * Math.PI) / 180,
-  ];
-  const rpyDelta = quatFromRpyRad(rpyRad);
-  const finalOrientation = baseOrientation.clone().multiply(rpyDelta);
-
-  // 3. Position = entity centroid + offset_xyz expressed in the
-  //    FINAL orientation's local frame. "Offset z=0.10" with face-
-  //    down therefore means "10 cm directly above the entity", which
-  //    is the natural approach-pose convention. World-frame offset
-  //    would force operators to recompute by hand whenever the
-  //    entity is rotated.
-  const offsetWorld = new Vector3(...moveTo.offsetXyzM).applyQuaternion(finalOrientation);
-  const finalPosition = entityPose.position.clone().add(offsetWorld);
-
-  return {
-    kind: 'cartesian',
-    position: [finalPosition.x, finalPosition.y, finalPosition.z],
-    quaternion: [finalOrientation.x, finalOrientation.y, finalOrientation.z, finalOrientation.w],
-    label,
-  };
-}
-
-function pickBaseOrientation(
+function selectedOrientation(
   mode: MoveToOrientationMode,
-  entityPose: { position: Vector3; quaternion: Quaternion },
-  tcpPose: { position_m?: number[]; orientation_xyzw?: number[] } | null,
+  entityPose: PoseTuple,
+  currentTcpPose: PoseTuple | null,
 ): Quaternion | null {
-  if (mode === 'use-entity') {
-    return entityPose.quaternion.clone();
+  if (mode === 'use-entity') return new Quaternion(...entityPose.quaternion).normalize();
+  if (mode === 'face-down') return new Quaternion(0, 0, 0, 1);
+  return finitePose(currentTcpPose)
+    ? new Quaternion(...currentTcpPose.quaternion).normalize()
+    : null;
+}
+
+/** Return Program target roles bound to one exact addressed command target. */
+export function boundProgramTargetRoleIds(
+  binding: ProgramBindingDocument | null,
+  controllableComponentId: string,
+  commandTargetId: string,
+): string[] {
+  if (binding === null) return [];
+  return binding.target_role_bindings
+    .filter((row) => (
+      row.controllable_component_id === controllableComponentId
+      && row.command_target_id === commandTargetId
+    ))
+    .map((row) => row.target_role_id)
+    .sort();
+}
+
+function recordAt(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+/** Parse the Program pose value while retaining no implicit frame assumption. */
+export function canonicalProgramPose(value: unknown): PoseTuple | null {
+  const pose = recordAt(value);
+  const position = pose?.position_m;
+  const orientation = recordAt(pose?.orientation);
+  if (!Array.isArray(position) || position.length !== 3 || orientation === null) {
+    return null;
   }
-  if (mode === 'keep-current') {
-    if (tcpPose == null) return null;
-    const q = readQuad(tcpPose.orientation_xyzw);
-    return q ? new Quaternion(...q) : null;
+  const numericPosition = position.map(Number) as [number, number, number];
+  if (!numericPosition.every(Number.isFinite)) return null;
+  let quaternion: Quaternion | null = null;
+  if (Array.isArray(orientation.xyzw) && orientation.xyzw.length === 4) {
+    const values = orientation.xyzw.map(Number) as [number, number, number, number];
+    if (values.every(Number.isFinite)) quaternion = new Quaternion(...values);
+  } else if (Array.isArray(orientation.rpy_deg) && orientation.rpy_deg.length === 3) {
+    // Stored Program RPY is intrinsic ZYX, like the backend.
+    const xyzw = rpyDegToXyzw(orientation.rpy_deg);
+    if (xyzw !== undefined) quaternion = new Quaternion(...xyzw);
   }
-  if (mode === 'face-down') {
-    // World "down" = -Z. We want the TCP's tool axis (also -Z by
-    // convention) to point in world -Z. That's the identity
-    // orientation for a standard tool frame. To keep some
-    // determinism around yaw, we don't pin it — operators tweak
-    // yaw via the offset rpy.
-    return new Quaternion(0, 0, 0, 1);
+  if (quaternion === null || quaternion.lengthSq() < 1e-12) return null;
+  quaternion.normalize();
+  return {
+    position: numericPosition,
+    quaternion: [quaternion.x, quaternion.y, quaternion.z, quaternion.w],
+  };
+}
+
+function referencePose(
+  value: unknown,
+  context: StoredPoseResolutionContext,
+): PoseTuple | null {
+  const reference = recordAt(value);
+  if (reference === null) return null;
+  if (reference.type === 'scene_resource') {
+    return typeof reference.scene_resource_id === 'string'
+      ? context.sceneResourcePoses.get(reference.scene_resource_id) ?? null
+      : null;
   }
+  if (reference.type === 'frame_role') {
+    return typeof reference.frame_role_id === 'string'
+      ? context.frameRolePoses.get(reference.frame_role_id) ?? null
+      : null;
+  }
+  if (reference.type === 'pose') return canonicalProgramPose(reference.pose);
   return null;
 }
 
-function quatFromRpyRad(rpy: [number, number, number]): Quaternion {
-  const [r, p, y] = rpy;
-  const cr = Math.cos(r / 2);
-  const sr = Math.sin(r / 2);
-  const cp = Math.cos(p / 2);
-  const sp = Math.sin(p / 2);
-  const cy = Math.cos(y / 2);
-  const sy = Math.sin(y / 2);
-  const w = cr * cp * cy + sr * sp * sy;
-  const qx = sr * cp * cy - cr * sp * sy;
-  const qy = cr * sp * cy + sr * cp * sy;
-  const qz = cr * cp * sy - sr * sp * cy;
-  return new Quaternion(qx, qy, qz, w);
-}
-
-function resolveStoredPoseTarget(
-  moveTo: MoveToState,
-  storedPoses: StoredPoseTarget[],
-  tcpPose: { position_m?: number[]; orientation_xyzw?: number[] } | null,
-): MoveToTarget | null {
-  if (moveTo.poseNodeName === null) return null;
-  const pose = storedPoses.find((p) => p.nodeName === moveTo.poseNodeName);
-  if (pose === undefined) return null;
-
-  if (pose.motionType === 'joint') {
-    // Program YAML stores joint_goal as flat sibling keys, not nested:
-    //   motion_type: joint
-    //   joint_goal_names: [...]
-    //   joint_goal_positions_rad: [...]
-    const jointNames = pose.params['joint_goal_names'];
-    const jointPositions = pose.params['joint_goal_positions_rad'];
-    if (!Array.isArray(jointNames) || !Array.isArray(jointPositions)) return null;
-    if (jointNames.length === 0 || jointNames.length !== jointPositions.length) return null;
-    return {
-      kind: 'joint',
-      jointNames: jointNames.map((n) => String(n)),
-      jointPositionsRad: jointPositions.map((v) => Number(v)),
-      label: `pose ${pose.nodeName}`,
-    };
+/**
+ * Resolve an authored stored pose through the normative target/offset-reference
+ * rule. Every input pose is already expressed in the direct-control base frame.
+ */
+export function resolveStoredProgramPose(
+  parameters: Readonly<Record<string, unknown>>,
+  context: StoredPoseResolutionContext,
+): PoseTuple | null {
+  const goal = canonicalProgramPose(parameters.goal);
+  if (goal === null) return null;
+  const mode = parameters.target_mode ?? 'absolute';
+  if (mode === 'absolute') {
+    if (parameters.target_reference !== undefined
+      || parameters.offset_reference !== undefined) return null;
+    const frame = recordAt(recordAt(parameters.goal)?.frame_ref);
+    return frame?.kind === 'target_frame'
+      && frame.target_role === context.programTargetRoleId
+      && frame.frame_role === context.baseFrameRoleId
+      ? goal
+      : null;
   }
-
-  // pose_goal motion: nested object with position_m and either
-  // orientation_xyzw (quaternion) or orientation_rpy_deg (Euler).
-  // The stored pose becomes the entity pose; the same orientation/
-  // offset pipeline applies so the operator can preview / offset
-  // stored poses identically to raw entity targets.
-  const poseGoal = pose.params['pose_goal'] as Record<string, unknown> | undefined;
-  if (poseGoal === undefined) return null;
-  const position = readTriple(poseGoal['position_m']);
-  if (position === null) return null;
-  const xyzw = readQuad(poseGoal['orientation_xyzw']);
-  const rpyDeg = readTriple(poseGoal['orientation_rpy_deg']);
-  let quaternion: [number, number, number, number];
-  if (xyzw !== null) {
-    quaternion = xyzw;
-  } else if (rpyDeg !== null) {
-    const rpyRad: [number, number, number] = [
-      (rpyDeg[0] * Math.PI) / 180,
-      (rpyDeg[1] * Math.PI) / 180,
-      (rpyDeg[2] * Math.PI) / 180,
-    ];
-    const q = quatFromRpyRad(rpyRad);
-    quaternion = [q.x, q.y, q.z, q.w];
-  } else {
-    quaternion = [0, 0, 0, 1];
-  }
-  const entityPose = {
-    position: new Vector3(...position),
-    quaternion: new Quaternion(...quaternion),
+  if (mode !== 'relative') return null;
+  const target = referencePose(parameters.target_reference, context);
+  if (target === null) return null;
+  const offset = parameters.offset_reference === undefined
+    ? target
+    : referencePose(parameters.offset_reference, context);
+  if (offset === null) return null;
+  const offsetOrientation = new Quaternion(...offset.quaternion).normalize();
+  const goalOrientation = new Quaternion(...goal.quaternion).normalize();
+  const position = new Vector3(...target.position).add(
+    new Vector3(...goal.position).applyQuaternion(offsetOrientation),
+  );
+  offsetOrientation.multiply(goalOrientation).normalize();
+  return {
+    position: [position.x, position.y, position.z],
+    quaternion: [
+      offsetOrientation.x,
+      offsetOrientation.y,
+      offsetOrientation.z,
+      offsetOrientation.w,
+    ],
   };
-  return assembleCartesian(moveTo, entityPose, tcpPose, `pose ${pose.nodeName}`);
 }
 
-function readTriple(value: unknown): [number, number, number] | null {
-  if (!Array.isArray(value) || value.length !== 3) return null;
-  const out: [number, number, number] = [Number(value[0]), Number(value[1]), Number(value[2])];
-  return out.every(Number.isFinite) ? out : null;
+/**
+ * Compute a local Cartesian target from one already-resolved portable pose.
+ * Addressed target and command-schema selection remain backend-owned; stored
+ * joint targets bypass this pose-only calculation and retain their exact units.
+ */
+export function computeCartesianMoveDraft(
+  entityPose: PoseTuple,
+  currentTcpPose: PoseTuple | null,
+  options: CartesianMoveDraftOptions,
+): PoseTuple | null {
+  if (!finitePose(entityPose)) return null;
+  if (
+    !options.offsetXyzM.every(Number.isFinite)
+    || !options.offsetRpyRad.every(Number.isFinite)
+  ) {
+    return null;
+  }
+  const orientation = selectedOrientation(
+    options.orientationMode,
+    entityPose,
+    currentTcpPose,
+  );
+  if (orientation === null) return null;
+
+  const [roll, pitch, yaw] = options.offsetRpyRad;
+  const delta = new Quaternion().setFromEuler(
+    new Euler(roll, pitch, yaw, 'XYZ'),
+  );
+  orientation.multiply(delta).normalize();
+  const position = new Vector3(...entityPose.position).add(
+    new Vector3(...options.offsetXyzM).applyQuaternion(new Quaternion(...entityPose.quaternion).normalize()),
+  );
+  return {
+    position: [position.x, position.y, position.z],
+    quaternion: [orientation.x, orientation.y, orientation.z, orientation.w],
+  };
 }
 
-function readQuad(value: unknown): [number, number, number, number] | null {
-  if (!Array.isArray(value) || value.length !== 4) return null;
-  const out: [number, number, number, number] = [
-    Number(value[0]),
-    Number(value[1]),
-    Number(value[2]),
-    Number(value[3]),
-  ];
-  return out.every(Number.isFinite) ? out : null;
+/** Inverse of the manual source-relative draft, not stored Program semantics. */
+export function cartesianMoveOffsetsFromTarget(
+  entityPose: PoseTuple,
+  currentTcpPose: PoseTuple | null,
+  options: CartesianMoveDraftOptions,
+  target: PoseTuple,
+): CartesianMoveDraftOptions | null {
+  if (!finitePose(entityPose) || !finitePose(target)) return null;
+  const reference = selectedOrientation(options.orientationMode, entityPose, currentTcpPose);
+  if (reference === null) return null;
+  const offset = new Vector3(...target.position).sub(new Vector3(...entityPose.position))
+    .applyQuaternion(new Quaternion(...entityPose.quaternion).normalize().invert());
+  const rotation = reference.invert().multiply(new Quaternion(...target.quaternion).normalize()).normalize();
+  const matrix = new Matrix4().makeRotationFromQuaternion(rotation).elements;
+  const cosine = Math.hypot(matrix[0], matrix[4]);
+  const pitch = Math.atan2(matrix[8], cosine);
+  // Unlike display-only Euler extraction, do not flatten a merely near-
+  // singular rotation. At the singularity retain the previous yaw gauge.
+  const yaw = cosine > 1e-10 ? Math.atan2(-matrix[4], matrix[0]) : options.offsetRpyRad[2];
+  const roll = cosine > 1e-10 ? Math.atan2(-matrix[9], matrix[10])
+    : Math.atan2(matrix[6], matrix[5]) - Math.sign(pitch) * yaw;
+  // Choose the nearest equivalent Euler representation to keep the fields
+  // continuous across +/-pi. The target itself always remains a quaternion.
+  const near = (angle: number, previous: number) => angle + 2 * Math.PI * Math.round((previous - angle) / (2 * Math.PI));
+  const candidates = [[roll, pitch, yaw], [roll + Math.PI, Math.PI - pitch, yaw + Math.PI]]
+    .map((angles) => angles.map((angle, index) => near(angle, options.offsetRpyRad[index])));
+  const distance = (angles: number[]) => angles.reduce((sum, angle, index) => sum + (angle - options.offsetRpyRad[index]) ** 2, 0);
+  const angles = distance(candidates[0]) <= distance(candidates[1]) ? candidates[0] : candidates[1];
+  return {
+    ...options,
+    offsetXyzM: [offset.x, offset.y, offset.z],
+    offsetRpyRad: angles as [number, number, number],
+  };
 }

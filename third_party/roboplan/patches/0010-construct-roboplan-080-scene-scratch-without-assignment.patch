@@ -1,0 +1,85 @@
+diff --git a/roboplan_core/include/roboplan/core/scene.hpp b/roboplan_core/include/roboplan/core/scene.hpp
+index 6e142ff..d9c7004 100644
+--- a/roboplan_core/include/roboplan/core/scene.hpp
++++ b/roboplan_core/include/roboplan/core/scene.hpp
+@@ -122,7 +122,7 @@ public:
+   /// @details The data is shared with the scene; computations such as
+   /// hasCollisions() and computeCollisionDistances() write into this data.
+   /// @return The Pinocchio collision (geometry) data.
+-  const pinocchio::GeometryData& getCollisionData() const { return collision_model_data_; };
++  const pinocchio::GeometryData& getCollisionData() const { return *collision_model_data_; };
+ 
+   /// @brief Updates geometry placements and computes distance results for all
+   /// active collision pairs at the specified joint configuration.
+@@ -714,7 +714,7 @@ private:
+ 
+   /// @brief The default data structure for the underlying Pinocchio collision model.
+   /// @details This won't be thread-safe unless each thread uses its own data.
+-  mutable pinocchio::GeometryData collision_model_data_;
++  mutable std::optional<pinocchio::GeometryData> collision_model_data_;
+ 
+   /// @brief Broadphase collision manager type, using a dynamic AABB tree to cull non-overlapping
+   /// geometry pairs before narrow-phase collision checking.
+diff --git a/roboplan_core/src/core/scene.cpp b/roboplan_core/src/core/scene.cpp
+index cfee30a..ef3f3bf 100644
+--- a/roboplan_core/src/core/scene.cpp
++++ b/roboplan_core/src/core/scene.cpp
+@@ -95,7 +95,8 @@ PinocchioSceneDescription loadMjcfModel(const std::filesystem::path& mjcf_path)
+ }
+ 
+ Scene::Scene(const std::string& name, const PinocchioSceneDescription& description)
+-    : name_{name}, model_{description.model}, collision_model_{description.collision_model} {
++    : name_{name}, model_{description.model}, model_data_{model_},
++      collision_model_{description.collision_model}, collision_model_data_{collision_model_} {
+   // Initialize the RNG to be pseudorandom. You can use setRngSeed() to fix this.
+   std::random_device rd;
+   rng_gen_ = std::mt19937(rd());
+@@ -168,8 +169,7 @@ Scene::Scene(const std::string& name, const PinocchioSceneDescription& descripti
+   frame_map_ = createFrameMap(model_);
+   joint_group_info_map_ = createDefaultJointGroupInfo(model_);
+ 
+-  model_data_ = pinocchio::Data(model_);
+-  refreshCollisionData();
++  rebuildBroadphaseManager();
+ 
+   // Initialize the current state of the scene.
+   cur_state_ = JointConfiguration{.joint_names = actuated_joint_names_,
+@@ -428,7 +428,8 @@ Scene::randomCollisionFreePositions(const std::vector<std::string>& joint_names,
+ }
+ 
+ void Scene::refreshCollisionData() {
+-  collision_model_data_ = pinocchio::GeometryData(collision_model_);
++  broadphase_manager_.reset();
++  collision_model_data_.emplace(collision_model_);
+   rebuildBroadphaseManager();
+ }
+ 
+@@ -439,12 +440,12 @@ void Scene::rebuildBroadphaseManager() {
+ 
+   // The manager caches AABB-tree state and pointers into collision_model_/collision_model_data_,
+   // so it is rebuilt from scratch whenever the collision data is (re)assigned.
+-  broadphase_manager_.emplace(&model_, &collision_model_, &collision_model_data_);
++  broadphase_manager_.emplace(&model_, &collision_model_, &*collision_model_data_);
+ 
+   // Initialize geometry world placements before the first AABB-tree refit. Without this the world
+   // transforms are uninitialized, which makes the underlying coal manager throw on degenerate
+   // bounding volumes. The per-query path overwrites these placements on every call.
+-  pinocchio::updateGeometryPlacements(model_, model_data_, collision_model_, collision_model_data_,
++  pinocchio::updateGeometryPlacements(model_, model_data_, collision_model_, *collision_model_data_,
+                                       pinocchio::neutral(model_));
+   broadphase_manager_->update(/*compute_local_aabb=*/true);
+ }
+@@ -459,11 +460,11 @@ bool Scene::hasCollisions(const Eigen::VectorXd& q, const bool debug) const {
+ 
+   // Debug path: the naive backend evaluates every pair (no stop-at-first) so all colliding pairs
+   // can be printed; the broadphase fast path stops at the first collision.
+-  return computeCollisionsVerbose(model_, model_data_, collision_model_, collision_model_data_, q);
++  return computeCollisionsVerbose(model_, model_data_, collision_model_, *collision_model_data_, q);
+ }
+ 
+ void Scene::computeCollisionDistances(const Eigen::VectorXd& q) const {
+-  pinocchio::computeDistances(model_, model_data_, collision_model_, collision_model_data_, q);
++  pinocchio::computeDistances(model_, model_data_, collision_model_, *collision_model_data_, q);
+ }
+ 
+ bool Scene::isValidConfiguration(const Eigen::VectorXd& q) const {

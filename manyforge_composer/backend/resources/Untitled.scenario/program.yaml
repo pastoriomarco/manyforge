@@ -1,0 +1,55 @@
+{
+  "api_version": "manyforge.program.v2",
+  "catalog": {
+    "api_version": "manyforge.node_catalog.v2",
+    "content_version": "2.9.0"
+  },
+  "component_roles": {},
+  "forest": [],
+  "name": "Untitled",
+  "parameters": [
+    {
+      "constraints": {
+        "max_inclusive": 1.0,
+        "min_exclusive": 0.0
+      },
+      "default": 1.0,
+      "description": "Default acceleration scale for motion nodes.",
+      "parameter_id": "acceleration_scale",
+      "type": "float64"
+    },
+    {
+      "constraints": {
+        "min_inclusive": 0.0
+      },
+      "default": 0.0,
+      "description": "Default Cartesian corner blend radius (m); 0 keeps exact corners.",
+      "parameter_id": "blend_radius_m",
+      "type": "float64"
+    },
+    {
+      "constraints": {
+        "min_exclusive": 0.0
+      },
+      "default": 0.005,
+      "description": "Default Cartesian translation tolerance for motion nodes.",
+      "parameter_id": "translation_tol_m",
+      "type": "float64"
+    },
+    {
+      "constraints": {
+        "max_inclusive": 1.0,
+        "min_exclusive": 0.0
+      },
+      "default": 1.0,
+      "description": "Default velocity scale for motion nodes.",
+      "parameter_id": "velocity_scale",
+      "type": "float64"
+    }
+  ],
+  "positions": {},
+  "program_id": "program-untitled",
+  "program_profile": "composable-cell-v1",
+  "schema_version": "manyforge.composer_authoring_forest.v1",
+  "target_roles": {}
+}

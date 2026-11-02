@@ -8,6 +8,8 @@
 #include <vector>
 
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
+#include <manyforge_core/observed_robot_state_publication.hpp>
+#include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_ros2_control_execution/controller_binding.hpp>
@@ -16,10 +18,22 @@ namespace manyforge::ros2_control_execution {
 
 struct Ros2ControlExecutionBackendConfig {
   std::string node_name = "manyforge_ros2_control_execution_backend";
+  /// Absolute ROS namespace for this exact runtime instance. Retained
+  /// products derive it from the controllable-component identity so two
+  /// same-type instances cannot share command-admission endpoints.
+  std::string node_namespace = "/";
   std::string action_name;
   std::string joint_state_topic = "/joint_states";
   std::string controller_state_topic;
+  /// Exact runtime/addressed joint identity in retained compiled-model order.
+  /// Trajectories, Stop profiles, state publications, and the Kernel use this
+  /// namespace.
   std::vector<std::string> required_joints;
+  /// Exact ROS controller/topic joint identity in the same coordinate order.
+  /// Empty preserves the historical one-namespace contract by selecting
+  /// `required_joints`. Retained MF2 products populate source URDF names here
+  /// so transport never leaks into addressed state identity.
+  std::vector<std::string> transport_joint_names;
   /// Highest-to-lowest authority order for the RT-8C observed-state channel.
   /// Every configured source is retained independently; stale higher-priority
   /// sources fall through to the next fresh complete source.
@@ -51,11 +65,13 @@ struct Ros2ControlExecutionBackendConfig {
   double execution_progress_projection_regression_tolerance_s = 0.005;
   double stop_completion_timeout_s = 0.5;
   double sim_reset_motion_duration_s = 2.0;
+  /// Legacy standalone profiles initialize the simulator when its controller
+  /// becomes ready. Managed installation observes readiness without motion.
+  bool initialize_commanded_sim_on_controller_ready{true};
   bool require_fresh_state_before_planning = true;
   bool disable_controller_path_tolerances = false;
   std::string execution_state_source_mode = "observed_robot";
   std::vector<double> initial_joint_positions_rad;
-  std::string command_gate_topic;
   // Phase 2.7A physical-controller admission. No contract means the existing
   // non-physical/static action binding remains in use. A present contract
   // enables event-invalidated, NRT controller-manager verification.
@@ -119,7 +135,35 @@ struct Ros2ControlExecutionBackendConfig {
   // with an `_experimental` capability id and physically executes
   // spring_back_hold through explicit fallback gating.
   bool enable_soft_on_path_experimental = false;
+
+  /// Exact sealed participant binding for the I8 Prepare/Dispatch boundary.
+  /// Absence keeps the legacy backend observable but makes direct prepared
+  /// admission fail closed until product composition supplies the referent.
+  std::optional<core::RuntimeParticipantBinding> prepared_participant_binding;
 };
+
+/// Exact bounded observed-state source set owned by one backend config.
+/// Command-authoritative simulation is first and non-expiring; ROS feedback
+/// remains measured diagnostic input behind it. A retained addressed owner
+/// uses this derivation to inject the sole numeric publication instead of
+/// creating a second state authority.
+std::vector<core::ObservedRobotStateSourceConfig>
+ros2_control_observed_state_sources(
+    const Ros2ControlExecutionBackendConfig& config);
+
+/// Authority-compatible subset suitable for one addressed publication. For
+/// commanded/authored lanes this contains only the non-expiring owner-issued
+/// source; measured ROS inputs remain diagnostic and cannot become fallback
+/// planning authority. Measured lanes retain their declared precedence set.
+std::vector<core::ObservedRobotStateSourceConfig>
+ros2_control_addressed_state_sources(
+    const Ros2ControlExecutionBackendConfig& config);
+
+/// Measured diagnostic sources split from an addressed authored authority.
+/// Empty for measured lanes, whose addressed publication already owns them.
+std::vector<core::ObservedRobotStateSourceConfig>
+ros2_control_diagnostic_state_sources(
+    const Ros2ControlExecutionBackendConfig& config);
 
 /// Pure capability evaluation for ros2_control deployments. This helper
 /// intentionally has no ROS message/runtime dependency so tests and deployment

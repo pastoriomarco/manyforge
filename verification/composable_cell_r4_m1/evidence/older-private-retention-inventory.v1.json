@@ -1,0 +1,49 @@
+{
+  "schema_version": "manyforge.older_private_retention_inventory.v1",
+  "scope": "DX1037 read-only retention decision support",
+  "recorded_utc": "2026-10-16T07:58:35.764549+00:00",
+  "resource_identifier": "dx952-browser-qualification01",
+  "owner_uid": 2002,
+  "allocated_bytes_total": 1909637120,
+  "purpose": "Superseded private GUI comparison stack; last qualification was partial Close failure retaining owner Scene objects.",
+  "last_qualification": {
+    "at_utc": "2026-10-15T22:06:56.022450+00:00",
+    "outcome": "PARTIAL_FAILURE_OWNER_SCENE_RETAINED",
+    "raw_receipt_identifier": "dx995-close-empty-editors-20261015/private-rendered-result02.json"
+  },
+  "containment": {
+    "standard_stop_evidence_utc": "2026-10-15T22:27:07.947964172Z",
+    "container_references": [],
+    "process_or_open_fd_references": [],
+    "current_user_or_private_symlink_dependencies": [],
+    "sentinel_files_independent_inodes": true
+  },
+  "sizes": {
+    "runner": 1593692160,
+    "runner_build": 1079402496,
+    "runner_node_modules": 356798464,
+    "runner_home": 129212416,
+    "runner_bootstrap_package": 28172288,
+    "source_basis": 221335552,
+    "runtime_and_preserved_runtime": 90550272
+  },
+  "recommendation": {
+    "classification": "Obsolete comparison; not required by current user or qualified private graphs.",
+    "maintainer_deletion_candidate_only": [
+      "runner",
+      "source"
+    ],
+    "candidate_allocated_bytes": 1815027712,
+    "preserve": [
+      "runtime",
+      "runtime-preserved-dx995-20261015T220459Z",
+      "logs, manifests and qualification evidence"
+    ],
+    "condition": "If the obsolete graph is retained for reuse, retain its source basis too: CMake uses the container /workspace mapping. Before deletion, retain the required immutable failure/source reconstruction evidence. Do not delete the entire root indiscriminately.",
+    "current_qualified_graph_and_source_remain_retained": true
+  },
+  "deletion_authorized": false,
+  "deleted_paths": [],
+  "no_user_api_or_runtime_commands": true,
+  "raw_receipt_identifier": "dx1037-older-private-inventory-20261016"
+}

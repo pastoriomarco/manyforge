@@ -1,7 +1,9 @@
-"""ManyForge ROS adapter package.
+"""Focused ROS translations and selected-owner adapters.
 
-ROS-specific helper scripts and launch-time configuration live here.  Runtime
-arm execution and observation for ros2_control deployments is implemented in
-the C++ ``manyforge_roboplan`` backend so timing-sensitive action, feedback,
-and freshness handling stays outside Python.
+The I9 simulator control and read-only scene clients use standard typed
+``simulation_interfaces`` services without owning simulator or command state.
+The Program simulation port adds only a cancellable task/context translation
+over those typed clients and an explicit launcher-owned entity mapping.
+Private Isaac inspection/mesh transport and the complete Isaac product lane
+remain unavailable until their separate I9 gates pass.
 """

@@ -11,4 +11,12 @@ else
 fi
 export PYTHONPATH="$REPO_ROOT/manyforge_ros:$REPO_ROOT/manyforge_behavior:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
+# Component authoring tools live outside the build-owned behavior package
+# (scripts/components); they read curated folders and rows under this root.
+if [ "${1:-}" = component ]; then
+    shift
+    export MANYFORGE_ROOT="$REPO_ROOT"
+    exec python -m scripts.components.cli "$@"
+fi
+
 exec python -m manyforge_behavior.cli "$@"

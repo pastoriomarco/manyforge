@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useState } from 'react';
 
-import { api } from '../api/client';
-import type {
-  ExecutionHistoryEvent,
-  ExecutionHistoryResponse,
-} from '../types/api';
+import { api, HISTORIAN_PAGE_LIMIT } from '../api/client';
+import { HistoryDiscovery } from './HistoryDiscovery';
+import type { HistorianListQuery } from '../api/client';
+import type { HistorianDetail, HistorianRetention } from '../types/headless';
+import { parseProgramRunEnd } from '../api/parsers/components';
+import { runEndPresentation, type RunEndPresentation } from '../state/componentPresentation';
 
 export type HistorySeverityFilter = 'all' | 'info' | 'warning' | 'error';
 export type HistoryAlarmFilter =
@@ -14,338 +15,363 @@ export type HistoryAlarmFilter =
   | 'return'
   | 'acknowledgement'
   | 'raw';
+export type HistoryAlarmPhase =
+  | 'activation'
+  | 'return'
+  | 'acknowledgement'
+  | null;
 
-const ALARM_LIFECYCLE_TYPES = new Set([
-  'operator_alarm_activated',
-  'operator_alarm_returned',
-  'operator_alarm_acknowledged',
-  'operator_alarms_acknowledged',
-]);
-
-function matchesAlarmView(
-  event: ExecutionHistoryEvent,
-  alarmView: HistoryAlarmFilter,
-): boolean {
-  if (alarmView === 'all') return true;
-  if (alarmView === 'raw') return !ALARM_LIFECYCLE_TYPES.has(event.type);
-  if (alarmView === 'lifecycle') return ALARM_LIFECYCLE_TYPES.has(event.type);
-  if (alarmView === 'activation') return event.type === 'operator_alarm_activated';
-  if (alarmView === 'return') return event.type === 'operator_alarm_returned';
-  return event.type === 'operator_alarm_acknowledged'
-    || event.type === 'operator_alarms_acknowledged';
+export interface ExecutionHistoryEventView {
+  id: string;
+  sequence?: number;
+  timestampNs: string;
+  timestamp?: string | null;
+  timestampUtcNs?: string | null;
+  clockOwner?: string | null;
+  wallClockRegressed?: boolean;
+  severity?: string | null;
+  channel: string;
+  message: string;
+  executionId?: number | null;
+  programRunId?: string | null;
+  operationId?: string | null;
+  type: string;
+  alarmPhase?: HistoryAlarmPhase;
+  details?: unknown;
 }
 
-function severityGroup(severity: string | null | undefined): HistorySeverityFilter {
+const MAXIMUM_MOUNTED_HISTORY_ROWS = 32;
+
+/** CONTRACTS §9: the run end a Program run's end event carries, if this is one. */
+export function historyRunEnd(payload: Record<string, unknown>): RunEndPresentation | null {
+  if (payload.run_end === undefined || payload.run_end === null) return null;
+  return runEndPresentation(parseProgramRunEnd(payload.run_end, 'history.run_end'));
+}
+
+export function historySeverityGroup(
+  severity: string | null | undefined,
+): Exclude<HistorySeverityFilter, 'all'> {
   const normalized = (severity ?? 'INFO').toUpperCase();
   if (normalized === 'ERROR' || normalized === 'CRITICAL') return 'error';
   if (normalized === 'WARN' || normalized === 'WARNING') return 'warning';
   return 'info';
 }
 
-export function filterExecutionHistoryEvents(
-  events: ExecutionHistoryEvent[],
-  options: {
-    severity: HistorySeverityFilter;
-    eventType: string;
-    channel: string;
-    search: string;
-    alarmView?: HistoryAlarmFilter;
-    conditionIdentity?: string;
-    executionId?: number;
-  },
-): ExecutionHistoryEvent[] {
-  const needle = options.search.trim().toLowerCase();
-  const conditionNeedle = (options.conditionIdentity ?? '').trim().toLowerCase();
-  return events.filter((event) => {
-    if (
-      options.severity !== 'all'
-      && severityGroup(event.severity) !== options.severity
-    ) return false;
-    if (options.eventType && event.type !== options.eventType) return false;
-    if (options.channel && event.channel !== options.channel) return false;
-    if (!matchesAlarmView(event, options.alarmView ?? 'all')) return false;
-    if (
-      options.executionId !== undefined
-      && event.execution_id !== options.executionId
-    ) return false;
-    if (
-      conditionNeedle
-      && !JSON.stringify(event).toLowerCase().includes(conditionNeedle)
-    ) return false;
-    if (!needle) return true;
-    return JSON.stringify(event).toLowerCase().includes(needle);
-  });
+export function historyFilterQuery(options: {
+  severity: HistorySeverityFilter;
+  alarmView: HistoryAlarmFilter;
+  timeWindow: 'all' | 'minute' | 'five_minutes' | 'hour';
+  component: string;
+  eventType: string;
+  search: string;
+  programRunId: string;
+  operationId: string;
+  correlations?: Partial<HistorianListQuery>;
+}): HistorianListQuery {
+  return {
+    ...options.correlations,
+    limit: HISTORIAN_PAGE_LIMIT,
+    recentSeconds: { all: undefined, minute: 60, five_minutes: 300, hour: 3600 }[options.timeWindow],
+    severities: { all: undefined, info: ['INFO', 'DEBUG'], warning: ['WARN'], error: ['ERROR', 'CRITICAL'] }[options.severity],
+    alarmPhase: { all: undefined, lifecycle: 'all', activation: 'activated', return: 'returned', acknowledgement: 'acknowledged', raw: 'raw' }[options.alarmView] as HistorianListQuery['alarmPhase'],
+    components: options.component.trim() ? [options.component.trim()] : undefined,
+    eventTypes: options.eventType.trim() ? [options.eventType.trim()] : undefined,
+    programRunId: options.programRunId.trim() || undefined,
+    operationId: options.operationId.trim() || undefined,
+    search: options.search.trim() || undefined,
+  };
 }
 
-function eventTime(event: ExecutionHistoryEvent): string {
-  if (event.timestamp) {
-    const parsed = new Date(event.timestamp);
-    if (!Number.isNaN(parsed.getTime())) return parsed.toLocaleTimeString();
+function eventTime(event: ExecutionHistoryEventView): string {
+  if (event.timestampUtcNs != null) {
+    return new Date(Number(BigInt(event.timestampUtcNs) / 1_000_000n)).toLocaleTimeString();
   }
-  return `${event.timestamp_ns} ns`;
+  return event.clockOwner
+    ? `UTC unavailable · ${event.clockOwner}: ${event.timestampNs} ns`
+    : 'Recorded UTC unavailable';
 }
 
-function severityStyle(severity: string | null | undefined): string {
-  switch (severityGroup(severity)) {
-    case 'error':
-      return 'border-red-700/70 bg-red-950/30 text-red-100';
-    case 'warning':
-      return 'border-amber-700/70 bg-amber-950/25 text-amber-100';
-    default:
-      return 'border-gray-700 bg-gray-900/60 text-gray-200';
-  }
+interface ExecutionHistoryPanelProps {
+  open: boolean;
+  onClose: () => void;
+  events: ExecutionHistoryEventView[];
+  eyebrow?: string;
+  loading?: boolean;
+  error?: string | null;
+  retention?: HistorianRetention | null;
+  currentProgramRunId?: string | null;
+  embedded?: boolean;
+  onReload?: (query: HistorianListQuery) => void;
+  onLoadOlder?: () => void;
+  onLoadNewer?: () => void;
+  hasOlder?: boolean;
+  hasNewer?: boolean;
+  selectedDetail?: HistorianDetail | null;
+  detailLoading?: boolean;
+  detailError?: string | null;
+  onSelectEvent?: (event: ExecutionHistoryEventView) => void;
 }
 
+/**
+ * Only a bounded, already-filtered backend page is rendered. Filters never
+ * scan the browser's current page or turn unrelated owner clocks into UTC.
+ */
 export function ExecutionHistoryPanel({
   open,
   onClose,
-}: {
-  open: boolean;
-  onClose: () => void;
-}) {
-  const [limit, setLimit] = useState(100);
-  const [history, setHistory] = useState<ExecutionHistoryResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  events,
+  eyebrow = 'Authoritative event projection',
+  loading = false,
+  error = null,
+  retention = null,
+  currentProgramRunId,
+  embedded = false,
+  onReload,
+  onLoadOlder,
+  onLoadNewer,
+  hasOlder = false,
+  hasNewer = false,
+  selectedDetail = null,
+  detailLoading = false,
+  detailError = null,
+  onSelectEvent,
+}: ExecutionHistoryPanelProps) {
   const [severity, setSeverity] = useState<HistorySeverityFilter>('all');
-  const [eventType, setEventType] = useState('');
-  const [channel, setChannel] = useState('');
   const [alarmView, setAlarmView] = useState<HistoryAlarmFilter>('all');
-  const [conditionIdentity, setConditionIdentity] = useState('');
   const [search, setSearch] = useState('');
-  const [currentExecutionOnly, setCurrentExecutionOnly] = useState(true);
-  const [autoRefresh, setAutoRefresh] = useState(true);
-
-  useEffect(() => {
-    if (!open) return undefined;
-    let cancelled = false;
-    let inFlight = false;
-    const refresh = async () => {
-      if (inFlight) return;
-      inFlight = true;
-      setLoading(true);
-      try {
-        const result = await api.execution.history({ limit });
-        if (!cancelled) {
-          setHistory(result);
-          setError(null);
-        }
-      } catch (reason) {
-        if (!cancelled) {
-          setError(reason instanceof Error ? reason.message : 'History unavailable');
-        }
-      } finally {
-        inFlight = false;
-        if (!cancelled) setLoading(false);
-      }
-    };
-    void refresh();
-    const timer = autoRefresh
-      ? window.setInterval(() => void refresh(), 2000)
-      : null;
-    return () => {
-      cancelled = true;
-      if (timer !== null) window.clearInterval(timer);
-    };
-  }, [autoRefresh, limit, open]);
-
-  const eventTypes = useMemo(
-    () => Array.from(new Set((history?.events ?? []).map((event) => event.type))).sort(),
-    [history],
-  );
-  const channels = useMemo(
-    () => Array.from(new Set(
-      (history?.events ?? [])
-        .map((event) => event.channel)
-        .filter((value): value is string => Boolean(value)),
-    )).sort(),
-    [history],
-  );
-  const visibleEvents = useMemo(() => filterExecutionHistoryEvents(
-    [...(history?.events ?? [])].reverse(),
-    {
-      severity,
-      eventType,
-      channel,
-      search,
-      alarmView,
-      conditionIdentity,
-      executionId:
-        currentExecutionOnly && (history?.executionId ?? 0) > 0
-          ? history!.executionId
-          : undefined,
-    },
-  ), [alarmView, channel, conditionIdentity, currentExecutionOnly, eventType, history, search, severity]);
-
+  const [timeWindow, setTimeWindow] = useState<'all' | 'minute' | 'five_minutes' | 'hour'>('all');
+  const [component, setComponent] = useState('');
+  const [eventType, setEventType] = useState('');
+  const [programRunId, setProgramRunId] = useState('');
+  const [operationId, setOperationId] = useState('');
+  const [currentOnly, setCurrentOnly] = useState(false);
+  const [correlations, setCorrelations] = useState<Partial<HistorianListQuery>>({});
+  const query = (): HistorianListQuery => historyFilterQuery({
+    severity, alarmView, timeWindow, component, eventType, search, operationId,
+    programRunId: currentOnly && currentProgramRunId ? currentProgramRunId : programRunId,
+    correlations,
+  });
+  const validSearch = search.trim() === '' || Array.from(search.trim()).length >= 3;
   if (!open) return null;
 
   return (
-    <aside
-      aria-label="Messages and execution history"
-      className="fixed bottom-0 right-0 top-11 z-[70] flex w-[min(44rem,calc(100vw-1rem))] flex-col border-l border-gray-600 bg-gray-950/98 text-gray-100 shadow-2xl shadow-black/70 backdrop-blur-sm"
+    <section
+      className={`history-panel${embedded ? ' history-panel-embedded' : ''}`}
+      aria-labelledby="history-title"
     >
-      <div className="flex items-center justify-between border-b border-gray-700 px-4 py-3">
+      <header>
         <div>
-          <h2 className="text-sm font-semibold">Messages and history</h2>
-          <div className="mt-0.5 text-[11px] text-gray-400">
-            {history?.runId ? `Run ${history.runId}` : 'Current Composer session'}
-            {' · '}{visibleEvents.length} shown / {history?.events.length ?? 0} loaded
-          </div>
+          <p className="eyebrow">{eyebrow}</p>
+          <h2 id="history-title">Runtime history</h2>
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close messages history"
-          className="rounded p-1.5 text-gray-400 hover:bg-gray-800 hover:text-white"
-        >
-          <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.6" aria-hidden>
-            <path d="m3 3 10 10M13 3 3 13" strokeLinecap="round" />
-          </svg>
-        </button>
-      </div>
-
-      <div className="grid gap-2 border-b border-gray-700 bg-gray-900/60 p-3 sm:grid-cols-2">
-        <label className="text-[11px] text-gray-400">
-          Severity
+        <div className="button-row">
+          {onReload && <button type="button" disabled={loading || !validSearch} onClick={() => onReload(query())}>Refresh</button>}
+          {!embedded && <button type="button" onClick={onClose}>Close</button>}
+        </div>
+      </header>
+      <div className="history-filters">
+        <label>
+          <span>Time</span>
+          <select
+            value={timeWindow}
+            onChange={(event) => setTimeWindow(event.target.value as typeof timeWindow)}
+          >
+            <option value="all">All retained time</option>
+            <option value="minute">Latest minute</option>
+            <option value="five_minutes">Latest 5 minutes</option>
+            <option value="hour">Latest hour</option>
+          </select>
+        </label>
+        <label>
+          <span>Severity</span>
           <select
             value={severity}
             onChange={(event) => setSeverity(event.target.value as HistorySeverityFilter)}
-            className="mt-1 w-full rounded border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-gray-100"
           >
-            <option value="all">All severities</option>
-            <option value="info">Messages (INFO)</option>
+            <option value="all">All</option>
+            <option value="info">Info</option>
             <option value="warning">Warnings</option>
-            <option value="error">Errors / critical</option>
+            <option value="error">Errors</option>
           </select>
         </label>
-        <label className="text-[11px] text-gray-400">
-          Event type
-          <select
+        <label>
+          <span>Component</span>
+          <input
+            value={component}
+            onChange={(event) => setComponent(event.target.value)}
+            placeholder="manyforge.runtime"
+          />
+        </label>
+        <label>
+          <span>Event type</span>
+          <input
             value={eventType}
             onChange={(event) => setEventType(event.target.value)}
-            className="mt-1 w-full rounded border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-gray-100"
-          >
-            <option value="">All event types</option>
-            {eventTypes.map((value) => <option key={value} value={value}>{value}</option>)}
-          </select>
+            placeholder="operation_completed"
+          />
         </label>
-        <label className="text-[11px] text-gray-400">
-          Channel
-          <select
-            value={channel}
-            onChange={(event) => setChannel(event.target.value)}
-            className="mt-1 w-full rounded border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-gray-100"
-          >
-            <option value="">All channels</option>
-            {channels.map((value) => <option key={value} value={value}>{value}</option>)}
-          </select>
+        <label>
+          <span>Program run</span>
+          <input
+            value={programRunId}
+            disabled={currentOnly && Boolean(currentProgramRunId)}
+            onChange={(event) => setProgramRunId(event.target.value)}
+            placeholder="program-run…"
+          />
         </label>
-        <label className="text-[11px] text-gray-400">
-          Alarm records
+        <label>
+          <span>Operation</span>
+          <input
+            value={operationId}
+            onChange={(event) => setOperationId(event.target.value)}
+            placeholder="operation…"
+          />
+        </label>
+        <label>
+          <span>Alarm events</span>
           <select
             value={alarmView}
             onChange={(event) => setAlarmView(event.target.value as HistoryAlarmFilter)}
-            className="mt-1 w-full rounded border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-gray-100"
           >
-            <option value="all">All records</option>
-            <option value="lifecycle">All alarm lifecycle</option>
-            <option value="activation">Alarm activations</option>
-            <option value="return">Alarm returns</option>
-            <option value="acknowledgement">Alarm acknowledgements</option>
-            <option value="raw">Raw events / occurrences</option>
+            <option value="all">All events</option>
+            <option value="lifecycle">Alarm lifecycle</option>
+            <option value="activation">Activations</option>
+            <option value="return">Returns</option>
+            <option value="acknowledgement">Acknowledgements</option>
+            <option value="raw">Non-alarm events</option>
           </select>
         </label>
-        <label className="text-[11px] text-gray-400">
-          Retained rows
-          <select
-            value={limit}
-            onChange={(event) => setLimit(Number(event.target.value))}
-            className="mt-1 w-full rounded border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-gray-100"
-          >
-            {[50, 100, 250, 500, 1000].map((value) => (
-              <option key={value} value={value}>{value}</option>
-            ))}
-          </select>
+        <label>
+          <span>Search</span>
+          <input value={search} maxLength={256} placeholder="At least 3 characters" onChange={(event) => setSearch(event.target.value)} />
         </label>
-        <label className="sm:col-span-2 text-[11px] text-gray-400">
-          Condition or activation identity
+        <label className="history-current-toggle">
           <input
-            value={conditionIdentity}
-            onChange={(event) => setConditionIdentity(event.target.value)}
-            className="mt-1 w-full rounded border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-gray-100"
-            placeholder="condition ID, activation ID, scope, or correlation…"
+            type="checkbox"
+            checked={currentOnly}
+            disabled={!currentProgramRunId}
+            onChange={(event) => setCurrentOnly(event.target.checked)}
           />
+          Current Program run
         </label>
-        <label className="sm:col-span-2 text-[11px] text-gray-400">
-          Search message or details
-          <input
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            className="mt-1 w-full rounded border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-gray-100"
-            placeholder="collision, warning, node name, error code…"
-          />
-        </label>
-        <div className="sm:col-span-2 flex flex-wrap gap-4 text-xs text-gray-300">
-          <label className="flex items-center gap-1.5">
-            <input
-              type="checkbox"
-              checked={currentExecutionOnly}
-              onChange={(event) => setCurrentExecutionOnly(event.target.checked)}
-              disabled={(history?.executionId ?? 0) <= 0}
-              className="accent-emerald-500"
-            />
-            Current execution{(history?.executionId ?? 0) > 0 ? ` #${history!.executionId}` : ''}
-          </label>
-          <label className="flex items-center gap-1.5">
-            <input
-              type="checkbox"
-              checked={autoRefresh}
-              onChange={(event) => setAutoRefresh(event.target.checked)}
-              className="accent-emerald-500"
-            />
-            Auto-refresh
-          </label>
-          {loading && <span className="text-gray-500">Refreshing…</span>}
-        </div>
+        {onReload && (
+          <button type="button" disabled={loading || !validSearch} onClick={() => onReload(query())}>Apply filters</button>
+        )}
       </div>
-
-      {error && (
-        <div role="alert" className="border-b border-red-800 bg-red-950/50 px-3 py-2 text-xs text-red-200">
-          {error}
+      <HistoryDiscovery onSelect={(kind, value) => {
+        if (kind === 'program_run_id') { setCurrentOnly(false); setProgramRunId(value); }
+        else if (kind === 'component') setComponent(value);
+        else if (kind === 'event_type') setEventType(value);
+        else setCorrelations({ ...correlations, channel: value });
+      }} />
+      {validSearch && <p>
+        <a href={api.history.exportUrl(query())} download="manyforge-debug.json">Export filtered diagnostic bundle</a>
+        {' · '}<a href={api.history.exportUrl(query(), true)} download="manyforge-trace.json">Normalized trace</a>
+        {' '}<span className="muted">Up to 256 retained events; coverage and continuation are included.</span>
+      </p>}
+      <details className="history-correlation-filters">
+        <summary>Exact causal references</summary>
+        <div className="history-filters">
+          {([
+            ['channel', 'Exact component / channel'],
+            ['actionSpanId', 'Action span'], ['nodeInstanceId', 'Node instance'],
+            ['interventionSessionId', 'Intervention'], ['contactPolicyId', 'Contact policy'],
+            ['incidentId', 'Incident'], ['conditionId', 'Condition'],
+          ] as const).map(([key, label]) => (
+            <label key={key}><span>{label}</span>
+              <input value={correlations[key] ?? ''} maxLength={1024}
+                onChange={(event) => setCorrelations({ ...correlations, [key]: event.target.value.trim() || undefined })} />
+            </label>
+          ))}
         </div>
-      )}
-      <div className="min-h-0 flex-1 overflow-y-auto p-3">
-        {visibleEvents.length === 0 ? (
-          <div className="rounded border border-gray-700 bg-gray-900/40 p-4 text-center text-xs text-gray-500">
-            No events match the selected filters.
-          </div>
-        ) : visibleEvents.map((event) => (
-          <details
-            key={`${event.event_index}:${event.type}`}
-            className={`mb-2 rounded border px-3 py-2 text-xs ${severityStyle(event.severity)}`}
+      </details>
+      {retention && <details className="history-retention">
+        <summary>Retention and recorded-time coverage</summary>
+        <p className="muted">Bounded local history, not a permanent archive. Important events and routine progress have independent limits. Export evidence before it is pruned.</p>
+        {!retention.priorPruningKnown && <p className="muted">Legacy history did not retain pruning counts; coverage before this migration is unknown.</p>}
+        {retention.partitions.map((part) => <p key={part.partition}>
+          <strong>{part.partition}</strong>: {part.retainedCount} retained; {part.prunedCount} pruned{part.lossCounterSaturated ? ' (at least)' : ''}.
+          {' '}Recorded UTC: {part.firstRecordedUtcNs === null ? 'unavailable' : new Date(Number(BigInt(part.firstRecordedUtcNs) / 1_000_000n)).toISOString()}
+          {' → '}{part.lastRecordedUtcNs === null ? 'unavailable' : new Date(Number(BigInt(part.lastRecordedUtcNs) / 1_000_000n)).toISOString()}.
+          {' '}{part.unknownTimeCount} unknown times; {part.regressedTimeCount} clock regressions.
+        </p>)}
+        <p>
+          <strong>failure captures</strong>: {retention.captures.liveCount} of {retention.captures.liveCaptureLimit} retained
+          {' '}protecting {retention.captures.protectedCount} events ({retention.captures.protectedBytes} of {retention.captures.protectedByteLimit} bytes);
+          {' '}{retention.captures.retiredCount} retired, releasing {retention.captures.releasedRows} events to ordinary pruning.
+        </p>
+      </details>}
+      <div className="history-events">
+        {loading && <p className="muted">Loading history…</p>}
+        {error && <p className="error-state notice severity-error" role="alert">{error}</p>}
+        {!loading && !error && events.length === 0 && (
+          <p className="muted">No events match these filters.</p>
+        )}
+        {events.slice(0, MAXIMUM_MOUNTED_HISTORY_ROWS).map((event) => (
+          <button
+            type="button"
+            key={event.id}
+            disabled={loading}
+            className={`history-event severity-${historySeverityGroup(event.severity)}${
+              event.sequence !== undefined
+                && selectedDetail !== null
+                && selectedDetail.sequence === event.sequence ? ' selected' : ''
+            }`}
+            onClick={() => onSelectEvent?.(event)}
           >
-            <summary className="cursor-pointer list-none">
-              <div className="flex items-start gap-2">
-                <span className="mt-0.5 shrink-0 rounded bg-black/25 px-1.5 py-0.5 font-mono text-[10px] uppercase">
-                  {event.severity ?? 'INFO'}
-                </span>
-                <span className="min-w-0 flex-1 break-words">
-                  {event.message || event.type.replaceAll('_', ' ')}
-                </span>
-                <span className="shrink-0 font-mono text-[10px] opacity-65">{eventTime(event)}</span>
-              </div>
-              <div className="mt-1 flex flex-wrap gap-2 font-mono text-[10px] opacity-65">
-                <span>{event.type}</span>
-                {event.channel && <span>{event.channel}</span>}
-                {event.execution_id > 0 && <span>execution #{event.execution_id}</span>}
-              </div>
-            </summary>
-            <pre className="mt-2 max-h-72 overflow-auto rounded bg-black/40 p-2 text-[10px] leading-4 text-gray-200">
-              {JSON.stringify(event, null, 2)}
-            </pre>
-          </details>
+            <header>
+              <strong>{event.message || event.type}</strong>
+              <time title={event.timestamp ? `Original recorded wall time: ${event.timestamp}` : undefined}>{eventTime(event)}{event.wallClockRegressed ? ' · clock moved backward' : ''}</time>
+            </header>
+            <small>{event.channel} · {event.type}</small>
+          </button>
         ))}
+        {(hasNewer || hasOlder) && (
+          <nav className="history-page-navigation" aria-label="History pages">
+            <button
+              type="button"
+              disabled={loading || !hasNewer}
+              onClick={onLoadNewer}
+            >Newer</button>
+            <button
+              type="button"
+              disabled={loading || !hasOlder}
+              onClick={onLoadOlder}
+            >Older</button>
+          </nav>
+        )}
       </div>
-    </aside>
+      {(detailLoading || detailError !== null || selectedDetail !== null) && (
+        <section className="history-detail" aria-label="Selected history event detail">
+          {detailLoading && <p className="muted">Loading exact event detail…</p>}
+          {detailError && <p className="error-state notice severity-error" role="alert">{detailError}</p>}
+          {selectedDetail && (
+            <>
+              <header>
+                <strong>{selectedDetail.event.eventType.replaceAll('_', ' ')}</strong>
+                <code>sequence {selectedDetail.sequence}</code>
+              </header>
+              <HistoryRunEnd payload={selectedDetail.event.payload} />
+              <div className="history-detail-sections">
+                {Object.entries(selectedDetail.sections).map(([name, section]) => (
+                  <details key={name} open={section.available}>
+                    <summary>{name.replaceAll(/([A-Z])/g, ' $1')}</summary>
+                    {section.available
+                      ? <pre>{JSON.stringify(section.value, null, 2)}</pre>
+                      : <p className="muted">{section.reason}</p>}
+                  </details>
+                ))}
+              </div>
+            </>
+          )}
+        </section>
+      )}
+    </section>
   );
+}
+
+function HistoryRunEnd({ payload }: { payload: Record<string, unknown> }) {
+  const end = historyRunEnd(payload);
+  if (end === null) return null;
+  return <p className={`run-end tone-${end.tone}`} role="status"><strong>{end.label}</strong> · {end.text}</p>;
 }

@@ -1,0 +1,82 @@
+{
+  "api_version": "manyforge.stop_evidence_policy.v2",
+  "containment_granularity": "resource",
+  "disposition": "stoppable",
+  "escalation_stages": [
+    {
+      "containment_command": {
+        "command": {
+          "command_kind": "logical_cancel",
+          "provider_contract_ref": {
+            "contract_schema_id": "manyforge.value_schema.provider_contract.empty.v1",
+            "contract_schema_revision": "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
+            "provider_contract_role_id": "gripper_logical_cancel"
+          }
+        }
+      },
+      "containment_granularity": "resource",
+      "evidence_conjunction": "all_of",
+      "evidence_requirements": [
+        {
+          "evidence": {
+            "evidence_kind": "logical_cancellation_no_continuing_effect",
+            "provider_contract_ref": {
+              "contract_schema_id": "manyforge.value_schema.provider_contract.empty.v1",
+              "contract_schema_revision": "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
+              "provider_contract_role_id": "gripper_logical_cancel"
+            }
+          },
+          "evidence_item_id": "logical_cancel_fenced",
+          "observation_semantics": {
+            "observation_kind": "command_result"
+          },
+          "source_requirement": {
+            "freshness_budget_ns": 100000000,
+            "source_kind": "command_target_status"
+          }
+        }
+      ],
+      "stage_kind": "nominal",
+      "stop_escalation_stage_id": "gripper_logical_cancel"
+    },
+    {
+      "containment_command": {
+        "command": {
+          "command_kind": "registered",
+          "provider_contract_ref": {
+            "contract_schema_id": "manyforge.value_schema.provider_contract.empty.v1",
+            "contract_schema_revision": "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
+            "provider_contract_role_id": "software_hard_stop"
+          },
+          "registered_command_kind_id": "manyforge.stop.software_hard"
+        }
+      },
+      "containment_granularity": "resource",
+      "evidence_conjunction": "all_of",
+      "evidence_requirements": [
+        {
+          "evidence": {
+            "evidence_kind": "logical_cancellation_no_continuing_effect",
+            "provider_contract_ref": {
+              "contract_schema_id": "manyforge.value_schema.provider_contract.empty.v1",
+              "contract_schema_revision": "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
+              "provider_contract_role_id": "gripper_logical_cancel"
+            }
+          },
+          "evidence_item_id": "hard_cancel_fenced",
+          "observation_semantics": {
+            "observation_kind": "command_result"
+          },
+          "source_requirement": {
+            "freshness_budget_ns": 100000000,
+            "source_kind": "command_target_status"
+          }
+        }
+      ],
+      "stage_kind": "software_hard",
+      "stop_escalation_stage_id": "software_hard"
+    }
+  ],
+  "stop_evidence_policy_id": "manyforge.gripper_position_cancellation",
+  "stop_evidence_policy_revision": "sha256:5534e855c9d46f58e45305ce22cd780a8befe4dec5e41bf3b53ee296d75613d5"
+}

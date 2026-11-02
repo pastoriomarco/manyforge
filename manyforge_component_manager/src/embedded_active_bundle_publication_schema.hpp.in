@@ -1,0 +1,10 @@
+#pragma once
+
+#include <string_view>
+
+namespace manyforge::component_manager::detail {
+
+inline constexpr std::string_view kEmbeddedActiveBundlePublicationSchema =
+    R"mf_abps(@MANYFORGE_ACTIVE_BUNDLE_PUBLICATION_SCHEMA_SQL@)mf_abps";
+
+}  // namespace manyforge::component_manager::detail

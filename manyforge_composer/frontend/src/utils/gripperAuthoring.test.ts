@@ -1,22 +1,25 @@
 import { describe, expect, it } from 'vitest';
+import { gripperPositionDraft } from './gripperAuthoring';
 
-import { gripperCandidateRequest } from './gripperAuthoring';
-
-describe('gripperCandidateRequest', () => {
-  it('builds a gripper candidate (not an immediate command) for a slider release', () => {
-    const req = gripperCandidateRequest('primary', 0.42, 'gripper_slider');
-    expect(req.inputMode).toBe('gripper');
-    expect(req.sourceSurface).toBe('gripper_slider');
-    expect(req.gripperTarget).toEqual({ gripperId: 'primary', targetPosition: 0.42 });
-    // Authoring only: no joint/cartesian payload, no direct command shape.
-    expect(req.jointTarget).toBeUndefined();
-    expect(req.cartesianTarget).toBeUndefined();
+describe('gripper authoring drafts', () => {
+  it('keeps articulated prismatic values in metres', () => {
+    expect(
+      gripperPositionDraft('robot-1', 'gripper', 'prismatic', 0.042, 'gripper_slider'),
+    ).toEqual({
+      source: 'gripper_slider',
+      address: { componentId: 'robot-1', targetId: 'gripper' },
+      coordinate: { kind: 'prismatic', value: 0.042, unit: 'm' },
+    });
   });
 
-  it('builds a gripper candidate for a preset click', () => {
-    const req = gripperCandidateRequest('primary', 0.0, 'gripper_preset');
-    expect(req.inputMode).toBe('gripper');
-    expect(req.sourceSurface).toBe('gripper_preset');
-    expect(req.gripperTarget).toEqual({ gripperId: 'primary', targetPosition: 0.0 });
+  it('keeps revolute values in radians and rejects unaddressed drafts', () => {
+    expect(
+      gripperPositionDraft('tool-1', 'fingers', 'revolute', 0.5, 'gripper_preset'),
+    ).toEqual(expect.objectContaining({
+      coordinate: { kind: 'revolute', value: 0.5, unit: 'rad' },
+    }));
+    expect(
+      gripperPositionDraft('', 'gripper', 'prismatic', 0.01, 'gripper_slider'),
+    ).toBeNull();
   });
 });

@@ -1,104 +1,93 @@
 #!/usr/bin/env bash
-# WS8 ros2_control backend hot-path qualification probe.
+# Report-only ROS hot-path measurement. Run after cutover.
+# Reports whole fake-FJT feedback delivery (SDK/executor/polling included) and
+# repeated idle observer updates through the public runtime handle. There are
+# no allocation/update budgets; the maintainer decides from measured evidence.
+# Does not start a Manager, Isaac, a real robot, or a controller process.
 #
-# Produces one archival JSON evidence line for high-rate backend surfaces:
-# action-feedback sample storage reuse and idle-scene repeated-sample skips.
-# This does not replace live controller qualification; it proves the in-tree
-# callback hot paths stay allocation-bounded after the WS8 optimizations.
-#
-# Usage (local Docker, from the manyforge repo root):
-#   ./scripts/run-ros2-control-hot-path-qualification.sh
-#
-# Usage (inside the dev container):
-#   ./scripts/run-ros2-control-hot-path-qualification.sh --in-container
-
+# Use an existing qualified ROS-full image through diagnostic-build.sh:
+#   MANYFORGE_DIAGNOSTIC_IMAGE=sha256:... ./scripts/run-ros2-control-hot-path-qualification.sh
+# Inside that toolchain: ./scripts/run-ros2-control-hot-path-qualification.sh --in-container
+# Caller owns the global build lock and any resource-priority window.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IN_CONTAINER=false
-if [[ "${1:-}" == "--in-container" ]]; then
-  IN_CONTAINER=true
-fi
+case "${1:-}" in
+    --in-container) IN_CONTAINER=true; shift ;;
+    --help)
+        printf '%s\n' 'Usage: run-ros2-control-hot-path-qualification.sh [--in-container]' \
+          'MANYFORGE_ROS2_CONTROL_HOT_PATH_ITERATIONS: delivered feedback messages (default 10000)' \
+          'MANYFORGE_ROS2_CONTROL_IDLE_WINDOW_MS: unchanged-sample window (default 1000)' \
+          'MANYFORGE_ROS2_CONTROL_HOT_PATH_JSON_OUT: optional archival JSON file' \
+          'MANYFORGE_DIAGNOSTIC_IMAGE: required existing qualified ROS-full image' \
+          'MANYFORGE_ROS2_CONTROL_HOT_PATH_VARIANT: diagnostic graph variant' \
+          'MANYFORGE_ROS2_CONTROL_HOT_PATH_BUILD_DIR: in-container graph directory' \
+          'MANYFORGE_ROS2_CONTROL_HOT_PATH_BUILD_TESTING: ON/OFF matching the graph (default ON)'
+        exit 0 ;;
+    '') ;;
+    *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
+esac
+if (( $# )); then printf 'Unexpected arguments\n' >&2; exit 2; fi
 
-select_container() {
-  if [[ -n "${MANYFORGE_QUAL_CONTAINER:-}" ]]; then
-    echo "${MANYFORGE_QUAL_CONTAINER}"
-    return 0
-  fi
-  docker ps --format '{{.Names}}' |
-    awk '/^manyforge-(composer-ros|.*ros|isaac-topic-control)-[0-9]+$/ {print; exit}'
-}
-
-source_ros_setup_if_available() {
-  local ros_distro="${ROS_DISTRO:-jazzy}"
-  if [[ -f "/opt/ros/${ros_distro}/setup.bash" ]]; then
+run_inside_container() {
+    local workspace="${WORKSPACE:-/workspace}"
+    local build_dir="${MANYFORGE_ROS2_CONTROL_HOT_PATH_BUILD_DIR:-${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}/ros-integration}"
+    local ros_distro="${ROS_DISTRO:?Selected ROS-full image must set ROS_DISTRO}"
+    local build_testing="${MANYFORGE_ROS2_CONTROL_HOT_PATH_BUILD_TESTING:-ON}"
+    local venv="${MANYFORGE_VENV:-/opt/manyforge/venv}"
+    local pinocchio_dir pinocchio_prefix
+    case "${build_testing}" in
+        ON|OFF) ;;
+        *) printf 'Build testing must be ON or OFF\n' >&2; return 2 ;;
+    esac
     set +u
     # shellcheck disable=SC1090
     source "/opt/ros/${ros_distro}/setup.bash"
+    if [[ -f "${venv}/bin/activate" ]]; then
+        # shellcheck disable=SC1091
+        source "${venv}/bin/activate"
+    fi
     set -u
-  fi
+    pinocchio_dir=$(find "${venv}" /usr -name pinocchioConfig.cmake -printf '%h\n' 2>/dev/null | head -1 || true)
+    if [[ -z "${pinocchio_dir}" ]]; then
+        printf 'pinocchioConfig.cmake missing from selected ROS-full toolchain\n' >&2
+        return 2
+    fi
+    pinocchio_prefix=$(dirname "$(dirname "$(dirname "${pinocchio_dir}")")")
+    export CMAKE_PREFIX_PATH="/usr/local:${pinocchio_prefix}:${CMAKE_PREFIX_PATH:-}"
+    cmake -S "${workspace}/scripts/ros/ros-integration" -B "${build_dir}" \
+        -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING="${build_testing}" >&2
+    cmake --build "${build_dir}" --target perf_ros2_control_hot_paths \
+        --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}" >&2
+    "${build_dir}/perf_ros2_control_hot_paths"
 }
 
-run_inside_container() {
-  source_ros_setup_if_available
-  export MANYFORGE_ROS2_CONTROL_FEEDBACK_ALLOC_BUDGET="${MANYFORGE_ROS2_CONTROL_FEEDBACK_ALLOC_BUDGET:-0}"
-  export MANYFORGE_ROS2_CONTROL_IDLE_SKIP_ALLOC_BUDGET="${MANYFORGE_ROS2_CONTROL_IDLE_SKIP_ALLOC_BUDGET:-0}"
-  export MANYFORGE_ROS2_CONTROL_IDLE_SKIP_MAX_UPDATES="${MANYFORGE_ROS2_CONTROL_IDLE_SKIP_MAX_UPDATES:-1}"
-
-  local workspace="${WORKSPACE:-/workspace}"
-  local build_dir="${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}/ros2-control-hot-paths"
-  local source_file="${workspace}/manyforge_ros2_control_execution/test/perf/perf_ros2_control_hot_paths.cpp"
-  local backend_source="${workspace}/manyforge_ros2_control_execution/src/ros2_control_execution_backend.cpp"
-  local backend_header="${workspace}/manyforge_ros2_control_execution/include/manyforge_ros2_control_execution/ros2_control_execution_backend.hpp"
-  local cmake_file="${workspace}/manyforge_ros2_control_execution/CMakeLists.txt"
-  local binary="${build_dir}/perf_ros2_control_hot_paths"
-
-  if [[ ! -x "${binary}" ||
-        "${source_file}" -nt "${binary}" ||
-        "${backend_source}" -nt "${binary}" ||
-        "${backend_header}" -nt "${binary}" ||
-        "${cmake_file}" -nt "${binary}" ||
-        "${MANYFORGE_FORCE_REBUILD_QUALIFICATION:-0}" == "1" ]]; then
-    echo "perf_ros2_control_hot_paths not built at ${build_dir}; running CMake build" >&2
-    mkdir -p "${build_dir}"
-    (cd "${build_dir}" && cmake "${workspace}/manyforge_ros2_control_execution" \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DBUILD_TESTING=ON >&2 && make -j"$(nproc)" perf_ros2_control_hot_paths >&2)
-  fi
-  "${binary}"
-}
-
-if [[ "${IN_CONTAINER}" == "true" ]]; then
-  if [[ -n "${MANYFORGE_ROS2_CONTROL_HOT_PATH_JSON_OUT:-}" ]]; then
-    run_inside_container | tee "${MANYFORGE_ROS2_CONTROL_HOT_PATH_JSON_OUT}"
-    exit "${PIPESTATUS[0]}"
-  fi
-  run_inside_container
-  exit $?
+if [[ "${IN_CONTAINER}" == true ]]; then
+    run_inside_container
+    exit $?
 fi
-
-if ! command -v docker >/dev/null 2>&1; then
-  echo "docker not found on PATH; rerun with --in-container inside the dev container" >&2
-  exit 1
+if [[ -z "${MANYFORGE_DIAGNOSTIC_IMAGE:-}" ]]; then
+    printf 'Set MANYFORGE_DIAGNOSTIC_IMAGE to an existing qualified ROS-full image\n' >&2
+    exit 2
 fi
-
-CONTAINER="$(select_container || true)"
-if [[ -n "${CONTAINER}" ]] &&
-   docker ps --format '{{.Names}}' | grep -qx "${CONTAINER}"; then
-  cd "${REPO_ROOT}"
-  docker exec "${CONTAINER}" bash -lc \
-    "cd /workspace && ./scripts/run-ros2-control-hot-path-qualification.sh --in-container"
-  exit $?
-fi
-
-cd "${REPO_ROOT}"
+# The existing launcher owns source/image identity, compiler cache and tree lock.
+# It never silently selects another running container or builds an image.
+# JSON is written on the host after extraction from the evidence line.
 set +e
-RESULT_JSON="$(docker compose run --rm dev \
-  bash -lc "./scripts/run-ros2-control-hot-path-qualification.sh --in-container")"
+result=$("${REPO_ROOT}/scripts/diagnostic-build.sh" \
+    "${MANYFORGE_ROS2_CONTROL_HOT_PATH_VARIANT:-ros-hot-path-report-release}" -- env \
+    "MANYFORGE_ROS2_CONTROL_HOT_PATH_ITERATIONS=${MANYFORGE_ROS2_CONTROL_HOT_PATH_ITERATIONS:-10000}" \
+    "MANYFORGE_ROS2_CONTROL_IDLE_WINDOW_MS=${MANYFORGE_ROS2_CONTROL_IDLE_WINDOW_MS:-1000}" \
+    "MANYFORGE_ROS2_CONTROL_HOT_PATH_BUILD_TESTING=${MANYFORGE_ROS2_CONTROL_HOT_PATH_BUILD_TESTING:-ON}" \
+    "MANYFORGE_ROS2_CONTROL_HOT_PATH_BUILD_DIR=${MANYFORGE_ROS2_CONTROL_HOT_PATH_BUILD_DIR:-/runner/build/ros-integration}" \
+    MANYFORGE_ROS2_CONTROL_HOT_PATH_JSON_OUT= \
+    bash /workspace/scripts/run-ros2-control-hot-path-qualification.sh --in-container)
 status=$?
 set -e
-echo "${RESULT_JSON}"
-if [[ -n "${MANYFORGE_ROS2_CONTROL_HOT_PATH_JSON_OUT:-}" ]]; then
-  echo "${RESULT_JSON}" > "${MANYFORGE_ROS2_CONTROL_HOT_PATH_JSON_OUT}"
+printf '%s\n' "${result}"
+if [[ "$status" == 0 && -n "${MANYFORGE_ROS2_CONTROL_HOT_PATH_JSON_OUT:-}" ]]; then
+    printf '%s\n' "${result}" | sed -n 's/^MANYFORGE_QUALIFICATION_EVIDENCE //p' \
+        > "${MANYFORGE_ROS2_CONTROL_HOT_PATH_JSON_OUT}"
 fi
 exit "${status}"

@@ -1,38 +1,39 @@
-# Example PLC Write Bool
+# PLC Boolean-Write Extension Reference
 
-This folder is the minimum copyable `manyforge.external_node.v0` contract
-example. It demonstrates a trusted, non-real-time behavior leaf that consumes a
-deployment-owned resource. It is not a Siemens protocol implementation.
+> **Non-operative example:** this folder is not an installable external node.
+> It contains no `node.py`, no v1 descriptor, and no executable-package
+> manifest. ManyForge has no external-node loader.
 
-Validate the folder before delivery:
+The historical example demonstrated a nonblocking Python leaf that obtained a
+deployment-owned PLC client from the blackboard. That mechanism was deleted
+with the v1 path loader and `runtime_resources` registry. It must not be copied
+back into production code.
 
-```bash
-manyforge nodes validate examples/external_nodes/example_plc_write_bool
-```
+For current portable authoring, the built-in v2 `io.set_output` entry already
+represents the same intent:
 
-The resource provider must make `write_bool_async(tag=..., value=...)` return
-immediately. The returned operation exposes `done()`, `result()`, and
-`cancel()`. Provider connection handling, credentials, endpoint selection, and
-network timeouts remain outside generated node code.
+- select a `target_role` from the Program Binding;
+- select a semantic `resource_role` on that target;
+- provide the boolean `value`;
+- require `io.gpio.set_output` at `target_binding` scope; and
+- invoke the `kernel.command_target` owner.
 
-The descriptor selects a resource through `plc_client_id`. A deployment that
-uses this node must define that alias and advertise the required capability:
+Provider selection, endpoint addresses, credentials, PLC tags, and runtime
+handles are deployment/compiler concerns. They are neither node parameters nor
+blackboard values.
 
-```yaml
-external_nodes:
-  enabled: [example_plc_write_bool]
-  strict: true
-runtime_resources:
-  plc_clients:
-    default:
-      provider: site_plc
-      endpoint_alias: cell_plc_1
-      timeout_s: 0.5
-      capabilities: [plc.siemens.s7.write]
-```
+## Files in this reference
 
-Run the fake-provider contract tests from the repository container:
+- [`node.yaml`](node.yaml) is entirely commented. It shows the intended v2
+  catalog-entry shape but deliberately parses as no descriptor, because the
+  closed extension-package manifest/compiler is not implemented yet.
+- [`reference_semantics.py`](reference_semantics.py) is a dependency-neutral
+  pure reducer for the historical start, completion, failure, timeout, and
+  cancellation decisions. It performs no I/O and is not a runner.
+- [`tests/test_fake_plc.py`](tests/test_fake_plc.py) keeps those pure acceptance
+  cases active without importing `py_trees`, loading a source path, or creating
+  a provider handle.
 
-```bash
-pytest -q examples/external_nodes/example_plc_write_bool/tests
-```
+Do not add this directory to a runtime path, invoke the removed
+`manyforge nodes validate` command, or uncomment `node.yaml` and claim it is a
+valid extension package.

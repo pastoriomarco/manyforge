@@ -1,3 +1,7 @@
+# Historical Composer runtime-agent reference
+
+> Preserved from `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1` as reimplementation input only. The runtime tools named below are unavailable. The remainder is non-operative historical text, not current repository guidance, an installable skill, an operator recipe, or qualification evidence. Its placement before any former frontmatter deliberately prevents skill activation.
+
 ---
 name: manyforge-escalate-to-human
 description: Produce a structured escalation report when automated recovery fails or the situation requires human judgment.

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <string_view>
 
@@ -117,6 +118,14 @@ class IScheduler {
   /// Cancel a previously scheduled callback. No-op if already fired or invalid.
   virtual void cancel(ScheduleHandle handle) = 0;
 
+  /// Cancel, and report whether the callback was removed before it was
+  /// dequeued, so it can never run. False when it was already dequeued (it
+  /// may still be running) or when the scheduler cannot prove removal.
+  [[nodiscard]] virtual bool cancel_before_dequeue(ScheduleHandle handle) {
+    cancel(handle);
+    return false;
+  }
+
   /// Wait until callbacks already dequeued on the given priority lane have
   /// returned. Test schedulers that invoke callbacks synchronously may keep the
   /// default no-op implementation.
@@ -145,6 +154,16 @@ class IScheduler {
       drained = drain_for(scheduler_priority_at(i), timeout) && drained;
     }
     return drained;
+  }
+
+  /// A callback on the Stop/safety path threw (a ControllerCommand,
+  /// RuntimeSafety or StopControl callback, or a runtime-collision lookahead
+  /// authority/observer callback). A production scheduler hands the typed
+  /// reason to the containment its host installed: motion admission closes
+  /// for the rest of the runtime and a Full Stop is attempted. Without an
+  /// installed containment the process terminates, as before.
+  virtual void contain_safety_path_fault(std::string_view /*reason_code*/) noexcept {
+    std::terminate();
   }
 };
 

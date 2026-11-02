@@ -1,185 +1,226 @@
-"""Tests for the skill loader."""
-from __future__ import annotations
+"""Portable skill expansion is effect-free and uses normal Program validation."""
 
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
+from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.program import Program
 from manyforge_behavior.skill_loader import (
     SkillCatalog,
+    SkillValidationError,
+    default_skills_dir,
     load_skill,
     load_skill_catalog,
-    default_skills_dir,
 )
 
+ROOT = Path(__file__).resolve().parents[2]
 
-SKILLS_DIR = default_skills_dir()
+
+def _context(catalog):
+    host = Program(
+        ROOT / "examples/lite6_lite_gripper_pick_and_place.program.yaml", catalog
+    ).to_dict()
+    del host["tree"], host["program_revision"]
+    return host
 
 
-class TestLoadSkill:
-    def test_loads_pick_object(self):
-        skill = load_skill(SKILLS_DIR / "pick_object.skill.yaml")
-        assert skill.id == "pick_object"
-        assert skill.version == "0.1.0"
-        assert "v0.1" in skill.compatible_profiles
-        assert "scene.edit.attach_detach" in skill.requires_capabilities
-        assert skill.requires_tools == []
-        assert len(skill.parameters) >= 1
-        assert skill.body["id"] == "sequence"
-        assert len(skill.requires) > 0
-        assert len(skill.provides) > 0
+@pytest.fixture
+def catalog():
+    return NodeCatalog(ROOT / "manyforge_behavior/resources/node_catalog.yaml")
 
-    def test_loads_place_object(self):
-        skill = load_skill(SKILLS_DIR / "place_object.skill.yaml")
-        assert skill.id == "place_object"
-        assert "planning.motion.pose_goal" in skill.requires_capabilities
-        assert "context.pose.resolve_reference" in skill.requires_capabilities
 
-    def test_loads_move_to_named_config(self):
-        skill = load_skill(SKILLS_DIR / "move_to_named_config.skill.yaml")
-        assert skill.id == "move_to_named_config"
-        assert skill.body["id"] == "move_manipulator_action"
+@pytest.fixture
+def artifact():
+    return load_skill(default_skills_dir() / "move_to_named_config.skill.yaml")
 
-    def test_rejects_missing_id(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text("api_version: manyforge.skill.v0\nbody: {id: x}\n")
-        with pytest.raises(ValueError, match="missing required field 'skill_id'"):
-            load_skill(bad)
 
-    def test_rejects_wrong_api_version(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text("api_version: wrong\nskill_id: test\nbody: {id: x}\n")
-        with pytest.raises(ValueError, match="api_version"):
-            load_skill(bad)
+def test_build_compiles_every_maintained_example(catalog):
+    skills = load_skill_catalog(default_skills_dir(), catalog=catalog)
+    assert {row["skill_id"] for row in skills.artifacts()} == {
+        "move_to_named_config",
+        "pick_object",
+        "place_object",
+    }
 
-    def test_rejects_missing_body(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text("api_version: manyforge.skill.v0\nskill_id: test\n")
-        with pytest.raises(ValueError, match="body"):
-            load_skill(bad)
 
-    def test_rejects_legacy_expands_to_without_body(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text(
-            "api_version: manyforge.skill.v0\n"
-            "skill_id: test\n"
-            "expands_to: {id: reset_trajectories, name: noop}\n",
+def test_expansion_preserves_roles_typed_values_and_host(catalog):
+    skills = load_skill_catalog(default_skills_dir(), catalog=catalog)
+    host = _context(catalog)
+    original = deepcopy(host)
+    arguments = {
+        "configuration_name": "rest",
+        "goal": [{"joint_name": "joint1", "position_rad": 0.0}],
+        "velocity_scale": 0.2,
+        "acceleration_scale": 0.3,
+        "max_tcp_linear_speed_mps": 0.1,
+    }
+    request = dict(
+        skill_id="move_to_named_config",
+        arguments=arguments,
+        component_roles={"robot": "robot"},
+        target_roles={"arm": "arm"},
+        instance_prefix="selected.rest",
+        program_context=host,
+    )
+    result = skills.expand(**request)
+    assert result == skills.expand(**request)
+    assert result["tree"]["instance_id"] == "selected.rest.move"
+    assert result["tree"]["parameters"]["goal"] == arguments["goal"]
+    assert result["trace"][0]["target_roles"] == {"arm": "arm"}
+    assert result["tree"]["metadata"]["skill_expansions"] == result["trace"]
+    assert host == original
+    result["tree"]["parameters"]["goal"][0]["position_rad"] = 2.0
+    assert arguments["goal"][0]["position_rad"] == 0.0
+    with pytest.raises(SkillValidationError, match="mapped skill role"):
+        skills.expand(**{**request, "target_roles": {"arm": "gripper"}})
+
+
+def test_place_expands_without_unused_tcp_frame_roles(catalog):
+    skills = load_skill_catalog(default_skills_dir(), catalog=catalog)
+    artifact = load_skill(default_skills_dir() / "place_object.skill.yaml")
+    host = _context(catalog)
+    host.update(deepcopy(artifact["example"]["program_declarations"]))
+    host["target_roles"]["gripper"].pop("required_frame_roles")
+    assert host["target_roles"]["arm"]["required_frame_roles"] == ["base"]
+    result = skills.expand(
+        skill_id="place_object",
+        # The host Program caps velocity at 0.4.
+        arguments={**artifact["example"]["arguments"], "velocity_scale": 0.4},
+        component_roles={"robot": "robot", "tool": "tool"},
+        target_roles={"arm": "arm", "gripper": "gripper"},
+        instance_prefix="selected.place",
+        program_context=host,
+    )
+    assert result["tree"]["instance_id"] == "selected.place.place"
+
+
+@pytest.mark.parametrize(
+    "mutate,reason",
+    [
+        (lambda row: row.update(api_version="manyforge.skill.v0"), "unsupported skill"),
+        (
+            lambda row: row["body"].update(node_id="no.such.node"),
+            "unknown skill primitive",
+        ),
+        (
+            lambda row: row["body"]["parameters"].update(goal="${param:missing}"),
+            "undeclared",
+        ),
+        (
+            lambda row: row["body"]["parameters"].update(goal="prefix ${param:goal}"),
+            "whole value",
+        ),
+        (
+            lambda row: row["body"]["parameters"].update(no_such_parameter=True),
+            "unknown primitive",
+        ),
+        (lambda row: row.update(requires_tools=["unregistered"]), "unknown tool"),
+        (lambda row: row.update(python_import="os.system"), "unknown fields"),
+        (
+            lambda row: row["body"].update(metadata={"skill_expansions": []}),
+            "provenance",
+        ),
+        (
+            lambda row: row["target_roles"]["arm"].update(component_role="missing"),
+            "declared component",
+        ),
+        (lambda row: row.update(description="x" * 100_000), "text exceeds"),
+    ],
+)
+def test_invalid_artifacts_fail_at_build(catalog, artifact, mutate, reason):
+    mutate(artifact)
+    with pytest.raises(SkillValidationError, match=reason):
+        SkillCatalog([artifact], catalog=catalog)
+
+
+def test_nested_skill_depth_and_cycle_are_bounded(catalog, artifact):
+    wrapper = deepcopy(artifact)
+    wrapper["skill_id"] = "wrapper"
+    wrapper["body"] = {
+        "skill_id": "move_to_named_config",
+        "instance_id": "nested",
+        "arguments": {row["id"]: "${param:" + row["id"] + "}" for row in artifact["parameters"]},
+        "component_roles": {"robot": "${component:robot}"},
+        "target_roles": {"arm": "${target:arm}"},
+    }
+    skills = SkillCatalog([wrapper, artifact], catalog=catalog)
+    host = _context(catalog)
+    result = skills.expand(
+        skill_id="wrapper",
+        arguments={
+            **artifact["example"]["arguments"],
+            "acceleration_scale": 1.0,
+        },
+        component_roles={"robot": "robot"},
+        target_roles={"arm": "arm"},
+        instance_prefix="wrapped",
+        program_context=host,
+    )
+    assert (
+        result["trace"][0]["instance_ids"]
+        == result["trace"][1]["instance_ids"]
+        == ["wrapped.nested.move"]
+    )
+    outer = deepcopy(wrapper)
+    outer["skill_id"] = "outer"
+    outer["body"]["skill_id"] = "wrapper"
+    with pytest.raises(SkillValidationError, match="too-deep"):
+        SkillCatalog([outer, wrapper, artifact], catalog=catalog)
+    wrapper["body"]["skill_id"] = "wrapper"
+    with pytest.raises(SkillValidationError, match="cyclic"):
+        SkillCatalog([wrapper, artifact], catalog=catalog)
+
+
+def test_duplicate_id_and_unexecutable_example_reject(catalog, artifact):
+    with pytest.raises(SkillValidationError, match="duplicate"):
+        SkillCatalog([artifact, artifact], catalog=catalog)
+    artifact["example"]["arguments"]["goal"] = "not joint values"
+    with pytest.raises(SkillValidationError, match="argument goal"):
+        SkillCatalog([artifact], catalog=catalog)
+
+
+def test_repeated_structured_argument_is_bounded_before_output_allocation(catalog, artifact):
+    artifact["body"]["metadata"] = {f"copy.{index}": "${param:goal}" for index in range(32)}
+    skills = SkillCatalog([artifact], catalog=catalog)
+    host = _context(catalog)
+    arguments = {
+        **artifact["example"]["arguments"],
+        "goal": [{"joint_name": f"axis{index}", "position_rad": 0.0} for index in range(200)],
+    }
+    with pytest.raises(SkillValidationError, match="expanded skill exceeds"):
+        skills.expand(
+            skill_id=artifact["skill_id"],
+            arguments=arguments,
+            component_roles={"robot": "robot"},
+            target_roles={"arm": "arm"},
+            instance_prefix="large",
+            program_context=host,
         )
-        with pytest.raises(ValueError, match="body"):
-            load_skill(bad)
-
-    def test_rejects_requires_capabilities_when_not_list(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text(
-            "api_version: manyforge.skill.v0\n"
-            "skill_id: test\n"
-            "requires_capabilities: planning.motion.pose_goal\n"
-            "body: {id: reset_trajectories, name: noop}\n",
-        )
-        with pytest.raises(ValueError, match="requires_capabilities must be a list"):
-            load_skill(bad)
-
-    def test_rejects_unknown_requires_capabilities(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text(
-            "api_version: manyforge.skill.v0\n"
-            "skill_id: test\n"
-            "requires_capabilities: [unknown.capability]\n"
-            "body: {id: reset_trajectories, name: noop}\n",
-        )
-        with pytest.raises(ValueError, match="unknown requires_capabilities"):
-            load_skill(bad)
-
-    def test_parses_requires_tools(self, tmp_path):
-        skill_path = tmp_path / "tool_skill.skill.yaml"
-        skill_path.write_text(
-            "api_version: manyforge.skill.v0\n"
-            "skill_id: tool_skill\n"
-            "requires_tools: [program_read, tree.insert_node]\n"
-            "body: {id: reset_trajectories, name: noop}\n",
-        )
-
-        skill = load_skill(skill_path)
-
-        assert skill.requires_tools == ["program_read", "tree.insert_node"]
-
-    def test_rejects_requires_tools_when_not_list(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text(
-            "api_version: manyforge.skill.v0\n"
-            "skill_id: test\n"
-            "requires_tools: program_read\n"
-            "body: {id: reset_trajectories, name: noop}\n",
-        )
-        with pytest.raises(ValueError, match="requires_tools must be a list"):
-            load_skill(bad)
-
-    def test_rejects_duplicate_requires_tools(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text(
-            "api_version: manyforge.skill.v0\n"
-            "skill_id: test\n"
-            "requires_tools: [program_read, program_read]\n"
-            "body: {id: reset_trajectories, name: noop}\n",
-        )
-        with pytest.raises(ValueError, match="duplicate requires_tools"):
-            load_skill(bad)
 
 
-class TestLoadSkillCatalog:
-    def test_loads_all_default_skills(self):
-        catalog = load_skill_catalog(SKILLS_DIR)
-        assert len(catalog.skills) >= 3
-        assert "pick_object" in catalog.skill_ids
-        assert "place_object" in catalog.skill_ids
-        assert "move_to_named_config" in catalog.skill_ids
-
-    def test_get_by_id(self):
-        catalog = load_skill_catalog(SKILLS_DIR)
-        pick = catalog.get("pick_object")
-        assert pick is not None
-        assert pick.id == "pick_object"
-
-    def test_get_missing_returns_none(self):
-        catalog = load_skill_catalog(SKILLS_DIR)
-        assert catalog.get("nonexistent") is None
-
-    def test_validate_invocation_rejects_wrong_parameter_type(self):
-        catalog = load_skill_catalog(SKILLS_DIR)
-
-        with pytest.raises(
-            ValueError,
-            match="Parameter 'joint_names' for skill 'move_to_named_config' must be a list of strings",
-        ):
-            catalog.validate_invocation(
-                "move_to_named_config",
-                {
-                    "config_name": "home",
-                    "joint_names": "joint_1",
-                    "joint_positions_rad": [0.0],
-                },
-            )
-
-    def test_nonexistent_dir_returns_empty(self, tmp_path):
-        catalog = load_skill_catalog(tmp_path / "no_such_dir")
-        assert len(catalog.skills) == 0
-
-    def test_malformed_files_skipped(self, tmp_path):
-        good = tmp_path / "good.skill.yaml"
-        good.write_text(
-            "api_version: manyforge.skill.v0\nskill_id: good\nbody: {id: x, name: ok}\n"
-        )
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text("not: valid: yaml: {{{{")
-
-        catalog = load_skill_catalog(tmp_path)
-        assert len(catalog.skills) == 1
-        assert catalog.skills[0].id == "good"
-
-    def test_duplicate_ids_skipped(self, tmp_path):
-        for name in ["a.skill.yaml", "b.skill.yaml"]:
-            (tmp_path / name).write_text(
-                "api_version: manyforge.skill.v0\nskill_id: dup\nbody: {id: x, name: ok}\n"
-            )
-        catalog = load_skill_catalog(tmp_path)
-        assert len(catalog.skills) == 1
+def test_first_subtree_needs_declarations_not_a_dummy_program(catalog, artifact):
+    skills = SkillCatalog([artifact], catalog=catalog)
+    context = {
+        "api_version": "manyforge.program.v2",
+        "program_id": "new_program",
+        "program_profile": "composable-cell-v1",
+        "name": "New Program",
+        "catalog": {
+            "api_version": catalog.api_version,
+            "content_version": catalog.content_version,
+        },
+        "component_roles": artifact["component_roles"],
+        "target_roles": artifact["target_roles"],
+    }
+    result = skills.expand(
+        skill_id=artifact["skill_id"],
+        arguments=artifact["example"]["arguments"],
+        component_roles={"robot": "robot"},
+        target_roles={"arm": "arm"},
+        instance_prefix="first",
+        program_context=context,
+    )
+    assert result["tree"]["node_id"] == "motion.move_to_joint_target"
+    assert "tree" not in context and "program_revision" not in context

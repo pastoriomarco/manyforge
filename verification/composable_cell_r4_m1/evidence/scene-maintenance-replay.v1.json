@@ -1,0 +1,100 @@
+{
+  "schema_version": "manyforge.scene_replay_fix_evidence.v1",
+  "status": "FOCUSED_NATIVE_GATE_PASSED_LANDED",
+  "date": "2026-10-16",
+  "source_base_commit": "d3920e13f0f9560a6b83fd8329570a6bb64d17c2",
+  "problem": "Repeated configuration Apply can leave the exact Scene projection unchanged. Replay stopped on projection equality and left a completed identity maintenance record behind; a later ordinary Scene edit advanced the head and subsequent reconstruction rejected the deferred completion.",
+  "affected_surface": "Ordinary Scene edits after repeated same-head configuration Apply, including temporary Close cleanup; not a Close-specific transaction rule.",
+  "correction": {
+    "owner": "manyforge_scene",
+    "always_visit_before_scene_transaction": true,
+    "drain_only_same_head_identity_completions_after_expected_projection_matches": true,
+    "require_matching_snapshot_transaction_sequence": true,
+    "existing_predecessor_snapshot_baseline_and_lineage_checks_preserved": true,
+    "persistent_schema_or_native_effect_change": false
+  },
+  "source_sha256": {
+    "manyforge_scene/src/logical_scene_owner_store.cpp": "048edb7f1119367a4301ea8d0730e2081278e2f73ecaccaa0985ff0dd16e4018",
+    "manyforge_scene/test/test_canonical_empty_scene_owner.cpp": "a70a6d0258165e02d865acf827322fdb7372589283b1bdf1e4cc3aca4f826a77"
+  },
+  "regression": {
+    "test": "CanonicalEmptySceneOwner.RepeatedEmptyConfigurationAdoptionReplaysBeforeOrdinarySceneEdits",
+    "variants": [
+      "loaded product to canonical empty, repeated identical empty Apply, ordinary object removal, integrity read and reopen",
+      "same sequence plus intervening no-op Scene edit which keeps projection revision but advances transaction sequence"
+    ],
+    "assertions": [
+      "exact final empty Scene projection and transaction sequence after reopen",
+      "same-head maintenance consumed before the next edit",
+      "future maintenance not consumed across no-op transaction boundary",
+      "no unrelated native projection effects"
+    ]
+  },
+  "qualification": {
+    "lane": "ROS-enabled Docker native build with existing fake planner projections; no robot or controller process started",
+    "image_id": "sha256:38e8d72a6b700059332aa63baa63e7a21c672376ad6582102fc62088081f74ab",
+    "target": "test_canonical_empty_scene_owner",
+    "native_build_passed": true,
+    "focused_distinct_tests_passed": 15,
+    "successor_test_cases_passed": 13,
+    "successor_test_elapsed_ms": 27431,
+    "prior_unchanged_tests_passed": 2,
+    "prior_unchanged_tests": [
+      "CanonicalEmptySceneOwner.RestartReconstructsCompleteSnapshotAndExactReplay",
+      "CanonicalEmptySceneOwner.ZeroNativeSceneCommitPublishesReplaysAndRestarts"
+    ],
+    "cumulative_gate_note": "Initial native build passed; thirteen affected cases were blocked before replay by obsolete native execution fixtures rejected by the current ROS-only materializer. Test-only fixture corrections reused existing qualified ROS products, retained adoption lifecycle-digest differences, and all thirteen cases then passed. Two unaffected initial passes were retained; this is fifteen distinct cases, not a complete suite run.",
+    "test_fixture_only_successor": {
+      "existing_one_component_helper_calls_retargeted": 12,
+      "existing_two_component_helper_calls_retargeted": 1,
+      "adoption_fixture_runtime_selection": "existing genuine ROS selector, provider and Mock settings; lifecycle digest distinction retained"
+    },
+    "static_diff_check": "passed",
+    "finished_utc": "2026-10-16T07:32:47.879394+00:00"
+  },
+  "provenance": [
+    {
+      "receipt_id": "dx1026-scene-replay-freeze02",
+      "sha256": "28a7a6958c47c591f013bf3361769919aff59c8a03e6ba85a44ddbbc3eddb223"
+    },
+    {
+      "receipt_id": "dx1026-scene-replay-native-gate02",
+      "sha256": "6ccee708a15375cc71b8622ac6ad915f52c9495558ad7df9737c1726249c3d0d"
+    },
+    {
+      "receipt_id": "dx1026-scene-replay-native-gate02-log",
+      "sha256": "d9125828964b7f8312acc6e275450126250ac83ce4e15cbb47165bfe7fc5fb9c"
+    },
+    {
+      "receipt_id": "dx1026-scene-replay-native-gate02-gtest",
+      "sha256": "1230b300f26aa719d4c81df89e6592f7c970c00e2642517ff938c74ed00ced6e"
+    },
+    {
+      "receipt_id": "dx1026-scene-replay-native-gate01",
+      "sha256": "2386d899eebfa8d8ceef279943bd1bb93aac5ad6a4071551427218d119b762b4"
+    },
+    {
+      "receipt_id": "dx1026-scene-replay-original-landing",
+      "sha256": "5ba061044f00cb00c195a6bb8303bce4708fe9d417e23023f984bd7e1b7c6272"
+    }
+  ],
+  "landing": {
+    "exact_frozen_two_paths_installed": true,
+    "index_unchanged": true,
+    "other_unstaged_diff_unchanged": true,
+    "commit_created": false
+  },
+  "limits": [
+    "Focused owner-layer regression only; full Scene suite not claimed.",
+    "No live deployment, Load, Close, Run, Reset or physical-rest result is claimed by this source receipt.",
+    "The separate invalid editable dual-robot Scenario is outside these two source paths."
+  ],
+  "runtime_effects_issued_by_source_author": [],
+  "deployment_reference": {
+    "receipt": "final-fixes-deployment.v1.json",
+    "sha256": "bb4d62cbc76fa4c803022e40eb3a3e01fade62bdfbc6105966fa7c2dc52ec28b",
+    "outcome": "deployed_and_usable",
+    "scene_source_posthash_verified": true,
+    "scope": "Runtime-owner deployment receipt; private actual dual-robot Load/Close and final user empty/ready browser checks. No runtime effects issued by this source author."
+  }
+}

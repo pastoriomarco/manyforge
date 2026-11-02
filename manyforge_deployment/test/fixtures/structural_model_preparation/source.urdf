@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot name="qualified">
+  <link name="base">
+    <visual>
+      <geometry>
+        <mesh filename="package://qualified_models/example/meshes/tool.stl"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://qualified_models/example/meshes/tool.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <ros2_control name="runtime" type="system">
+    <hardware>
+      <plugin>example/Runtime</plugin>
+    </hardware>
+  </ros2_control>
+  <transmission name="runtime">
+    <type>runtime</type>
+  </transmission>
+  <gazebo reference="base">
+    <selfCollide>true</selfCollide>
+  </gazebo>
+</robot>

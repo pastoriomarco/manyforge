@@ -1,459 +1,443 @@
-"""Orchestrator runner — builds and ticks a py_trees behavior tree from a ManyForge program."""
+"""First bounded Program-Binding caller for addressed native execution."""
 
 from __future__ import annotations
 
-import time
-from typing import Any, Callable, Optional
+from collections.abc import Mapping, Sequence
+import math
+from typing import Any, Literal
 
-import py_trees
-
-from manyforge_behavior.blackboard_bindings import resolve_runtime_blackboard_bindings
-from manyforge_behavior.kernel_client import KernelClient, SceneEditRequest
-from manyforge_behavior.motion_runtime import MotionExecutionCoordinator
-from manyforge_behavior.node_environment import NodeEnvironment
-from manyforge_behavior.node_registry import NodeFactoryContext
-from manyforge_behavior.runtime_pause import RuntimePauseRegistry
-from manyforge_behavior.runtime_resources import RuntimeResourceRegistry
-from manyforge_behavior.nodes.motion import _rpy_deg_to_xyzw
-from manyforge_behavior.nodes.stop_policy import OperatorMotionStopPolicy
-from manyforge_behavior.parameters import ParameterResolver
-from manyforge_behavior.program import Program, TreeNode, tree_node_from_dict
-from manyforge_behavior.skill_loader import (
-    SkillCatalog,
-    default_skills_dir,
-    load_skill_catalog,
-)
+from .kernel_client import ActionSpan, KernelClient, KernelClientResponseError
 
 
 class OrchestratorRunner:
-    """Main entry point: load, build, and run a ManyForge program."""
+    """Submit one source-joint goal without owning runtime or planner state.
+
+    Program execution identity comes from the Applied Program binding this
+    run was admitted with, never from the execution owner's status: the
+    owner reports runtime identity only (execution_identity.v2, H1a-IF.2).
+    """
 
     def __init__(
-        self,
-        node_environment: NodeEnvironment,
-        program_path: str,
-        kernel: KernelClient,
-        overrides: Optional[dict[str, Any]] = None,
-        deployment_path: Optional[str] = None,
-        program: Optional[Program] = None,
-        deployment: Optional["Deployment"] = None,
-        skill_catalog: Optional[SkillCatalog] = None,
-        event_recorder: Optional[Any] = None,
-        scene_snapshot_provider: Optional[Callable[[int, int, str], Optional[bytes]]] = None,
-        scene_snapshot_url_publisher: Optional[
-            Callable[..., Optional[dict[str, Any]]]
-        ] = None,
-        pose_source_apply_callback: Optional[
-            Callable[..., dict[str, Any]]
-        ] = None,
-        pose_source_between_nodes_callback: Optional[
-            Callable[..., dict[str, Any]]
-        ] = None,
-        simulation_control_callback: Optional[
-            Callable[..., dict[str, Any]]
-        ] = None,
-        simulation_reset_callback: Optional[
-            Callable[..., dict[str, Any]]
-        ] = None,
-        runtime_resources: RuntimeResourceRegistry | None = None,
-    ):
-        self._node_environment = node_environment
-        self._program_path = program_path
-        self._kernel = kernel
-        self._overrides = overrides or {}
-        self._deployment_path = deployment_path
-        self._provided_program = program
-        self._provided_deployment = deployment
-        self._provided_skill_catalog = skill_catalog
-        self._catalog = node_environment.catalog
-        self._node_registry = node_environment.registry
-        self._program: Optional[Program] = None
-        self._resolver: Optional[ParameterResolver] = None
-        self._tree: Optional[py_trees.trees.BehaviourTree] = None
-        self._deployment: Optional["Deployment"] = None
-        self._skill_catalog: Optional[SkillCatalog] = skill_catalog
-        self._event_recorder = event_recorder
-        self._scene_snapshot_provider = scene_snapshot_provider
-        self._scene_snapshot_url_publisher = scene_snapshot_url_publisher
-        self._pose_source_apply_callback = pose_source_apply_callback
-        self._pose_source_between_nodes_callback = pose_source_between_nodes_callback
-        self._simulation_control_callback = simulation_control_callback
-        self._simulation_reset_callback = simulation_reset_callback
-        self._runtime_resources = runtime_resources or RuntimeResourceRegistry.empty()
-        self._motion_coordinator = MotionExecutionCoordinator(kernel)
-        self._runtime_pause_registry = RuntimePauseRegistry()
-        # Intervention context — set by cycle_manager before building
-        # intervention subtrees so nodes like QueryModelNode can attribute
-        # audit events to the active session.
-        self._intervention_context: Optional[dict[str, str]] = None
-
-    @property
-    def runtime_pause_registry(self) -> RuntimePauseRegistry:
-        return self._runtime_pause_registry
-
-    def load(self) -> None:
-        """Load catalog, program, validate, set up parameter resolver."""
-        if self._provided_skill_catalog is None:
-            self._skill_catalog = load_skill_catalog(
-                default_skills_dir(),
-                catalog=self._catalog,
-                strict=True,
-            )
-        if self._provided_program is not None:
-            self._program = self._provided_program
-        else:
-            self._program = Program(
-                self._program_path,
-                self._catalog,
-                skill_catalog=self._skill_catalog,
-            )
-        self._resolver = ParameterResolver(
-            self._program.get_parameter_defaults(),
-            self._overrides,
-        )
-
-        # Load and validate deployment if provided
-        if self._provided_deployment is not None:
-            self._deployment = self._provided_deployment
-            self._deployment.validate_against_program(self._program)
-            self._deployment.validate_capabilities(self._program)
-            self._deployment.validate_assistant_modes(self._catalog, self._skill_catalog)
-        elif self._deployment_path:
-            from manyforge_behavior.deployment import Deployment
-            self._deployment = Deployment(self._deployment_path)
-            self._deployment.validate_against_program(self._program)
-            self._deployment.validate_capabilities(self._program)
-            self._deployment.validate_assistant_modes(self._catalog, self._skill_catalog)
-
-    def build_tree(self) -> py_trees.trees.BehaviourTree:
-        """Build a py_trees BehaviourTree from the loaded program."""
-        if self._program is None or self._resolver is None:
-            raise RuntimeError("Call load() first")
-
-        root = self._build_node(self._program.tree)
-        tree = py_trees.trees.BehaviourTree(root=root)
-
-        # Publish setup-time services before calling BehaviourTree.setup().
-        # External nodes are explicitly allowed to acquire deployment-owned
-        # handles in setup(), so creating these keys afterward would make their
-        # lifecycle depend on an incidental first-tick fallback.
-        bb = py_trees.blackboard.Client(name="runner")
-        bb.register_key(key="kernel", access=py_trees.common.Access.WRITE)
-        bb.kernel = self._kernel
-        bb.register_key(key="motion_coordinator", access=py_trees.common.Access.WRITE)
-        bb.motion_coordinator = self._motion_coordinator
-        bb.register_key(key="runtime_resources", access=py_trees.common.Access.WRITE)
-        bb.runtime_resources = self._runtime_resources
-        tree.setup()
-
-        # Inject robot profile defaults for motion nodes
-        bb.register_key(key="robot_id", access=py_trees.common.Access.WRITE)
-        bb.register_key(key="group_id", access=py_trees.common.Access.WRITE)
-        bb.register_key(key="base_frame", access=py_trees.common.Access.WRITE)
-        bb.register_key(key="tcp_frame", access=py_trees.common.Access.WRITE)
-        bb.robot_id = self._program.robot.robot_id
-        bb.group_id = self._program.robot.group_id
-        bb.base_frame = self._program.robot.base_frame
-        bb.tcp_frame = self._program.robot.tcp_frame
-
-        # Build static scene metadata registry for attach/detach nodes.
-        # Runtime object pose/frame always comes from backend queries.
-        bb.register_key(key="scene_objects", access=py_trees.common.Access.WRITE)
-        scene_registry = {}
-        for resource in (self._program.scene or []):
-            scene_registry[resource.object_id] = {
-                "shape_type": resource.shape.get("type"),
-                "box_dimensions_m": resource.shape.get("box_dimensions_m"),
-                "sphere_radius_m": resource.shape.get("sphere_radius_m"),
-                "cylinder_radius_m": resource.shape.get("cylinder_radius_m"),
-                "cylinder_height_m": resource.shape.get("cylinder_height_m"),
-                "mesh_resource_uri": resource.shape.get("mesh_resource_uri"),
-                "mesh_scale": resource.shape.get("mesh_scale"),
-                "support_contacts": resource.metadata.get("support_contacts"),
-            }
-        bb.scene_objects = scene_registry
-
-        bb.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
-        if self._deployment is not None:
-            bb.gripper_configs = {
-                gripper_id: {
-                    "command_mode": config.command_mode,
-                    "group_id": config.group_id,
-                    "joint_name": config.joint_name,
-                    "motion_time_s": config.motion_time_s,
-                    "srdf_presets": dict(config.srdf_presets),
-                    "actuation_kind": config.actuation_kind,
-                    "state_authority": config.state_authority,
-                    "completion_policy": config.completion_policy,
-                    "grasp_confirmation_policy": config.grasp_confirmation_policy,
-                    "transport": dict(config.transport),
-                    "open_state_ref": config.open_state_ref,
-                    "closed_state_ref": config.closed_state_ref,
-                    "semantic_configured": config.semantic_configured,
-                    "migration_notes": list(config.migration_notes),
-                    "description": config.description,
-                    "touch_links": list(config.touch_links),
-                }
-                for gripper_id, config in self._deployment.grippers.items()
-            }
-        else:
-            bb.gripper_configs = {}
-
-        # Write global TCP speed cap from deployment if available
-        if self._deployment:
-            bb.register_key(key="global_max_tcp_linear_speed_mps", access=py_trees.common.Access.WRITE)
-            bb.global_max_tcp_linear_speed_mps = self._deployment.robot_config.global_max_tcp_linear_speed_mps
-
-        # Register stop flag and velocity scale keys for CycleManager
-        bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
-        bb.stop_requested = False
-        bb.register_key(key="motion_stop_active", access=py_trees.common.Access.WRITE)
-        bb.motion_stop_active = False
-        bb.register_key(key="velocity_scale", access=py_trees.common.Access.WRITE)
-        bb.velocity_scale = 1.0
-        bb.register_key(
-            key="pose_source_apply_callback",
-            access=py_trees.common.Access.WRITE,
-        )
-        bb.pose_source_apply_callback = self._pose_source_apply_callback
-        bb.register_key(
-            key="pose_source_between_nodes_callback",
-            access=py_trees.common.Access.WRITE,
-        )
-        bb.pose_source_between_nodes_callback = self._pose_source_between_nodes_callback
-        bb.register_key(
-            key="simulation_control_callback",
-            access=py_trees.common.Access.WRITE,
-        )
-        bb.simulation_control_callback = self._simulation_control_callback
-        if (
-            bb.simulation_control_callback is None
-            and self._simulation_reset_callback is not None
+        self, kernel: KernelClient, applied_program_binding: Mapping[str, Any]
+    ) -> None:
+        if not isinstance(kernel, KernelClient):
+            raise TypeError("kernel must be the bounded addressed KernelClient")
+        if not isinstance(applied_program_binding, Mapping):
+            raise TypeError("applied_program_binding must be a Program binding")
+        for field in (
+            "program_id",
+            "program_revision",
+            "program_binding_id",
+            "graph_revision",
+            "retained_bundle_id",
         ):
-            bb.simulation_control_callback = self._legacy_simulation_reset_adapter
+            value = applied_program_binding.get(field)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"applied Program binding has no {field}")
+        targets = applied_program_binding.get("target_role_bindings")
+        if not isinstance(targets, list):
+            raise ValueError("applied Program binding has no target role bindings")
+        self._kernel = kernel
+        self._binding = applied_program_binding
 
-        self._tree = tree
-        return tree
+    def _bound_capability(
+        self, *, component_role_id: str, target_role_id: str, capability_id: str
+    ) -> Mapping[str, Any]:
+        """The Program-bound capability of one authored target role."""
 
-    def _legacy_simulation_reset_adapter(self, **kwargs: Any) -> dict[str, Any]:
-        if kwargs.get("operation") != "reset":
-            raise RuntimeError("legacy simulation reset callback only supports reset")
-        payload = dict(kwargs)
-        payload.pop("operation", None)
-        if self._simulation_reset_callback is None:
-            raise RuntimeError("simulation reset callback is not configured")
-        return self._simulation_reset_callback(**payload)
-
-    def apply_scene(self) -> None:
-        """Apply program scene resources via kernel.scene_edit() before execution."""
-        if self._program is None:
-            raise RuntimeError("Call load() first")
-
-        self._kernel.set_robot_base_pose(self._program.robot.base_pose)
-
-        for resource in self._program.scene:
-            shape_type = resource.shape.get("type")
-            request = SceneEditRequest(
-                operation="add",
-                object_id=resource.object_id,
-                shape_type=shape_type,
-                box_dimensions_m=resource.shape.get("box_dimensions_m"),
-                sphere_radius_m=resource.shape.get("sphere_radius_m"),
-                cylinder_radius_m=resource.shape.get("cylinder_radius_m"),
-                cylinder_height_m=resource.shape.get("cylinder_height_m"),
-                mesh_resource_uri=resource.shape.get("mesh_resource_uri"),
-                mesh_scale=resource.shape.get("mesh_scale"),
-                pose_position_m=resource.pose.get("position_m"),
-                pose_orientation_xyzw=resource.pose.get("orientation_xyzw")
-                    or (_rpy_deg_to_xyzw(resource.pose["orientation_rpy_deg"])
-                        if "orientation_rpy_deg" in resource.pose else None),
-                frame_id=resource.pose.get("frame_id"),
-                support_contacts=resource.metadata.get("support_contacts"),
-            )
-            result = self._kernel.scene_edit(request)
-            if not result.success:
-                raise RuntimeError(
-                    f"Failed to add scene object '{resource.object_id}': "
-                    f"{result.error}"
-                )
-
-    def run(self, max_ticks: int = 1000, tick_period_s: float = 0.0) -> bool:
-        """Tick the tree until completion or max_ticks. Returns True if tree succeeded."""
-        if self._tree is None:
-            raise RuntimeError("Call build_tree() first")
-
-        for _ in range(max_ticks):
-            self._tree.tick()
-            status = self._tree.root.status
-            if status == py_trees.common.Status.SUCCESS:
-                return True
-            if status == py_trees.common.Status.FAILURE:
-                return False
-            if status == py_trees.common.Status.RUNNING:
-                # Yield to background workers used by non-blocking nodes such as
-                # QueryModelNode. A zero-period run is still allowed, but should not
-                # busy-spin so tightly that futures never get CPU time.
-                time.sleep(tick_period_s if tick_period_s > 0.0 else 0.001)
-        return False
-
-    @property
-    def catalog(self) -> Optional[NodeCatalog]:
-        return self._catalog
-
-    @property
-    def program(self) -> Optional[Program]:
-        return self._program
-
-    @property
-    def deployment(self) -> Optional["Deployment"]:
-        return self._deployment
-
-    @property
-    def skill_catalog(self) -> Optional[SkillCatalog]:
-        return self._skill_catalog
-
-    def set_scene_snapshot_provider(
-        self,
-        provider: Optional[Callable[[int, int, str], Optional[bytes]]],
-    ) -> None:
-        """Update the viewer-backed render provider used by query_model nodes."""
-        self._scene_snapshot_provider = provider
-
-    def set_scene_snapshot_url_publisher(
-        self,
-        publisher: Optional[Callable[..., Optional[dict[str, Any]]]],
-    ) -> None:
-        """Update the URL publisher used for HTTP-served snapshot experiments."""
-        self._scene_snapshot_url_publisher = publisher
-
-    def _expand_tree_node(self, tree_node: TreeNode) -> TreeNode:
-        """Expand a skill invocation into a concrete subtree when needed."""
-        if self._skill_catalog is None or not self._skill_catalog.contains(tree_node.id):
-            return tree_node
-
-        resolved_params = self._resolver.resolve(tree_node.params)
-        expanded_dict = self._skill_catalog.expand_node_dict(
-            {
-                "id": tree_node.id,
-                "name": tree_node.name,
-                "params": resolved_params,
-                "children": [child.to_dict() for child in tree_node.children],
-            }
-        )
-        expanded = tree_node_from_dict(expanded_dict)
-        expanded.operator_stop_policy = tree_node.operator_stop_policy
-        return expanded
-
-    def _make_skill_expander(self):
-        """Return a callable that expands a skill ID into a py_trees subtree."""
-        def _expand(skill_id: str, params: dict):
-            if self._skill_catalog is None:
-                return None
-            if not self._skill_catalog.contains(skill_id):
-                return None
-            expanded_dict = self._skill_catalog.expand_node_dict(
-                {"id": skill_id, "name": f"_recovery_{skill_id}", "params": params, "children": []}
-            )
-            recovery_tree_node = tree_node_from_dict(expanded_dict)
-            return self._build_node(recovery_tree_node)
-        return _expand
-
-    def _build_node(
-        self,
-        tree_node: TreeNode,
-        *,
-        inherited_operator_stop_policy: str = "continue",
-        inherited_operator_stop_policy_explicit: bool = False,
-    ) -> py_trees.behaviour.Behaviour:
-        """Recursively build a py_trees node from a TreeNode."""
-        tree_node = self._expand_tree_node(tree_node)
-        entry = self._catalog.get(tree_node.id)
-        if entry.kind == "authoring_macro":
-            raise ValueError(
-                f"Authoring macro '{tree_node.id}' reached the runtime tree; "
-                "Composer must expand it before apply/save"
-            )
-        explicit_operator_stop_policy = tree_node.operator_stop_policy != "inherit"
-        if explicit_operator_stop_policy:
-            effective_operator_stop_policy = tree_node.operator_stop_policy
-        elif inherited_operator_stop_policy_explicit:
-            effective_operator_stop_policy = inherited_operator_stop_policy
-        else:
-            effective_operator_stop_policy = (
-                inherited_operator_stop_policy
-                if entry.operator_stop_policy == "inherit"
-                else entry.operator_stop_policy
-            )
-        n_children = len(tree_node.children)
-        if n_children < entry.children_min:
-            raise ValueError(
-                f"Node '{tree_node.name}' ({tree_node.id}) requires at least "
-                f"{entry.children_min} child{'ren' if entry.children_min != 1 else ''}, got {n_children}"
-            )
-        if entry.children_max >= 0 and n_children > entry.children_max:
-            raise ValueError(
-                f"Node '{tree_node.name}' ({tree_node.id}) allows at most "
-                f"{entry.children_max} child{'ren' if entry.children_max != 1 else ''}, got {n_children}"
-            )
-        resolved_params = self._resolver.resolve(tree_node.params)
-        resolved_params = resolve_runtime_blackboard_bindings(
-            entry,
-            resolved_params,
-            blackboard_namespaces=self._program.blackboard_namespaces,
-            blackboard_keys=self._program.blackboard_keys,
-        )
-        children = [
-            self._build_node(
-                c,
-                inherited_operator_stop_policy=effective_operator_stop_policy,
-                inherited_operator_stop_policy_explicit=(
-                    explicit_operator_stop_policy
-                    or inherited_operator_stop_policy_explicit
-                ),
-            )
-            for c in tree_node.children
+        matches = [
+            capability
+            for target in self._binding["target_role_bindings"]
+            if isinstance(target, Mapping)
+            and target.get("target_role_id") == target_role_id
+            and target.get("component_role_id") == component_role_id
+            for capability in target.get("capability_bindings", [])
+            if isinstance(capability, Mapping)
+            and capability.get("capability_id") == capability_id
         ]
+        if len(matches) != 1:
+            raise ValueError(
+                "target_role_id is not bound to this capability in the "
+                "applied Program"
+            )
+        return matches[0]
 
-        def finalize(behavior: py_trees.behaviour.Behaviour) -> py_trees.behaviour.Behaviour:
-            if effective_operator_stop_policy == "continue":
-                return behavior
-            return OperatorMotionStopPolicy(
-                name=tree_node.name,
-                child=behavior,
-                policy=effective_operator_stop_policy,
+    def _selected_status(self) -> dict[str, Any]:
+        status_envelope = self._kernel.identity()
+        status = status_envelope.get("identity")
+        if not isinstance(status, dict):
+            raise KernelClientResponseError(
+                "headless execution status has no selected-owner projection"
+            )
+        if any(
+            not isinstance(status.get(field), str) or not status[field]
+            for field in ("owner_epoch", "graph_revision", "retained_bundle_id")
+        ):
+            raise KernelClientResponseError(
+                "headless execution status has an incomplete runtime identity"
+            )
+        # The run's binding executes only against the publication it was
+        # compiled for; a changed owner product is refused, never rebound.
+        if (
+            status["graph_revision"] != self._binding["graph_revision"]
+            or status["retained_bundle_id"] != self._binding["retained_bundle_id"]
+        ):
+            raise KernelClientResponseError(
+                "execution owner product differs from the applied Program binding"
+            )
+        return status
+
+    def submit_joint_goal(
+        self,
+        *,
+        request_id: str,
+        program_run_id: str,
+        component_role_id: str,
+        target_role_id: str,
+        node_instance_id: str,
+        node_attempt_id: str,
+        move_id: str,
+        joint_names: Sequence[str],
+        positions_rad: Sequence[float],
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve selection from owner status and submit one portable goal."""
+
+        self._bound_capability(
+            component_role_id=component_role_id,
+            target_role_id=target_role_id,
+            capability_id="execution.trajectory.execute",
+        )
+        target = next(
+            target for target in self._binding["target_role_bindings"]
+            if isinstance(target, Mapping)
+            and target.get("target_role_id") == target_role_id
+            and target.get("component_role_id") == component_role_id
+        )
+        tcps = target.get("robot_tcps")
+        end_effectors = [row.get("entry") for row in tcps if isinstance(row, Mapping)
+                         and row.get("end_effector") is True] if isinstance(tcps, list) else []
+        if len(end_effectors) != 1 or not isinstance(end_effectors[0], Mapping):
+            raise ValueError("applied Program binding has no unique end-effector TCP")
+        entry = end_effectors[0]
+        if not all(isinstance(entry.get(key), str) and entry[key]
+                   for key in ("component_id", "target_id", "frame_role_id")):
+            raise ValueError("applied Program binding has an invalid end-effector TCP")
+        status = self._selected_status()
+        span = ActionSpan(
+            action_source="program_node",
+            action_span_id=node_attempt_id,
+            program_run_id=program_run_id,
+            node_instance_id=node_instance_id,
+            node_attempt_id=node_attempt_id,
+        )
+        intent = {
+            "request_context": {
+                "request_id": request_id,
+                "request_owner_epoch": status["owner_epoch"],
+                "source_label": "manyforge_behavior",
+                "correlation_id": correlation_id,
+            },
+            "program_id": self._binding["program_id"],
+            "program_revision": self._binding["program_revision"],
+            "program_binding_id": self._binding["program_binding_id"],
+            "program_run_id": program_run_id,
+            "expected_graph_revision": status["graph_revision"],
+            "expected_retained_bundle_id": status["retained_bundle_id"],
+            "expected_scene_revision": None,
+            "participants": [
+                {
+                    "component_role_id": component_role_id,
+                    "target_role_id": target_role_id,
+                    "required_capability_id": "execution.trajectory.execute",
+                    "action_span": span.as_request(),
+                    "payload": {
+                        "kind": "motion",
+                        "move_id": move_id,
+                        "base_frame_role_id": "base",
+                        "tcp_endpoint": {
+                            "kind": "entry",
+                            "entry": {key: entry[key] for key in
+                                      ("component_id", "target_id", "frame_role_id")},
+                        },
+                        "tolerances": {
+                            "joint_position_tol_rad": 0.001,
+                            "translation_tol_m": 0.001,
+                            "rotation_tol_rad": 0.001,
+                        },
+                        "speed_profile": {
+                            "velocity_scale": 0.25,
+                            "acceleration_scale": 0.25,
+                            "max_tcp_linear_speed_mps": None,
+                        },
+                        "timeouts": {
+                            "planning_timeout_s": 5.0,
+                            "execution_timeout_s": 10.0,
+                        },
+                        "cache_mode": "default",
+                        "target_mode": "absolute",
+                        "target_reference": None,
+                        "offset_reference": None,
+                        "motion": {
+                            "kind": "joint_goal",
+                            "joint_names": list(joint_names),
+                            "positions_rad": list(positions_rad),
+                        },
+                        "contact_policy_id": None,
+                        "per_joint_dynamics_limits": {},
+                        "motion_interrupt_scopes": [],
+                    },
+                }
+            ],
+            "coordination_policy": "independent",
+        }
+        return self._kernel.execute(intent)
+
+    def submit_gripper_position(
+        self,
+        *,
+        request_id: str,
+        program_run_id: str,
+        component_role_id: str,
+        target_role_id: str,
+        node_instance_id: str,
+        node_attempt_id: str,
+        position_kind: Literal["angular_rad", "linear_m"],
+        position: float,
+        max_effort: float | None = None,
+        command_duration_s: float = 0.0,
+        wait_for_duration: bool = False,
+        completion_timeout_s: float = 5.0,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Submit one unit-tagged gripper target through the addressed owner."""
+
+        if position_kind not in ("angular_rad", "linear_m"):
+            raise ValueError("position_kind must be angular_rad or linear_m")
+        if not math.isfinite(position):
+            raise ValueError("position must be finite")
+        if (
+            max_effort is not None
+            and (not math.isfinite(max_effort) or max_effort < 0.0)
+        ):
+            raise ValueError("max_effort must be finite and nonnegative")
+        if not math.isfinite(command_duration_s) or command_duration_s < 0.0:
+            raise ValueError("command_duration_s must be finite and nonnegative")
+        if not math.isfinite(completion_timeout_s) or completion_timeout_s <= 0.0:
+            raise ValueError("completion_timeout_s must be finite and positive")
+
+        capability = self._bound_capability(
+            component_role_id=component_role_id,
+            target_role_id=target_role_id,
+            capability_id="tool.gripper.command",
+        )
+        command_schema = capability.get("command_schema")
+        schema_id = (
+            command_schema.get("command_schema_id")
+            if isinstance(command_schema, Mapping)
+            else None
+        )
+        schema_revision = (
+            command_schema.get("command_schema_revision")
+            if isinstance(command_schema, Mapping)
+            else None
+        )
+        if not isinstance(schema_id, str) or not schema_id:
+            raise ValueError("applied Program binding has no gripper command schema")
+        if not isinstance(schema_revision, str) or not schema_revision:
+            raise ValueError(
+                "applied Program binding has no gripper command schema revision"
+            )
+        status = self._selected_status()
+
+        if position_kind == "angular_rad":
+            position_value: dict[str, Any] = {
+                "kind": "angular_rad",
+                "value_rad": position,
+            }
+            effort_value = (
+                None
+                if max_effort is None
+                else {
+                    "kind": "angular_newton_meter",
+                    "value_nm": max_effort,
+                }
+            )
+        else:
+            position_value = {"kind": "linear_m", "value_m": position}
+            effort_value = (
+                None
+                if max_effort is None
+                else {"kind": "linear_newton", "value_n": max_effort}
             )
 
-        for injection in entry.runtime_injections:
-            if injection == "runtime_pause_registry":
-                resolved_params["runtime_pause_registry"] = (
-                    self._runtime_pause_registry
-                )
-            elif injection == "robot_defaults":
-                resolved_params.setdefault("robot_id", self._program.robot.robot_id)
-                resolved_params.setdefault("group_id", self._program.robot.group_id)
-                resolved_params.setdefault("base_frame", self._program.robot.base_frame)
-                resolved_params.setdefault("tcp_frame", self._program.robot.tcp_frame)
-            elif injection == "base_frame_default":
-                resolved_params.setdefault("base_frame", self._program.robot.base_frame)
-            elif injection == "scene_snapshot_provider":
-                resolved_params["scene_snapshot_provider"] = self._scene_snapshot_provider
-
-        services = {
-            "deployment": self._deployment,
-            "event_recorder": self._event_recorder,
-            "intervention_context": self._intervention_context,
-            "runtime_pause_registry": self._runtime_pause_registry,
-            "scene_snapshot_provider": self._scene_snapshot_provider,
-            "scene_snapshot_url_publisher": self._scene_snapshot_url_publisher,
-            "skill_expander": self._make_skill_expander(),
-        }
-        behavior = self._node_registry.instantiate(
-            tree_node.id,
-            NodeFactoryContext(
-                name=tree_node.name,
-                params=resolved_params,
-                children=tuple(children),
-                services=services,
-            ),
+        span = ActionSpan(
+            action_source="program_node",
+            action_span_id=node_attempt_id,
+            program_run_id=program_run_id,
+            node_instance_id=node_instance_id,
+            node_attempt_id=node_attempt_id,
         )
-        return finalize(behavior)
+        intent = {
+            "request_context": {
+                "request_id": request_id,
+                "request_owner_epoch": status["owner_epoch"],
+                "source_label": "manyforge_behavior",
+                "correlation_id": correlation_id,
+            },
+            "program_id": self._binding["program_id"],
+            "program_revision": self._binding["program_revision"],
+            "program_binding_id": self._binding["program_binding_id"],
+            "program_run_id": program_run_id,
+            "expected_graph_revision": status["graph_revision"],
+            "expected_retained_bundle_id": status["retained_bundle_id"],
+            "expected_scene_revision": None,
+            "participants": [
+                {
+                    "component_role_id": component_role_id,
+                    "target_role_id": target_role_id,
+                    "required_capability_id": "tool.gripper.command",
+                    "action_span": span.as_request(),
+                    "payload": {
+                        "kind": "capability_command",
+                        "command_schema_id": schema_id,
+                        "command_schema_revision": schema_revision,
+                        "command_value": {
+                            "kind": "gripper_position",
+                            "position": position_value,
+                            "max_effort": effort_value,
+                        },
+                        "completion_timeout_s": completion_timeout_s,
+                        "caller_options": [
+                            {
+                                "option_id": "command_duration_s",
+                                "value_s": command_duration_s,
+                            },
+                            *(
+                                [{"option_id": "wait_for_duration", "value_bool": True}]
+                                if wait_for_duration
+                                else []
+                            ),
+                        ],
+                    },
+                }
+            ],
+            "coordination_policy": "independent",
+        }
+        return self._kernel.execute(intent)
+
+    def operation(self, operation_id: str) -> dict[str, Any]:
+        return self._kernel.operation(operation_id)
+
+    def _request_context(
+        self,
+        *,
+        request_id: str,
+        correlation_id: str | None,
+    ) -> dict[str, str | None]:
+        status = self._kernel.identity().get("identity")
+        owner_epoch = status.get("owner_epoch") if isinstance(status, dict) else None
+        if not isinstance(owner_epoch, str) or not owner_epoch:
+            raise KernelClientResponseError(
+                "headless execution status has no owner epoch"
+            )
+        return {
+            "request_id": request_id,
+            "request_owner_epoch": owner_epoch,
+            "source_label": "manyforge_behavior",
+            "correlation_id": correlation_id,
+        }
+
+    def _control_operation(
+        self,
+        control: str,
+        *,
+        request_id: str,
+        operation_id: str,
+        expected_operation_revision: int,
+        reason: str | None,
+        correlation_id: str | None,
+    ) -> dict[str, Any]:
+        request = {
+            "request_context": self._request_context(
+                request_id=request_id,
+                correlation_id=correlation_id,
+            ),
+            "operation_id": operation_id,
+            "expected_operation_revision": expected_operation_revision,
+            "reason": reason,
+        }
+        callback = {
+            "reset": self._kernel.reset,
+            "acknowledge_completed": self._kernel.acknowledge_completed,
+        }.get(control)
+        if callback is None:
+            raise ValueError("operation control is unsupported")
+        return callback(operation_id, request)
+
+    def reset_operation(
+        self,
+        *,
+        request_id: str,
+        operation_id: str,
+        expected_operation_revision: int,
+        reason: str | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._control_operation(
+            "reset",
+            request_id=request_id,
+            operation_id=operation_id,
+            expected_operation_revision=expected_operation_revision,
+            reason=reason,
+            correlation_id=correlation_id,
+        )
+
+    def acknowledge_completed_operation(
+        self,
+        *,
+        request_id: str,
+        operation_id: str,
+        expected_operation_revision: int,
+        reason: str | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._control_operation(
+            "acknowledge_completed",
+            request_id=request_id,
+            operation_id=operation_id,
+            expected_operation_revision=expected_operation_revision,
+            reason=reason,
+            correlation_id=correlation_id,
+        )
+
+    def stop_operation(
+        self,
+        *,
+        request_id: str,
+        operation_id: str,
+        expected_operation_revision: int,
+        expected_stop_generation: int,
+        reason: str | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Submit one scoped Stop; owner projections settle its outcome."""
+
+        request = {
+            "request_context": self._request_context(
+                request_id=request_id,
+                correlation_id=correlation_id,
+            ),
+            "operations": [
+                {
+                    "operation_id": operation_id,
+                    "expected_operation_revision": expected_operation_revision,
+                    "expected_stop_generation": expected_stop_generation,
+                }
+            ],
+            "reason": reason,
+        }
+        return self._kernel.stop(request)
+
+
+__all__ = ["OrchestratorRunner"]

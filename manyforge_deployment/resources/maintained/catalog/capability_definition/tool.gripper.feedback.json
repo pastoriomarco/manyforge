@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:53cebcf32900bf3fab41aeb490a9176d3130ae53c1a289c954f1eb8d07738e23",
+  "capability_id": "tool.gripper.feedback",
+  "provider_binding_kind": "control_binding",
+  "scope": "target_binding"
+}

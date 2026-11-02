@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -8,8 +9,28 @@
 
 #include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/geometry.hpp>
+#include <manyforge_core/types/strong_id.hpp>
 
 namespace manyforge::core {
+
+/// Shared spelling authority for collision-body identities projected from the
+/// retained model map and logical scene. Program Binding, scene projection,
+/// and operation-local policy code must not reproduce these strings.
+[[nodiscard]] inline CollisionBodyId make_component_collision_body_id(
+    const ControllableComponentId& component_id,
+    const ModelInstanceId& model_instance_id,
+    const CollisionBodyRoleId& body_role_id, std::size_t collision_index) {
+  return CollisionBodyId("component/" + component_id.value() + "/model/" +
+                         model_instance_id.value() + "/body/" +
+                         body_role_id.value() + "/collision/" +
+                         std::to_string(collision_index));
+}
+
+[[nodiscard]] inline CollisionBodyId make_scene_collision_body_id(
+    const SceneResourceId& scene_resource_id, std::size_t shape_index) {
+  return CollisionBodyId("scene/" + scene_resource_id.value() + "/shape/" +
+                         std::to_string(shape_index));
+}
 
 /// One collision body present in a `CollisionWorldSnapshot` (spec
 /// §3.8.1, defined by the kernel-architecture sprint
@@ -18,7 +39,7 @@ namespace manyforge::core {
 /// A body is the unit of pose: every geometry attached to the body
 /// inherits the body's `pose` and is offset by its own
 /// `CollisionGeometryDescriptor::local_pose`. A single body may carry
-/// multiple geometries (e.g. a robot link with several primitives in
+/// multiple geometries (e.g. a component-model body with several primitives in
 /// its `<collision>` URDF block).
 ///
 /// Bodies are immutable for the lifetime of the snapshot they belong
@@ -26,71 +47,56 @@ namespace manyforge::core {
 /// publishers MUST construct a fresh snapshot for any change and
 /// advance the snapshot's `revision`.
 struct CollisionWorldBody {
-  /// Body identifier in the spec §3.8.1 normative format, e.g.
-  /// `robot/<id>/link/<name>/collision/<idx>`,
-  /// `robot/<id>/attached/<object_id>/shape/<idx>`,
-  /// `object/<object_id>/shape/<idx>`,
-  /// `fixture/<fixture_id>/shape/<idx>`.
+  /// Body identifier in the spec §3.8.1 normative format:
+  /// `component/<component>/model/<model>/body/<role>/collision/<index>`,
+  /// `scene/<scene_resource>/shape/<index>`, or
+  /// `runtime_object/<runtime_object>/shape/<index>`.
   CollisionBodyId body_id;
 
-  /// What this body represents — a robot link, an attached object, a
-  /// detached scene object, or a fixed workcell fixture.
-  CollisionOwnerKind owner_kind = CollisionOwnerKind::kFixture;
+  /// Portable owner category. Attached and detached scene resources retain
+  /// the same owner identity; parent_body_id distinguishes a carried body.
+  CollisionOwnerKind owner_kind = CollisionOwnerKind::kSceneResource;
 
-  /// Parent link for attached objects in `robot/<id>/link/<name>`
-  /// form. This intentionally omits `/collision/<idx>` because the
-  /// parent is a kinematic link, not one collision body of that link.
-  /// Empty for everything else.
-  std::optional<std::string> parent_link;
+  /// Exact component-model collision body carrying this scene resource.
+  /// Required for a carried scene-resource body and absent otherwise.
+  std::optional<CollisionBodyId> parent_body_id;
 
-  /// Frame in which `pose` is expressed. Typically the world frame
-  /// for robot links / detached objects / fixtures and the parent
-  /// link's body_id for attached objects.
+  /// Frame in which `pose` is expressed. Typically the collision-world frame
+  /// for component-model, detached scene-resource, and runtime-object bodies;
+  /// carried scene resources use their parent component-model body frame.
   std::string frame_id;
 
   /// Pose of the body within `frame_id` at snapshot time.
   Pose3DTO pose;
-
-  /// Optional timestamp of the upstream observation that produced this body
-  /// pose. Leave unset for static authored geometry. Dynamic pose-source /
-  /// simulator-observed bodies SHOULD set this together with
-  /// `source_freshness_budget_ns`; runtime monitors then fail closed when the
-  /// body pose has aged beyond its declared budget.
-  std::optional<std::string> source_id;
-  std::optional<std::int64_t> source_timestamp_ns;
-
-  /// Optional freshness budget for `source_timestamp_ns`. Leave unset for
-  /// static authored geometry. When set, `source_timestamp_ns` MUST also be
-  /// set, non-negative, and this budget MUST be positive.
-  std::optional<std::int64_t> source_freshness_budget_ns;
 
   /// Geometries making up this body. Ordering is preserved by the
   /// builder; engines MUST treat the list as a multi-set keyed by
   /// `body_id + index`.
   std::vector<CollisionGeometryDescriptor> geometries;
 
-  /// Per-body content hash over (body_id, owner_kind, parent_link,
+  /// Per-body content hash over (body_id, owner_kind, parent_body_id,
   /// frame_id, pose, geometries source-hash digest). Set by the
   /// builder; publishers SHOULD NOT pre-populate this field — the
   /// builder will overwrite it.
   std::string body_content_hash;
 };
 
-/// Pose of one robot model frame in the collision-world frame.
+/// Pose of one component-owned model frame in the collision-world frame.
 ///
 /// `CollisionWorldSnapshot` bodies are published in the scene/world frame, but
 /// most robot collision engines evaluate Pinocchio-style robot geometry in the
 /// robot model's root frame. This descriptor is the explicit bridge between
-/// those frames: engines use it to transform detached objects and fixtures into
-/// the model frame before running per-waypoint FK.
-struct CollisionRobotModelFrame {
-  /// Stable robot namespace used in `CollisionBodyId`, e.g. `robot0`.
-  std::string robot_id;
+/// those frames: engines use it to transform scene resources and runtime
+/// objects into the model frame before running per-waypoint FK.
+struct CollisionComponentModelFrame {
+  ControllableComponentId controllable_component_id;
+  ModelInstanceId model_instance_id;
+  FrameRoleId frame_role_id;
+  /// Compiler-owned frame name retained only as internal projection evidence.
+  std::string compiled_frame_name;
+  ModelRevision model_revision;
 
-  /// Frame name in the robot model, e.g. `base_link`.
-  std::string model_frame_id;
-
-  /// Pose of `model_frame_id` in the collision-world frame.
+  /// Pose of `compiled_frame_name` in the collision-world frame.
   Pose3DTO world_pose;
 };
 
@@ -100,8 +106,8 @@ struct CollisionRobotModelFrame {
 ///
 /// The snapshot is the *world* half of the (world, policy) pair that
 /// every `ICollisionQueryEngine` worker consumes. It carries the
-/// scene state — robot bodies, attached objects, detached scene
-/// objects, fixtures, their poses, and their geometry descriptors —
+/// scene state — component-model bodies, scene resources, runtime objects,
+/// their poses, and their geometry descriptors —
 /// plus a deterministic revision identity that engines use for cache
 /// invalidation and that the kernel uses for mismatch correlation.
 ///
@@ -147,12 +153,9 @@ struct CollisionWorldSnapshot {
   /// telemetry only; engines MUST NOT use it for cache decisions.
   std::int64_t emitted_at_ns = 0;
 
-  /// Robot model frames published with the snapshot. Current production
-  /// profiles contain one robot; the vector shape is intentionally used so
-  /// multi-robot snapshots can add one descriptor per robot without changing
-  /// the schema. Engines that support only one robot MUST fail closed if more
-  /// than one descriptor is present.
-  std::vector<CollisionRobotModelFrame> robot_model_frames;
+  /// Canonical component/model/frame projection rows needed by collision
+  /// engines to transform scene resources into each model frame.
+  std::vector<CollisionComponentModelFrame> component_model_frames;
 
   /// All collision bodies, sorted lexicographically by `body_id`.
   /// Sorting is performed by the builder; publishers MUST NOT rely
@@ -165,10 +168,9 @@ struct CollisionWorldSnapshot {
   /// `bodies[i].geometries.size()`.
   std::int64_t body_count = 0;
   std::int64_t geometry_count = 0;
-  std::int64_t robot_link_count = 0;
-  std::int64_t attached_object_count = 0;
-  std::int64_t detached_object_count = 0;
-  std::int64_t fixture_count = 0;
+  std::int64_t component_model_body_count = 0;
+  std::int64_t scene_resource_count = 0;
+  std::int64_t runtime_object_count = 0;
 
   /// True iff any geometry in the snapshot reports
   /// `geometry_kind == kTriangleMesh` or `kCompound`. Engines that

@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:b2f0e892d401460c6b43b1c1b8b39a0cad5fcc130ba694c2c5e32d6cc2d8c323",
+  "capability_id": "execution.contact.geometric_signed_penetration",
+  "provider_binding_kind": "control_binding",
+  "scope": "target_binding"
+}

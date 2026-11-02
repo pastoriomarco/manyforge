@@ -13,6 +13,8 @@ struct ErrorDTO {
     std::string code;
     std::string message;
     std::map<std::string, std::string> details;
+
+    friend bool operator==(const ErrorDTO&, const ErrorDTO&) = default;
 };
 
 /// Error code enum (spec §5.2)
@@ -21,6 +23,8 @@ enum class ErrorCode {
     kInvalidRequest,
     kMissingReference,
     kAmbiguousReference,
+    kStaleGeneration,
+    kAuthoringNotReady,
     kUnsupportedCapability,
     kPlanningFailed,
     kPlanningTimeout,
@@ -39,8 +43,6 @@ enum class ErrorCode {
     kExecutionAborted,
     kExecutionTimeout,
     kStopFailed,
-    kPauseFailed,
-    kResumeFailed,
     kResetFailed,
     kInternalError,
     kInvariantViolation,
@@ -63,6 +65,8 @@ inline const char* to_string(ErrorCode code) {
         case kInvalidRequest: return "invalid_request";
         case kMissingReference: return "missing_reference";
         case kAmbiguousReference: return "ambiguous_reference";
+        case kStaleGeneration: return "stale_generation";
+        case kAuthoringNotReady: return "authoring_not_ready";
         case kUnsupportedCapability: return "unsupported_capability";
         case kPlanningFailed: return "planning_failed";
         case kPlanningTimeout: return "planning_timeout";
@@ -81,8 +85,6 @@ inline const char* to_string(ErrorCode code) {
         case kExecutionAborted: return "execution_aborted";
         case kExecutionTimeout: return "execution_timeout";
         case kStopFailed: return "stop_failed";
-        case kPauseFailed: return "pause_failed";
-        case kResumeFailed: return "resume_failed";
         case kResetFailed: return "reset_failed";
         case kInternalError: return "internal_error";
         case kInvariantViolation: return "invariant_violation";
@@ -252,6 +254,8 @@ public:
 inline const char* kErrorInvalidRequest = "invalid_request";
 inline const char* kErrorMissingReference = "missing_reference";
 inline const char* kErrorAmbiguousReference = "ambiguous_reference";
+inline const char* kErrorStaleGeneration = "stale_generation";
+inline const char* kErrorAuthoringNotReady = "authoring_not_ready";
 inline const char* kErrorUnsupportedCapability = "unsupported_capability";
 inline const char* kErrorRecoveryActionRejected = "recovery_action_rejected";
 
@@ -282,9 +286,11 @@ inline const char* kErrorExecutionRejected = "execution_rejected";
 inline const char* kErrorExecutionAborted = "execution_aborted";
 inline const char* kErrorExecutionTimeout = "execution_timeout";
 inline const char* kErrorStopFailed = "stop_failed";
-inline const char* kErrorPauseFailed = "pause_failed";
-inline const char* kErrorResumeFailed = "resume_failed";
 inline const char* kErrorResetFailed = "reset_failed";
+// The runtime collision monitor could not be prepared at dispatch. A critical
+// fault with no effect: nothing is sent and the operation needs Reset.
+inline const char* kErrorRuntimeCollisionMonitorPrepareFailed =
+    "runtime_collision_monitor_prepare_failed";
 
 // Internal
 inline const char* kErrorInternalError = "internal_error";

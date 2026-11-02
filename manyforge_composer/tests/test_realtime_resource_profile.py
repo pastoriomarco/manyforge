@@ -9,7 +9,6 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HELPER = _REPO_ROOT / "scripts" / "lib" / "realtime-resources.sh"
-_COMPOSE_HELPER = _REPO_ROOT / "scripts" / "lib" / "compose.sh"
 
 
 def _available_cpus() -> list[int]:
@@ -140,50 +139,3 @@ def test_strict_resource_profile_rejects_cpu_unavailable_to_launch_context():
 
     assert completed.returncode != 0
     assert "selects a CPU unavailable to this launch context" in completed.stderr
-
-
-def test_native_composer_strict_profile_forwards_minimum_container_contract():
-    completed = _run_shell(
-        (
-            f"source {str(_COMPOSE_HELPER)!r}; "
-            "prepare_native_composer_rt_docker_args; "
-            "printf '<%s>\\n' \"${NATIVE_COMPOSER_RT_DOCKER_ARGS[@]}\""
-        ),
-        _profile_environment(),
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    arguments = completed.stdout.splitlines()
-    assert "<--cap-add>" in arguments
-    assert "<SYS_NICE>" in arguments
-    assert "<--ulimit>" in arguments
-    assert "<rtprio=99:99>" in arguments
-    assert "<-e>" in arguments
-    assert "<MANYFORGE_RT_RESOURCE_PROFILE=strict>" in arguments
-    assert "<MANYFORGE_RT_CONTROLLER_MANAGER_PRESENT=false>" in arguments
-    assert any(
-        value.startswith("<MANYFORGE_NRT_CPU_AFFINITY=")
-        for value in arguments
-    )
-
-    source = _COMPOSE_HELPER.read_text(encoding="utf-8")
-    assert "manyforge_exec_with_nrt_affinity python -m manyforge_composer" in source
-
-
-def test_native_profile_can_reclaim_absent_controller_manager_cpu_for_nrt():
-    environment = _profile_environment()
-    environment["MANYFORGE_NRT_CPU_AFFINITY"] = ",".join(
-        [
-            environment["MANYFORGE_NRT_CPU_AFFINITY"],
-            environment["MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY"],
-        ]
-    )
-    completed = _run_shell(
-        (
-            f"source {str(_COMPOSE_HELPER)!r}; "
-            "prepare_native_composer_rt_docker_args"
-        ),
-        environment,
-    )
-
-    assert completed.returncode == 0, completed.stderr

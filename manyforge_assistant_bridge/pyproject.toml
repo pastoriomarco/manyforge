@@ -4,15 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "manyforge_assistant_bridge"
-version = "0.1.0"
-description = "ManyForge assistant-provider bridge — multi-turn loop against an OpenAI-compatible upstream model, plus the assistant-stack supervisor that feeds Composer's runtime-status surface"
+version = "0.2.0"
+description = "Bounded ManyForge assistant provider bridge and owner-neutral read client"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Marco Pastorio" }]
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.111",
-    "uvicorn[standard]>=0.30",
     "httpx>=0.27",
+    "jsonschema>=4.23",
+    "manyforge_headless_api>=0.2.0,<0.3.0",
+    "pydantic>=2.7",
+    "rfc8785==0.1.4",
+    "uvicorn[standard]>=0.30",
 ]
 
 [tool.setuptools]

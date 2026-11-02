@@ -1,9 +1,9 @@
-"""ManyForge assistant-provider bridge service (v0.1 skeleton).
+"""Bounded assistant bridge plus owner-neutral client/reducer inputs.
 
-Implements the assistant-provider HTTP contract against a local
-OpenAI-compatible LLM endpoint (typically vLLM on the deployment host).
-
-Operator-facing wire contract: `docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`.
+``bridge`` is the current direct/``nemoclaw`` provider mediator. ``headless``
+exposes the closed H0 read client, ``protocol`` exports the strict current wire,
+and ``supervisor`` keeps only the pure reducer from the superseded fixed
+launcher.
 """
 
-__all__ = ["bridge"]
+__all__ = ["bridge", "headless", "protocol", "supervisor"]

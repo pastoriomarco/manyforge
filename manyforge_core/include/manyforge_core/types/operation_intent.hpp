@@ -1,0 +1,178 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <manyforge_core/types/action_span.hpp>
+#include <manyforge_core/types/command_schema.hpp>
+#include <manyforge_core/types/configuration_fence.hpp>
+#include <manyforge_core/types/execution_status.hpp>
+#include <manyforge_core/types/joint_dynamics_limits.hpp>
+#include <manyforge_core/types/motion_interrupt.hpp>
+#include <manyforge_core/types/motion_spec.hpp>
+#include <manyforge_core/types/program_contract.hpp>
+#include <manyforge_core/types/projection_common.hpp>
+#include <manyforge_core/types/runtime_object_binding.hpp>
+#include <manyforge_core/types/speed_profile.hpp>
+#include <manyforge_core/types/tcp_entry.hpp>
+#include <manyforge_core/types/timeouts.hpp>
+#include <manyforge_core/types/tolerances.hpp>
+#include <map>
+#include <optional>
+#include <string>
+#include <variant>
+#include <vector>
+
+namespace manyforge::core {
+
+inline constexpr std::size_t kMaxOperationParticipants = 4096U;
+inline constexpr std::size_t kMaxOperationCommandOptions = 64U;
+inline constexpr std::size_t kMaxOperationRuntimeObjectBindings = 4096U;
+
+enum class OperationCoordinationPolicy {
+  kIndependent,
+  kCoordinatedAll,
+};
+
+struct GripperPositionCommandValueDTO final {
+  CoordinatePositionDTO position;
+  std::optional<CoordinateEffortDTO> max_effort;
+  friend bool operator==(const GripperPositionCommandValueDTO&,
+                         const GripperPositionCommandValueDTO&) = default;
+};
+
+/// One caller option of a capability command, typed by its schema
+/// `value_kind`: a duration (`nonnegative_duration_seconds`, wire `value_s`)
+/// or a flag (`bool`, wire `value_bool`).
+struct CommandOptionDTO final {
+  CommandOptionId option_id;
+  std::variant<double, bool> value;
+  friend bool operator==(const CommandOptionDTO&, const CommandOptionDTO&) = default;
+};
+
+struct CapabilityCommandIntentDTO final {
+  CommandSchemaId command_schema_id;
+  CommandSchemaRevision command_schema_revision;
+  GripperPositionCommandValueDTO command_value;
+  std::optional<double> completion_timeout_s;
+  std::vector<CommandOptionDTO> caller_options;
+  friend bool operator==(const CapabilityCommandIntentDTO&,
+                         const CapabilityCommandIntentDTO&) = default;
+};
+
+struct MotionParticipantIntentDTO final {
+  MoveId move_id;
+  FrameRoleId base_frame_role_id;
+  /// Active TCP (M7, T-MQ17): which TCP the move uses. Current is resolved
+  /// to the robot's Active TCP, form 2 through the Program binding; the
+  /// resolved entry is the binding's `motion_endpoint.entry`. Forms 2 and 3
+  /// set the Active TCP to that entry before the move is sent.
+  TcpSelectorDTO tcp_endpoint;
+  TolerancesDTO tolerances;
+  SpeedProfileDTO speed_profile;
+  TimeoutsDTO timeouts;
+  CacheMode cache_mode{CacheMode::kDefault};
+  /// The motion's planner override; unset members take the Deployment's.
+  PlannerOverrideDTO planner{};
+  MotionTargetModeDTO target_mode{MotionTargetModeDTO::kAbsolute};
+  std::optional<ReferenceDTO> target_reference;
+  std::optional<ReferenceDTO> offset_reference;
+  MotionSpecDTO motion;
+  std::optional<ContactPolicyId> contact_policy_id;
+  /// Source-local URDF joint names scoped by `target_role_id`.
+  std::map<std::string, JointDynamicsLimitDTO> per_joint_dynamics_limits;
+  std::vector<MotionInterruptScopeDTO> motion_interrupt_scopes;
+  /// Public selection of one declared Program runtime-object key. Admission
+  /// resolves and validates these rows against the exact Program Binding and
+  /// retained logical scene; equal spelling is never treated as proof.
+  std::vector<RuntimeObjectReferenceBindingDTO> runtime_object_bindings{};
+  /// Absolute pose/Cartesian goal expressed in this frame instead of the
+  /// moving target's base frame. Resolved once at admission through the same
+  /// cell reference resolver as relative targets. Forbidden for relative or
+  /// joint/named motion and for inline poses.
+  std::optional<ReferenceDTO> goal_frame_reference{};
+  /// Collision clearance for this move, in [0, kMaxCollisionClearanceM] m.
+  /// Absent means the Deployment's `collision_clearance_m`; 0 turns the
+  /// clearance off for this move.
+  std::optional<double> clearance_m{};
+  friend bool operator==(const MotionParticipantIntentDTO&,
+                         const MotionParticipantIntentDTO&) = default;
+};
+
+/// Active TCP (M7, T-MQ15): set the robot's Active TCP. One participant on
+/// the robot's motion target and capability, never Current. The Kernel runs
+/// it as an atomic step that a Stop does not end; see
+/// `ResourceAddressedExecutionKernel::execute`.
+struct SetTcpParticipantIntentDTO final {
+  TcpSelectorDTO tcp;
+  friend bool operator==(const SetTcpParticipantIntentDTO&,
+                         const SetTcpParticipantIntentDTO&) = default;
+};
+
+using OperationParticipantPayloadDTO =
+    std::variant<MotionParticipantIntentDTO, CapabilityCommandIntentDTO,
+                 SetTcpParticipantIntentDTO>;
+
+struct OperationParticipantIntentDTO final {
+  ComponentRoleId component_role_id;
+  TargetRoleId target_role_id;
+  CapabilityId required_capability_id;
+  std::optional<ActionSpanDTO> action_span;
+  OperationParticipantPayloadDTO payload;
+  /// Required for captured Program work; absent only for exact intrinsic
+  /// direct-control bindings. It cannot be inferred from an ActionSpan label.
+  std::optional<ProgramNodeExecutionScopeDTO> execution_scope{};
+  friend bool operator==(const OperationParticipantIntentDTO&,
+                         const OperationParticipantIntentDTO&) = default;
+};
+
+/// Exact held Program selected before manual cleanup/approval. This is a
+/// precondition, never permission: the Kernel rechecks producers and settlement.
+struct ManualProgramHandoverContextDTO final {
+  RequestOwnerEpoch program_runner_owner_epoch;
+  ProgramRunId program_run_id;
+  CellAdmissionClaimGeneration claim_generation;
+  std::uint64_t selection_revision{};
+  friend bool operator==(const ManualProgramHandoverContextDTO&,
+                         const ManualProgramHandoverContextDTO&) = default;
+};
+
+struct OperationIntentDTO final {
+  PublicRequestContextDTO request_context;
+  ProgramId program_id;
+  ProgramRevision program_revision;
+  ProgramBindingId program_binding_id;
+  ProgramRunId program_run_id;
+  GraphRevision expected_graph_revision;
+  RetainedBundleId expected_retained_bundle_id;
+  std::optional<SceneRevision> expected_scene_revision;
+  std::vector<OperationParticipantIntentDTO> participants;
+  OperationCoordinationPolicy coordination_policy{OperationCoordinationPolicy::kIndependent};
+  /// Receiving-adapter provenance. Public payloads cannot populate this field.
+  RequestAttributionDTO attribution{};
+  std::optional<ManualProgramHandoverContextDTO> manual_handover{};
+  friend bool operator==(const OperationIntentDTO&, const OperationIntentDTO&) = default;
+};
+
+struct OperationParticipantAssignmentDTO final {
+  std::size_t input_index{};
+  OperationParticipantId participant_id;
+  friend bool operator==(const OperationParticipantAssignmentDTO&,
+                         const OperationParticipantAssignmentDTO&) = default;
+};
+
+struct OperationAcceptedDTO final {
+  RequestId request_id;
+  RequestReplayStatusDTO replay_status;
+  OperationId operation_id;
+  OperationRevision operation_revision;
+  std::vector<OperationParticipantAssignmentDTO> participant_assignments;
+  std::int64_t accepted_at_ns{};
+  friend bool operator==(const OperationAcceptedDTO&, const OperationAcceptedDTO&) = default;
+};
+
+/// Pure public-boundary validation. Runtime binding, current-generation,
+/// resource, scene, and backend admission are intentionally later Kernel
+/// checks and are not inferred here.
+[[nodiscard]] Result<void> validate_operation_intent(const OperationIntentDTO& intent);
+
+}  // namespace manyforge::core

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot name="qualified">
+  <group name="arm">
+    <link name="base"/>
+  </group>
+</robot>

@@ -82,8 +82,7 @@ const char* runtime_collision_lookahead_termination_name(
   return "invalid_input";
 }
 
-const char* runtime_collision_lookahead_error_message(
-    std::string_view reason) noexcept {
+const char* runtime_collision_lookahead_error_message(std::string_view reason) noexcept {
   if (reason == "runtime_lookahead_deadline_exceeded") {
     return "Runtime trajectory lookahead missed its cycle deadline";
   }
@@ -148,10 +147,8 @@ bool build_lookahead_waypoint_time_index(
   return true;
 }
 
-std::int64_t quadratic_target_time(std::int64_t cursor_time_ns,
-                                   std::int64_t window_end_ns,
-                                   std::size_t index,
-                                   std::size_t sample_count) {
+std::int64_t quadratic_target_time(std::int64_t cursor_time_ns, std::int64_t window_end_ns,
+                                   std::size_t index, std::size_t sample_count) {
   const auto span = static_cast<std::uint64_t>(window_end_ns - cursor_time_ns);
   const auto denominator = static_cast<std::uint64_t>(sample_count) * sample_count;
   const auto numerator = static_cast<std::uint64_t>(index) * index;
@@ -161,10 +158,8 @@ std::int64_t quadratic_target_time(std::int64_t cursor_time_ns,
   return cursor_time_ns + static_cast<std::int64_t>(offset);
 }
 
-void build_quadratic_targets(std::int64_t cursor_time_ns,
-                             std::int64_t window_end_ns,
-                             std::size_t max_samples,
-                             std::vector<std::int64_t>& targets) {
+void build_quadratic_targets(std::int64_t cursor_time_ns, std::int64_t window_end_ns,
+                             std::size_t max_samples, std::vector<std::int64_t>& targets) {
   targets.clear();
   const auto span = window_end_ns - cursor_time_ns;
   if (span <= 0 || max_samples == 0) {
@@ -185,11 +180,10 @@ void build_quadratic_targets(std::int64_t cursor_time_ns,
   targets.back() = window_end_ns;
 }
 
-void merge_required_and_fill_targets(
-    const std::vector<std::int64_t>& required,
-    const std::vector<std::int64_t>& quadratic,
-    std::size_t desired_count,
-    std::vector<std::int64_t>& selected) {
+void merge_required_and_fill_targets(const std::vector<std::int64_t>& required,
+                                     const std::vector<std::int64_t>& quadratic,
+                                     std::size_t desired_count,
+                                     std::vector<std::int64_t>& selected) {
   selected.clear();
   selected.reserve(desired_count);
   const auto extras_needed = desired_count - required.size();
@@ -213,11 +207,9 @@ void merge_required_and_fill_targets(
 
 void select_runtime_collision_lookahead_samples_from_index(
     const TrajectoryDTO& trajectory, const std::vector<std::int64_t>& waypoint_times,
-    std::int64_t cursor_time_ns, std::int64_t horizon_ns,
-    std::size_t max_samples, RuntimeCollisionLookaheadSelection& out,
-    std::vector<std::int64_t>& required_times,
-    std::vector<std::int64_t>& target_times,
-    TrajectorySampleResult& sample_scratch) {
+    std::int64_t cursor_time_ns, std::int64_t horizon_ns, std::size_t max_samples,
+    RuntimeCollisionLookaheadSelection& out, std::vector<std::int64_t>& required_times,
+    std::vector<std::int64_t>& target_times, TrajectorySampleResult& sample_scratch) {
   reset_lookahead_selection(out, cursor_time_ns);
   if (trajectory.joint_names.empty() || trajectory.waypoints.empty() ||
       waypoint_times.size() != trajectory.waypoints.size() || cursor_time_ns < 0 ||
@@ -263,24 +255,20 @@ void select_runtime_collision_lookahead_samples_from_index(
     if (!endpoint_is_source) {
       required_times.push_back(window_end_ns);
     }
-    const auto available_nanoseconds = static_cast<std::uint64_t>(
-        window_end_ns - cursor_time_ns);
-    const auto desired_count = static_cast<std::size_t>(
-        std::min<std::uint64_t>(max_samples, available_nanoseconds));
+    const auto available_nanoseconds = static_cast<std::uint64_t>(window_end_ns - cursor_time_ns);
+    const auto desired_count =
+        static_cast<std::size_t>(std::min<std::uint64_t>(max_samples, available_nanoseconds));
     // Generate enough deterministic candidates that even complete overlap
     // with every mandatory source knot still leaves enough distinct times to
     // fill the bounded selection whenever the nanosecond domain permits it.
     const auto candidate_count = static_cast<std::size_t>(
-        std::min<std::uint64_t>(available_nanoseconds,
-                                max_samples + required_times.size()));
-    build_quadratic_targets(cursor_time_ns, window_end_ns, candidate_count,
-                            target_times);
+        std::min<std::uint64_t>(available_nanoseconds, max_samples + required_times.size()));
+    build_quadratic_targets(cursor_time_ns, window_end_ns, candidate_count, target_times);
     merge_required_and_fill_targets(required_times, target_times, desired_count,
                                     out.sample_times_ns);
   } else {
     out.sampling_reduced = true;
-    build_quadratic_targets(cursor_time_ns, window_end_ns, max_samples,
-                            target_times);
+    build_quadratic_targets(cursor_time_ns, window_end_ns, max_samples, target_times);
     out.sample_times_ns = target_times;
   }
 
@@ -297,20 +285,17 @@ void select_runtime_collision_lookahead_samples_from_index(
   out.source_waypoint_indices.reserve(out.sample_times_ns.size());
   out.original_trajectory_sample_fractions.reserve(out.sample_times_ns.size());
   auto upper_index = static_cast<std::size_t>(
-      std::lower_bound(waypoint_times.begin(), waypoint_times.end(),
-                       out.sample_times_ns.front()) -
+      std::lower_bound(waypoint_times.begin(), waypoint_times.end(), out.sample_times_ns.front()) -
       waypoint_times.begin());
   for (const auto sample_time_ns : out.sample_times_ns) {
-    while (upper_index < waypoint_times.size() &&
-           waypoint_times[upper_index] < sample_time_ns) {
+    while (upper_index < waypoint_times.size() && waypoint_times[upper_index] < sample_time_ns) {
       ++upper_index;
     }
-    if (upper_index < waypoint_times.size() &&
-        waypoint_times[upper_index] == sample_time_ns) {
+    if (upper_index < waypoint_times.size() && waypoint_times[upper_index] == sample_time_ns) {
       out.trajectory.waypoints.push_back(trajectory.waypoints[upper_index]);
       out.source_waypoint_indices.push_back(static_cast<std::int64_t>(upper_index));
-      out.original_trajectory_sample_fractions.push_back(
-          static_cast<double>(upper_index) / fraction_denominator);
+      out.original_trajectory_sample_fractions.push_back(static_cast<double>(upper_index) /
+                                                         fraction_denominator);
       continue;
     }
     if (upper_index == 0 || upper_index >= waypoint_times.size()) {
@@ -319,11 +304,10 @@ void select_runtime_collision_lookahead_samples_from_index(
       return;
     }
     const auto sample_s = static_cast<double>(sample_time_ns) / 1e9;
-    const auto sampled = sample_trajectory_prevalidated(
-        trajectory, sample_s, upper_index - 1, sample_scratch);
+    const auto sampled =
+        sample_trajectory_prevalidated(trajectory, sample_s, upper_index - 1, sample_scratch);
     if (!sampled.ok() ||
-        !std::all_of(sample_scratch.positions_rad.begin(),
-                     sample_scratch.positions_rad.end(),
+        !std::all_of(sample_scratch.positions_rad.begin(), sample_scratch.positions_rad.end(),
                      [](double value) { return std::isfinite(value); })) {
       out.error_reason = "lookahead_trajectory_sample_failed";
       out.termination = RuntimeCollisionLookaheadTermination::kInvalidInput;
@@ -340,8 +324,8 @@ void select_runtime_collision_lookahead_samples_from_index(
     const auto segment_ns = waypoint_times[upper_index] - waypoint_times[lower_index];
     const auto alpha = static_cast<double>(sample_time_ns - waypoint_times[lower_index]) /
                        static_cast<double>(segment_ns);
-    out.original_trajectory_sample_fractions.push_back(
-        (static_cast<double>(lower_index) + alpha) / fraction_denominator);
+    out.original_trajectory_sample_fractions.push_back((static_cast<double>(lower_index) + alpha) /
+                                                       fraction_denominator);
   }
   out.covered_until_time_ns = window_end_ns;
   out.reaches_trajectory_end = window_end_ns == trajectory_end_ns;
@@ -352,10 +336,10 @@ void select_runtime_collision_lookahead_samples_from_index(
 
 }  // namespace
 
-void select_runtime_collision_lookahead_samples(
-    const TrajectoryDTO& trajectory, std::int64_t cursor_time_ns,
-    std::int64_t horizon_ns, std::size_t max_samples,
-    RuntimeCollisionLookaheadSelection& out) {
+void select_runtime_collision_lookahead_samples(const TrajectoryDTO& trajectory,
+                                                std::int64_t cursor_time_ns,
+                                                std::int64_t horizon_ns, std::size_t max_samples,
+                                                RuntimeCollisionLookaheadSelection& out) {
   reset_lookahead_selection(out, cursor_time_ns);
   if (trajectory.joint_names.empty() || trajectory.waypoints.empty() || cursor_time_ns < 0 ||
       horizon_ns <= 0 || max_samples < 2 || max_samples > 4096) {
@@ -370,16 +354,16 @@ void select_runtime_collision_lookahead_samples(
   std::vector<std::int64_t> required_times;
   TrajectorySampleResult sample_scratch;
   select_runtime_collision_lookahead_samples_from_index(
-      trajectory, waypoint_times, cursor_time_ns, horizon_ns, max_samples, out,
-      required_times, target_times, sample_scratch);
+      trajectory, waypoint_times, cursor_time_ns, horizon_ns, max_samples, out, required_times,
+      target_times, sample_scratch);
 }
 
 RuntimeCollisionLookaheadSelection select_runtime_collision_lookahead_samples(
     const TrajectoryDTO& trajectory, std::int64_t cursor_time_ns, std::int64_t horizon_ns,
     std::size_t max_samples) {
   RuntimeCollisionLookaheadSelection out;
-  select_runtime_collision_lookahead_samples(trajectory, cursor_time_ns, horizon_ns,
-                                             max_samples, out);
+  select_runtime_collision_lookahead_samples(trajectory, cursor_time_ns, horizon_ns, max_samples,
+                                             out);
   return out;
 }
 
@@ -387,10 +371,11 @@ RuntimeCollisionLookaheadSession::RuntimeCollisionLookaheadSession(
     Config config, IClock& clock, IScheduler& scheduler,
     ICollisionWorldSnapshotPublisher& publisher,
     const ExecutionProgressPublication& progress_publication,
-    std::vector<std::shared_ptr<ICollisionQueryEngine>> engines,
-    ResultCallback callback, AuthorityCallback authority_callback)
+    std::vector<std::shared_ptr<ICollisionQueryEngine>> engines, ResultCallback callback,
+    AuthorityCallback authority_callback)
     : config_(config),
       clock_(&clock),
+      scheduler_(&scheduler),
       publisher_(&publisher),
       progress_publication_(&progress_publication),
       engines_(std::move(engines)),
@@ -400,17 +385,14 @@ RuntimeCollisionLookaheadSession::RuntimeCollisionLookaheadSession(
         ParallelCollisionValidationWorkerPool::Config pool_config;
         pool_config.worker_count = config.workers;
         pool_config.min_waypoints_for_parallel = config.min_waypoints_for_parallel;
-        pool_config.validation_wall_timeout =
-            std::chrono::nanoseconds(config.cycle_budget_ns);
+        pool_config.validation_wall_timeout = std::chrono::nanoseconds(config.cycle_budget_ns);
         pool_config.clock = &clock;
         pool_config.scheduler = &scheduler;
         return pool_config;
       }()) {
-  if (config_.cycle_budget_ns <= 0 || config_.horizon_ns <= 0 ||
-      config_.max_samples < 2 || config_.max_samples > 4096 ||
-      config_.workers < 1 || config_.workers > 64 ||
-      config_.query_budget_ns <= 0 ||
-      config_.cycle_budget_ns < config_.query_budget_ns ||
+  if (config_.cycle_budget_ns <= 0 || config_.horizon_ns <= 0 || config_.max_samples < 2 ||
+      config_.max_samples > 4096 || config_.workers < 1 || config_.workers > 64 ||
+      config_.query_budget_ns <= 0 || config_.cycle_budget_ns < config_.query_budget_ns ||
       !callback_ || !authority_callback_) {
     throw std::invalid_argument("runtime collision lookahead config invalid");
   }
@@ -443,40 +425,56 @@ RuntimeCollisionLookaheadSession::~RuntimeCollisionLookaheadSession() {
   }
 }
 
-void RuntimeCollisionLookaheadSession::arm(std::uint64_t execution_id,
-                                           std::uint64_t execution_generation,
-                                           std::shared_ptr<const TrajectoryDTO> trajectory,
-                                           std::string contact_policy_id) {
-  if (execution_id == 0 || execution_generation == 0 || !trajectory ||
-      trajectory->waypoints.empty()) {
+RuntimeCollisionLookaheadSession::PreparedArm RuntimeCollisionLookaheadSession::prepare_arm(
+    std::uint64_t execution_id, std::uint64_t execution_generation,
+    std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id) {
+  if (execution_id == 0 || !trajectory || trajectory->waypoints.empty()) {
     throw std::invalid_argument("runtime collision lookahead arm invalid");
   }
+  return PreparedArm{execution_id,
+                     execution_generation,
+                     std::move(trajectory),
+                     std::move(contact_policy_id),
+                     "lookahead_rearmed",
+                     "lookahead_rearmed"};
+}
+
+void RuntimeCollisionLookaheadSession::arm(
+    std::uint64_t execution_id, std::uint64_t execution_generation,
+    std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id) {
+  if (execution_generation == 0)
+    throw std::invalid_argument("runtime collision lookahead arm invalid");
+  publish_prepared_arm(prepare_arm(execution_id, execution_generation, std::move(trajectory),
+                                   std::move(contact_policy_id)));
+}
+
+void RuntimeCollisionLookaheadSession::publish_prepared_arm(PreparedArm prepared) noexcept {
   accepting_clear_permits_.store(false, std::memory_order_release);
-  const auto arm_permit_generation =
-      permit_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  const auto arm_permit_generation = permit_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
   std::lock_guard<std::mutex> lock(mutex_);
   if (const auto active_cancel = active_cancel_.load(std::memory_order_acquire)) {
-    active_cancel->request_cancel("lookahead_rearmed");
+    active_cancel->request_cancel(std::move(prepared.active_cancel_reason));
   }
   if (pending_job_ && pending_job_->cancel) {
-    pending_job_->cancel->request_cancel("lookahead_rearmed");
+    pending_job_->cancel->request_cancel(std::move(prepared.pending_cancel_reason));
   }
-  arm_ = ArmState{execution_id, execution_generation, next_arm_generation_++, std::move(trajectory),
-                  std::move(contact_policy_id)};
+  arm_ = ArmState{prepared.execution_id,
+                  prepared.execution_generation,
+                  next_arm_generation_++,
+                  std::move(prepared.trajectory),
+                  std::move(prepared.contact_policy_id)};
   pending_job_.reset();
   indexed_arm_generation_ = 0;
   // A stop/reset revocation can invalidate the permit generation without
   // waiting for this leaf mutex. Reopen only when no such authority event
   // raced the arm; otherwise the next execution arm must authorize work.
   const bool permit_authorized =
-      permit_generation_.load(std::memory_order_acquire) ==
-      arm_permit_generation;
-  accepting_clear_permits_.store(permit_authorized,
-                                 std::memory_order_release);
+      permit_generation_.load(std::memory_order_acquire) == arm_permit_generation;
+  accepting_clear_permits_.store(permit_authorized, std::memory_order_release);
   {
     std::lock_guard<std::mutex> status_lock(status_mutex_);
-    status_.execution_id = execution_id;
-    status_.execution_generation = execution_generation;
+    status_.execution_id = arm_.execution_id;
+    status_.execution_generation = arm_.execution_generation;
     status_.arm_generation = arm_.arm_generation;
     status_.armed = true;
     status_.permit_pending = false;
@@ -502,6 +500,12 @@ void RuntimeCollisionLookaheadSession::disarm() noexcept {
   }
 }
 
+bool RuntimeCollisionLookaheadSession::quiescent_for_resource_replacement() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return !arm_.trajectory && !pending_job_.has_value() && !job_active_ &&
+         !callback_active_;
+}
+
 void RuntimeCollisionLookaheadSession::request(
     std::int64_t requested_at_ns, RuntimeCollisionQueryBundlePtr bundle,
     RuntimeContactReleaseStateSnapshot contact_state) noexcept {
@@ -515,8 +519,8 @@ void RuntimeCollisionLookaheadSession::request(
     return;
   }
   if (!accepting_clear_permits_.load(std::memory_order_acquire) ||
-      permit_generation_.load(std::memory_order_acquire) != permit_generation ||
-      !arm_.trajectory || arm_.execution_generation == 0) {
+      permit_generation_.load(std::memory_order_acquire) != permit_generation || !arm_.trajectory ||
+      arm_.execution_generation == 0) {
     return;
   }
   if (job_active_ || pending_job_) {
@@ -554,8 +558,7 @@ void RuntimeCollisionLookaheadSession::revoke_clear_permits() noexcept {
       accepting_clear_permits_.exchange(false, std::memory_order_acq_rel);
   permit_generation_.fetch_add(1, std::memory_order_acq_rel);
   if (permission_was_open) {
-    clear_permits_invalidated_total_.fetch_add(1,
-                                               std::memory_order_relaxed);
+    clear_permits_invalidated_total_.fetch_add(1, std::memory_order_relaxed);
   }
   if (const auto active_cancel = active_cancel_.load(std::memory_order_acquire)) {
     active_cancel->request_cancel("lookahead_clear_permit_revoked");
@@ -587,10 +590,8 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
                  arm_.execution_generation == job.arm.execution_generation &&
                  arm_.trajectory != nullptr &&
                  accepting_clear_permits_.load(std::memory_order_acquire) &&
-                 permit_generation_.load(std::memory_order_acquire) ==
-                     job.permit_generation &&
-                 !progress_generation_is_terminal(
-                     job.arm.execution_generation);
+                 permit_generation_.load(std::memory_order_acquire) == job.permit_generation &&
+                 !progress_generation_is_terminal(job.arm.execution_generation);
       if (admitted) {
         job.arm.trajectory = arm_.trajectory;
         job.arm.contact_policy_id = arm_.contact_policy_id;
@@ -606,14 +607,12 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
         std::lock_guard<std::mutex> status_lock(status_mutex_);
         status_.job_active = admitted;
         status_.permit_pending = false;
-        status_.accepting_clear_permits =
-            accepting_clear_permits_.load(std::memory_order_acquire);
+        status_.accepting_clear_permits = accepting_clear_permits_.load(std::memory_order_acquire);
         if (admitted) {
           ++status_.jobs_started_total;
           if (last_job_completed_at_ns_ >= 0) {
             status_.last_inter_job_gap_ns =
-                std::max<std::int64_t>(0, active_job_started_at_ns_ -
-                                             last_job_completed_at_ns_);
+                std::max<std::int64_t>(0, active_job_started_at_ns_ - last_job_completed_at_ns_);
           }
         } else {
           ++status_.stale_generation_results_total;
@@ -632,8 +631,7 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
     };
     const auto refresh_completion_deadline = [&]() {
       const auto now_ns = clock_->now();
-      result.cycle_duration_ns =
-          std::max<std::int64_t>(0, now_ns - job.requested_at_ns);
+      result.cycle_duration_ns = std::max<std::int64_t>(0, now_ns - job.requested_at_ns);
       if (now_ns < result.cycle_deadline_ns) {
         return;
       }
@@ -646,8 +644,7 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
     const auto current_arm = [&]() {
       return arm_.arm_generation == job.arm.arm_generation &&
              arm_.execution_generation == job.arm.execution_generation &&
-             permit_generation_.load(std::memory_order_acquire) ==
-                 job.permit_generation &&
+             permit_generation_.load(std::memory_order_acquire) == job.permit_generation &&
              accepting_clear_permits_.load(std::memory_order_acquire) &&
              !progress_generation_is_terminal(job.arm.execution_generation);
     };
@@ -663,6 +660,7 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
     // handoff so a late clear can never be published as authoritative.
     refresh_completion_deadline();
     bool authority_completed = false;
+    bool authority_faulted = false;
     const auto apply_authority_if_required = [&]() {
       if (stale_arm || authority_completed || !requires_authority()) {
         return;
@@ -671,10 +669,8 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
         std::lock_guard<std::mutex> lock(mutex_);
         stale_arm = !current_arm();
         if (!stale_arm) {
-          if (accepting_clear_permits_.exchange(
-                  false, std::memory_order_acq_rel)) {
-            clear_permits_invalidated_total_.fetch_add(
-                1, std::memory_order_relaxed);
+          if (accepting_clear_permits_.exchange(false, std::memory_order_acq_rel)) {
+            clear_permits_invalidated_total_.fetch_add(1, std::memory_order_relaxed);
           }
           pending_job_.reset();
         }
@@ -685,10 +681,12 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
           stale_arm = authority_callback_(this, result) ==
                       RuntimeCollisionLookaheadAuthorityDisposition::kStale;
         } catch (...) {
-          // Authority callbacks are part of the fail-closed stop path. An
-          // escaped exception means the process can no longer prove that the
-          // detected/inconclusive hazard reached stop authority.
-          std::terminate();
+          // The hazard may not have reached Stop authority. Clear permits are
+          // already withdrawn above; the host contains the cell. No observer
+          // evidence follows for this result.
+          authority_faulted = true;
+          scheduler_->contain_safety_path_fault(
+              "runtime_collision_lookahead_authority_exception");
         }
       }
     };
@@ -711,30 +709,28 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
       }
       active_cancel_.store(nullptr, std::memory_order_release);
       job_active_ = false;
+      callback_active_ = !stale_arm;
       const auto completed_at_ns = clock_->now();
-      const auto active_duration_ns = std::max<std::int64_t>(
-          0, completed_at_ns - active_job_started_at_ns_);
+      const auto active_duration_ns =
+          std::max<std::int64_t>(0, completed_at_ns - active_job_started_at_ns_);
       result.worker_active_duration_ns = active_duration_ns;
       last_job_completed_at_ns_ = completed_at_ns;
       {
         std::lock_guard<std::mutex> status_lock(status_mutex_);
         status_.job_active = false;
         status_.permit_pending = pending_job_.has_value();
-        status_.accepting_clear_permits =
-            accepting_clear_permits_.load(std::memory_order_acquire);
+        status_.accepting_clear_permits = accepting_clear_permits_.load(std::memory_order_acquire);
         status_.active_time_total_ns += active_duration_ns;
-        status_.duty_window_ns = std::max<std::int64_t>(
-            0, completed_at_ns - duty_window_started_at_ns_);
-        status_.duty_cycle_ppm = status_.duty_window_ns > 0
-                                     ? std::min<std::uint64_t>(
-                                           1'000'000,
-                                           static_cast<std::uint64_t>(
-                                               static_cast<long double>(
-                                                   status_.active_time_total_ns) *
-                                               1'000'000.0L /
-                                               static_cast<long double>(
-                                                   status_.duty_window_ns)))
-                                     : 0;
+        status_.duty_window_ns =
+            std::max<std::int64_t>(0, completed_at_ns - duty_window_started_at_ns_);
+        status_.duty_cycle_ppm =
+            status_.duty_window_ns > 0
+                ? std::min<std::uint64_t>(
+                      1'000'000,
+                      static_cast<std::uint64_t>(
+                          static_cast<long double>(status_.active_time_total_ns) * 1'000'000.0L /
+                          static_cast<long double>(status_.duty_window_ns)))
+                : 0;
         if (stale_arm) {
           ++status_.stale_generation_results_total;
         }
@@ -746,19 +742,24 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
       // status snapshot when their callback returns.
       record_result(result);
       try {
-        callback_(this, result);
+        if (!authority_faulted) {
+          callback_(this, result);
+        }
       } catch (...) {
-        // Production result observers emit kernel evidence. Losing that
-        // evidence after authority is a process-integrity failure, matching
-        // the existing kernel event-publisher policy.
-        std::terminate();
+        // Production result observers emit kernel evidence. Losing it after
+        // authority is an internal fault: the host contains the cell.
+        scheduler_->contain_safety_path_fault(
+            "runtime_collision_lookahead_result_observer_exception");
       }
+      std::lock_guard<std::mutex> lock(mutex_);
+      callback_active_ = false;
     }
   }
 }
 
 RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const Job& job) {
   RuntimeCollisionLookaheadResult result;
+  result.job_context_observed = true;
   result.execution_id = job.arm.execution_id;
   result.execution_generation = job.arm.execution_generation;
   result.arm_generation = job.arm.arm_generation;
@@ -766,8 +767,7 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
   result.requested_at_ns = job.requested_at_ns;
   result.start_jitter_ns = std::max<std::int64_t>(0, clock_->now() - job.requested_at_ns);
   const auto absolute_deadline_ns =
-      job.requested_at_ns >
-              std::numeric_limits<std::int64_t>::max() - config_.cycle_budget_ns
+      job.requested_at_ns > std::numeric_limits<std::int64_t>::max() - config_.cycle_budget_ns
           ? std::numeric_limits<std::int64_t>::max()
           : job.requested_at_ns + config_.cycle_budget_ns;
   result.cycle_deadline_ns = absolute_deadline_ns;
@@ -775,11 +775,15 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
     // Complete-cycle latency starts at clear-permit admission. Worker-active
     // time and start jitter are tracked independently for CPU/interference
     // analysis.
-    output.cycle_duration_ns =
-        std::max<std::int64_t>(0, clock_->now() - job.requested_at_ns);
+    output.cycle_duration_ns = std::max<std::int64_t>(0, clock_->now() - job.requested_at_ns);
     return output;
   };
-  const auto deadline_exceeded = [&]() { return clock_->now() >= absolute_deadline_ns; };
+  const auto deadline_exceeded = [&]() {
+    const auto checked_at_ns = clock_->now();
+    result.checked_input_details["lookahead_deadline_checked_at_ns"] =
+        std::to_string(checked_at_ns);
+    return checked_at_ns >= absolute_deadline_ns;
+  };
 
   if (deadline_exceeded()) {
     result.reason = "runtime_lookahead_deadline_exceeded";
@@ -787,11 +791,21 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
   }
 
   const auto& cursor = job.cursor;
+  result.checked_input_details["lookahead_cursor_valid"] = cursor.valid ? "true" : "false";
+  result.checked_input_details["lookahead_cursor_execution_generation"] =
+      std::to_string(cursor.execution_generation);
+  result.checked_input_details["lookahead_cursor_time_ns"] =
+      std::to_string(cursor.trajectory_time_ns);
   if (!cursor.valid || cursor.execution_generation != job.arm.execution_generation) {
     result.reason = !cursor.valid ? "progress_cursor_invalid" : "progress_generation_mismatch";
     return finish(std::move(result));
   }
   const auto now_ns = clock_->now();
+  result.checked_input_details["lookahead_cursor_freshness_checked_at_ns"] = std::to_string(now_ns);
+  result.checked_input_details["lookahead_cursor_received_timestamp_ns"] =
+      std::to_string(cursor.received_timestamp_ns);
+  result.checked_input_details["lookahead_cursor_freshness_budget_ns"] =
+      std::to_string(cursor.freshness_budget_ns);
   if (cursor.freshness_budget_ns > 0 &&
       (cursor.received_timestamp_ns < 0 || cursor.received_timestamp_ns > now_ns ||
        now_ns - cursor.received_timestamp_ns > cursor.freshness_budget_ns)) {
@@ -800,20 +814,42 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
   }
   result.cursor_time_ns = cursor.trajectory_time_ns;
 
+  result.checked_input_details["lookahead_bundle_present"] = job.bundle ? "true" : "false";
+  if (job.bundle) {
+    result.checked_input_details["lookahead_world_present"] = job.bundle->world ? "true" : "false";
+    result.checked_input_details["lookahead_policy_present"] = job.bundle->policy ? "true" : "false";
+    result.checked_input_details["lookahead_policy_index_present"] =
+        job.bundle->policy_index ? "true" : "false";
+    result.checked_input_details["lookahead_lookup_order_valid"] =
+        job.bundle->lookup_order_valid ? "true" : "false";
+    if (job.bundle->world) {
+      result.checked_input_details["collision_world_revision_id"] =
+          std::to_string(job.bundle->world->revision.revision_id);
+      result.checked_input_details["collision_world_content_hash"] =
+          job.bundle->world->revision.content_hash;
+    }
+  }
   if (!job.bundle || !job.bundle->world || !job.bundle->policy || !job.bundle->policy_index ||
       !job.bundle->lookup_order_valid) {
     result.reason = "runtime_lookahead_bundle_invalid";
     return finish(std::move(result));
   }
-  result.runtime_bundle_epoch = job.bundle->epoch;
-  result.collision_world_revision = job.bundle->world->revision;
-  const auto freshness = check_runtime_dynamic_body_freshness(
-      *job.bundle->world, job.bundle->body_freshness, now_ns, config_.dynamic_body_max_age_cap_ns,
-      job.bundle->lookup_order_valid);
-  if (freshness.status != RuntimeDynamicBodyFreshnessStatus::kFresh) {
-    result.reason = runtime_dynamic_body_freshness_reason(freshness.status);
+  result.projection_revision = job.bundle->projection_revision;
+  const auto policy_bundle =
+      job.contact_state.binding_owner ? job.contact_state.binding_owner : job.bundle;
+  result.checked_input_details["lookahead_policy_binding_present"] =
+      policy_bundle ? "true" : "false";
+  if (policy_bundle) {
+    result.checked_input_details["lookahead_bound_policy_present"] =
+        policy_bundle->policy ? "true" : "false";
+    result.checked_input_details["lookahead_bound_policy_index_present"] =
+        policy_bundle->policy_index ? "true" : "false";
+  }
+  if (!policy_bundle || !policy_bundle->policy || !policy_bundle->policy_index) {
+    result.reason = "runtime_lookahead_policy_binding_unavailable";
     return finish(std::move(result));
   }
+  result.collision_world_revision = job.bundle->world->revision;
 
   if (indexed_arm_generation_ != job.arm.arm_generation) {
     std::string index_error;
@@ -824,11 +860,15 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
     }
     indexed_arm_generation_ = job.arm.arm_generation;
   }
+  result.checked_input_details["lookahead_selection_horizon_ns"] = std::to_string(config_.horizon_ns);
+  result.checked_input_details["lookahead_selection_max_samples"] = std::to_string(config_.max_samples);
   select_runtime_collision_lookahead_samples_from_index(
-      *job.arm.trajectory, waypoint_times_scratch_, cursor.trajectory_time_ns,
-      config_.horizon_ns, config_.max_samples, selection_scratch_,
-      required_times_scratch_, target_times_scratch_, sample_scratch_);
+      *job.arm.trajectory, waypoint_times_scratch_, cursor.trajectory_time_ns, config_.horizon_ns,
+      config_.max_samples, selection_scratch_, required_times_scratch_, target_times_scratch_,
+      sample_scratch_);
   auto& selection = selection_scratch_;
+  result.selection_computed =
+      selection.termination != RuntimeCollisionLookaheadTermination::kInvalidInput;
   result.termination = selection.termination;
   result.covered_until_time_ns = selection.covered_until_time_ns;
   result.checked_samples = selection.trajectory.waypoints.size();
@@ -854,8 +894,7 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
     result.reason = "runtime_lookahead_engine_unavailable";
     return finish(std::move(result));
   }
-  const auto prepare_status =
-      engines_.front()->prepare_runtime_snapshot(*job.bundle->world);
+  const auto prepare_status = engines_.front()->prepare_runtime_snapshot(*job.bundle->world);
   if (prepare_status != RuntimeCollisionQueryPrepareStatus::kReady &&
       prepare_status != RuntimeCollisionQueryPrepareStatus::kUnsupported) {
     result.reason = "runtime_lookahead_snapshot_prepare_failed";
@@ -869,20 +908,19 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
   }
 
   CollisionValidationPassConfig pass;
-  pass.policy_snapshot_ref = job.bundle->policy;
-  pass.policy_index = job.bundle->policy_index;
+  pass.policy_snapshot_ref = policy_bundle->policy;
+  pass.policy_index = policy_bundle->policy_index;
   pass.require_pose_source_borrow = false;
   pass.per_state_timeout_ns = config_.query_budget_ns;
   pass.surface = CollisionSurface::kObservedRuntimeLookahead;
   pass.contact_policy_id = job.arm.contact_policy_id;
-  if (!job.arm.contact_policy_id.empty() && !job.bundle->policy->contact_grasps.empty()) {
-    pass.original_trajectory_sample_fractions =
-        selection.original_trajectory_sample_fractions;
+  if (!job.arm.contact_policy_id.empty() && !policy_bundle->policy->contact_grasps.empty()) {
+    pass.original_trajectory_sample_fractions = selection.original_trajectory_sample_fractions;
   }
   pass.enforce_contact_release_trajectory_end = selection.reaches_trajectory_end;
-  if (!job.bundle->policy->support_contacts.empty()) {
+  if (!policy_bundle->policy->support_contacts.empty()) {
     if (!job.contact_state.valid ||
-        job.contact_state.count != job.bundle->policy->support_contacts.size()) {
+        job.contact_state.count != policy_bundle->policy->support_contacts.size()) {
       result.reason = "runtime_contact_state_unavailable";
       return finish(std::move(result));
     }
@@ -894,8 +932,25 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
         result.reason = "runtime_contact_state_identity_invalid";
         return finish(std::move(result));
       }
-      support_state.emplace(*entry.pair, entry.support_state);
-      release_state.emplace(*entry.pair, entry.release_state);
+      auto support = entry.support_state;
+      auto release = entry.release_state;
+      const auto policy = policy_bundle->policy_index->support_contact_index.find(*entry.pair);
+      if (release.initialized && release.started_in_contact &&
+          policy != policy_bundle->policy_index->support_contact_index.end() &&
+          policy->second.mode == CollisionContactPolicyMode::kContactRelease) {
+        // LKA-1: the cursor (controller feedback) can trail the monitor's
+        // latest observation, so the first planned sample may lie before it
+        // in trajectory order. Keep only the motion-start facts; the first
+        // planned sample sets the contact, separation and depth baseline.
+        // The immediate monitor keeps comparing observation with observation.
+        support = SupportContactEvaluationState::kContactActive;
+        release.in_contact = true;
+        release.separated = false;
+        release.previous_depth_m = std::numeric_limits<double>::infinity();
+        release.best_depth_m = release.initial_depth_m.value_or(0.0);
+      }
+      support_state.emplace(*entry.pair, support);
+      release_state.emplace(*entry.pair, release);
     }
     pass.entering_support_contact_state = std::move(support_state);
     pass.entering_contact_release_state = std::move(release_state);
@@ -909,6 +964,7 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
   auto decision = pool_.validate_trajectory(job.bundle->world, engines_, selection.trajectory,
                                             job.cancel, std::move(pass), absolute_deadline_ns);
   const auto telemetry = pool_.last_telemetry();
+  result.validation_completed = true;
   result.workers_used = telemetry.workers_actually_used;
   result.first_failing_waypoint = decision.decision.first_failing_waypoint;
   result.first_failing_time_ns = decision.decision.first_failing_time_ns;
@@ -925,8 +981,7 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
       }
     }
     if (auto violation = contact_policy_violation_details(
-            decision, *job.bundle->policy, "preempt_trajectory",
-            entering_contact_pair_count)) {
+            decision, *policy_bundle->policy, "preempt_trajectory", entering_contact_pair_count)) {
       violation->emplace("surface", "observed_runtime_lookahead");
       for (auto& [key, value] : *violation) {
         result.failure_details[key] = std::move(value);
@@ -940,8 +995,7 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
   if (result.first_failing_waypoint) {
     const auto local_index = *result.first_failing_waypoint;
     if (local_index < 0 ||
-        static_cast<std::size_t>(local_index) >=
-            selection.source_waypoint_indices.size()) {
+        static_cast<std::size_t>(local_index) >= selection.source_waypoint_indices.size()) {
       result.first_failing_waypoint.reset();
     } else {
       const auto source_index =
@@ -958,12 +1012,10 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
       result.reason = "runtime_lookahead_deadline_exceeded";
     } else if (decision.cancellation_reason.has_value()) {
       result.reason = *decision.cancellation_reason;
-    } else if (const auto status =
-                   result.failure_details.find("collision_result_engine_status");
+    } else if (const auto status = result.failure_details.find("collision_result_engine_status");
                status != result.failure_details.end() && status->second == "timeout") {
       result.reason = "runtime_lookahead_query_timeout";
-    } else if (status != result.failure_details.end() &&
-               status->second != "ok") {
+    } else if (status != result.failure_details.end() && status->second != "ok") {
       result.reason = "runtime_lookahead_" + status->second;
     } else {
       result.reason = "runtime_lookahead_inconclusive";
@@ -987,19 +1039,17 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
     result.reason = "runtime_lookahead_deadline_exceeded";
     return finish(std::move(result));
   }
-  if (!latest || latest->epoch != job.bundle->epoch || !latest->world ||
-      !revisions_equal(latest->world->revision, job.bundle->world->revision)) {
+  // A different handle is a newer publication; its world may have moved. A job
+  // on a move's admitted operation-local policy keeps that policy whatever the
+  // published one, so only a newer world supersedes it.
+  const bool superseded =
+      !latest || !latest->world ||
+      (job.bundle->admitted_operation_policy ? latest->world != job.bundle->world
+                                             : latest != job.bundle) ||
+      !revisions_equal(latest->world->revision, job.bundle->world->revision);
+  if (superseded) {
     result.status = RuntimeCollisionLookaheadResultStatus::kSupersededRevision;
     result.reason = "runtime_lookahead_revision_superseded";
-    return finish(std::move(result));
-  }
-  const auto completion_freshness = check_runtime_dynamic_body_freshness(
-      *job.bundle->world, job.bundle->body_freshness, clock_->now(),
-      config_.dynamic_body_max_age_cap_ns, job.bundle->lookup_order_valid);
-  if (completion_freshness.status !=
-      RuntimeDynamicBodyFreshnessStatus::kFresh) {
-    result.reason =
-        runtime_dynamic_body_freshness_reason(completion_freshness.status);
     return finish(std::move(result));
   }
   result.status = RuntimeCollisionLookaheadResultStatus::kClear;
@@ -1011,12 +1061,10 @@ void RuntimeCollisionLookaheadSession::record_result(
     const RuntimeCollisionLookaheadResult& result) {
   std::lock_guard<std::mutex> lock(status_mutex_);
   status_.last_cycle_duration_ns = result.cycle_duration_ns;
-  status_.max_cycle_duration_ns =
-      std::max(status_.max_cycle_duration_ns, result.cycle_duration_ns);
+  status_.max_cycle_duration_ns = std::max(status_.max_cycle_duration_ns, result.cycle_duration_ns);
   status_.last_worker_active_duration_ns = result.worker_active_duration_ns;
   status_.max_worker_active_duration_ns =
-      std::max(status_.max_worker_active_duration_ns,
-               result.worker_active_duration_ns);
+      std::max(status_.max_worker_active_duration_ns, result.worker_active_duration_ns);
   status_.max_start_jitter_ns = std::max(status_.max_start_jitter_ns, result.start_jitter_ns);
   status_.last_cursor_time_ns = result.cursor_time_ns;
   status_.last_covered_until_time_ns = result.covered_until_time_ns;
@@ -1050,14 +1098,13 @@ void RuntimeCollisionLookaheadSession::record_result(
 }
 
 bool RuntimeCollisionLookaheadSession::accept_result_for_current_arm(
-    std::uint64_t execution_id, std::uint64_t execution_generation,
-    std::uint64_t arm_generation, std::uint64_t permit_generation) noexcept {
+    std::uint64_t execution_id, std::uint64_t execution_generation, std::uint64_t arm_generation,
+    std::uint64_t permit_generation) noexcept {
   std::lock_guard<std::mutex> lock(mutex_);
   const bool current = arm_.trajectory != nullptr && arm_.execution_id == execution_id &&
                        arm_.execution_generation == execution_generation &&
                        arm_.arm_generation == arm_generation &&
-                       permit_generation_.load(std::memory_order_acquire) ==
-                           permit_generation &&
+                       permit_generation_.load(std::memory_order_acquire) == permit_generation &&
                        !progress_generation_is_terminal(execution_generation);
   if (!current) {
     std::lock_guard<std::mutex> status_lock(status_mutex_);
@@ -1072,8 +1119,7 @@ bool RuntimeCollisionLookaheadSession::progress_generation_is_terminal(
   // Only a coherent, explicit terminal marker suppresses authority. A
   // transiently unreadable or invalid cursor remains fail-closed and is
   // handled by the normal inconclusive path.
-  return cursor.valid && cursor.terminal &&
-         cursor.execution_generation == execution_generation;
+  return cursor.valid && cursor.terminal && cursor.execution_generation == execution_generation;
 }
 
 RuntimeCollisionLookaheadStatus RuntimeCollisionLookaheadSession::status() const {
@@ -1088,8 +1134,7 @@ RuntimeCollisionLookaheadStatus RuntimeCollisionLookaheadSession::status() const
       clear_permits_invalidated_total_.load(std::memory_order_relaxed);
   snapshot.clear_permit_try_lock_misses_total =
       clear_permit_try_lock_misses_total_.load(std::memory_order_relaxed);
-  snapshot.accepting_clear_permits =
-      accepting_clear_permits_.load(std::memory_order_acquire);
+  snapshot.accepting_clear_permits = accepting_clear_permits_.load(std::memory_order_acquire);
   const auto cursor = progress_publication_->acquire();
   snapshot.cursor_source_kind = execution_progress_source_kind_name(cursor.source_kind);
   snapshot.cursor_authority_profile = std::string(cursor.authority_profile);

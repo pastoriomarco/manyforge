@@ -6,7 +6,6 @@ robot_config:
   robot_id: ur5
   group_id: arm
   urdf_path: package://test.urdf
-  global_max_tcp_linear_speed_mps: 0.25
 adapters:
   planning:
     adapter_id: planning.test
@@ -15,9 +14,6 @@ adapters:
     capability_keys:
       - planning.motion.joint_goal
       - planning.motion.pose_goal
-      - planning.profile.first_feasible
-      - planning.profile.balanced
-      - planning.profile.quality_bounded
       - planning.trajectory.time_parameterized
     config: {}
   context:
@@ -47,8 +43,6 @@ adapters:
       - execution.feedback.phase_events
       - execution.feedback.state_snapshots
       - execution.stop.soft
-      - execution.pause
-      - execution.resume
       - execution.reset
     config: {}
 orchestrator:

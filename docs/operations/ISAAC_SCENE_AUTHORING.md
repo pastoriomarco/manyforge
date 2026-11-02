@@ -1,191 +1,76 @@
-# Authoring a ManyForge scene from an Isaac Sim stage
+# Using an Isaac Sim stage as a ManyForge scene
 
-This is the operator runbook for taking a freshly-authored Isaac Sim
-scene and producing the ManyForge artefacts (program YAML + static
-`.obj` meshes) that drive Composer planning and the native viewer.
-Run it once per scene revision; the resulting OBJ files are static
-inputs to subsequent program loads and should be committed alongside
-the program YAML.
+How to mirror objects from an Isaac Sim stage in a ManyForge Scene, and how to
+stream their poses from Isaac at runtime. The bundled
+`examples/sim_ur10e_pick_and_place.scenario` is a complete example: its Program
+scene uses the OBJ meshes in `examples/isaac_manipulator_scene_light/meshes/`.
 
-For the extractor's wire contract, filename rules, and OBJ format see
-[`../../exts/manyforge.isaac.collider_service/README.md`](../../exts/manyforge.isaac.collider_service/README.md).
+ManyForge does not include a tool that exports meshes from Isaac Sim. Export
+each object's mesh from your stage with your own tools, then reference the
+files from the Program scene as below.
 
-## Prerequisites
+## 1. Place the mesh files
 
-- Isaac Sim with ROS 2 Python support enabled.
-- The `manyforge.isaac.collider_service` extension enabled — see the
-  extension's README "Install" section. Confirm with
-  `ros2 service list | grep manyforge`.
-- A ManyForge checkout on the same network (or the same host) as Isaac.
-- `ros2` reachable from the ManyForge host (either via a native ROS
-  install or the `manyforge-ros-jazzy-full` Docker image).
+Put the mesh files inside the Scenario project (for example under its
+`assets/` folder) or in another folder Composer can read: the repository
+`examples/` tree or a configured project folder (see
+[`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md#project-folders)).
+Supported formats are `.obj`, `.stl`, `.ply`, `.glb` and `.gltf`. For a
+planning scene, prefer simple collider geometry over detailed visual meshes:
+collision-check cost grows with triangle count.
 
-Throughout this runbook the placeholder `${MANYFORGE_REPO_ROOT}` refers
-to your checkout (for example `${HOME}/workspaces/dev_ws/src/manyforge`), and
-`${SCENE_NAME}` is whatever short identifier you're giving the new
-scene (e.g. `isaac_manipulator_scene_light`).
+## 2. Add the objects to the Program scene
 
-## 1. Confirm the extension sees your scene
+In Composer's Scene workspace, add a mesh object per Isaac object and set its
+mesh path, scale and pose. Take the pose from the Isaac stage (position in
+metres, orientation as roll/pitch/yaw in degrees) in the frame the Scene uses.
+In `program.yaml` an object looks like this (from the bundled example):
 
-With Isaac Sim running and your scene loaded, ask the extension for an
-inventory:
+```json
+{
+  "scene_resource_id": "isaac_cheese_box",
+  "pose": {
+    "frame_ref": {"kind": "cell_frame"},
+    "position_m": [-0.455038, 0.076595, 0.087827],
+    "orientation": {"rpy_deg": [92.340746, -1.76826, -90.093258]}
+  },
+  "shape": {
+    "type": "mesh",
+    "mesh_resource_uri": "examples/isaac_manipulator_scene_light/meshes/mac_n_cheese_centered_collider_cooked.obj",
+    "mesh_scale": [1.0, 1.0, 1.0]
+  }
+}
+```
+
+## 3. Check the scene in Composer
+
+Start Isaac Sim yourself and open the stage with its ROS 2 bridge; the
+workbench reaches it over DDS
+([ROS and DDS](DEVELOPMENT_WORKBENCH.md#ros-and-dds)) and does not start it.
+From the ManyForge repository root, start the workbench (see
+[`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md)):
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-ros2 service call /manyforge/isaac_collider_report std_srvs/srv/Trigger '{}'
+./scripts/compose-dev.sh start
 ```
 
-The response is a JSON string. Spot-check that the objects you expect
-appear under `objects[].source_root`. If an object is missing:
+Open `http://localhost:3000`, then use **Load Scenario** for the Scenario that
+binds this Program and Deployment. Confirm:
 
-- Check it actually has a collider authored in Isaac (the extension is
-  collider-driven; visual-only meshes without a `MeshCollisionAPI` are
-  skipped by default).
-- Use a parameterised query (see the extension README "CLI Examples"
-  section) with `include_hidden: true` and a wider `include_subtrees`
-  if you've hidden the prim or it lives outside `/World`.
-- Check the extension logs in Isaac Sim's Kit window for stage-walk
-  errors.
+1. **The viewer renders each mesh** at the Isaac pose. A mesh that cannot be
+   shown is marked with its status (`missing`, `parse_failed`,
+   `unsupported_format`, `outside_allowed_roots`, …).
+1. **A test plan succeeds** through the loaded scene: planning reads the same
+   mesh files, so a successful plan confirms the geometry reaches the planner.
 
-Do **not** proceed if the inventory is incomplete; the meshes you
-don't see here are the meshes that will be missing from your program.
-
-## 2. Decide which mesh source you want per object
-
-The extractor can produce up to four variants per object — visual mesh,
-collider mesh, cooked convex collider, primitive collider — and the
-`mesh_source_preference` request field picks between them:
-
-- `auto` — visual when available, falling back to collider/cooked/primitive.
-- `collider` — prefer cheap collider-derived geometry; this is usually
-  the right choice for a planning scene because RoboPlan's collision
-  cost scales with triangle count.
-- `original` — prefer the authored visual mesh; pick this only when
-  visual fidelity matters more than planner cost.
-- `primitive` — force AABB/primitive recommendations and skip mesh
-  transfer entirely.
-
-If a collision body falls back to a conservative AABB proxy because mesh-like
-geometry cannot be preserved or loaded, treat it as degraded collision geometry:
-diagnostics should carry `conservative_proxy` and
-`warning_conservative_aabb_proxy`, and you should inspect the collision overlay
-before tuning poses around a reported contact.
-
-For the current Isaac demo scenes we use `collider` per-object and
-accept the fidelity trade-off. The decision is the operator's; the
-file-naming convention in step 4 reflects what you pick (`*_collider.obj`
-vs `*_visual.obj` etc.).
-
-## 3. Pull mesh files onto the ManyForge host
-
-The transfer client lives in `manyforge_ros`. From the ManyForge host
-(either natively or in the ROS Docker image), run one transfer per
-object you want to materialise. The `mesh_export_dir` argument is a
-directory on the **Isaac host** where the extractor writes the OBJ;
-the client then chunked-transfers the bytes back and reassembles them
-into `--output-dir` on the **ManyForge host**.
-
-Example, importing one object's collider variant into a program-local
-mesh folder:
-
-```bash
-mkdir -p ${MANYFORGE_REPO_ROOT}/examples/${SCENE_NAME}/meshes
-
-docker run --rm --network host \
-  -v ${MANYFORGE_REPO_ROOT}:/workspace \
-  -w /workspace manyforge-ros-jazzy-full \
-  bash -lc 'source /opt/ros/jazzy/setup.bash;
-    export PYTHONPATH=/workspace:/workspace/manyforge_ros:${PYTHONPATH};
-    python3 -m manyforge_ros.isaac_mesh_transfer \
-      --timeout 90 \
-      --include-hidden \
-      --purpose all \
-      --source-root /World/<object_prim_path> \
-      --mesh-source-preference collider \
-      --mesh-export-dir /tmp/manyforge-isaac-meshes \
-      --output-dir /workspace/examples/'${SCENE_NAME}'/meshes'
-```
-
-Repeat per object. The client verifies the full-file sha256 from the
-chunked transfer header before writing the file out, so a partial or
-corrupted transfer fails the client and leaves no garbage on disk.
-
-If you already have a known local URI (because Isaac already wrote the
-OBJ in a previous run), you can use `--mesh-resource-uri` instead of
-`--source-root` to skip the export step.
-
-## 4. Place files in the program directory
-
-Convention: program-local meshes live at
-`${MANYFORGE_REPO_ROOT}/examples/${SCENE_NAME}/meshes/`. The extractor
-names them `<object_id_hint>_<variant>.obj` (for example
-`mac_n_cheese_centered_collider_cooked.obj`). Keep the filenames as
-shipped — the program YAML references them by path.
-
-Commit these files. They are deterministic outputs of the pipeline
-against a known scene revision; they should travel with the program
-YAML so that operators on other hosts can load the scene without
-re-running the extractor.
-
-## 5. Write or update the program YAML
-
-The program YAML's `scene` block references each mesh by local path.
-Repo-root relative paths such as `examples/${SCENE_NAME}/meshes/...`
-match the committed examples; paths relative to the program file's
-directory are also accepted. The pose and `mesh_scale` come from the
-inventory response — if you skip those, the mesh ends up in the wrong
-place. Example shape:
-
-```yaml
-scene:
-- object_id: isaac_cheese_box
-  shape:
-    type: mesh
-    mesh_resource_uri: examples/${SCENE_NAME}/meshes/mac_n_cheese_centered_collider_cooked.obj
-    mesh_scale:
-    - 1.0
-    - 1.0
-    - 1.0
-  pose:
-    frame_id: universe
-    position_m: [-0.455038, 0.076595, 0.087827]
-    orientation_rpy_deg: [92.340746, -1.76826, -90.093258]
-```
-
-Cross-check the `position_m` and `orientation_rpy_deg` against the
-inventory response — they're the pose the extractor returned, not a
-guess. The path is relative to the program YAML's directory.
-
-## 6. Smoke-test the load through Composer
-
-From the ManyForge host:
-
-```bash
-cd ${MANYFORGE_REPO_ROOT}
-./scripts/launch.sh   # interactive wizard; pick the isaac-sim lane
-```
-
-Once Composer is up, load your program (`POST /api/program/load` or
-through the UI). Confirm three things:
-
-1. **`/api/scene/state` reports each object** with the right pose and
-   non-error `mesh_asset_status`.
-1. **The native viewer renders the actual collider shape** — table,
-   crates, cheese box — not orange wireframe placeholders. If you see
-   placeholders, the visualization plan's error-marker tooltip will
-   tell you which status the asset is in (`missing`,
-   `parse_failed`, `unsupported_format`, etc.).
-1. **A test plan succeeds** through the loaded scene — the planning
-   context is reading the same OBJ files, so a successful plan
-   confirms the geometry is reaching RoboPlan as well as the viewer.
-
-## 7. Optional: stream object poses from Isaac
+## 4. Optional: stream object poses from Isaac
 
 Static OBJ files define object shape. Object pose can also be observed
-from Isaac at runtime through deployment `pose_sources`. In Composer,
-open **Deployment > Object Pose Sources** to edit the source, entity
-binding, and apply policy. The Isaac demo source uses
-`kind: simulation_interfaces`, `service_prefix: auto`, `frame_id: universe`, and a bounded `max_update_hz` such as `4.0`.
+from Isaac at runtime through a pose-source component of the Deployment. In
+Composer, each object's **Object pose source** card selects the apply policy
+for its source/object binding through normal Draft, Save and Apply. The Isaac
+pose source in `examples/sim_ur10e_pick_and_place.scenario` polls the simulator
+every 250 ms (`simulation.poll_period_ms`) in frame `universe`.
 
 For camera/perception scenes such as the Lite6 trocar FoundationPose workflow,
 also configure each Isaac Sim `ROS2CameraHelper` publisher with bounded
@@ -200,95 +85,78 @@ Use a conservative `frameSkipCount` while commissioning over a shared LAN. See
 [`ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md`](ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md)
 for the full multi-machine DDS/QoS/perception runbook.
 
-Pick the apply policy per object:
+Pick the apply policy per object (the object's
+`policies.scene_pose_sources` row in the Deployment):
 
 - `observe_only` shows freshness and observed pose without changing
   ManyForge's planning scene.
-- `when_idle` updates only while no cycle or direct-control session is
-  active.
-- `before_planning` latches the latest fresh pose just before planning
-  an object-relative motion.
-- `between_nodes` applies only at behavior-tree safe points.
+- `before_planning` latches fresh configured detached poses at the planning
+  boundary. Missing required observations block planning.
+- `between_nodes` latches objects referenced by the next motion or pick;
+  reset readiness latches the full configured set. It may also revise an
+  attached object's offset. These captures require fresh observations and
+  then retain a planning snapshot without continuous source expiry.
 - `continuous` applies fresh observations immediately at the configured
-  source rate. If the object is attached, Composer updates the object's
+  source rate. If the object is attached, the Scene owner updates the object's
   offset in the attachment frame instead of detaching it with a
   world-frame overwrite.
 - `continuous_unattached` applies fresh observations at the configured
   source rate only while the object is detached. Once attached, the
   planning-scene object stays at the canonical attachment offset while
   the external observation remains available for ghost/drift diagnostics.
+- `continuous_relative_to_attached` behaves like `continuous_unattached`
+  while the object is detached. While it is attached, the source must also
+  report the object relative to a gripper reference measured at the same
+  source instant (`simulation.relative_reference` on the pose-source
+  component: the reference `entity`, its `source_header_frame_id`, and the
+  model `link` it shows). The Scene owner sets the attachment offset from that relative
+  pose and the fixed model transform from the link to the carrier frame; no
+  commanded or measured robot pose is used. The Isaac observer reads both
+  in the same simulator read; an observation that is not from one
+  instant, or a link that is not joined to the carrier frame by fixed joints
+  only, is refused and does not update the offset.
 
 For industrial cells, keep `observe_only` as the default while
 commissioning a source, then move individual objects to `before_planning`,
-`between_nodes`, `continuous`, or `continuous_unattached` only when that
+`between_nodes`, `continuous`, `continuous_unattached`, or
+`continuous_relative_to_attached` only when that
 source is part of the cell authority model and its stale-data behavior is
 understood.
 
-For diagnostics, open **Tools > Sources** in the native viewer and enable
-**Measured-state ghosts**. It renders fresh external object observations as
-a cyan translucent overlay so you can compare Isaac/perception state with
-Composer's backend-authoritative planning scene. Enable **Robot collision
-meshes** in the same panel to overlay the URDF collision geometry used by
-trajectory validation. These overlays are viewer-only; they do not modify
+The primary viewer always uses the authoritative Scene, including while
+objects are detached. For diagnostics, enable **Measured state ghosts** in the
+viewer. It renders fresh external object observations as a translucent overlay
+so you can compare Isaac/perception state with Composer's backend-authoritative
+planning scene. Enable **Collision geometry** to show the collision shapes used
+by trajectory validation. These overlays are viewer-only; they do not modify
 object poses or collision validation.
 
-## 8. Qualify visual-state responsiveness during a live cycle
-
-The native viewer should read Composer's published visual-state snapshot, not
-the mutable planning scene. While Isaac and Composer are running, use the live
-probe to record whether `/api/scene/state` stays on the snapshot path during
-the pick/place cycle:
-
-```bash
-cd ${MANYFORGE_REPO_ROOT}
-
-docker compose run --rm --network host dev bash -lc '
-  python scripts/qualify-visual-state-live.py \
-    --base-url http://127.0.0.1:9000 \
-    --duration-s 90 \
-    --hz 10 \
-    --max-p95-ms 100 \
-    --samples-jsonl /tmp/manyforge-visual-state-samples.jsonl \
-    --summary-json /tmp/manyforge-visual-state-summary.json'
-```
-
-Run the probe while the browser or a scenario harness drives the program. It is
-read-only; it does not start, stop, reset, or otherwise mutate the cell state.
-
-Acceptance for the current migration:
-
-1. `mode` is `visual_snapshot` for steady-state samples. A short
-   `visual_snapshot_pending` window is acceptable immediately after reload or
-   reset. `legacy_live` is no longer an accepted scene-state route mode.
-1. p95 `/api/scene/state` latency remains under the configured budget while
-   planning, validation, gripper motion, and pose-source polling are active.
-1. `snapshot_publisher_error` remains empty and the stale ratio stays within
-   the configured budget.
-1. Object and gripper counts remain plausible for the loaded scene, so a fast
-   route is not hiding missing observer data.
-
-If the probe fails, keep the JSONL samples and Composer logs. The samples show
-exactly when the viewer fell back, went stale, or exceeded the latency budget.
+With an outside measured robot source (the pose observer's measured robot),
+the ghost uses that source for the robot's joints, mapped to the arm through
+the component index. Other robots and tools use their own joint or position
+streams. A static fixture or any other element without a stream gets no
+ghost. If data needed to place an element has not arrived yet, that element is
+hidden rather than drawn at a neutral pose as if measured; unrelated elements
+continue to render. The Scene panel shows one line per component, for example
+"Parts of lite_gripper are hidden in the measured overlay until their joint
+state arrives." With no live robot position at all it shows "Measured robot
+overlay requires execution."
 
 ## Troubleshooting
 
-Scene-authoring-specific cases below. For cross-cutting failures
-(collision rejection, kernel interrupts, ros2_control discovery)
-see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
+Scene-specific cases below. For cross-cutting failures (collision rejection,
+controller discovery) see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
-| Symptom                                                      | Likely cause                                                                                    | Fix                                                                                                                               |
-| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| Inventory response missing an object                         | Object has no collider, or it's hidden and you didn't pass `include_hidden`.                    | Author a collider in Isaac, or re-run with the right include flags.                                                               |
-| Transfer client fails with `sha256 mismatch`                 | Network instability during the chunked transfer.                                                | Re-run the same command. `request_id` deduplication on the extension side handles overlapping retries safely.                     |
-| OBJ file present but Composer shows a `missing` marker       | Path mismatch between the program YAML's `mesh_resource_uri` and where the file actually lives. | Check both — repo-root relative paths such as `examples/...`, program-directory relative paths, and `file://` paths are accepted. |
-| OBJ file present, Composer shows `parse_failed`              | OBJ is malformed (very rare from this extractor).                                               | Re-extract from Isaac. If it keeps happening, file a bug — the extractor contract guarantees parseable output.                    |
-| Composer shows `outside_allowed_roots`                       | The `mesh_resource_uri` resolves outside the deployment / program / model allowlist.            | Move the OBJ inside an allowed root (the program directory is always allowed).                                                    |
-| Planner fails on the loaded scene but the viewer looks right | RoboPlan's collision tolerance flagged the geometry (zero-area triangle, self-intersection).    | Inspect the OBJ in MeshLab/Blender; clean the source mesh in Isaac and re-extract.                                                |
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Mesh file present but Composer shows `missing` | Path mismatch between `mesh_resource_uri` and the file location. | Check the path; repository-relative paths such as `examples/...` and paths inside the Scenario project are accepted. |
+| Composer shows `parse_failed` | The mesh file is malformed. | Re-export it and check it in a mesh viewer. |
+| Composer shows `unsupported_format` | The file type is not supported (for example `.dae`). | Convert it to `.obj`, `.stl`, `.ply`, `.glb` or `.gltf`. |
+| Composer shows `outside_allowed_roots` | The `mesh_resource_uri` resolves outside the folders Composer can read. | Move the file into the Scenario project, `examples/`, or a configured project folder. |
+| Planner fails on the loaded scene but the viewer looks right | Degenerate geometry (zero-area triangles, self-intersection) or a genuine collision. | Inspect and clean the mesh, then re-export. |
 
 ## See also
 
-- [`../../exts/manyforge.isaac.collider_service/README.md`](../../exts/manyforge.isaac.collider_service/README.md)
-  — extension install, ROS contract, JSON schemas, filename rules, and
-  OBJ format contract.
-- [`STACK_SETUP.md`](STACK_SETUP.md)
-  — Isaac / ROS 2 controller execution bring-up.
+- [`ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md`](ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md)
+  — multi-machine Isaac + perception runbook.
+- [`STACK_SETUP.md`](STACK_SETUP.md) — lanes and setup overview.

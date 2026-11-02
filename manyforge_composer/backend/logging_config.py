@@ -79,3 +79,5 @@ def setup_logging(level: str = "INFO") -> None:
     root.addHandler(handler)
     # Quiet noisy libraries
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)

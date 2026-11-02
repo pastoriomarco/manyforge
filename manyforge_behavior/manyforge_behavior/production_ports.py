@@ -1,0 +1,7510 @@
+"""Production client ports from bounded Program orchestration to native owners.
+
+This module translates already-validated Program node inputs into the public
+headless request vocabulary. It owns no planning, frame resolution, scene
+truth, gripper state, or Stop semantics; those remain in the native owners.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+import logging
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
+from hashlib import sha256
+from heapq import heapify, heappop, heappush
+import json
+import math
+from threading import RLock
+import time
+from typing import Any, Callable, Final, Protocol
+
+from manyforge_behavior.geometry import (
+    normalize_quat,
+    rpy_deg_to_xyzw,
+)
+from manyforge_behavior.failure_details import (
+    bounded_failure_details,
+    exception_failure_details,
+)
+from manyforge_behavior.kernel_client import (
+    EXECUTION_TRANSPORT_FAILURE_CODES,
+    ActionSpan,
+    ExecutionState,
+    KernelClient,
+    KernelClientResponseError,
+    KernelOperationAdmissionRejectedError,
+    KernelImmediateStepFailedError,
+    KernelOperationObservationUnavailableError,
+    KernelOperationSettlementPendingError,
+)
+from manyforge_behavior.program import INTERRUPT_MOTION_NODE_IDS as _INTERRUPT_MOTION_NODE_IDS
+from manyforge_behavior.program import MOTION_NODE_IDS as _MOTION_NODE_IDS
+from manyforge_behavior.program import (
+    CHANGED_OUTSIDE_SUFFIX,
+    ProgramValidationError,
+    motion_tcp_selection,
+)
+from manyforge_behavior.orchestration_ports import (
+    FAILED_EXECUTION_STATES as _FAILED_STATES,
+    INTERRUPTED_EXECUTION_STATES as _INTERRUPTED_STATES,
+    PROGRAM_MOTION_STOP_RECOVERY_CLASS,
+    recovery_outcome,
+    request_identity as _request_identity,
+    FrameTransformError,
+    FrameTransformResult,
+    MockSimulationRefusedError,
+    NodeAttemptIdentity,
+    OwnerInvocationResult,
+    OwnerInvocationPendingError,
+    OwnerInvocationHeldError,
+    OwnerInvocationRefusedByPriorityError,
+    OwnerNodeInputs,
+    OwnerTaskObservationUnavailableError,
+    OwnerTaskSettlementPendingError,
+    OwnerTaskSnapshot,
+    OwnerTaskState,
+    PoseSourceLatchError,
+    ProgramRunPortContext,
+    ProgramRunScopeSnapshot,
+    ProgramRunScopeState,
+    describe_owner_failure,
+)
+from manyforge_behavior.recovery import OWNER_RECOVERY_ACTIONS
+from manyforge_behavior.scene_client import (
+    SceneClient,
+    SceneOutcomeUnknownError,
+    SceneTransactionRejectedError,
+)
+
+
+_ACTIVE_STATES: Final = frozenset(
+    {
+        ExecutionState.QUEUED.value,
+        ExecutionState.RESOLVING.value,
+        ExecutionState.PLANNING.value,
+        ExecutionState.VALIDATING.value,
+        ExecutionState.PREPARED.value,
+        ExecutionState.DISPATCHING.value,
+        ExecutionState.EXECUTING.value,
+        ExecutionState.STOPPING.value,
+    }
+)
+def _held_selection_revision(error: KernelOperationAdmissionRejectedError) -> int | None:
+    if error.details.get("reason") not in {
+        "program_run_stop_fence_active",
+        "program_node_stop_fence_active",
+    }:
+        return None
+    revision = error.details.get("selection_revision")
+    return int(revision) if isinstance(revision, str) and revision.isdecimal() else 0
+
+
+_MAX_CONTEXTS: Final = 4_096
+_MAX_TASKS: Final = 65_536
+_GRASP_LOST_RESPONSE_DEFAULTS: Final = {
+    "raise_alarm": True,
+    "stop_motion": True,
+    "set_key": None,
+    "detach": True,
+}
+_MAX_PENDING_SIMULATION_RESETS: Final = 4_096
+_SCENE_INITIALIZATION_SETTLEMENT_TIMEOUT_S: Final = 2.0
+_SCENE_INITIALIZATION_SETTLEMENT_POLL_S: Final = 0.01
+_PROGRAM_RESET_SETTLEMENT_TIMEOUT_S: Final = 5.0
+_PROGRAM_RESET_SETTLEMENT_POLL_S: Final = 0.01
+
+
+def _grasp_lost_response(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture the attach node's literal response with its documented defaults."""
+
+    if "on_grasp_lost" not in parameters:
+        return dict(_GRASP_LOST_RESPONSE_DEFAULTS)
+    raw = parameters["on_grasp_lost"]
+    if not isinstance(raw, Mapping):
+        raise ProductionPortError("on_grasp_lost must be an object")
+    unknown = [
+        key
+        for key in raw
+        if type(key) is not str or key not in _GRASP_LOST_RESPONSE_DEFAULTS
+    ]
+    if unknown:
+        raise ProductionPortError(
+            f"on_grasp_lost has unknown fields: {unknown!r}"
+        )
+    response = {**_GRASP_LOST_RESPONSE_DEFAULTS, **raw}
+    for field_name in ("raise_alarm", "stop_motion", "detach"):
+        if type(response[field_name]) is not bool:
+            raise ProductionPortError(f"on_grasp_lost.{field_name} must be a boolean")
+    if response["set_key"] is not None:
+        response["set_key"] = _text(
+            response["set_key"], field="on_grasp_lost.set_key"
+        )
+    if response["raise_alarm"] and not response["stop_motion"]:
+        raise ProductionPortError(
+            "on_grasp_lost.stop_motion must be true when raise_alarm is true"
+        )
+    return response
+
+
+_AUTHORED_SCENE_OPERATIONS: Final = frozenset(
+    {
+        "add_object",
+        "upsert_object",
+        "remove_object",
+        "update_object_pose",
+        "set_collision_policy",
+    }
+)
+_SCENE_RUNTIME_COMMAND_VERSION: Final = "manyforge.manager_command.v1"
+_SCENE_RUNTIME_RESPONSE_VERSION: Final = "manyforge.manager_command_response.v1"
+_SCENE_RUNTIME_IDENTITY_FIELDS: Final = frozenset(
+    {
+        "retained_bundle_id",
+        "graph_revision",
+        "deployment_generation",
+        "program_generation",
+        "runtime_generation",
+    }
+)
+_SCENE_PROJECTION_REVISION_FIELDS: Final = frozenset(
+    {"retained_bundle_id", "graph_revision", "scene_revision"}
+)
+_SCENE_REVISION_FIELDS: Final = frozenset(
+    {"scene_id", "revision_id", "content_hash"}
+)
+_SCENE_RUNTIME_LATCH_RESPONSE_FIELDS: Final = frozenset(
+    {
+        "already_applied_observation_count",
+        "api_version",
+        "committed_observation_count",
+        "initial_projection_revision",
+        "latched_observation_count",
+        "ok",
+        "projection_revision",
+        "runtime_identity",
+        "scene_runtime_source_generation",
+        "skipped_attached_observation_count",
+    }
+)
+
+
+def _scene_runtime_identity_value(value: object, *, field: str) -> dict[str, Any]:
+    record = _mapping(value, field=field)
+    if set(record) != _SCENE_RUNTIME_IDENTITY_FIELDS:
+        raise ProductionPortError(f"{field} has an unknown or missing field")
+    identity = {
+        "retained_bundle_id": _text(
+            record.get("retained_bundle_id"), field=f"{field}.retained_bundle_id"
+        ),
+        "graph_revision": _text(
+            record.get("graph_revision"), field=f"{field}.graph_revision"
+        ),
+    }
+    for name in ("deployment_generation", "program_generation", "runtime_generation"):
+        value = record.get(name)
+        minimum = 1 if name == "runtime_generation" else 0
+        if type(value) is not int or not minimum <= value <= 9_007_199_254_740_991:
+            raise ProductionPortError(f"{field}.{name} is not an exact safe integer")
+        identity[name] = value
+    return identity
+
+
+def _scene_projection_revision_value(value: object, *, field: str) -> dict[str, Any]:
+    record = _mapping(value, field=field)
+    if set(record) != _SCENE_PROJECTION_REVISION_FIELDS:
+        raise ProductionPortError(f"{field} has an unknown or missing field")
+    scene = _mapping(record.get("scene_revision"), field=f"{field}.scene_revision")
+    if set(scene) != _SCENE_REVISION_FIELDS:
+        raise ProductionPortError(f"{field}.scene_revision has an unknown or missing field")
+    scene_revision_id = scene.get("revision_id")
+    if (
+        type(scene_revision_id) is not int
+        or not 1 <= scene_revision_id <= 9_007_199_254_740_991
+    ):
+        raise ProductionPortError(f"{field}.scene_revision.revision_id is invalid")
+    return {
+        "retained_bundle_id": _text(
+            record.get("retained_bundle_id"), field=f"{field}.retained_bundle_id"
+        ),
+        "graph_revision": _text(
+            record.get("graph_revision"), field=f"{field}.graph_revision"
+        ),
+        "scene_revision": {
+            "scene_id": _text(scene.get("scene_id"), field=f"{field}.scene_revision.scene_id"),
+            "revision_id": scene_revision_id,
+            "content_hash": _text(
+                scene.get("content_hash"), field=f"{field}.scene_revision.content_hash"
+            ),
+        },
+    }
+
+
+def _projection_same_or_forward(candidate: object, floor: Mapping[str, Any]) -> bool:
+    """Whether ``candidate`` is ``floor`` or a newer revision of its Scene."""
+    try:
+        current = _scene_projection_revision_value(candidate, field="projection revision")
+    except ProductionPortError:
+        return False
+    current_scene = current["scene_revision"]
+    floor_scene = floor["scene_revision"]
+    return (
+        current["retained_bundle_id"] == floor["retained_bundle_id"]
+        and current["graph_revision"] == floor["graph_revision"]
+        and current_scene["scene_id"] == floor_scene["scene_id"]
+        and current_scene["revision_id"] >= floor_scene["revision_id"]
+        and (
+            current_scene["revision_id"] != floor_scene["revision_id"]
+            or current_scene["content_hash"] == floor_scene["content_hash"]
+        )
+    )
+
+
+class ProductionPortError(RuntimeError):
+    """A captured client context or native owner projection is inconsistent."""
+
+
+def _mapping(value: object, *, field: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ProductionPortError(f"{field} must be a mapping")
+    return value
+
+
+def _text(value: object, *, field: str, maximum_bytes: int = 512) -> str:
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > maximum_bytes:
+        raise ProductionPortError(f"{field} must be bounded non-empty text")
+    return value
+
+
+def _number(value: object, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProductionPortError(f"{field} must be numeric")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ProductionPortError(f"{field} must be finite")
+    return result
+
+
+def _owner_failure_message(exc: BaseException) -> str:
+    """Return a bounded failure message that names the owner's structured cause.
+
+    Owner rejections carry the precise cause in ``error.details.reason`` and a
+    failed reference in ``reference_type``/``reference_id``; the human message
+    alone is often generic (for example "addressed observed state is
+    unavailable"), so it names both once. The same bounded details travel
+    separately (`exception_failure_details`).
+    """
+
+    message = str(exc) or type(exc).__name__
+    return describe_owner_failure(message, exception_failure_details(exc))[:1024]
+
+
+_PREEMPTION_KINDS: Final = frozenset({"preempted", "superseded_unsent"})
+_SUCCESSOR_FIELDS: Final = ("operation_id", "node_instance_id", "node_attempt_id")
+
+
+def _preemption_fact(value: object) -> dict[str, Any]:
+    """The Kernel's logical preemption of this operation (DX-1168), exactly."""
+    by = value.get("by") if isinstance(value, Mapping) else None
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"kind", "by"}
+        or value["kind"] not in _PREEMPTION_KINDS
+        or not isinstance(by, Mapping)
+        or set(by) != set(_SUCCESSOR_FIELDS)
+        or any(not isinstance(by[key], str) or not by[key] for key in _SUCCESSOR_FIELDS)
+    ):
+        raise ProductionPortError("native operation preemption fact is invalid")
+    return {"kind": value["kind"], "by": {key: by[key] for key in _SUCCESSOR_FIELDS}}
+
+
+_TAKEOVER_PATHS: Final = frozenset(
+    {"moving_replacement", "spring_back_hold", "ordinary_containment"}
+)
+_TAKEOVER_FIELDS: Final = frozenset({
+    "incumbent_operation_id", "path", "cause", "decided_at_ns",
+    "elapsed_since_acceptance_ns", "preparation_budget_ns", "planning_budget_ns",
+    "stop_certificate",
+})
+
+
+_INT64_MAX = 2**63 - 1  # The Kernel encodes these ns fields as int64.
+
+
+def _motion_takeover_fact(value: object) -> dict[str, Any] | None:
+    """The Kernel's takeover decision on this newcomer operation, exactly;
+    None (logged) when malformed. Observability only: never an outcome."""
+
+    cause = value.get("cause") if isinstance(value, Mapping) else None
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _TAKEOVER_FIELDS
+        or not isinstance(value["incumbent_operation_id"], str)
+        or not value["incumbent_operation_id"]
+        or not isinstance(value["path"], str)
+        or value["path"] not in _TAKEOVER_PATHS
+        or type(value["decided_at_ns"]) is not int
+        or not 0 <= value["decided_at_ns"] <= _INT64_MAX
+        or type(value["elapsed_since_acceptance_ns"]) is not int
+        or not 0 <= value["elapsed_since_acceptance_ns"] <= _INT64_MAX
+        or type(value["preparation_budget_ns"]) is not int
+        or not 0 < value["preparation_budget_ns"] <= _INT64_MAX
+        or type(value["planning_budget_ns"]) is not int
+        or not 0 <= value["planning_budget_ns"] <= _INT64_MAX
+        or not (cause is None or (
+            isinstance(cause, Mapping)
+            and isinstance(cause.get("code"), str)
+            and bool(cause["code"])
+            and isinstance(cause.get("message"), str)
+            and bool(cause["message"])
+        ))
+        or not (value["stop_certificate"] is None or isinstance(value["stop_certificate"], Mapping))
+    ):
+        _LOGGER.warning("native operation motion_takeover fact is invalid; ignored")
+        return None
+    return deepcopy(dict(value))
+
+
+def _operation_failure_fact(
+    envelope: Mapping[str, Any],
+    operation: Mapping[str, Any],
+    reason_code: str,
+    message: str,
+) -> dict[str, Any] | None:
+    """The failed operation's own Kernel facts, for the operator-facing run
+    record (`operation_failures`); None when the facts are incomplete."""
+    epoch = envelope.get("owner_epoch")
+    revision = operation.get("operation_revision")
+    participants = operation.get("participants")
+    if (
+        not isinstance(epoch, str)
+        or not epoch
+        or type(revision) is not int
+        or revision < 1
+        or not isinstance(participants, list)
+    ):
+        return None
+    resources: set[str] = set()
+    facts: list[dict[str, str]] = []
+    for participant in participants:
+        if not isinstance(participant, Mapping):
+            return None
+        for resource in participant.get("resources") or ():
+            if isinstance(resource, str) and resource:
+                resources.add(resource)
+        fact = participant.get("terminal_fact")
+        if isinstance(fact, Mapping) and participant.get("state") != (
+            ExecutionState.COMPLETED.value
+        ):
+            kind, effect = fact.get("kind"), fact.get("effect")
+            if isinstance(kind, str) and kind and isinstance(effect, str) and effect:
+                facts.append({"kind": kind, "effect": effect})
+    if not resources:
+        return None
+    return {
+        "operation": {
+            "source_owner_epoch": epoch,
+            "operation_id": operation.get("operation_id"),
+            "operation_revision": revision,
+        },
+        "resource_ids": sorted(resources),
+        "failure": {"code": reason_code, "message": message[:4096]},
+        "terminal_facts": facts,
+    }
+
+
+def _require_participant_binding(participant: Mapping[str, Any]) -> None:
+    """Strictly read one operation participant's binding identity: its
+    controller's paired control binding (SX-2119)."""
+
+    def text(name: str) -> bool:
+        value = participant.get(name)
+        return isinstance(value, str) and bool(value)
+
+    if ("control_binding_id" in participant or "control_binding_revision" in participant) and not (
+        text("control_binding_id") and text("control_binding_revision")
+    ):
+        raise ProductionPortError("participant control binding identity is not paired")
+
+
+def _sequence(value: object, *, field: str, length: int | None = None) -> Sequence[Any]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ProductionPortError(f"{field} must be a sequence")
+    if length is not None and len(value) != length:
+        raise ProductionPortError(f"{field} must contain {length} values")
+    return value
+
+
+def _base_framed_pose3(
+    value: object,
+    *,
+    field: str,
+    target_role_id: str,
+    base_frame_role_id: str,
+) -> dict[str, Any]:
+    """A wire pose that must be stated in the moving robot's base frame."""
+
+    if not _is_base_frame(
+        _mapping(value, field=field).get("frame_ref"),
+        field=f"{field}.frame_ref",
+        target_role_id=target_role_id,
+        base_frame_role_id=base_frame_role_id,
+    ):
+        raise ProductionPortError(f"{field}.frame_ref is not the selected target base frame")
+    return _pose3(value, field=field)
+
+
+def _is_base_frame(
+    frame: object, *, field: str, target_role_id: str, base_frame_role_id: str
+) -> bool:
+    """True for an absent frame (the base by contract) or the move's base frame."""
+
+    if frame is None:
+        return True
+    frame_value = _mapping(frame, field=field)
+    return (
+        frame_value.get("kind") == "target_frame"
+        and frame_value.get("target_role") == target_role_id
+        and frame_value.get("frame_role") == base_frame_role_id
+    )
+
+
+def _pose3(value: object, *, field: str) -> dict[str, Any]:
+    """The wire position and unit quaternion of one authored pose.
+
+    The frame the pose is stated in travels separately (a goal frame or a
+    transform source frame); it is never applied here.
+    """
+
+    pose = _mapping(value, field=field)
+    position = _sequence(pose.get("position_m"), field=f"{field}.position_m", length=3)
+    orientation = _mapping(pose.get("orientation"), field=f"{field}.orientation")
+    if set(orientation) == {"xyzw"}:
+        quaternion = normalize_quat(
+            _sequence(
+                orientation["xyzw"],
+                field=f"{field}.orientation.xyzw",
+                length=4,
+            )
+        )
+    elif set(orientation) == {"rpy_deg"}:
+        quaternion = rpy_deg_to_xyzw(
+            _sequence(
+                orientation["rpy_deg"],
+                field=f"{field}.orientation.rpy_deg",
+                length=3,
+            )
+        )
+    else:
+        raise ProductionPortError(f"{field}.orientation must contain exactly xyzw or rpy_deg")
+    return {
+        "position_m": {
+            "x_m": _number(position[0], field=f"{field}.position_m[0]"),
+            "y_m": _number(position[1], field=f"{field}.position_m[1]"),
+            "z_m": _number(position[2], field=f"{field}.position_m[2]"),
+        },
+        "orientation": {
+            "x": quaternion[0],
+            "y": quaternion[1],
+            "z": quaternion[2],
+            "w": quaternion[3],
+        },
+    }
+
+
+def _scene_pose3(value: object, *, field: str) -> dict[str, Any]:
+    pose = _mapping(value, field=field)
+    position = _sequence(pose.get("position_m"), field=f"{field}.position_m", length=3)
+    orientation = _mapping(pose.get("orientation"), field=f"{field}.orientation")
+    if set(orientation) == {"xyzw"}:
+        quaternion = normalize_quat(
+            _sequence(
+                orientation["xyzw"],
+                field=f"{field}.orientation.xyzw",
+                length=4,
+            )
+        )
+    elif set(orientation) == {"rpy_deg"}:
+        quaternion = rpy_deg_to_xyzw(
+            _sequence(
+                orientation["rpy_deg"],
+                field=f"{field}.orientation.rpy_deg",
+                length=3,
+            )
+        )
+    else:
+        raise ProductionPortError(f"{field}.orientation must contain exactly xyzw or rpy_deg")
+    return {
+        "position_m": {
+            "x_m": _number(position[0], field=f"{field}.position_m[0]"),
+            "y_m": _number(position[1], field=f"{field}.position_m[1]"),
+            "z_m": _number(position[2], field=f"{field}.position_m[2]"),
+        },
+        "orientation": {
+            "x": quaternion[0],
+            "y": quaternion[1],
+            "z": quaternion[2],
+            "w": quaternion[3],
+        },
+    }
+
+
+def _scene_shape(value: object, *, field: str) -> dict[str, Any]:
+    shape = _mapping(value, field=field)
+    kind = shape.get("type")
+    if kind == "box" and set(shape) == {"type", "box_dimensions_m"}:
+        dimensions = _sequence(
+            shape["box_dimensions_m"],
+            field=f"{field}.box_dimensions_m",
+            length=3,
+        )
+        return {
+            "type": "box",
+            "box_dimensions_m": {
+                "x_m": _number(dimensions[0], field=f"{field}.box_dimensions_m[0]"),
+                "y_m": _number(dimensions[1], field=f"{field}.box_dimensions_m[1]"),
+                "z_m": _number(dimensions[2], field=f"{field}.box_dimensions_m[2]"),
+            },
+        }
+    if kind == "sphere" and set(shape) == {"type", "sphere_radius_m"}:
+        return {
+            "type": "sphere",
+            "sphere_radius_m": _number(shape["sphere_radius_m"], field=f"{field}.sphere_radius_m"),
+        }
+    if kind == "cylinder" and set(shape) == {
+        "type",
+        "cylinder_radius_m",
+        "cylinder_height_m",
+    }:
+        return {
+            "type": "cylinder",
+            "cylinder_radius_m": _number(
+                shape["cylinder_radius_m"], field=f"{field}.cylinder_radius_m"
+            ),
+            "cylinder_height_m": _number(
+                shape["cylinder_height_m"], field=f"{field}.cylinder_height_m"
+            ),
+        }
+    if kind == "mesh" and set(shape) == {
+        "type",
+        "mesh_resource_uri",
+        "mesh_scale",
+    }:
+        scale = _sequence(shape["mesh_scale"], field=f"{field}.mesh_scale", length=3)
+        return {
+            "type": "mesh",
+            "mesh_resource_uri": _text(
+                shape["mesh_resource_uri"],
+                field=f"{field}.mesh_resource_uri",
+                maximum_bytes=4096,
+            ),
+            "mesh_scale": {
+                "x_m": _number(scale[0], field=f"{field}.mesh_scale[0]"),
+                "y_m": _number(scale[1], field=f"{field}.mesh_scale[1]"),
+                "z_m": _number(scale[2], field=f"{field}.mesh_scale[2]"),
+            },
+        }
+    raise ProductionPortError(f"{field} has an unsupported shape")
+
+
+def _scene_support_contacts(value: object, *, field: str) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    metadata = _mapping(value, field=field)
+    return [
+        dict(_mapping(contact, field=f"{field}.support_contacts[{index}]"))
+        for index, contact in enumerate(
+            _sequence(
+                metadata.get("support_contacts", ()),
+                field=f"{field}.support_contacts",
+            )
+        )
+    ]
+
+
+def _robot_target(
+    targets: Mapping[str, "_TargetBinding"], target_role_id: str, *, field: str
+) -> dict[str, str]:
+    """The exact robot of one target role, from the captured Program Binding."""
+
+    try:
+        target = targets[target_role_id]
+    except KeyError as exc:
+        raise ProductionPortError(
+            f"{field} names target role {target_role_id!r} absent from the Program Binding"
+        ) from exc
+    return {
+        "target_role_id": target.target_role_id,
+        "controllable_component_id": target.controllable_component_id,
+        "command_target_id": target.command_target_id,
+    }
+
+
+def _frame_reference(
+    frame: object,
+    *,
+    field: str,
+    targets: Mapping[str, "_TargetBinding"],
+) -> dict[str, Any]:
+    """Map one authored pose frame to its native frame reference.
+
+    Only forwarding: the native cell frame resolver owns every transform.
+    """
+
+    frame_value = _mapping(frame, field=field)
+    kind = frame_value.get("kind")
+    if kind == "cell_frame" and set(frame_value) == {"kind"}:
+        return {"type": "cell_frame"}
+    if kind == "scene_resource" and set(frame_value) == {"kind", "scene_resource_id"}:
+        return {
+            "type": "scene_resource",
+            "scene_resource_id": _text(
+                frame_value["scene_resource_id"], field=f"{field}.scene_resource_id"
+            ),
+        }
+    if kind == "target_frame" and set(frame_value) == {"kind", "target_role", "frame_role"}:
+        target_role_id = _text(frame_value["target_role"], field=f"{field}.target_role")
+        return {
+            "type": "frame_role",
+            "frame_role_id": _text(frame_value["frame_role"], field=f"{field}.frame_role"),
+            "target": _robot_target(targets, target_role_id, field=f"{field}.target_role"),
+        }
+    raise ProductionPortError(f"{field} has an unsupported frame form")
+
+
+def _reference(
+    value: object,
+    *,
+    field: str,
+    target_role_id: str,
+    base_frame_role_id: str,
+    targets: Mapping[str, "_TargetBinding"],
+) -> dict[str, Any] | None:
+    """Map one authored motion or pick-offset reference to its native form.
+
+    A robot-qualified frame role must name a target role of the captured
+    Program Binding (``targets``); the native owner resolves every form.
+    """
+
+    if value is None:
+        return None
+    reference = dict(_mapping(value, field=field))
+    reference_type = reference.get("type")
+    identity_fields = {
+        "frame_role": "frame_role_id",
+        "component_body_role": "collision_body_role_id",
+        "scene_resource": "scene_resource_id",
+        "runtime_object": "runtime_object_id",
+    }
+    if reference_type == "cell_frame" and set(reference) == {"type"}:
+        return {"type": "cell_frame"}
+    if reference_type == "frame_role" and set(reference) == {
+        "type",
+        "frame_role_id",
+        "target_role",
+    }:
+        robot = _text(reference["target_role"], field=f"{field}.target_role")
+        return {
+            "type": "frame_role",
+            "frame_role_id": _text(reference["frame_role_id"], field=f"{field}.frame_role_id"),
+            "target": _robot_target(targets, robot, field=f"{field}.target_role"),
+        }
+    if reference_type in identity_fields:
+        identity_field = identity_fields[reference_type]
+        if set(reference) != {"type", identity_field}:
+            raise ProductionPortError(f"{field} has a malformed reference")
+        _text(reference[identity_field], field=f"{field}.{identity_field}")
+        return reference
+    if reference_type == "pose" and set(reference) == {"type", "pose"}:
+        # A reference pose has no frame of its own on the wire: it is the
+        # moving robot's base frame by contract.
+        return {
+            "type": "pose",
+            "pose": _base_framed_pose3(
+                reference["pose"],
+                field=f"{field}.pose",
+                target_role_id=target_role_id,
+                base_frame_role_id=base_frame_role_id,
+            ),
+        }
+    raise ProductionPortError(f"{field} has an unsupported reference form")
+
+
+_IO_READ_NODE_IDS: Final = frozenset({"io.get_input", "io.check_input"})
+_IO_SIGNAL_NODE_IDS: Final = _IO_READ_NODE_IDS | {"io.wait_for_input"}
+_IO_OUTPUT_NODE_ID: Final = "io.set_output"
+_IO_CLEAR_OUTSIDE_CHANGE_NODE_ID: Final = "io.clear_outside_change"
+_MAX_IO_WATCHES: Final = 4_096
+
+
+class IoSignalRefusedError(ProductionPortError):
+    """An `io.*` node's signal reference cannot be served; ``code`` is the
+    stable refusal (spec 210 §5.2), raised at Run preparation where literal."""
+
+    def __init__(
+        self, code: str, message: str, *, target_role_id: str, resource_role_id: str
+    ) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.details = {
+            "reason": code,
+            "reference_type": "resource_role",
+            "reference_id": resource_role_id,
+            "target_role_id": target_role_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _SignalBinding:
+    resource_role_id: str
+    signal_name: str
+    value_type: str
+    direction: str
+    transition_capability: str
+    signal_descriptor_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _TargetBinding:
+    target_role_id: str
+    component_role_id: str
+    controllable_component_id: str
+    command_target_id: str
+    capabilities: Mapping[str, Mapping[str, Any]]
+    # Resource roles bound to one boolean signal, and those bound more than
+    # once (signal and coordinate rows, or repeated signal rows).
+    signals: Mapping[str, _SignalBinding] = field(default_factory=dict)
+    ambiguous_signal_roles: frozenset[str] = frozenset()
+    pneumatic_io: Mapping[str, Any] | None = None
+
+
+def _signal_role_bindings(
+    row: Mapping[str, Any],
+) -> tuple[dict[str, _SignalBinding], frozenset[str]]:
+    """One target row's optional `signal_role_bindings` (handshake01).
+
+    The rows arrive already decoded by the generated Program Binding transport
+    (`validate_program_binding`: closed fields, sorted unique roles, no
+    coordinate overlap). Values are checked where they are used (`_io_signal`)
+    so each refusal keeps its own reason; a role bound more than once is
+    reported ambiguous rather than resolved by row order.
+    """
+
+    signals: dict[str, _SignalBinding] = {}
+    repeated: set[str] = set()
+    for signal in row.get("signal_role_bindings", ()):
+        binding = _SignalBinding(**signal)
+        if binding.resource_role_id in signals:
+            repeated.add(binding.resource_role_id)
+        signals[binding.resource_role_id] = binding
+    coordinate_roles = {
+        resource["resource_role_id"] for resource in row.get("resource_role_bindings", ())
+    }
+    return signals, frozenset(repeated | (coordinate_roles & set(signals)))
+
+
+def _io_signal(
+    targets: Mapping[str, _TargetBinding],
+    target_role_id: str,
+    resource_role_id: str,
+    *,
+    output: bool = False,
+) -> _SignalBinding:
+    """The one boolean input (or, for ``output``, output) bound to this
+    target's resource role."""
+
+    def refuse(code: str, message: str) -> IoSignalRefusedError:
+        return IoSignalRefusedError(
+            code,
+            message,
+            target_role_id=target_role_id,
+            resource_role_id=resource_role_id,
+        )
+
+    target = targets.get(target_role_id)
+    if not output and resource_role_id.endswith(CHANGED_OUTSIDE_SUFFIX):
+        # The core-held boolean input of an output (CONTRACTS §7); the host
+        # resolves it from the output's binding.
+        bound = _io_signal(
+            targets,
+            target_role_id,
+            resource_role_id[: -len(CHANGED_OUTSIDE_SUFFIX)],
+            output=True,
+        )
+        return replace(
+            bound,
+            resource_role_id=resource_role_id,
+            signal_name=bound.signal_name + CHANGED_OUTSIDE_SUFFIX,
+            direction="input",
+            transition_capability="sampled_only",
+        )
+    if target is None or resource_role_id not in target.signals:
+        raise refuse(
+            "io_signal_unbound",
+            f"resource role {resource_role_id!r} of target role {target_role_id!r} "
+            "is not bound to a signal",
+        )
+    if resource_role_id in target.ambiguous_signal_roles:
+        raise refuse(
+            "io_signal_unbound",
+            f"resource role {resource_role_id!r} of target role {target_role_id!r} "
+            "is bound more than once",
+        )
+    signal = target.signals[resource_role_id]
+    if signal.value_type != "bool":
+        raise refuse(
+            "io_signal_type_mismatch",
+            f"signal {signal.signal_name!r} is {signal.value_type!r}, not bool",
+        )
+    if output:
+        if signal.direction != "output":
+            raise refuse(
+                "io_signal_direction_mismatch",
+                f"signal {signal.signal_name!r} is an {signal.direction!r}, not an output",
+            )
+        return signal
+    if signal.direction != "input":
+        # An output's reported state is read only through its separately
+        # declared readback input, which this binding does not carry yet.
+        raise refuse(
+            "io_signal_direction_mismatch",
+            f"signal {signal.signal_name!r} is an {signal.direction!r} without a "
+            "declared readback input",
+        )
+    if signal.transition_capability not in {"sampled_only", "captured"}:
+        raise refuse(
+            "io_signal_transition_unsupported",
+            f"signal {signal.signal_name!r} declares an unsupported transition "
+            f"capability {signal.transition_capability!r}",
+        )
+    return signal
+
+
+def _validate_io_signal_nodes(
+    program: Mapping[str, Any], targets: Mapping[str, _TargetBinding]
+) -> None:
+    """Refuse literal `io.*` signal references at Run preparation."""
+
+    pending = [program.get("tree")] if program.get("tree") is not None else []
+    while pending:
+        node = _mapping(pending.pop(), field="Program tree node")
+        pending.extend(node.get("children") or ())
+        if node.get("node_id") not in _IO_SIGNAL_NODE_IDS | {
+            _IO_OUTPUT_NODE_ID,
+            _IO_CLEAR_OUTSIDE_CHANGE_NODE_ID,
+        }:
+            continue
+        parameters = node.get("parameters")
+        if not isinstance(parameters, Mapping):
+            continue
+        target_role_id = parameters.get("target_role")
+        resource_role_id = parameters.get("resource_role")
+        if isinstance(target_role_id, str) and isinstance(resource_role_id, str):
+            _io_signal(
+                targets,
+                target_role_id,
+                resource_role_id,
+                output=node["node_id"]
+                in {_IO_OUTPUT_NODE_ID, _IO_CLEAR_OUTSIDE_CHANGE_NODE_ID},
+            )
+        if node["node_id"] == "io.wait_for_input":
+            _io_watch_edge(parameters, target_role_id, resource_role_id)
+
+
+def _io_watch_edge(
+    parameters: Mapping[str, Any], target_role_id: Any, resource_role_id: Any
+) -> None:
+    """This slice watches levels only; an edge is refused, never run."""
+
+    edge = parameters.get("edge", "level")
+    if edge != "level":
+        raise IoSignalRefusedError(
+            "io_watch_condition_unsupported",
+            f"wait_for_input edge {edge!r} is not supported; only level waits are",
+            target_role_id=str(target_role_id),
+            resource_role_id=str(resource_role_id),
+        )
+
+
+def _io_watch_condition(
+    parameters: Mapping[str, Any], target_role_id: Any, resource_role_id: Any
+) -> dict[str, Any]:
+    """The one level condition of a node attempt's resolved parameters."""
+
+    _io_watch_edge(parameters, target_role_id, resource_role_id)
+    expected = parameters.get("expected_value")
+    if type(expected) is not bool:
+        raise ProductionPortError("wait_for_input expected_value must be boolean")
+    return {"kind": "level", "expected_value": expected}
+
+
+def _io_owner_reason(error: BaseException, default: str) -> str:
+    """An owner refusal's stable `io_*` reason, else ``default``."""
+
+    details = getattr(error, "details", None)
+    reason = details.get("reason") if isinstance(details, Mapping) else None
+    code = getattr(error, "code", None)
+    for candidate in (reason, code):
+        if isinstance(candidate, str) and candidate.startswith("io_"):
+            return candidate
+    return default
+
+
+@dataclass(slots=True)
+class _IoWatch:
+    identity: NodeAttemptIdentity
+    registration: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _ContactGraspBinding:
+    contact_policy_id: str
+    runtime_object_id: str
+    mode: str
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundContext:
+    capture: ProgramRunPortContext
+    targets: Mapping[str, _TargetBinding]
+    contact_grasps: Mapping[str, _ContactGraspBinding]
+    request_owner_epoch: str
+
+
+class _SceneProgramTransport(Protocol):
+    def authoring_admission(self) -> dict[str, Any]: ...
+
+    def scene(self) -> dict[str, Any]: ...
+
+    def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _SceneTargetBinding:
+    target_role_id: str
+    component_role_id: str
+    controllable_component_id: str
+    command_target_id: str
+    frames: Mapping[str, tuple[str, str]]
+    collision_body_roles: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _SceneApplyCapture:
+    retained_bundle_id: str
+    graph_revision: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SceneBoundContext:
+    capture: ProgramRunPortContext | _SceneApplyCapture
+    component_models: Mapping[tuple[str, str], tuple[str, str]]
+    component_frames: Mapping[tuple[str, str, str], dict[str, str]]
+    targets: Mapping[str, _SceneTargetBinding]
+
+
+@dataclass(frozen=True, slots=True)
+class _SceneView:
+    request_owner_epoch: str
+    projection_revision: dict[str, Any]
+    cell_id: str
+    objects: Mapping[str, Mapping[str, Any]]
+    attachments: tuple[Mapping[str, Any], ...]
+
+
+@dataclass(slots=True)
+class _SharedOperation:
+    operation_id: str
+    request_owner_epoch: str
+    member_attempt_ids: frozenset[str]
+    member_task_ids: frozenset[str]
+    stop_requested: bool = False
+    completed_revision: int | None = field(default=None, compare=False)
+    acknowledged_attempt_ids: set[str] = field(default_factory=set, compare=False)
+    recovered_attempt_ids: set[str] = field(default_factory=set, compare=False)
+    recovery_result: Mapping[str, Any] | None = field(default=None, compare=False)
+    recovery_action: str | None = field(default=None, compare=False)
+
+
+@dataclass(slots=True)
+class _HeldPreparation:
+    selection_revision: int
+    scope_identity: tuple[str, str, int]
+    operation: Mapping[str, Any]
+    reset_request: Mapping[str, Any] | None = None
+    reset_submitted: bool = False
+    reset_acceptance: Mapping[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class _OperationTask:
+    identity: NodeAttemptIdentity
+    node_id: str
+    task_id: str
+    operation: _SharedOperation | None = None
+    terminal: OwnerTaskSnapshot | None = None
+    held_before_admission: bool = False
+    unknown_admission: _UnknownOperationAdmission | None = None
+    unknown_close: _UnknownRecovery | None = None
+    # (actuation, dwell, grasp-confirmation read or None) from the one
+    # descriptor read a Program gripper command already does.
+    gripper_timing: tuple[str | None, float | None, Mapping[str, Any] | None] | None = None
+    submitted_intent: Mapping[str, Any] | None = None
+    acceptance: Mapping[str, Any] | None = None
+    held_preparation: _HeldPreparation | None = None
+    # Interrupt motion: per participant, the qualified Stop stage order read
+    # once at its terminal observation (SX-2211).
+    interrupt_stop_chain: Mapping[str, tuple[str, ...]] | None = None
+    tcp_robot_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _UnknownRecovery:
+    """One operation closure whose outcome is unknown: its exact request,
+    replayed byte-for-byte under the same request identity."""
+
+    request_id: str
+    revision: int
+    request: Mapping[str, Any]
+    assessment: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _UnknownOperationAdmission:
+    request_id: str
+    request_owner_epoch: str
+    intent: Mapping[str, Any]
+    member_task_ids: frozenset[str]
+
+
+@dataclass(slots=True)
+class _ProgramScopeStop:
+    owner_epoch: str
+    pending: int = 0
+    generation: int = 0
+    active: tuple[str, int, int] | None = None
+    unresolved: object | None = None
+
+
+class ProgramMotionPreviewUnavailableError(ProductionPortError):
+    """The node's exact motion has no representation on the native preview wire."""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramMotionParticipant:
+    """One node's effect-free motion request, before any attempt or dispatch.
+
+    Program execution and the node-correction preview build this from the
+    same captured Program Binding and resolved node inputs; only the opaque
+    ``move_id`` differs between the two uses.
+    """
+
+    target: _TargetBinding
+    payload: Mapping[str, Any]
+
+
+def _goal_frame_reference(
+    poses: Sequence[object],
+    *,
+    field: str,
+    target_mode: str,
+    target_role_id: str,
+    base_frame_role_id: str,
+    targets: Mapping[str, _TargetBinding],
+) -> dict[str, Any] | None:
+    """The one frame an absolute pose/Cartesian goal is stated in.
+
+    None means the moving robot's base frame (the wire default). Any other
+    declared frame is forwarded as `goal_frame_reference` and resolved by
+    the native owner at motion admission.
+    """
+
+    frames: list[Mapping[str, Any] | None] = []
+    for index, pose in enumerate(poses):
+        label = field if len(poses) == 1 else f"{field}[{index}]"
+        frame = _mapping(pose, field=label).get("frame_ref")
+        frames.append(
+            None
+            if _is_base_frame(
+                frame,
+                field=f"{label}.frame_ref",
+                target_role_id=target_role_id,
+                base_frame_role_id=base_frame_role_id,
+            )
+            else _mapping(frame, field=f"{label}.frame_ref")
+        )
+    if any(frame != frames[0] for frame in frames):
+        raise ProductionPortError(f"{field} waypoints must all use one frame")
+    if frames[0] is None:
+        return None
+    if target_mode != "absolute":
+        raise ProductionPortError(
+            f"{field}.frame_ref must be the moving robot's base frame for a "
+            "relative goal; its reference is target_reference"
+        )
+    return _frame_reference(frames[0], field=f"{field}.frame_ref", targets=targets)
+
+
+def _motion_spec(
+    node_id: str,
+    parameters: Mapping[str, Any],
+) -> dict[str, Any]:
+    if node_id == "motion.move_to_joint_target":
+        goals = _sequence(parameters.get("goal"), field="goal")
+        joint_names: list[str] = []
+        positions: list[float] = []
+        for index, raw_goal in enumerate(goals):
+            goal = _mapping(raw_goal, field=f"goal[{index}]")
+            joint_names.append(_text(goal.get("joint_name"), field=f"goal[{index}].joint_name"))
+            positions.append(
+                _number(
+                    goal.get("position_rad"),
+                    field=f"goal[{index}].position_rad",
+                )
+            )
+        return {
+            "kind": "joint_goal",
+            "joint_names": joint_names,
+            "positions_rad": positions,
+        }
+    if node_id == "motion.move_to_pose" or node_id in _INTERRUPT_MOTION_NODE_IDS:
+        # The interrupt moves are pose goals; their rule is the Core's,
+        # lowered from the captured node (never sent as caller scopes).
+        return {
+            "kind": "pose_goal",
+            "goal": _pose3(parameters.get("goal"), field="goal"),
+        }
+    if node_id == "motion.follow_cartesian_path":
+        path = _sequence(parameters.get("path"), field="path")
+        motion: dict[str, Any] = {
+            "kind": "cartesian_path",
+            "waypoints": [
+                _pose3(waypoint, field=f"path[{index}]")
+                for index, waypoint in enumerate(path)
+            ],
+            "max_translation_step_m": parameters["max_translation_step_m"],
+            "max_rotation_step_rad": parameters["max_rotation_step_rad"],
+            # CartesianPathDTO still carries the planner's numerical
+            # bound, but it is not an authored second speed knob. The
+            # admitted SpeedProfile supplies the exact Deployment/request
+            # value and the planner takes the stricter value.
+            "max_angular_speed_rad_s": parameters["max_angular_speed_rad_s"],
+            "max_linear_acceleration_mps2": parameters["max_linear_acceleration_mps2"],
+            "max_angular_acceleration_rad_s2": parameters["max_angular_acceleration_rad_s2"],
+            "fallback_policy": parameters["fallback_policy"],
+            # A waypoint's own radius overrides the move's default.
+            "blend_radii_m": [
+                waypoint.get("blend_radius_m", parameters["blend_radius_m"])
+                for waypoint in path
+            ],
+        }
+        # Absent means the Deployment's cartesian_timing.
+        if parameters.get("cartesian_timing") is not None:
+            motion["speed_mode"] = parameters["cartesian_timing"]
+        return motion
+    raise ProductionPortError(f"unsupported Kernel motion node {node_id!r}")
+
+
+def _tcp_selector_payload(
+    selector: Mapping[str, Any],
+    *,
+    targets: Mapping[str, _TargetBinding],
+    active_tcp: Any = None,
+    active_tcp_key: str = "active_tcp",
+) -> dict[str, Any]:
+    if set(selector) == {"component_id", "target_id", "frame_role_id"}:
+        return {"kind": "entry", "entry": {
+            name: _text(selector.get(name), field=f"tcp.{name}")
+            for name in ("component_id", "target_id", "frame_role_id")
+        }}
+    kind = selector.get("kind")
+    if kind == "current":
+        if active_tcp is None:
+            raise ProductionPortError(f"blackboard key {active_tcp_key!r} has no value")
+        entry = _mapping(active_tcp, field=active_tcp_key)
+        return {"kind": "entry", "entry": {
+            name: _text(entry.get(name), field=f"{active_tcp_key}.{name}")
+            for name in ("component_id", "target_id", "frame_role_id")
+        }}
+    if kind == "default_of_role":
+        return {"kind": "default_of_role", "role": _text(selector.get("role"), field="tcp.role")}
+    if kind == "entry":
+        role = _text(selector.get("target_role"), field="tcp.target_role")
+        try:
+            target = targets[role]
+        except KeyError as exc:
+            raise ProductionPortError(f"Program Binding has no target role {role!r}") from exc
+        return {"kind": "entry", "entry": {
+            "component_id": target.controllable_component_id,
+            "target_id": target.command_target_id,
+            "frame_role_id": _text(selector.get("frame_role"), field="tcp.frame_role"),
+        }}
+    raise ProductionPortError("unsupported TCP selector kind")
+
+
+def _motion_tcp_payload(
+    parameters: Mapping[str, Any], *, targets: Mapping[str, _TargetBinding],
+    active_tcp: Any = None,
+) -> dict[str, Any]:
+    try:
+        selection = motion_tcp_selection(parameters)
+    except ProgramValidationError as exc:
+        raise ProductionPortError(str(exc)) from exc
+    role = _text(parameters.get("target_role"), field="target_role")
+    return {"tcp_endpoint": _tcp_selector_payload(
+        selection["tcp_endpoint"], targets=targets, active_tcp=active_tcp,
+        active_tcp_key=f"active_tcp.{role}",
+    )}
+
+
+def _planner_override(value: Any) -> dict[str, Any]:
+    """The node's `planner` block as plain wire members (only the set ones)."""
+
+    return {
+        name: member
+        for name, member in _mapping(value, field="planner").items()
+        if member is not None
+    }
+
+
+def program_motion_participant(
+    node_id: str,
+    parameters: Mapping[str, Any],
+    *,
+    targets: Mapping[str, _TargetBinding],
+    contact_grasps: Mapping[str, _ContactGraspBinding],
+    move_id: str,
+    active_tcp: Any = None,
+) -> ProgramMotionParticipant:
+    """Translate resolved motion-node inputs into the native motion payload.
+
+    Pure: it reads only the captured Program Binding rows (``targets`` and
+    ``contact_grasps``) and the node's resolved ``parameters``. The binding,
+    robot and capability come from the capture, never from the inputs.
+    """
+
+    target_role_id = _text(parameters.get("target_role"), field="target_role")
+    try:
+        target = targets[target_role_id]
+    except KeyError as exc:
+        raise ProductionPortError(
+            f"Program Binding has no target role {target_role_id!r}"
+        ) from exc
+    if "execution.trajectory.execute" not in target.capabilities:
+        raise ProductionPortError(
+            f"target role {target_role_id!r} lacks 'execution.trajectory.execute'"
+        )
+    base_frame_role_id = _text(parameters.get("base_frame_role"), field="base_frame_role")
+    tcp_payload = _motion_tcp_payload(parameters, targets=targets, active_tcp=active_tcp)
+    target_mode = parameters.get("target_mode", "absolute")
+    if target_mode not in {"absolute", "relative"}:
+        raise ProductionPortError("motion target_mode is unsupported")
+    target_reference = _reference(
+        parameters.get("target_reference"),
+        field="target_reference",
+        target_role_id=target_role_id,
+        base_frame_role_id=base_frame_role_id,
+        targets=targets,
+    )
+    offset_reference = _reference(
+        parameters.get("offset_reference"),
+        field="offset_reference",
+        target_role_id=target_role_id,
+        base_frame_role_id=base_frame_role_id,
+        targets=targets,
+    )
+    pose_goal = node_id == "motion.move_to_pose" or node_id in _INTERRUPT_MOTION_NODE_IDS
+    goal_poses: Sequence[object] = (
+        ()
+        if node_id == "motion.move_to_joint_target"
+        else (
+            (parameters.get("goal"),)
+            if pose_goal
+            else _sequence(parameters.get("path"), field="path")
+        )
+    )
+    goal_frame_reference = (
+        None
+        if not goal_poses
+        else _goal_frame_reference(
+            goal_poses,
+            field="goal" if pose_goal else "path",
+            target_mode=target_mode,
+            target_role_id=target_role_id,
+            base_frame_role_id=base_frame_role_id,
+            targets=targets,
+        )
+    )
+    runtime_object_ids = {
+        reference["runtime_object_id"]
+        for reference in (target_reference, offset_reference)
+        if reference is not None and reference["type"] == "runtime_object"
+    }
+    if runtime_object_ids:
+        raise ProductionPortError(
+            "runtime-object motion references require the N7-a5.3b " "scene-binding join"
+        )
+    contact_policy_id = parameters.get("contact_policy_id")
+    contact_scene_resource_id = parameters.get("contact_scene_resource_id")
+    runtime_object_bindings: list[dict[str, str]] = []
+    if (contact_policy_id is None) != (contact_scene_resource_id is None):
+        raise ProductionPortError(
+            "contact policy and contact scene resource must be supplied together"
+        )
+    elif contact_policy_id is not None:
+        policy_id = _text(contact_policy_id, field="contact_policy_id")
+        scene_resource_id = _text(
+            contact_scene_resource_id, field="contact_scene_resource_id"
+        )
+        try:
+            contact = contact_grasps[policy_id]
+        except KeyError as exc:
+            raise ProductionPortError(
+                "Program Binding has no exact motion contact-grasp policy"
+            ) from exc
+        runtime_object_bindings.append(
+            {
+                "runtime_object_id": contact.runtime_object_id,
+                "scene_resource_id": scene_resource_id,
+            }
+        )
+    payload = {
+        "kind": "motion",
+        "move_id": _text(move_id, field="move_id"),
+        "base_frame_role_id": base_frame_role_id,
+        **tcp_payload,
+        "tolerances": {
+            "joint_position_tol_rad": parameters["joint_position_tol_rad"],
+            "translation_tol_m": parameters["translation_tol_m"],
+            "rotation_tol_rad": parameters["rotation_tol_rad"],
+        },
+        "speed_profile": {
+            "velocity_scale": parameters["velocity_scale"],
+            "acceleration_scale": parameters["acceleration_scale"],
+            "max_tcp_linear_speed_mps": parameters.get("max_tcp_linear_speed_mps"),
+        },
+        "timeouts": {
+            "planning_timeout_s": parameters["planning_timeout_s"],
+            "execution_timeout_s": parameters["execution_timeout_s"],
+        },
+        "cache_mode": parameters["cache_mode"],
+        "target_mode": target_mode,
+        "target_reference": target_reference,
+        "offset_reference": offset_reference,
+        "motion": _motion_spec(node_id, parameters),
+        "contact_policy_id": contact_policy_id,
+        # Resolved inputs are frozen; the wire needs plain per-joint objects.
+        "per_joint_dynamics_limits": {
+            joint_name: dict(_mapping(limit, field=f"per_joint_dynamics_limits.{joint_name}"))
+            for joint_name, limit in _mapping(
+                parameters.get("per_joint_dynamics_limits", {}),
+                field="per_joint_dynamics_limits",
+            ).items()
+        },
+        "motion_interrupt_scopes": [],
+        "runtime_object_bindings": runtime_object_bindings,
+    }
+    if goal_frame_reference is not None:
+        payload["goal_frame_reference"] = goal_frame_reference
+    # The move's own collision clearance; absent keeps the Deployment's.
+    if parameters.get("clearance_m") is not None:
+        payload["clearance_m"] = parameters["clearance_m"]
+    # The move's planner override; absent keeps the Deployment planner block.
+    if parameters.get("planner") is not None:
+        payload["planner"] = _planner_override(parameters["planner"])
+    return ProgramMotionParticipant(target, payload)
+
+
+class NativeKernelProgramPort:
+    """Captured context plus separate native task and Program-scope clients."""
+
+    def __init__(
+        self,
+        kernel: KernelClient,
+        *,
+        current_owner_epoch: Callable[[], str] | None = None,
+        stop_terminal: Callable[..., Mapping[str, Any] | None] | None = None,
+        scene_pose_source_latch: Callable[..., None] | None = None,
+        active_tcp_result: Callable[[str, str, object], bool | None] | None = None,
+    ) -> None:
+        if not isinstance(kernel, KernelClient):
+            raise TypeError("kernel must be one bounded KernelClient")
+        if current_owner_epoch is not None and not callable(current_owner_epoch):
+            raise TypeError("current_owner_epoch must be callable")
+        if stop_terminal is not None and not callable(stop_terminal):
+            raise TypeError("stop_terminal must be callable")
+        if scene_pose_source_latch is not None and not callable(scene_pose_source_latch):
+            raise TypeError("scene_pose_source_latch must be callable")
+        if active_tcp_result is not None and not callable(active_tcp_result):
+            raise TypeError("active_tcp_result must be callable")
+        self._active_tcp_result = active_tcp_result
+        self._kernel = kernel
+        self._current_owner_epoch = current_owner_epoch
+        self._scene_pose_source_latch = scene_pose_source_latch
+        # The Runner's existing events reader: the Stop terminal projection
+        # of exactly (stop_id, stop_generation), or None (SX-2215); with
+        # read_to_end=True it first reads the events to that record.
+        self._stop_terminal = stop_terminal
+        self._contexts: dict[str, _BoundContext] = {}
+        self._tasks: dict[str, _OperationTask] = {}
+        self._scope_stops: dict[str, _ProgramScopeStop] = {}
+        self._io_watches: dict[str, _IoWatch] = {}
+        self._lock = RLock()
+        self.operations = _NativeKernelOperationTaskPort(self)
+        self.controls = _NativeKernelControlTaskPort(self)
+        self.queries = _NativeTargetQueryPort(self)
+        self.scope = _NativeKernelProgramScopePort(self)
+        self.io_watches = _NativeIoWatchTaskPort(self)
+        self.mock_simulation = _NativeMockSimulationPort(self)
+
+    @staticmethod
+    def _validate_execution_group_policies(program: Mapping[str, Any]) -> None:
+        definitions = program.get("execution_groups", {})
+        if not isinstance(definitions, Mapping):
+            raise ProductionPortError("execution group definitions are invalid")
+        for name, raw_definition in definitions.items():
+            if not isinstance(name, str) or not name or not isinstance(raw_definition, Mapping):
+                raise ProductionPortError("execution group definition is invalid")
+            policy = raw_definition.get("execution_policy")
+            if policy == "independent":
+                continue
+            if policy not in {
+                "common_start",
+                "common_start_and_finish",
+                "sync_offset_traj",
+            }:
+                raise ProductionPortError("execution group policy is invalid")
+            raise ProductionPortError(
+                f"execution policy {policy!r} is declared but unavailable until F2"
+            )
+
+    @staticmethod
+    def _parse_context(
+        context: ProgramRunPortContext,
+        *,
+        request_owner_epoch: str,
+    ) -> _BoundContext:
+        binding = context.program_binding
+        rows = binding.get("target_role_bindings")
+        # A logical (zero-component) cell's Program binds no target role.
+        if not isinstance(rows, (list, tuple)):
+            raise ProductionPortError("Program Binding has no target-role bindings")
+        targets: dict[str, _TargetBinding] = {}
+        for index, raw_row in enumerate(rows):
+            row = _mapping(raw_row, field=f"target_role_bindings[{index}]")
+            target_role_id = _text(
+                row.get("target_role_id"),
+                field=f"target_role_bindings[{index}].target_role_id",
+            )
+            component_role_id = _text(
+                row.get("component_role_id"),
+                field=f"target_role_bindings[{index}].component_role_id",
+            )
+            raw_capabilities = row.get("capability_bindings")
+            if not isinstance(raw_capabilities, (list, tuple)):
+                raise ProductionPortError(
+                    f"target role {target_role_id!r} has no capability bindings"
+                )
+            capabilities: dict[str, Mapping[str, Any]] = {}
+            for raw_capability in raw_capabilities:
+                capability = _mapping(
+                    raw_capability,
+                    field=f"target role {target_role_id!r} capability",
+                )
+                capability_id = _text(capability.get("capability_id"), field="capability_id")
+                if capability_id in capabilities:
+                    raise ProductionPortError(
+                        f"target role {target_role_id!r} repeats a capability"
+                    )
+                capabilities[capability_id] = capability
+            if target_role_id in targets:
+                raise ProductionPortError("Program Binding repeats a target role")
+            signals, ambiguous_signal_roles = _signal_role_bindings(row)
+            targets[target_role_id] = _TargetBinding(
+                target_role_id,
+                component_role_id,
+                _text(
+                    row.get("controllable_component_id"),
+                    field=f"target_role_bindings[{index}].controllable_component_id",
+                ),
+                _text(
+                    row.get("command_target_id"),
+                    field=f"target_role_bindings[{index}].command_target_id",
+                ),
+                capabilities,
+                signals,
+                ambiguous_signal_roles,
+                row.get("pneumatic_io"),
+            )
+        contact_grasps: dict[str, _ContactGraspBinding] = {}
+        raw_contact_grasps = binding.get("contact_grasp_bindings", ())
+        if not isinstance(raw_contact_grasps, (list, tuple)):
+            raise ProductionPortError("Program Binding contact-grasp bindings are invalid")
+        for index, raw_contact in enumerate(raw_contact_grasps):
+            contact = _mapping(
+                raw_contact,
+                field=f"contact_grasp_bindings[{index}]",
+            )
+            policy_id = _text(
+                contact.get("contact_policy_id"),
+                field=f"contact_grasp_bindings[{index}].contact_policy_id",
+            )
+            runtime_object_id = _text(
+                contact.get("runtime_object_id"),
+                field=f"contact_grasp_bindings[{index}].runtime_object_id",
+            )
+            if policy_id in contact_grasps:
+                raise ProductionPortError("Program Binding repeats a contact-grasp policy")
+            mode = contact.get("mode", "contact_grasp")
+            if mode not in ("contact_grasp", "contact_release"):
+                raise ProductionPortError("Program Binding contact mode is invalid")
+            contact_grasps[policy_id] = _ContactGraspBinding(
+                policy_id,
+                runtime_object_id,
+                mode,
+            )
+        NativeKernelProgramPort._validate_execution_group_policies(context.program)
+        _validate_io_signal_nodes(context.program, targets)
+        return _BoundContext(
+            context,
+            targets,
+            contact_grasps,
+            _text(request_owner_epoch, field="request_owner_epoch"),
+        )
+
+    def bind(self, context: ProgramRunPortContext) -> None:
+        if not isinstance(context, ProgramRunPortContext):
+            raise TypeError("bind requires one exact Program-run port context")
+        owner_epoch = self._owner_status_for_capture(context)
+        parsed = self._parse_context(
+            context,
+            request_owner_epoch=owner_epoch,
+        )
+        with self._lock:
+            current = self._contexts.get(context.program_run_id)
+            if current is not None:
+                if current != parsed:
+                    raise ProductionPortError("Program-run identity was rebound")
+                return
+            if len(self._contexts) >= _MAX_CONTEXTS:
+                raise ProductionPortError("Program-run client-context retention is full")
+            self._contexts[context.program_run_id] = parsed
+
+    def unbind(self, program_run_id: str) -> None:
+        # Run teardown releases every watch its nodes still hold.
+        self.io_watches.release_run(program_run_id)
+        # SX-2433: settle ENDs while the Run is still current. An END not yet
+        # OK-ACKed fails this unbind like an unresolved operation; the context
+        # stays bound and the next (finalizing) unbind resends it unchanged.
+        if self.mock_simulation.resend_unknown_ends(program_run_id):
+            raise ProductionPortError(
+                "cannot unbind a Program run with unconfirmed Mock simulation ends"
+            )
+        with self._lock:
+            stop = self._scope_stops.get(program_run_id)
+            has_scope_stop = stop is not None
+        if has_scope_stop:
+            scope = self._observe_scope(program_run_id)
+            if scope.state is not ProgramRunScopeState.SETTLED:
+                raise ProductionPortError(
+                    "cannot unbind a Program run before aggregate Stop settlement"
+                )
+            with self._lock:
+                self._contexts.pop(program_run_id, None)
+            self.mock_simulation.release_run(program_run_id)
+            return
+        tasks, local_tasks = self._run_operation_tasks(program_run_id)
+        if any(task.terminal is None and not task.held_before_admission for task in local_tasks):
+            raise ProductionPortError(
+                "cannot unbind a Program run with an unresolved local operation"
+            )
+        with self._lock:
+            for task in local_tasks:
+                self._tasks.pop(task.task_id, None)
+        completed: list[_OperationTask] = []
+        for task in tasks:
+            _operation, snapshot, _envelope = self._observation(task)
+            if snapshot.state is OwnerTaskState.ACTIVE:
+                raise ProductionPortError(
+                    "cannot unbind a Program run with active native operations"
+                )
+            if snapshot.state is OwnerTaskState.SUCCEEDED or (
+                snapshot.state is OwnerTaskState.FAILED and snapshot.settlement_proven
+            ):
+                completed.append(task)
+        # A sequence may settle between its final owner transition and the
+        # next tree tick. Consume successful or final pneumatic evidence now.
+        # Other interrupted/failed operations keep their identity until Reset
+        # releases the corresponding resident Kernel operation.
+        for task in completed:
+            assert task.operation is not None
+            for member_task_id in task.operation.member_task_ids:
+                with self._lock:
+                    member = self._tasks.get(member_task_id)
+                if member is not None and member.operation is task.operation:
+                    self._acknowledge_task(member_task_id, member.identity)
+        with self._lock:
+            self._contexts.pop(program_run_id, None)
+        self.mock_simulation.release_run(program_run_id)
+
+    def _context(self, program_run_id: str) -> _BoundContext:
+        with self._lock:
+            try:
+                return self._contexts[program_run_id]
+            except KeyError as exc:
+                raise ProductionPortError("Program-run client context is not bound") from exc
+
+    def _run_attribution(self, program_run_id: str) -> dict[str, Any]:
+        """The exact private Runner attribution of one Run: the captured
+        Kernel/Binding occurrence plus the current scope's claim."""
+
+        context = self._context(program_run_id)
+        scope = self.scope.execution_scope(program_run_id)
+        claim = scope.get("claim_generation")
+        if type(claim) is not int or claim < 1:
+            raise ProductionPortError("Program execution scope has no claim generation")
+        return {
+            "owner_epoch": context.request_owner_epoch,
+            "program_binding_id": context.capture.program_binding_id,
+            "program_runner_owner_epoch": _text(
+                scope.get("program_runner_owner_epoch"), field="scope runner epoch"
+            ),
+            "claim_generation": claim,
+            "program_run_id": program_run_id,
+        }
+
+    def _node_attribution(self, identity: NodeAttemptIdentity) -> dict[str, Any]:
+        """The Run attribution plus the exact node attempt."""
+
+        return {
+            **self._run_attribution(identity.program_run_id),
+            "node_instance_id": identity.node_instance_id,
+            "node_attempt_id": identity.node_attempt_id,
+        }
+
+    def _require_scope_open(self, program_run_id: str) -> None:
+        """Reject fresh local work after the Program owner accepted Stop.
+
+        The native Kernel independently fences the same exact run while an
+        admission is crossing this check, so this local lifecycle guard never
+        has to block Stop behind ordinary command work.
+        """
+
+        with self._lock:
+            stop = self._scope_stops.get(program_run_id)
+            if stop is not None:
+                raise ProductionPortError("Program-run scope is stopped; fresh work is unavailable")
+
+    @staticmethod
+    def _target(
+        context: _BoundContext,
+        target_role_id: str,
+        capability_id: str | None,
+    ) -> _TargetBinding:
+        try:
+            target = context.targets[target_role_id]
+        except KeyError as exc:
+            raise ProductionPortError(
+                f"Program Binding has no target role {target_role_id!r}"
+            ) from exc
+        if capability_id is not None and capability_id not in target.capabilities:
+            raise ProductionPortError(f"target role {target_role_id!r} lacks {capability_id!r}")
+        return target
+
+    def _owner_status_for_capture(
+        self,
+        capture: ProgramRunPortContext,
+    ) -> str:
+        envelope = self._kernel.identity()
+        status = _mapping(envelope.get("identity"), field="execution identity")
+        owner_epoch = _text(status.get("owner_epoch"), field="owner_epoch")
+        if (
+            status.get("graph_revision") != capture.graph_revision
+            or status.get("retained_bundle_id") != capture.retained_bundle_id
+        ):
+            raise ProductionPortError(
+                "native execution owner and captured Program deployment disagree"
+            )
+        return owner_epoch
+
+    def _owner_status(self, context: _BoundContext) -> str:
+        return self._owner_status_for_capture(context.capture)
+
+    def _motion_payload(
+        self,
+        node_id: str,
+        parameters: Mapping[str, Any],
+        identity: NodeAttemptIdentity,
+        active_tcp: Any = None,
+    ) -> tuple[_BoundContext, _TargetBinding, dict[str, Any]]:
+        context = self._context(identity.program_run_id)
+        participant = program_motion_participant(
+            node_id,
+            parameters,
+            targets=context.targets,
+            contact_grasps=context.contact_grasps,
+            active_tcp=active_tcp,
+            move_id=_request_identity(
+                "move", identity.program_run_id, identity.node_attempt_id
+            ),
+        )
+        return context, participant.target, dict(participant.payload)
+
+    def _latch_motion_between_nodes(
+        self,
+        identity: NodeAttemptIdentity,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Latch only normalized Scene resources from this motion's references."""
+
+        if self._scene_pose_source_latch is None:
+            return
+        resource_ids = tuple(
+            sorted(
+                {
+                    reference["scene_resource_id"]
+                    for name in ("target_reference", "offset_reference")
+                    if isinstance((reference := payload.get(name)), Mapping)
+                    and reference.get("type") == "scene_resource"
+                    and isinstance(reference.get("scene_resource_id"), str)
+                    and reference["scene_resource_id"]
+                }
+            )
+        )
+        if resource_ids:
+            self._scene_pose_source_latch(
+                identity,
+                scene_resource_ids=resource_ids,
+            )
+
+    def motion_preview_intent(
+        self,
+        identity: NodeAttemptIdentity,
+        node_id: str,
+        parameters: Mapping[str, Any],
+        *,
+        request_id: str,
+        active_tcp: Any = None,
+    ) -> tuple[ProgramMotionParticipant, dict[str, Any]]:
+        """Build the native preview intent of one node attempt's motion.
+
+        Effect-free: it reads the captured binding and the execution owner's
+        current identity, and starts, ticks, retries or reserves nothing. The
+        payload is the execution builder's own; a motion the native preview
+        cannot evaluate exactly raises ``ProgramMotionPreviewUnavailableError``
+        instead of being approximated.
+        """
+
+        if not isinstance(identity, NodeAttemptIdentity):
+            raise TypeError("motion preview requires one node-attempt identity")
+        if node_id not in _MOTION_NODE_IDS and node_id not in _INTERRUPT_MOTION_NODE_IDS:
+            raise ProgramMotionPreviewUnavailableError(
+                "node_motion_preview_unsupported",
+                f"node {node_id!r} has no native motion preview",
+            )
+        try:
+            context = self._context(identity.program_run_id)
+        except ProductionPortError as error:
+            raise ProgramMotionPreviewUnavailableError(
+                "program_run_context_unavailable", str(error)
+            ) from error
+        preview_request_id = _text(request_id, field="request_id")
+        participant = program_motion_participant(
+            node_id,
+            parameters,
+            targets=context.targets,
+            contact_grasps=context.contact_grasps,
+            active_tcp=active_tcp,
+            move_id=_request_identity(
+                "preview-move",
+                identity.program_run_id,
+                identity.node_attempt_id,
+                preview_request_id,
+            ),
+        )
+        # The native preview plans only an already-resolved absolute target in
+        # the moving robot's base frame. Relative and other-frame goals are
+        # resolved against observed state at execution admission only.
+        if participant.payload["target_mode"] != "absolute":
+            raise ProgramMotionPreviewUnavailableError(
+                "relative_motion_preview_unsupported",
+                "the native motion preview cannot resolve a relative target; "
+                "execution resolves it only at motion admission",
+            )
+        if "goal_frame_reference" in participant.payload:
+            raise ProgramMotionPreviewUnavailableError(
+                "goal_frame_motion_preview_unsupported",
+                "the native motion preview cannot resolve a goal stated outside "
+                "the moving robot's base frame; execution resolves it only at "
+                "motion admission",
+            )
+        try:
+            owner_epoch = self._owner_status(context)
+        except Exception as error:
+            raise ProgramMotionPreviewUnavailableError(
+                "execution_owner_unavailable", _owner_failure_message(error)
+            ) from error
+        previewed: dict[str, Any] = {
+            "component_role_id": participant.target.component_role_id,
+            "target_role_id": participant.target.target_role_id,
+            "required_capability_id": "execution.trajectory.execute",
+            # Preview is not node work: no span.
+            "action_span": None,
+            "payload": dict(participant.payload),
+        }
+        if node_id in _INTERRUPT_MOTION_NODE_IDS:
+            # The original node context: the Core projects the captured
+            # node's rule into the preview exactly as at execution.
+            previewed["execution_scope"] = {
+                "node_instance_id": identity.node_instance_id,
+                "node_attempt_id": identity.node_attempt_id,
+            }
+        intent = self._operation_intent(
+            context,
+            request_id=preview_request_id,
+            owner_epoch=owner_epoch,
+            participants=[previewed],
+            coordination_policy="independent",
+        )
+        return participant, intent
+
+    def _gripper_descriptor(
+        self,
+        context: _BoundContext,
+        target: _TargetBinding,
+        *,
+        expected_owner_epoch: str,
+    ) -> Mapping[str, Any]:
+        """Read the already bound target's retained configuration before effects."""
+        if expected_owner_epoch != context.request_owner_epoch:
+            raise ProductionPortError("gripper descriptor owner changed since Program capture")
+        envelope = self._kernel.targets()
+        owner = _mapping(envelope.get("identity"), field="preset owner identity")
+        if (
+            owner.get("owner_epoch") != expected_owner_epoch
+            or owner.get("graph_revision") != context.capture.graph_revision
+            or owner.get("retained_bundle_id") != context.capture.retained_bundle_id
+        ):
+            raise ProductionPortError("gripper preset owner and captured deployment disagree")
+        inventory = _mapping(envelope.get("targets"), field="execution targets")
+        if inventory.get("schema_version") != "manyforge.execution_targets.v3":
+            raise ProductionPortError("gripper preset target inventory is unsupported")
+        components = [
+            _mapping(row, field="preset component")
+            for row in _sequence(inventory.get("components"), field="preset components")
+        ]
+        selected = [row for row in components if
+                    row.get("controllable_component_id") == target.controllable_component_id]
+        if len(selected) != 1:
+            raise ProductionPortError("gripper preset has no unique bound component")
+        targets = [
+            _mapping(row, field="preset target")
+            for row in _sequence(selected[0].get("targets"), field="preset targets")
+        ]
+        selected_targets = [row for row in targets if
+                            row.get("command_target_id") == target.command_target_id
+                            and row.get("operation_capability_id") == "tool.gripper.command"]
+        if len(selected_targets) != 1 or selected_targets[0].get("presentation") != "gripper":
+            raise ProductionPortError("gripper preset has no unique bound command target")
+        command = _mapping(selected_targets[0].get("command"), field="preset command")
+        descriptor = _mapping(command.get("target_descriptor"), field="gripper preset descriptor")
+        schema = _mapping(target.capabilities["tool.gripper.command"].get("command_schema"),
+                          field="captured gripper command schema")
+        contracts = _mapping(descriptor.get("contracts"), field="preset contracts")
+        if (
+            descriptor.get("schema_version") != "manyforge.manual_control_gripper_descriptor.v3"
+            or descriptor.get("controllable_component_id") != target.controllable_component_id
+            or descriptor.get("command_target_id") != target.command_target_id
+            or descriptor.get("source_kind") != "model_role"
+            or command.get("command_schema_id") != schema.get("command_schema_id")
+            or command.get("command_schema_revision") != schema.get("command_schema_revision")
+            or contracts.get("command_schema") != schema
+        ):
+            raise ProductionPortError("gripper preset descriptor crosses its retained binding")
+        # Nulls are the existing explicitly unconfigured legacy descriptor,
+        # never an inferred pneumatic kind. Missing fields are not that class.
+        fields = ("actuation_kind", "output_mode", "completion_policy",
+                  "grasp_confirmation_policy", "command_duration_s")
+        if any(key not in descriptor for key in fields):
+            raise ProductionPortError("gripper descriptor omits configured semantics")
+        configuration = tuple(descriptor[key] for key in fields[:4])
+        if configuration == (None, None, None, None):
+            if descriptor["command_duration_s"] is not None:
+                raise ProductionPortError("unconfigured gripper has a configured duration")
+        elif configuration not in (
+            ("position_commanded", "commanded", "goal_fenced_target_reached", "binding_feedback_required"),
+            ("pneumatic", "commanded", "output_delivery", "not_required"),
+            ("pneumatic", "none", "no_output", "not_required"),
+        ) and not (
+            configuration == ("pneumatic", "commanded", "no_output", "not_required")
+            and target.pneumatic_io is not None
+        ):
+            raise ProductionPortError("gripper descriptor has no complete configured output semantics")
+        else:
+            duration = _number(descriptor["command_duration_s"], field="gripper command duration")
+            if duration < 0 or (configuration[0] == "position_commanded" and duration == 0):
+                raise ProductionPortError("gripper configured duration is invalid")
+        lower = _number(descriptor.get("min_position"), field="gripper minimum position")
+        upper = _number(descriptor.get("max_position"), field="gripper maximum position")
+        if lower > upper or (descriptor.get("coordinate_kind"), descriptor.get("unit")) not in {
+            ("angular_rad", "rad"), ("linear_m", "m"),
+        }:
+            raise ProductionPortError("gripper descriptor limits or coordinate unit are invalid")
+        return descriptor
+
+    @staticmethod
+    def _named_gripper_position(
+        descriptor: Mapping[str, Any], position: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if (set(position) != {"kind", "name"}
+            or not isinstance(position.get("name"), str)
+            or position["name"] not in {"open", "closed"}):
+            raise ProductionPortError("gripper named preset must be the open or closed alias")
+        if descriptor["actuation_kind"] is None:
+            raise ProductionPortError("gripper preset has no complete configured output semantics")
+        reference = _text(descriptor.get(f"{position['name']}_state_ref"), field="gripper state reference")
+        presets = [
+            _mapping(row, field="named gripper preset")
+            for row in _sequence(descriptor.get("named_presets"), field="named gripper presets")
+        ]
+        matches = [row for row in presets if row.get("name") == reference]
+        if len(matches) != 1:
+            raise ProductionPortError("gripper alias has no unique configured model preset")
+        value = _number(matches[0].get("master_position"), field="gripper preset master position")
+        lower = _number(descriptor.get("min_position"), field="gripper minimum position")
+        upper = _number(descriptor.get("max_position"), field="gripper maximum position")
+        if not lower <= value <= upper:
+            raise ProductionPortError("gripper preset is outside its retained limits")
+        kind = descriptor.get("coordinate_kind")
+        if kind == "angular_rad" and descriptor.get("unit") == "rad":
+            return {"kind": "angular_rad", "value_rad": value}
+        if kind == "linear_m" and descriptor.get("unit") == "m":
+            return {"kind": "linear_m", "value_m": value}
+        raise ProductionPortError("gripper preset coordinate kind and unit disagree")
+
+    def _gripper_payload(
+        self,
+        parameters: Mapping[str, Any],
+        identity: NodeAttemptIdentity,
+        *,
+        expected_owner_epoch: str,
+        capture_timing: bool = False,
+    ) -> tuple[_BoundContext, _TargetBinding, dict[str, Any],
+               tuple[str | None, float | None, Mapping[str, Any] | None]]:
+        context = self._context(identity.program_run_id)
+        target_role_id = _text(parameters.get("target_role"), field="target_role")
+        target = self._target(context, target_role_id, "tool.gripper.command")
+        capability = target.capabilities["tool.gripper.command"]
+        command_schema = _mapping(capability.get("command_schema"), field="gripper command_schema")
+        schema_id = _text(command_schema.get("command_schema_id"), field="command_schema_id")
+        schema_revision = _text(
+            command_schema.get("command_schema_revision"),
+            field="command_schema_revision",
+        )
+        position = dict(_mapping(parameters.get("position"), field="position"))
+        actuation, dwell, grasp_check = None, None, None
+        # Numeric planning preflight shares this payload builder, but is not
+        # itself a Program gripper command. Preserve that existing read scope.
+        if capture_timing or position.get("kind") == "named_preset":
+            descriptor = self._gripper_descriptor(
+                context, target, expected_owner_epoch=expected_owner_epoch,
+            )
+            actuation = descriptor["actuation_kind"]
+            if capture_timing and actuation == "pneumatic":
+                dwell = _number(parameters.get("command_duration_s", descriptor["command_duration_s"]),
+                                field="gripper Program dwell")
+                if dwell < 0:
+                    raise ProductionPortError("pneumatic Program dwell cannot be negative")
+            if position.get("kind") == "named_preset":
+                position = self._named_gripper_position(descriptor, position)
+            if capture_timing and descriptor.get("grasp_confirmation") == "required":
+                grasp_check = self._grasp_confirmation_check(descriptor, target, position)
+        max_effort_value = parameters.get("max_effort")
+        max_effort = (
+            None
+            if max_effort_value is None
+            else dict(_mapping(max_effort_value, field="max_effort"))
+        )
+        return (
+            context,
+            target,
+            {
+                "kind": "capability_command",
+                "command_schema_id": schema_id,
+                "command_schema_revision": schema_revision,
+                "command_value": {
+                    "kind": "gripper_position",
+                    "position": position,
+                    "max_effort": max_effort,
+                },
+                "completion_timeout_s": parameters["completion_timeout_s"],
+                "caller_options": [
+                    {
+                        "option_id": "command_duration_s",
+                        "value_s": parameters.get("command_duration_s", 0.0),
+                    },
+                    # GRP-2: absent means false (complete on the controller's result).
+                    *(
+                        [{"option_id": "wait_for_duration", "value_bool": True}]
+                        if parameters.get("wait_for_duration", False) is True
+                        else []
+                    ),
+                ],
+            },
+            (actuation, dwell, grasp_check),
+        )
+
+    def _grasp_confirmation_check(
+        self, descriptor: Mapping[str, Any], target: _TargetBinding, position: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        """The evidence read for a Close of a gripper whose policy is `required`.
+
+        None for an Open. A pneumatic gripper reads its mapped
+        `workpiece_grasped` input; a position gripper its stall-window evidence.
+        """
+        opened = self._named_gripper_position(descriptor, {"kind": "named_preset", "name": "open"})
+        closed = self._named_gripper_position(descriptor, {"kind": "named_preset", "name": "closed"})
+        field_name = "value_rad" if opened["kind"] == "angular_rad" else "value_m"
+        wanted = _number(position.get(field_name), field="gripper position")
+        # The same Open/Close split as the pneumatic route: nearer to open is an Open.
+        if abs(wanted - opened[field_name]) < abs(wanted - closed[field_name]):
+            return None
+        if descriptor["actuation_kind"] == "pneumatic":
+            route = _mapping(target.pneumatic_io, field="captured pneumatic route")
+            rows = [row for row in route.get("inputs", ()) if row.get("input") == "workpiece_grasped"]
+            if len(rows) != 1:
+                raise ProductionPortError("grasp confirmation has no workpiece_grasped input")
+            return {"node_id": "io.check_input", "parameters": {
+                "target_role": _text(rows[0].get("target_role_id"), field="pneumatic input target"),
+                "resource_role": _text(rows[0].get("resource_role_id"), field="pneumatic input resource"),
+                "expected_value": True}}
+        return {"node_id": "gripper.check_status", "parameters": {
+            "target_role": target.target_role_id, "expected_state": "reached"}}
+
+    @staticmethod
+    def _pick_synthesis(
+        parameters: Mapping[str, Any],
+        *,
+        target_role_id: str,
+        base_frame_role_id: str,
+        targets: Mapping[str, _TargetBinding],
+    ) -> dict[str, Any]:
+        synthesis = _mapping(parameters.get("synthesis"), field="synthesis")
+
+        def envelope(name: str) -> dict[str, list[float]]:
+            value = _mapping(synthesis.get(name), field=f"synthesis.{name}")
+            return {
+                key: [
+                    _number(item, field=f"synthesis.{name}.{key}[{index}]")
+                    for index, item in enumerate(
+                        _sequence(
+                            value.get(key),
+                            field=f"synthesis.{name}.{key}",
+                            length=3,
+                        )
+                    )
+                ]
+                for key in (
+                    "position_min_m",
+                    "position_max_m",
+                    "orientation_rpy_min_deg",
+                    "orientation_rpy_max_deg",
+                )
+            }
+
+        def reference(name: str) -> dict[str, Any] | None:
+            # Pick offsets accept every motion-reference form, resolved by the
+            # native owner like a motion reference.
+            return _reference(
+                synthesis.get(name),
+                field=f"synthesis.{name}",
+                target_role_id=target_role_id,
+                base_frame_role_id=base_frame_role_id,
+                targets=targets,
+            )
+
+        base_orientation = synthesis.get("base_tool_orientation_rpy_deg", (180.0, 0.0, 0.0))
+        return {
+            "pick_offset_envelope": envelope("pick_offset_envelope"),
+            "approach_offset_envelope": envelope("approach_offset_envelope"),
+            "pick_offset_reference": reference("pick_offset_reference"),
+            "approach_offset_reference": reference("approach_offset_reference"),
+            "base_tool_orientation_rpy_deg": [
+                _number(value, field=f"base_tool_orientation_rpy_deg[{index}]")
+                for index, value in enumerate(
+                    _sequence(
+                        base_orientation,
+                        field="base_tool_orientation_rpy_deg",
+                        length=3,
+                    )
+                )
+            ],
+            "translation_step_m": _number(
+                synthesis.get("translation_step_m", 0.01),
+                field="translation_step_m",
+            ),
+            "rotation_step_deg": _number(
+                synthesis.get("rotation_step_deg", 15.0),
+                field="rotation_step_deg",
+            ),
+            "force_vertical_pick": synthesis.get("force_vertical_pick", False),
+            "min_tcp_z_m": synthesis.get("min_tcp_z_m"),
+            "maximum_candidate_count": synthesis.get("maximum_candidate_count", 4096),
+            "search_strategy": synthesis.get("search_strategy", "first_feasible"),
+        }
+
+    @staticmethod
+    def _phase_motion_payload(
+        *,
+        identity: NodeAttemptIdentity,
+        parameters: Mapping[str, Any],
+        phase: str,
+        motion: Mapping[str, Any],
+        tcp_endpoint: Mapping[str, Any],
+        contact_policy_id: str | None = None,
+        runtime_object_id: str | None = None,
+        selected_object_id: str | None = None,
+    ) -> dict[str, Any]:
+        options = _mapping(parameters.get("motion_options", {}), field="motion_options")
+        velocity_key = {
+            "approach": "approach_velocity_scale",
+            "descend": "descend_velocity_scale",
+            "retreat": "retreat_velocity_scale",
+        }[phase]
+        runtime_bindings = []
+        if runtime_object_id is not None or selected_object_id is not None:
+            if runtime_object_id is None or selected_object_id is None:
+                raise ProductionPortError("pick runtime-object binding is incomplete")
+            runtime_bindings = [
+                {
+                    "runtime_object_id": runtime_object_id,
+                    "scene_resource_id": selected_object_id,
+                }
+            ]
+        return {
+            "kind": "motion",
+            "move_id": _request_identity(
+                "pick-place-move",
+                identity.program_run_id,
+                identity.node_attempt_id,
+                phase,
+            ),
+            "base_frame_role_id": _text(parameters.get("base_frame_role"), field="base_frame_role"),
+            "tcp_endpoint": dict(tcp_endpoint),
+            "tolerances": {
+                "joint_position_tol_rad": options.get("joint_position_tol_rad", 0.05),
+                "translation_tol_m": options.get("translation_tol_m", 0.005),
+                "rotation_tol_rad": options.get("rotation_tol_rad", 0.05),
+            },
+            "speed_profile": {
+                "velocity_scale": options.get(velocity_key, 0.35),
+                "acceleration_scale": options.get("acceleration_scale", 1.0),
+                "max_tcp_linear_speed_mps": options.get("max_tcp_linear_speed_mps"),
+            },
+            "timeouts": {
+                "planning_timeout_s": options.get("planning_timeout_s", 2.0),
+                "execution_timeout_s": options.get("execution_timeout_s", 10.0),
+            },
+            "cache_mode": options.get("cache_mode", "disable"),
+            **(
+                {"planner": _planner_override(parameters["planner"])}
+                if parameters.get("planner") is not None
+                else {}
+            ),
+            "target_mode": "absolute",
+            "target_reference": None,
+            "offset_reference": None,
+            "motion": dict(motion),
+            "contact_policy_id": contact_policy_id,
+            "per_joint_dynamics_limits": {},
+            "motion_interrupt_scopes": [],
+            "runtime_object_bindings": runtime_bindings,
+        }
+
+    @staticmethod
+    def _cartesian_motion(
+        waypoints: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "kind": "cartesian_path",
+            "waypoints": [dict(waypoint) for waypoint in waypoints],
+            "max_translation_step_m": 0.005,
+            "max_rotation_step_rad": 0.05,
+            "max_angular_speed_rad_s": 0.5,
+            "max_linear_acceleration_mps2": 0.5,
+            "max_angular_acceleration_rad_s2": 2.5,
+            "fallback_policy": "fail_closed",
+            "blend_radii_m": [0.0] * len(waypoints),
+        }
+
+    @staticmethod
+    def _phase_operation(
+        *,
+        context: _BoundContext,
+        target: _TargetBinding,
+        capability_id: str,
+        payload: Mapping[str, Any],
+        identity: NodeAttemptIdentity,
+        owner_epoch: str,
+        phase: str,
+    ) -> dict[str, Any]:
+        child_attempt_id = f"{identity.node_attempt_id}:{phase}"
+        span = ActionSpan(
+            action_source="program_node",
+            action_span_id=child_attempt_id,
+            program_run_id=identity.program_run_id,
+            node_instance_id=f"{identity.node_instance_id}/{phase}",
+            node_attempt_id=child_attempt_id,
+            parent_node_attempt_id=identity.node_attempt_id,
+        )
+        return {
+            "request_context": {
+                "request_id": _request_identity(
+                    "pick-place-phase",
+                    identity.program_run_id,
+                    identity.node_attempt_id,
+                    phase,
+                ),
+                "request_owner_epoch": owner_epoch,
+                "source_label": "manyforge_behavior",
+                "correlation_id": identity.program_run_id,
+            },
+            "program_id": context.capture.program_id,
+            "program_revision": context.capture.program_revision,
+            "program_binding_id": context.capture.program_binding_id,
+            "program_run_id": context.capture.program_run_id,
+            "expected_graph_revision": context.capture.graph_revision,
+            "expected_retained_bundle_id": context.capture.retained_bundle_id,
+            "expected_scene_revision": None,
+            "participants": [
+                {
+                    "component_role_id": target.component_role_id,
+                    "target_role_id": target.target_role_id,
+                    "required_capability_id": capability_id,
+                    "action_span": span.as_request(),
+                    "execution_scope": {
+                        "node_instance_id": identity.node_instance_id,
+                        "node_attempt_id": identity.node_attempt_id,
+                    },
+                    "payload": dict(payload),
+                }
+            ],
+            "coordination_policy": "independent",
+        }
+
+    def _pick_place_intent(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        parameters: Mapping[str, Any],
+        active_tcp: Any = None,
+    ) -> tuple[str, str, dict[str, Any]]:
+        context = self._context(identity.program_run_id)
+        target_role_id = _text(parameters.get("target_role"), field="target_role")
+        arm = self._target(
+            context,
+            target_role_id,
+            "execution.trajectory.execute",
+        )
+        tool_role_id = _text(parameters.get("tool_target_role"), field="tool_target_role")
+        tool = self._target(context, tool_role_id, "tool.gripper.command")
+        owner_epoch = self._owner_status(context)
+        selected_object_id = _text(parameters.get("selected_object_id"), field="selected_object_id")
+        kind = "place" if node_id == "planning.plan_place_sequence" else "pick"
+        sequence_id = _request_identity(
+            kind,
+            identity.program_run_id,
+            identity.node_attempt_id,
+        )
+
+        identity_pose = {
+            "position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        }
+        if kind == "pick":
+            contact_policy_id = _text(
+                parameters.get("contact_policy_id"), field="contact_policy_id"
+            )
+            try:
+                contact = context.contact_grasps[contact_policy_id]
+            except KeyError as exc:
+                raise ProductionPortError(
+                    "Program Binding has no exact pick contact-grasp policy"
+                ) from exc
+            if contact.mode != "contact_grasp":
+                raise ProductionPortError("pick requires a contact-grasp policy")
+            approach_motion: Mapping[str, Any] = {
+                "kind": "pose_goal",
+                "goal": identity_pose,
+            }
+            descend_motion = self._cartesian_motion((identity_pose, identity_pose))
+            retreat_motion = self._cartesian_motion((identity_pose, identity_pose))
+            synthesis = self._pick_synthesis(
+                parameters,
+                target_role_id=target_role_id,
+                base_frame_role_id=_text(
+                    parameters.get("base_frame_role"), field="base_frame_role"
+                ),
+                targets=context.targets,
+            )
+        else:
+            contact_policy_id = None
+            contact = None
+            place_pose = _base_framed_pose3(
+                parameters.get("place_pose"),
+                field="place_pose",
+                target_role_id=target_role_id,
+                base_frame_role_id=_text(
+                    parameters.get("base_frame_role"), field="base_frame_role"
+                ),
+            )
+            offset = [
+                _number(value, field=f"approach_offset_m[{index}]")
+                for index, value in enumerate(
+                    _sequence(
+                        parameters.get("approach_offset_m", (0.0, 0.0, 0.05)),
+                        field="approach_offset_m",
+                        length=3,
+                    )
+                )
+            ]
+            approach_pose = {
+                "position_m": {
+                    axis: place_pose["position_m"][axis] + offset[index]
+                    for index, axis in enumerate(("x_m", "y_m", "z_m"))
+                },
+                "orientation": dict(place_pose["orientation"]),
+            }
+            approach_motion = {"kind": "pose_goal", "goal": approach_pose}
+            descend_motion = self._cartesian_motion((approach_pose, place_pose))
+            retreat_motion = self._cartesian_motion((place_pose, approach_pose))
+            synthesis = None
+
+        tcp_endpoint = _motion_tcp_payload(
+            parameters, targets=context.targets, active_tcp=active_tcp
+        )["tcp_endpoint"]
+        phase_payloads = {
+            "approach": self._phase_motion_payload(
+                identity=identity,
+                parameters=parameters,
+                tcp_endpoint=tcp_endpoint,
+                phase="approach",
+                motion=approach_motion,
+            ),
+            "descend": self._phase_motion_payload(
+                identity=identity,
+                parameters=parameters,
+                tcp_endpoint=tcp_endpoint,
+                phase="descend",
+                motion=descend_motion,
+                contact_policy_id=contact_policy_id,
+                runtime_object_id=(None if contact is None else contact.runtime_object_id),
+                selected_object_id=(None if contact is None else selected_object_id),
+            ),
+            "retreat": self._phase_motion_payload(
+                identity=identity,
+                parameters=parameters,
+                tcp_endpoint=tcp_endpoint,
+                phase="retreat",
+                motion=retreat_motion,
+            ),
+        }
+        _tool_context, _tool_target, tool_payload, _tool_timing = self._gripper_payload(
+            {
+                "target_role": tool_role_id,
+                "position": parameters.get("tool_position"),
+                "max_effort": parameters.get("tool_max_effort"),
+                "command_duration_s": parameters.get("tool_command_duration_s", 0.0),
+                "completion_timeout_s": parameters.get("tool_completion_timeout_s", 30.0),
+            },
+            identity,
+            expected_owner_epoch=owner_epoch,
+        )
+        operations = {
+            phase: self._phase_operation(
+                context=context,
+                target=(tool if phase == "tool" else arm),
+                capability_id=(
+                    "tool.gripper.command" if phase == "tool" else "execution.trajectory.execute"
+                ),
+                payload=(tool_payload if phase == "tool" else phase_payloads[phase]),
+                identity=identity,
+                owner_epoch=owner_epoch,
+                phase=phase,
+            )
+            for phase in ("approach", "descend", "tool", "retreat")
+        }
+        intent = {
+            "sequence_id": sequence_id,
+            "selected_object_id": selected_object_id,
+            "carrier_frame_role_id": _text(
+                parameters.get("carrier_frame_role"),
+                field="carrier_frame_role",
+            ),
+            "approach_operation": operations["approach"],
+            "descend_operation": operations["descend"],
+            "tool_operation": operations["tool"],
+            "retreat_operation": operations["retreat"],
+        }
+        if kind == "pick":
+            intent["selected_runtime_object_id"] = contact.runtime_object_id
+            intent["synthesis"] = synthesis
+        return kind, selected_object_id, intent
+
+    @staticmethod
+    def _validated_planning_result(
+        response: Mapping[str, Any],
+        *,
+        sequence_id: str,
+        kind: str,
+        selected_object_id: str,
+    ) -> dict[str, Any]:
+        result = dict(_mapping(response.get("planning_result"), field="planning_result"))
+        status = result.get("status")
+        if (
+            result.get("schema_version") != "manyforge.pick_place_planning_result.v1"
+            or result.get("sequence_id") != sequence_id
+            or result.get("kind") != kind
+            or result.get("selected_object_id") != selected_object_id
+            or status not in {"planned", "no_feasible_candidate"}
+            or type(result.get("attempted_candidate_count")) is not int
+            or result["attempted_candidate_count"] < 0
+            or not isinstance(result.get("reports"), list)
+            or (status == "planned") != isinstance(result.get("plan"), Mapping)
+        ):
+            raise ProductionPortError("pick/place planning response changed its public identity")
+        return result
+
+    @staticmethod
+    def _no_feasible_candidate_message(
+        planning: Mapping[str, Any],
+    ) -> str:
+        prefix = "No feasible pick/place candidate was found"
+        reports = planning.get("reports")
+        if not isinstance(reports, (list, tuple)):
+            return prefix
+        for report in reversed(reports):
+            if not isinstance(report, Mapping):
+                continue
+            stages = report.get("stages")
+            if not isinstance(stages, (list, tuple)):
+                continue
+            for stage in reversed(stages):
+                if not isinstance(stage, Mapping) or stage.get("succeeded") is not False:
+                    continue
+                error = stage.get("error")
+                if not isinstance(error, Mapping):
+                    continue
+                stage_name = stage.get("stage")
+                code = error.get("code")
+                message = error.get("message")
+                details = error.get("details")
+                reason = details.get("reason") if isinstance(details, Mapping) else None
+                diagnostic = next(
+                    (
+                        value
+                        for value in (message, reason, code)
+                        if isinstance(value, str) and value
+                    ),
+                    None,
+                )
+                if diagnostic is None:
+                    continue
+                stage_text = (
+                    f" at {stage_name}" if isinstance(stage_name, str) and stage_name else ""
+                )
+                return f"{prefix}; last rejection{stage_text}: {diagnostic}"[:4_096]
+        return prefix
+
+    @staticmethod
+    def _portable_pick_place_planning_output(
+        planning: Mapping[str, Any],
+        *,
+        target_role_id: str,
+        base_frame_role_id: str,
+        tool_position: object,
+    ) -> dict[str, Any]:
+        """Expose the validated geometry to ordinary subtree children."""
+
+        plan = _mapping(planning.get("plan"), field="plan")
+
+        def stored_pose(value: object, *, field: str) -> dict[str, Any]:
+            pose = _mapping(value, field=field)
+            position = _mapping(pose.get("position_m"), field=f"{field}.position_m")
+            orientation = _mapping(
+                pose.get("orientation"),
+                field=f"{field}.orientation",
+            )
+            return {
+                "frame_ref": {
+                    "kind": "target_frame",
+                    "target_role": target_role_id,
+                    "frame_role": base_frame_role_id,
+                },
+                "position_m": [
+                    _number(position.get(axis), field=f"{field}.position_m.{axis}")
+                    for axis in ("x_m", "y_m", "z_m")
+                ],
+                "orientation": {
+                    "xyzw": [
+                        _number(
+                            orientation.get(axis),
+                            field=f"{field}.orientation.{axis}",
+                        )
+                        for axis in ("x", "y", "z", "w")
+                    ]
+                },
+            }
+
+        approach = _mapping(plan.get("approach_motion"), field="approach_motion")
+        descend = _mapping(plan.get("descend_motion"), field="descend_motion")
+        retreat = _mapping(plan.get("retreat_motion"), field="retreat_motion")
+        if approach.get("kind") != "pose_goal":
+            raise ProductionPortError("pick/place approach is not a pose goal")
+        if descend.get("kind") != "cartesian_path" or retreat.get("kind") != "cartesian_path":
+            raise ProductionPortError("pick/place descend and retreat are not Cartesian paths")
+
+        def path(value: Mapping[str, Any], *, field: str) -> list[dict[str, Any]]:
+            waypoints = _sequence(value.get("waypoints"), field=f"{field}.waypoints")
+            if len(waypoints) < 2:
+                raise ProductionPortError(f"{field}.waypoints must contain at least two poses")
+            return [
+                stored_pose(waypoint, field=f"{field}.waypoints[{index}]")
+                for index, waypoint in enumerate(waypoints)
+            ]
+
+        descend_path = path(descend, field="descend_motion")
+        retreat_path = path(retreat, field="retreat_motion")
+
+        approach_pose = stored_pose(
+            approach.get("goal"), field="approach_motion.goal"
+        )
+        return {
+            "approach_pose": approach_pose,
+            "descend_path": descend_path,
+            "pick_pose": descend_path[-1],
+            "retreat_path": retreat_path,
+            "retreat_pose": retreat_path[-1],
+            "selected_object_id": _text(
+                planning.get("selected_object_id"),
+                field="selected_object_id",
+            ),
+            "tool_position": dict(_mapping(tool_position, field="tool_position")),
+        }
+
+    def _start_pick_place_planning(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot:
+        if node_id not in {
+            "planning.plan_pick_sequence",
+            "planning.plan_place_sequence",
+        }:
+            raise ProductionPortError(f"pick/place planner does not implement {node_id!r}")
+        kind, selected_object_id, intent = self._pick_place_intent(
+            node_id,
+            identity,
+            inputs.parameters,
+            inputs.blackboard.get("active_tcp"),
+        )
+        self._require_scope_open(identity.program_run_id)
+        if kind == "pick" and self._scene_pose_source_latch is not None:
+            self._scene_pose_source_latch(
+                identity,
+                scene_resource_ids=(selected_object_id,),
+            )
+            context = self._context(identity.program_run_id)
+            current_owner_epoch = self._owner_status(context)
+            for phase in ("approach", "descend", "tool", "retreat"):
+                operation = intent.get(f"{phase}_operation")
+                if not isinstance(operation, dict):
+                    raise ProductionPortError(f"pick {phase} operation is invalid")
+                request_context = operation.get("request_context")
+                if (
+                    not isinstance(request_context, Mapping)
+                    or request_context.get("request_owner_epoch") != current_owner_epoch
+                ):
+                    raise ProductionPortError(
+                        "Kernel owner changed during between-nodes pose latching"
+                    )
+        response = (
+            self._kernel.plan_pick(intent)
+            if kind == "pick"
+            else self._kernel.plan_place(intent)
+        )
+        response_value = _mapping(response, field="pick/place response")
+        planning = self._validated_planning_result(
+            response_value,
+            sequence_id=intent["sequence_id"],
+            kind=kind,
+            selected_object_id=selected_object_id,
+        )
+        metadata: dict[str, Any] = {
+            "sequence_id": intent["sequence_id"],
+            "planning_result": planning,
+        }
+        if planning["status"] == "no_feasible_candidate":
+            if kind == "pick":
+                metadata.update(
+                    {
+                        "authored_failure_policy": inputs.parameters.get(
+                            "no_feasible_plan_policy", "pause_for_operator"
+                        ),
+                        "authored_failure_policy_parameter": "no_feasible_plan_policy",
+                    }
+                )
+            snapshot = OwnerTaskSnapshot(
+                task_id=intent["sequence_id"],
+                state=OwnerTaskState.FAILED,
+                metadata=metadata,
+                reason_code="no_feasible_candidate",
+                message=self._no_feasible_candidate_message(planning),
+                settlement_proven=True,
+            )
+        else:
+            snapshot = OwnerTaskSnapshot(
+                task_id=intent["sequence_id"],
+                state=OwnerTaskState.SUCCEEDED,
+                output=self._portable_pick_place_planning_output(
+                    planning,
+                    target_role_id=_text(
+                        inputs.parameters.get("target_role"), field="target_role"
+                    ),
+                    base_frame_role_id=_text(
+                        inputs.parameters.get("base_frame_role"),
+                        field="base_frame_role",
+                    ),
+                    tool_position=intent["tool_operation"]["participants"][0]["payload"][
+                        "command_value"
+                    ]["position"],
+                ),
+                metadata=metadata,
+                settlement_proven=True,
+            )
+        task = _OperationTask(
+            identity, node_id, intent["sequence_id"], terminal=snapshot
+        )
+        with self._lock:
+            current = self._tasks.get(task.task_id)
+            if current is not None and current != task:
+                raise ProductionPortError("pick/place planning task identity was reused")
+            if current is None:
+                if len(self._tasks) >= _MAX_TASKS:
+                    raise ProductionPortError("native task retention is full")
+                self._tasks[task.task_id] = task
+            else:
+                task = current
+        assert task.terminal is not None
+        return task.terminal
+
+    def _start(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot:
+        if not isinstance(identity, NodeAttemptIdentity):
+            raise TypeError("operation start requires one node-attempt identity")
+        if not isinstance(inputs, OwnerNodeInputs):
+            raise TypeError("operation start requires immutable owner inputs")
+        if node_id in {
+            "planning.plan_pick_sequence",
+            "planning.plan_place_sequence",
+        }:
+            return self._start_pick_place_planning(node_id, identity, inputs)
+        preset_owner_status: str | None = None
+        gripper_timing = None
+        if node_id in _MOTION_NODE_IDS or node_id in _INTERRUPT_MOTION_NODE_IDS:
+            context, target, payload = self._motion_payload(node_id, inputs.parameters, identity, inputs.blackboard.get("active_tcp"))
+            capability_id = "execution.trajectory.execute"
+        elif node_id == "motion.set_tcp":
+            context = self._context(identity.program_run_id)
+            role = _text(inputs.parameters.get("target_role"), field="target_role")
+            target = self._target(context, role,
+                                  "execution.trajectory.execute")
+            selector = _mapping(inputs.parameters.get("tcp"), field="tcp")
+            tcp = _tcp_selector_payload(
+                selector, targets=context.targets,
+                active_tcp=inputs.blackboard.get("active_tcp"),
+                active_tcp_key=f"active_tcp.{role}",
+            )
+            payload = {"kind": "set_tcp", "tcp": tcp}
+            capability_id = "execution.trajectory.execute"
+        elif node_id == "gripper.command_position":
+            context = self._context(identity.program_run_id)
+            self._require_scope_open(identity.program_run_id)
+            preset_owner_status = self._owner_status(context)
+            context, target, payload, gripper_timing = self._gripper_payload(
+                inputs.parameters, identity, expected_owner_epoch=preset_owner_status, capture_timing=True,
+            )
+            capability_id = "tool.gripper.command"
+        else:
+            raise ProductionPortError(f"Kernel operation port does not implement {node_id!r}")
+        span = ActionSpan(
+            action_source="program_node",
+            action_span_id=identity.node_attempt_id,
+            program_run_id=identity.program_run_id,
+            node_instance_id=identity.node_instance_id,
+            node_attempt_id=identity.node_attempt_id,
+            parent_node_attempt_id=identity.parent_node_attempt_id,
+        )
+        participant = {
+            "component_role_id": target.component_role_id,
+            "target_role_id": target.target_role_id,
+            "required_capability_id": capability_id,
+            "action_span": span.as_request(),
+            "execution_scope": {
+                "node_instance_id": identity.node_instance_id,
+                "node_attempt_id": identity.node_attempt_id,
+            },
+            "payload": payload,
+        }
+        self._require_scope_open(identity.program_run_id)
+        if node_id in _MOTION_NODE_IDS or node_id in _INTERRUPT_MOTION_NODE_IDS:
+            self._latch_motion_between_nodes(identity, payload)
+        owner_epoch = preset_owner_status or self._owner_status(context)
+        request_id = _request_identity("program-node", identity.program_run_id, identity.node_attempt_id)
+        operation_intent = self._operation_intent(
+            context,
+            request_id=request_id,
+            owner_epoch=owner_epoch,
+            participants=[participant],
+            coordination_policy="independent",
+        )
+        immediate_failure: KernelImmediateStepFailedError | None = None
+        try:
+            try:
+                accepted = self._kernel.execute(operation_intent)
+            except KernelImmediateStepFailedError as error:
+                if node_id != "motion.set_tcp":
+                    raise
+                immediate_failure = error
+                accepted = {"active_tcp": error.active_tcp}
+            if node_id == "motion.set_tcp":
+                if immediate_failure is None:
+                    receipt = _mapping(accepted.get("accepted"), field="acceptance")
+                    if receipt.get("request_id") != request_id:
+                        raise ProductionPortError("Set TCP acceptance changed request identity")
+                    _text(receipt.get("operation_id"), field="accepted.operation_id")
+                if self._active_tcp_result is None:
+                    raise ProductionPortError("Active TCP result consumer is unavailable")
+                self._active_tcp_result(identity.program_run_id, target.controllable_component_id,
+                                        accepted.get("active_tcp"))
+        except KernelOperationAdmissionRejectedError as error:
+            revision = _held_selection_revision(error)
+            if revision is not None:
+                raise OwnerInvocationHeldError(revision) from error
+            if error.code == "refused_by_priority":
+                raise OwnerInvocationRefusedByPriorityError(
+                    str(error),
+                    {
+                        key: str(error.details.get(f"winner_{key}", ""))
+                        for key in _SUCCESSOR_FIELDS
+                    },
+                ) from error
+            raise
+        except Exception as error:
+            # The owner may already have accepted the deterministic request.
+            # Keep that exact intent for destructive Reset reconciliation; a
+            # later fresh attempt must never replace its unknown outcome.
+            task_id = request_id
+            unknown = _UnknownOperationAdmission(
+                request_id,
+                owner_epoch,
+                deepcopy(operation_intent),
+                frozenset({task_id}),
+            )
+            terminal = OwnerTaskSnapshot(
+                task_id=task_id,
+                state=OwnerTaskState.FAILED,
+                reason_code="operation_admission_outcome_unknown",
+                message=str(error),
+                settlement_proven=False,
+                metadata={"request_id": request_id},
+            )
+            task = _OperationTask(
+                identity,
+                node_id,
+                task_id,
+                terminal=terminal,
+                unknown_admission=unknown,
+                tcp_robot_id=(target.controllable_component_id
+                              if node_id == "motion.set_tcp" or node_id in _MOTION_NODE_IDS
+                              or node_id in _INTERRUPT_MOTION_NODE_IDS else None),
+            )
+            with self._lock:
+                if task_id in self._tasks:
+                    raise ProductionPortError("native operation identity was reused")
+                if len(self._tasks) >= _MAX_TASKS:
+                    raise ProductionPortError("native operation-task retention is full")
+                self._tasks[task_id] = task
+            return terminal
+        if node_id == "motion.set_tcp":
+            # Immediate component steps return only after the atomic step ends;
+            # they are not retained for observation or acknowledgement.
+            task = _OperationTask(
+                identity, node_id, request_id,
+                terminal=(OwnerTaskSnapshot(task_id=request_id, state=OwnerTaskState.SUCCEEDED,
+                                            settlement_proven=True)
+                          if immediate_failure is None else OwnerTaskSnapshot(
+                              task_id=request_id, state=OwnerTaskState.FAILED,
+                              reason_code=immediate_failure.code, message=str(immediate_failure),
+                              details=bounded_failure_details(immediate_failure.details),
+                              settlement_proven=True)),
+            )
+            with self._lock:
+                if request_id in self._tasks:
+                    raise ProductionPortError("native operation identity was reused")
+                if len(self._tasks) >= _MAX_TASKS:
+                    raise ProductionPortError("native operation-task retention is full")
+                self._tasks[request_id] = task
+            return task.terminal
+        accepted_value = _mapping(accepted.get("accepted"), field="acceptance")
+        operation_id = _text(
+            accepted_value.get("operation_id"), field="accepted.operation_id"
+        )
+        shared = _SharedOperation(
+            operation_id,
+            owner_epoch,
+            frozenset({identity.node_attempt_id}),
+            frozenset({operation_id}),
+        )
+        task = _OperationTask(
+            identity, node_id, operation_id, shared, gripper_timing=gripper_timing,
+            submitted_intent=(deepcopy(operation_intent) if gripper_timing is not None else None),
+            acceptance=(deepcopy(dict(accepted_value)) if gripper_timing is not None else None),
+            tcp_robot_id=(target.controllable_component_id if node_id in _MOTION_NODE_IDS
+                          or node_id in _INTERRUPT_MOTION_NODE_IDS else None),
+        )
+        with self._lock:
+            current = self._tasks.get(operation_id)
+            if current is not None and current != task:
+                raise ProductionPortError("native operation identity was reused")
+            if current is None:
+                if len(self._tasks) >= _MAX_TASKS:
+                    raise ProductionPortError("native operation-task retention is full")
+                self._tasks[operation_id] = task
+        return OwnerTaskSnapshot(
+            task_id=operation_id,
+            state=OwnerTaskState.ACTIVE,
+            metadata={"operation_id": operation_id, **self._gripper_metadata(task)},
+        )
+
+    @staticmethod
+    def _gripper_metadata(task: _OperationTask) -> dict[str, Any]:
+        if task.gripper_timing is None:
+            return {}
+        kind, dwell, grasp_check = task.gripper_timing
+        return {"gripper_actuation_kind": kind, "gripper_dwell_s": dwell,
+                **({} if grasp_check is None else {"grasp_confirmation_check": grasp_check})}
+
+    @staticmethod
+    def _operation_intent(
+        context: _BoundContext,
+        *,
+        request_id: str,
+        owner_epoch: str,
+        participants: Sequence[Mapping[str, Any]],
+        coordination_policy: str,
+    ) -> dict[str, Any]:
+        return {
+            "request_context": {
+                "request_id": request_id,
+                "request_owner_epoch": owner_epoch,
+                "source_label": "manyforge_behavior",
+                "correlation_id": context.capture.program_run_id,
+            },
+            "program_id": context.capture.program_id,
+            "program_revision": context.capture.program_revision,
+            "program_binding_id": context.capture.program_binding_id,
+            "program_run_id": context.capture.program_run_id,
+            "expected_graph_revision": context.capture.graph_revision,
+            "expected_retained_bundle_id": context.capture.retained_bundle_id,
+            "expected_scene_revision": None,
+            "participants": [dict(participant) for participant in participants],
+            "coordination_policy": coordination_policy,
+        }
+
+    @staticmethod
+    def _settled_pneumatic_failure(operation: Mapping[str, Any]) -> bool:
+        # The Kernel marks final failures from its captured typed actuation.
+        # A node name, transport, or an unmarked error cannot establish this.
+        if operation.get("state") != ExecutionState.FAILED.value:
+            return False
+        participants = operation.get("participants")
+        if not isinstance(participants, list) or not participants:
+            return False
+        has_failure = False
+        for participant in participants:
+            if not isinstance(participant, Mapping):
+                return False
+            state = participant.get("state")
+            if state == ExecutionState.COMPLETED.value:
+                continue
+            if state != ExecutionState.FAILED.value:
+                return False
+            error = participant.get("terminal_error")
+            details = error.get("details") if isinstance(error, Mapping) else None
+            if (
+                not isinstance(details, Mapping)
+                or details.get("pneumatic_transaction_final") != "true"
+            ):
+                return False
+            has_failure = True
+        return has_failure
+
+    @staticmethod
+    def _terminal_error(
+        operation: Mapping[str, Any],
+    ) -> tuple[str, str, Mapping[str, Any] | None]:
+        participants = operation.get("participants")
+        if isinstance(participants, list):
+            for participant in participants:
+                if not isinstance(participant, Mapping):
+                    continue
+                error = participant.get("terminal_error")
+                if isinstance(error, Mapping):
+                    code = error.get("code")
+                    message = error.get("message")
+                    if isinstance(code, str) and code:
+                        details = bounded_failure_details(error.get("details"))
+                        return (
+                            code,
+                            describe_owner_failure(
+                                message if isinstance(message, str) else "", details
+                            ).strip()[:1024],
+                            details,
+                        )
+        return "operation_failed", "native operation did not succeed", None
+
+    def _recovery_assessment(
+        self, operation: Mapping[str, Any], operation_id: str
+    ) -> Mapping[str, Any] | None:
+        # Manual callers: any absence or read failure is no assessment.
+        assessment, _failure = self._recovery_assessment_read(operation, operation_id)
+        return assessment
+
+    def _recovery_assessment_read(
+        self, operation: Mapping[str, Any], operation_id: str
+    ) -> tuple[Mapping[str, Any] | None, Exception | None]:
+        """One exact read: (assessment, None) for the operation revision;
+        (None, None) for a transient absence (owner unreachable, or the
+        assessment has not caught up with the revision); (None, error) for a
+        malformed or unexpected read."""
+
+        try:
+            assessment = self._kernel.recovery_assessment(operation_id)
+        except KernelOperationObservationUnavailableError:
+            return None, None
+        except Exception as error:
+            return None, error
+        if assessment.get("operation_revision") != operation.get("operation_revision"):
+            return None, None
+        return assessment, None
+
+    def _observed_recovery_assessment(
+        self,
+        operation: Mapping[str, Any],
+        operation_id: str,
+        metadata: dict[str, Any],
+    ) -> Mapping[str, Any] | None:
+        assessment, failure = self._recovery_assessment_read(operation, operation_id)
+        if failure is not None:
+            # Recorded for the automatic caller, which surfaces it; manual
+            # callers ignore it, as they ignore an absent assessment.
+            metadata["recovery_assessment_failure"] = {
+                "reason_code": "owner_recovery_assessment_invalid",
+                "message": (str(failure) or type(failure).__name__)[:1024],
+            }
+        return assessment
+
+    def _held_preparation_scope(
+        self, task: _OperationTask, *, require_settled: bool = False,
+    ) -> tuple[Mapping[str, Any], bool]:
+        context = self._context(task.identity.program_run_id)
+        self._owner_status(context)
+        scope = self.scope.execution_scope(task.identity.program_run_id)
+        runner = _text(scope.get("program_runner_owner_epoch"), field="scope runner epoch")
+        claim, revision = scope.get("claim_generation"), scope.get("selection_revision")
+        if (scope.get("schema_version") != "manyforge.program_execution_scope.v2"
+            or type(claim) is not int or claim < 1
+            or type(revision) is not int or revision < 0):
+            raise ProductionPortError("held preparation scope identity is incomplete")
+        # Same immutable tree/canonical order used by ExecutableProgramRun.
+        pending = [context.capture.program.get("tree")]
+        nodes = []
+        while pending:
+            node = _mapping(pending.pop(), field="captured Program tree")
+            nodes.append(_text(node.get("instance_id"), field="captured node ID"))
+            pending.extend(_sequence(node.get("children"), field="captured children"))
+        nodes.sort()
+        if len(nodes) != len(set(nodes)) or task.identity.node_instance_id not in nodes:
+            raise ProductionPortError("held preparation is outside the captured Program")
+        phases = {}
+        for field in ("held_node_indices", "stopping_node_indices", "faulted_node_indices"):
+            indices = scope.get(field)
+            if (not isinstance(indices, (list, tuple))
+                or any(type(i) is not int or not 0 <= i < len(nodes) for i in indices)
+                or list(indices) != sorted(set(indices))):
+                raise ProductionPortError("held preparation scope indices are invalid")
+            phases[field] = set(indices)
+        identity = (scope["request_owner_epoch"], runner, claim)
+        if (task.operation is None or identity[0] != task.operation.request_owner_epoch
+            or (task.held_preparation is not None
+                and task.held_preparation.scope_identity != identity)):
+            raise ProductionPortError("held preparation scope owner changed")
+        index = nodes.index(task.identity.node_instance_id)
+        settling = phases["stopping_node_indices"] | phases["faulted_node_indices"]
+        held = index in phases["held_node_indices"]
+        return scope, (held and index not in settling if require_settled else held or index in settling)
+
+    def _require_cancelled_preparation(
+        self, task: _OperationTask, envelope: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        operation, _resident = self._resettable_operation(envelope, task)
+        context = self._context(task.identity.program_run_id)
+        intent, accepted = task.submitted_intent, task.acceptance
+        if (task.gripper_timing is None or task.gripper_timing[0] != "pneumatic"
+            or task.operation is None or intent is None or accepted is None
+            or envelope.get("owner_epoch") != task.operation.request_owner_epoch
+            or operation.get("program_binding_id") != context.capture.program_binding_id
+            or operation.get("state") != ExecutionState.CANCELLED_PRE_DISPATCH.value
+            or accepted.get("operation_id") != task.operation.operation_id
+            or accepted.get("request_id") != intent["request_context"]["request_id"]
+            or task.operation.member_task_ids != frozenset({task.task_id})):
+            raise ProductionPortError("held preparation has no exact original no-effect identity")
+        revision = operation.get("operation_revision")
+        rows, assignments = operation.get("participants"), accepted.get("participant_assignments")
+        if (type(revision) is not int or revision < 1
+            or not isinstance(rows, (list, tuple)) or len(rows) != 1
+            or not isinstance(assignments, (list, tuple)) or len(assignments) != 1):
+            raise ProductionPortError("held preparation has no complete no-effect participants")
+        row, assignment = _mapping(rows[0], field="held participant"), _mapping(assignments[0], field="accepted participant")
+        original = intent["participants"][0]
+        target = self._target(context, original["target_role_id"], "tool.gripper.command")
+        if (assignment.get("input_index") != 0
+            or not isinstance(assignment.get("participant_id"), str) or not assignment["participant_id"]
+            or row.get("participant_id") != assignment["participant_id"]
+            or row.get("payload_kind") != "capability_command"
+            or row.get("state") != ExecutionState.CANCELLED_PRE_DISPATCH.value
+            or "terminal_error" not in row or row["terminal_error"] is not None
+            or row.get("controllable_component_id") != target.controllable_component_id
+            or row.get("command_target_id") != target.command_target_id
+            or row.get("capability_id") != "tool.gripper.command"
+            or not isinstance(row.get("resources"), (list, tuple)) or not row["resources"]):
+            raise ProductionPortError("held preparation participant is not exact cancelled capability work")
+        return operation
+
+    def _observe_held_preparation(self, task: _OperationTask, envelope: Mapping[str, Any]) -> None:
+        # This keeps the original accepted owner task in the existing map.
+        # HeldError changes only the wrapper's scheduling pointer, not history.
+        try:
+            scope, held = self._held_preparation_scope(task)
+            if not held:
+                if task.held_preparation is None:
+                    return
+                raise ProductionPortError("pending preparation lost its held selection")
+            operation = self._require_cancelled_preparation(task, envelope)
+            if task.held_preparation is None:
+                task.held_preparation = _HeldPreparation(
+                    scope["selection_revision"],
+                    (scope["request_owner_epoch"], scope["program_runner_owner_epoch"], scope["claim_generation"]),
+                    deepcopy(dict(operation)),
+                )
+        except Exception as error:
+            raise OwnerTaskObservationUnavailableError("cancelled preparation is not yet proven held/no-effect") from error
+        raise OwnerInvocationHeldError(scope["selection_revision"])
+
+    def _interrupt_stop_terminal(
+        self, operation: Mapping[str, Any]
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """The Stop terminal projection of the single Stop the operation's
+        escalated rule row names (exact Stop id and generation), read through
+        the existing events consumption, and whether it is still pending.
+
+        Only an escalated trip needs the containing stage. When the events
+        reader lacks the record, one existing ``read_stop`` (``stop_status``)
+        tells its ``terminal_projection`` (SX-2226): ``pending`` waits (the
+        node re-observes on its next tick), ``recorded`` reads the events to
+        the record after that observation, and ``failed``, a missing or an
+        unknown value stays unproven. The interrupt mapper still matches the
+        Stop certificate id/revision (distinct from the control binding),
+        participant and plan references and treats truncated details as
+        unproven."""
+
+        if self._stop_terminal is None:
+            return None, False
+        rows = [
+            row
+            for participant in operation.get("participants") or ()
+            if isinstance(participant, Mapping)
+            for row in participant.get("io_rule_outcomes") or ()
+            if isinstance(row, Mapping) and row.get("stop_id") is not None
+        ]
+        stops = {(row.get("stop_id"), row.get("stop_generation")) for row in rows}
+        if len(stops) != 1 or not any(
+            # Only this case maps by the containing stage (interrupt_outcome).
+            row.get("stop_result") == "succeeded_escalated"
+            and row.get("terminal_cause") in ("signal_trip", "failed")
+            and isinstance(row.get("evidence"), Mapping)
+            and row["evidence"].get("trip") is not None
+            for row in rows
+        ):
+            return None, False
+        ((stop_id, stop_generation),) = stops
+        if type(stop_id) is not str or not stop_id or type(stop_generation) is not int:
+            return None, False
+        terminal = self._stop_terminal(stop_id, stop_generation)
+        if terminal is None:
+            # SX-2222/2226: the record may follow the operation's terminal
+            # state; the existing read_stop tells whether it is recorded.
+            try:
+                status = self._kernel.stop_status(stop_id).get("stop_status")
+            except Exception:
+                return None, False
+            if not isinstance(status, Mapping) or status.get("stop_generation") != stop_generation:
+                return None, False
+            projection = status.get("terminal_projection")
+            if projection == "pending":
+                return None, True
+            if projection != "recorded":
+                return None, False
+            terminal = self._stop_terminal(stop_id, stop_generation, read_to_end=True)
+        return (deepcopy(dict(terminal)) if isinstance(terminal, Mapping) else None), False
+
+    def _interrupt_stop_chains(
+        self, task: _OperationTask, operation: Mapping[str, Any]
+    ) -> dict[str, tuple[str, ...]]:
+        """Per operation participant, the qualified Stop stage order of the
+        exact Targets motion row it used (``command.stop_response``,
+        SX-2211/2224): same component, command target and operation
+        capability, the participant's actual control binding id and revision,
+        and a Targets identity of the Run's Applied bundle and graph. A null
+        stop_response (with ``stop_response_error``), an unreadable reply or
+        any mismatch gives that participant no chain (its containing stage
+        stays unproven); another target's chain is never borrowed."""
+
+        try:
+            capture = self._context(task.identity.program_run_id).capture
+            envelope = self._kernel.targets()
+            owner = _mapping(envelope.get("identity"), field="targets identity")
+            if (
+                owner.get("retained_bundle_id") != capture.retained_bundle_id
+                or owner.get("graph_revision") != capture.graph_revision
+            ):
+                return {}
+            inventory = _mapping(envelope.get("targets"), field="execution targets")
+            if inventory.get("schema_version") != "manyforge.execution_targets.v3":
+                return {}
+            rows: dict[tuple[Any, Any, Any], list[Mapping[str, Any]]] = {}
+            for component in _sequence(inventory.get("components"), field="target components"):
+                component = _mapping(component, field="target component")
+                for row in _sequence(component.get("targets"), field="component targets"):
+                    row = _mapping(row, field="component target")
+                    key = (
+                        component.get("controllable_component_id"),
+                        row.get("command_target_id"),
+                        row.get("operation_capability_id"),
+                    )
+                    rows.setdefault(key, []).append(row)
+        except Exception:
+            return {}
+        chains: dict[str, tuple[str, ...]] = {}
+        for participant in operation.get("participants") or ():
+            if not isinstance(participant, Mapping) or type(participant.get("participant_id")) is not str:
+                continue
+            matches = rows.get((
+                participant.get("controllable_component_id"),
+                participant.get("command_target_id"),
+                participant.get("capability_id"),
+            ), [])
+            command = matches[0].get("command") if len(matches) == 1 else None
+            if (
+                matches and matches[0].get("presentation") != "motion"
+                or not isinstance(command, Mapping)
+                or command.get("stop_response_error") is not None
+            ):
+                continue
+            response = command.get("stop_response")
+            if (
+                not isinstance(response, Mapping)
+                or type(participant.get("control_binding_id")) is not str
+                or response.get("control_binding_id") != participant["control_binding_id"]
+                or response.get("control_binding_revision")
+                != participant.get("control_binding_revision")
+                or not isinstance(response.get("stages"), list)
+            ):
+                continue
+            stages = [
+                stage.get("stage_id") if isinstance(stage, Mapping) else None
+                for stage in response["stages"]
+            ]
+            if (
+                not stages
+                or any(type(stage) is not str or not stage for stage in stages)
+                or len(set(stages)) != len(stages)
+            ):
+                continue
+            chains[participant["participant_id"]] = tuple(stages)
+        return chains
+
+    def _observation(self, task: _OperationTask) -> tuple[dict[str, Any], OwnerTaskSnapshot, Mapping[str, Any]]:
+        shared = task.operation
+        if shared is None:
+            raise ProductionPortError("coordinated operation has not been admitted")
+        try:
+            envelope = self._kernel.operation(shared.operation_id)
+        except KernelOperationObservationUnavailableError as exc:
+            raise OwnerTaskObservationUnavailableError(
+                "accepted native operation is temporarily unavailable to observe"
+            ) from exc
+        operation = dict(_mapping(envelope.get("operation"), field="operation"))
+        if (
+            operation.get("operation_id") != shared.operation_id
+            or operation.get("program_run_id") != task.identity.program_run_id
+        ):
+            raise ProductionPortError("native operation observation changed identity")
+        if (task.held_preparation is not None or (
+            task.gripper_timing is not None and task.gripper_timing[0] == "pneumatic"
+            and operation.get("state") == ExecutionState.CANCELLED_PRE_DISPATCH.value)):
+            self._observe_held_preparation(task, envelope)
+        if task.terminal is not None:
+            return operation, task.terminal, envelope
+        state = operation.get("state")
+        metadata = {
+            "operation_id": shared.operation_id,
+            "operation_revision": operation.get("operation_revision"),
+            "operation_state": state,
+            **self._gripper_metadata(task),
+        }
+        for row in operation.get("participants") or ():
+            _require_participant_binding(_mapping(row, field="operation participant"))
+        if task.node_id in _INTERRUPT_MOTION_NODE_IDS:
+            # The typed rule result the interrupt adapter maps (P5, I5).
+            metadata["interrupt_operation"] = {
+                "operation_id": shared.operation_id,
+                "participants": deepcopy(list(operation.get("participants") or ())),
+            }
+            if state not in _ACTIVE_STATES:
+                terminal, pending = self._interrupt_stop_terminal(metadata["interrupt_operation"])
+                if terminal is not None:
+                    metadata["interrupt_stop_terminal"] = terminal
+                if pending:
+                    metadata["interrupt_stop_terminal_pending"] = True
+                if task.interrupt_stop_chain is None:
+                    task.interrupt_stop_chain = self._interrupt_stop_chains(
+                        task, operation
+                    )
+                metadata["interrupt_stop_chain"] = dict(task.interrupt_stop_chain)
+        if type(envelope.get("resident")) is bool:
+            # A successful read with resident false: retirement completed.
+            metadata["resident"] = envelope["resident"]
+        stop_id = operation.get("active_stop_id")
+        stop_generation = operation.get("active_stop_generation")
+        if (
+            isinstance(stop_id, str)
+            and stop_id
+            and type(stop_generation) is int
+            and stop_generation > 0
+        ):
+            metadata["active_stop_id"] = stop_id
+            metadata["active_stop_generation"] = stop_generation
+        if operation.get("preemption") is not None:
+            # Logical, at the newcomer's acceptance: the incumbent node ends
+            # now while the Kernel still owns its physical handover.
+            metadata["preemption"] = _preemption_fact(operation["preemption"])
+        if operation.get("motion_takeover") is not None:
+            # The newcomer's takeover path (spec: fallback is a brief warning).
+            takeover = _motion_takeover_fact(operation["motion_takeover"])
+            if takeover is not None:
+                metadata["motion_takeover"] = takeover
+        if state in _ACTIVE_STATES:
+            snapshot = OwnerTaskSnapshot(
+                task_id=task.task_id,
+                state=OwnerTaskState.ACTIVE,
+                metadata=metadata,
+            )
+        elif state == ExecutionState.COMPLETED.value:
+            snapshot = OwnerTaskSnapshot(
+                task_id=task.task_id,
+                state=OwnerTaskState.SUCCEEDED,
+                metadata=metadata,
+            )
+        elif state in _INTERRUPTED_STATES:
+            assessment = self._observed_recovery_assessment(
+                operation, shared.operation_id, metadata
+            )
+            reason_code, message, details = (
+                f"operation_{state}", "native operation was interrupted", None
+            )
+            if assessment is not None:
+                metadata["recovery_assessment"] = assessment
+                if assessment.get("recovery_class") == PROGRAM_MOTION_STOP_RECOVERY_CLASS:
+                    # Only an operator's (or other non-Program) Stop holds.
+                    metadata["authored_failure_policy"] = "pause_for_operator"
+                    metadata["authored_failure_policy_parameter"] = "operator_stop_policy"
+                elif assessment.get("recovery_class") == "ordinary_program_stop":
+                    # The Program's own Stop: the node fails with its typed cause.
+                    code, text, cause = self._terminal_error(operation)
+                    if code != "operation_failed":
+                        reason_code, message, details = code, text, cause
+            failure_fact = _operation_failure_fact(envelope, operation, reason_code, message)
+            if failure_fact is not None:
+                metadata["operation_failure"] = failure_fact
+            snapshot = OwnerTaskSnapshot(
+                task_id=task.task_id,
+                state=OwnerTaskState.INTERRUPTED,
+                metadata=metadata,
+                reason_code=reason_code,
+                message=message,
+                details=details,
+            )
+        elif state in _FAILED_STATES:
+            assessment = self._observed_recovery_assessment(
+                operation, shared.operation_id, metadata
+            )
+            if assessment is not None:
+                metadata["recovery_assessment"] = assessment
+            reason_code, message, details = self._terminal_error(operation)
+            failure_fact = _operation_failure_fact(envelope, operation, reason_code, message)
+            if failure_fact is not None:
+                metadata["operation_failure"] = failure_fact
+            snapshot = OwnerTaskSnapshot(
+                task_id=task.task_id,
+                state=OwnerTaskState.FAILED,
+                metadata=metadata,
+                reason_code=reason_code,
+                message=message,
+                details=details,
+                settlement_proven=self._settled_pneumatic_failure(operation),
+            )
+        else:
+            raise ProductionPortError("native operation has an unknown state")
+        if snapshot.state is OwnerTaskState.FAILED and snapshot.settlement_proven:
+            revision = operation.get("operation_revision")
+            if type(revision) is not int or revision < 1:
+                raise ProductionPortError("native operation revision is invalid")
+            with self._lock:
+                if self._tasks.get(task.task_id) is task:
+                    if task.terminal is None:
+                        task.terminal = snapshot
+                        shared.completed_revision = revision
+                    snapshot = task.terminal
+        return operation, snapshot, envelope
+
+    def _apply_operation_recovery(
+        self,
+        operation_id: str,
+        identity: NodeAttemptIdentity,
+        operation: Mapping[str, Any],
+        snapshot: OwnerTaskSnapshot,
+        *,
+        action: str,
+        request_id: str,
+        reason: str | None,
+    ) -> Mapping[str, Any]:
+        revision, recovery_request, assessment = self._build_operation_recovery(
+            operation,
+            snapshot,
+            action=action,
+            request_id=request_id,
+            reason=reason,
+        )
+        return self._send_operation_recovery(
+            operation_id, revision, recovery_request, assessment
+        )
+
+    @staticmethod
+    def _build_operation_recovery(
+        operation: Mapping[str, Any],
+        snapshot: OwnerTaskSnapshot,
+        *,
+        action: str,
+        request_id: str,
+        reason: str | None,
+    ) -> tuple[int, dict[str, Any], Mapping[str, Any]]:
+        """The exact fenced request for one observed operation revision."""
+
+        if snapshot.state not in {
+            OwnerTaskState.FAILED,
+            OwnerTaskState.INTERRUPTED,
+        }:
+            raise ProductionPortError("operation recovery is not current")
+        assessment = snapshot.metadata.get("recovery_assessment")
+        revision = operation.get("operation_revision")
+        if not isinstance(assessment, Mapping) or type(revision) is not int:
+            raise ProductionPortError("operation recovery identity is incomplete")
+        recovery_request = {
+            "request_id": request_id,
+            "action": action,
+            "principal_id": "program_runner",
+            "expected_assessment_revision": assessment.get("assessment_revision"),
+            "expected_control_command_epoch": assessment.get("control_command_epoch"),
+            "expected_execution_id": assessment.get("execution_id"),
+            "expected_stop_certificate_id": assessment.get("stop_certificate_id", ""),
+            "expected_stop_owner_generation": assessment.get("stop_owner_generation", 0),
+            "reason": reason or "",
+        }
+        return revision, recovery_request, assessment
+
+    def _send_operation_recovery(
+        self,
+        operation_id: str,
+        revision: int,
+        recovery_request: Mapping[str, Any],
+        assessment: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        request_id = recovery_request["request_id"]
+        action = recovery_request["action"]
+        try:
+            result = self._kernel.recover(operation_id, revision, dict(recovery_request))
+        except Exception as error:
+            code = getattr(error, "code", None)
+            if code not in {
+                "operation_recovery_invalid",
+                "operation_recovery_stale",
+                "request_id_conflict",
+                "request_ledger_full",
+            }:
+                raise
+            return {
+                "request_id": request_id,
+                "action": action,
+                "accepted": False,
+                "resulting_assessment": dict(assessment),
+                "error": {
+                    "code": code,
+                    "message": str(error) or "operation recovery was rejected",
+                    "details": dict(getattr(error, "details", None) or {}),
+                },
+            }
+        resulting = result.get("resulting_assessment")
+        if isinstance(resulting, Mapping):
+            result = {
+                **result,
+                "resulting_assessment": {
+                    **resulting,
+                    "operation_revision": revision,
+                    "participants": assessment.get("participants", []),
+                    "acknowledged_non_moving": (
+                        result.get("accepted") is True and action == "acknowledge_and_continue"
+                    ),
+                },
+            }
+        # Program Resume owns its Stop-fence handoff. Operation recovery must
+        # neither release a newer independent Stop nor reinterpret acceptance
+        # through a fallible follow-up observation.
+        return result
+
+    def _close_task(
+        self,
+        task_id: str,
+        identity: NodeAttemptIdentity,
+        *,
+        request_id: str,
+    ) -> bool:
+        """Close one settled terminal operation (`close_operation`, DX-1169).
+
+        True once the Kernel retired it (or nothing is retained any more);
+        False when refused, which leaves the operation retained for Reset.
+        An unknown outcome keeps the exact request on the task and raises
+        OwnerTaskSettlementPendingError: the same request is replayed later.
+        """
+        with self._lock:
+            task = self._tasks.get(task_id)
+        if task is None:
+            # Already retired by an accepted recovery, ACK or Reset.
+            return True
+        if task.identity != identity:
+            raise ProductionPortError("operation closure changed node attempt")
+        shared = task.operation
+        if shared is None:
+            raise ProductionPortError("unadmitted operation has no closure")
+        pending = task.unknown_close
+        if pending is None:
+            operation, snapshot, _envelope = self._observation(task)
+            revision, recovery_request, assessment = self._build_operation_recovery(
+                operation,
+                snapshot,
+                action="close_operation",
+                request_id=request_id,
+                reason="Program node finished with a failure",
+            )
+        elif pending.request_id != request_id:
+            raise ProductionPortError("unknown operation closure changed request")
+        else:
+            revision, recovery_request, assessment = (
+                pending.revision,
+                pending.request,
+                pending.assessment,
+            )
+        try:
+            result = self._send_operation_recovery(
+                shared.operation_id, revision, recovery_request, assessment
+            )
+        except Exception as error:
+            result, outcome_error = None, error
+        else:
+            outcome_error = None
+        outcome = None if outcome_error is not None else recovery_outcome(result)
+        if outcome is None:
+            with self._lock:
+                task.unknown_close = _UnknownRecovery(
+                    request_id, revision, recovery_request, assessment
+                )
+            raise OwnerTaskSettlementPendingError(
+                "operation closure outcome is unknown"
+            ) from outcome_error
+        with self._lock:
+            task.unknown_close = None
+            if outcome:
+                for member_task_id in shared.member_task_ids:
+                    member = self._tasks.get(member_task_id)
+                    if member is not None and member.operation is shared:
+                        self._tasks.pop(member_task_id, None)
+        return outcome
+
+    def _release_preempted_task(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        """Forget a logically preempted task: the Kernel owns its handover."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            if task.identity != identity:
+                raise ProductionPortError("preempted task changed node attempt")
+            self._tasks.pop(task_id, None)
+
+    def _recover_task(
+        self,
+        task_id: str,
+        identity: NodeAttemptIdentity,
+        *,
+        action: str,
+        request_id: str,
+        reason: str | None,
+    ) -> Mapping[str, Any]:
+        task = self._task(task_id)
+        if task.identity != identity:
+            raise ProductionPortError("operation recovery changed node attempt")
+        shared = task.operation
+        if shared is None:
+            raise ProductionPortError("unadmitted operation has no recovery action")
+        with self._lock:
+            cached = shared.recovery_result
+            cached_action = shared.recovery_action
+        if cached is None:
+            operation, snapshot, _envelope = self._observation(task)
+            result = self._apply_operation_recovery(
+                shared.operation_id,
+                identity,
+                operation,
+                snapshot,
+                action=action,
+                request_id=request_id,
+                reason=reason,
+            )
+            if result.get("accepted") is True:
+                with self._lock:
+                    if shared.recovery_result is None:
+                        shared.recovery_result = dict(result)
+                        shared.recovery_action = action
+        else:
+            if cached_action != action:
+                raise ProductionPortError(
+                    "coordinated operation recovery action changed between members"
+                )
+            result = {**cached, "request_id": request_id}
+        if result.get("accepted") is True:
+            with self._lock:
+                shared.recovered_attempt_ids.add(identity.node_attempt_id)
+                if shared.recovered_attempt_ids == set(shared.member_attempt_ids):
+                    for member_task_id in shared.member_task_ids:
+                        member = self._tasks.get(member_task_id)
+                        if member is not None and member.operation is shared:
+                            self._tasks.pop(member_task_id, None)
+        return result
+
+    def _current_recovery_assessment(
+        self, task_id: str, identity: NodeAttemptIdentity
+    ) -> Mapping[str, Any]:
+        """A fresh Kernel read of a held operation's recovery assessment.
+
+        A manual-result press checks freshness here (offers do not expire).
+        It reads the operation and its assessment again, like the recovery
+        press, and never answers from the task's cached terminal.
+        """
+
+        task = self._task(task_id)
+        if task.identity != identity:
+            raise ProductionPortError("recovery assessment read changed node attempt")
+        shared = task.operation
+        if shared is None:
+            raise ProductionPortError("unadmitted operation has no recovery assessment")
+        envelope = self._kernel.operation(shared.operation_id)
+        operation = dict(_mapping(envelope.get("operation"), field="operation"))
+        if operation.get("operation_id") != shared.operation_id:
+            raise ProductionPortError("native operation observation changed identity")
+        assessment, failure = self._recovery_assessment_read(operation, shared.operation_id)
+        if failure is not None:
+            raise failure
+        if assessment is None:
+            raise ProductionPortError("the owner's recovery assessment is not current")
+        return assessment
+
+    def _task(self, task_id: str) -> _OperationTask:
+        with self._lock:
+            try:
+                return self._tasks[task_id]
+            except KeyError as exc:
+                raise ProductionPortError("native operation task is not retained") from exc
+
+    def _run_operation_tasks(
+        self, program_run_id: str
+    ) -> tuple[tuple[_OperationTask, ...], tuple[_OperationTask, ...]]:
+        """Return one representative per native operation plus local staged work."""
+
+        with self._lock:
+            representatives: dict[str, _OperationTask] = {}
+            local: list[_OperationTask] = []
+            for task in self._tasks.values():
+                if task.identity.program_run_id != program_run_id:
+                    continue
+                if task.operation is None:
+                    local.append(task)
+                else:
+                    representatives.setdefault(task.operation.operation_id, task)
+            return tuple(representatives.values()), tuple(local)
+
+    def _cancel(self, task: _OperationTask, reason: str | None) -> None:
+        if task.held_before_admission:
+            with self._lock:
+                self._tasks.pop(task.task_id, None)
+            return
+        if task.terminal is not None:
+            return
+        if task.operation is None:
+            raise ProductionPortError("local operation has no native effect or terminal result")
+        operation, snapshot, _envelope = self._observation(task)
+        if snapshot.state is not OwnerTaskState.ACTIVE:
+            return
+        shared = task.operation
+        assert shared is not None
+        with self._lock:
+            if shared.stop_requested or operation.get("state") == "stopping":
+                return
+            scope_stop = self._scope_stops.get(task.identity.program_run_id)
+            if (
+                scope_stop is not None
+                and scope_stop.active is not None
+                and scope_stop.unresolved is None
+            ):
+                # The Kernel's accepted Program-run fence owns operations that
+                # crossed admission before their local task was retained.
+                # Issuing a second operation Stop here would overlap that
+                # containment and can promote an ordinary Stop into a fault.
+                shared.stop_requested = True
+                return
+            shared.stop_requested = True
+        revision = operation.get("operation_revision")
+        stop_generation = operation.get("active_stop_generation")
+        if type(revision) is not int or revision < 1:
+            raise ProductionPortError("native operation revision is invalid")
+        if stop_generation is None:
+            stop_generation = 0
+        if type(stop_generation) is not int or stop_generation < 0:
+            raise ProductionPortError("native Stop generation is invalid")
+        try:
+            context = self._context(task.identity.program_run_id)
+            owner_epoch = self._owner_status(context)
+            self._kernel.stop(
+                {
+                    "request_context": {
+                        "request_id": _request_identity(
+                            "program-stop",
+                            task.identity.program_run_id,
+                            shared.operation_id,
+                        ),
+                        "request_owner_epoch": owner_epoch,
+                        "source_label": "manyforge_behavior",
+                        "correlation_id": task.identity.program_run_id,
+                    },
+                    "operations": [
+                        {
+                            "operation_id": shared.operation_id,
+                            "expected_operation_revision": revision,
+                            "expected_stop_generation": stop_generation,
+                        }
+                    ],
+                    "reason": reason,
+                }
+            )
+        except Exception:
+            with self._lock:
+                shared.stop_requested = False
+            raise
+
+    def _cancel_task(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        task = self._task(task_id)
+        if task.identity != identity:
+            raise ProductionPortError("operation cancellation changed node attempt")
+        self._cancel(task, "Program node was invalidated")
+
+    def _acknowledge_task(
+        self,
+        task_id: str,
+        identity: NodeAttemptIdentity,
+    ) -> None:
+        task = self._task(task_id)
+        if task.identity != identity:
+            raise ProductionPortError("operation acknowledgement changed node attempt")
+        if task.terminal is not None and task.operation is None:
+            if not task.terminal.settlement_proven:
+                raise ProductionPortError("terminal local task has no settlement proof")
+            with self._lock:
+                self._tasks.pop(task_id, None)
+            return
+        shared = task.operation
+        if shared is None:
+            raise ProductionPortError("unadmitted operation cannot be acknowledged")
+        with self._lock:
+            revision = shared.completed_revision
+            remaining = shared.member_attempt_ids - shared.acknowledged_attempt_ids
+            if identity.node_attempt_id not in remaining:
+                raise ProductionPortError("operation member was already acknowledged")
+            last = len(remaining) == 1
+            if not last:
+                shared.acknowledged_attempt_ids.add(identity.node_attempt_id)
+                self._tasks.pop(task_id, None)
+                return
+        if revision is None:
+            operation, snapshot, _envelope = self._observation(task)
+            if snapshot.state is not OwnerTaskState.SUCCEEDED and not (
+                snapshot.state is OwnerTaskState.FAILED and snapshot.settlement_proven
+            ):
+                raise ProductionPortError("only a completed operation can be acknowledged")
+            revision = operation.get("operation_revision")
+        if type(revision) is not int or revision < 1:
+            raise ProductionPortError("native operation revision is invalid")
+        try:
+            self._kernel.acknowledge_completed(
+                shared.operation_id,
+                {
+                    "request_context": {
+                        "request_id": _request_identity(
+                            "program-ack", identity.program_run_id, shared.operation_id
+                        ),
+                        "request_owner_epoch": shared.request_owner_epoch,
+                        "source_label": "manyforge_behavior",
+                        "correlation_id": identity.program_run_id,
+                    },
+                    "operation_id": shared.operation_id,
+                    "expected_operation_revision": revision,
+                    "reason": "Program node consumed completed evidence",
+                },
+            )
+        except KernelOperationSettlementPendingError as error:
+            raise OwnerTaskSettlementPendingError(
+                "operation completion is still settling"
+            ) from error
+        with self._lock:
+            shared.acknowledged_attempt_ids.add(identity.node_attempt_id)
+            for member_task_id in shared.member_task_ids:
+                member = self._tasks.get(member_task_id)
+                if member is not None and member.operation is shared:
+                    self._tasks.pop(member_task_id, None)
+
+    def _observe_scope(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+        with self._lock:
+            stop = self._scope_stops.get(program_run_id)
+            if stop is not None and stop.unresolved is not None:
+                return ProgramRunScopeSnapshot(
+                    program_run_id,
+                    ProgramRunScopeState.UNKNOWN,
+                    None,
+                    "program_run_stop_outcome_unknown",
+                )
+            if stop is not None and stop.pending:
+                return ProgramRunScopeSnapshot(program_run_id, ProgramRunScopeState.ACTIVE, 0)
+            scope_stop = stop.active if stop is not None else None
+            stop_owner_epoch = stop.owner_epoch if stop is not None else None
+        tasks, local_tasks = self._run_operation_tasks(program_run_id)
+        if scope_stop is not None:
+            stop_id, stop_generation, retained_count = scope_stop
+            try:
+                status = _mapping(
+                    self._kernel.stop_status(stop_id).get("stop_status"),
+                    field="aggregate Stop status",
+                )
+                state = _text(status.get("state"), field="Stop status state")
+                if (
+                    type(status.get("stop_generation")) is not int
+                    or status["stop_generation"] != stop_generation
+                ):
+                    raise ProductionPortError("program_run_stop_generation_mismatch")
+            except Exception as exc:
+                return ProgramRunScopeSnapshot(
+                    program_run_id=program_run_id,
+                    state=ProgramRunScopeState.UNKNOWN,
+                    active_operation_count=None,
+                    reason_code=(str(exc) or type(exc).__name__)[:256],
+                )
+            with self._lock:
+                if (
+                    self._scope_stops.get(program_run_id) is not stop
+                    or stop.owner_epoch != stop_owner_epoch
+                    or stop.active != scope_stop
+                    or stop.pending
+                    or stop.unresolved is not None
+                ):
+                    return ProgramRunScopeSnapshot(
+                        program_run_id,
+                        ProgramRunScopeState.UNKNOWN,
+                        None,
+                        "program_run_stop_observation_changed",
+                    )
+            if state in {"accepted", "stopping", "certifying"}:
+                return ProgramRunScopeSnapshot(
+                    program_run_id,
+                    ProgramRunScopeState.ACTIVE,
+                    retained_count,
+                )
+            if state == "succeeded":
+                return ProgramRunScopeSnapshot(
+                    program_run_id,
+                    ProgramRunScopeState.SETTLED,
+                    0,
+                )
+            return ProgramRunScopeSnapshot(
+                program_run_id=program_run_id,
+                state=ProgramRunScopeState.UNKNOWN,
+                active_operation_count=None,
+                reason_code=f"program_run_stop_{state}",
+            )
+        uncertain = next(
+            (
+                task.terminal
+                for task in local_tasks
+                if task.terminal is not None and not task.terminal.settlement_proven
+            ),
+            None,
+        )
+        if uncertain is not None:
+            return ProgramRunScopeSnapshot(
+                program_run_id,
+                ProgramRunScopeState.UNKNOWN,
+                None,
+                uncertain.reason_code or "operation_admission_outcome_unknown",
+            )
+        try:
+            active_count = sum(
+                self._observation(task)[1].state is OwnerTaskState.ACTIVE for task in tasks
+            )
+            active_count += sum(
+                task.terminal is None and not task.held_before_admission
+                for task in local_tasks
+            )
+        except Exception as exc:
+            return ProgramRunScopeSnapshot(
+                program_run_id=program_run_id,
+                state=ProgramRunScopeState.UNKNOWN,
+                active_operation_count=None,
+                reason_code=(str(exc) or type(exc).__name__)[:256],
+            )
+        with self._lock:
+            if program_run_id in self._scope_stops:
+                return ProgramRunScopeSnapshot(
+                    program_run_id,
+                    ProgramRunScopeState.UNKNOWN,
+                    None,
+                    "program_run_stop_observation_changed",
+                )
+        return ProgramRunScopeSnapshot(
+            program_run_id=program_run_id,
+            state=(ProgramRunScopeState.ACTIVE if active_count else ProgramRunScopeState.SETTLED),
+            active_operation_count=active_count,
+        )
+
+    def _request_stop(
+        self,
+        program_run_id: str,
+        stop_request_id: str,
+        reason: str | None,
+    ) -> ProgramRunScopeSnapshot:
+        _text(stop_request_id, field="stop_request_id", maximum_bytes=2_048)
+        with self._lock:
+            existing_stop = self._scope_stops.get(program_run_id)
+            request_owner_epoch = existing_stop.owner_epoch if existing_stop is not None else None
+        tasks, local_tasks = self._run_operation_tasks(program_run_id)
+        # Every distinct Stop reaches the owner: it refreshes the run fence
+        # even when no further physical containment is necessary. A local
+        # "already stopped" shortcut could let an older Resume erase a newer
+        # Stop. Exact retry/no-effect semantics already belong to the Kernel.
+        retained_count = len(tasks) + len(local_tasks)
+        # A zero local task count does not prove that the run is idle: its first
+        # operation may be crossing the native Execute boundary. Always hand
+        # the semantic Program Stop to the Kernel, whose current-run and
+        # pending-admission capture can close that race without making Stop
+        # wait for the ordinary command lane.
+        # A delayed Starting Stop can arrive after Start has contained its
+        # own aborted admission and retired its temporary context. Reuse that
+        # exact Stop responder, without an ordinary-lane identity lookup.
+        if request_owner_epoch is None:
+            try:
+                context = self._context(program_run_id)
+                request_owner_epoch = context.request_owner_epoch
+            except ProductionPortError:
+                # Starting may precede tree binding. The Kernel can fence the
+                # claimed run without any local task or operation existing.
+                request_owner_epoch = _text(
+                    (
+                        self._current_owner_epoch()
+                        if self._current_owner_epoch is not None
+                        else _mapping(
+                            self._kernel.identity().get("identity"),
+                            field="execution identity",
+                        ).get("owner_epoch")
+                    ),
+                    field="owner_epoch",
+                )
+        with self._lock:
+            stop = self._scope_stops.get(program_run_id)
+            if stop is None:
+                stop = _ProgramScopeStop(request_owner_epoch)
+                self._scope_stops[program_run_id] = stop
+            # Retain a replacement responder only as Stop attribution, never
+            # as a new execution binding or an ordinary-lane owner read.
+            request_owner_epoch = stop.owner_epoch
+            stop.pending += 1
+            unresolved = stop.unresolved
+        try:
+            response = self._kernel.stop_program_run(
+                {
+                    "request_context": {
+                        "request_id": _request_identity(
+                            "program-scope-stop",
+                            program_run_id,
+                            stop_request_id,
+                        ),
+                        "request_owner_epoch": request_owner_epoch,
+                        "source_label": "manyforge_behavior",
+                        "correlation_id": program_run_id,
+                    },
+                    "program_run_id": program_run_id,
+                    "reason": reason,
+                }
+            )
+            accepted = _mapping(response.get("accepted"), field="Program-run Stop acceptance")
+            response_owner_epoch = _text(
+                response.get("owner_epoch"), field="Stop response owner_epoch"
+            )
+            if response_owner_epoch != request_owner_epoch:
+                with self._lock:
+                    if stop.owner_epoch == request_owner_epoch:
+                        stop.owner_epoch = response_owner_epoch
+                        stop.generation = 0
+                        stop.active = None
+                raise ProductionPortError("Program-run Stop responder incarnation changed")
+            stop_id = _text(accepted.get("stop_id"), field="stop_id")
+            stop_generation = accepted.get("stop_generation")
+            if type(stop_generation) is not int or stop_generation < 1:
+                raise ProductionPortError("Program-run Stop generation is invalid")
+            with self._lock:
+                if (
+                    self._scope_stops.get(program_run_id) is stop
+                    and stop.owner_epoch == request_owner_epoch
+                    and stop_generation > stop.generation
+                ):
+                    stop.generation = stop_generation
+                    stop.active = (stop_id, stop_generation, retained_count)
+                    for task in tasks:
+                        assert task.operation is not None
+                        task.operation.stop_requested = True
+                elif stop.active is not None:
+                    retained_count = stop.active[2]
+                if (
+                    stop.owner_epoch == request_owner_epoch
+                    and stop.unresolved is unresolved
+                    and accepted.get("replay_status") == "accepted_new"
+                ):
+                    # A subsequent explicit Stop recaptures an earlier unknown
+                    # outcome. An old replay is not a new capture, nor may a
+                    # failure during this request be cleared by its reply.
+                    stop.unresolved = None
+        except Exception:
+            with self._lock:
+                stop.unresolved = object()
+            raise
+        finally:
+            with self._lock:
+                stop.pending -= 1
+                # Retain the watermark only while replies can still arrive.
+                # Releasing a newer fence cannot let an older reply recreate
+                # it, and completed handoffs leave no lifetime receipt map.
+                if (
+                    stop.pending == 0
+                    and stop.active is None
+                    and stop.unresolved is None
+                    and self._scope_stops.get(program_run_id) is stop
+                ):
+                    self._scope_stops.pop(program_run_id)
+        # Acceptance fenced the exact Kernel-owned run scope. Settlement is a
+        # later observation; do not add a synchronous per-task read sweep here.
+        return ProgramRunScopeSnapshot(
+            program_run_id,
+            ProgramRunScopeState.ACTIVE,
+            retained_count,
+        )
+
+    @staticmethod
+    def _resettable_operation(
+        envelope: Mapping[str, Any],
+        task: _OperationTask,
+    ) -> tuple[Mapping[str, Any], bool]:
+        if task.operation is None:
+            raise ProductionPortError("unadmitted operation cannot be reset")
+        operation = _mapping(envelope.get("operation"), field="native operation")
+        if operation.get("operation_id") != task.operation.operation_id:
+            raise ProductionPortError("native operation changed identity")
+        if operation.get("program_run_id") != task.identity.program_run_id:
+            raise ProductionPortError("native operation changed Program run")
+        resident = envelope.get("resident")
+        if type(resident) is not bool:
+            raise ProductionPortError("native operation residency is invalid")
+        return operation, resident
+
+    @staticmethod
+    def _require_preparation_reset_receipt(
+        accepted: object, task: _OperationTask, pending: _HeldPreparation,
+    ) -> None:
+        value = _mapping(accepted, field="preparation retirement acceptance")
+        assert task.operation is not None and pending.reset_request is not None
+        # Reset resolves to the current revision; the request's is informational.
+        if (value.get("operation_id") != task.operation.operation_id
+            or value.get("request_id") != pending.reset_request["request_context"]["request_id"]
+            or value.get("control") != "reset"
+            or type(value.get("accepted_against_revision")) is not int
+            or type(value.get("operation_revision_after_acceptance")) is not int
+            or value["operation_revision_after_acceptance"]
+            <= value["accepted_against_revision"]
+            or value.get("replay_status") not in {"accepted_new", "replayed_exact"}):
+            raise ProductionPortError("preparation retirement did not confirm the exact control")
+
+    def _retire_held_preparations(
+        self, program_run_id: str, selected_node_ids: frozenset[str],
+        expected_selection_revision: int,
+    ) -> None:
+        # ProgramRunOwner resolves the actual selected nodes. This method has
+        # no group parser, selection release, backend Reset or new timeout.
+        with self._lock:
+            tasks = tuple(task for task in self._tasks.values()
+                          if task.identity.program_run_id == program_run_id
+                          and task.identity.node_instance_id in selected_node_ids
+                          and task.held_preparation is not None)
+        for task in tasks:
+            pending, shared = task.held_preparation, task.operation
+            assert pending is not None and shared is not None
+            scope, held = self._held_preparation_scope(task, require_settled=True)
+            if (not held or type(expected_selection_revision) is not int
+                or expected_selection_revision < pending.selection_revision
+                or scope["selection_revision"] != expected_selection_revision):
+                raise ProductionPortError("preparation cleanup identifies a stale or unsettled hold")
+            envelope = self._kernel.operation(shared.operation_id)
+            operation, resident = self._resettable_operation(envelope, task)
+            if envelope.get("owner_epoch") != shared.request_owner_epoch:
+                raise ProductionPortError("preparation cleanup owner changed")
+            if pending.reset_request is None:
+                self._require_cancelled_preparation(task, envelope)
+                if operation != pending.operation or not resident:
+                    raise ProductionPortError("preparation cleanup no longer identifies original resident work")
+                pending.reset_request = {
+                    "request_context": {
+                        "request_id": _request_identity("program-held-preparation", program_run_id, shared.operation_id),
+                        "request_owner_epoch": shared.request_owner_epoch,
+                        "source_label": "manyforge_behavior",
+                        "correlation_id": program_run_id,
+                    },
+                    "operation_id": shared.operation_id,
+                    "expected_operation_revision": operation["operation_revision"],
+                    "reason": "Selected Resume retires cancelled unsent preparation",
+                }
+            if resident:
+                # Existing Kernel reset owns the permanent no-effect proof and
+                # refuses active/unknown borrows. It must never fall through to
+                # provider Reset for this exact class (DX843 private guard).
+                # Retries of explicit Resume use this same deterministic body.
+                pending.reset_submitted = True
+                result = self._kernel.reset(shared.operation_id, pending.reset_request)
+                self._require_preparation_reset_receipt(result.get("accepted"), task, pending)
+                pending.reset_acceptance = dict(result["accepted"])
+                envelope = self._kernel.operation(shared.operation_id)
+                operation, resident = self._resettable_operation(envelope, task)
+            if (not pending.reset_submitted or resident
+                or envelope.get("owner_epoch") != shared.request_owner_epoch
+                or operation.get("program_binding_id") != pending.operation["program_binding_id"]
+                or envelope.get("control_pending") is not False):
+                raise ProductionPortError("preparation retirement remains unconfirmed")
+            self._require_preparation_reset_receipt(envelope.get("last_control"), task, pending)
+            if (pending.reset_acceptance is not None
+                and envelope["last_control"]["operation_revision_after_acceptance"]
+                != pending.reset_acceptance["operation_revision_after_acceptance"]):
+                raise ProductionPortError("preparation retirement control was superseded")
+            # The real control receipt and history remain in the Kernel. Recheck
+            # the selection after cleanup; a newer Stop always wins release.
+            scope, held = self._held_preparation_scope(task, require_settled=True)
+            if not held or scope["selection_revision"] != expected_selection_revision:
+                raise ProductionPortError("Program hold changed during preparation retirement")
+            with self._lock:
+                if self._tasks.get(task.task_id) is not task:
+                    raise ProductionPortError("preparation owner changed during retirement")
+                self._tasks.pop(task.task_id)
+
+    def _reset_scope(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+        tasks, local_tasks = self._run_operation_tasks(program_run_id)
+        replaced = self._reconcile_unknown_admissions_for_reset(program_run_id, local_tasks)
+        tasks, local_tasks = self._run_operation_tasks(program_run_id)
+        if not tasks and not local_tasks:
+            settled = self._finish_scope_stop(program_run_id, release_fence=False)
+            if settled.state is not ProgramRunScopeState.SETTLED:
+                raise ProductionPortError("Program-run Stop changed during Reset cleanup")
+            return ProgramRunScopeSnapshot(
+                program_run_id,
+                ProgramRunScopeState.SETTLED,
+                0,
+            )
+
+        status = _mapping(self._kernel.identity().get("identity"), field="execution identity")
+        owner_epoch = _text(status.get("owner_epoch"), field="owner_epoch")
+        for task in tasks:
+            assert task.operation is not None
+            operation_id = task.operation.operation_id
+            operation, resident = self._resettable_operation(
+                self._kernel.operation(operation_id), task
+            )
+            if resident:
+                state = _text(operation.get("state"), field="operation state")
+                if state in _ACTIVE_STATES:
+                    raise ProductionPortError(
+                        "cannot reset a Program run with active native operations"
+                    )
+                revision = operation.get("operation_revision")
+                if type(revision) is not int or revision < 1:
+                    raise ProductionPortError("native operation revision is invalid")
+                self._kernel.reset(
+                    operation_id,
+                    {
+                        "request_context": {
+                            "request_id": _request_identity(
+                                "program-reset", program_run_id, operation_id
+                            ),
+                            "request_owner_epoch": owner_epoch,
+                            "source_label": "manyforge_behavior",
+                            "correlation_id": program_run_id,
+                        },
+                        "operation_id": operation_id,
+                        "expected_operation_revision": revision,
+                        "reason": "Program-cycle Reset released terminal work",
+                    },
+                )
+                deadline = time.monotonic() + _PROGRAM_RESET_SETTLEMENT_TIMEOUT_S
+                while True:
+                    _operation, resident = self._resettable_operation(
+                        self._kernel.operation(operation_id), task
+                    )
+                    if not resident:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise ProductionPortError("native operation Reset did not settle")
+                    time.sleep(_PROGRAM_RESET_SETTLEMENT_POLL_S)
+            with self._lock:
+                for member_task_id in task.operation.member_task_ids:
+                    member = self._tasks.get(member_task_id)
+                    if member is not None and member.operation is task.operation:
+                        self._tasks.pop(member_task_id, None)
+
+        with self._lock:
+            for task in local_tasks:
+                if any(task is pending for pending, _unknown in replaced):
+                    continue
+                self._tasks.pop(task.task_id, None)
+
+        settled = self._finish_scope_stop(
+            program_run_id, release_fence=False, retire_replaced=replaced
+        )
+        if settled.state is not ProgramRunScopeState.SETTLED:
+            raise ProductionPortError("Program-run Stop changed during Reset cleanup")
+        return ProgramRunScopeSnapshot(
+            program_run_id,
+            ProgramRunScopeState.SETTLED,
+            0,
+        )
+
+    def _reconcile_unknown_admissions_for_reset(
+        self,
+        program_run_id: str,
+        local_tasks: Sequence[_OperationTask],
+    ) -> tuple[tuple[_OperationTask, _UnknownOperationAdmission], ...]:
+        """Recover exact accepted receipts before destructive task cleanup.
+
+        Reset calls this only behind a settled Program Stop. For resident
+        operations exact replay may return an old acceptance. Immediate Set
+        TCP is never replayed and requires a confirmed same-owner read.
+        """
+
+        unknown_by_request: dict[str, _UnknownOperationAdmission] = {}
+        for task in local_tasks:
+            unknown = task.unknown_admission
+            if unknown is not None:
+                retained = unknown_by_request.setdefault(unknown.request_id, unknown)
+                if retained is not unknown:
+                    raise ProductionPortError(
+                        "unknown operation admission request identity was reused"
+                    )
+        if not unknown_by_request:
+            return ()
+
+        replaced: list[tuple[_OperationTask, _UnknownOperationAdmission]] = []
+        immediate_tasks = [task for task in local_tasks
+                           if task.unknown_admission is not None and task.node_id == "motion.set_tcp"]
+        if immediate_tasks:
+            current = _mapping(self._kernel.identity().get("identity"), field="execution identity")
+            current_owner = _text(current.get("owner_epoch"), field="owner_epoch")
+            for task in immediate_tasks:
+                unknown = task.unknown_admission
+                if (unknown is None or task.tcp_robot_id is None or
+                    sum(member.unknown_admission is unknown for member in local_tasks) != 1):
+                    raise ProductionPortError("unknown Set TCP identity is invalid")
+                if unknown.request_owner_epoch == current_owner:
+                    continue
+                # Keep this exact local evidence until the existing Stop
+                # settlement check commits its retirement below.
+                replaced.append((task, unknown))
+                unknown_by_request.pop(unknown.request_id, None)
+            if not unknown_by_request:
+                return tuple(replaced)
+
+        with self._lock:
+            stop = self._scope_stops.get(program_run_id)
+            if stop is None or stop.pending or stop.unresolved is not None:
+                raise ProductionPortError(
+                    "unknown operation admission requires settled Program Stop"
+                )
+            scope_stop = stop.active
+        if scope_stop is None:
+            raise ProductionPortError(
+                "unknown operation admission requires settled Program Stop"
+            )
+        stop_id, stop_generation, _retained_count = scope_stop
+        stop_status = _mapping(
+            self._kernel.stop_status(stop_id).get("stop_status"),
+            field="aggregate Stop status",
+        )
+        if (
+            stop_status.get("state") != "succeeded"
+            or stop_status.get("stop_generation") != stop_generation
+        ):
+            raise ProductionPortError(
+                "unknown operation admission requires settled Program Stop"
+            )
+
+        identity = _mapping(
+            self._kernel.identity().get("identity"), field="execution identity"
+        )
+        owner_epoch = _text(identity.get("owner_epoch"), field="owner_epoch")
+        for unknown in unknown_by_request.values():
+            immediate_tasks = [task for task in local_tasks
+                               if task.unknown_admission is unknown and task.node_id == "motion.set_tcp"]
+            if immediate_tasks:
+                if len(immediate_tasks) != 1 or immediate_tasks[0].tcp_robot_id is None:
+                    raise ProductionPortError("unknown Set TCP identity is invalid")
+                if self._active_tcp_result is None:
+                    raise ProductionPortError("Active TCP result consumer is unavailable")
+                try:
+                    # FIFO is host enqueue order, not proof that a prior send on
+                    # another connection was accepted. DX-3074 accepts this
+                    # residual when retiring an unknown immediate step.
+                    status = self._kernel.read_active_tcp(ordered=True)
+                    rows = status.get("robots")
+                    robot = immediate_tasks[0].tcp_robot_id
+                    if owner_epoch != unknown.request_owner_epoch or not isinstance(rows, list):
+                        raise ProductionPortError("unknown Set TCP belongs to a replaced owner")
+                    matches = [row for row in rows if isinstance(row, Mapping)
+                               and row.get("component_id") == robot]
+                    if len(matches) != 1 or matches[0].get("owner_epoch") != unknown.request_owner_epoch:
+                        raise ProductionPortError("unknown Set TCP read does not prove its owner")
+                    if self._active_tcp_result(program_run_id, robot, rows) is not True:
+                        raise ProductionPortError("unknown Set TCP result was not applied")
+                except Exception as error:
+                    raise ProductionPortError("unknown Set TCP could not be reconciled") from error
+                with self._lock:
+                    task = immediate_tasks[0]
+                    if self._tasks.get(task.task_id) is not task or task.unknown_admission is not unknown:
+                        raise ProductionPortError("unknown Set TCP task changed during Reset")
+                    task.unknown_admission = None
+                continue
+            if unknown.request_owner_epoch != owner_epoch:
+                raise ProductionPortError(
+                    "unknown operation admission belongs to a replaced owner"
+                )
+            try:
+                accepted = self._kernel.execute(unknown.intent)
+            except KernelOperationAdmissionRejectedError as error:
+                # Under the still-active Stop fence, this exact request can be
+                # rejected as new only after the replay ledger proves that no
+                # old acceptance exists. Reset may then retire the local task.
+                if error.details.get("reason") != "motion_admission_closed":
+                    raise ProductionPortError(
+                        "unknown operation admission could not be reconciled"
+                    ) from error
+                continue
+            except Exception as error:
+                raise ProductionPortError(
+                    "unknown operation admission could not be reconciled"
+                ) from error
+
+            accepted_value = _mapping(accepted.get("accepted"), field="acceptance")
+            operation_id = _text(
+                accepted_value.get("operation_id"), field="accepted.operation_id"
+            )
+            member_tasks: list[_OperationTask] = []
+            with self._lock:
+                for task_id in unknown.member_task_ids:
+                    member = self._tasks.get(task_id)
+                    if member is None or member.unknown_admission is not unknown:
+                        raise ProductionPortError(
+                            "unknown operation admission task changed during Reset"
+                        )
+                    member_tasks.append(member)
+                shared = _SharedOperation(
+                    operation_id,
+                    unknown.request_owner_epoch,
+                    frozenset(
+                        member.identity.node_attempt_id for member in member_tasks
+                    ),
+                    unknown.member_task_ids,
+                )
+                for member in member_tasks:
+                    member.operation = shared
+                    member.terminal = None
+                    member.unknown_admission = None
+        return tuple(replaced)
+
+    def _finish_scope_stop(
+        self,
+        program_run_id: str,
+        *,
+        release_fence: bool,
+        expected_stop: tuple[str, int] | None = None,
+        retire_replaced: tuple[tuple[_OperationTask, _UnknownOperationAdmission], ...] = (),
+    ) -> ProgramRunScopeSnapshot:
+        """Retire a proved handoff; only Resume reopens Kernel admission.
+
+        Destructive cycle Reset keeps the existing whole-run fence through
+        scene restoration. The parent claim's release retires that fence and
+        capture; local receipt cleanup is not permission for fresh node work.
+        """
+
+        with self._lock:
+            stop = self._scope_stops.get(program_run_id)
+            if stop is not None and stop.pending:
+                raise ProductionPortError("Program-run Stop requests are still in flight")
+            if stop is not None and stop.unresolved is not None:
+                raise ProductionPortError(
+                    "Program-run Stop outcome must be reconciled before release"
+                )
+            scope_stop = stop.active if stop is not None else None
+            if retire_replaced and (release_fence or scope_stop is None):
+                raise ProductionPortError("owner-replaced Set TCP requires an exact settled Stop")
+        if scope_stop is not None:
+            stop_id, stop_generation, _retained_count = scope_stop
+            if expected_stop is not None and expected_stop != (
+                stop_id,
+                stop_generation,
+            ):
+                raise ProductionPortError("Program-run Stop handoff is stale")
+            status = _mapping(
+                self._kernel.stop_status(stop_id).get("stop_status"),
+                field="aggregate Stop status",
+            )
+            if (
+                type(status.get("stop_generation")) is not int
+                or status["stop_generation"] != stop_generation
+            ):
+                raise ProductionPortError("Program-run Stop settlement generation is stale")
+            stop_state = status.get("state")
+            # A partial or failed Stop leaves a component's activity unknown:
+            # the cell latch (derived by the Kernel) blocks all execution until
+            # it reports idle, so only the fence release needs full settlement.
+            if stop_state != "succeeded" and not (
+                not release_fence and stop_state in ("partial", "failed")
+            ):
+                raise ProductionPortError(
+                    "Program-run Stop cannot be released before settlement"
+                )
+            if release_fence:
+                self._kernel.release_program_run_stop_fence(
+                    program_run_id,
+                    stop_id,
+                    stop_generation,
+                )
+            with self._lock:
+                if retire_replaced:
+                    if (self._scope_stops.get(program_run_id) is not stop
+                        or stop.active != scope_stop or stop.pending or stop.unresolved is not None):
+                        raise ProductionPortError("Program-run Stop changed during Reset cleanup")
+                    if any(self._tasks.get(task.task_id) is not task or
+                           task.unknown_admission is not unknown
+                           for task, unknown in retire_replaced):
+                        raise ProductionPortError("unknown Set TCP task changed during Reset")
+                    retiring = {task.task_id for task, _unknown in retire_replaced}
+                    if any(task.identity.program_run_id == program_run_id and task.task_id not in retiring
+                           for task in self._tasks.values()):
+                        raise ProductionPortError("Program-run scope changed during Reset cleanup")
+                    for task, unknown in retire_replaced:
+                        self._tasks.pop(task.task_id)
+                        _LOGGER.warning(
+                            "retired unknown Set TCP at Reset: owner replaced; run=%s request=%s",
+                            program_run_id, unknown.request_id,
+                        )
+                if self._scope_stops.get(program_run_id) is stop and stop.active == scope_stop:
+                    stop.active = None
+                    if stop.pending == 0 and stop.unresolved is None:
+                        self._scope_stops.pop(program_run_id)
+                if retire_replaced:
+                    return ProgramRunScopeSnapshot(program_run_id, ProgramRunScopeState.SETTLED, 0)
+        return self._observe_scope(program_run_id)
+
+    def _observe_task(self, task_id: str) -> OwnerTaskSnapshot:
+        task = self._task(task_id)
+        if task.held_before_admission:
+            with self._lock:
+                self._tasks.pop(task_id, None)
+            raise OwnerInvocationHeldError(0)
+        if task.terminal is not None and (task.operation is None or task.tcp_robot_id is None):
+            return task.terminal
+        operation, snapshot, envelope = self._observation(task)
+        if task.tcp_robot_id is not None and operation.get("state") not in _ACTIVE_STATES:
+            try:
+                if self._active_tcp_result is None:
+                    raise ProductionPortError("Active TCP result consumer is unavailable")
+                self._active_tcp_result(task.identity.program_run_id, task.tcp_robot_id,
+                                        envelope.get("active_tcp"))
+            except Exception as error:
+                raise OwnerTaskObservationUnavailableError(
+                    "confirmed Active TCP could not be applied"
+                ) from error
+        if snapshot.state is OwnerTaskState.SUCCEEDED:
+            revision = operation.get("operation_revision")
+            if type(revision) is not int or revision < 1:
+                raise ProductionPortError("native operation revision is invalid")
+            with self._lock:
+                current = self._tasks.get(task_id)
+                if current is task and current.operation is not None:
+                    current.operation.completed_revision = revision
+        return snapshot
+
+@dataclass(slots=True)
+class _ControlTask:
+    identity: NodeAttemptIdentity
+    node_id: str
+    query: Mapping[str, Any] | None = None
+    operation: Mapping[str, Any] | None = None
+    accepted: Mapping[str, Any] = field(default_factory=dict)
+
+
+class _NativeKernelControlTaskPort:
+    """One-shot controls; only pending observations are retained locally."""
+
+    _CAPABILITIES = {
+        "kernel.reset_operation": "execution.reset",
+        "kernel.stop_operation": "execution.stop.soft",
+        "kernel.set_runtime_scale": "execution.runtime_scale.operation_scoped",
+        # Recovery authority is the exact current offer, not a capability.
+        "recovery.apply_offered_action": None,
+    }
+
+    def __init__(self, owner: NativeKernelProgramPort) -> None:
+        self._owner = owner
+        self._pending: dict[str, _ControlTask] = {}
+
+    def start(
+        self, node_id: str, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> OwnerTaskSnapshot:
+        if node_id not in self._CAPABILITIES and node_id != "kernel.full_stop":
+            raise ProductionPortError("Kernel control node is unsupported")
+        task_id = _request_identity(
+            "program-control", identity.program_run_id, identity.node_attempt_id
+        )
+        task = _ControlTask(identity, node_id)
+        with self._owner._lock:
+            if task_id in self._pending:
+                raise ProductionPortError("control attempt was already submitted")
+            if len(self._pending) >= _MAX_TASKS:
+                raise ProductionPortError("too many pending Kernel control nodes")
+            self._pending[task_id] = task
+        try:
+            context = self._owner._context(identity.program_run_id)
+            caller = {
+                "request_id": task_id,
+                "request_owner_epoch": context.request_owner_epoch,
+                "source_label": "manyforge_behavior",
+                "correlation_id": identity.program_run_id,
+            }
+            kernel = self._owner._kernel
+            if node_id == "kernel.full_stop":
+                # Full Stop's unambiguous cell scope is resolved by the Kernel
+                # even with stale attribution. Never gate its reserved lane on
+                # an ordinary read merely to refresh diagnostic generation.
+                response = kernel.full_stop(
+                    {"request_context": caller, "expected_stop_generation": 0}
+                )
+            else:
+                target = self._owner._target(
+                    context,
+                    _text(inputs.parameters.get("target_role"), field="target_role"),
+                    self._CAPABILITIES[node_id],
+                )
+                task.query = {
+                    "schema_version": "manyforge.program_operation_query.v1",
+                    "owner_epoch": context.request_owner_epoch,
+                    "program_binding_id": context.capture.program_binding_id,
+                    "program_run_id": identity.program_run_id,
+                    "target_role_id": target.target_role_id,
+                }
+                selected = kernel.query_operation(task.query)
+                operation = dict(_mapping(selected.get("operation"), field="operation"))
+                if (
+                    selected.get("owner_epoch") != context.request_owner_epoch
+                    or selected.get("target_role_id") != target.target_role_id
+                    or operation.get("program_binding_id") != context.capture.program_binding_id
+                    or operation.get("program_run_id") != identity.program_run_id
+                ):
+                    raise ProductionPortError("control context crossed its captured scope")
+                task.operation = operation
+                operation_id = _text(operation.get("operation_id"), field="operation_id")
+                revision = operation.get("operation_revision")
+                if type(revision) is not int or revision < 1:
+                    raise ProductionPortError("control operation revision is invalid")
+                if node_id == "recovery.apply_offered_action":
+                    result = self._recover(task, inputs)
+                    with self._owner._lock:
+                        self._pending.pop(task_id, None)
+                    return OwnerTaskSnapshot(
+                        task_id,
+                        (
+                            OwnerTaskState.SUCCEEDED
+                            if result.get("accepted") is True
+                            else OwnerTaskState.FAILED
+                        ),
+                        metadata={
+                            "operation_id": operation_id,
+                            "recovery_result": result,
+                        },
+                        reason_code=(
+                            None if result.get("accepted") is True else "recovery_rejected"
+                        ),
+                        details=(
+                            None
+                            if result.get("accepted") is True
+                            or not isinstance(result.get("error"), Mapping)
+                            else bounded_failure_details(result["error"].get("details"))
+                        ),
+                    )
+                request = {
+                    "request_context": caller,
+                    "operation_id": operation_id,
+                    "expected_operation_revision": revision,
+                }
+                if node_id == "kernel.stop_operation":
+                    generation = operation.get("active_stop_generation")
+                    response = kernel.stop(
+                        {
+                            "request_context": caller,
+                            "operations": [
+                                {
+                                    "operation_id": operation_id,
+                                    "expected_operation_revision": revision,
+                                    "expected_stop_generation": (
+                                        0 if generation is None else generation
+                                    ),
+                                }
+                            ],
+                            "reason": "Program Stop node",
+                        }
+                    )
+                elif node_id == "kernel.set_runtime_scale":
+                    response = kernel.set_operation_runtime_scale(
+                        {
+                            **request,
+                            "expected_runtime_scale_generation": operation.get(
+                                "runtime_scale_generation"
+                            ),
+                            "scale": _number(inputs.parameters.get("scale"), field="scale"),
+                        }
+                    )
+                else:
+                    method = {
+                        "kernel.reset_operation": kernel.reset,
+                    }[node_id]
+                    response = method(
+                        operation_id,
+                        {
+                            **request,
+                            "reason": node_id,
+                            "execution_scope": {
+                                "node_instance_id": identity.node_instance_id,
+                                "node_attempt_id": identity.node_attempt_id,
+                            },
+                        },
+                    )
+            task.accepted = dict(_mapping(response.get("accepted"), field="accepted control"))
+            return OwnerTaskSnapshot(task_id, OwnerTaskState.ACTIVE)
+        except Exception:
+            with self._owner._lock:
+                self._pending.pop(task_id, None)
+            raise
+
+    def _recover(self, task: _ControlTask, inputs: OwnerNodeInputs) -> Mapping[str, Any]:
+        assert task.operation is not None
+        operation = task.operation
+        operation_id = _text(operation.get("operation_id"), field="operation_id")
+        action = _text(inputs.parameters.get("recovery_action"), field="recovery_action")
+        assessment = self._owner._recovery_assessment(operation, operation_id)
+        if assessment is None:
+            raise ProductionPortError("the exact current recovery offer is unavailable")
+        actions = assessment.get("allowed_actions")
+        if (
+            action not in OWNER_RECOVERY_ACTIONS
+            or not isinstance(actions, list)
+            or action not in actions
+        ):
+            raise ProductionPortError("the authored recovery action is not currently offered")
+        if operation.get("state") in _INTERRUPTED_STATES:
+            state = OwnerTaskState.INTERRUPTED
+        elif operation.get("state") in _FAILED_STATES:
+            state = OwnerTaskState.FAILED
+        else:
+            raise ProductionPortError("operation recovery is not current")
+        result = self._owner._apply_operation_recovery(
+            operation_id,
+            task.identity,
+            operation,
+            OwnerTaskSnapshot(
+                operation_id,
+                state,
+                metadata={"recovery_assessment": assessment},
+                reason_code=f"operation_{operation['state']}",
+            ),
+            action=action,
+            request_id=_request_identity(
+                "program-control",
+                task.identity.program_run_id,
+                task.identity.node_attempt_id,
+            ),
+            reason="Program recovery node",
+        )
+        if result.get("accepted") is True:
+            with self._owner._lock:
+                previous = self._owner._tasks.get(operation_id)
+                if (
+                    previous is not None
+                    and previous.identity.program_run_id == task.identity.program_run_id
+                ):
+                    self._owner._tasks.pop(operation_id, None)
+        return result
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        try:
+            return self._observe(task_id)
+        except KernelOperationObservationUnavailableError as error:
+            raise OwnerTaskObservationUnavailableError(str(error)) from error
+        except Exception as error:
+            if getattr(error, "code", None) in {
+                "execution_owner_unavailable",
+                "execution_operation_observation_changed",
+            }:
+                raise OwnerTaskObservationUnavailableError(str(error)) from error
+            with self._owner._lock:
+                self._pending.pop(task_id, None)
+            raise
+
+    def _observe(self, task_id: str) -> OwnerTaskSnapshot:
+        with self._owner._lock:
+            task = self._pending.get(task_id)
+        if task is None:
+            raise ProductionPortError("control task is not pending")
+        kernel = self._owner._kernel
+        state = OwnerTaskState.ACTIVE
+        reason = None
+        if task.node_id in {"kernel.stop_operation", "kernel.full_stop"}:
+            stop_id = _text(task.accepted.get("stop_id"), field="stop_id")
+            stop = _mapping(kernel.stop_status(stop_id).get("stop_status"), field="Stop status")
+            if stop.get("stop_id") != stop_id or stop.get("stop_generation") != task.accepted.get(
+                "stop_generation"
+            ):
+                raise ProductionPortError("control Stop observation changed identity")
+            if stop.get("state") == "succeeded":
+                state = OwnerTaskState.SUCCEEDED
+            elif stop.get("state") not in {"accepted", "stopping", "certifying"}:
+                state, reason = OwnerTaskState.FAILED, "stop_not_certified"
+        elif task.node_id == "kernel.set_runtime_scale":
+            response = kernel.query_operation(task.query)
+            operation = _mapping(response.get("operation"), field="operation")
+            scale = _mapping(response.get("runtime_scale"), field="runtime scale")
+            if operation.get("operation_id") != task.operation["operation_id"] or scale.get(
+                "generation"
+            ) != task.accepted.get("runtime_scale_generation"):
+                state, reason = OwnerTaskState.FAILED, "runtime_scale_superseded"
+            elif scale.get("state") == "applied":
+                state = OwnerTaskState.SUCCEEDED
+            elif scale.get("state") != "pending":
+                state, reason = OwnerTaskState.FAILED, "runtime_scale_not_applied"
+        else:
+            envelope = kernel.operation(task.operation["operation_id"])
+            operation = _mapping(envelope.get("operation"), field="operation")
+            if envelope.get("owner_epoch") != task.query["owner_epoch"]:
+                raise ProductionPortError("control observation changed owner")
+            if (
+                operation.get("operation_id") != task.operation["operation_id"]
+                or operation.get("program_run_id") != task.identity.program_run_id
+                or operation.get("program_binding_id") != task.operation["program_binding_id"]
+            ):
+                raise ProductionPortError("control observation changed operation")
+            last_control = _mapping(envelope.get("last_control"), field="last control")
+            if last_control.get("request_id") != task_id or last_control.get(
+                "operation_revision_after_acceptance"
+            ) != task.accepted.get("operation_revision_after_acceptance"):
+                state, reason = OwnerTaskState.FAILED, "operation_control_superseded"
+            elif envelope.get("control_pending") is True:
+                pass  # an observed Executing state is not completed provider work
+            elif envelope.get("control_pending") is not False:
+                raise ProductionPortError("control completion is unavailable")
+            elif task.node_id == "kernel.reset_operation":
+                if envelope.get("resident") is False:
+                    state = OwnerTaskState.SUCCEEDED
+                else:
+                    state, reason = OwnerTaskState.FAILED, "operation_reset_failed"
+            elif operation.get("state") not in _ACTIVE_STATES:
+                state, reason = OwnerTaskState.FAILED, "operation_control_interrupted"
+        if state is not OwnerTaskState.ACTIVE:
+            with self._owner._lock:
+                self._pending.pop(task_id, None)
+        return OwnerTaskSnapshot(task_id, state, reason_code=reason)
+
+    def acknowledge(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        # Consumption of a control result is not an operation Reset or ACK.
+        if task_id != _request_identity(
+            "program-control", identity.program_run_id, identity.node_attempt_id
+        ):
+            raise ProductionPortError("control result consumption changed node attempt")
+
+    def cancel(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        self.acknowledge(task_id, identity)
+        # Invalidation cancels only observation. The Kernel retains accepted
+        # effects; the Program scope's independent Stop/reset path settles them.
+        with self._owner._lock:
+            self._pending.pop(task_id, None)
+
+
+class _NativeTargetQueryPort:
+    """On-demand native observations; no client-side model or gripper state."""
+
+    def __init__(self, owner: NativeKernelProgramPort) -> None:
+        self._owner = owner
+
+    def express_pose(
+        self,
+        identity: NodeAttemptIdentity,
+        pose: Mapping[str, Any],
+        target_frame: Mapping[str, Any],
+    ) -> FrameTransformResult:
+        """Express one stored pose in another declared frame.
+
+        One native `frame_transform` query: the cell frame resolver resolves
+        both frames from one coherent state capture. Robots on another
+        execution host are refused there by name.
+        """
+
+        try:
+            context = self._owner._context(identity.program_run_id)
+            stored = _mapping(pose, field="pose")
+            query = {
+                "schema_version": "manyforge.target_observation_query.v1",
+                "owner_epoch": context.request_owner_epoch,
+                "program_binding_id": context.capture.program_binding_id,
+                "kind": "frame_transform",
+                "pose": _pose3(stored, field="pose"),
+                "source_frame": _frame_reference(
+                    stored.get("frame_ref"), field="pose.frame_ref", targets=context.targets
+                ),
+                "target_frame": _frame_reference(
+                    target_frame, field="target_frame", targets=context.targets
+                ),
+            }
+            response = self._owner._kernel.query_target(query)
+            observation = _mapping(
+                response.get("target_observation"), field="target_observation"
+            )
+            expected = {**query, "schema_version": "manyforge.target_observation.v1"}
+            if any(observation.get(key) != value for key, value in expected.items()):
+                raise ProductionPortError("native frame transform crossed the captured query")
+            value = _mapping(observation.get("value"), field="frame transform value")
+            position = _mapping(value.get("position_m"), field="frame transform position")
+            orientation = _mapping(value.get("orientation"), field="frame transform orientation")
+            return FrameTransformResult(
+                pose={
+                    "frame_ref": dict(_mapping(target_frame, field="target_frame")),
+                    "position_m": [
+                        _number(position.get(axis), field=axis) for axis in ("x_m", "y_m", "z_m")
+                    ],
+                    "orientation": {
+                        "xyzw": normalize_quat(
+                            [
+                                _number(orientation.get(axis), field=axis)
+                                for axis in ("x", "y", "z", "w")
+                            ]
+                        )
+                    },
+                },
+                metadata={
+                    key: observation[key]
+                    for key in (
+                        "evaluated_at_ns",
+                        "scene_revision",
+                        "resolution_evidence_digests",
+                    )
+                },
+            )
+        except FrameTransformError:
+            raise
+        except Exception as exc:
+            details = exception_failure_details(exc)
+            reason = None if details is None else details.get("reason")
+            raise FrameTransformError(
+                reason if isinstance(reason, str) and reason else "frame_transform_failed",
+                _owner_failure_message(exc),
+                details=details,
+            ) from exc
+
+    def _read_io_input(
+        self, node_id: str, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> OwnerInvocationResult:
+        """Read one bound boolean input once; only `fresh` authorizes it."""
+
+        context = self._owner._context(identity.program_run_id)
+        target_role_id = _text(inputs.parameters.get("target_role"), field="target_role")
+        resource_role_id = _text(
+            inputs.parameters.get("resource_role"), field="resource_role"
+        )
+        try:
+            _io_signal(context.targets, target_role_id, resource_role_id)
+        except IoSignalRefusedError as error:
+            return OwnerInvocationResult(
+                False, reason_code=error.code, message=str(error), details=error.details
+            )
+        query = {
+            "schema_version": "manyforge.target_observation_query.v1",
+            "owner_epoch": context.request_owner_epoch,
+            "program_binding_id": context.capture.program_binding_id,
+            "target_role_id": target_role_id,
+            "kind": "io_signal",
+            "resource_role_id": resource_role_id,
+        }
+        try:
+            response = self._owner._kernel.query_target(query)
+        except Exception as error:
+            reason = _io_owner_reason(error, "")
+            if not reason:
+                raise
+            details = exception_failure_details(error)
+            return OwnerInvocationResult(
+                False,
+                reason_code=reason,
+                message=_owner_failure_message(error),
+                details=details,
+            )
+        observation = _mapping(response.get("target_observation"), field="target_observation")
+        expected = {**query, "schema_version": "manyforge.target_observation.v1"}
+        if any(observation.get(key) != value for key, value in expected.items()):
+            raise ProductionPortError("native I/O observation crossed the captured query")
+        value = _mapping(observation.get("value"), field="I/O observation value")
+        metadata = {
+            key: value.get(key)
+            for key in ("signal_name", "quality", "source_id", "source_epoch", "source_sequence")
+        }
+        if value.get("quality") != "fresh" or type(value.get("value")) is not bool:
+            return OwnerInvocationResult(
+                False,
+                metadata=metadata,
+                reason_code="io_input_unavailable",
+                message=(
+                    f"input {resource_role_id!r} of target role {target_role_id!r} "
+                    f"is {value.get('quality')!r}; only a fresh value can be read"
+                ),
+                details={
+                    "reason": "io_input_unavailable",
+                    "reference_type": "resource_role",
+                    "reference_id": resource_role_id,
+                    "target_role_id": target_role_id,
+                },
+            )
+        if node_id == "io.get_input":
+            return OwnerInvocationResult(True, output=value["value"], metadata=metadata)
+        expected_value = inputs.parameters.get("expected_value")
+        if type(expected_value) is not bool:
+            raise ProductionPortError("check_input expected_value must be boolean")
+        matched = value["value"] is expected_value
+        return OwnerInvocationResult(
+            matched,
+            metadata=metadata,
+            reason_code=None if matched else "io_input_not_matched",
+            message="" if matched else (
+                f"input {resource_role_id!r} is {value['value']}, expected {expected_value}"
+            ),
+        )
+
+    def _kernel_call(self, call: Callable[[], Any]) -> OwnerInvocationResult:
+        """One immediate Kernel call: success at once, or the node fails with
+        the Kernel's typed refusal (a tree outcome, never a fault)."""
+
+        try:
+            call()
+        except Exception as error:
+            code = getattr(error, "code", None)
+            if not isinstance(code, str) or not code:
+                raise
+            return OwnerInvocationResult(
+                False,
+                reason_code=code,
+                message=_owner_failure_message(error),
+                details=exception_failure_details(error),
+            )
+        return OwnerInvocationResult(True)
+
+    def _set_rule_active(self, inputs: OwnerNodeInputs) -> OwnerInvocationResult:
+        rule_id = _text(inputs.parameters.get("rule_id"), field="rule_id")
+        active = inputs.parameters.get("active")
+        if type(active) is not bool:
+            raise ProductionPortError("rules.set_active active must be boolean")
+        return self._kernel_call(lambda: self._owner._kernel.set_rule_active(rule_id, active))
+
+    def _clear_outside_change(
+        self, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> OwnerInvocationResult:
+        context = self._owner._context(identity.program_run_id)
+        target_role_id = _text(inputs.parameters.get("target_role"), field="target_role")
+        resource_role_id = _text(inputs.parameters.get("resource_role"), field="resource_role")
+        try:
+            signal = _io_signal(context.targets, target_role_id, resource_role_id, output=True)
+        except IoSignalRefusedError as error:
+            return OwnerInvocationResult(
+                False, reason_code=error.code, message=str(error), details=error.details
+            )
+        component_id = context.targets[target_role_id].controllable_component_id
+        return self._kernel_call(
+            lambda: self._owner._kernel.clear_outside_change(component_id, signal.signal_name)
+        )
+
+    def _set_io_output(
+        self, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> OwnerInvocationResult:
+        """One output write through the one write path (CONTRACTS §7): the
+        same host call as a manual write, made once and never resent. The
+        pneumatic gripper's valve steps come here too."""
+
+        context = self._owner._context(identity.program_run_id)
+        target_role_id = _text(inputs.parameters.get("target_role"), field="target_role")
+        resource_role_id = _text(inputs.parameters.get("resource_role"), field="resource_role")
+        value = inputs.parameters.get("value")
+        if type(value) is not bool:
+            raise ProductionPortError("io.set_output value must be a boolean")
+        try:
+            signal = _io_signal(context.targets, target_role_id, resource_role_id, output=True)
+        except IoSignalRefusedError as error:
+            return OwnerInvocationResult(
+                False, reason_code=error.code, message=str(error), details=error.details
+            )
+        component_id = context.targets[target_role_id].controllable_component_id
+        self._owner._require_scope_open(identity.program_run_id)
+        return self._kernel_call(
+            lambda: self._owner._kernel.set_io_output(component_id, signal.signal_name, value)
+        )
+
+    def invoke(
+        self, node_id: str, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> OwnerInvocationResult:
+        if node_id in _IO_READ_NODE_IDS:
+            return self._read_io_input(node_id, identity, inputs)
+        if node_id == "rules.set_active":
+            return self._set_rule_active(inputs)
+        if node_id == _IO_CLEAR_OUTSIDE_CHANGE_NODE_ID:
+            return self._clear_outside_change(identity, inputs)
+        if node_id == _IO_OUTPUT_NODE_ID:
+            return self._set_io_output(identity, inputs)
+        if node_id not in {
+            "model.get_frame_pose",
+            "gripper.check_status",
+            "gripper.wait_for_status",
+        }:
+            raise ProductionPortError("target query node is unsupported")
+        context = self._owner._context(identity.program_run_id)
+        frame_query = node_id == "model.get_frame_pose"
+        target = self._owner._target(
+            context,
+            _text(inputs.parameters.get("target_role"), field="target_role"),
+            "model.kinematics.fk" if frame_query else "tool.gripper.feedback",
+        )
+        query = {
+            "schema_version": "manyforge.target_observation_query.v1",
+            "owner_epoch": context.request_owner_epoch,
+            "program_binding_id": context.capture.program_binding_id,
+            "target_role_id": target.target_role_id,
+            "kind": "frame_pose" if frame_query else "gripper_status",
+        }
+        if frame_query:
+            query["frame_role_id"] = _text(inputs.parameters.get("frame_role"), field="frame_role")
+        response = self._owner._kernel.query_target(query)
+        observation = _mapping(response.get("target_observation"), field="target_observation")
+        expected = {**query, "schema_version": "manyforge.target_observation.v1"}
+        if any(observation.get(key) != value for key, value in expected.items()):
+            raise ProductionPortError("native target observation crossed the captured query")
+        metadata = {key: observation[key] for key in ("source_epoch", "source_sequence")}
+        value = _mapping(observation.get("value"), field="target observation value")
+        if frame_query:
+            position = _mapping(value.get("position_m"), field="frame position")
+            orientation = _mapping(value.get("orientation"), field="frame orientation")
+            return OwnerInvocationResult(
+                True,
+                output={
+                    "frame_ref": {"kind": "cell_frame"},
+                    "position_m": [
+                        _number(position.get(axis), field=axis) for axis in ("x_m", "y_m", "z_m")
+                    ],
+                    "orientation": {
+                        "xyzw": [
+                            _number(orientation.get(axis), field=axis)
+                            for axis in ("x", "y", "z", "w")
+                        ]
+                    },
+                },
+                metadata=metadata,
+            )
+        expected_state = inputs.parameters.get("expected_state")
+        metadata["command_scope"] = tuple(
+            value[key]
+            for key in (
+                "command_id",
+                "generation",
+                "source_id",
+                "source_revision",
+                "source_epoch",
+                "active_control_configuration_id",
+                "active_control_configuration_generation",
+            )
+        )
+        metadata["command_state"] = value["state"]
+        # Opt-in typed grasp evidence of this command (None when not configured).
+        metadata["grasp_confirmed"] = value.get("grasp_confirmed")
+        expected_native = {
+            "idle": "idle",
+            "moving": "executing",
+            "reached": "completed",
+            "failed": "failed",
+        }
+        if expected_state not in expected_native:
+            raise ProductionPortError("gripper expected state is unsupported")
+        matched = value.get("state") == expected_native[expected_state]
+        return OwnerInvocationResult(
+            matched,
+            metadata=metadata,
+            reason_code=None if matched else "gripper_status_not_matched",
+        )
+
+
+class _NativeIoWatchTaskPort:
+    """`io.wait_for_input` as a narrowed OwnerTaskPort over the command socket.
+
+    start registers one zero-claim level watch for the exact node attempt,
+    observe reads it, and cancel/acknowledge release that exact token. Run
+    teardown (`unbind`) releases what is left. A transport failure is never
+    teardown: the watch stays registered and is read again on a later tick.
+
+    A registration whose reply is unknown (transport failure, timeout or an
+    unusable reply: no token) ends the attempt, so the exact attempt's scope
+    is released then with `scope_request`. That release is sent once over the
+    existing transport; if it is unknown too, Run teardown releases the Run's
+    watches on the host. A host refusal registered nothing and sends nothing.
+    """
+
+    def __init__(self, owner: NativeKernelProgramPort) -> None:
+        self._owner = owner
+
+    def start(
+        self, node_id: str, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> OwnerTaskSnapshot:
+        if node_id != "io.wait_for_input":
+            raise ProductionPortError("I/O watch node is unsupported")
+        owner = self._owner
+        context = owner._context(identity.program_run_id)
+        owner._require_scope_open(identity.program_run_id)
+        target_role_id = _text(inputs.parameters.get("target_role"), field="target_role")
+        resource_role_id = _text(
+            inputs.parameters.get("resource_role"), field="resource_role"
+        )
+        condition = _io_watch_condition(inputs.parameters, target_role_id, resource_role_id)
+        _io_signal(context.targets, target_role_id, resource_role_id)
+        attempt = owner._node_attribution(identity)
+        task_id = _request_identity(
+            "program-io-watch", identity.program_run_id, identity.node_attempt_id
+        )
+        with owner._lock:
+            if task_id in owner._io_watches:
+                raise ProductionPortError("node attempt already registered its I/O watch")
+            if len(owner._io_watches) >= _MAX_IO_WATCHES:
+                raise ProductionPortError("I/O watch retention is full")
+        try:
+            response = owner._kernel.register_io_watch(
+                {
+                    "schema_version": "manyforge.io_watch_request.v1",
+                    **attempt,
+                    "target_role_id": target_role_id,
+                    "resource_role_id": resource_role_id,
+                    "condition": condition,
+                }
+            )
+        except Exception as error:
+            if isinstance(error, KernelClientResponseError) or (
+                getattr(error, "code", None) in EXECUTION_TRANSPORT_FAILURE_CODES
+            ):
+                self._release_unknown_scope(attempt)
+            raise
+        with owner._lock:
+            owner._io_watches[task_id] = _IoWatch(
+                identity, deepcopy(dict(response["registration"]))
+            )
+        return self._snapshot(task_id, response["result"])
+
+    def _release_unknown_scope(self, attempt: Mapping[str, Any]) -> None:
+        try:
+            self._owner._kernel.release_io_watch_scope(
+                {"schema_version": "manyforge.io_watch_scope_release.v1", **attempt}
+            )
+        except Exception:
+            # Unknown again: no retry here; Run teardown releases the Run's
+            # watches on the host, and the original failure stays reported.
+            pass
+
+    def _watch(self, task_id: str) -> _IoWatch | None:
+        with self._owner._lock:
+            return self._owner._io_watches.get(task_id)
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        watch = self._watch(task_id)
+        if watch is None:
+            raise ProductionPortError("I/O watch is not registered")
+        try:
+            result = self._owner._kernel.read_io_watch(watch.registration)
+        except Exception as error:
+            if getattr(error, "code", None) in EXECUTION_TRANSPORT_FAILURE_CODES:
+                raise OwnerTaskObservationUnavailableError(
+                    "I/O watch is temporarily unavailable to read"
+                ) from error
+            raise
+        return self._snapshot(task_id, result)
+
+    @staticmethod
+    def _snapshot(task_id: str, result: Mapping[str, Any]) -> OwnerTaskSnapshot:
+        state = result.get("state")
+        if state == "released":
+            # Released by the host (owner/activation teardown) before a match;
+            # Core erased the watch, so the reply has no observation.
+            return OwnerTaskSnapshot(
+                task_id,
+                OwnerTaskState.FAILED,
+                metadata={"io_watch_state": state},
+                reason_code="io_watch_released",
+                message="the I/O watch was released by its owner before it matched",
+            )
+        observation = _mapping(result.get("observation"), field="I/O watch observation")
+        metadata = {
+            "io_watch_state": state,
+            "quality": observation.get("quality"),
+            "signal_name": observation.get("signal_name"),
+        }
+        if state == "pending":
+            return OwnerTaskSnapshot(task_id, OwnerTaskState.ACTIVE, metadata=metadata)
+        if state == "matched":
+            sample = _mapping(result.get("matched_sample"), field="matched sample")
+            metadata["matched_sample"] = {
+                key: sample.get(key) for key in ("source_id", "source_epoch", "source_sequence")
+            }
+            return OwnerTaskSnapshot(task_id, OwnerTaskState.SUCCEEDED, metadata=metadata)
+        raise ProductionPortError("I/O watch read has an unknown state")
+
+    def cancel(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        """Release the exact watch; idempotent, and absent means released."""
+
+        watch = self._watch(task_id)
+        if watch is None:
+            return
+        if watch.identity != identity:
+            raise ProductionPortError("I/O watch belongs to another node attempt")
+        self._owner._kernel.release_io_watch(watch.registration)
+        with self._owner._lock:
+            self._owner._io_watches.pop(task_id, None)
+
+    def acknowledge(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        self.cancel(task_id, identity)
+
+    def release_run(self, program_run_id: str) -> None:
+        """Run teardown: release each remaining watch of this run.
+
+        A release the host cannot confirm now is dropped locally: the host
+        releases a retired run's watches itself (run-capture/owner teardown).
+        """
+
+        with self._owner._lock:
+            watches = [
+                (task_id, watch)
+                for task_id, watch in self._owner._io_watches.items()
+                if watch.identity.program_run_id == program_run_id
+            ]
+        for task_id, watch in watches:
+            try:
+                self._owner._kernel.release_io_watch(watch.registration)
+            except Exception:
+                pass
+            with self._owner._lock:
+                self._owner._io_watches.pop(task_id, None)
+
+
+_LOGGER = logging.getLogger(__name__)
+_MOCK_SIMULATION_OCCURRENCE: Final = (
+    "owner_epoch",
+    "program_binding_id",
+    "program_runner_owner_epoch",
+    "claim_generation",
+    "program_run_id",
+    "node_instance_id",
+    "node_attempt_id",
+    "node_start_index",
+)
+
+
+def _pause_fact(state: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "paused": state["paused"],
+        "run_revision": str(state["revision"]),
+        "held_node_instance_ids": list(state["held"]),
+    }
+
+
+def _mock_simulation_row(row: Any) -> dict[str, Any]:
+    """One authored row on the wire: an omitted change is an explicit null."""
+
+    row = _mapping(row, field="mock_simulation row")
+    signal = _mapping(row.get("signal"), field="mock_simulation signal")
+    change = row.get("change")
+    return {
+        "signal": {
+            "target_role": _text(signal.get("target_role"), field="target_role"),
+            "resource_role": _text(signal.get("resource_role"), field="resource_role"),
+        },
+        "start_value": row.get("start_value"),
+        "change": None if change is None else {
+            "after_ms": _mapping(change, field="mock_simulation change").get("after_ms"),
+            "value": change.get("value"),
+        },
+    }
+
+
+class _NativeMockSimulationPort:
+    """Decision 133: `start_mock_io_node_simulation` for one node attempt.
+
+    The request carries the attempt's existing io-watch attribution, the
+    Runner's node start index (decimal text) and the node's literal rows in
+    canonical selector order. The host retains each node start's result, so
+    the node resends the same request after an unknown reply. A typed host
+    ErrorResponse is a closed refusal (`MockSimulationRefusedError`).
+    """
+
+    def __init__(self, owner: NativeKernelProgramPort) -> None:
+        self._owner = owner
+        # Ends whose reply is unknown, resent unchanged before the next
+        # Mock call and at Run teardown; bounded (the host also cancels a
+        # retired Run's pending changes).
+        self._unknown_ends: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._refusal_logged: set[tuple[str, str, str]] = set()
+        # Per Run: the latest Halt state {revision, paused, request, settled};
+        # a START waits until it is answered.
+        self._run_pause: dict[str, dict[str, Any]] = {}
+        self._unconfirmed_pauses: dict[str, list[dict[str, Any]]] = {}
+
+    def request(
+        self,
+        identity: NodeAttemptIdentity,
+        node_start_index: int,
+        signals: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        if type(node_start_index) is not int or not 1 <= node_start_index <= 2**64 - 1:
+            raise ProductionPortError("node start index must be a positive uint64")
+        self._owner._require_scope_open(identity.program_run_id)
+        rows = sorted(
+            (_mock_simulation_row(row) for row in signals),
+            key=lambda row: (row["signal"]["target_role"], row["signal"]["resource_role"]),
+        )
+        return {
+            "schema_version": "manyforge.mock_io_node_start.v1",
+            **self._owner._node_attribution(identity),
+            "node_start_index": str(node_start_index),
+            "signals": rows,
+        }
+
+    def set_run_paused(
+        self,
+        program_run_id: str,
+        run_revision: int,
+        paused: bool,
+        held_node_instance_ids: Sequence[str] = (),
+    ) -> None:
+        """Decision 135 / SX-2411/2416: record the Run's Halt state at the
+        Runner's run_revision. Nothing is sent until the Run's first START
+        establishes its Mock context (then exactly once, the current state,
+        just before that START); afterwards each change is sent. Never
+        raises. An unanswered state (lost reply, or an explicit error, which
+        had no effect) is resent unchanged on the Run's ticks and before the
+        next START, never with a fresh revision; one superseded while
+        unanswered is reported unconfirmed."""
+
+        if type(run_revision) is not int or not 1 <= run_revision <= 2**64 - 1:
+            raise ProductionPortError("run_revision must be a positive uint64")
+        with self._owner._lock:
+            current = self._run_pause.get(program_run_id)
+            if current is not None and current["revision"] >= run_revision:
+                return
+            established = current is not None and current["established"]
+            # A state still being sent reports itself if it stays unanswered.
+            if established and current["outcome"] in {"unknown", "refused"}:
+                self._unconfirmed_pauses.setdefault(program_run_id, []).append(
+                    _pause_fact(current)
+                )
+            self._run_pause[program_run_id] = {
+                "revision": run_revision, "paused": paused,
+                "held": sorted(set(held_node_instance_ids)), "request": None,
+                "outcome": "unsent", "established": established,
+            }
+        if established:
+            self._settle_run_pause(program_run_id)
+
+    def _settle_run_pause(self, program_run_id: str) -> str:
+        """Send the Run's latest Halt state unless answered: its outcome,
+        `settled`, `unknown` (lost reply) or `refused` (explicit error).
+
+        The state is established and its request fixed under the lock, so a
+        Halt arriving during this send sees the established context and is
+        sent itself. Only the current state takes the reply's outcome; a
+        superseded one just returns it (reported if it was never answered).
+        """
+
+        attribution: dict[str, Any] | None = None
+        while True:
+            with self._owner._lock:
+                state = self._run_pause.get(program_run_id)
+                if state is None:
+                    raise MockSimulationRefusedError(
+                        "mock_run_pause_unknown",
+                        "the Run never supplied its Mock pause state",
+                        {"reason": "mock_run_pause_unknown"},
+                    )
+                if state["outcome"] == "settled":
+                    return "settled"
+                if state["request"] is None and attribution is not None:
+                    state["request"] = {
+                        "schema_version": "manyforge.mock_io_run_pause.v1",
+                        **attribution,
+                        "run_revision": str(state["revision"]),
+                        "paused": state["paused"],
+                        "held_node_instance_ids": list(state["held"]),
+                    }
+                if state["request"] is not None:
+                    state["established"] = True  # The first START needs it.
+                    request = state["request"]
+                    break
+            # The Run attribution reads the Kernel scope: never under the lock.
+            try:
+                attribution = self._owner._run_attribution(program_run_id)
+            except Exception:
+                with self._owner._lock:
+                    state["established"] = True
+                    if self._run_pause.get(program_run_id) is state:
+                        state["outcome"] = "unknown"
+                return "unknown"
+        try:
+            self._owner._kernel.set_mock_io_run_paused(request)
+            outcome = "settled"
+        except Exception as error:
+            code = getattr(error, "code", None)
+            if isinstance(error, KernelClientResponseError) or not isinstance(code, str) or (
+                code in EXECUTION_TRANSPORT_FAILURE_CODES
+            ):
+                outcome = "unknown"
+            elif code == "mock_simulation_stale":
+                # The same revision with the other state: a Runner bug,
+                # logged and never retried.
+                _LOGGER.error(
+                    "Mock Run pause state refused as stale: run=%s revision=%s paused=%s",
+                    program_run_id, state["revision"], state["paused"],
+                )
+                with self._owner._lock:  # No accepted receipt: unconfirmed.
+                    self._unconfirmed_pauses.setdefault(program_run_id, []).append(
+                        _pause_fact(state)
+                    )
+                outcome = "settled"
+            else:
+                outcome = "refused"  # No effect: resent unchanged.
+        with self._owner._lock:
+            if self._run_pause.get(program_run_id) is state:
+                state["outcome"] = outcome
+            elif outcome != "settled":
+                self._unconfirmed_pauses.setdefault(program_run_id, []).append(
+                    _pause_fact(state)
+                )
+        return outcome
+
+    def resend_run_pause(
+        self, program_run_id: str
+    ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any] | None]:
+        """The Run's tick resend: (superseded states never answered, to
+        record now; the current state if still unanswered)."""
+
+        with self._owner._lock:
+            superseded = tuple(self._unconfirmed_pauses.pop(program_run_id, ()))
+            state = self._run_pause.get(program_run_id)
+        if (
+            state is None
+            or not state["established"]  # No START yet: no Mock call at all.
+            or self._settle_run_pause(program_run_id) == "settled"
+        ):
+            return superseded, None
+        return superseded, _pause_fact(state)
+
+    def start(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        if self.resend_unknown_ends(request["program_run_id"]):
+            # An older attempt's timer may still be live: the node waits and
+            # resends the same START once every END of the Run is answered.
+            raise ProductionPortError("the Run's Mock ends are not yet answered")
+        if self._settle_run_pause(request["program_run_id"]) == "unknown":
+            # Unknown: the node keeps waiting and resends the same START. An
+            # explicit pause error lets the host answer the START itself.
+            raise ProductionPortError("the Run's Mock pause state is not yet answered")
+        with self._owner._lock:
+            current = self._run_pause.get(request["program_run_id"])
+            if current is None or current["outcome"] not in {"settled", "refused"}:
+                # A superseded send's ACK cannot confirm a newer snapshot.
+                # Keep the same START/index until the actual current request
+                # is answered. The existing explicit-refusal path is unchanged.
+                raise ProductionPortError("the Run's Mock pause state is not yet answered")
+        try:
+            return self._owner._kernel.start_mock_io_node_simulation(request)
+        except Exception as error:
+            code = getattr(error, "code", None)
+            if (
+                not isinstance(error, KernelClientResponseError)
+                and isinstance(code, str)
+                and code
+                and code not in EXECUTION_TRANSPORT_FAILURE_CODES
+            ):
+                details = getattr(error, "details", None)
+                raise MockSimulationRefusedError(
+                    code,
+                    str(error),
+                    details if isinstance(details, Mapping) else None,
+                ) from error
+            raise
+
+    @staticmethod
+    def end_request(start_request: Mapping[str, Any]) -> dict[str, Any]:
+        """Decision 135: the end of the attempt that sent ``start_request``."""
+
+        return {
+            "schema_version": "manyforge.mock_io_node_end.v1",
+            **{name: start_request[name] for name in _MOCK_SIMULATION_OCCURRENCE},
+        }
+
+    def end(self, start_request: Mapping[str, Any]) -> None:
+        request = self.end_request(start_request)
+        self.resend_unknown_ends(request["program_run_id"])
+        self._send_end(request)
+
+    def _send_end(self, request: dict[str, Any]) -> bool:
+        """Send one exact END; only its exact OK ACK settles it (True).
+
+        A lost reply and every refusal (SX-2427: no refusal proves the entry
+        absent) keep that END pending, resent unchanged; a refusal is logged
+        once per END at warning level. The Run reports an END still pending
+        when it ends, and its unbind fails until every END is OK-ACKed.
+        """
+
+        key = (
+            request["program_run_id"], request["node_instance_id"], request["node_start_index"]
+        )
+        try:
+            self._owner._kernel.end_mock_io_node_simulation(request)
+        except Exception as error:
+            code = getattr(error, "code", None)
+            refused = not isinstance(error, KernelClientResponseError) and isinstance(code, str) and (
+                code not in EXECUTION_TRANSPORT_FAILURE_CODES
+            )
+            with self._owner._lock:
+                if key not in self._unknown_ends and len(self._unknown_ends) >= _MAX_IO_WATCHES:
+                    raise ProductionPortError("Mock end retention is full") from error
+                self._unknown_ends[key] = request
+                warn = refused and key not in self._refusal_logged
+                if warn:
+                    self._refusal_logged.add(key)
+            if warn:
+                details = getattr(error, "details", None)
+                _LOGGER.warning(
+                    "Mock simulation END refused, kept pending: run=%s node=%s index=%s "
+                    "code=%s reason=%s",
+                    key[0], key[1], key[2], code,
+                    details.get("reason") if isinstance(details, Mapping) else None,
+                )
+            return False
+        with self._owner._lock:
+            self._unknown_ends.pop(key, None)
+            self._refusal_logged.discard(key)
+        return True
+
+    def resend_unknown_ends(self, program_run_id: str) -> tuple[dict[str, Any], ...]:
+        """Resend this Run's unanswered ENDs unchanged (the tree tick, each
+        Mock START/END and the Run's unbind call this); those still
+        unanswered afterwards."""
+
+        with self._owner._lock:
+            pending = [
+                request for key, request in self._unknown_ends.items()
+                if key[0] == program_run_id
+            ]
+        return tuple(request for request in pending if not self._send_end(request))
+
+    def release_run(self, program_run_id: str) -> None:
+        """The Run's unbind succeeded, so none of its ENDs is pending (an
+        unanswered END fails the unbind): forget its pause state."""
+
+        with self._owner._lock:
+            self._run_pause.pop(program_run_id, None)
+            self._unconfirmed_pauses.pop(program_run_id, None)
+
+
+class _NativeKernelOperationTaskPort:
+    """Unambiguous OwnerTaskPort view over one native Program client."""
+
+    def __init__(self, owner: NativeKernelProgramPort) -> None:
+        self._owner = owner
+
+    def start(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot:
+        return self._owner._start(node_id, identity, inputs)
+
+    def pneumatic_plan(
+        self, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> Mapping[str, Any] | None:
+        """Resolve the captured gripper route before issuing any effects."""
+        owner = self._owner
+        context = owner._context(identity.program_run_id)
+        owner._require_scope_open(identity.program_run_id)
+        target = owner._target(
+            context, _text(inputs.parameters.get("target_role"), field="target_role"),
+            "tool.gripper.command",
+        )
+        if target.pneumatic_io is None:
+            return None
+        route = _mapping(target.pneumatic_io, field="captured pneumatic route")
+        epoch = owner._owner_status(context)
+        descriptor = owner._gripper_descriptor(context, target, expected_owner_epoch=epoch)
+        opened = owner._named_gripper_position(descriptor, {"kind": "named_preset", "name": "open"})
+        closed = owner._named_gripper_position(descriptor, {"kind": "named_preset", "name": "closed"})
+        requested = _mapping(inputs.parameters.get("position"), field="position")
+        position = (owner._named_gripper_position(descriptor, requested)
+                    if requested.get("kind") == "named_preset" else requested)
+        kind = opened["kind"]
+        field_name = "value_rad" if kind == "angular_rad" else "value_m"
+        if position.get("kind") != kind or closed.get("kind") != kind:
+            raise ProductionPortError("pneumatic position does not match the gripper coordinate kind")
+        wanted = _number(position.get(field_name), field="gripper position")
+        if not descriptor["min_position"] <= wanted <= descriptor["max_position"]:
+            raise ProductionPortError("pneumatic position is outside the gripper limits")
+        is_open = abs(wanted - opened[field_name]) < abs(wanted - closed[field_name])
+        logical = {**inputs.parameters, "position": opened if is_open else closed}
+        dwell = _number(inputs.parameters.get("command_duration_s", descriptor["command_duration_s"]),
+                        field="gripper Program dwell")
+        if dwell < 0:
+            raise ProductionPortError("pneumatic Program dwell cannot be negative")
+        outputs = []
+        for raw in _sequence(route.get("outputs"), field="pneumatic outputs"):
+            row = _mapping(raw, field="pneumatic output")
+            target_role = _text(row.get("target_role_id"), field="pneumatic output target")
+            resource_role = _text(row.get("resource_role_id"), field="pneumatic output resource")
+            signal = _io_signal(context.targets, target_role, resource_role, output=True)
+            level = row.get("open_value" if is_open else "close_value")
+            if type(level) is not bool:
+                raise ProductionPortError("pneumatic output value must be boolean")
+            outputs.append((level, context.targets[target_role].controllable_component_id, signal.signal_name,
+                            {"target_role": target_role, "resource_role": resource_role, "value": level}))
+        outputs.sort(key=lambda row: row[:3])
+        declared = {row["input"]: row for row in route.get("inputs", ())}
+        required = []
+        for raw in _sequence(inputs.parameters.get("required_inputs", ()), field="required inputs"):
+            item = _mapping(raw, field="required input")
+            row = declared.get(item.get("input"))
+            if row is None or type(item.get("value")) is not bool:
+                raise ProductionPortError("pneumatic required input is not declared")
+            target_role = _text(row.get("target_role_id"), field="pneumatic input target")
+            resource_role = _text(row.get("resource_role_id"), field="pneumatic input resource")
+            _io_signal(context.targets, target_role, resource_role)
+            required.append({"target_role": target_role, "resource_role": resource_role,
+                             "expected_value": item["value"]})
+        return {"outputs": [row[3] for row in outputs], "inputs": required,
+                "logical": OwnerNodeInputs(logical, inputs.blackboard), "dwell_s": dwell}
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        return self._owner._observe_task(task_id)
+
+    def cancel(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        self._owner._cancel_task(task_id, identity)
+
+    def acknowledge(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        self._owner._acknowledge_task(task_id, identity)
+
+    def current_recovery_assessment(
+        self, task_id: str, identity: NodeAttemptIdentity
+    ) -> Mapping[str, Any]:
+        return self._owner._current_recovery_assessment(task_id, identity)
+
+    def recover(
+        self,
+        task_id: str,
+        identity: NodeAttemptIdentity,
+        *,
+        action: str,
+        request_id: str,
+        reason: str | None,
+    ) -> Mapping[str, Any]:
+        return self._owner._recover_task(
+            task_id,
+            identity,
+            action=action,
+            request_id=request_id,
+            reason=reason,
+        )
+
+    def close(self, task_id: str, identity: NodeAttemptIdentity, *, request_id: str) -> bool:
+        return self._owner._close_task(task_id, identity, request_id=request_id)
+
+    def release_preempted(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        self._owner._release_preempted_task(task_id, identity)
+
+
+class _NativeKernelProgramScopePort:
+    """Unambiguous ProgramRunScopePort view over one native Program client."""
+
+    def __init__(self, owner: NativeKernelProgramPort) -> None:
+        self._owner = owner
+
+    def request_stop(
+        self,
+        program_run_id: str,
+        stop_request_id: str,
+        reason: str | None,
+    ) -> ProgramRunScopeSnapshot:
+        return self._owner._request_stop(
+            program_run_id,
+            stop_request_id,
+            reason,
+        )
+
+    def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+        return self._owner._observe_scope(program_run_id)
+
+    def execution_scope(self, program_run_id: str) -> Mapping[str, Any]:
+        context = self._owner._context(program_run_id)
+        scope = self._owner._kernel.read_program_execution_scope(program_run_id)
+        if scope.get("request_owner_epoch") != context.request_owner_epoch:
+            raise ProductionPortError("Program execution scope owner changed")
+        return scope
+
+    def stop_selection(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        return self._owner._kernel.stop_program_selection(request)
+
+    def retire_held_preparations(
+        self, program_run_id: str, selected_node_ids: frozenset[str],
+        expected_selection_revision: int,
+    ) -> None:
+        self._owner._retire_held_preparations(
+            program_run_id, selected_node_ids, expected_selection_revision,
+        )
+
+    def release_selection(
+        self, request: Mapping[str, Any], expected_selection_revision: int
+    ) -> Mapping[str, Any]:
+        return self._owner._kernel.release_program_selection(request, expected_selection_revision)
+
+    def start_selection(
+        self, request: Mapping[str, Any], expected_selection_revision: int
+    ) -> Mapping[str, Any]:
+        return self._owner._kernel.start_program_selection(request, expected_selection_revision)
+
+    def check_node_motion_attention(self, request: Mapping[str, Any]) -> None:
+        self._owner._kernel.check_program_node_motion_attention(request)
+
+    def capture_stop(self, program_run_id: str) -> tuple[str, int] | None:
+        with self._owner._lock:
+            stop = self._owner._scope_stops.get(program_run_id)
+            if stop is not None and stop.pending:
+                raise ProductionPortError("Program-run Stop requests are still in flight")
+            if stop is not None and stop.unresolved is not None:
+                raise ProductionPortError("Program-run Stop outcome is unknown")
+            if stop is None or stop.active is None:
+                return None
+            return stop.active[:2]
+
+    def release_stop(
+        self, program_run_id: str, *, expected_stop: tuple[str, int] | None = None
+    ) -> ProgramRunScopeSnapshot:
+        return self._owner._finish_scope_stop(
+            program_run_id, release_fence=True, expected_stop=expected_stop
+        )
+
+    def reset(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+        return self._owner._reset_scope(program_run_id)
+
+
+class HeadlessSceneProgramPort:
+    """Stateless scene intents plus captured Program-role translation.
+
+    The native logical-scene owner remains the only scene authority. This port
+    keeps only immutable Program Binding context and reads fresh owner truth for
+    every preparation, verification, or node attempt.
+    """
+
+    def __init__(
+        self,
+        transport: _SceneProgramTransport,
+        *,
+        manager_command: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        resolve_attach_active_tcp: Callable[[str, str], str] | None = None,
+        program_node_evidence: (
+            Callable[[NodeAttemptIdentity, str], Mapping[str, Any]] | None
+        ) = None,
+    ) -> None:
+        for method in (
+            "authoring_admission",
+            "scene",
+            "commit_scene_transaction",
+        ):
+            if not callable(getattr(transport, method, None)):
+                raise TypeError(f"scene transport has no callable {method}")
+        if manager_command is not None and not callable(manager_command):
+            raise TypeError("manager_command must be callable")
+        self._transport = transport
+        self._manager_command = manager_command
+        self._resolve_attach_active_tcp = resolve_attach_active_tcp
+        self._program_node_evidence = program_node_evidence
+        if program_node_evidence is not None and not callable(
+            getattr(transport, "scene_transaction_status", None)
+        ):
+            raise TypeError("runtime Scene transport has no exact result lookup")
+        self._scene = SceneClient(transport)
+        self._contexts: dict[str, _SceneBoundContext] = {}
+        self._lock = RLock()
+        self._pose_source_latch_lock = RLock()
+
+    def bind(self, context: ProgramRunPortContext) -> None:
+        if not isinstance(context, ProgramRunPortContext):
+            raise TypeError("bind requires one exact Program-run port context")
+        parsed = self._parse_context(context)
+        with self._lock:
+            current = self._contexts.get(context.program_run_id)
+            if current is not None:
+                if current != parsed:
+                    raise ProductionPortError("Program-run scene context was rebound")
+                return
+            if len(self._contexts) >= _MAX_CONTEXTS:
+                raise ProductionPortError("Program-run scene-context retention is full")
+            self._contexts[context.program_run_id] = parsed
+
+    def unbind(self, program_run_id: str) -> None:
+        with self._lock:
+            self._contexts.pop(program_run_id, None)
+
+    def latch_between_nodes(
+        self,
+        identity: NodeAttemptIdentity,
+        *,
+        scene_resource_ids: Sequence[str] | None,
+    ) -> None:
+        """Apply one exact Manager between-nodes latch to authoritative Scene.
+
+        Manager captures the current Scene at the command boundary. The exact
+        runtime identity fences the captured deployment; ordinary object-pose
+        updates do not invalidate an earlier, unnecessary Scene pre-read.
+        """
+
+        if not isinstance(identity, NodeAttemptIdentity):
+            raise PoseSourceLatchError("between-nodes latch has no exact node identity")
+        if self._manager_command is None:
+            raise PoseSourceLatchError("Manager scene-runtime latch is unavailable")
+        resource_ids: tuple[str, ...] | None = None
+        if scene_resource_ids is not None:
+            try:
+                resource_ids = tuple(
+                    _text(value, field="scene_resource_ids item")
+                    for value in scene_resource_ids
+                )
+            except (TypeError, ProductionPortError) as error:
+                raise PoseSourceLatchError(
+                    "between-nodes latch resource selection is invalid",
+                    details={"reason": "scene_resource_ids_invalid"},
+                ) from error
+            if not resource_ids or resource_ids != tuple(sorted(set(resource_ids))):
+                raise PoseSourceLatchError(
+                    "between-nodes latch resource selection is not canonical",
+                    details={"reason": "scene_resource_ids_invalid"},
+                )
+
+        with self._pose_source_latch_lock:
+            try:
+                with self._lock:
+                    context = self._contexts.get(identity.program_run_id)
+                if context is None:
+                    raise ProductionPortError(
+                        "between-nodes latch has no captured Program-run context"
+                    )
+                owner = self._manager_command(
+                    {
+                        "api_version": _SCENE_RUNTIME_COMMAND_VERSION,
+                        "command": "scene_runtime_owner_read",
+                    }
+                )
+                self._raise_pose_latch_refusal(owner, phase="Manager identity read")
+                if set(owner) != {
+                    "api_version",
+                    "cell_id",
+                    "initialization_generation",
+                    "initialization_state",
+                    "ok",
+                    "runtime_identity",
+                    "scene_runtime_owner_epoch",
+                }:
+                    raise ProductionPortError(
+                        "scene-runtime owner response has an unknown or missing field"
+                    )
+                if owner.get("api_version") != _SCENE_RUNTIME_RESPONSE_VERSION or owner.get(
+                    "ok"
+                ) is not True:
+                    raise ProductionPortError("scene-runtime owner response is invalid")
+                _text(owner.get("cell_id"), field="scene-runtime cell_id")
+                _text(
+                    owner.get("scene_runtime_owner_epoch"),
+                    field="scene-runtime owner epoch",
+                )
+                state_generation = owner.get("initialization_generation")
+                if (
+                    type(state_generation) is not int
+                    or not 0 <= state_generation <= 9_007_199_254_740_991
+                ):
+                    raise ProductionPortError(
+                        "scene-runtime initialization generation is invalid"
+                    )
+                _text(
+                    owner.get("initialization_state"),
+                    field="scene-runtime initialization state",
+                )
+                runtime_identity = _scene_runtime_identity_value(
+                    owner.get("runtime_identity"), field="scene-runtime identity"
+                )
+                if (
+                    runtime_identity["retained_bundle_id"]
+                    != context.capture.retained_bundle_id
+                    or runtime_identity["graph_revision"] != context.capture.graph_revision
+                ):
+                    raise ProductionPortError(
+                        "scene-runtime owner and captured Program deployment disagree"
+                    )
+
+                request: dict[str, Any] = {
+                    "api_version": _SCENE_RUNTIME_COMMAND_VERSION,
+                    "command": "scene_runtime_latch_between_nodes",
+                    "expected_runtime_identity": runtime_identity,
+                }
+                if resource_ids is not None:
+                    request["scene_resource_ids"] = list(resource_ids)
+                response = self._manager_command(request)
+                self._raise_pose_latch_refusal(response, phase="between-nodes latch")
+                if (
+                    set(response) != _SCENE_RUNTIME_LATCH_RESPONSE_FIELDS
+                    or response.get("api_version") != _SCENE_RUNTIME_RESPONSE_VERSION
+                    or response.get("ok") is not True
+                ):
+                    raise ProductionPortError(
+                        "between-nodes latch response has an unknown or missing field"
+                    )
+                echoed_identity = _scene_runtime_identity_value(
+                    response.get("runtime_identity"),
+                    field="between-nodes latch runtime identity",
+                )
+                if echoed_identity != runtime_identity:
+                    raise ProductionPortError(
+                        "between-nodes latch response selected another runtime"
+                    )
+                initial_projection = _scene_projection_revision_value(
+                    response.get("initial_projection_revision"),
+                    field="between-nodes initial projection revision",
+                )
+                if (
+                    initial_projection["retained_bundle_id"] != context.capture.retained_bundle_id
+                    or initial_projection["graph_revision"] != context.capture.graph_revision
+                ):
+                    raise ProductionPortError(
+                        "between-nodes latch started from another captured deployment"
+                    )
+                projection = _scene_projection_revision_value(
+                    response.get("projection_revision"),
+                    field="between-nodes projection revision",
+                )
+                if (
+                    projection["retained_bundle_id"]
+                    != initial_projection["retained_bundle_id"]
+                    or projection["graph_revision"] != initial_projection["graph_revision"]
+                    or projection["scene_revision"]["scene_id"]
+                    != initial_projection["scene_revision"]["scene_id"]
+                    or projection["scene_revision"]["revision_id"]
+                    < initial_projection["scene_revision"]["revision_id"]
+                ):
+                    raise ProductionPortError(
+                        "between-nodes latch response changed Scene lineage"
+                    )
+                counters: dict[str, int] = {}
+                for name in (
+                    "latched_observation_count",
+                    "committed_observation_count",
+                    "already_applied_observation_count",
+                    "skipped_attached_observation_count",
+                    "scene_runtime_source_generation",
+                ):
+                    value = response.get(name)
+                    minimum = 1 if name == "scene_runtime_source_generation" else 0
+                    if (
+                        type(value) is not int
+                        or not minimum <= value <= 9_007_199_254_740_991
+                    ):
+                        raise ProductionPortError(
+                            f"between-nodes latch {name} is invalid"
+                        )
+                    counters[name] = value
+                if counters["latched_observation_count"] != sum(
+                    counters[name]
+                    for name in (
+                        "committed_observation_count",
+                        "already_applied_observation_count",
+                        "skipped_attached_observation_count",
+                    )
+                ):
+                    raise ProductionPortError(
+                        "between-nodes latch observation counts do not reconcile"
+                    )
+            except PoseSourceLatchError:
+                raise
+            except Exception as error:
+                reason = getattr(error, "code", None)
+                raise PoseSourceLatchError(
+                    f"between-nodes pose-source apply failed: {str(error) or type(error).__name__}",
+                    details={
+                        "reason": (
+                            reason if isinstance(reason, str) and reason
+                            else "scene_runtime_latch_failed"
+                        )
+                    },
+                ) from error
+
+    @staticmethod
+    def _raise_pose_latch_refusal(response: object, *, phase: str) -> None:
+        if not isinstance(response, Mapping):
+            raise ProductionPortError(f"{phase} response is not an object")
+        if response.get("ok") is not False:
+            return
+        error = response.get("error")
+        if (
+            not isinstance(error, Mapping)
+            or not isinstance(error.get("code"), str)
+            or not error["code"]
+            or not isinstance(error.get("message"), str)
+            or not error["message"]
+        ):
+            raise ProductionPortError(f"{phase} refusal is malformed")
+        raise PoseSourceLatchError(
+            f"{phase} was refused ({error['code']}): {error['message']}",
+            details={"reason": error["code"]},
+        )
+
+    @staticmethod
+    def _parse_context(context: ProgramRunPortContext) -> _SceneBoundContext:
+        if not isinstance(context, ProgramRunPortContext):
+            raise TypeError("scene context must be one Program-run port context")
+        binding = context.program_binding
+        component_rows = _sequence(
+            binding.get("component_role_bindings"),
+            field="component_role_bindings",
+        )
+        component_models: dict[tuple[str, str], tuple[str, str]] = {}
+        component_ids: dict[str, str] = {}
+        for index, raw_row in enumerate(component_rows):
+            row = _mapping(raw_row, field=f"component_role_bindings[{index}]")
+            role = _text(
+                row.get("component_role_id"),
+                field=f"component_role_bindings[{index}].component_role_id",
+            )
+            component_id = _text(
+                row.get("controllable_component_id"),
+                field=(f"component_role_bindings[{index}].controllable_component_id"),
+            )
+            if role in component_ids:
+                raise ProductionPortError("Program Binding repeats a component role")
+            component_ids[role] = component_id
+            models = _sequence(
+                row.get("model_role_bindings"),
+                field=f"component_role_bindings[{index}].model_role_bindings",
+            )
+            for model_index, raw_model in enumerate(models):
+                model = _mapping(
+                    raw_model,
+                    field=(
+                        f"component_role_bindings[{index}]." f"model_role_bindings[{model_index}]"
+                    ),
+                )
+                model_role = _text(model.get("model_role_id"), field="model_role_id")
+                key = (role, model_role)
+                value = (
+                    _text(model.get("model_instance_id"), field="model_instance_id"),
+                    _text(model.get("model_revision"), field="model_revision"),
+                )
+                if key in component_models:
+                    raise ProductionPortError("Program Binding repeats a component/model role")
+                component_models[key] = value
+
+        target_rows = _sequence(binding.get("target_role_bindings"), field="target_role_bindings")
+        targets: dict[str, _SceneTargetBinding] = {}
+        for index, raw_row in enumerate(target_rows):
+            row = _mapping(raw_row, field=f"target_role_bindings[{index}]")
+            target_role = _text(
+                row.get("target_role_id"),
+                field=f"target_role_bindings[{index}].target_role_id",
+            )
+            component_role = _text(
+                row.get("component_role_id"),
+                field=f"target_role_bindings[{index}].component_role_id",
+            )
+            component_id = _text(
+                row.get("controllable_component_id"),
+                field=f"target_role_bindings[{index}].controllable_component_id",
+            )
+            if component_ids.get(component_role) != component_id:
+                raise ProductionPortError("target and component role bindings disagree")
+            frames: dict[str, tuple[str, str]] = {}
+            for raw_frame in _sequence(row.get("frame_role_bindings"), field="frame_role_bindings"):
+                frame = _mapping(raw_frame, field="frame_role_binding")
+                frame_role = _text(frame.get("frame_role_id"), field="frame_role_id")
+                value = (
+                    _text(frame.get("model_instance_id"), field="model_instance_id"),
+                    _text(frame.get("model_revision"), field="model_revision"),
+                )
+                if frame_role in frames:
+                    raise ProductionPortError(f"target role {target_role!r} repeats a frame role")
+                frames[frame_role] = value
+            body_roles: list[str] = []
+            for raw_body in _sequence(
+                row.get("collision_body_role_bindings"),
+                field="collision_body_role_bindings",
+            ):
+                body = _mapping(raw_body, field="collision_body_role_binding")
+                body_roles.append(
+                    _text(
+                        body.get("collision_body_role_id"),
+                        field="collision_body_role_id",
+                    )
+                )
+            if len(body_roles) != len(set(body_roles)):
+                raise ProductionPortError(
+                    f"target role {target_role!r} repeats a collision-body role"
+                )
+            if target_role in targets:
+                raise ProductionPortError("Program Binding repeats a target role")
+            targets[target_role] = _SceneTargetBinding(
+                target_role_id=target_role,
+                component_role_id=component_role,
+                controllable_component_id=component_id,
+                command_target_id=_text(row.get("command_target_id"), field="command_target_id"),
+                frames=frames,
+                collision_body_roles=frozenset(body_roles),
+            )
+
+        component_frames: dict[tuple[str, str, str], dict[str, str]] = {}
+        for (component_role, model_role), (
+            model_instance_id,
+            model_revision,
+        ) in component_models.items():
+            component_id = component_ids[component_role]
+            for target in targets.values():
+                if target.controllable_component_id != component_id:
+                    continue
+                for frame_role, frame_binding in target.frames.items():
+                    if frame_binding[0] != model_instance_id:
+                        continue
+                    if frame_binding[1] != model_revision:
+                        raise ProductionPortError(
+                            "component and target frame model revisions disagree"
+                        )
+                    key = (component_role, model_role, frame_role)
+                    frame = {
+                        "kind": "component_frame",
+                        "controllable_component_id": component_id,
+                        "model_instance_id": model_instance_id,
+                        "frame_role_id": frame_role,
+                    }
+                    previous = component_frames.get(key)
+                    if previous is not None and previous != frame:
+                        raise ProductionPortError(
+                            "Program Binding gives an ambiguous component frame"
+                        )
+                    component_frames[key] = frame
+        return _SceneBoundContext(
+            capture=context,
+            component_models=component_models,
+            component_frames=component_frames,
+            targets=targets,
+        )
+
+    @staticmethod
+    def _target(context: _SceneBoundContext, target_role_id: str) -> _SceneTargetBinding:
+        try:
+            return context.targets[target_role_id]
+        except KeyError as exc:
+            raise ProductionPortError(
+                f"Program Binding has no target role {target_role_id!r}"
+            ) from exc
+
+    def _context(self, program_run_id: str) -> _SceneBoundContext:
+        with self._lock:
+            try:
+                return self._contexts[program_run_id]
+            except KeyError as exc:
+                raise ProductionPortError("Program-run scene context is not initialized") from exc
+
+    def _read_view(
+        self, context: _SceneBoundContext, *, require_writes: bool = True
+    ) -> _SceneView:
+        projection = self._scene.snapshot()
+        logical = _mapping(projection.get("logical_scene"), field="logical_scene")
+        if (
+            logical.get("available") is not True
+            or logical.get("freshness") != "fresh"
+            or list(_sequence(logical.get("known_gaps"), field="known_gaps"))
+        ):
+            raise ProductionPortError("logical-scene owner truth is not fresh")
+        owner_epoch = _text(logical.get("source_owner_epoch"), field="scene source_owner_epoch")
+        payload = _mapping(logical.get("payload"), field="logical_scene.payload")
+        if payload.get("api_version") != "manyforge.logical_scene_source.v1":
+            raise ProductionPortError("logical-scene payload version is unsupported")
+        access = _mapping(payload.get("access"), field="logical_scene.access")
+        if require_writes and (
+            access.get("scene_writes_open") is not True
+            or access.get("projection_leases_open") is not True
+        ):
+            raise ProductionPortError("logical-scene writes are fenced")
+        active = dict(
+            _mapping(
+                access.get("active_projection"),
+                field="logical_scene.active_projection",
+            )
+        )
+        if (
+            active.get("retained_bundle_id") != context.capture.retained_bundle_id
+            or active.get("graph_revision") != context.capture.graph_revision
+        ):
+            raise ProductionPortError(
+                "logical-scene owner and captured Program deployment disagree"
+            )
+        active_scene = _mapping(active.get("scene_revision"), field="active scene revision")
+        _text(active_scene.get("scene_id"), field="scene_id")
+        _text(active_scene.get("content_hash"), field="scene content_hash")
+        if type(active_scene.get("revision_id")) is not int or active_scene["revision_id"] < 1:
+            raise ProductionPortError("active scene revision is invalid")
+        snapshot = _mapping(payload.get("snapshot"), field="logical_scene.snapshot")
+        if dict(_mapping(snapshot.get("revision"), field="snapshot revision")) != dict(
+            active_scene
+        ):
+            raise ProductionPortError("logical-scene snapshot and active projection disagree")
+        cell_id = _text(snapshot.get("cell_id"), field="cell_id")
+        objects: dict[str, Mapping[str, Any]] = {}
+        object_ids: list[str] = []
+        for index, raw_object in enumerate(
+            _sequence(snapshot.get("objects"), field="scene objects")
+        ):
+            scene_object = _mapping(raw_object, field=f"scene objects[{index}]")
+            scene_resource_id = _text(
+                scene_object.get("scene_resource_id"), field="scene_resource_id"
+            )
+            object_ids.append(scene_resource_id)
+            objects[scene_resource_id] = scene_object
+        if object_ids != sorted(object_ids) or len(object_ids) != len(objects):
+            raise ProductionPortError("logical-scene objects are not canonical")
+        attachments: list[Mapping[str, Any]] = []
+        attachment_ids: list[str] = []
+        for index, raw_attachment in enumerate(
+            _sequence(
+                snapshot.get("carried_object_attachments"),
+                field="carried_object_attachments",
+            )
+        ):
+            attachment = _mapping(raw_attachment, field=f"carried_object_attachments[{index}]")
+            attachment_ids.append(
+                _text(
+                    attachment.get("carried_object_attachment_id"),
+                    field="carried_object_attachment_id",
+                )
+            )
+            attachments.append(attachment)
+        if attachment_ids != sorted(attachment_ids) or len(attachment_ids) != len(
+            set(attachment_ids)
+        ):
+            raise ProductionPortError("logical-scene attachments are not canonical")
+        return _SceneView(owner_epoch, active, cell_id, objects, tuple(attachments))
+
+    def _commit(
+        self,
+        *,
+        context: _SceneBoundContext,
+        request_id: str,
+        correlation_id: str,
+        request_owner_epoch: str,
+        expected_projection_revision: Mapping[str, Any],
+        operation: Mapping[str, Any],
+        program_reset_scene_authorization: Mapping[str, Any] | None = None,
+        program_node_evidence: Mapping[str, Any] | None = None,
+        verify_receipt: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        body: dict[str, Any] = {
+            "request_context": {
+                "request_id": request_id,
+                "request_owner_epoch": request_owner_epoch,
+                "source_label": "manyforge.behavior.program_scene",
+                "correlation_id": correlation_id,
+            },
+            "expected_projection_revision": dict(expected_projection_revision),
+            "operation": dict(operation),
+        }
+        if program_node_evidence is not None:
+            body["program_node_evidence"] = dict(program_node_evidence)
+        if operation.get("kind") in _AUTHORED_SCENE_OPERATIONS or program_node_evidence is not None:
+            if program_reset_scene_authorization is not None:
+                authorization = dict(program_reset_scene_authorization)
+                if "reset_claim" in authorization:
+                    if set(authorization) != {"program_runner_owner_epoch", "cycle_generation", "reset_claim"}:
+                        raise ProductionPortError("Idle Program Reset scene authorization is malformed")
+                    _text(authorization["program_runner_owner_epoch"], field="program_runner_owner_epoch")
+                    cycle_generation = authorization["cycle_generation"]
+                    idle = authorization["reset_claim"]
+                    if (
+                        type(cycle_generation) is not int
+                        or not 1 <= cycle_generation <= 9_007_199_254_740_991
+                        or not isinstance(idle, Mapping)
+                        or set(idle) != {"request_owner_epoch", "request_id", "request_payload_digest", "reset_claim_generation"}
+                    ):
+                        raise ProductionPortError("Idle Program Reset scene context is malformed")
+                    for key in ("request_owner_epoch", "request_id"):
+                        _text(idle[key], field=key)
+                    generation = idle["reset_claim_generation"]
+                    reference = _text(idle["request_payload_digest"], field="request_payload_digest")
+                    if type(generation) is not int or not 1 <= generation <= 9_007_199_254_740_991:
+                        raise ProductionPortError("Program Reset scene claim generation is invalid")
+                    if (
+                        len(reference) != 71 or not reference.startswith("sha256:")
+                        or any(character not in "0123456789abcdef" for character in reference[7:])
+                    ):
+                        raise ProductionPortError("Program Reset scene evidence digest is invalid")
+                else:
+                    if set(authorization) != {
+                        "program_runner_owner_epoch",
+                        "program_run_id",
+                        "cycle_claim_generation",
+                        "terminal_or_settlement_reference",
+                    }:
+                        raise ProductionPortError("Program Reset scene authorization is malformed")
+                    _text(
+                        authorization["program_runner_owner_epoch"],
+                        field="program_runner_owner_epoch",
+                    )
+                    _text(
+                        authorization["program_run_id"],
+                        field="program_run_id",
+                    )
+                    generation = authorization["cycle_claim_generation"]
+                    if type(generation) is not int or not 1 <= generation <= 9_007_199_254_740_991:
+                        raise ProductionPortError("Program Reset scene claim generation is invalid")
+                    reference = _text(
+                        authorization["terminal_or_settlement_reference"],
+                        field="terminal_or_settlement_reference",
+                    )
+                    if (
+                        len(reference) != 71
+                        or not reference.startswith("sha256:")
+                        or any(character not in "0123456789abcdef" for character in reference[7:])
+                    ):
+                        raise ProductionPortError("Program Reset scene settlement reference is invalid")
+                body["program_reset_scene_authorization"] = authorization
+                body["request_context"]["request_id"] = _request_identity(
+                    "scene-reset", request_id, str(generation)
+                )
+            else:
+                admission = self._transport.authoring_admission()
+                generation = admission.get("admission_generation")
+                if type(generation) is not int or not 1 <= generation <= 9_007_199_254_740_991:
+                    raise ProductionPortError(
+                        "authoring-admission owner omitted its current generation"
+                    )
+                body["expected_admission_generation"] = generation
+                # A no-effect stale-admission rejection is durably replayed by the
+                # logical-scene owner. Include the observed generation so a later
+                # retry cannot be trapped behind that obsolete outcome.
+                body["request_context"]["request_id"] = _request_identity(
+                    "scene-admission", request_id, str(generation)
+                )
+        try:
+            response = self._scene.commit(body)
+        except SceneTransactionRejectedError as error:
+            if verify_receipt and (
+                error.response.get("request_id") != body["request_context"]["request_id"]
+                or error.response.get("request_owner_epoch") != body["request_context"]["request_owner_epoch"]
+            ):
+                raise SceneOutcomeUnknownError("Scene refusal names another request") from error
+            raise
+        except SceneOutcomeUnknownError as error:
+            if program_node_evidence is None:
+                raise
+
+            # Retain this one exact call in its node adapter. A later tick only
+            # reads its result; it never sends the transaction a second time.
+            def observe() -> OwnerInvocationResult | None:
+                try:
+                    response = self._scene.receipt(body)
+                except SceneTransactionRejectedError as rejected:
+                    self._raise_if_stop_prevented_admission(rejected)
+                    return OwnerInvocationResult(
+                        False,
+                        reason_code=rejected.code,
+                        message=_owner_failure_message(rejected),
+                        details=exception_failure_details(rejected),
+                    )
+                if response is None:
+                    return None
+                committed = self._committed_revision(
+                    context, expected_projection_revision, response
+                )
+                return OwnerInvocationResult(
+                    True,
+                    output={"committed_projection_revision": committed},
+                    metadata={
+                        "transaction_sequence": response.get("transaction_sequence"),
+                        "update_status": response.get("update_status"),
+                    },
+                )
+
+            raise OwnerInvocationPendingError(
+                "Scene transaction outcome is unconfirmed", observe
+            ) from error
+        if verify_receipt and (
+            response.get("request_id") != body["request_context"]["request_id"]
+            or response.get("request_owner_epoch") != body["request_context"]["request_owner_epoch"]
+        ):
+            raise SceneOutcomeUnknownError("Scene receipt names another request")
+        return self._committed_revision(context, expected_projection_revision, response), response
+
+    @staticmethod
+    def _raise_if_stop_prevented_admission(error: SceneTransactionRejectedError) -> None:
+        details = error.response["error"].get("details", {})
+        if isinstance(details, dict) and details.get("reason") == "program_node_stop_fence_active":
+            revision = details.get("selection_revision")
+            if isinstance(revision, str) and revision.isdecimal() and len(revision) <= 16:
+                raise OwnerInvocationHeldError(int(revision)) from error
+
+    @staticmethod
+    def _committed_revision(
+        context: _SceneBoundContext,
+        expected_projection_revision: Mapping[str, Any],
+        response: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        committed = dict(
+            _mapping(
+                response.get("committed_projection_revision"),
+                field="committed_projection_revision",
+            )
+        )
+        expected_scene = _mapping(
+            expected_projection_revision.get("scene_revision"),
+            field="expected scene revision",
+        )
+        committed_scene = _mapping(
+            committed.get("scene_revision"), field="committed scene revision"
+        )
+        if (
+            committed.get("retained_bundle_id") != context.capture.retained_bundle_id
+            or committed.get("graph_revision") != context.capture.graph_revision
+            or committed_scene.get("scene_id") != expected_scene.get("scene_id")
+        ):
+            raise ProductionPortError(
+                "scene commit changed captured structural or lineage identity"
+            )
+        return committed
+
+    def _scene_refresh_matches(
+        self,
+        context: _SceneBoundContext,
+        previous: _SceneView,
+        refreshed: _SceneView,
+    ) -> bool:
+        """Whether a re-read view is the same Scene, at its revision or later.
+
+        Scene identity only: the revision (pose sources) may have advanced.
+        """
+        # The bound Applied Program is the runtime identity available to this
+        # port; _read_view has also checked its exact retained bundle and graph.
+        with self._lock:
+            if self._contexts.get(context.capture.program_run_id) != context:
+                return False
+        return (
+            refreshed.cell_id == previous.cell_id
+            and _projection_same_or_forward(
+                refreshed.projection_revision, previous.projection_revision
+            )
+        )
+
+    @staticmethod
+    def _initial_pose_and_frame(
+        context: _SceneBoundContext,
+        raw_pose: object,
+        *,
+        cell_id: str,
+        field: str,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        pose = _mapping(raw_pose, field=field)
+        frame = _mapping(pose.get("frame_ref"), field=f"{field}.frame_ref")
+        kind = frame.get("kind")
+        if kind == "cell_frame" and set(frame) == {"kind"}:
+            frame_ref = {"kind": "cell_frame", "cell_id": cell_id}
+        elif kind == "component_frame" and set(frame) == {
+            "kind",
+            "component_role",
+            "model_role",
+            "frame_role",
+        }:
+            key = (
+                _text(frame["component_role"], field="component_role"),
+                _text(frame["model_role"], field="model_role"),
+                _text(frame["frame_role"], field="frame_role"),
+            )
+            try:
+                frame_ref = dict(context.component_frames[key])
+            except KeyError as exc:
+                raise ProductionPortError(
+                    "Program Binding has no exact initial-scene component frame"
+                ) from exc
+        else:
+            raise ProductionPortError("initial scene pose has an invalid frame")
+        return _scene_pose3(pose, field=field), frame_ref
+
+    def _node_pose_and_frame(
+        self,
+        context: _SceneBoundContext,
+        view: _SceneView,
+        raw_pose: object,
+        *,
+        field: str,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        pose = _mapping(raw_pose, field=field)
+        frame = _mapping(pose.get("frame_ref"), field=f"{field}.frame_ref")
+        converted = _scene_pose3(pose, field=field)
+        kind = frame.get("kind")
+        if kind == "cell_frame" and set(frame) == {"kind"}:
+            return converted, {"kind": "cell_frame", "cell_id": view.cell_id}
+        if kind == "target_frame" and set(frame) == {
+            "kind",
+            "target_role",
+            "frame_role",
+        }:
+            target = self._target(context, _text(frame["target_role"], field="target_role"))
+            frame_role = _text(frame["frame_role"], field="frame_role")
+            try:
+                model_instance_id, _model_revision = target.frames[frame_role]
+            except KeyError as exc:
+                raise ProductionPortError("Program Binding has no exact target frame") from exc
+            # B7: a frame's component is its owner. A target's frames belong to
+            # its own component (one name per frame, no alias rows).
+            return converted, {
+                "kind": "component_frame",
+                "controllable_component_id": target.controllable_component_id,
+                "model_instance_id": model_instance_id,
+                "frame_role_id": frame_role,
+            }
+        if kind == "scene_resource" and set(frame) == {
+            "kind",
+            "scene_resource_id",
+        }:
+            reference_id = _text(frame["scene_resource_id"], field="scene_resource_id")
+            return converted, {
+                "kind": "scene_resource",
+                "scene_resource_id": reference_id,
+            }
+        raise ProductionPortError("scene pose has an unsupported frame")
+
+    @staticmethod
+    def _removal_order(objects: Mapping[str, Mapping[str, Any]]) -> tuple[str, ...]:
+        dependent_count = {scene_resource_id: 0 for scene_resource_id in objects}
+        supports_by_object: dict[str, tuple[str, ...]] = {}
+        for scene_resource_id, scene_object in objects.items():
+            supports: list[str] = []
+            for raw_contact in _sequence(
+                scene_object.get("support_contacts", ()),
+                field="support_contacts",
+            ):
+                contact = _mapping(raw_contact, field="support_contact")
+                support_id = _text(contact.get("support_object_id"), field="support_object_id")
+                if support_id not in dependent_count:
+                    raise ProductionPortError(
+                        "logical scene contains an unknown support dependency"
+                    )
+                supports.append(support_id)
+            if len(supports) != len(set(supports)):
+                raise ProductionPortError("logical scene contains a duplicate support dependency")
+            supports_by_object[scene_resource_id] = tuple(supports)
+            for support_id in supports:
+                dependent_count[support_id] += 1
+
+        removable = [
+            scene_resource_id for scene_resource_id, count in dependent_count.items() if count == 0
+        ]
+        heapify(removable)
+        ordered: list[str] = []
+        while removable:
+            scene_resource_id = heappop(removable)
+            ordered.append(scene_resource_id)
+            for support_id in supports_by_object[scene_resource_id]:
+                dependent_count[support_id] -= 1
+                if dependent_count[support_id] == 0:
+                    heappush(removable, support_id)
+        if len(ordered) != len(objects):
+            raise ProductionPortError("logical scene contains a cyclic support dependency")
+        return tuple(ordered)
+
+    @staticmethod
+    def _desired_scene_digest(
+        context: _SceneBoundContext,
+        operations: Sequence[Mapping[str, Any]],
+    ) -> str:
+        encoded = json.dumps(
+            {
+                "applied_record_digest": context.capture.applied_record_digest,
+                "program_revision": context.capture.program_revision,
+                "program_binding_id": context.capture.program_binding_id,
+                "retained_bundle_id": context.capture.retained_bundle_id,
+                "graph_revision": context.capture.graph_revision,
+                "objects": [dict(operation) for operation in operations],
+            },
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return f"sha256:{sha256(encoded).hexdigest()}"
+
+    @staticmethod
+    def _object_matches_operation(
+        view: _SceneView,
+        operation: Mapping[str, Any],
+    ) -> bool:
+        scene_resource_id = _text(operation.get("scene_resource_id"), field="scene_resource_id")
+        current = view.objects.get(scene_resource_id)
+        # Commands use the binding DTO spelling; snapshots use the Scene
+        # owner's public representation (owner_publication.cpp). Compare in
+        # snapshot form rather than treating identical geometry as an edit.
+        shape = operation["shape"]
+        kind = shape["type"]
+        if kind == "box":
+            expected_shape = {
+                "type": kind,
+                "dimensions_m": {axis: shape["box_dimensions_m"][f"{axis}_m"] for axis in "xyz"},
+            }
+        elif kind == "sphere":
+            expected_shape = {"type": kind, "radius_m": shape["sphere_radius_m"]}
+        elif kind == "cylinder":
+            expected_shape = {
+                "type": kind, "radius_m": shape["cylinder_radius_m"],
+                "height_m": shape["cylinder_height_m"],
+            }
+        elif kind == "mesh":
+            expected_shape = {
+                "type": kind, "resource_uri": shape["mesh_resource_uri"],
+                "scale": {axis: shape["mesh_scale"][f"{axis}_m"] for axis in "xyz"},
+            }
+        else:
+            raise ProductionPortError("initial Scene operation has an unsupported shape")
+        if current is None or (
+            list(_sequence(current.get("collision_shapes"), field="collision_shapes"))
+            != [expected_shape]
+            or list(
+                _sequence(
+                    current.get("support_contacts", ()),
+                    field="support_contacts",
+                )
+            )
+            != operation.get("support_contacts")
+            or current.get("provider_evidence") is not None
+        ):
+            return False
+        frame_ref = _mapping(operation.get("frame_ref"), field="frame_ref")
+        # Component-frame intent is resolved by the native owner and cannot
+        # be compared here, so it is always committed again.
+        if frame_ref.get("kind") != "cell_frame":
+            return False
+        return current.get("placement") == {
+            "kind": "cell_fixed",
+            "cell_id": view.cell_id,
+            "pose_in_cell": {
+                "position_m": {
+                    axis: operation["pose"]["position_m"][f"{axis}_m"] for axis in "xyz"
+                },
+                "orientation_xyzw": [operation["pose"]["orientation"][axis] for axis in "xyzw"],
+            },
+        }
+
+    @staticmethod
+    def _scene_matches_operations(
+        view: _SceneView,
+        operations: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        if view.attachments:
+            return False
+        expected_ids = tuple(
+            _text(operation.get("scene_resource_id"), field="scene_resource_id")
+            for operation in operations
+        )
+        return bool(
+            tuple(view.objects) == tuple(sorted(expected_ids))
+            and all(
+                HeadlessSceneProgramPort._object_matches_operation(view, operation)
+                for operation in operations
+            )
+        )
+
+    @staticmethod
+    def _proof(
+        context: _SceneBoundContext,
+        view: _SceneView,
+        desired_scene_digest: str,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": "manyforge.prepared_program_scene.v1",
+            "applied_record_digest": context.capture.applied_record_digest,
+            "program_revision": context.capture.program_revision,
+            "program_binding_id": context.capture.program_binding_id,
+            "retained_bundle_id": context.capture.retained_bundle_id,
+            "graph_revision": context.capture.graph_revision,
+            "desired_scene_digest": desired_scene_digest,
+            "scene_identity": HeadlessSceneProgramPort._scene_identity(view),
+        }
+
+    @staticmethod
+    def _scene_identity(view: _SceneView) -> dict[str, Any]:
+        # Verification before capture compares the prepared scene's identity,
+        # not its revision or owner epoch: continuous pose sources advance the
+        # revision, and history compaction the epoch, between preparation and
+        # capture without changing which scene was prepared.
+        identity = {
+            key: deepcopy(value)
+            for key, value in view.projection_revision.items()
+            if key != "scene_revision"
+        }
+        identity["scene_id"] = view.projection_revision["scene_revision"]["scene_id"]
+        return identity
+
+    @staticmethod
+    def _proof_identifies(
+        context: _SceneBoundContext,
+        view: _SceneView,
+        desired_scene_digest: str,
+        proof: Mapping[str, Any],
+    ) -> bool:
+        return (
+            dict(proof) == HeadlessSceneProgramPort._proof(context, view, desired_scene_digest)
+            and not view.attachments
+        )
+
+    def _initial_scene_operations(
+        self,
+        context: _SceneBoundContext,
+        initial_scene: Sequence[Mapping[str, Any]],
+        *,
+        cell_id: str,
+    ) -> list[dict[str, Any]]:
+        rows = list(initial_scene)
+        ids = [
+            _text(
+                _mapping(row, field=f"initial_scene[{index}]").get("scene_resource_id"),
+                field=f"initial_scene[{index}].scene_resource_id",
+            )
+            for index, row in enumerate(rows)
+        ]
+        if ids != sorted(ids) or len(ids) != len(set(ids)):
+            raise ProductionPortError("initial scene is not canonical")
+        operations: list[tuple[bool, dict[str, Any]]] = []
+        for index, raw_row in enumerate(rows):
+            row = _mapping(raw_row, field=f"initial_scene[{index}]")
+            pose, frame_ref = self._initial_pose_and_frame(
+                context,
+                row.get("pose"),
+                cell_id=cell_id,
+                field=f"initial_scene[{index}].pose",
+            )
+            resource_roles = {
+                _text(role, field=f"initial_scene[{index}].resource_roles")
+                for role in _sequence(
+                    row.get("resource_roles", ()),
+                    field=f"initial_scene[{index}].resource_roles",
+                )
+            }
+            operations.append(
+                (
+                    "pick_object" in resource_roles,
+                    {
+                        "kind": "add_object",
+                        "scene_resource_id": ids[index],
+                        "shape": _scene_shape(
+                            row.get("shape"),
+                            field=f"initial_scene[{index}].shape",
+                        ),
+                        "pose": pose,
+                        "frame_ref": frame_ref,
+                        "support_contacts": _scene_support_contacts(
+                            row.get("metadata"),
+                            field=f"initial_scene[{index}].metadata",
+                        ),
+                    },
+                )
+            )
+        operations.sort(key=lambda item: (item[0], item[1]["scene_resource_id"]))
+        return [operation for _pick_object, operation in operations]
+
+    def clear_applied_scene(
+        self, *, retained_bundle_id: str, graph_revision: str,
+        request_id: str, is_current: Callable[[], bool],
+    ) -> dict[str, Any]:
+        """Clear one empty Applied Scene using ordinary owner transactions.
+
+        The current Apply is checked before every write. A newer Apply can
+        still arrive between that check and the owner's transaction boundary.
+        """
+        context = _SceneBoundContext(
+            capture=_SceneApplyCapture(retained_bundle_id, graph_revision),
+            component_models={}, component_frames={}, targets={},
+        )
+        view = self._read_view(context)
+        refused: list[dict[str, str]] = []
+        kept: set[str] = set()
+        ordinal = 0
+
+        def commit(operation: Mapping[str, Any], resource_id: str) -> dict[str, Any] | None:
+            nonlocal view, ordinal
+            try:
+                current = is_current()
+            except Exception as error:
+                return {"state": "failed", "reason": "apply_status_unavailable",
+                        "message": str(error), "last_observed_remaining": sorted(view.objects)}
+            if not current:
+                return {"state": "superseded", "last_observed_remaining": sorted(view.objects)}
+            ordinal += 1
+            try:
+                committed_revision, _response = self._commit(
+                    context=context,
+                    request_id=_request_identity("scene-clear", request_id, str(ordinal)),
+                    correlation_id=request_id,
+                    request_owner_epoch=view.request_owner_epoch,
+                    expected_projection_revision=view.projection_revision,
+                    operation=operation,
+                    verify_receipt=True,
+                )
+                refreshed = self._read_view(context)
+                if (refreshed.cell_id != view.cell_id
+                    or not _projection_same_or_forward(refreshed.projection_revision,
+                                                       committed_revision)):
+                    raise ProductionPortError("Scene changed identity while clearing")
+                view = refreshed
+            except SceneTransactionRejectedError as error:
+                return {"state": "failed", "resource_id": resource_id,
+                        "reason": error.code, "message": str(error), "owner_refused": True,
+                        "last_observed_remaining": sorted(view.objects)}
+            except Exception as error:
+                return {"state": "unknown", "resource_id": resource_id,
+                        "reason": "scene_outcome_unknown", "message": str(error),
+                        "last_observed_remaining": sorted(view.objects)}
+            return None
+
+        for attachment in view.attachments:
+            resource_id = _text(attachment.get("scene_resource_id"), field="scene_resource_id")
+            result = commit({
+                "kind": "detach_carried_object_at_current_pose",
+                "carried_object_attachment_id": attachment["carried_object_attachment_id"],
+                "expected_carried_object_attachment_revision": attachment["carried_object_attachment_revision"],
+                "expected_scene_resource_id": resource_id,
+                "expected_controllable_component_id": attachment["controllable_component_id"],
+                "expected_command_target_id": attachment["command_target_id"],
+            }, resource_id)
+            if result is not None:
+                if result.get("owner_refused") is not True:
+                    result["refused"] = refused
+                    return result
+                kept.add(resource_id)
+                refused.append({"resource_id": resource_id, "code": result["reason"],
+                                "message": result["message"]})
+
+        # A retained carried object may depend on another Scene object.
+        try:
+            removal_order = self._removal_order(view.objects)
+            pending = list(kept)
+            while pending:
+                resource_id = pending.pop()
+                for contact in view.objects.get(resource_id, {}).get("support_contacts", ()):
+                    support_id = contact["support_object_id"]
+                    if support_id not in kept:
+                        kept.add(support_id)
+                        pending.append(support_id)
+        except Exception as error:
+            return {"state": "failed", "reason": "scene_removal_order_invalid",
+                    "message": str(error), "last_observed_remaining": sorted(view.objects),
+                    "refused": refused}
+        for resource_id in removal_order:
+            if resource_id in kept:
+                continue
+            result = commit({"kind": "remove_object", "scene_resource_id": resource_id}, resource_id)
+            if result is not None:
+                result["refused"] = refused
+                return result
+        try:
+            current = is_current()
+        except Exception as error:
+            return {"state": "failed", "reason": "apply_status_unavailable",
+                    "message": str(error), "last_observed_remaining": sorted(view.objects),
+                    "refused": refused}
+        if not current:
+            return {"state": "superseded", "last_observed_remaining": sorted(view.objects)}
+        remaining = sorted(set(view.objects) | {
+            _text(attachment.get("scene_resource_id"), field="scene_resource_id")
+            for attachment in view.attachments
+        })
+        if remaining and not refused:
+            return {"state": "failed", "reason": "scene_changed",
+                    "message": "Scene still contains objects after clearing",
+                    "last_observed_remaining": remaining}
+        return {"state": "partial" if remaining else "succeeded",
+                "last_observed_remaining": remaining, "refused": refused}
+
+    def prepare_initial_scene(
+        self,
+        context: ProgramRunPortContext,
+        initial_scene: Sequence[Mapping[str, Any]],
+        *,
+        program_reset_scene_authorization: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        parsed = self._parse_context(context)
+        self.bind(context)
+        with self._lock:
+            current = self._contexts.get(context.program_run_id)
+            if current != parsed:
+                raise ProductionPortError("Program-run scene context was rebound")
+        view = self._read_view(parsed)
+        operations = self._initial_scene_operations(parsed, initial_scene, cell_id=view.cell_id)
+        desired_scene_digest = self._desired_scene_digest(parsed, operations)
+        # Always converge against the current objects; the Scene revision is
+        # not a precondition, so there is no proof of an earlier preparation.
+        if self._scene_matches_operations(view, operations):
+            return self._proof(parsed, view, desired_scene_digest)
+
+        expected = view.projection_revision
+        ordinal = 0
+
+        def commit(operation: Mapping[str, Any], coordinate: str) -> None:
+            nonlocal expected, ordinal, view
+            ordinal += 1
+            attempt = 0
+            deadline = time.monotonic() + _SCENE_INITIALIZATION_SETTLEMENT_TIMEOUT_S
+            while True:
+                request_id = _request_identity(
+                    "scene-init",
+                    context.program_run_id,
+                    str(ordinal),
+                    coordinate,
+                    str(attempt),
+                )
+                try:
+                    expected, _response = self._commit(
+                        context=parsed,
+                        request_id=request_id,
+                        correlation_id=context.program_run_id,
+                        request_owner_epoch=view.request_owner_epoch,
+                        expected_projection_revision=expected,
+                        operation=operation,
+                        program_reset_scene_authorization=(program_reset_scene_authorization),
+                    )
+                    return
+                except Exception as error:
+                    code = getattr(error, "code", None)
+                    if code != "authoring_not_ready":
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise ProductionPortError(
+                            "logical-scene initialization could not acquire "
+                            "stable scene and authoring revisions"
+                        ) from error
+                    time.sleep(_SCENE_INITIALIZATION_SETTLEMENT_POLL_S)
+                    refreshed = self._read_view(parsed)
+                    if not self._scene_refresh_matches(parsed, view, refreshed):
+                        raise ProductionPortError(
+                            "logical scene changed identity during initialization"
+                        ) from error
+                    view = refreshed
+                    expected = refreshed.projection_revision
+                    attempt += 1
+
+        for attachment in view.attachments:
+            attachment_id = _text(
+                attachment.get("carried_object_attachment_id"),
+                field="carried_object_attachment_id",
+            )
+            commit(
+                {
+                    "kind": "detach_carried_object_at_current_pose",
+                    "carried_object_attachment_id": attachment_id,
+                    "expected_carried_object_attachment_revision": _text(
+                        attachment.get("carried_object_attachment_revision"),
+                        field="carried_object_attachment_revision",
+                    ),
+                    "expected_scene_resource_id": _text(
+                        attachment.get("scene_resource_id"),
+                        field="scene_resource_id",
+                    ),
+                    "expected_controllable_component_id": _text(
+                        attachment.get("controllable_component_id"),
+                        field="controllable_component_id",
+                    ),
+                    "expected_command_target_id": _text(
+                        attachment.get("command_target_id"),
+                        field="command_target_id",
+                    ),
+                },
+                f"detach:{attachment_id}",
+            )
+        if view.attachments:
+            refreshed = self._read_view(parsed)
+            if not self._scene_refresh_matches(parsed, view, refreshed):
+                raise ProductionPortError(
+                    "logical scene changed identity during initialization"
+                )
+            view = refreshed
+            expected = view.projection_revision
+
+        desired_ids = {str(operation["scene_resource_id"]) for operation in operations}
+        for operation in operations:
+            if self._object_matches_operation(view, operation):
+                continue
+            scene_resource_id = str(operation["scene_resource_id"])
+            replacement = dict(operation)
+            if scene_resource_id in view.objects:
+                replacement["kind"] = "upsert_object"
+            commit(replacement, f"upsert:{scene_resource_id}")
+        for scene_resource_id in self._removal_order(view.objects):
+            if scene_resource_id in desired_ids:
+                continue
+            commit(
+                {
+                    "kind": "remove_object",
+                    "scene_resource_id": scene_resource_id,
+                },
+                f"remove:{scene_resource_id}",
+            )
+        verified = self._read_view(parsed)
+        if (
+            self._scene_identity(verified) != self._scene_identity(view)
+            or verified.attachments
+            or tuple(verified.objects)
+            != tuple(sorted(str(item["scene_resource_id"]) for item in operations))
+        ):
+            raise ProductionPortError(
+                "logical-scene owner did not publish the exact initialized scene"
+            )
+        proof = self._proof(parsed, verified, desired_scene_digest)
+        with self._lock:
+            if self._contexts.get(context.program_run_id) != parsed:
+                raise ProductionPortError("Program-run scene context was rebound")
+        return proof
+
+    def verify_initial_scene(
+        self,
+        context: ProgramRunPortContext,
+        initial_scene: Sequence[Mapping[str, Any]],
+        proof: Mapping[str, Any],
+    ) -> None:
+        parsed = self._parse_context(context)
+        view = self._read_view(parsed)
+        operations = self._initial_scene_operations(parsed, initial_scene, cell_id=view.cell_id)
+        desired_scene_digest = self._desired_scene_digest(parsed, operations)
+        if not self._proof_identifies(parsed, view, desired_scene_digest, proof):
+            raise ProductionPortError("prepared logical scene changed before Program capture")
+
+    def release(self, program_run_id: str) -> None:
+        self.unbind(program_run_id)
+
+    def _object_pose(
+        self, context: _SceneBoundContext, parameters: Mapping[str, Any]
+    ) -> OwnerInvocationResult:
+        """Read one object's current cell-frame pose; never a transaction.
+
+        A fixed object's pose is owner truth in the cell frame. A carried
+        object's pose is composed by the native owner, never in Python.
+        """
+        view = self._read_view(context, require_writes=False)
+        resource_id = _text(parameters.get("scene_resource_id"), field="scene_resource_id")
+        scene_object = view.objects.get(resource_id)
+        if scene_object is None:
+            raise ProductionPortError(
+                f"scene resource {resource_id!r} is absent from the logical scene"
+            )
+        placement = _mapping(scene_object.get("placement"), field="placement")
+        kind = placement.get("kind")
+        if kind == "cell_fixed":
+            if placement.get("cell_id") != view.cell_id:
+                raise ProductionPortError("scene resource is fixed in another cell")
+            pose = placement.get("pose_in_cell")
+        elif kind == "carried":
+            resolve = getattr(self._transport, "resolve_scene_resources", None)
+            if not callable(resolve):
+                raise ProductionPortError("native carried-object pose projection is unavailable")
+            response = _mapping(
+                resolve(
+                    {
+                        "api_version": "manyforge.scene_resource_pose_query.v1",
+                        "expected_projection_revision": view.projection_revision,
+                        "scene_resource_ids": [resource_id],
+                    }
+                ),
+                field="scene resource pose response",
+            )
+            rows = _sequence(response.get("poses"), field="resolved poses", length=1)
+            row = _mapping(rows[0], field="resolved pose")
+            # The owner resolves against its current projection; a newer
+            # revision of the same Scene is the latest truth.
+            if (
+                response.get("api_version") != "manyforge.scene_resource_pose_response.v1"
+                or not _projection_same_or_forward(
+                    response.get("projection_revision"), view.projection_revision
+                )
+                or row.get("scene_resource_id") != resource_id
+            ):
+                raise ProductionPortError("native scene pose projection changed owner revision")
+            pose = row.get("pose_in_cell")
+        else:
+            raise ProductionPortError("scene resource placement is unsupported")
+        pose = _mapping(pose, field="pose_in_cell")
+        position = _mapping(pose.get("position_m"), field="pose_in_cell.position_m")
+        return OwnerInvocationResult(
+            True,
+            output={
+                "frame_ref": {"kind": "cell_frame"},
+                "position_m": [
+                    _number(position.get(axis), field=f"pose_in_cell.position_m.{axis}")
+                    for axis in "xyz"
+                ],
+                "orientation": {
+                    "xyzw": normalize_quat(
+                        _sequence(
+                            pose.get("orientation_xyzw"),
+                            field="pose_in_cell.orientation_xyzw",
+                            length=4,
+                        )
+                    )
+                },
+            },
+            metadata={"placement": kind},
+        )
+
+    def invoke(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        inputs: OwnerNodeInputs,
+    ) -> OwnerInvocationResult:
+        try:
+            context = self._context(identity.program_run_id)
+            if node_id == "scene.get_object_pose":
+                return self._object_pose(context, inputs.parameters)
+            if self._program_node_evidence is None:
+                raise ProductionPortError("runtime Scene node admission is unavailable")
+            owner_api = (
+                "scene.carried_attachment"
+                if node_id in {"scene.attach_carried_object", "scene.detach_carried_object"}
+                else "scene.transaction"
+            )
+            evidence = self._program_node_evidence(identity, owner_api)
+            view = self._read_view(context)
+            parameters = inputs.parameters
+            if node_id in {"scene.add_object", "scene.upsert_object"}:
+                pose, frame_ref = self._node_pose_and_frame(
+                    context, view, parameters.get("pose"), field="pose"
+                )
+                operation = {
+                    "kind": ("add_object" if node_id == "scene.add_object" else "upsert_object"),
+                    "scene_resource_id": _text(
+                        parameters.get("scene_resource_id"),
+                        field="scene_resource_id",
+                    ),
+                    "shape": _scene_shape(parameters.get("shape"), field="shape"),
+                    "pose": pose,
+                    "frame_ref": frame_ref,
+                    "support_contacts": [],
+                }
+            elif node_id == "scene.remove_object":
+                operation = {
+                    "kind": "remove_object",
+                    "scene_resource_id": _text(
+                        parameters.get("scene_resource_id"),
+                        field="scene_resource_id",
+                    ),
+                }
+            elif node_id == "scene.update_object_pose":
+                pose, frame_ref = self._node_pose_and_frame(
+                    context, view, parameters.get("pose"), field="pose"
+                )
+                operation = {
+                    "kind": "update_object_pose",
+                    "scene_resource_id": _text(
+                        parameters.get("scene_resource_id"),
+                        field="scene_resource_id",
+                    ),
+                    "pose": pose,
+                    "frame_ref": frame_ref,
+                    "provider_evidence": None,
+                    "expected_attached": None,
+                }
+            elif node_id == "scene.attach_carried_object":
+                target_role = _text(parameters.get("target_role"), field="target_role")
+                target = self._target(context, target_role)
+                if ("carrier_frame" in parameters) == ("carrier_frame_role" in parameters):
+                    raise ProductionPortError("requires exactly one carrier frame selector")
+                if "carrier_frame" in parameters:
+                    selector = _mapping(parameters["carrier_frame"], field="carrier_frame")
+                    if set(selector) != {"kind"} or selector.get("kind") != "active_tcp":
+                        raise ProductionPortError("invalid carrier frame selector")
+                    if self._resolve_attach_active_tcp is None:
+                        raise ProductionPortError("Active TCP holder resolution is unavailable")
+                    frame_role = _text(
+                        self._resolve_attach_active_tcp(context.capture.program_binding_id, target_role),
+                        field="resolved carrier frame",
+                    )
+                else:
+                    frame_role = _text(parameters.get("carrier_frame_role"), field="carrier_frame_role")
+                    if frame_role not in target.frames:
+                        raise ProductionPortError("Program Binding has no exact carrier frame")
+                touch_body_roles = [
+                    _text(value, field="touch_body_role")
+                    for value in _sequence(
+                        parameters.get("touch_body_roles"),
+                        field="touch_body_roles",
+                    )
+                ]
+                if len(touch_body_roles) != len(set(touch_body_roles)) or any(
+                    role not in target.collision_body_roles for role in touch_body_roles
+                ):
+                    raise ProductionPortError(
+                        "touch-body roles are duplicate or absent from the binding"
+                    )
+                scene_resource_id = _text(
+                    parameters.get("scene_resource_id"),
+                    field="scene_resource_id",
+                )
+                operation = {
+                    "kind": "attach_carried_object",
+                    "carried_object_attachment_id": _request_identity(
+                        "carried-object",
+                        identity.program_run_id,
+                        scene_resource_id,
+                        target_role,
+                    ),
+                    "scene_resource_id": scene_resource_id,
+                    "controllable_component_id": target.controllable_component_id,
+                    "command_target_id": target.command_target_id,
+                    "frame_role_id": frame_role,
+                    "touch_body_roles": sorted(touch_body_roles),
+                    # The owner resolves the carrier against its current
+                    # structural attachments and ignores this field.
+                    "expected_component_attachment_revisions": [],
+                }
+                grasp_lost_response = _grasp_lost_response(parameters)
+                if grasp_lost_response != _GRASP_LOST_RESPONSE_DEFAULTS:
+                    operation["on_grasp_lost"] = grasp_lost_response
+                # The node's grasp-lost bound (catalog defaults) travels with
+                # the attachment; the Manager checks later measured offsets.
+                if (
+                    "grasp_lost_translation_m" in parameters
+                    or "grasp_lost_rotation_rad" in parameters
+                ):
+                    operation["grasp_lost_bound"] = {
+                        "translation_m": _number(
+                            parameters.get("grasp_lost_translation_m"),
+                            field="grasp_lost_translation_m",
+                        ),
+                        "rotation_rad": _number(
+                            parameters.get("grasp_lost_rotation_rad"),
+                            field="grasp_lost_rotation_rad",
+                        ),
+                    }
+            elif node_id == "scene.detach_carried_object":
+                scene_resource_id = _text(
+                    parameters.get("scene_resource_id"),
+                    field="scene_resource_id",
+                )
+                target = self._target(
+                    context,
+                    _text(parameters.get("target_role"), field="target_role"),
+                )
+                matches = [
+                    attachment
+                    for attachment in view.attachments
+                    if attachment.get("scene_resource_id") == scene_resource_id
+                ]
+                if len(matches) != 1:
+                    raise ProductionPortError(
+                        "scene resource has no unique carried-object attachment"
+                    )
+                attachment = matches[0]
+                if (
+                    attachment.get("controllable_component_id") != target.controllable_component_id
+                    or attachment.get("command_target_id") != target.command_target_id
+                ):
+                    raise ProductionPortError("carried-object attachment belongs to another target")
+                detached_attachment_id = _text(
+                    attachment.get("carried_object_attachment_id"),
+                    field="carried_object_attachment_id",
+                )
+                operation = {
+                    "kind": "detach_carried_object_at_current_pose",
+                    "carried_object_attachment_id": detached_attachment_id,
+                    "expected_carried_object_attachment_revision": _text(
+                        attachment.get("carried_object_attachment_revision"),
+                        field="carried_object_attachment_revision",
+                    ),
+                    "expected_scene_resource_id": scene_resource_id,
+                    "expected_controllable_component_id": (target.controllable_component_id),
+                    "expected_command_target_id": target.command_target_id,
+                }
+            else:
+                raise ProductionPortError(f"scene Program port does not implement {node_id!r}")
+            request_id = _request_identity(
+                "scene-node",
+                identity.program_run_id,
+                identity.node_instance_id,
+                identity.node_attempt_id,
+                node_id,
+            )
+            committed, response = self._commit(
+                context=context,
+                request_id=request_id,
+                correlation_id=identity.node_attempt_id,
+                request_owner_epoch=view.request_owner_epoch,
+                expected_projection_revision=view.projection_revision,
+                operation=operation,
+                program_node_evidence=evidence,
+            )
+            return OwnerInvocationResult(
+                True,
+                output={"committed_projection_revision": committed},
+                metadata={
+                    "transaction_sequence": response.get("transaction_sequence"),
+                    "update_status": response.get("update_status"),
+                },
+            )
+        except OwnerInvocationPendingError:
+            raise
+        except Exception as exc:
+            if isinstance(exc, SceneTransactionRejectedError):
+                self._raise_if_stop_prevented_admission(exc)
+            reason_code = getattr(exc, "code", None)
+            if not isinstance(reason_code, str) or not reason_code:
+                reason_code = "scene_program_request_failed"
+            return OwnerInvocationResult(
+                False,
+                reason_code=reason_code,
+                message=_owner_failure_message(exc),
+                details=exception_failure_details(exc),
+            )
+
+
+class SimulationResetPoseSourceTaskPort:
+    """Finish known simulator resets before reporting their success."""
+
+    def __init__(
+        self, port: Any, scene: Any | None,
+        on_reset: Callable[[NodeAttemptIdentity], None] | None = None,
+    ) -> None:
+        if any(
+            not callable(getattr(port, method, None))
+            for method in ("acknowledge", "cancel", "observe", "start")
+        ):
+            raise TypeError("pose-source task wrapper requires one OwnerTaskPort")
+        if scene is not None and not callable(getattr(scene, "latch_between_nodes", None)):
+            raise TypeError("pose-source task wrapper requires a between-nodes latch port")
+        if on_reset is not None and not callable(on_reset):
+            raise TypeError("simulation reset callback must be callable")
+        self._port = port
+        self._scene = scene
+        self._on_reset = on_reset
+        self._pending_resets: dict[str, NodeAttemptIdentity] = {}
+        self._finished_resets: dict[str, NodeAttemptIdentity] = {}
+        self._reset_in_flight: set[str] = set()
+        self._reset_errors: dict[str, OwnerTaskSnapshot] = {}
+        self._lock = RLock()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._port, name)
+
+    def _remember_reset(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        with self._lock:
+            current = self._pending_resets.get(task_id) or self._finished_resets.get(task_id)
+            if current is not None and current != identity:
+                raise ProductionPortError("simulation reset task identity was reused")
+            if current is None:
+                if len(self._pending_resets) + len(self._finished_resets) >= _MAX_PENDING_SIMULATION_RESETS:
+                    raise ProductionPortError("pending simulation reset retention is full")
+                self._pending_resets[task_id] = identity
+
+    def _finish_reset(self, task_id: str, identity: NodeAttemptIdentity) -> OwnerTaskSnapshot | None:
+        with self._lock:
+            if self._finished_resets.get(task_id) == identity:
+                return self._reset_errors.get(task_id)
+            if task_id in self._reset_in_flight:
+                raise OwnerTaskObservationUnavailableError("simulation reset completion is in progress")
+            self._reset_in_flight.add(task_id)
+        try:
+            if self._on_reset is not None:
+                self._on_reset(identity)
+        except Exception as error:
+            failure = OwnerTaskSnapshot(
+                task_id=task_id, state=OwnerTaskState.FAILED,
+                reason_code="active_tcp_reset_failed",
+                message=_owner_failure_message(error),
+                details=exception_failure_details(error),
+                settlement_proven=True,
+            )
+            with self._lock:
+                self._reset_in_flight.discard(task_id)
+                if self._pending_resets.get(task_id) == identity:
+                    self._pending_resets.pop(task_id, None)
+                    self._finished_resets[task_id] = identity
+                    self._reset_errors[task_id] = failure
+            return failure
+        with self._lock:
+            self._reset_in_flight.discard(task_id)
+            if self._pending_resets.get(task_id) != identity:
+                return
+            self._pending_resets.pop(task_id, None)
+            self._reset_errors.pop(task_id, None)
+            self._finished_resets[task_id] = identity
+        if self._scene is not None:
+            self._scene.latch_between_nodes(identity, scene_resource_ids=None)
+
+    def start(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot:
+        if not isinstance(identity, NodeAttemptIdentity) or not isinstance(
+            inputs, OwnerNodeInputs
+        ):
+            raise TypeError("pose-source task start requires an exact node attempt")
+        if node_id == "simulation.reset":
+            with self._lock:
+                retained = tuple(self._pending_resets.values()) + tuple(self._finished_resets.values())
+                if len(retained) >= _MAX_PENDING_SIMULATION_RESETS and identity not in retained:
+                    raise ProductionPortError("pending simulation reset retention is full")
+        task = self._port.start(node_id, identity, inputs)
+        if node_id == "simulation.reset" and task.state in {
+            OwnerTaskState.ACTIVE, OwnerTaskState.SUCCEEDED
+        }:
+            self._remember_reset(task.task_id, identity)
+            if task.state is OwnerTaskState.SUCCEEDED:
+                failure = self._finish_reset(task.task_id, identity)
+                if failure is not None:
+                    return failure
+        return task
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        with self._lock:
+            failure = self._reset_errors.get(task_id)
+        if failure is not None:
+            return failure
+        task = self._port.observe(task_id)
+        with self._lock:
+            identity = self._pending_resets.get(task.task_id)
+        if identity is not None and task.state is OwnerTaskState.SUCCEEDED:
+            failure = self._finish_reset(task.task_id, identity)
+            if failure is not None:
+                return failure
+        elif identity is not None and task.state is not OwnerTaskState.ACTIVE:
+            with self._lock:
+                self._pending_resets.pop(task.task_id, None)
+        return task
+
+    def cancel(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        self._port.cancel(task_id, identity)
+        with self._lock:
+            if self._pending_resets.get(task_id) == identity:
+                self._pending_resets.pop(task_id, None)
+                self._reset_errors.pop(task_id, None)
+            if self._finished_resets.get(task_id) == identity:
+                self._finished_resets.pop(task_id, None)
+                self._reset_errors.pop(task_id, None)
+
+    def acknowledge(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        self._port.acknowledge(task_id, identity)
+        with self._lock:
+            if self._finished_resets.get(task_id) == identity:
+                self._finished_resets.pop(task_id, None)
+                self._reset_errors.pop(task_id, None)
+
+
+__all__ = [
+    "HeadlessSceneProgramPort",
+    "NativeKernelProgramPort",
+    "ProductionPortError",
+    "ProgramMotionParticipant",
+    "ProgramMotionPreviewUnavailableError",
+    "SimulationResetPoseSourceTaskPort",
+    "program_motion_participant",
+]

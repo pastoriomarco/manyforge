@@ -15,13 +15,10 @@ const TOKEN_LABELS: Record<string, string> = {
   request_ack_then_dwell: 'Request ack then dwell',
   open_loop_immediate: 'Open-loop immediate',
   none_open_loop: 'None, open loop',
-  operator_confirm: 'Operator confirm',
   discrete_signal: 'Discrete signal',
   perception: 'Perception',
   force_or_current: 'Force/current',
   unverified: 'Unverified',
-  faulted_unverified: 'Faulted, unverified',
-  pressure_or_part_lost: 'Pressure or part lost',
 };
 
 function cleanToken(value: unknown): string {
@@ -30,19 +27,11 @@ function cleanToken(value: unknown): string {
 
 export function formatGripperSemanticToken(value: unknown): string {
   const token = cleanToken(value);
-  if (token.length === 0) return 'Unconfigured';
+  if (!token) return 'Unconfigured';
   return TOKEN_LABELS[token] ?? token.replaceAll('_', ' ');
 }
 
-export function gripperTransportKind(
-  transport: Record<string, unknown> | null | undefined,
-  fallback?: unknown,
-): string {
-  const kind = cleanToken(transport?.kind);
-  if (kind.length > 0) return kind;
-  return cleanToken(fallback);
-}
-
+/** Explain completion evidence without treating open-loop completion as grasp proof. */
 export function gripperCompletionNotice(options: {
   actuationKind?: unknown;
   completionPolicy?: unknown;
@@ -51,11 +40,10 @@ export function gripperCompletionNotice(options: {
   const actuationKind = cleanToken(options.actuationKind);
   const completionPolicy = cleanToken(options.completionPolicy);
   const graspConfirmationPolicy = cleanToken(options.graspConfirmationPolicy);
-
   if (
-    actuationKind === 'pneumatic' &&
-    (completionPolicy === 'dwell_elapsed' ||
-      completionPolicy === 'request_ack_then_dwell')
+    actuationKind === 'pneumatic'
+    && (completionPolicy === 'dwell_elapsed'
+      || completionPolicy === 'request_ack_then_dwell')
   ) {
     return 'Command and dwell completion only; grasp remains unverified unless a confirmation policy provides evidence.';
   }
@@ -80,5 +68,5 @@ export function gripperPositionSourceLabel(options: {
   if (options.commandedPosition !== null && options.commandedPosition !== undefined) {
     return 'commanded estimate';
   }
-  return 'live';
+  return 'unavailable';
 }

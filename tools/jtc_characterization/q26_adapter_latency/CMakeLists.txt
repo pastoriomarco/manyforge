@@ -1,0 +1,41 @@
+cmake_minimum_required(VERSION 3.16)
+project(q26_real_adapter_probe LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+find_package(ament_cmake REQUIRED)
+find_package(OpenSSL REQUIRED)
+find_package(double-conversion CONFIG REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(UTF8PROC REQUIRED IMPORTED_TARGET libutf8proc)
+foreach(dep rclcpp rclcpp_action control_msgs action_msgs controller_manager_msgs lifecycle_msgs sensor_msgs std_msgs trajectory_msgs builtin_interfaces)
+  find_package(${dep} REQUIRED)
+endforeach()
+add_executable(q26_adapter_probe probe.cpp)
+set(MANYFORGE_SOURCE_ROOT "" CACHE PATH "Current ManyForge checkout")
+set(MANYFORGE_ROBOPLAN_BUILD_DIR "" CACHE PATH "Existing ROS runtime build")
+if(NOT EXISTS "${MANYFORGE_SOURCE_ROOT}/manyforge_core/CMakeLists.txt" OR
+   NOT EXISTS "${MANYFORGE_ROBOPLAN_BUILD_DIR}/CMakeCache.txt")
+  message(FATAL_ERROR "Select the current source and its existing ROS runtime build")
+endif()
+foreach(library_name manyforge_ros2_control_execution manyforge_core manyforge_content_identity)
+  find_library(Q26_${library_name} NAMES ${library_name}
+    PATHS "${MANYFORGE_ROBOPLAN_BUILD_DIR}"
+    PATH_SUFFIXES adapter core core/manyforge_content_identity
+      manyforge_ros2_control_execution manyforge_core
+      manyforge_core/manyforge_content_identity manyforge_content_identity
+    NO_DEFAULT_PATH)
+  if(NOT Q26_${library_name})
+    message(FATAL_ERROR "Build ${library_name} in the selected ROS runtime graph first")
+  endif()
+  message(STATUS "Q26 ${library_name}: ${Q26_${library_name}}")
+  target_link_libraries(q26_adapter_probe "${Q26_${library_name}}")
+endforeach()
+target_include_directories(q26_adapter_probe PRIVATE "${MANYFORGE_SOURCE_ROOT}/manyforge_core/include" "${MANYFORGE_SOURCE_ROOT}/manyforge_ros2_control_execution/include")
+target_compile_options(q26_adapter_probe PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(q26_adapter_probe OpenSSL::Crypto PkgConfig::UTF8PROC double-conversion::double-conversion)
+ament_target_dependencies(q26_adapter_probe rclcpp rclcpp_action control_msgs action_msgs controller_manager_msgs lifecycle_msgs sensor_msgs std_msgs trajectory_msgs builtin_interfaces)
+# Not built normally. Its exact compiler command is the bounded load workload.
+add_library(q26_compile_load OBJECT EXCLUDE_FROM_ALL "${MANYFORGE_SOURCE_ROOT}/manyforge_ros2_control_execution/src/ros2_control_execution_backend.cpp")
+target_include_directories(q26_compile_load PRIVATE "${MANYFORGE_SOURCE_ROOT}/manyforge_core/include" "${MANYFORGE_SOURCE_ROOT}/manyforge_ros2_control_execution/include")
+target_compile_options(q26_compile_load PRIVATE -O3 -DNDEBUG -fPIC -Wall -Wextra -Werror -Wno-deprecated-copy)
+ament_target_dependencies(q26_compile_load rclcpp rclcpp_action control_msgs action_msgs controller_manager_msgs lifecycle_msgs sensor_msgs std_msgs trajectory_msgs builtin_interfaces)

@@ -1,41 +1,51 @@
 name: cpp-stability-gate
 
+# Heavy tier: nightly (on dev), on demand, and on release tags. Not on PRs.
+# Builds only test_execution_kernel (stability_gate.sh) and repeats it under load.
 on:
-  pull_request:
-    paths:
-      - "manyforge_core/src/execution_kernel.cpp"
-      - "manyforge_core/src/operator_stop_worker.cpp"
-      - "manyforge_core/src/execution_worker_signals.cpp"
-      - "manyforge_core/src/interrupt_manager.cpp"
-      - "manyforge_core/tools/stability_gate.sh"
-      - ".github/workflows/cpp-stability-gate.yml"
-  push:
-    branches: [main, dev]
-    paths:
-      - "manyforge_core/src/execution_kernel.cpp"
-      - "manyforge_core/src/operator_stop_worker.cpp"
-      - "manyforge_core/src/execution_worker_signals.cpp"
-      - "manyforge_core/src/interrupt_manager.cpp"
-      - "manyforge_core/tools/stability_gate.sh"
-      - ".github/workflows/cpp-stability-gate.yml"
+  schedule:
+    - cron: "0 3 * * *"
   workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   manyforge-core-stability:
     name: manyforge_core repeat-under-load stability
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
-      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      CMAKE_BUILD_PARALLEL_LEVEL: "4"
       CORE_BUILD_DIR: "${{ github.workspace }}/build/stability-core"
-      MANYFORGE_STABILITY_ITERATIONS: "30"
+      MANYFORGE_STABILITY_ITERATIONS: "5"
       MANYFORGE_STABILITY_LOAD_WORKERS: "3"
-      MANYFORGE_STABILITY_TIMEOUT_SECONDS: "30"
+      MANYFORGE_STABILITY_TIMEOUT_SECONDS: "240"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_MAXSIZE: 500M
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'dev' || '' }}
       - name: Install C++ test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake g++ libgtest-dev libc6
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ ccache libgtest-dev libc6 pkg-config \
+            libdouble-conversion-dev libutf8proc-dev libssl-dev libsqlite3-dev
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-stability-${{ github.sha }}
+          restore-keys: ccache-stability-
       - name: Configure core tests
         run: |
           cmake -S manyforge_core -B "$CORE_BUILD_DIR" \

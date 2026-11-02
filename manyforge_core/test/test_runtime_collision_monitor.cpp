@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <string>
 #include <thread>
 
 namespace manyforge::core {
@@ -212,6 +213,46 @@ TEST(RuntimeCollisionMonitorTest,
   EXPECT_EQ(metrics.late_periods, 1u);
   EXPECT_EQ(metrics.missed_periods, 2u);
   EXPECT_EQ(metrics.max_consecutive_late_periods, 1u);
+}
+
+TEST(RuntimeCollisionMonitorTest, StuckDrainWaitsWithTypedLineInsteadOfTerminating) {
+  // Lane drain misses its bound once, then completes: stop() reports the
+  // stuck drain, runs the evidence hook once and keeps waiting.
+  class FirstDrainStuckScheduler final : public IScheduler {
+   public:
+    ScheduleHandle schedule(TimePoint deadline, std::function<void()> callback,
+                            SchedulerPriority priority) override {
+      return scheduler_.schedule(deadline, std::move(callback), priority);
+    }
+    void cancel(ScheduleHandle handle) override { scheduler_.cancel(handle); }
+    bool drain_for(SchedulerPriority, std::chrono::nanoseconds) override {
+      return ++drain_calls > 1;
+    }
+    int drain_calls = 0;
+
+   private:
+    ManualScheduler scheduler_;
+  };
+  FakeClock clock;
+  FirstDrainStuckScheduler scheduler;
+  int dumps = 0;
+  RuntimeCollisionMonitor monitor{
+      clock, scheduler, RuntimeCollisionMonitor::Config{10'000'000},
+      []() { return Result<void>::Ok(); }, []() { return true; }};
+  monitor.set_fail_closed_dump_hook([&] { ++dumps; });
+  monitor.start();
+
+  testing::internal::CaptureStderr();
+  monitor.stop(/*drain_callbacks=*/true);
+  const auto output = testing::internal::GetCapturedStderr();
+
+  EXPECT_EQ(scheduler.drain_calls, 2);
+  EXPECT_EQ(dumps, 1);
+  EXPECT_NE(output.find("manyforge_fault code=drain_stuck "
+                        "drain=runtime_collision_monitor.scheduler_runtime_safety_lane "
+                        "bound_ms=1000 state=waiting_for_operator"),
+            std::string::npos)
+      << output;
 }
 
 }  // namespace

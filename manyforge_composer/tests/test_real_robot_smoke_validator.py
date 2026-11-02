@@ -1,4 +1,10 @@
-"""Tests for the fail-closed real-Lite6 product-lane smoke validator."""
+"""Tests for the fail-closed real-Lite6 product-lane smoke reducer.
+
+Historical test blob ``4f5eaf4f570d01bbac798ded94bcb0fc735ab94d``
+maps advancing/closed admission to I5/H0 plus I10/R, unexpected admission to
+I8 plus I10/R, component convergence/identity to I4/I5 plus I10/R, and
+endpoint failure handling to the future I10/R thin client.
+"""
 
 from __future__ import annotations
 
@@ -178,3 +184,15 @@ def test_wait_times_out_on_endpoint_failure_without_false_pass():
             clock=clock,
             sleep=clock.sleep,
         )
+
+
+def test_direct_smoke_client_is_gated_before_argument_access(capsys):
+    class PoisonArguments:
+        def __iter__(self):
+            raise AssertionError('unavailable client inspected arguments')
+
+    assert smoke.main(PoisonArguments()) == 78
+    assert (
+        smoke.LITE6_PRODUCT_SMOKE_UNAVAILABLE_REASON_CODE
+        in capsys.readouterr().err
+    )

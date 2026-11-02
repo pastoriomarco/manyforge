@@ -7,7 +7,13 @@ Source runtime:
 
 - ManyMove image: `manymove-xarm:jazzy`
 - xarm fork: `https://github.com/pastoriomarco/xarm_ros2`
-- xarm branch: `jazzy_no_gazebo`
+- xarm branch: `lyrical-no-gazebo`, commit `ef7351f90e451a37ef73de69c643b7e85040401a`
+  (2026-10-25: `manymove_lite6_runtime.urdf` replaced by the xacro expansion of
+  that commit with the capture arguments `robot_type:=lite dof:=6
+  add_gripper:=true limited:=true ros2_control_plugin:=isaac prefix:=`; the
+  original `/move_group` capture at `jazzy_no_gazebo` `012731a` was proven
+  identical to that commit's xacro output, and the two commits differ only in
+  the six arm joint effort values. The SRDF capture is unchanged.)
 - runtime owner: `/move_group`
 - launch:
 

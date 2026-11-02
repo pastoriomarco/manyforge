@@ -1,51 +1,53 @@
 import { describe, expect, it, vi } from 'vitest';
-
-import { authorGizmoRelease, gizmoCartesianRequest } from './gizmoAuthoring';
+import { gizmoPoseDraft, retainGizmoRelease } from './gizmoAuthoring';
 import type { PoseTuple } from './poseTransforms';
 
-const ANCHOR: PoseTuple = {
+const anchor: PoseTuple = {
   position: [0.5, 0.1, 0.4],
   quaternion: [0, 0, 0, 1],
 };
-const BASE: PoseTuple = {
-  position: [0, 0, 0],
+const reference: PoseTuple = {
+  position: [0.1, 0, 0],
   quaternion: [0, 0, 0, 1],
 };
+const address = {
+  componentId: 'robot-1',
+  targetId: 'arm',
+  referenceFrame: 'base_link',
+};
 
-describe('gizmoCartesianRequest', () => {
-  it('returns null when the base world pose is unknown (cannot resolve frame)', () => {
-    expect(gizmoCartesianRequest(ANCHOR, null, 'tool0')).toBeNull();
+describe('gizmo authoring drafts', () => {
+  it('retains an explicit component/target/frame address', () => {
+    expect(gizmoPoseDraft(anchor, reference, address)).toEqual({
+      source: 'cartesian_gizmo',
+      address,
+      pose: {
+        relative_to: 'base_link',
+        position_m: [0.4, 0.1, 0.4],
+        orientation_xyzw: [0, 0, 0, 1],
+      },
+    });
   });
 
-  it('returns a base-frame cartesian request when the base world pose is known', () => {
-    const req = gizmoCartesianRequest(ANCHOR, BASE, 'tool0');
-    expect(req).not.toBeNull();
-    expect(req?.sourceSurface).toBe('cartesian_gizmo');
-    expect(req?.inputMode).toBe('cartesian');
-    expect(req?.cartesianTarget?.frameId).toBe('base');
-    expect(req?.cartesianTarget?.tcpFrame).toBe('tool0');
-    expect(req?.cartesianTarget?.positionM).toHaveLength(3);
-    expect(req?.cartesianTarget?.orientationXyzw).toHaveLength(4);
-  });
-});
+  it('fails closed instead of producing a mis-framed or unaddressed draft', () => {
+    expect(gizmoPoseDraft(anchor, null, address)).toBeNull();
+    expect(
+      gizmoPoseDraft(anchor, reference, { ...address, componentId: '' }),
+    ).toBeNull();
 
-describe('authorGizmoRelease', () => {
-  it('does NOT author and rejects the draft when the frame cannot be resolved', () => {
-    const author = vi.fn();
+    const retainDraft = vi.fn();
     const rejectDraft = vi.fn();
-    authorGizmoRelease(ANCHOR, null, 'tool0', { author, rejectDraft });
-    // Fail closed: no candidate authored for a mis-framed release.
-    expect(author).not.toHaveBeenCalled();
-    // And the prior draft is made non-approvable.
+    retainGizmoRelease(anchor, null, address, { retainDraft, rejectDraft });
+    expect(retainDraft).not.toHaveBeenCalled();
     expect(rejectDraft).toHaveBeenCalledTimes(1);
   });
 
-  it('authors exactly once when the frame can be resolved', () => {
-    const author = vi.fn();
+  it('retains one successful release exactly once', () => {
+    const retainDraft = vi.fn();
     const rejectDraft = vi.fn();
-    authorGizmoRelease(ANCHOR, BASE, 'tool0', { author, rejectDraft });
-    expect(author).toHaveBeenCalledTimes(1);
+    retainGizmoRelease(anchor, reference, address, { retainDraft, rejectDraft });
+    expect(retainDraft).toHaveBeenCalledTimes(1);
+    expect(retainDraft).toHaveBeenCalledWith(gizmoPoseDraft(anchor, reference, address));
     expect(rejectDraft).not.toHaveBeenCalled();
-    expect(author.mock.calls[0][0].cartesianTarget.frameId).toBe('base');
   });
 });

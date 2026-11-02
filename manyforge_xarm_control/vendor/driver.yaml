@@ -1,0 +1,14 @@
+# The xArm vendor driver (CONTRACTS §12, plan "Vendor driver configuration").
+# The image build pins `source.commit`; the base files are read from the
+# installed driver when a component's configuration is generated (no vendor
+# launch file or Python runs). See README.md.
+source:
+  repository: https://github.com/pastoriomarco/xarm_ros2
+  branch: lyrical-no-gazebo
+  # Dockerfile.ros-lyrical-full `XARM_SOURCE_COMMIT`.
+  commit: 46aa1147d99963a8357b89744633db428746667b
+hardware_plugin: uf_robot_hardware/UFRobotSystemHardware
+base_files:
+  # `{model}` is the model row's `vendor_model` (lite6, uf850, xarm6, ...).
+  controllers: xarm_controller/config/{model}_controllers.yaml
+  driver_parameters: xarm_api/config/xarm_params.yaml

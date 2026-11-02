@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
-# ThreadSanitizer lane for the Phase 4 collision-engine qualification path.
+# ThreadSanitizer lane for the owner-neutral manyforge_collision integration
+# path. Factory/scene/runtime composition cases remain assigned to I6/I8.
 #
-# This builds the RoboPlan composition package because the cross-package
-# integration tests need both manyforge_roboplan (snapshot publisher / shadow
-# comparator) and manyforge_collision (authoritative engine). The production
-# engine code remains in manyforge_collision; this script only chooses the
-# CMake entry point that wires the integration tests.
+# The historical no-argument command built the RoboPlan cross-package engine
+# campaign (manyforge@082221... blob 1176a7a9225c7e418300f7ba42491a6766ac873d).
+# That meaning is unavailable until I6/N and I8/P5.  The narrower retained
+# primitive registry is deliberately exposed only by an explicit selector.
 
 set -euo pipefail
+
+if [[ "$#" -ne 1 || "$1" != "retained-primitives" ]]; then
+  builtin printf '%s\n' \
+    'composable_cell_runtime_unavailable: historical cross-package collision sanitizer qualification returns at I6/N and I8/P5; use retained-primitives only for the owner-neutral manyforge_collision subset' \
+    >&2
+  exit 78
+fi
+shift
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -30,13 +38,13 @@ if [[ "${TSAN_OPTIONS}" != *"suppressions="* ]]; then
 fi
 export TSAN_OPTIONS
 
-if [[ -f /opt/ros/jazzy/setup.bash ]]; then
+if [[ -f "/opt/ros/${ROS_DISTRO:-lyrical}/setup.bash" ]]; then
   # CMake's ament package templates import ament_package from the ROS Python
   # tree. Source ROS here so the TSan lane is reproducible under docker exec and
   # not dependent on an interactive shell profile.
   # shellcheck disable=SC1091
   set +u
-  source /opt/ros/jazzy/setup.bash
+  source "/opt/ros/${ROS_DISTRO:-lyrical}/setup.bash"
   set -u
 fi
 
@@ -55,10 +63,11 @@ fi
 # default -Werror promotion converts to a hard build failure. Mirrors the
 # same fix in scripts/ci/run-core-tsan.sh.
 cmake \
-  -S "${REPO_ROOT}/manyforge_roboplan" \
+  -S "${REPO_ROOT}/manyforge_collision" \
   -B "${BUILD_DIR}" \
   -DBUILD_TESTING=ON \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1 -g1 -DNDEBUG" \
   -DMANYFORGE_GTEST_TIMEOUT_SECONDS="${GTEST_TIMEOUT_SECONDS}" \
   -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -Wno-error=array-bounds" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
@@ -68,5 +77,5 @@ cmake --build "${BUILD_DIR}" --parallel "${PARALLEL}" \
   --target test_collision_engine_integration
 python3 "${SCRIPT_DIR}/run-ctest-gtest-binaries-grouped.py" \
   --build-dir "${BUILD_DIR}" \
-  --test-regex "ManyForgeCollisionEngineTest" \
+  --test-regex "(ManyForgeCollision|CollisionQualificationPrimitives)" \
   --summary-prefix COLLISION_TSAN

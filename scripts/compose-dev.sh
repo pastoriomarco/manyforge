@@ -1,49 +1,690 @@
 #!/usr/bin/env bash
-# compose-dev.sh — Start ManyForge Composer in dev mode
-#
-# Usage:
-#   ./scripts/compose-dev.sh              # Start API (9000) + Vite HMR (3000)
-#   ./scripts/compose-dev.sh --prod       # Start production mode (API serves built frontend on 9000)
-#   ./scripts/compose-dev.sh --stop       # Stop all composer services
-#
-# Dev mode:   http://localhost:3000  (Vite + hot reload, proxies API to :9000)
-# Prod mode:  http://localhost:9000  (FastAPI serves static dist/)
-#
-# Pick-and-place E2E test:
-#   1. Start the composer (this script)
-#   2. Open the UI in a browser
-#   3. POST to load the example program:
-#      curl -X POST http://localhost:9000/api/program/load \
-#        -H 'Content-Type: application/json' \
-#        -d '{"path":"/workspace/examples/pick_and_place_minimal.program.yaml",
-#             "deploymentPath":"/workspace/manyforge_behavior/tests/fixtures/ur5_roboplan.deployment.yaml"}'
-#   4. GET /api/program/tree to see the behavior tree
-#   5. POST /api/cycle/run to start the cycle
-#   6. Watch /ws/state WebSocket for live node statuses
-#   7. POST /api/cycle/stop to stop
-#   8. POST /api/cycle/reset to reset
+# One supported D0 development workbench: explicit start/status/stop, exact
+# backend-owned scenario activation, and Vite HMR. It never runs qualification,
+# tests, sanitizers, release packaging, or Stop-proof generation.
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+# Runtime journals refuse group/other-writable directories; create every host
+# directory owner-writable only, whatever the caller's umask.
+umask 0022
+repo_root=$(cd "$(dirname "$0")/.." && pwd)
+container_name=${MANYFORGE_DEV_CONTAINER_NAME:-manyforge-development-workbench}
+[[ "$container_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { echo "Invalid Docker container name" >&2; exit 64; }
+image=${MANYFORGE_DEV_IMAGE:-${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-lyrical-full}}
+cache_base=${MANYFORGE_DEV_CACHE_BASE:-"$repo_root/.manyforge-dev"}
+runtime_root=${MANYFORGE_DEV_RUNTIME_STATE_ROOT:-"$cache_base/runtime/$container_name"}
+retention_helper="$repo_root/scripts/lib/export_retention.py"
+session_helper="$repo_root/scripts/lib/workbench_session.py"
+project=
+bootstrap_project=
+ros2_control=true
+started_container=false
+stopped_container_receipt=
+operator_instance=${MANYFORGE_DEV_LAUNCH_INSTANCE_ID:-}
+operator_digest=${MANYFORGE_DEV_LAUNCH_INPUT_DIGEST:-}
+operator_mode=false
+container_ref=${MANYFORGE_DEV_EXPECTED_CONTAINER_ID:-$container_name}
 
-case "${1:-}" in
-  --stop)
-    docker compose --profile composer --profile dev-composer down
-    exit 0
+# Read the host project folders from the same site file used by the Manager.
+read_project_folders() {
+  project_folders=()
+  [[ -n ${MANYFORGE_DEV_SITE_SETTINGS:-} ]] || return 0
+  local reader_fd reader_pid
+  exec {reader_fd}< <(python3 - "$MANYFORGE_DEV_SITE_SETTINGS" <<'PY'
+import json, os, sys
+
+try:
+    if not os.path.isabs(sys.argv[1]):
+        raise ValueError("site settings path must be absolute")
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        site = json.load(stream)
+    if not isinstance(site, dict):
+        raise ValueError("site settings must be a JSON object")
+    if site.get("schema") != "manyforge.site.v1":
+        raise ValueError("site settings schema must be manyforge.site.v1")
+    unknown = site.keys() - {"schema", "device_addresses", "project_folders"}
+    if unknown:
+        raise ValueError(f"site settings has unknown fields: {', '.join(sorted(unknown))}")
+    folders = site.get("project_folders", [])
+    if not isinstance(folders, list):
+        raise ValueError("project_folders must be a list of absolute host paths")
+    seen = set()
+    for folder in folders:
+        if not isinstance(folder, str) or not os.path.isabs(folder) or not os.path.isdir(folder):
+            raise ValueError(f"project folder must be an existing absolute directory: {folder!r}")
+        if folder in seen:
+            raise ValueError(f"project_folders repeats {folder!r}")
+        seen.add(folder)
+        name = os.path.basename(os.path.normpath(folder)) or "/"
+        if ":" in folder or "," in name or name != name.strip():
+            raise ValueError(f"unsupported project folder {folder!r}: paths cannot contain ':', and folder names cannot contain ',' or start or end with whitespace; rename the folder")
+        sys.stdout.buffer.write(os.fsencode(folder) + b"\0")
+except json.JSONDecodeError as error:
+    print(f"project_folder_invalid: site settings file must be JSON: {error}", file=sys.stderr)
+    raise SystemExit(64)
+except (OSError, ValueError, TypeError, AttributeError) as error:
+    print(f"project_folder_invalid: {error}", file=sys.stderr)
+    raise SystemExit(64)
+PY
+  )
+  reader_pid=$!
+  mapfile -d '' -t project_folders <&"$reader_fd"
+  exec {reader_fd}<&-
+  wait "$reader_pid" || return 64
+}
+
+project_root_taken() {
+  local root
+  for root in "${project_roots[@]}"; do
+    [[ "$root" != "$1" ]] || return 0
+  done
+  return 1
+}
+
+if [[ -n "$operator_instance" ]]; then
+  operator_mode=true
+  [[ "$operator_instance" != . && "$operator_instance" != .. && "$operator_instance" != */* && "$operator_instance" != *\\* ]] || { echo "Invalid operator instance path" >&2; exit 64; }
+  [[ "$operator_digest" =~ ^[0-9a-f]{64}$ ]] || { echo "Invalid operator input digest" >&2; exit 64; }
+  [[ "$image" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Operator requires an explicit full image ID" >&2; exit 64; }
+fi
+
+assert_owned_container() {
+  [[ "$operator_mode" == true ]] || return 0
+  docker inspect --format '{{json .}}' "$container_ref" | python3 -c '
+import json,sys
+row=json.load(sys.stdin); labels=row["Config"].get("Labels") or {}
+expected_id, image, instance, digest=sys.argv[1:]
+if (expected_id and row["Id"] != expected_id) or row["Image"] != image or labels.get("manyforge.launch-instance") != instance or labels.get("manyforge.launch-input-digest") != digest:
+    raise SystemExit("Refusing foreign or changed operator container")
+' "${MANYFORGE_DEV_EXPECTED_CONTAINER_ID:-}" "$image" "$operator_instance" "$operator_digest"
+}
+
+assert_runtime_root_available() {
+  local running
+  running=$(docker container ls --filter status=running --filter status=paused --filter status=restarting \
+    --quiet --no-trunc) || return $?
+  [[ -n "$running" ]] || return 0
+  local -a running_ids
+  mapfile -t running_ids <<<"$running"
+  docker inspect "${running_ids[@]}" | python3 -c '
+import json,os,sys
+root=os.path.realpath(sys.argv[1])
+try:
+    rows=json.load(sys.stdin)
+    if not isinstance(rows,list):
+        raise ValueError("container inspection is not a list")
+except (ValueError,TypeError) as error:
+    raise SystemExit("Could not verify exclusive ManyForge state root: "+str(error))
+for row in rows:
+    if not any(row["State"].get(key, False) for key in ("Running", "Paused", "Restarting")):
+        continue
+    for mount in row["Mounts"]:
+        if mount.get("Type") == "bind":
+            source=os.path.realpath(mount["Source"])
+            if os.path.commonpath((source,root)) in (source,root):
+                raise SystemExit("Refusing overlapping live ManyForge state root: "+root+" already bound by "+row["Id"])
+' "$runtime_root"
+}
+
+operator_status() {
+  local require_ready=${1:-false}
+  assert_owned_container || return $?
+  local inspect current code
+  inspect=$(docker inspect --format '{{json .}}' "$container_ref") || return $?
+  current=null
+  code=69
+  if [[ $(docker inspect -f '{{.State.Running}}' "$container_ref") == true ]]; then
+    if current=$(docker exec "$container_ref" python3 scripts/dev-workbench.py status --operator-runtime --composer-port 9000); then
+      code=0
+    else
+      code=$?
+      [[ -n "$current" ]] || current=null
+    fi
+  fi
+  python3 -c '
+import json,sys
+row=json.loads(sys.argv[1]);workbench=json.loads(sys.argv[2])
+print(json.dumps({"container_id":row["Id"],"image_id":row["Image"],"labels":row["Config"].get("Labels") or {},"running":row["State"]["Running"],"workbench":workbench,"log_reference":"docker logs "+row["Id"]},sort_keys=True,separators=(",",":")))
+' "$inspect" "$current" || return $?
+  if [[ "$require_ready" == true ]]; then
+    return "$code"
+  fi
+  return 0
+}
+
+frontend_ready() {
+  docker exec "$container_ref" python3 -c \
+    'import socket; socket.create_connection(("127.0.0.1", 3000), timeout=0.5).close()' \
+    >/dev/null 2>&1
+}
+
+cleanup_failed_start() {
+  result=$?
+  if [[ $result -ne 0 && "$started_container" == true && "$operator_mode" == true ]]; then
+    # G owns the Sim. Keep this exact ROS client available for its cleanup;
+    # G then calls the same evidence-preserving stop path below.
+    operator_status || true
+  elif [[ $result -ne 0 && "$started_container" == true ]]; then
+    stop_with_evidence || true
+  fi
+  exit "$result"
+}
+trap cleanup_failed_start EXIT
+
+usage() {
+  echo "Usage: $0 build | start [--project <scenario-project-folder> | --bootstrap-project <first-ros-scenario-folder>] | status | stop [--keep-evidence]" >&2
+}
+
+stop_with_evidence() {
+  assert_owned_container || return $?
+  if ! docker stop --time 15 "$container_ref" >/dev/null; then
+    echo "Failed to stop the development workbench; no evidence was copied." >&2
+    return 69
+  fi
+
+  local running
+  if ! running=$(docker inspect -f '{{.State.Running}}' "$container_ref"); then
+    echo "Could not verify that the development workbench stopped; no evidence was copied." >&2
+    return 69
+  fi
+  if [[ "$running" != false ]]; then
+    echo "Development workbench is still running; no evidence was copied." >&2
+    return 69
+  fi
+
+  if ! capture_stopped_container; then
+    enforce_retained_limit || true
+    return 69
+  fi
+}
+
+container_state_mount() {
+  docker inspect --format '{{json .Mounts}}' "$container_ref" | python3 -c '
+import json,sys
+mounts=json.load(sys.stdin)
+roots=[row["Source"] for row in mounts if row.get("Type")=="bind" and row.get("Destination")=="/tmp/manyforge-state"]
+if len(roots)>1: raise SystemExit("Ambiguous runtime state mount")
+print(roots[0] if roots else "")
+'
+}
+
+rotate_quiescent_root() {
+  local runtime_root=$1
+  local -a aggregate=()
+  if [[ -z ${MANYFORGE_DEV_RUNTIME_STATE_ROOT:-} ]] && python3 -c '
+import pathlib,sys
+raise SystemExit(0 if pathlib.Path(sys.argv[1]).resolve().parent == pathlib.Path(sys.argv[2]).resolve() else 1)
+' "$runtime_root" "$cache_base/runtime"; then
+    aggregate=(--default-roots "$cache_base/runtime")
+  fi
+  if assert_runtime_root_available; then
+    python3 "$retention_helper" rotate "$runtime_root" "${aggregate[@]}" || echo "WARNING ManyForge retention helper failed; runtime remains available" >&2
+  else
+    echo "WARNING ManyForge retention skipped: state root has another live user or inspection failed" >&2
+  fi
+}
+
+capture_stopped_container() {
+  local mounted_root timestamp evidence_root evidence_path partial_path inspect_format kind
+  local inspect_summary tail_path
+  local -a prepare_options=()
+  [[ $(docker inspect -f '{{.State.Running}}' "$container_ref") == false ]] || {
+    echo "Container $container_ref is not confirmed stopped; capture/removal refused" >&2; return 69;
+  }
+  mounted_root=$(container_state_mount) || return 69
+  timestamp=$(date -u +%Y%m%dT%H%M%SZ.%N)
+  evidence_root=${MANYFORGE_DEV_EVIDENCE_ROOT:-"$cache_base/evidence"}
+  kind=legacy_state
+  if [[ -n "$mounted_root" ]]; then
+    mounted_root=$(python3 -c 'import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())' "$mounted_root") || return 69
+    evidence_root="$mounted_root/evidence"
+    prepare_options=(--state-root "$mounted_root")
+    kind=console_tail
+  fi
+  if [[ -z "$mounted_root" ]]; then
+    evidence_root=$(python3 -c 'import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())' "$evidence_root") || return 69
+    prepare_options=(--legacy)
+  fi
+  evidence_path="$evidence_root/$timestamp"
+  if [[ -e "$evidence_path" ]]; then
+    echo "Container is stopped, capture failed, container retained: $container_ref; destination exists: $evidence_path" >&2
+    return 69
+  fi
+  # This summary is also the approved failed-capture receipt; write it FIRST.
+  inspect_format='{"container_id":{{json .Id}},"manyforge_export_kind":"'"$kind"'","image":{{json .Image}},"mounts":{{json .Mounts}},'
+  inspect_format+='"state":{"status":{{json .State.Status}},"running":{{json .State.Running}},'
+  inspect_format+='"exit_code":{{json .State.ExitCode}},"finished_at":{{json .State.FinishedAt}}}}'
+  if ! inspect_summary=$(docker inspect --format "$inspect_format" "$container_ref" | python3 -c '
+import json,sys
+data=sys.stdin.buffer.read(65537)
+if len(data)>65536: raise SystemExit("Stopped-container summary exceeds 64KB")
+row=json.loads(data)
+if row["state"]["running"] is not False or row["state"]["status"] not in ("exited","dead","created"):
+    raise SystemExit("Container is no longer stopped")
+print(json.dumps(row,separators=(",",":")))
+'); then
+    echo "Could not inspect the stopped-container capture." >&2
+    echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
+    return 69
+  fi
+  if ! partial_path=$(python3 "$retention_helper" prepare "$evidence_root" --timestamp "$timestamp" "${prepare_options[@]}" <<<"$inspect_summary"); then
+    echo "Could not prepare the stopped-container capture. Partial evidence: $evidence_root" >&2
+    echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
+    return 69
+  fi
+  if [[ -z "$mounted_root" ]]; then
+    # Transitional unmounted containers may hold the only durable evidence.
+    if ! docker cp "$container_ref:/tmp/manyforge-state" - |
+        tar --extract --no-same-owner --directory "$partial_path" \
+          --exclude='manyforge-state/installed-targets' \
+          --exclude='manyforge-state/artifacts/raw-artifacts' \
+          --exclude='manyforge-state/artifacts/prepared-activations' \
+          --exclude='manyforge-state/execution-run/manyforge-retained-planning-*'; then
+      echo "Could not copy legacy runtime evidence. Partial evidence: $partial_path" >&2
+      echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
+      return 69
+    fi
+  fi
+  tail_path="$partial_path/docker.log"
+  [[ -z "$mounted_root" ]] || tail_path="$partial_path/.docker.log.next"
+  if ! docker logs "$container_ref" 2>&1 | python3 "$retention_helper" tail "$tail_path"; then
+    echo "Could not copy container logs. Partial evidence: $partial_path" >&2
+    echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
+    return 69
+  fi
+  if [[ -n "$mounted_root" ]] && ! mv --no-target-directory "$tail_path" "$partial_path/docker.log"; then
+    echo "Could not replace bounded console tail. Partial evidence: $partial_path" >&2
+    echo "Container is stopped, capture failed, container retained: $container_ref; prior tail preserved" >&2
+    return 69
+  fi
+  if ! mv --no-clobber --no-target-directory "$partial_path" "$evidence_path" || [[ -e "$partial_path" ]]; then
+    echo "Could not finalize evidence folder. Partial evidence: $partial_path" >&2
+    echo "Container is stopped, capture failed, container retained: $container_ref" >&2
+    return 69
+  fi
+  [[ $(docker inspect -f '{{.State.Running}}' "$container_ref") == false ]] || return 69
+  if ! docker rm "$container_ref" >/dev/null; then
+    echo "Evidence was preserved at $evidence_path, but the stopped container could not be removed." >&2
+    return 69
+  fi
+  echo "Evidence preserved at $evidence_path"
+  [[ -z "$mounted_root" ]] || stopped_container_receipt="$evidence_path/docker-inspect.json"
+  [[ -z "$mounted_root" ]] || rotate_quiescent_root "$mounted_root"
+}
+
+enforce_retained_limit() {
+  local current=$container_ref current_id ids candidates older mode
+  current_id=$(docker inspect --format '{{.Id}}' "$current") || return 69
+  ids=$(docker container ls --all --filter label=manyforge.dev.ros2-control --quiet --no-trunc) || return 69
+  [[ -n "$ids" ]] || return 0
+  local -a stopped_ids
+  mapfile -t stopped_ids <<<"$ids"
+  candidates=$(docker inspect "${stopped_ids[@]}" | python3 "$retention_helper" retained "$repo_root" \
+    --current-id "$current_id" --legacy-evidence "${MANYFORGE_DEV_EVIDENCE_ROOT:-$cache_base/evidence}") || return 69
+  while read -r older mode; do
+    [[ -n "$older" ]] || continue
+    # Requalify the actual stopped occurrence immediately before retrying it.
+    [[ $(docker inspect "$older" | python3 "$retention_helper" retained "$repo_root" \
+      --current-id "$current_id" --legacy-evidence "${MANYFORGE_DEV_EVIDENCE_ROOT:-$cache_base/evidence}") == "$older $mode" ]] || continue
+    container_ref=$older
+    if capture_stopped_container; then
+      echo "Retried older retained container $older once; capture succeeded and container was removed" >&2
+    elif [[ "$mode" == mounted && $(docker inspect -f '{{.State.Running}}' "$older") == false ]]; then
+      if docker rm "$older" >/dev/null; then
+        echo "WARNING ManyForge older retained container $older removed after one failed capture retry; persistent state remains, console capture failed" >&2
+      else
+        echo "WARNING ManyForge could not remove older retained container $older after retry" >&2
+      fi
+    else
+      echo "WARNING ManyForge kept legacy container $older: failed retry may hold its only console trace; manually export or explicitly remove after investigation" >&2
+    fi
+    container_ref=$current
+  done <<<"$candidates"
+}
+
+command=${1:-}
+if [[ -n "$command" ]]; then
+  shift
+fi
+case "$command" in
+  build)
+    (($# == 0)) || { usage; exit 64; }
+    # The full ROS Lyrical image: ManyForge toolchain, pinned controller
+    # overlay and xArm driver. Jetson hosts use NVIDIA's JetPack suite.
+    suite=noble
+    [[ ! -e /etc/nv_tegra_release ]] || suite=noble-jetpack
+    "$repo_root/scripts/setup-docker.sh" --prepare-only
+    MANYFORGE_ROS_FULL_IMAGE="$image" \
+      NVIDIA_ISAAC_ROS_RELEASE_SUITE="${NVIDIA_ISAAC_ROS_RELEASE_SUITE:-$suite}" \
+      docker compose -f "$repo_root/docker-compose.yaml" --profile ros-full build ros-jazzy-full
+    echo "Built $image. Start the workbench with: $0 start"
     ;;
-  --prod)
-    echo "Starting Composer in production mode (port 9000)..."
-    docker compose --profile composer up --build -d
-    echo ""
-    echo "Composer running at http://localhost:9000"
-    echo "Stop with: $0 --stop"
+  start)
+    while (($#)); do
+      case "$1" in
+        --project)
+          [[ $# -ge 2 ]] || { usage; exit 64; }
+          project=$2
+          shift 2
+          ;;
+        --bootstrap-project)
+          [[ $# -ge 2 ]] || { usage; exit 64; }
+          bootstrap_project=$2
+          shift 2
+          ;;
+        *) usage; exit 64 ;;
+      esac
+    done
+    if [[ -n "$bootstrap_project" && ( "$ros2_control" != true || -n "$project" ) ]]; then
+      echo "--bootstrap-project requires ROS control and excludes --project." >&2
+      exit 64
+    fi
+    if docker inspect "$container_ref" >/dev/null 2>&1; then
+      assert_owned_container || return $?
+      if [[ $(docker inspect -f '{{.State.Running}}' "$container_ref") == true ]]; then
+        existing_ros=$(docker inspect -f '{{index .Config.Labels "manyforge.dev.ros2-control"}}' "$container_ref")
+        if [[ "$existing_ros" == true && "$ros2_control" != true ]] ||
+            [[ "$existing_ros" != true && "$ros2_control" == true ]]; then
+          echo "A workbench with different runtime capabilities is already running; stop it before starting this ROS workbench." >&2
+          exit 69
+        fi
+        if [[ -n "$bootstrap_project" ]]; then
+          echo "A workbench is already running; use status, or stop it before selecting an empty ROS bootstrap." >&2
+          exit 69
+        fi
+        if [[ "$operator_mode" == true ]]; then
+          operator_status true
+          exit $?
+        fi
+        status_args=(status)
+        if [[ -n "$project" ]]; then
+          status_args+=(--project "$project")
+        fi
+        if frontend_ready && current=$(docker exec "$container_ref" python3 scripts/dev-workbench.py "${status_args[@]}" 2>/dev/null); then
+          echo "$current"
+          echo "Development workbench is already running at http://localhost:3000"
+          exit 0
+        fi
+        echo "A different or unhealthy workbench is already running." >&2
+        echo "Use '$0 stop' before selecting another scenario." >&2
+        exit 69
+      fi
+      existing_mount=$(container_state_mount) || exit 69
+      if [[ -z "$existing_mount" && -d "$runtime_root" && -n $(find "$runtime_root" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+        echo "Refusing legacy unmounted transition into nonempty runtime root: $runtime_root; preserve/export legacy state and choose an empty root" >&2
+        exit 69
+      fi
+      stop_with_evidence
+    fi
+    image_id=$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null) || {
+      echo "Development image is unavailable: $image" >&2
+      echo "Build it once with: ./scripts/compose-dev.sh build" >&2
+      exit 69
+    }
+    image_key=${image_id#sha256:}
+    cache_root="$cache_base/images/$image_key"
+    mkdir -p "$cache_root/build" "$cache_root/node_modules"
+    # Installation Composer settings and the Program runner's persistent
+    # blackboard values survive stop/start (values are checked against the
+    # applied Program; see DEVELOPMENT_WORKBENCH.md).
+    state_base="$cache_base/state"
+    if [[ "$operator_mode" == true ]]; then
+      state_base="$cache_base/state/$operator_instance"
+    fi
+    composer_state="$state_base/composer"
+    runner_state="$state_base/program-runner"
+    mkdir -p "$composer_state" "$runner_state"
+    serve_args=(serve)
+    if [[ "$operator_mode" == true ]]; then
+      runtime_root=${MANYFORGE_DEV_RUNTIME_STATE_ROOT:?explicit runtime state root required}
+    fi
+    [[ "$runtime_root" == /* ]] || { echo "Runtime state root must be an absolute host path" >&2; exit 64; }
+    # The selected container is already absent here. A different live owned
+    # container must never share these journals, even with an explicit override.
+    assert_runtime_root_available || exit 69
+    if [[ "$operator_mode" != true ]]; then
+      mkdir -p "$runtime_root"
+    fi
+    startup_mounts=()
+    operator_labels=()
+    if [[ "$operator_mode" == true ]]; then
+      [[ "$ros2_control" == true && -z "$project" && -z "$bootstrap_project" ]] || { echo "G requires ROS and no auto-Load" >&2; exit 64; }
+      install_root=${MANYFORGE_DEV_OPERATOR_INSTALL_ROOT:?qualified install root required}
+      [[ "$runtime_root" == /* && "$runtime_root" != /tmp && "$runtime_root" != /tmp/* && "$runtime_root" != /run && "$runtime_root" != /run/* ]] || { echo "Operator runtime state requires persistent absolute host storage" >&2; exit 64; }
+      mkdir -p "$runtime_root"
+      [[ $(stat -f -c %T "$runtime_root") != tmpfs ]] || { echo "Operator runtime state cannot be tmpfs" >&2; exit 64; }
+      [[ "$install_root" == /* && -d "$install_root" ]] || { echo "Qualified install root unavailable" >&2; exit 64; }
+      serve_args+=(--operator-runtime --operator-install-root "$install_root"
+        --operator-cell-id "${MANYFORGE_DEV_OPERATOR_CELL_ID:?original cell ID required}"
+        --operator-instance-id "$operator_instance"
+        --operator-readiness-timeout "${MANYFORGE_DEV_OPERATOR_READINESS_TIMEOUT:-60}"
+        --canonical-empty-admission-filename "${MANYFORGE_DEV_OPERATOR_ADMISSION:?qualified admission required}"
+        --package-aggregate-sha256 "${MANYFORGE_DEV_OPERATOR_PACKAGE_SHA256:?qualified package digest required}"
+        --composer-port 9000 --composer-bind-host 0.0.0.0)
+      startup_mounts=(-v "$install_root:$install_root:ro")
+      for option in COMPOSER_STATIC_DIR SIMULATION_CONTROL_CONFIG SITE_SETTINGS OPERATOR_NODE_CATALOG OPERATOR_ALARM_CATALOG; do
+        variable="MANYFORGE_DEV_$option"
+        if [[ -n ${!variable:-} ]]; then
+          path=${!variable}
+          [[ "$path" == /* ]] || { echo "Operator input must be absolute: $option" >&2; exit 64; }
+          case "$option" in
+            COMPOSER_STATIC_DIR) [[ -f "$path/index.html" ]] || exit 64; option_name=--composer-static-dir; parent=$path ;;
+            SIMULATION_CONTROL_CONFIG) [[ -f "$path" ]] || exit 64; option_name=--simulation-control-config; parent=$(dirname "$path") ;;
+            SITE_SETTINGS) [[ -f "$path" ]] || exit 64; option_name=--site-settings; parent=$(dirname "$path") ;;
+            OPERATOR_NODE_CATALOG) [[ -f "$path" ]] || exit 64; option_name=--node-catalog-path; parent=$(dirname "$path") ;;
+            OPERATOR_ALARM_CATALOG) [[ -f "$path" ]] || exit 64; option_name=--alarm-catalog-path; parent=$(dirname "$path") ;;
+          esac
+          startup_mounts+=(-v "$parent:$parent:ro")
+          serve_args+=("$option_name" "$path")
+        fi
+      done
+      operator_labels=(--log-driver json-file --label "manyforge.launch-instance=$operator_instance"
+        --label "manyforge.launch-input-digest=$operator_digest")
+    fi
+    # Generic machine site facts (manyforge.site.v1), independent of Isaac.
+    if [[ "$operator_mode" != true && -n ${MANYFORGE_DEV_SITE_SETTINGS:-} ]]; then
+      path=$MANYFORGE_DEV_SITE_SETTINGS
+      [[ "$path" == /* ]] || { echo "Development site settings must be an absolute path" >&2; exit 64; }
+      [[ -f "$path" ]] || { echo "Development site settings file is unavailable: $path" >&2; exit 64; }
+      parent=$(dirname "$path")
+      [[ " ${startup_mounts[*]} " == *" $parent:$parent:ro "* ]] || startup_mounts+=(-v "$parent:$parent:ro")
+      serve_args+=(--site-settings "$path")
+    fi
+    # Project folders are user-selected host directories. Reordering folders
+    # with equal basenames may change their destination suffixes.
+    read_project_folders
+    project_roots=()
+    project_mapping_arguments=()
+    for folder in "${project_folders[@]}"; do
+      project_name=$(basename -- "$(realpath -s -- "$folder")")
+      project_root="/projects/$project_name"
+      project_suffix=2
+      while project_root_taken "$project_root"; do
+        project_root="/projects/$project_name-$project_suffix"
+        ((project_suffix+=1))
+      done
+      startup_mounts+=(-v "$folder:$project_root")
+      project_roots+=("$project_root")
+      project_mapping_arguments+=("$folder" "$project_root")
+    done
+    project_environment=()
+    if ((${#project_roots[@]})); then
+      project_environment=(-e "MANYFORGE_DEV_PROJECT_ROOTS=$(IFS=,; printf '%s' "${project_roots[*]}")")
+      project_mappings=$(python3 -c 'import json,sys; print(json.dumps([{"hostPath": a, "containerPath": b} for a,b in zip(sys.argv[1::2],sys.argv[2::2])], separators=(",", ":")))' "${project_mapping_arguments[@]}")
+      project_environment+=(-e "MANYFORGE_PROJECT_ROOT_MAPPINGS=$project_mappings")
+    fi
+    ros_environment=()
+    ros_identity=()
+    if [[ "$ros2_control" == true ]]; then
+      # The full ROS image has its own development UID. Keep all bind-mounted
+      # writes with the launching user's ownership, including npm/ROS caches.
+      mkdir -p "$cache_root/home"
+      for directory in "$repo_root" "$runtime_root" "$cache_root" "$cache_root/build" \
+          "$cache_root/home" "$cache_root/node_modules" "$composer_state" "$runner_state"; do
+        if [[ ! -w "$directory" ]]; then
+          echo "ROS workbench requires a writable host-owned directory: $directory" >&2
+          exit 69
+        fi
+      done
+      ros_identity=(--user "$(id -u):$(id -g)" --env HOME=/runner/home \
+        --env MANYFORGE_BUILD_DIR=/runner/build)
+      # Fast DDS talks over UDP loopback, not shared memory: a process killed
+      # after a hang leaves its SHM port behind; long-lived participants (the
+      # execution host) keep writing into the unlinked old port, so a
+      # replacement that reuses its participant id never receives their
+      # requests (Fast DDS 3.6.2). An explicit value is kept. rmw_fastrtps
+      # always adds SHM under ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST.
+      export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS-UDPv4}"
+      # Preserve explicitly configured DDS and build inputs. The image entrypoint owns
+      # ROS/venv setup; this launcher neither sources a topology nor picks peers.
+      for variable in ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_AUTOMATIC_DISCOVERY_RANGE \
+          ROS_STATIC_PEERS FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE \
+          FASTDDS_BUILTIN_TRANSPORTS \
+          ROS_DISCOVERY_SERVER ROS_SUPER_CLIENT CYCLONEDDS_URI \
+          MANYFORGE_ROS2_CONTROL_BUILD_TESTING MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS; do
+        if [[ -v "$variable" ]]; then
+          ros_environment+=(--env "$variable")
+        fi
+      done
+    fi
+    if [[ -n "$project" ]]; then
+      serve_args+=(--project "$project")
+    fi
+    if [[ -n "$bootstrap_project" ]]; then
+      serve_args+=(--bootstrap-project "$bootstrap_project")
+    fi
+    rotate_quiescent_root "$runtime_root"
+    # Same inode lock as the child launcher: hold it across the final old-
+    # process proof, durable session switch and creation of the new container.
+    exec {session_lock_fd}<"$runtime_root"
+    flock --exclusive --nonblock "$session_lock_fd" || { echo "Another workbench owns the state-root lock" >&2; exit 69; }
+    assert_runtime_root_available || exit 69
+    session_id=$(python3 -c 'import uuid;print(uuid.uuid4().hex)')
+    session_proof=()
+    [[ -z "$stopped_container_receipt" ]] || session_proof=(--stopped-container-receipt "$stopped_container_receipt")
+    python3 "$session_helper" "$runtime_root" --session-id "$session_id" --lock-fd "$session_lock_fd" "${session_proof[@]}" >/dev/null
+    session_environment=(-e "MANYFORGE_DEV_COLD_SESSION_ID=$session_id")
+    # Motion-trace snapshots for the debug export are kept by default in the
+    # capped store (64 MiB, oldest first); set it empty to keep traces inline.
+    export MANYFORGE_MOTION_TRACE_DIR="${MANYFORGE_MOTION_TRACE_DIR-/tmp/manyforge-state/motion-traces}"
+    for variable in MANYFORGE_MOTION_TRACE_DIR \
+        MANYFORGE_EXPERIMENTAL_RELEASE_TIMER \
+        MANYFORGE_EXPERIMENTAL_MIDTICK_STAMP MANYFORGE_EXPERIMENTAL_V0_PAYLOAD \
+        MANYFORGE_EXPERIMENTAL_SCHEDULED_SPRING_BACK_FAST \
+        MANYFORGE_EXPERIMENTAL_RELEASE_TIMER_LATENCY_MS \
+        MANYFORGE_EXPERIMENTAL_REPLACEMENT_START_ALLOWANCE_MS; do
+      [[ ! -v "$variable" ]] || session_environment+=(--env "$variable")
+    done
+    # AI model tokens: an ai_model component names its token variable
+    # MANYFORGE_AI_*; forward each by name only (the value never enters argv).
+    while IFS= read -r variable; do
+      [[ $variable != MANYFORGE_AI_* ]] || session_environment+=(--env "$variable")
+    done < <(compgen -e)
+    container_ref=$(docker run -d \
+      --name "$container_name" \
+      --label "manyforge.dev.ros2-control=$ros2_control" \
+      --label "manyforge.workbench-session=$session_id" \
+      "${operator_labels[@]}" \
+      --network host \
+      --init \
+      --log-opt max-size=50m \
+      --log-opt max-file=3 \
+      -e MANYFORGE_DEV_BUILD_JOBS="${MANYFORGE_DEV_BUILD_JOBS:-}" \
+      -e MANYFORGE_STATE_DIR=/var/lib/manyforge \
+      "${session_environment[@]}" \
+      "${ros_identity[@]}" \
+      "${ros_environment[@]}" \
+      "${startup_mounts[@]}" \
+      "${project_environment[@]}" \
+      -v "$repo_root:/workspace" \
+      -v "$runtime_root:/tmp/manyforge-state" \
+      -v "$cache_root:/runner" \
+      -v "$composer_state:/var/lib/manyforge/composer" \
+      -v "$runner_state:/var/lib/manyforge/program-runner" \
+      -v "$cache_root/node_modules:/workspace/manyforge_composer/frontend/node_modules" \
+      -w /workspace \
+      "$image_id" \
+      python3 scripts/dev-workbench.py "${serve_args[@]}")
+    started_container=true
+    python3 "$session_helper" "$runtime_root" --session-id "$session_id" --lock-fd "$session_lock_fd" --bind-container-id "$container_ref"
+    # The running container is now the process-set boundary. Its launcher
+    # takes the root flock before opening any store; contenders recheck all
+    # live overlapping mounts while holding the lock before any rotation.
+    exec {session_lock_fd}<&-
+    deadline=$((SECONDS + ${MANYFORGE_DEV_START_TIMEOUT_SECONDS:-900}))
+    while ((SECONDS < deadline)); do
+      if [[ $(docker inspect -f '{{.State.Running}}' "$container_ref") != true ]]; then
+        docker logs --tail 200 "$container_ref" >&2
+        exit 69
+      fi
+      if [[ "$operator_mode" == true ]]; then
+        if current=$(operator_status true); then
+          echo "$current"
+          started_container=false
+          exit 0
+        fi
+        sleep 1
+        continue
+      fi
+      status_args=(status)
+      if [[ -n "$project" ]]; then
+        status_args+=(--project "$project")
+      fi
+      if frontend_ready && current=$(docker exec "$container_ref" python3 scripts/dev-workbench.py "${status_args[@]}" 2>/dev/null); then
+        echo "$current"
+        echo "Development workbench: http://localhost:3000"
+        started_container=false
+        exit 0
+      fi
+      sleep 1
+    done
+    docker logs --tail 200 "$container_ref" >&2
+    echo "Development workbench did not become ready before its bounded startup timeout." >&2
+    exit 69
     ;;
-  *)
-    echo "Starting Composer in dev mode (API :9000 + Vite :3000)..."
-    docker compose --profile dev-composer up --build -d
-    echo ""
-    echo "API:      http://localhost:9000"
-    echo "Frontend: http://localhost:3000"
-    echo "Stop with: $0 --stop"
+  status)
+    if [[ "$operator_mode" == true ]]; then
+      (($# == 0)) || { usage; exit 64; }
+      if docker inspect "$container_ref" >/dev/null 2>&1; then
+        operator_status
+      else
+        # A daemon/transport error is not proof of absence.
+        candidates=$(docker container ls --all --no-trunc --format '{{.ID}} {{.Names}}')
+        present=$(python3 -c '
+import sys
+ref=sys.argv[1]
+print(any(ref in line.split() for line in sys.stdin), end="")
+' "$container_ref" <<<"$candidates")
+        [[ "$present" == False ]] || { echo "Container inspection failed despite listed occurrence" >&2; exit 75; }
+        echo '{"container_id":null,"running":false,"workbench":null}'
+      fi
+      exit $?
+    fi
+    (($# == 0)) || { usage; exit 64; }
+    docker inspect "$container_ref" >/dev/null 2>&1 || {
+      echo "Development workbench is stopped." >&2
+      exit 69
+    }
+    [[ $(docker inspect -f '{{.State.Running}}' "$container_ref") == true ]] || {
+      echo "Development workbench container is not running." >&2
+      exit 69
+    }
+    docker exec "$container_ref" python3 scripts/dev-workbench.py status
     ;;
+  stop)
+    keep_evidence=false
+    if [[ ${1:-} == --keep-evidence ]]; then
+      keep_evidence=true
+      shift
+    fi
+    (($# == 0)) || { usage; exit 64; }
+    if docker inspect "$container_ref" >/dev/null 2>&1; then
+      stop_with_evidence
+    elif [[ "$keep_evidence" == true || "$operator_mode" == true ]]; then
+      echo "Cannot preserve evidence: development workbench container does not exist." >&2
+      exit 69
+    fi
+    echo "Development workbench is stopped. Build and npm caches were retained."
+    ;;
+  *) usage; exit 64 ;;
 esac

@@ -1,269 +1,705 @@
-"""Non-blocking model query node for ManyForge behavior tree (OP-7).
+"""Pure model-output authoring helpers and the I5/I6 model-node gate.
 
-QueryModelNode is a leaf node that queries a deployment-configured model
-endpoint using a versioned prompt template.  It is designed for 100Hz tick
-loop compatibility: the actual model call runs in a background thread via
-ThreadPoolExecutor, and update() checks the future status without blocking.
+Provider HTTP calls, shared executors/clients, environment secrets, scene
+snapshot transport, retry policy, output commits, and pause/recovery ownership
+were coupled inside the legacy py_trees node.  They return through the
+qualified assistant settings/provider boundary.  Bounded JSON parsing,
+schema validation, confidence derivation, and template resolution remain as
+transport-neutral authoring inputs.
 
-Blackboard writes are atomic at the namespace level — all validated output
-fields are applied together or not at all.
+Historical source: ``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1``
+blob ``e5385b4e22a75c2049fb55bef5a0cd85868f5403``.  The retained validator and
+confidence responsibilities were previously concentrated at lines 1123-1173;
+the provider/runtime body remains restoration input only.
 """
 
 from __future__ import annotations
 
-import base64
-import copy
-import hashlib
 import json
-import logging
 import math
-import os
 import re
-import time
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
-from typing import Any, Callable, Optional
+from typing import Any, Final, NoReturn, Optional
 
-import py_trees
 
-from manyforge_behavior.blackboard_namespace import (
-    read_blackboard_binding_value,
-    write_namespace_bundle,
+MODEL_NODE_UNAVAILABLE_REASON_CODE: Final = (
+    "composable_cell_model_node_unavailable"
 )
-from manyforge_behavior.runtime_pause import RuntimePauseMixin, RuntimePauseRegistry
-
-logger = logging.getLogger(__name__)
-
+MODEL_NODE_RESTORATION_GATES: Final = ("I5", "H0", "I6", "N")
+_MAX_TEMPLATE_CHARS: Final = 1_000_000
+_MAX_TEMPLATE_VARIABLES: Final = 256
+_MAX_SCHEMA_DEPTH: Final = 16
+_MAX_SCHEMA_NODES: Final = 2048
+_MAX_SCHEMA_PROPERTIES: Final = 512
+_MAX_ENUM_VALUES: Final = 512
+_MAX_OUTPUT_DEPTH: Final = 16
+_MAX_OUTPUT_NODES: Final = 16_384
+_MAX_OUTPUT_PROPERTIES: Final = 1024
+_MAX_OUTPUT_ARRAY_ITEMS: Final = 4096
+_MAX_SCHEMA_NAME_CHARS: Final = 256
+_SUPPORTED_JSON_SCHEMA_TYPES: Final = frozenset(
+    {"array", "boolean", "integer", "null", "number", "object", "string"}
+)
+_SCHEMA_ANNOTATION_KEYS: Final = frozenset({"description", "title"})
+_SCHEMA_KEYS_BY_TYPE: Final = {
+    "array": frozenset({"items", "minItems", "maxItems"}),
+    "boolean": frozenset(),
+    "integer": frozenset(),
+    "null": frozenset(),
+    "number": frozenset(),
+    "object": frozenset({"properties", "required", "additionalProperties"}),
+    "string": frozenset(),
+}
 _FENCED_JSON_RE = re.compile(
     r"^\s*```(?:json)?\s*(.*?)\s*```\s*$",
     re.IGNORECASE | re.DOTALL,
 )
 
-# Shared executor — max 2 workers to avoid thread explosion in the tick loop
-_MODEL_EXECUTOR: Optional[ThreadPoolExecutor] = None
 
-# Shared httpx client — reuses TCP connections across model calls.
-# Timeout is set per-request via the ``timeout`` kwarg on ``client.post()``.
-_HTTP_CLIENT: Optional["httpx.Client"] = None
-_HTTP_CLIENT_LOCK = __import__("threading").Lock()
-_SCENE_SNAPSHOT_WAIT_TIMEOUT_S = 2.0
-_PARSE_RETRY_SUFFIX = (
-    "\n\nThe previous response did not satisfy the required structured output contract. "
-    "Return ONLY valid structured output for this request. Do not include markdown "
-    "fences, prose, or any extra text."
-)
+class ModelNodeUnavailableError(RuntimeError):
+    """Raised before environment, provider, network, thread, or scene access."""
 
 
-def _get_executor() -> ThreadPoolExecutor:
-    global _MODEL_EXECUTOR
-    if _MODEL_EXECUTOR is None:
-        _MODEL_EXECUTOR = ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="manyforge_model",
-        )
-    return _MODEL_EXECUTOR
+class ModelOutputValidationError(ValueError):
+    """A model-output schema or instance is invalid or outside safe bounds."""
 
 
-def _get_http_client() -> "httpx.Client":
-    """Return a module-level httpx.Client for connection pooling."""
-    global _HTTP_CLIENT
-    if _HTTP_CLIENT is None:
-        with _HTTP_CLIENT_LOCK:
-            if _HTTP_CLIENT is None:
-                import httpx
-                _HTTP_CLIENT = httpx.Client(
-                    timeout=60.0,  # generous default; per-request overrides below
-                    limits=httpx.Limits(
-                        max_connections=4,
-                        max_keepalive_connections=2,
-                    ),
-                )
-    return _HTTP_CLIENT
+def _raise_model_node_unavailable() -> NoReturn:
+    raise ModelNodeUnavailableError(
+        f"{MODEL_NODE_UNAVAILABLE_REASON_CODE}: qualified model provider and "
+        "Program-Binding execution return at I5/H0 and I6/N"
+    )
 
 
-def _call_model(
-    *,
-    provider: str,
-    model_id: str,
-    base_url: Optional[str],
-    api_key_env: Optional[str],
-    prompt: str,
-    max_tokens: int,
-    timeout_s: float,
-    output_schema: Optional[dict] = None,
-    response_tool: Optional[dict[str, Any]] = None,
-    scene_snapshot_bytes: Optional[bytes] = None,
-    scene_snapshot_url: Optional[str] = None,
-    scene_snapshot_format: str = "jpeg",
-) -> dict[str, Any]:
-    """Execute a model call synchronously (runs in thread pool).
+def _call_model(*_args: object, **_kwargs: object) -> NoReturn:
+    """Fail before reading provider configuration, credentials, or payloads."""
+    _raise_model_node_unavailable()
 
-    Returns a dict with:
-      - "text": raw response text
-      - "parsed": parsed JSON if response is valid JSON, else None
-      - "model_version": model version string if available
-      - "usage": token usage dict if available
-    """
-    api_key = os.environ.get(api_key_env, "") if api_key_env else ""
 
-    if provider in ("openai", "local", "anthropic"):
-        import httpx
-        headers: dict[str, str] = {"Content-Type": "application/json"}
-        body: dict[str, Any] = {
-            "model": model_id,
-            "max_tokens": max_tokens,
-        }
-        media_type = "image/png" if scene_snapshot_format.lower() == "png" else "image/jpeg"
-        image_b64 = (
-            base64.b64encode(scene_snapshot_bytes).decode("ascii")
-            if scene_snapshot_bytes is not None and scene_snapshot_url is None
-            else None
-        )
+def _reject_nonfinite_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"non-finite JSON constant {value}")
 
-        if provider in ("openai", "local"):
-            url = (base_url or "https://api.openai.com/v1") + "/chat/completions"
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-            if image_b64 is not None or scene_snapshot_url is not None:
-                body["messages"] = [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": (
-                                    scene_snapshot_url
-                                    if scene_snapshot_url is not None
-                                    else f"data:{media_type};base64,{image_b64}"
-                                ),
-                            },
-                        },
-                    ],
-                }]
-            else:
-                body["messages"] = [{"role": "user", "content": prompt}]
-            if response_tool is not None:
-                body["tools"] = [{
-                    "type": "function",
-                    "function": response_tool,
-                }]
-                body["tool_choice"] = "required"
-            elif output_schema:
-                body["response_format"] = {"type": "json_object"}
-        else:  # anthropic
-            url = (base_url or "https://api.anthropic.com/v1") + "/messages"
-            headers["x-api-key"] = api_key
-            headers["anthropic-version"] = "2023-06-01"
-            if response_tool is not None:
-                raise ValueError("response_tool is only supported for openai/local providers")
-            if scene_snapshot_url is not None:
-                raise ValueError(
-                    "scene_snapshot_url transport is only supported for openai/local providers"
-                )
-            if image_b64 is not None:
-                body["messages"] = [{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": image_b64,
-                            },
-                        },
-                        {"type": "text", "text": prompt},
-                    ],
-                }]
-            else:
-                body["messages"] = [{"role": "user", "content": prompt}]
 
-        client = _get_http_client()
-        resp = client.post(
-            url, json=body, headers=headers,
-            timeout=timeout_s,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Extract text from response
-        if provider in ("openai", "local"):
-            message = data.get("choices", [{}])[0].get("message", {})
-            text = message.get("content", "")
-            tool_calls = message.get("tool_calls", [])
-            model_version = data.get("model", model_id)
-            usage = data.get("usage", {})
-        else:
-            content_blocks = data.get("content", [])
-            text = "".join(
-                b.get("text", "") for b in content_blocks if b.get("type") == "text"
-            )
-            tool_calls = []
-            model_version = data.get("model", model_id)
-            usage = data.get("usage", {})
-
-        tool_call_payload: Optional[dict[str, Any]] = None
-        if response_tool is not None and tool_calls:
-            first_call = tool_calls[0]
-            function_payload = first_call.get("function", {})
-            arguments_text = function_payload.get("arguments", "")
-            parsed = _parse_json_text(arguments_text)
-            tool_call_payload = {
-                "name": function_payload.get("name", ""),
-                "arguments_text": arguments_text,
-                "id": first_call.get("id"),
-                "raw": first_call,
-            }
-        else:
-            parsed = _parse_json_text(text)
-
-        return {
-            "text": text,
-            "parsed": parsed,
-            "model_version": model_version,
-            "tool_call": tool_call_payload,
-            "usage": {
-                "input_tokens": usage.get("input_tokens") or usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("output_tokens") or usage.get("completion_tokens", 0),
-            },
-        }
-    else:
-        raise ValueError(f"Unsupported model provider: {provider}")
+def _reject_duplicate_json_names(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError(f"duplicate JSON object name {name!r}")
+        result[name] = value
+    return result
 
 
 def _parse_json_text(text: Any) -> Optional[Any]:
-    """Parse JSON text, tolerating fenced ```json wrappers from compliant-ish models."""
-    if not isinstance(text, str):
+    """Parse bounded JSON, tolerating one surrounding Markdown JSON fence."""
+    if not isinstance(text, str) or len(text) > _MAX_TEMPLATE_CHARS:
         return None
-
     candidates = [text]
     fenced = _FENCED_JSON_RE.match(text)
     if fenced:
         candidates.append(fenced.group(1))
-
     for candidate in candidates:
         try:
-            return json.loads(candidate)
-        except (json.JSONDecodeError, TypeError):
+            return json.loads(
+                candidate,
+                object_pairs_hook=_reject_duplicate_json_names,
+                parse_constant=_reject_nonfinite_json_constant,
+            )
+        except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
             continue
     return None
 
 
-def _stringify_template_value(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=True)
-    return str(value)
-
-
-def _render_prompt_template(template_text: str, template_variables: dict[str, str]) -> str:
-    """Render ``{{ variable }}`` placeholders with optional inner whitespace."""
+def _render_prompt_template(
+    template_text: str,
+    template_variables: dict[str, str],
+) -> str:
+    """Render bounded ``{{ variable }}`` placeholders with inner whitespace."""
+    if len(template_text) > _MAX_TEMPLATE_CHARS:
+        raise ValueError("template text exceeds the bounded text limit")
+    if len(template_variables) > _MAX_TEMPLATE_VARIABLES:
+        raise ValueError("template variable count exceeds 256")
     rendered = template_text
     for var_name, var_value in template_variables.items():
+        if not isinstance(var_name, str) or not var_name:
+            raise ValueError("template variable names must be non-empty strings")
+        if not isinstance(var_value, str):
+            raise TypeError("rendered template variable values must be strings")
         pattern = re.compile(r"\{\{\s*" + re.escape(var_name) + r"\s*\}\}")
-        rendered = pattern.sub(var_value, rendered)
+        rendered = pattern.sub(lambda _match: var_value, rendered)
+        if len(rendered) > _MAX_TEMPLATE_CHARS:
+            raise ValueError("rendered template exceeds the bounded text limit")
     return rendered
+
+
+def _resolve_output_schema_template(
+    schema: Optional[dict[str, Any]],
+    template_variables: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Resolve bounded runtime enum placeholders without mutating inputs."""
+    if schema is None:
+        return None
+    if not isinstance(schema, dict):
+        raise ValueError("output schema must be a mapping")
+    remaining_nodes = _MAX_SCHEMA_NODES
+
+    def walk(node: Any, *, depth: int, ancestors: set[int]) -> Any:
+        nonlocal remaining_nodes
+        if depth > _MAX_SCHEMA_DEPTH or remaining_nodes <= 0:
+            raise ValueError("output schema exceeds structural bounds")
+        remaining_nodes -= 1
+        if isinstance(node, dict):
+            object_id = id(node)
+            if object_id in ancestors:
+                raise ValueError("output schema contains a cycle")
+            ancestors.add(object_id)
+            try:
+                resolved_node = {
+                    key: walk(value, depth=depth + 1, ancestors=ancestors)
+                    for key, value in node.items()
+                }
+            finally:
+                ancestors.remove(object_id)
+            enum_var = resolved_node.pop(
+                "x-manyforge-enum-template-variable",
+                None,
+            )
+            has_allow_empty = "x-manyforge-enum-allow-empty-string" in resolved_node
+            allow_empty = resolved_node.pop(
+                "x-manyforge-enum-allow-empty-string",
+                False,
+            )
+            if not isinstance(allow_empty, bool):
+                raise ValueError(
+                    "x-manyforge-enum-allow-empty-string must be a boolean"
+                )
+            if has_allow_empty and enum_var is None:
+                raise ValueError(
+                    "x-manyforge-enum-allow-empty-string requires "
+                    "x-manyforge-enum-template-variable"
+                )
+            if enum_var is not None:
+                if "enum" in resolved_node:
+                    raise ValueError(
+                        "static enum cannot be combined with "
+                        "x-manyforge-enum-template-variable"
+                    )
+                if not isinstance(enum_var, str) or not enum_var:
+                    raise ValueError(
+                        "x-manyforge-enum-template-variable must be a "
+                        "non-empty string"
+                    )
+                enum_source = template_variables.get(enum_var)
+                if not isinstance(enum_source, list) or not enum_source:
+                    raise ValueError(
+                        "x-manyforge-enum-template-variable must resolve to a "
+                        "non-empty list"
+                    )
+                if len(enum_source) > _MAX_ENUM_VALUES:
+                    raise ValueError("runtime enum exceeds 512 values")
+                enum_values: list[Any] = []
+                for item in enum_source:
+                    if not isinstance(item, (str, int, float, bool)) or (
+                        isinstance(item, float) and not math.isfinite(item)
+                    ):
+                        raise ValueError(
+                            "runtime enum items must be finite JSON scalars"
+                        )
+                    enum_values.append(item)
+                if allow_empty and "" not in enum_values:
+                    enum_values.append("")
+                resolved_node["enum"] = enum_values
+            return resolved_node
+        if isinstance(node, list):
+            object_id = id(node)
+            if object_id in ancestors:
+                raise ValueError("output schema contains a cycle")
+            ancestors.add(object_id)
+            try:
+                return [
+                    walk(item, depth=depth + 1, ancestors=ancestors)
+                    for item in node
+                ]
+            finally:
+                ancestors.remove(object_id)
+        return node
+
+    result = walk(schema, depth=0, ancestors=set())
+    if not isinstance(result, dict):
+        raise ValueError("resolved output schema must be a mapping")
+    _validate_schema_definition(
+        result,
+        path="$schema",
+        depth=0,
+        remaining_nodes=[_MAX_SCHEMA_NODES],
+        ancestors=set(),
+    )
+    return result
+
+
+def _json_type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def _matches_json_schema_type(value: Any, schema_type: str) -> bool:
+    if schema_type == "object":
+        return isinstance(value, dict)
+    if schema_type == "array":
+        return isinstance(value, list)
+    if schema_type == "string":
+        return isinstance(value, str)
+    if schema_type == "number":
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and (not isinstance(value, float) or math.isfinite(value))
+        )
+    if schema_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if schema_type == "boolean":
+        return isinstance(value, bool)
+    if schema_type == "null":
+        return value is None
+    return False
+
+
+def _enum_identity(value: Any) -> tuple[str, Any]:
+    """Return type-aware identity for the supported scalar enum subset."""
+    value_type = _json_type_name(value)
+    if value_type in {"integer", "number"}:
+        return ("number", value)
+    return (value_type, value)
+
+
+def _validate_schema_definition(
+    schema: Any,
+    *,
+    path: str,
+    depth: int,
+    remaining_nodes: list[int],
+    ancestors: set[int],
+) -> None:
+    """Validate the explicit, bounded JSON Schema subset used for model output."""
+    if depth > _MAX_SCHEMA_DEPTH or remaining_nodes[0] <= 0:
+        raise ModelOutputValidationError(
+            f"{path}: schema exceeds depth/node bounds"
+        )
+    remaining_nodes[0] -= 1
+    if not isinstance(schema, dict):
+        raise ModelOutputValidationError(f"{path}: schema must be an object")
+    if len(schema) > _MAX_SCHEMA_PROPERTIES:
+        raise ModelOutputValidationError(f"{path}: schema has too many keywords")
+    if any(not isinstance(key, str) for key in schema):
+        raise ModelOutputValidationError(f"{path}: schema keywords must be strings")
+
+    object_id = id(schema)
+    if object_id in ancestors:
+        raise ModelOutputValidationError(f"{path}: schema contains a cycle")
+    ancestors.add(object_id)
+    try:
+        schema_type = schema.get("type")
+        if not isinstance(schema_type, str) or schema_type not in _SUPPORTED_JSON_SCHEMA_TYPES:
+            supported = ", ".join(sorted(_SUPPORTED_JSON_SCHEMA_TYPES))
+            raise ModelOutputValidationError(
+                f"{path}.type: expected one of {supported}"
+            )
+
+        allowed_keys = {
+            "type",
+            "enum",
+            *_SCHEMA_ANNOTATION_KEYS,
+            *_SCHEMA_KEYS_BY_TYPE[schema_type],
+        }
+        unsupported = sorted(set(schema) - allowed_keys)
+        if unsupported:
+            raise ModelOutputValidationError(
+                f"{path}: unsupported schema keywords {unsupported}"
+            )
+
+        for annotation in _SCHEMA_ANNOTATION_KEYS:
+            if annotation in schema:
+                value = schema[annotation]
+                if not isinstance(value, str):
+                    raise ModelOutputValidationError(
+                        f"{path}.{annotation}: expected a string"
+                    )
+                if len(value) > _MAX_TEMPLATE_CHARS:
+                    raise ModelOutputValidationError(
+                        f"{path}.{annotation}: annotation exceeds text bound"
+                    )
+
+        if "enum" in schema:
+            if schema_type in {"array", "object"}:
+                raise ModelOutputValidationError(
+                    f"{path}.enum: composite enum values are unsupported"
+                )
+            enum_values = schema["enum"]
+            if not isinstance(enum_values, list) or not enum_values:
+                raise ModelOutputValidationError(
+                    f"{path}.enum: expected a non-empty array"
+                )
+            if len(enum_values) > _MAX_ENUM_VALUES:
+                raise ModelOutputValidationError(
+                    f"{path}.enum: exceeds {_MAX_ENUM_VALUES} values"
+                )
+            identities: set[tuple[str, Any]] = set()
+            for index, enum_value in enumerate(enum_values):
+                if not _matches_json_schema_type(enum_value, schema_type):
+                    raise ModelOutputValidationError(
+                        f"{path}.enum[{index}]: value does not match type {schema_type}"
+                    )
+                if isinstance(enum_value, str) and len(enum_value) > _MAX_TEMPLATE_CHARS:
+                    raise ModelOutputValidationError(
+                        f"{path}.enum[{index}]: string exceeds text bound"
+                    )
+                identity = _enum_identity(enum_value)
+                if identity in identities:
+                    raise ModelOutputValidationError(
+                        f"{path}.enum[{index}]: duplicate enum value"
+                    )
+                identities.add(identity)
+
+        if schema_type == "object":
+            properties = schema.get("properties", {})
+            if not isinstance(properties, dict):
+                raise ModelOutputValidationError(
+                    f"{path}.properties: expected an object"
+                )
+            if len(properties) > _MAX_SCHEMA_PROPERTIES:
+                raise ModelOutputValidationError(
+                    f"{path}.properties: exceeds {_MAX_SCHEMA_PROPERTIES} fields"
+                )
+            for name, property_schema in properties.items():
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or len(name) > _MAX_SCHEMA_NAME_CHARS
+                ):
+                    raise ModelOutputValidationError(
+                        f"{path}.properties: names must be bounded non-empty strings"
+                    )
+                _validate_schema_definition(
+                    property_schema,
+                    path=f"{path}.properties.{name}",
+                    depth=depth + 1,
+                    remaining_nodes=remaining_nodes,
+                    ancestors=ancestors,
+                )
+
+            required = schema.get("required", [])
+            if not isinstance(required, list):
+                raise ModelOutputValidationError(
+                    f"{path}.required: expected an array"
+                )
+            if len(required) > _MAX_SCHEMA_PROPERTIES:
+                raise ModelOutputValidationError(
+                    f"{path}.required: has too many fields"
+                )
+            required_names: set[str] = set()
+            for index, name in enumerate(required):
+                if not isinstance(name, str) or not name:
+                    raise ModelOutputValidationError(
+                        f"{path}.required[{index}]: expected a non-empty string"
+                    )
+                if name in required_names:
+                    raise ModelOutputValidationError(
+                        f"{path}.required[{index}]: duplicate field {name!r}"
+                    )
+                if name not in properties:
+                    raise ModelOutputValidationError(
+                        f"{path}.required[{index}]: undeclared field {name!r}"
+                    )
+                required_names.add(name)
+
+            additional_properties = schema.get("additionalProperties", True)
+            if not isinstance(additional_properties, bool):
+                raise ModelOutputValidationError(
+                    f"{path}.additionalProperties: only boolean values are supported"
+                )
+
+        elif schema_type == "array":
+            if "items" not in schema:
+                raise ModelOutputValidationError(
+                    f"{path}.items: bounded array schemas require an item schema"
+                )
+            _validate_schema_definition(
+                schema["items"],
+                path=f"{path}.items",
+                depth=depth + 1,
+                remaining_nodes=remaining_nodes,
+                ancestors=ancestors,
+            )
+            minimum = schema.get("minItems", 0)
+            maximum = schema.get("maxItems", _MAX_OUTPUT_ARRAY_ITEMS)
+            for keyword, value in (("minItems", minimum), ("maxItems", maximum)):
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise ModelOutputValidationError(
+                        f"{path}.{keyword}: expected a non-negative integer"
+                    )
+                if value > _MAX_OUTPUT_ARRAY_ITEMS:
+                    raise ModelOutputValidationError(
+                        f"{path}.{keyword}: exceeds the output array bound"
+                    )
+            if minimum > maximum:
+                raise ModelOutputValidationError(
+                    f"{path}: minItems cannot exceed maxItems"
+                )
+    finally:
+        ancestors.remove(object_id)
+
+
+def _validate_json_structure(
+    value: Any,
+    *,
+    path: str,
+    depth: int,
+    remaining_nodes: list[int],
+    ancestors: set[int],
+) -> None:
+    """Reject non-JSON, cyclic, non-finite, or structurally excessive output."""
+    if depth > _MAX_OUTPUT_DEPTH or remaining_nodes[0] <= 0:
+        raise ModelOutputValidationError(
+            f"{path}: output exceeds depth/node bounds"
+        )
+    remaining_nodes[0] -= 1
+
+    if value is None or isinstance(value, (bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ModelOutputValidationError(f"{path}: number must be finite")
+        return
+    if isinstance(value, str):
+        if len(value) > _MAX_TEMPLATE_CHARS:
+            raise ModelOutputValidationError(f"{path}: string exceeds text bound")
+        return
+    if isinstance(value, list):
+        if len(value) > _MAX_OUTPUT_ARRAY_ITEMS:
+            raise ModelOutputValidationError(
+                f"{path}: array exceeds {_MAX_OUTPUT_ARRAY_ITEMS} items"
+            )
+        object_id = id(value)
+        if object_id in ancestors:
+            raise ModelOutputValidationError(f"{path}: output contains a cycle")
+        ancestors.add(object_id)
+        try:
+            for index, item in enumerate(value):
+                _validate_json_structure(
+                    item,
+                    path=f"{path}[{index}]",
+                    depth=depth + 1,
+                    remaining_nodes=remaining_nodes,
+                    ancestors=ancestors,
+                )
+        finally:
+            ancestors.remove(object_id)
+        return
+    if isinstance(value, dict):
+        if len(value) > _MAX_OUTPUT_PROPERTIES:
+            raise ModelOutputValidationError(
+                f"{path}: object exceeds {_MAX_OUTPUT_PROPERTIES} properties"
+            )
+        object_id = id(value)
+        if object_id in ancestors:
+            raise ModelOutputValidationError(f"{path}: output contains a cycle")
+        ancestors.add(object_id)
+        try:
+            for name, item in value.items():
+                if not isinstance(name, str):
+                    raise ModelOutputValidationError(
+                        f"{path}: object property names must be strings"
+                    )
+                if len(name) > _MAX_SCHEMA_NAME_CHARS:
+                    raise ModelOutputValidationError(
+                        f"{path}: object property name exceeds bound"
+                    )
+                _validate_json_structure(
+                    item,
+                    path=f"{path}.{name}",
+                    depth=depth + 1,
+                    remaining_nodes=remaining_nodes,
+                    ancestors=ancestors,
+                )
+        finally:
+            ancestors.remove(object_id)
+        return
+    raise ModelOutputValidationError(
+        f"{path}: value of type {type(value).__name__} is not JSON-compatible"
+    )
+
+
+def _validate_json_value(data: Any, schema: dict[str, Any], *, path: str) -> None:
+    schema_type = schema["type"]
+    if not _matches_json_schema_type(data, schema_type):
+        raise ModelOutputValidationError(
+            f"{path}: expected {schema_type}, got {_json_type_name(data)}"
+        )
+
+    if "enum" in schema:
+        actual_identity = _enum_identity(data)
+        if not any(
+            actual_identity == _enum_identity(candidate)
+            for candidate in schema["enum"]
+        ):
+            raise ModelOutputValidationError(
+                f"{path}: value is not in the declared enum"
+            )
+
+    if schema_type == "object":
+        properties = schema.get("properties", {})
+        for name in schema.get("required", []):
+            if name not in data:
+                raise ModelOutputValidationError(
+                    f"{path}.{name}: required property is missing"
+                )
+        unknown = set(data) - set(properties)
+        if unknown and not schema.get("additionalProperties", True):
+            raise ModelOutputValidationError(
+                f"{path}: undeclared properties are forbidden: {sorted(unknown)}"
+            )
+        for name, property_schema in properties.items():
+            if name in data:
+                _validate_json_value(
+                    data[name],
+                    property_schema,
+                    path=f"{path}.{name}",
+                )
+    elif schema_type == "array":
+        minimum = schema.get("minItems", 0)
+        maximum = schema.get("maxItems", _MAX_OUTPUT_ARRAY_ITEMS)
+        if len(data) < minimum or len(data) > maximum:
+            raise ModelOutputValidationError(
+                f"{path}: array length {len(data)} is outside [{minimum}, {maximum}]"
+            )
+        for index, item in enumerate(data):
+            _validate_json_value(item, schema["items"], path=f"{path}[{index}]")
+
+
+def _validate_json_schema(data: Any, schema: dict[str, Any]) -> None:
+    """Validate model output against a bounded fail-closed JSON Schema subset.
+
+    The supported assertion keywords are ``type``, ``required``,
+    ``properties``, ``additionalProperties`` (boolean), ``items``,
+    ``minItems``, ``maxItems``, and scalar ``enum``.  ``title`` and
+    ``description`` are accepted annotations.  Every other keyword is
+    rejected so an unsupported constraint can never be silently ignored.
+    """
+    _validate_schema_definition(
+        schema,
+        path="$schema",
+        depth=0,
+        remaining_nodes=[_MAX_SCHEMA_NODES],
+        ancestors=set(),
+    )
+    _validate_json_structure(
+        data,
+        path="$",
+        depth=0,
+        remaining_nodes=[_MAX_OUTPUT_NODES],
+        ancestors=set(),
+    )
+    _validate_json_value(data, schema, path="$")
+
+
+def _derive_confidence(
+    parsed: Any,
+    schema: Optional[dict[str, Any]] = None,
+) -> Optional[float]:
+    """Return explicit finite confidence, never an invented success default.
+
+    When a schema is supplied, only a declared numeric ``confidence``
+    property participates, matching spec 470's threshold contract.
+    """
+    if schema is not None:
+        _validate_schema_definition(
+            schema,
+            path="$schema",
+            depth=0,
+            remaining_nodes=[_MAX_SCHEMA_NODES],
+            ancestors=set(),
+        )
+        properties = schema.get("properties", {}) if schema.get("type") == "object" else {}
+        confidence_schema = properties.get("confidence")
+        if confidence_schema is None:
+            return None
+        if confidence_schema.get("type") not in {"integer", "number"}:
+            raise ModelOutputValidationError(
+                "$schema.properties.confidence: confidence must be numeric"
+            )
+    if not isinstance(parsed, dict) or "confidence" not in parsed:
+        return None
+    raw_confidence = parsed["confidence"]
+    if (
+        not isinstance(raw_confidence, (int, float))
+        or isinstance(raw_confidence, bool)
+        or (isinstance(raw_confidence, float) and not math.isfinite(raw_confidence))
+    ):
+        raise ModelOutputValidationError(
+            "$.confidence: expected a finite number"
+        )
+    try:
+        confidence = float(raw_confidence)
+    except OverflowError as exc:
+        raise ModelOutputValidationError(
+            "$.confidence: expected a finite number"
+        ) from exc
+    if not math.isfinite(confidence):
+        raise ModelOutputValidationError(
+            "$.confidence: expected a finite number"
+        )
+    return confidence
+
+
+def _validate_model_output(
+    data: Any,
+    schema: dict[str, Any],
+    *,
+    min_confidence: Optional[float] = None,
+) -> Optional[float]:
+    """Validate one output and apply spec 470's optional confidence gate."""
+    _validate_json_schema(data, schema)
+    confidence = _derive_confidence(data, schema)
+    if min_confidence is None:
+        return confidence
+    if (
+        not isinstance(min_confidence, (int, float))
+        or isinstance(min_confidence, bool)
+        or (isinstance(min_confidence, float) and not math.isfinite(min_confidence))
+    ):
+        raise ModelOutputValidationError(
+            "min_confidence: expected a finite number"
+        )
+    try:
+        minimum = float(min_confidence)
+    except OverflowError as exc:
+        raise ModelOutputValidationError(
+            "min_confidence: expected a finite number"
+        ) from exc
+    if not math.isfinite(minimum):
+        raise ModelOutputValidationError(
+            "min_confidence: expected a finite number"
+        )
+    if confidence is None:
+        raise ModelOutputValidationError(
+            "min_confidence requires a declared numeric confidence output"
+        )
+    if confidence < minimum:
+        raise ModelOutputValidationError(
+            f"$.confidence: {confidence} is below minimum {minimum}"
+        )
+    return confidence
 
 
 def _resolve_response_tool_template(
@@ -274,20 +710,29 @@ def _resolve_response_tool_template(
         return None
     if not isinstance(response_tool, dict):
         raise ValueError("response_tool must be a mapping")
-
-    resolved = copy.deepcopy(response_tool)
+    if any(not isinstance(key, str) for key in response_tool):
+        raise ValueError("response_tool field names must be strings")
+    unsupported = sorted(
+        set(response_tool) - {"name", "description", "parameters"}
+    )
+    if unsupported:
+        raise ValueError(f"response_tool contains unsupported fields {unsupported}")
+    resolved = dict(response_tool)
     name = resolved.get("name")
-    if not isinstance(name, str) or not name:
-        raise ValueError("response_tool.name must be a non-empty string")
-
+    if (
+        not isinstance(name, str)
+        or not name
+        or len(name) > _MAX_SCHEMA_NAME_CHARS
+    ):
+        raise ValueError("response_tool.name must be a bounded non-empty string")
     description = resolved.get("description", "")
     if description is not None and not isinstance(description, str):
         raise ValueError("response_tool.description must be a string")
-
+    if isinstance(description, str) and len(description) > _MAX_TEMPLATE_CHARS:
+        raise ValueError("response_tool.description exceeds the text bound")
     parameters = resolved.get("parameters")
     if parameters is not None and not isinstance(parameters, dict):
         raise ValueError("response_tool.parameters must be a mapping when provided")
-
     resolved["parameters"] = _resolve_output_schema_template(
         parameters,
         template_variables,
@@ -295,879 +740,8 @@ def _resolve_response_tool_template(
     return resolved
 
 
-def _resolve_output_schema_template(
-    schema: Optional[dict[str, Any]],
-    template_variables: dict[str, Any],
-) -> Optional[dict[str, Any]]:
-    if schema is None:
-        return None
+class QueryModelNode:
+    """Unavailable legacy provider node; no shared client or executor is built."""
 
-    resolved = copy.deepcopy(schema)
-
-    def _walk(node: Any) -> Any:
-        if isinstance(node, dict):
-            resolved_node = {key: _walk(value) for key, value in node.items()}
-            enum_var = resolved_node.pop("x-manyforge-enum-template-variable", None)
-            allow_empty_string = bool(
-                resolved_node.pop("x-manyforge-enum-allow-empty-string", False)
-            )
-            if enum_var is not None:
-                enum_source = template_variables.get(str(enum_var))
-                if not isinstance(enum_source, list):
-                    raise ValueError(
-                        "x-manyforge-enum-template-variable must resolve to a list, "
-                        f"got {type(enum_source).__name__}"
-                    )
-                if not enum_source:
-                    raise ValueError(
-                        "x-manyforge-enum-template-variable resolved to an empty list"
-                    )
-                enum_values: list[Any] = []
-                for item in enum_source:
-                    if isinstance(item, (str, int, float, bool)) and not (
-                        isinstance(item, float) and not math.isfinite(item)
-                    ):
-                        enum_values.append(item)
-                    else:
-                        raise ValueError(
-                            "x-manyforge-enum-template-variable items must be finite "
-                            "JSON scalars"
-                        )
-                if allow_empty_string and "" not in enum_values:
-                    enum_values.append("")
-                resolved_node["enum"] = enum_values
-            return resolved_node
-        if isinstance(node, list):
-            return [_walk(item) for item in node]
-        return node
-
-    return _walk(resolved)
-
-
-class QueryModelNode(RuntimePauseMixin, py_trees.behaviour.Behaviour):
-    """Non-blocking leaf node that queries a model endpoint.
-
-    Constructor args are injected by the runner at build time.
-    """
-
-    def __init__(
-        self,
-        name: str,
-        *,
-        model_endpoint_alias: str,
-        prompt_template_id: str,
-        template_variables: Optional[dict[str, Any]] = None,
-        output_key_prefix: str,
-        timeout_s: float = 30.0,
-        min_confidence: float = 0.0,
-        retry_on_parse_failure: bool = False,
-        include_scene_snapshot: bool = False,
-        scene_snapshot_transport: str = "inline_data_url",
-        scene_snapshot_width: int = 640,
-        scene_snapshot_height: int = 480,
-        scene_snapshot_format: str = "jpeg",
-        # Injected by runner — not from program params
-        endpoint: Any = None,
-        template: Any = None,
-        event_recorder: Any = None,
-        audit_policy: Any = None,
-        scene_snapshot_provider: Optional[
-            Callable[[int, int, str], Optional[bytes]]
-        ] = None,
-        scene_snapshot_url_publisher: Optional[
-            Callable[..., Optional[dict[str, Any]]]
-        ] = None,
-        model_runtime_failure_policy: str = "pause_for_operator",
-        model_low_confidence_policy: str = "pause_for_operator",
-        runtime_pause_registry: Optional[RuntimePauseRegistry] = None,
-        node_id: Optional[str] = None,
-        # Execution context — injected by runner for audit correlation
-        run_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-        principal_id: Optional[str] = None,
-        parent_run_id: Optional[str] = None,
-    ):
-        super().__init__(name=name)
-        self._model_endpoint_alias = model_endpoint_alias
-        self._prompt_template_id = prompt_template_id
-        self._template_variables = dict(template_variables or {})
-        self._output_key_prefix = output_key_prefix
-        self._timeout_s = timeout_s
-        self._min_confidence = min_confidence
-        self._retry_on_parse_failure = retry_on_parse_failure
-        self._include_scene_snapshot = include_scene_snapshot
-        self._scene_snapshot_transport = scene_snapshot_transport
-        self._scene_snapshot_width = scene_snapshot_width
-        self._scene_snapshot_height = scene_snapshot_height
-        self._scene_snapshot_format = scene_snapshot_format
-        self._endpoint = endpoint
-        self._template = template
-        self._event_recorder = event_recorder
-        self._audit_policy = audit_policy
-        self._scene_snapshot_provider = scene_snapshot_provider
-        self._scene_snapshot_url_publisher = scene_snapshot_url_publisher
-        self._model_runtime_failure_policy = str(model_runtime_failure_policy)
-        self._model_low_confidence_policy = str(model_low_confidence_policy)
-        self._run_id = run_id
-        self._session_id = session_id
-        self._principal_id = principal_id
-        self._parent_run_id = parent_run_id
-        self._future: Optional[Future] = None
-        self._call_start_ns: int = 0
-        self._resolved_prompt: str = ""
-        self._resolved_output_schema: Optional[dict[str, Any]] = None
-        self._resolved_response_tool: Optional[dict[str, Any]] = None
-        self._resolved_template_vars_raw: dict[str, Any] = {}
-        self._awaiting_scene_snapshot = False
-        self._scene_snapshot_wait_started_ns: int = 0
-        self._skip_snapshot_retry_once = False
-        self._parse_retry_attempted = False
-        self._call_generation = 0
-        self._active_call_generation: Optional[int] = None
-        self._terminated_call_generation: Optional[int] = None
-        self._last_scene_snapshot_bytes: Optional[bytes] = None
-        self._last_scene_snapshot_url: Optional[str] = None
-        self._last_scene_snapshot_metadata: Optional[dict[str, Any]] = None
-        self._bb = py_trees.blackboard.Client(name=f"query_model_{name}")
-        self._output_keys_registered = False
-        self._configure_runtime_pause(
-            registry=runtime_pause_registry,
-            node_id=str(node_id or name),
-            domain="model",
-        )
-
-    def _pause_or_fail(
-        self,
-        *,
-        policy: str,
-        reason_code: str,
-        message: str,
-        details: Optional[dict[str, Any]] = None,
-    ) -> py_trees.common.Status:
-        self.feedback_message = message
-        self._write_failed_output_best_effort()
-        if policy == "condition_failure":
-            return py_trees.common.Status.FAILURE
-        if policy != "pause_for_operator":
-            self.feedback_message = f"invalid model failure policy: {policy!r}"
-            return py_trees.common.Status.FAILURE
-        self._future = None
-        self._active_call_generation = None
-        self._raise_runtime_pause(
-            reason_code=reason_code,
-            message=message,
-            details=details,
-        )
-        return py_trees.common.Status.RUNNING
-
-    def _runtime_failure(
-        self,
-        *,
-        reason_code: str,
-        message: str,
-        details: Optional[dict[str, Any]] = None,
-    ) -> py_trees.common.Status:
-        return self._pause_or_fail(
-            policy=self._model_runtime_failure_policy,
-            reason_code=reason_code,
-            message=message,
-            details=details,
-        )
-
-    @staticmethod
-    def _scene_snapshot_error_is_configuration(error: str) -> bool:
-        return error.startswith(
-            (
-                "scene snapshot requested but no native viewer render provider",
-                "scene_snapshot_url_publisher_unavailable",
-                "unsupported_scene_snapshot_transport",
-            )
-        )
-
-    def _ensure_output_keys(self) -> None:
-        if self._output_keys_registered:
-            return
-        self._bb.register_key(
-            key=self._output_key_prefix,
-            access=py_trees.common.Access.WRITE,
-        )
-        self._bb.register_key(
-            key="stop_requested",
-            access=py_trees.common.Access.READ,
-        )
-        self._output_keys_registered = True
-
-    def _stop_requested(self) -> bool:
-        try:
-            return bool(self._bb.get("stop_requested"))
-        except KeyError:
-            return False
-
-    def _event_context(self) -> dict[str, Any]:
-        """Return execution context kwargs for record_model_event calls."""
-        ctx: dict[str, Any] = {}
-        if self._run_id is not None:
-            ctx["run_id"] = self._run_id
-        if self._session_id is not None:
-            ctx["session_id"] = self._session_id
-        if self._principal_id is not None:
-            ctx["principal_id"] = self._principal_id
-        if self._parent_run_id is not None:
-            ctx["parent_run_id"] = self._parent_run_id
-        return ctx
-
-    def _maybe_prepare_scene_snapshot(
-        self,
-    ) -> tuple[Optional[bytes], Optional[str], Optional[dict[str, Any]], Optional[str], bool]:
-        """Try to prepare an optional scene snapshot without blocking for availability."""
-        if not self._include_scene_snapshot:
-            return None, None, None, None, True
-
-        provider = self._scene_snapshot_provider
-        if provider is None:
-            return (
-                None,
-                None,
-                None,
-                "scene snapshot requested but no native viewer render provider configured",
-                False,
-            )
-
-        try:
-            scene_snapshot_bytes = provider(
-                self._scene_snapshot_width,
-                self._scene_snapshot_height,
-                self._scene_snapshot_format,
-            )
-        except Exception as exc:
-            return (
-                None,
-                None,
-                None,
-                f"scene_snapshot_unavailable: {exc}",
-                False,
-            )
-        if scene_snapshot_bytes is None:
-            return None, None, None, None, False
-
-        scene_snapshot_metadata: dict[str, Any] = {
-            "format": self._scene_snapshot_format,
-            "width": self._scene_snapshot_width,
-            "height": self._scene_snapshot_height,
-            "sha256": hashlib.sha256(scene_snapshot_bytes).hexdigest(),
-            "byte_size": len(scene_snapshot_bytes),
-            "transport": self._scene_snapshot_transport,
-        }
-        scene_snapshot_url: Optional[str] = None
-        if self._scene_snapshot_transport == "http_url":
-            publisher = self._scene_snapshot_url_publisher
-            if publisher is None:
-                return (
-                    None,
-                    None,
-                    None,
-                    "scene_snapshot_url_publisher_unavailable",
-                    False,
-                )
-            try:
-                published = publisher(
-                    scene_snapshot_bytes,
-                    self._scene_snapshot_width,
-                    self._scene_snapshot_height,
-                    self._scene_snapshot_format,
-                    fetch_base_url=getattr(self._endpoint, "image_fetch_base_url", None),
-                    model_base_url=getattr(self._endpoint, "base_url", None),
-                )
-            except TypeError:
-                published = publisher(
-                    scene_snapshot_bytes,
-                    self._scene_snapshot_width,
-                    self._scene_snapshot_height,
-                    self._scene_snapshot_format,
-                )
-            except Exception as exc:
-                return None, None, None, f"scene_snapshot_publish_failed: {exc}", False
-            if not isinstance(published, dict):
-                return None, None, None, "scene_snapshot_publish_failed", False
-            scene_snapshot_url = str(published.get("url", "") or "")
-            if not scene_snapshot_url:
-                return None, None, None, "scene_snapshot_publish_failed", False
-            scene_snapshot_metadata["url"] = scene_snapshot_url
-            if published.get("snapshot_id"):
-                scene_snapshot_metadata["snapshot_id"] = published["snapshot_id"]
-        elif self._scene_snapshot_transport != "inline_data_url":
-            return (
-                None,
-                None,
-                None,
-                f"unsupported_scene_snapshot_transport: {self._scene_snapshot_transport}",
-                False,
-            )
-
-        return scene_snapshot_bytes, scene_snapshot_url, scene_snapshot_metadata, None, True
-
-    def _submit_model_call(
-        self,
-        *,
-        scene_snapshot_bytes: Optional[bytes],
-        scene_snapshot_url: Optional[str],
-        scene_snapshot_metadata: Optional[dict[str, Any]],
-        prompt_override: Optional[str] = None,
-    ) -> None:
-        self._call_start_ns = time.monotonic_ns()
-        self._call_generation += 1
-        self._active_call_generation = self._call_generation
-        self._last_scene_snapshot_bytes = scene_snapshot_bytes
-        self._last_scene_snapshot_url = scene_snapshot_url
-        self._last_scene_snapshot_metadata = (
-            dict(scene_snapshot_metadata)
-            if scene_snapshot_metadata is not None
-            else None
-        )
-        prompt_text = prompt_override if prompt_override is not None else self._resolved_prompt
-        if self._event_recorder is not None:
-            audit_arguments = dict(self._resolved_template_vars_raw)
-            if scene_snapshot_metadata is not None:
-                audit_arguments["_scene_snapshot"] = scene_snapshot_metadata
-            self._event_recorder.record_model_event(
-                action="started",
-                model_endpoint_alias=self._model_endpoint_alias,
-                prompt_template_id=self._prompt_template_id,
-                prompt_template_hash=self._template.content_hash,
-                prompt_text=prompt_text,
-                argument_keys=list(audit_arguments.keys()),
-                argument_values=audit_arguments,
-                node_instance=self.name,
-                audit_policy=self._audit_policy,
-                **self._event_context(),
-            )
-
-        self._future = _get_executor().submit(
-            _call_model,
-            provider=self._endpoint.provider,
-            model_id=self._endpoint.model_id,
-            base_url=self._endpoint.base_url,
-            api_key_env=self._endpoint.api_key_env,
-            prompt=prompt_text,
-            max_tokens=self._endpoint.max_tokens,
-            timeout_s=self._timeout_s,
-            output_schema=self._resolved_output_schema,
-            response_tool=self._resolved_response_tool,
-            scene_snapshot_bytes=scene_snapshot_bytes,
-            scene_snapshot_url=scene_snapshot_url,
-            scene_snapshot_format=self._scene_snapshot_format,
-        )
-
-    def _advance_preflight(self) -> py_trees.common.Status | None:
-        scene_snapshot_bytes, scene_snapshot_url, scene_snapshot_metadata, error, ready = (
-            self._maybe_prepare_scene_snapshot()
-        )
-        if error is not None:
-            self.feedback_message = error
-            self._write_namespace_output(value=None, status="failed")
-            if not self._scene_snapshot_error_is_configuration(error):
-                return self._runtime_failure(
-                    reason_code="model_scene_snapshot_failed",
-                    message=error,
-                )
-            return py_trees.common.Status.FAILURE
-        if not ready:
-            if self._scene_snapshot_wait_started_ns == 0:
-                self._scene_snapshot_wait_started_ns = time.monotonic_ns()
-            elapsed_s = (
-                time.monotonic_ns() - self._scene_snapshot_wait_started_ns
-            ) / 1_000_000_000
-            if elapsed_s >= _SCENE_SNAPSHOT_WAIT_TIMEOUT_S:
-                return self._runtime_failure(
-                    reason_code="model_scene_snapshot_timeout",
-                    message=(
-                        "scene_snapshot_unavailable_after_"
-                        f"{_SCENE_SNAPSHOT_WAIT_TIMEOUT_S:.1f}s"
-                    ),
-                    details={"timeout_s": _SCENE_SNAPSHOT_WAIT_TIMEOUT_S},
-                )
-            self._awaiting_scene_snapshot = True
-            self.feedback_message = "waiting_for_scene_snapshot"
-            self._write_namespace_output(
-                value=None,
-                status="waiting_for_scene_snapshot",
-            )
-            return py_trees.common.Status.RUNNING
-
-        self._awaiting_scene_snapshot = False
-        self.feedback_message = ""
-        try:
-            self._submit_model_call(
-                scene_snapshot_bytes=scene_snapshot_bytes,
-                scene_snapshot_url=scene_snapshot_url,
-                scene_snapshot_metadata=scene_snapshot_metadata,
-            )
-        except Exception as exc:
-            logger.error("%s: failed to submit model call: %s", self.name, exc)
-            return self._runtime_failure(
-                reason_code="model_call_submission_failed",
-                message=str(exc),
-                details={"exception_type": type(exc).__name__},
-            )
-        return None
-
-    def initialise(self) -> None:
-        self._ensure_output_keys()
-        self._future = None
-        self._call_start_ns = 0
-        self._resolved_output_schema = None
-        self._resolved_response_tool = None
-        self._resolved_template_vars_raw = {}
-        self._awaiting_scene_snapshot = False
-        self._scene_snapshot_wait_started_ns = 0
-        self._skip_snapshot_retry_once = False
-        self._parse_retry_attempted = False
-        self._terminated_call_generation = None
-        self._active_call_generation = None
-        self._last_scene_snapshot_bytes = None
-        self._last_scene_snapshot_url = None
-        self._last_scene_snapshot_metadata = None
-
-        if self._endpoint is None or self._template is None:
-            logger.error(
-                "%s: model endpoint or template not configured", self.name
-            )
-            return
-
-        # Resolve template variables from blackboard
-        resolved_vars_raw: dict[str, Any] = {}
-        resolved_vars_prompt: dict[str, str] = {}
-        for var_name, binding in self._template_variables.items():
-            try:
-                value = read_blackboard_binding_value(self._bb, binding)
-                resolved_vars_raw[var_name] = value
-                resolved_vars_prompt[var_name] = _stringify_template_value(value)
-            except KeyError:
-                resolved_vars_raw[var_name] = ""
-                resolved_vars_prompt[var_name] = ""
-
-        try:
-            self._resolved_output_schema = _resolve_output_schema_template(
-                self._template.output_schema,
-                resolved_vars_raw,
-            )
-            self._resolved_response_tool = _resolve_response_tool_template(
-                getattr(self._template, "response_tool", None),
-                resolved_vars_raw,
-            )
-        except ValueError as exc:
-            logger.error("%s: failed to resolve output contract: %s", self.name, exc)
-            self.feedback_message = f"output_contract_resolution_failed: {exc}"
-            return
-
-        # Build prompt from template
-        self._resolved_prompt = _render_prompt_template(
-            self._template.template_text,
-            resolved_vars_prompt,
-        )
-        self._resolved_template_vars_raw = dict(resolved_vars_raw)
-        preflight_status = self._advance_preflight()
-        if preflight_status == py_trees.common.Status.RUNNING:
-            self._skip_snapshot_retry_once = True
-
-    def _record_failed_model_event(
-        self,
-        *,
-        result: Optional[dict[str, Any]],
-        error: str,
-        latency_ms: float,
-    ) -> None:
-        if self._event_recorder is None:
-            return
-        self._event_recorder.record_model_event(
-            action="failed",
-            model_endpoint_alias=self._model_endpoint_alias,
-            prompt_template_id=self._prompt_template_id,
-            prompt_template_hash=self._template.content_hash if self._template else None,
-            response_text=result.get("text") if isinstance(result, dict) else None,
-            error=error,
-            latency_ms=latency_ms,
-            node_instance=self.name,
-            audit_policy=self._audit_policy,
-            **self._event_context(),
-        )
-
-    def _retry_parse_failure(
-        self,
-        *,
-        result: dict[str, Any],
-        latency_ms: float,
-        reason: str,
-    ) -> bool:
-        if not self._retry_on_parse_failure or self._parse_retry_attempted:
-            return False
-        self._parse_retry_attempted = True
-        logger.warning("%s: %s; retrying once with repair prompt", self.name, reason)
-        self._record_failed_model_event(
-            result=result,
-            error=f"{reason}; retrying_once",
-            latency_ms=latency_ms,
-        )
-        self.feedback_message = f"{reason}; retrying_once"
-        try:
-            self._submit_model_call(
-                scene_snapshot_bytes=self._last_scene_snapshot_bytes,
-                scene_snapshot_url=self._last_scene_snapshot_url,
-                scene_snapshot_metadata=self._last_scene_snapshot_metadata,
-                prompt_override=self._resolved_prompt + _PARSE_RETRY_SUFFIX,
-            )
-        except Exception as exc:
-            logger.error("%s: failed to submit model repair call: %s", self.name, exc)
-            self._runtime_failure(
-                reason_code="model_call_submission_failed",
-                message=str(exc),
-                details={"exception_type": type(exc).__name__},
-            )
-        return True
-
-    def _write_namespace_output(self, *, value: Any, status: str, **meta: Any) -> None:
-        write_namespace_bundle(
-            self._bb,
-            self._output_key_prefix,
-            value=value,
-            status=status,
-            **meta,
-        )
-
-    def _write_failed_output_best_effort(self) -> None:
-        """Do not let secondary diagnostics replace the originating fault."""
-        try:
-            self._write_namespace_output(value=None, status="failed")
-        except Exception as exc:  # noqa: BLE001 - diagnostic write boundary.
-            logger.error(
-                "%s: failed to publish model failure output: %s",
-                self.name,
-                exc,
-            )
-
-    def update(self) -> py_trees.common.Status:
-        if self._runtime_pause_fault is not None:
-            if self._consume_runtime_resume() is None:
-                self.feedback_message = self._runtime_pause_fault.message
-                return py_trees.common.Status.RUNNING
-            # The accepted exact recovery action retries this node generation.
-            # Re-run the same configuration preflight; no observer or generic
-            # Run path can reach this branch.
-            self.initialise()
-            return py_trees.common.Status.RUNNING
-
-        if self._stop_requested():
-            self.feedback_message = "stop_requested"
-            if self._future is not None and not self._future.done():
-                self._future.cancel()
-            self._future = None
-            self._active_call_generation = None
-            self._write_namespace_output(value=None, status="failed")
-            return py_trees.common.Status.FAILURE
-
-        if self._future is None:
-            if self._awaiting_scene_snapshot:
-                if self._skip_snapshot_retry_once:
-                    self._skip_snapshot_retry_once = False
-                    return py_trees.common.Status.RUNNING
-                status = self._advance_preflight()
-                if status is not None:
-                    return status
-            if self._future is None:
-                # Configuration or preflight error in initialise/update
-                self._write_namespace_output(value=None, status="error")
-                return py_trees.common.Status.FAILURE
-
-        if self._future is None:
-            self._write_namespace_output(value=None, status="error")
-            return py_trees.common.Status.FAILURE
-
-        if not self._future.done():
-            return py_trees.common.Status.RUNNING
-
-        latency_ms = (time.monotonic_ns() - self._call_start_ns) / 1_000_000
-        active_generation = self._active_call_generation
-
-        try:
-            if self._future.cancelled():
-                return self._runtime_failure(
-                    reason_code="model_call_cancelled",
-                    message="model_call_cancelled",
-                )
-            result = self._future.result()
-        except CancelledError:
-            return self._runtime_failure(
-                reason_code="model_call_cancelled",
-                message="model_call_cancelled",
-            )
-        except Exception as exc:
-            logger.error("%s: model call failed: %s", self.name, exc)
-            self._record_failed_model_event(
-                result=None,
-                error=str(exc),
-                latency_ms=latency_ms,
-            )
-            return self._runtime_failure(
-                reason_code="model_call_failed",
-                message=str(exc),
-                details={"exception_type": type(exc).__name__},
-            )
-
-        if (
-            active_generation is None
-            or self._active_call_generation != active_generation
-            or self._terminated_call_generation == active_generation
-        ):
-            logger.info(
-                "%s: dropping stale model result for generation %s",
-                self.name,
-                active_generation,
-            )
-            self._future = None
-            return py_trees.common.Status.FAILURE
-
-        # Validate response against output contract if provided
-        parsed = result.get("parsed")
-        tool_call = result.get("tool_call")
-        if self._resolved_response_tool is not None:
-            expected_tool_name = str(self._resolved_response_tool.get("name", ""))
-            actual_tool_name = ""
-            if isinstance(tool_call, dict):
-                actual_tool_name = str(tool_call.get("name", "") or "")
-            if actual_tool_name != expected_tool_name:
-                self.feedback_message = (
-                    f"tool_call_missing_or_mismatched: expected {expected_tool_name!r}, "
-                    f"got {actual_tool_name!r}"
-                )
-                logger.error("%s: %s", self.name, self.feedback_message)
-                self._write_namespace_output(value=None, status="tool_call_failed")
-                self._record_failed_model_event(
-                    result=result,
-                    error=self.feedback_message,
-                    latency_ms=latency_ms,
-                )
-                return py_trees.common.Status.FAILURE
-            if parsed is None:
-                self.feedback_message = "tool_call_arguments_not_valid_json"
-                logger.error("%s: %s", self.name, self.feedback_message)
-                if self._retry_parse_failure(
-                    result=result,
-                    latency_ms=latency_ms,
-                    reason=self.feedback_message,
-                ):
-                    self._write_namespace_output(
-                        value=None,
-                        status="retrying_after_parse_failure",
-                    )
-                    return py_trees.common.Status.RUNNING
-                self._write_namespace_output(value=None, status="tool_call_parse_failed")
-                self._record_failed_model_event(
-                    result=result,
-                    error=self.feedback_message,
-                    latency_ms=latency_ms,
-                )
-                return py_trees.common.Status.FAILURE
-            try:
-                parameters_schema = self._resolved_response_tool.get("parameters")
-                if parameters_schema is not None:
-                    _validate_json_schema(parsed, parameters_schema)
-            except ValueError as exc:
-                self.feedback_message = f"tool_schema_validation: {exc}"
-                logger.error(
-                    "%s: tool arguments schema validation failed: %s",
-                    self.name,
-                    exc,
-                )
-                self._write_namespace_output(value=None, status="validation_failed")
-                self._record_failed_model_event(
-                    result=result,
-                    error=f"tool_schema_validation: {exc}",
-                    latency_ms=latency_ms,
-                )
-                return py_trees.common.Status.FAILURE
-        elif self._resolved_output_schema is not None and parsed is not None:
-            try:
-                _validate_json_schema(parsed, self._resolved_output_schema)
-            except ValueError as exc:
-                self.feedback_message = f"schema_validation: {exc}"
-                logger.error(
-                    "%s: response JSON schema validation failed: %s",
-                    self.name,
-                    exc,
-                )
-                self._write_namespace_output(value=None, status="validation_failed")
-                self._record_failed_model_event(
-                    result=result,
-                    error=f"schema_validation: {exc}",
-                    latency_ms=latency_ms,
-                )
-                return py_trees.common.Status.FAILURE
-        elif self._resolved_output_schema is not None and parsed is None:
-            self.feedback_message = "response is not valid JSON"
-            logger.error(
-                "%s: response is not valid JSON but output_schema requires it",
-                self.name,
-            )
-            if self._retry_parse_failure(
-                result=result,
-                latency_ms=latency_ms,
-                reason=self.feedback_message,
-            ):
-                self._write_namespace_output(
-                    value=None,
-                    status="retrying_after_parse_failure",
-                )
-                return py_trees.common.Status.RUNNING
-            self._write_namespace_output(value=None, status="parse_failed")
-            self._record_failed_model_event(
-                result=result,
-                error="response is not valid JSON",
-                latency_ms=latency_ms,
-            )
-            return py_trees.common.Status.FAILURE
-
-        if (
-            self._stop_requested()
-            or self._terminated_call_generation == active_generation
-            or self._active_call_generation != active_generation
-        ):
-            self.feedback_message = "model_call_result_discarded"
-            self._future = None
-            return py_trees.common.Status.FAILURE
-
-        output = parsed if parsed is not None else result.get("text", "")
-        confidence = self._derive_confidence(parsed)
-        write_status = "succeeded" if confidence >= self._min_confidence else "failed"
-        try:
-            self._write_namespace_output(
-                value=output,
-                status=write_status,
-                confidence=confidence,
-                model_version=result.get("model_version", ""),
-            )
-        except Exception as exc:
-            self.feedback_message = f"output_commit_failed: {exc}"
-            logger.error("%s: %s", self.name, self.feedback_message)
-            self._record_failed_model_event(
-                result=result,
-                error=self.feedback_message,
-                latency_ms=latency_ms,
-            )
-            return self._runtime_failure(
-                reason_code="model_output_commit_failed",
-                message=self.feedback_message,
-                details={"exception_type": type(exc).__name__},
-            )
-
-        # Record completed event
-        if self._event_recorder is not None:
-            self._event_recorder.record_model_event(
-                action="completed",
-                model_endpoint_alias=self._model_endpoint_alias,
-                prompt_template_id=self._prompt_template_id,
-                prompt_template_hash=self._template.content_hash if self._template else None,
-                response_text=result.get("text"),
-                response_fields=parsed if isinstance(parsed, dict) else None,
-                model_version=result.get("model_version"),
-                latency_ms=latency_ms,
-                token_counts=result.get("usage"),
-                node_instance=self.name,
-                audit_policy=self._audit_policy,
-                **self._event_context(),
-            )
-
-        if confidence < self._min_confidence:
-            message_parts = [
-                f"confidence {confidence:.2f} below threshold {self._min_confidence:.2f}"
-            ]
-            if isinstance(parsed, dict):
-                outcome = parsed.get("outcome")
-                if isinstance(outcome, str) and outcome:
-                    message_parts.append(f"outcome={outcome}")
-                reason = parsed.get("reason")
-                if isinstance(reason, str) and reason:
-                    message_parts.append(f"reason={reason}")
-                request_interpretation = parsed.get("request_interpretation")
-                if isinstance(request_interpretation, str) and request_interpretation:
-                    message_parts.append(
-                        f"request_interpretation={request_interpretation}"
-                    )
-            self.feedback_message = " | ".join(message_parts)
-            logger.warning("%s: %s", self.name, self.feedback_message)
-            return self._pause_or_fail(
-                policy=self._model_low_confidence_policy,
-                reason_code="model_confidence_below_threshold",
-                message=self.feedback_message,
-                details={
-                    "confidence": confidence,
-                    "minimum_confidence": self._min_confidence,
-                },
-            )
-
-        return py_trees.common.Status.SUCCESS
-
-    def terminate(self, new_status: py_trees.common.Status) -> None:
-        if self._active_call_generation is not None:
-            self._terminated_call_generation = self._active_call_generation
-        if (
-            self._future is not None
-            and not self._future.done()
-            and new_status != py_trees.common.Status.RUNNING
-        ):
-            self._future.cancel()
-            self._future = None
-            self._active_call_generation = None
-        if new_status != py_trees.common.Status.RUNNING:
-            self._clear_runtime_pause()
-
-    def _derive_confidence(self, parsed: Any) -> float:
-        if isinstance(parsed, dict):
-            raw_confidence = parsed.get("confidence")
-            if isinstance(raw_confidence, (int, float)) and not isinstance(raw_confidence, bool):
-                return float(raw_confidence)
-        return 1.0 if parsed is not None else 0.5
-
-
-def _validate_json_schema(data: Any, schema: dict[str, Any]) -> None:
-    """Minimal JSON schema validation for structured model outputs.
-
-    Validates type, required fields, and basic property types without
-    pulling in a heavy jsonschema dependency.
-    """
-    schema_type = schema.get("type")
-    if schema_type == "object":
-        if not isinstance(data, dict):
-            raise ValueError(f"Expected object, got {type(data).__name__}")
-        required = schema.get("required", [])
-        for field_name in required:
-            if field_name not in data:
-                raise ValueError(f"Missing required field: {field_name}")
-        properties = schema.get("properties", {})
-        for prop_name, prop_schema in properties.items():
-            if prop_name in data:
-                _validate_json_schema(data[prop_name], prop_schema)
-    elif schema_type == "array":
-        if not isinstance(data, list):
-            raise ValueError(f"Expected array, got {type(data).__name__}")
-        items_schema = schema.get("items")
-        if items_schema:
-            for i, item in enumerate(data):
-                try:
-                    _validate_json_schema(item, items_schema)
-                except ValueError as exc:
-                    raise ValueError(f"Item [{i}]: {exc}") from exc
-    elif schema_type == "string":
-        if not isinstance(data, str):
-            raise ValueError(f"Expected string, got {type(data).__name__}")
-    elif schema_type == "number":
-        if not isinstance(data, (int, float)) or isinstance(data, bool):
-            raise ValueError(f"Expected number, got {type(data).__name__}")
-    elif schema_type == "integer":
-        if not isinstance(data, int) or isinstance(data, bool):
-            raise ValueError(f"Expected integer, got {type(data).__name__}")
-    elif schema_type == "boolean":
-        if not isinstance(data, bool):
-            raise ValueError(f"Expected boolean, got {type(data).__name__}")
-
-    if "enum" in schema and data not in schema["enum"]:
-        raise ValueError(f"Expected one of {schema['enum']}, got {data!r}")
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        _raise_model_node_unavailable()

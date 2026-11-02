@@ -1,109 +1,260 @@
-import { useLayoutEffect } from 'react';
+import { useLayoutEffect, type KeyboardEvent, type MouseEvent, type Ref } from 'react';
 import { Handle, Position, useUpdateNodeInternals } from '@xyflow/react';
-import type { NodeProps } from '@xyflow/react';
-import { useComposerStore } from '../store/composerStore';
-import { useProgramStore } from '../store/programStore';
-import { useCatalogStore } from '../store/catalogStore';
+import type {
+  LayoutDirection,
+  NodePresentationStatus,
+} from '../store/composerStore';
+import {
+  isProgramCanvasFormTarget,
+  programCanvasKeyIntent,
+} from '../utils/programCanvasInteraction';
+import { programCategoryFamily } from '../styles/tokens';
+import type { CollapsedProgramItem } from '../utils/programCollapse';
+import {
+  ProgramCategoryIcon,
+  ProgramHeldBadge as HeldBadge,
+  ProgramKindSymbol,
+  ProgramNodeName,
+} from './programNodeGlyphs';
 
-const CONTROL_FLOW_COLORS: Record<string, string> = {
-  sequence: 'bg-blue-700/65',
-  fallback: 'bg-orange-700/65',
-  parallel: 'bg-violet-700/65',
-  inverter: 'bg-yellow-600/55',
-  repeat: 'bg-cyan-700/65',
-  retry: 'bg-cyan-600/55',
-  timer: 'bg-teal-700/65',
-  default: 'bg-slate-700/75',
+export interface BtNodePresentation {
+  id: string;
+  label: string;
+  catalogId: string;
+  category: string;
+  kind: string;
+  childrenMax: number;
+  childCount: number;
+  hasParent: boolean;
+  isRoot?: boolean;
+  status: NodePresentationStatus;
+  selected: boolean;
+  layoutDirection: LayoutDirection;
+  executionAvailable?: boolean;
+  executionDisposition?: 'executable' | 'configuration_required' | 'unavailable';
+  executionReason?: string;
+  invalid?: boolean;
+  /** The node has children, so it can collapse. */
+  collapsible?: boolean;
+  /** When collapsed: its whole subtree, listed inside the node. */
+  collapsedItems?: CollapsedProgramItem[] | null;
+}
+
+export function btNodeConnectionAvailability(node: Pick<
+  BtNodePresentation,
+  'childrenMax' | 'childCount' | 'hasParent'
+>): { sourceConnectable: boolean; targetConnectable: boolean } {
+  const canHaveChildren = node.childrenMax !== 0;
+  return {
+    sourceConnectable: canHaveChildren
+      && (node.childrenMax < 0 || node.childCount < node.childrenMax),
+    targetConnectable: !node.hasParent,
+  };
+}
+
+/** Catalog-node presentation with graph handles and no topology authority. */
+interface BtNodeProps {
+  node: BtNodePresentation;
+  onSelect?: (instanceId: string) => void;
+  onFocus?: (instanceId: string) => void;
+  onDelete?: (event: KeyboardEvent<HTMLDivElement>, instanceId: string) => void;
+  onNavigate?: (instanceId: string, key: string) => void;
+  elementRef?: Ref<HTMLDivElement>;
+  onToggleCollapse?: (instanceId: string) => void;
+  /** Right-click on a listed node of a collapsed subtree. */
+  onItemContextMenu?: (event: MouseEvent, instanceId: string) => void;
+}
+
+const FOLD_ICON = {
+  collapse: 'M4 6l4 4 4-4',
+  expand: 'M6 4l4 4-4 4',
 };
 
-const CATEGORY_COLORS: Record<string, string> = {
-  motion: 'bg-orange-600/70',
-  logic: 'bg-yellow-600/60',
-  geometry: 'bg-pink-700/65',
-  scene: 'bg-purple-700/65',
-  simulation: 'bg-emerald-700/65',
-  model: 'bg-indigo-600/65',
-  selection: 'bg-lime-700/60',
-  pick_planning: 'bg-amber-700/65',
-  recovery: 'bg-rose-700/65',
-  blackboard_output: 'bg-sky-800/65',
-  default: 'bg-slate-700/75',
-};
+/** A collapsed node's list: leaves are rows, composites enclose their children. */
+function CollapsedItems({
+  items,
+  onSelect,
+  onItemContextMenu,
+}: {
+  items: CollapsedProgramItem[];
+  onSelect?: (instanceId: string) => void;
+  onItemContextMenu?: (event: MouseEvent, instanceId: string) => void;
+}) {
+  return items.map((item) => {
+    const row = (
+      <div
+        className="bt-node-collapsed-row"
+        title={`${item.label} · ${item.status === 'held' ? 'waiting for Run' : item.status}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          onSelect?.(item.id);
+        }}
+        onContextMenu={(event) => {
+          event.stopPropagation();
+          onItemContextMenu?.(event, item.id);
+        }}
+      >
+        <ProgramCategoryIcon category={item.category} catalogId={item.catalogId} />
+        <span className="bt-node-collapsed-name">{item.label}</span>
+        <span className="bt-node-collapsed-count">
+          {item.status === 'held'
+            ? <HeldBadge />
+            : item.children.length > 0 ? item.descendantCount : ''}
+        </span>
+      </div>
+    );
+    return (
+      <div
+        key={item.id}
+        className={`bt-node-collapsed-item ${item.children.length > 0 ? 'group' : 'leaf'} status-${item.status}${item.invalid ? ' invalid' : ''}${item.selected ? ' selected' : ''}`}
+        data-category-family={programCategoryFamily(item.category)}
+      >
+        {row}
+        {item.children.length > 0 && (
+          <div className="bt-node-collapsed-body">
+            <CollapsedItems
+              items={item.children}
+              onSelect={onSelect}
+              onItemContextMenu={onItemContextMenu}
+            />
+          </div>
+        )}
+      </div>
+    );
+  });
+}
 
-const STATUS_BORDER_COLORS: Record<string, string> = {
-  idle: 'border-gray-500',
-  running: 'border-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.35)]',
-  success: 'border-green-400 shadow-[0_0_10px_rgba(74,222,128,0.25)]',
-  failure: 'border-red-400 shadow-[0_0_10px_rgba(248,113,113,0.25)]',
-};
-
-export function BtNode({ data, selected, id }: NodeProps) {
-  const { nodeStatuses } = useComposerStore();
-  const layoutDirection = useProgramStore((state) => state.layoutDirection);
-  const edges = useProgramStore((state) => state.edges);
-  const catalogEntry = useCatalogStore(
-    (state) => state.entries.find((entry) => entry.id === (data.catalogId as string)),
-  );
-  const nodeCategory = catalogEntry?.category ?? 'default';
+export function BtNode({
+  node,
+  onSelect,
+  onFocus,
+  onDelete,
+  onNavigate,
+  elementRef,
+  onToggleCollapse,
+  onItemContextMenu,
+}: BtNodeProps) {
+  const collapsed = node.collapsedItems !== undefined && node.collapsedItems !== null;
+  const connections = btNodeConnectionAvailability(node);
   const updateNodeInternals = useUpdateNodeInternals();
-  
-  const colorClass =
-    nodeCategory === 'control_flow'
-      ? CONTROL_FLOW_COLORS[data.catalogId as string] || CONTROL_FLOW_COLORS.default
-      : CATEGORY_COLORS[nodeCategory] || CATEGORY_COLORS.default;
-  const selectedClass = selected ? 'ring-2 ring-white ring-offset-2 ring-offset-gray-900' : '';
-  const targetPosition = layoutDirection === 'vertical' ? Position.Top : Position.Left;
-  const sourcePosition = layoutDirection === 'vertical' ? Position.Bottom : Position.Right;
-  
-  // Get node status
-  const nodeStatus = nodeStatuses[id] ?? 'idle';
-  const statusClass = STATUS_BORDER_COLORS[nodeStatus] || STATUS_BORDER_COLORS.idle;
-  const childCount = edges.filter((edge) => edge.source === id).length;
-  const hasParent = edges.some((edge) => edge.target === id);
-  const kind = catalogEntry?.kind ?? 'leaf';
-  const childrenMax = catalogEntry?.childrenMax ?? -1;
-  const canHaveChildren = childrenMax !== 0;
-  const sourceConnectable = canHaveChildren && (childrenMax < 0 || childCount < childrenMax);
-  const targetConnectable = !hasParent;
-  const kindGlyph = kind === 'composite' ? '\u25c6' : kind === 'decorator' ? '\u25c7' : '\u2022';
-  const childHint =
-    kind === 'decorator'
-      ? '1 child'
-      : childrenMax === 0
-        ? 'leaf'
-        : childrenMax < 0
-          ? 'n children'
-          : `${childrenMax} max`;
-
+  const targetConnectable = connections.targetConnectable;
+  const disposition = node.executionDisposition
+    ?? (node.executionAvailable ? 'executable' : 'unavailable');
+  const availabilityLabel = disposition === 'executable'
+    ? 'Execution available'
+    : disposition === 'configuration_required'
+      ? 'Configuration required'
+      : 'Execution unavailable';
+  const availabilityDetail = node.invalid
+    ? 'This node needs valid required configuration before execution.'
+    : node.executionDisposition === 'executable'
+      ? 'Executable for the exact current Applied Program and Binding.'
+      : node.executionDisposition === 'configuration_required'
+        ? 'Execution implementation is available; complete the required node configuration.'
+        : `Authorable here; execution unavailable${node.executionReason ? `: ${node.executionReason}` : '.'}`;
   useLayoutEffect(() => {
-    const raf = window.requestAnimationFrame(() => {
-      updateNodeInternals(id);
+    const frame = window.requestAnimationFrame(() => {
+      updateNodeInternals(node.id);
     });
-    return () => window.cancelAnimationFrame(raf);
-  }, [id, layoutDirection, updateNodeInternals, canHaveChildren, sourceConnectable, targetConnectable]);
-
+    return () => window.cancelAnimationFrame(frame);
+  }, [
+    node.catalogId,
+    node.childrenMax,
+    node.id,
+    node.label,
+    node.layoutDirection,
+    collapsed,
+    updateNodeInternals,
+  ]);
   return (
-    <div className={`relative px-3 py-2 rounded border-2 min-w-[120px] text-center ${colorClass} ${selectedClass} ${statusClass}`}>
+    <div
+      ref={elementRef}
+      className={`bt-node status-${node.status}${node.invalid ? ' invalid' : ''}${node.selected ? ' selected' : ''}${collapsed ? ' collapsed' : ''}`}
+      data-category={node.category}
+      data-category-family={programCategoryFamily(node.category)}
+      data-node-id={node.id}
+      data-layout-direction={node.layoutDirection}
+      role="button"
+      tabIndex={0}
+      aria-pressed={node.selected}
+      aria-label={`${node.label} Program node`}
+      title={`${node.label}${node.status === 'held' ? '\nWaiting for Run: its work starts when Run is pressed.' : ''}\n${availabilityDetail}`}
+      onClick={() => onSelect?.(node.id)}
+      onFocus={() => onFocus?.(node.id)}
+      onKeyDown={(event) => {
+        const intent = programCanvasKeyIntent(
+          event.key,
+          isProgramCanvasFormTarget(event.target) ? 'form' : 'node',
+        );
+        if (!intent) return;
+        event.preventDefault();
+        if (intent.type === 'delete') {
+          onDelete?.(event, node.id);
+        } else if (intent.type === 'select') {
+          onSelect?.(node.id);
+        } else {
+          onNavigate?.(node.id, intent.key);
+        }
+      }}
+    >
       <Handle
-        key={`target-${layoutDirection}`}
         type="target"
-        position={targetPosition}
+        position={node.layoutDirection === 'vertical' ? Position.Left : Position.Top}
         isConnectable={targetConnectable}
-        className={`!w-4 !h-4 !border-2 !border-gray-900 transition-all ${targetConnectable ? '!bg-gray-300 hover:!bg-green-400 hover:!w-5 hover:!h-5' : '!bg-gray-700 opacity-60'}`}
+        className={`bt-node-react-flow-handle${targetConnectable ? '' : ' disabled'}`}
+        aria-label={`Connect ${node.label} as child`}
       />
-      <div className="text-xs text-gray-500 mb-0.5">{kindGlyph}</div>
-      <div className="text-xs text-gray-300 uppercase">{data.catalogId as string}</div>
-      <div className="text-sm text-white font-medium">{data.label as string}</div>
-      <div className="text-[10px] text-gray-500 mt-0.5">{childHint}</div>
-      {canHaveChildren ? (
+      {/* UI6-I-VC D3: icon band, name, empty band of the same width. */}
+      <span className="bt-node-band" aria-hidden="true">
+        <ProgramCategoryIcon category={node.category} catalogId={node.catalogId} />
+      </span>
+      <strong className="bt-node-name"><ProgramNodeName name={node.label} /></strong>
+      {/* The empty right band holds the collapse chevron of a composite. */}
+      <span className="bt-node-band">
+        {node.collapsible && onToggleCollapse && (
+          <button
+            type="button"
+            className="bt-node-fold nodrag"
+            aria-label={`${collapsed ? 'Expand' : 'Collapse'} ${node.label}`}
+            aria-expanded={!collapsed}
+            title={collapsed ? 'Expand subtree' : 'Collapse subtree'}
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggleCollapse(node.id);
+            }}
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d={collapsed ? FOLD_ICON.expand : FOLD_ICON.collapse} />
+            </svg>
+          </button>
+        )}
+      </span>
+      {collapsed && (
+        <div className="bt-node-collapsed-list">
+          <CollapsedItems
+            items={node.collapsedItems ?? []}
+            onSelect={onSelect}
+            onItemContextMenu={onItemContextMenu}
+          />
+        </div>
+      )}
+      {node.childrenMax !== 0 && (
         <Handle
-          key={`source-${layoutDirection}`}
           type="source"
-          position={sourcePosition}
-          isConnectable={sourceConnectable}
-          className={`!w-4 !h-4 !border-2 !border-gray-900 transition-all ${sourceConnectable ? '!bg-gray-300 hover:!bg-blue-400 hover:!w-5 hover:!h-5' : '!bg-gray-700 opacity-60'}`}
+          position={node.layoutDirection === 'vertical' ? Position.Right : Position.Bottom}
+          isConnectable={connections.sourceConnectable}
+          className={`bt-node-react-flow-handle${connections.sourceConnectable ? '' : ' disabled'}`}
+          aria-label={`Connect ${node.label} as parent`}
         />
-      ) : null}
+      )}
+      {node.status === 'held' && <HeldBadge />}
+      {/* The kind symbol appears only when execution is not available. */}
+      {disposition !== 'executable' && (
+        <span className={`bt-node-status ${disposition}`} aria-hidden="true">
+          <ProgramKindSymbol kind={node.kind} />
+        </span>
+      )}
+      <span className="sr-only">{availabilityLabel}</span>
     </div>
   );
 }

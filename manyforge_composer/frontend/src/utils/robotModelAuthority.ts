@@ -1,45 +1,27 @@
-import type {
-  SceneUrdfJoint,
-  SceneUrdfManifest,
-} from '../types/api';
+import type { SceneUrdfJoint, SceneUrdfManifest } from '../types/api';
 
-const DRIVABLE_TYPES = new Set(['revolute', 'prismatic', 'continuous']);
+const ACTUATED_TYPES = new Set(['revolute', 'prismatic', 'continuous']);
 
-function isDrivable(joint: SceneUrdfJoint): boolean {
-  return DRIVABLE_TYPES.has(joint.type);
-}
-
-export function robotControlJointsForGroup(
+/**
+ * Resolve an explicit, qualified target-joint list against structural model
+ * data. I6 owns the component/target mapping. Missing names, duplicates, fixed
+ * joints, and implicit group fallbacks fail closed here.
+ */
+export function modelJointsForQualifiedTarget(
   manifest: SceneUrdfManifest | null,
-  groupId: string | null | undefined,
-): SceneUrdfJoint[] {
-  if (manifest?.joints === undefined) return [];
-  const byName = new Map(manifest.joints.map((joint) => [joint.name, joint]));
-  const authorityNames =
-    groupId != null && groupId.length > 0
-      ? manifest.authority?.group_commandable_joint_names?.[groupId]
-      : undefined;
-  if (authorityNames !== undefined && authorityNames.length > 0) {
-    return authorityNames
-      .map((name) => byName.get(name))
-      .filter((joint): joint is SceneUrdfJoint => joint !== undefined)
-      .filter(isDrivable);
+  targetJointNames: readonly string[] | null,
+): SceneUrdfJoint[] | null {
+  if (manifest === null || targetJointNames === null || targetJointNames.length === 0) {
+    return null;
   }
-
-  // Legacy/mock fallback: no Robot Model Authority metadata is available.
-  // Hide mimic followers and masters so gripper chains stay under the
-  // dedicated gripper widget instead of leaking into arm jogging.
-  return manifest.joints.filter(
-    (joint) =>
-      isDrivable(joint) &&
-      !joint.mimic &&
-      !joint.is_mimic_master,
-  );
-}
-
-export function robotControlJointNamesForGroup(
-  manifest: SceneUrdfManifest | null,
-  groupId: string | null | undefined,
-): string[] {
-  return robotControlJointsForGroup(manifest, groupId).map((joint) => joint.name);
+  const unique = new Set(targetJointNames);
+  if (unique.size !== targetJointNames.length) return null;
+  const byName = new Map(manifest.joints.map((joint) => [joint.name, joint]));
+  const selected: SceneUrdfJoint[] = [];
+  for (const name of targetJointNames) {
+    const joint = byName.get(name);
+    if (!joint || !ACTUATED_TYPES.has(joint.type)) return null;
+    selected.push(joint);
+  }
+  return selected;
 }

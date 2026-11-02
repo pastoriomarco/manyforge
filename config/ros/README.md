@@ -1,44 +1,53 @@
 # ROS Environment Profiles
 
-This directory contains sourceable ROS 2 environment profiles for ManyForge
-operator workflows.
+Sourceable ROS 2 environment profiles for shells that take part in a
+multi-machine cell (the Isaac Sim shell, a perception container, the shell that
+runs `./scripts/compose-dev.sh start`). Sourcing one is optional.
 
-## Isaac Lite6 Trocar FoundationPose
+The workbench itself needs none of them: `./scripts/compose-dev.sh start`
+passes `ROS_DOMAIN_ID` (default `0`), `RMW_IMPLEMENTATION` (default
+`rmw_fastrtps_cpp`), `ROS_AUTOMATIC_DISCOVERY_RANGE`, `ROS_STATIC_PEERS` and the
+DDS profile variables through from its own environment when they are set, and
+never picks peers itself. With `ROS_AUTOMATIC_DISCOVERY_RANGE` unset ROS uses
+`SUBNET`, which reaches Isaac Sim and other ROS machines on the LAN;
+`LOCALHOST` isolates a machine.
 
-Use `isaac_lite6_trocar_foundationpose.env.sh` for the multi-machine workflow
-where Isaac Sim runs on the laptop, Isaac ROS 4.4 YOLOv8/FoundationPose runs on
-Thor or another Jetson, and ManyForge runs its ROS-capable launcher on the
-Thor/Jetson host.
+Both profiles unset stale Fast DDS discovery-server/profile and Cyclone DDS
+inputs, then set `ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`,
+`ROS_AUTOMATIC_DISCOVERY_RANGE` and `ROS_STATIC_PEERS`. Override each with its
+`MANYFORGE_`-prefixed counterpart (`MANYFORGE_ROS_DOMAIN_ID`,
+`MANYFORGE_RMW_IMPLEMENTATION`, `MANYFORGE_ROS_AUTOMATIC_DISCOVERY_RANGE`,
+`MANYFORGE_ROS_STATIC_PEERS`), identically in every participant shell.
 
-Source the same profile in every ROS participant shell:
-
-```bash
-source /home/tndlux/workspaces/dev_ws/src/manyforge/config/ros/isaac_lite6_trocar_foundationpose.env.sh
-```
-
-The default topology is:
-
-- Thor / ManyForge / Isaac ROS host: `192.168.1.136`
-- Isaac Sim laptop: `192.168.1.132`
-- ROS domain: `0`
-- RMW: Fast DDS (`rmw_fastrtps_cpp`)
-- Discovery: `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST` with explicit
-  `ROS_STATIC_PEERS`
-
-For a different LAN, override the host IPs before sourcing:
+## `isaac_i9.env.sh`: explicit peer list
 
 ```bash
-export MANYFORGE_THOR_IP=<thor-or-jetson-ip>
-export MANYFORGE_ISAAC_SIM_IP=<isaac-sim-laptop-ip>
-source /home/tndlux/workspaces/dev_ws/src/manyforge/config/ros/isaac_lite6_trocar_foundationpose.env.sh
+MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge}"
+source "${MANYFORGE_ROOT}/config/ros/isaac_i9.env.sh"
 ```
 
-The profile intentionally overwrites existing `ROS_DOMAIN_ID`,
-`RMW_IMPLEMENTATION`, `ROS_AUTOMATIC_DISCOVERY_RANGE`, and `ROS_STATIC_PEERS`
-so stale shell state does not leak into a commissioning session. Override with
-`MANYFORGE_ROS_DOMAIN_ID`, `MANYFORGE_RMW_IMPLEMENTATION`,
-`MANYFORGE_ROS_AUTOMATIC_DISCOVERY_RANGE`, or `MANYFORGE_ROS_STATIC_PEERS` only
-when intentionally qualifying a different topology.
+Defaults (an already set standard variable is kept):
 
-See `docs/operations/ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md` for the full
-bring-up sequence, camera QoS settings, TF checks, and smoke validation.
+- `ROS_DOMAIN_ID=0`
+- `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`
+- `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`
+- `ROS_STATIC_PEERS=192.168.1.132;192.168.1.68`
+
+Set the peers to your machines' addresses before sourcing.
+
+## `isaac_lite6_trocar_foundationpose.env.sh`: Isaac Sim + Isaac ROS perception
+
+For Isaac Sim on one machine, Isaac ROS YOLOv8/FoundationPose on a Jetson, and
+ManyForge on that Jetson. Override the host addresses before sourcing:
+
+```bash
+export MANYFORGE_THOR_IP=<jetson-ip>            # default 192.168.1.136
+export MANYFORGE_ISAAC_SIM_IP=<isaac-sim-ip>    # default 192.168.1.132
+MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge}"
+source "${MANYFORGE_ROOT}/config/ros/isaac_lite6_trocar_foundationpose.env.sh"
+```
+
+It sets `ROS_DOMAIN_ID=0`, Fast DDS, `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`
+and `ROS_STATIC_PEERS=<jetson>;<isaac-sim>`, overwriting what the shell had
+(only the `MANYFORGE_` overrides change them). See
+`docs/operations/ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md` for that workflow.

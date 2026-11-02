@@ -5,12 +5,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
 #include <manyforge_core/execution_progress_publication.hpp>
 #include <manyforge_core/runtime_collision_query_session.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -31,8 +31,7 @@ enum class RuntimeCollisionLookaheadTermination {
 const char* runtime_collision_lookahead_termination_name(
     RuntimeCollisionLookaheadTermination termination) noexcept;
 
-const char* runtime_collision_lookahead_error_message(
-    std::string_view reason) noexcept;
+const char* runtime_collision_lookahead_error_message(std::string_view reason) noexcept;
 
 struct RuntimeCollisionLookaheadSelection {
   TrajectoryDTO trajectory;
@@ -61,10 +60,10 @@ struct RuntimeCollisionLookaheadSelection {
 RuntimeCollisionLookaheadSelection select_runtime_collision_lookahead_samples(
     const TrajectoryDTO& trajectory, std::int64_t cursor_time_ns, std::int64_t horizon_ns,
     std::size_t max_samples);
-void select_runtime_collision_lookahead_samples(
-    const TrajectoryDTO& trajectory, std::int64_t cursor_time_ns,
-    std::int64_t horizon_ns, std::size_t max_samples,
-    RuntimeCollisionLookaheadSelection& output);
+void select_runtime_collision_lookahead_samples(const TrajectoryDTO& trajectory,
+                                                std::int64_t cursor_time_ns,
+                                                std::int64_t horizon_ns, std::size_t max_samples,
+                                                RuntimeCollisionLookaheadSelection& output);
 
 enum class RuntimeCollisionLookaheadResultStatus {
   kClear,
@@ -87,7 +86,7 @@ struct RuntimeCollisionLookaheadResult {
   std::uint64_t execution_generation = 0;
   std::uint64_t arm_generation = 0;
   std::uint64_t permit_generation = 0;
-  std::uint64_t runtime_bundle_epoch = 0;
+  std::optional<ProjectionRevisionDTO> projection_revision;
   CollisionWorldRevision collision_world_revision;
   std::int64_t requested_at_ns = 0;
   std::int64_t cycle_deadline_ns = 0;
@@ -110,6 +109,13 @@ struct RuntimeCollisionLookaheadResult {
   std::optional<std::int64_t> first_failing_waypoint;
   std::optional<std::int64_t> first_failing_time_ns;
   std::optional<CollisionPairId> first_failing_pair;
+  /// Presence describes work actually performed, never validity/authority.
+  bool job_context_observed = false;
+  bool selection_computed = false;
+  bool validation_completed = false;
+  /// Fixed-key input diagnostics populated only at the check that reads them.
+  /// Separate from potentially large engine evidence at the Stop handoff.
+  std::map<std::string, std::string> checked_input_details;
   /// Bounded diagnostics from the first failing collision-engine record.
   /// Populated only for a collision or inconclusive result, off the immediate
   /// runtime-monitor path.
@@ -175,7 +181,6 @@ class RuntimeCollisionLookaheadSession final {
     int workers = 2;
     int min_waypoints_for_parallel = 8;
     std::int64_t query_budget_ns = 75'000'000;
-    std::int64_t dynamic_body_max_age_cap_ns = 500'000'000;
   };
 
   /// Observer callback invoked only after any required authority callback and
@@ -192,16 +197,41 @@ class RuntimeCollisionLookaheadSession final {
                                    ICollisionWorldSnapshotPublisher& publisher,
                                    const ExecutionProgressPublication& progress_publication,
                                    std::vector<std::shared_ptr<ICollisionQueryEngine>> engines,
-                                   ResultCallback callback,
-                                   AuthorityCallback authority_callback);
+                                   ResultCallback callback, AuthorityCallback authority_callback);
   ~RuntimeCollisionLookaheadSession();
 
   RuntimeCollisionLookaheadSession(const RuntimeCollisionLookaheadSession&) = delete;
   RuntimeCollisionLookaheadSession& operator=(const RuntimeCollisionLookaheadSession&) = delete;
 
+  /// Allocation/copy stage for adoption by the existing owner. This contains
+  /// no running task or second monitoring authority. Generation may remain
+  /// zero until the actual dispatch receipt is verified, then assigned before
+  /// publication; ordinary arm() still refuses generation zero.
+  struct PreparedArm final {
+    std::uint64_t execution_id{};
+    std::uint64_t execution_generation{};
+    std::shared_ptr<const TrajectoryDTO> trajectory;
+    std::string contact_policy_id;
+    std::string active_cancel_reason;
+    std::string pending_cancel_reason;
+  };
+
+  [[nodiscard]] static PreparedArm prepare_arm(
+      std::uint64_t execution_id, std::uint64_t execution_generation,
+      std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id);
+  /// Only accepts the product of prepare_arm. The owning Kernel rechecks its
+  /// source/Stop/scene fence before its CAS and publishes while holding the
+  /// existing protection mutex, after backend adoption exposes new progress.
+  void publish_prepared_arm(PreparedArm prepared) noexcept;
+
   void arm(std::uint64_t execution_id, std::uint64_t execution_generation,
            std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id);
   void disarm() noexcept;
+
+  /// True only when this generation has no arm, queued/in-flight job, or
+  /// result callback. Retained collision-resource replacement uses this to
+  /// avoid destroying a publisher still borrowed by the worker.
+  [[nodiscard]] bool quiescent_for_resource_replacement() const;
 
   /// Called only after a clear immediate current-state tick. It never waits:
   /// a busy session coalesces one rerun and returns.
@@ -250,6 +280,8 @@ class RuntimeCollisionLookaheadSession final {
 
   Config config_;
   IClock* clock_ = nullptr;
+  // Also the host's containment for a throwing authority/observer callback.
+  IScheduler* scheduler_ = nullptr;
   ICollisionWorldSnapshotPublisher* publisher_ = nullptr;
   const ExecutionProgressPublication* progress_publication_ = nullptr;
   std::vector<std::shared_ptr<ICollisionQueryEngine>> engines_;
@@ -274,6 +306,7 @@ class RuntimeCollisionLookaheadSession final {
   std::optional<Job> pending_job_;
   std::atomic<std::shared_ptr<CollisionCancellationToken>> active_cancel_{nullptr};
   bool job_active_ = false;
+  bool callback_active_ = false;
   std::atomic<bool> accepting_clear_permits_{false};
   std::atomic<std::uint64_t> permit_generation_{1};
   std::atomic<std::uint64_t> reruns_coalesced_total_{0};

@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:37a4b6d145a96b0336ad03680c3222a63da28168764663cee7f5185fcbd467da",
+  "capability_id": "execution.feedback.phase_events",
+  "provider_binding_kind": "control_binding",
+  "scope": "target_binding"
+}

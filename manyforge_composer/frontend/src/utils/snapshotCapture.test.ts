@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from 'vitest';
-
 import { canvasToBlobWithTimeout, flipRgbaRowsInPlace } from './snapshotCapture';
 
 describe('snapshot capture utilities', () => {
@@ -22,17 +21,15 @@ describe('snapshot capture utilities', () => {
     const canvas = {
       toBlob: (callback: BlobCallback) => callback(null),
     } as unknown as HTMLCanvasElement;
-    await expect(canvasToBlobWithTimeout(canvas, 'image/png', 0.9, 100)).rejects.toThrow(
-      'returned no image',
-    );
+    await expect(
+      canvasToBlobWithTimeout(canvas, 'image/png', 0.9, 100),
+    ).rejects.toThrow('returned no image');
     vi.useRealTimers();
   });
 
   it('bounds a renderer that never completes encoding', async () => {
     vi.useFakeTimers();
-    const canvas = {
-      toBlob: () => undefined,
-    } as unknown as HTMLCanvasElement;
+    const canvas = { toBlob: () => undefined } as unknown as HTMLCanvasElement;
     const result = canvasToBlobWithTimeout(canvas, 'image/png', 0.9, 100);
     const assertion = expect(result).rejects.toThrow('timed out');
     await vi.advanceTimersByTimeAsync(101);

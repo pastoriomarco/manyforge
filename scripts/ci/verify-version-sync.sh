@@ -48,7 +48,23 @@ extract_cmake_version() {
 }
 
 check "manyforge_core CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_core/CMakeLists.txt")"
+check "manyforge_content_identity CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_content_identity/CMakeLists.txt")"
+check "manyforge_persistence CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_persistence/CMakeLists.txt")"
+check "manyforge_scene CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_scene/CMakeLists.txt")"
+check "manyforge_component_manager CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_component_manager/CMakeLists.txt")"
+check "manyforge_deployment CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_deployment/CMakeLists.txt")"
+check "manyforge_headless CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_headless/CMakeLists.txt")"
 check "manyforge_roboplan CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_roboplan/CMakeLists.txt")"
+for cmake_pkg in \
+    manyforge_core/python \
+    manyforge_collision \
+    manyforge_ros2_control_execution \
+    manyforge_xarm_control \
+    manyforge_isaac_adapter \
+    manyforge_perception_interfaces \
+    manyforge_perception_provider; do
+    check "${cmake_pkg} CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/${cmake_pkg}/CMakeLists.txt")"
+done
 
 # Python packages — pyproject.toml `version = "X.Y.Z"`
 extract_pyproject_version() {
@@ -57,7 +73,16 @@ extract_pyproject_version() {
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
 }
 
-for pkg in manyforge_behavior manyforge_ros manyforge_composer manyforge_assistant_bridge; do
+for pkg in \
+    manyforge_behavior \
+    manyforge_ros \
+    manyforge_composer \
+    manyforge_assistant_bridge \
+    manyforge_headless_api \
+    manyforge_program_runner \
+    manyforge_operator \
+    manyforge_medkit_adapter \
+    manyforge_example_nodes; do
     file="${REPO_ROOT}/${pkg}/pyproject.toml"
     if [[ ! -f "${file}" ]]; then
         printf '  ✗ %-50s pyproject.toml missing\n' "${pkg}"
@@ -75,10 +100,10 @@ extract_rospkg_version() {
 }
 for pkg in \
     manyforge_ros_bringup \
-    manyforge_robot_lifecycle \
-    manyforge_robot_lifecycle_msgs \
     manyforge_xarm_control \
-    manyforge_xarm_adapter; do
+    manyforge_isaac_adapter \
+    manyforge_perception_interfaces \
+    manyforge_perception_provider; do
     check "${pkg} package.xml" "$(extract_rospkg_version "${REPO_ROOT}/${pkg}/package.xml")"
 done
 
@@ -88,9 +113,14 @@ extract_setup_py_version() {
     grep -oE "version=['\"][0-9]+\\.[0-9]+\\.[0-9]+['\"]" "${file}" \
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
 }
-for pkg in manyforge_ros_bringup manyforge_xarm_adapter; do
+for pkg in manyforge_ros_bringup; do
     check "${pkg} setup.py" "$(extract_setup_py_version "${REPO_ROOT}/${pkg}/setup.py")"
 done
+
+# Python package metadata — __version__ = "X.Y.Z"
+check "manyforge_composer __init__.py" \
+    "$(grep -oE '^__version__\s*=\s*"[0-9]+\.[0-9]+\.[0-9]+"' "${REPO_ROOT}/manyforge_composer/__init__.py" \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
 
 # Frontend — package.json "version": "X.Y.Z"
 extract_packagejson_version() {

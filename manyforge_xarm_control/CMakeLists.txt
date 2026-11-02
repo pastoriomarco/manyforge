@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_xarm_control VERSION 0.1.0 LANGUAGES CXX)
+project(manyforge_xarm_control VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,205 +8,147 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_compile_options(-Wall -Wextra -Werror -pedantic)
 
 find_package(ament_cmake REQUIRED)
-find_package(controller_manager_msgs REQUIRED)
-find_package(hardware_interface REQUIRED)
-find_package(lifecycle_msgs REQUIRED)
-find_package(manyforge_robot_lifecycle REQUIRED)
-find_package(manyforge_robot_lifecycle_msgs REQUIRED)
-find_package(pluginlib REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
-find_package(rclcpp_lifecycle REQUIRED)
 find_package(xarm_msgs REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
-add_library(${PROJECT_NAME}_core
-  src/coordinator.cpp
-  src/fake_hardware_backend.cpp
-  src/lifecycle_ros_port.cpp
-  src/lite6_lifecycle_catalog.cpp
-  src/real_hardware_backend.cpp
-  src/xarm_ros_transport_session.cpp
+set(
+  MANYFORGE_CORE_SOURCE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_core"
+  CACHE PATH
+  "Path to the ROS-independent ManyForge Core source tree")
+if(NOT TARGET manyforge_core)
+  set(_MANYFORGE_XARM_BUILD_TESTING "${BUILD_TESTING}")
+  set(BUILD_TESTING OFF)
+  add_subdirectory(
+    "${MANYFORGE_CORE_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_core"
+    EXCLUDE_FROM_ALL)
+  set(BUILD_TESTING "${_MANYFORGE_XARM_BUILD_TESTING}")
+  unset(_MANYFORGE_XARM_BUILD_TESTING)
+endif()
+if(NOT TARGET manyforge_core)
+  message(FATAL_ERROR "manyforge_xarm_control could not resolve manyforge_core")
+endif()
+
+# The execution host's adapter interfaces this package implements
+# (`launch_contribution.hpp`, `io_output_writer.hpp`: header-only, Core types
+# only).
+set(
+  MANYFORGE_ROBOPLAN_SOURCE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_roboplan"
+  CACHE PATH
+  "Path to the ManyForge RoboPlan source tree (the adapter interfaces)")
+
+# The xArm vendor adapter (CONTRACTS §6, §7, §12, §16): the machine owner,
+# arm and I/O member adapters, the driver services, the status and I/O
+# subscriptions and the launch contribution.
+add_library(${PROJECT_NAME}
+  src/xarm_adapters.cpp
+  src/xarm_arm_adapter.cpp
+  src/xarm_driver_services.cpp
+  src/xarm_fault.cpp
+  src/xarm_io_component.cpp
+  src/xarm_io_states_transport.cpp
+  src/xarm_launch_contribution.cpp
+  src/xarm_owner_adapter.cpp
+  src/xarm_robot_states_transport.cpp
+  src/xarm_tool_context.cpp
 )
-set_target_properties(${PROJECT_NAME}_core PROPERTIES
-  POSITION_INDEPENDENT_CODE ON
-)
-target_include_directories(${PROJECT_NAME}_core PUBLIC
+target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
+  "$<BUILD_INTERFACE:${MANYFORGE_ROBOPLAN_SOURCE_DIR}/include>"
 )
-ament_target_dependencies(${PROJECT_NAME}_core
-  controller_manager_msgs
-  lifecycle_msgs
-  manyforge_robot_lifecycle
+ament_target_dependencies(${PROJECT_NAME}
   rclcpp
   xarm_msgs
 )
-
-add_library(${PROJECT_NAME}_plugin SHARED
-  src/system_hardware.cpp
-)
-target_include_directories(${PROJECT_NAME}_plugin PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>
-)
-ament_target_dependencies(${PROJECT_NAME}_plugin
-  hardware_interface
-  controller_manager_msgs
-  lifecycle_msgs
-  manyforge_robot_lifecycle
-  pluginlib
-  rclcpp
-  rclcpp_lifecycle
-)
-target_link_libraries(${PROJECT_NAME}_plugin ${PROJECT_NAME}_core)
-
-add_executable(lite6_supervised_preflight
-  src/lite6_supervised_preflight.cpp
-)
-target_link_libraries(
-  lite6_supervised_preflight
-  ${PROJECT_NAME}_core
-)
-ament_target_dependencies(lite6_supervised_preflight rclcpp)
-
-add_executable(lite6_lifecycle_command_evidence
-  src/lite6_lifecycle_command_evidence.cpp
-)
-target_link_libraries(
-  lite6_lifecycle_command_evidence
-  ${PROJECT_NAME}_core
-)
-ament_target_dependencies(
-  lite6_lifecycle_command_evidence
-  manyforge_robot_lifecycle
-  rclcpp
-)
-
-add_executable(lite6_execution_admission_provider
-  src/lite6_execution_admission_provider.cpp
-)
-target_link_libraries(
-  lite6_execution_admission_provider
-  ${PROJECT_NAME}_core
-)
-ament_target_dependencies(
-  lite6_execution_admission_provider
-  manyforge_robot_lifecycle
-  manyforge_robot_lifecycle_msgs
-  rclcpp
-)
-
-pluginlib_export_plugin_description_file(
-  hardware_interface
-  manyforge_xarm_control_plugins.xml
-)
+target_link_libraries(${PROJECT_NAME} yaml-cpp)
+set_property(TARGET ${PROJECT_NAME} APPEND PROPERTY
+  LINK_LIBRARIES manyforge_core)
+set_property(TARGET ${PROJECT_NAME} APPEND PROPERTY
+  INTERFACE_LINK_LIBRARIES "$<BUILD_INTERFACE:manyforge_core>")
 
 install(
   DIRECTORY include/
   DESTINATION include
 )
+# The adapter folder (CONTRACTS §12): driver.yaml, manyforge_settings.yaml,
+# README.md.
 install(
-  FILES manyforge_xarm_control_plugins.xml
+  DIRECTORY vendor
   DESTINATION share/${PROJECT_NAME}
 )
 install(
-  TARGETS
-    ${PROJECT_NAME}_core
-    ${PROJECT_NAME}_plugin
+  TARGETS ${PROJECT_NAME}
   EXPORT export_${PROJECT_NAME}
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
 )
-install(
-  TARGETS
-    lite6_execution_admission_provider
-    lite6_lifecycle_command_evidence
-    lite6_supervised_preflight
-  DESTINATION lib/${PROJECT_NAME}
-)
+
+# CONTRACTS §6: the xArm adapter family, which the execution host loads from
+# the ament resource index. It links the host's adapter runtime, so it is
+# built inside the RoboPlan execution host graph only.
+if(TARGET manyforge_roboplan_ros2_control_runtime)
+  add_library(manyforge_xarm_adapter_family SHARED
+    src/xarm_adapter_family.cpp)
+  target_link_libraries(manyforge_xarm_adapter_family PRIVATE
+    ${PROJECT_NAME}
+    manyforge_roboplan_ros2_control_runtime
+    ament_index_cpp::ament_index_cpp)
+  manyforge_register_component_adapter_family(manyforge_xarm_adapter_family xarm)
+  manyforge_stage_component_adapter_data(${PROJECT_NAME} vendor)
+endif()
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_ros REQUIRED)
   find_package(ament_lint_auto REQUIRED)
-  find_package(controller_manager REQUIRED)
-  find_package(joint_trajectory_controller REQUIRED)
-  find_package(trajectory_msgs REQUIRED)
+  # Each test process runs in its own ROS domain (Fast DDS #6599, N16).
+  set(MANYFORGE_ROS_TEST_ENV ENV ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST)
 
-  ament_add_gtest(test_end_to_end_fake
-    test/test_end_to_end_fake.cpp
-  )
-  target_link_libraries(
-    test_end_to_end_fake
-    ${PROJECT_NAME}_core
-  )
+  foreach(test_name
+      test_xarm_fault
+      test_xarm_arm_adapter
+      test_xarm_owner_adapter
+      test_xarm_io_component
+      test_xarm_robot_states_transport
+      test_xarm_driver_services
+      test_xarm_tool_context)
+    ament_add_ros_isolated_gtest(${test_name} test/${test_name}.cpp ${MANYFORGE_ROS_TEST_ENV})
+    target_link_libraries(${test_name} ${PROJECT_NAME} manyforge_core)
+  endforeach()
 
-  ament_add_gtest(test_system_hardware_boundary
-    test/test_system_hardware_boundary.cpp
-  )
-  target_link_libraries(
-    test_system_hardware_boundary
-    ${PROJECT_NAME}_plugin
-    ${PROJECT_NAME}_core
-  )
-  ament_target_dependencies(
-    test_system_hardware_boundary
-    hardware_interface
-    pluginlib
-  )
+  ament_add_ros_isolated_gtest(test_xarm_launch_contribution
+    test/test_xarm_launch_contribution.cpp ${MANYFORGE_ROS_TEST_ENV})
+  target_link_libraries(test_xarm_launch_contribution ${PROJECT_NAME} manyforge_core yaml-cpp)
+  target_compile_definitions(test_xarm_launch_contribution PRIVATE
+    MANYFORGE_XARM_CONTROL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/..")
 
-  ament_add_gtest(test_real_hardware_backend
-    test/test_real_hardware_backend.cpp
-  )
-  target_link_libraries(
-    test_real_hardware_backend
-    ${PROJECT_NAME}_core
-  )
-
-  ament_add_gtest(test_lite6_production_path
-    test/test_lite6_production_path.cpp
-  )
-  target_link_libraries(
-    test_lite6_production_path
-    ${PROJECT_NAME}_core
-  )
-
-  ament_add_gtest(test_controller_manager_integration
-    test/test_controller_manager_integration.cpp
-  )
-  target_link_libraries(
-    test_controller_manager_integration
-    ${PROJECT_NAME}_plugin
-    ${PROJECT_NAME}_core
-  )
-  ament_target_dependencies(
-    test_controller_manager_integration
-    controller_manager
-    controller_manager_msgs
-    hardware_interface
-    joint_trajectory_controller
-    lifecycle_msgs
-    rclcpp
-    trajectory_msgs
-  )
+  if(TARGET manyforge_xarm_adapter_family)
+    ament_add_ros_isolated_gtest(test_xarm_adapter_family
+      test/test_xarm_adapter_family.cpp ${MANYFORGE_ROS_TEST_ENV})
+    target_link_libraries(test_xarm_adapter_family
+      manyforge_roboplan_ros2_control_runtime manyforge_core yaml-cpp)
+    target_compile_definitions(test_xarm_adapter_family PRIVATE
+      MANYFORGE_XARM_ADAPTER_FAMILY_LIBRARY="$<TARGET_FILE:manyforge_xarm_adapter_family>"
+      MANYFORGE_XARM_CONTROL_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_dependencies(test_xarm_adapter_family manyforge_xarm_adapter_family)
+  endif()
 
   ament_lint_auto_find_test_dependencies()
 endif()
 
 ament_export_dependencies(
-  controller_manager_msgs
-  hardware_interface
-  lifecycle_msgs
-  manyforge_robot_lifecycle
-  manyforge_robot_lifecycle_msgs
-  pluginlib
+  ament_index_cpp
   rclcpp
-  rclcpp_lifecycle
   xarm_msgs
+  yaml-cpp
 )
 ament_export_include_directories(include)
-ament_export_libraries(
-  ${PROJECT_NAME}_core
-  ${PROJECT_NAME}_plugin
-)
+ament_export_libraries(${PROJECT_NAME})
 ament_export_targets(export_${PROJECT_NAME})
 ament_package()

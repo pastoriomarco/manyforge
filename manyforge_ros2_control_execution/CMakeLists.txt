@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_ros2_control_execution VERSION 0.1.0 LANGUAGES CXX)
+project(manyforge_ros2_control_execution VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,6 +12,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(control_msgs REQUIRED)
+find_package(action_msgs REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -29,6 +30,10 @@ add_library(manyforge_ros2_control_execution
   src/package.cpp
   src/ros2_control_capability.cpp
   src/ros2_control_execution_backend.cpp
+  src/volatile_motion_trace.cpp
+  src/volatile_motion_trace_file.cpp
+  src/ros2_gripper_command_backend.cpp
+  src/ros2_transport_resources.cpp
   src/scene_projection_worker.cpp
 )
 
@@ -45,6 +50,7 @@ ament_target_dependencies(manyforge_ros2_control_execution
   rclcpp
   rclcpp_action
   control_msgs
+  action_msgs
   controller_manager_msgs
   lifecycle_msgs
   sensor_msgs
@@ -64,6 +70,14 @@ if(BUILD_TESTING)
   find_package(GTest QUIET)
   if(GTest_FOUND)
     include(GoogleTest)
+    # Each test process runs in its own ROS domain (Fast DDS #6599, N16);
+    # same launcher as manyforge_roboplan's tests.
+    find_program(MANYFORGE_RUN_RMW_ISOLATED run_rmw_isolated
+      PATHS ENV AMENT_PREFIX_PATH
+      PATH_SUFFIXES lib/rmw_test_fixture_implementation
+      NO_DEFAULT_PATH REQUIRED)
+    set(CMAKE_CROSSCOMPILING_EMULATOR
+      env ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST "${MANYFORGE_RUN_RMW_ISOLATED}")
     add_executable(test_ros2_control_execution_package
       test/test_package.cpp)
     target_link_libraries(test_ros2_control_execution_package PRIVATE
@@ -82,13 +96,16 @@ if(BUILD_TESTING)
       manyforge_ros2_control_execution GTest::gtest_main)
     gtest_discover_tests(test_ros2_control_execution_backend)
 
-    # WS8 hot-path qualification probe. This executable is intentionally not a
-    # ctest case: unit tests prove behavior, while
-    # scripts/run-ros2-control-hot-path-qualification.sh runs this probe in a
-    # release build and emits archival JSON allocation/latency evidence.
-    add_executable(perf_ros2_control_hot_paths
-      test/perf/perf_ros2_control_hot_paths.cpp)
-    target_link_libraries(perf_ros2_control_hot_paths PRIVATE
-      manyforge_ros2_control_execution)
+    add_executable(test_volatile_motion_trace test/test_volatile_motion_trace.cpp)
+    target_link_libraries(test_volatile_motion_trace PRIVATE
+      manyforge_ros2_control_execution GTest::gtest_main)
+    gtest_discover_tests(test_volatile_motion_trace)
+
+    add_executable(test_ros2_gripper_command_backend
+      test/test_ros2_gripper_command_backend.cpp)
+    target_link_libraries(test_ros2_gripper_command_backend PRIVATE
+      manyforge_ros2_control_execution GTest::gtest_main)
+    gtest_discover_tests(test_ros2_gripper_command_backend)
+
   endif()
 endif()

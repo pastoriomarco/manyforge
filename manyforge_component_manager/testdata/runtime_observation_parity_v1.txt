@@ -1,0 +1,6 @@
+initial|dependency|converged|present|dependency-epoch-1|
+initial|worker|converged|present|worker-epoch-1|dependency=dependency-epoch-1
+dependency_restarted|dependency|converged|present|dependency-epoch-2|
+dependency_restarted|worker|recovering|present|worker-epoch-1|runtime_dependency_epoch_changed
+worker_rejoined|dependency|converged|present|dependency-epoch-2|
+worker_rejoined|worker|converged|present|worker-epoch-1|dependency=dependency-epoch-2

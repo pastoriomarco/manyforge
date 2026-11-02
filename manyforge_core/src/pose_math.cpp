@@ -81,6 +81,19 @@ Pose3DTO multiply_poses(const Pose3DTO& a, const Pose3DTO& b) {
   return matrix_to_pose(out);
 }
 
+Pose3DTO inverse_pose(const Pose3DTO& pose) {
+  const QuaternionDTO inverse_orientation{-pose.orientation.x,
+                                           -pose.orientation.y,
+                                           -pose.orientation.z,
+                                           pose.orientation.w};
+  const Pose3DTO inverse_rotation{{0.0, 0.0, 0.0}, inverse_orientation};
+  const Pose3DTO inverse_translation{{-pose.position_m.x_m,
+                                      -pose.position_m.y_m,
+                                      -pose.position_m.z_m},
+                                     {0.0, 0.0, 0.0, 1.0}};
+  return multiply_poses(inverse_rotation, inverse_translation);
+}
+
 Pose3DTO pose_with_position_and_orientation(
     const Vector3DTO& position,
     const QuaternionDTO& orientation) {

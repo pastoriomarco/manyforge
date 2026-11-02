@@ -1,0 +1,23 @@
+# Ubuntu Noble cache tooling only; the helper pins an already-built ROS image.
+# Build with scripts/ros/build-jazzy-cache-image.sh (legacy helper name).
+# The helper resolves and pins an existing local full Lyrical image.
+ARG MANYFORGE_ROS_BASE=manyforge-ros-lyrical-full:eval-20261011
+FROM ${MANYFORGE_ROS_BASE}
+ARG MANYFORGE_ROS_BASE_ID
+LABEL manyforge.ros-cache.base-image-id="${MANYFORGE_ROS_BASE_ID}"
+
+USER root
+RUN test -n "${MANYFORGE_ROS_BASE_ID}" \
+    && . /etc/os-release && test "$ID:$VERSION_CODENAME" = ubuntu:noble \
+    && test -f /opt/ros/lyrical/setup.bash \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ccache=4.9.1-1 \
+    && ccache --version \
+    && rm -rf /var/lib/apt/lists/*
+
+# Only the canonical diagnostic launcher enables the cache explicitly.
+ENV CCACHE_DISABLE=1
+# The diagnostic runner owns the command and package builders source Lyrical.
+# Do not activate inherited vendor/venv overlays or bootstrap another graph.
+ENTRYPOINT []
+USER 1000:1000

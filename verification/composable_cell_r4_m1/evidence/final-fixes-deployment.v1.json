@@ -1,0 +1,173 @@
+{
+  "schema_version": "manyforge.workbench_final_fixes_deployment.v1",
+  "scope": [
+    "Previous-session warning acknowledgement (DX1016-DX1024)",
+    "Temporary Close Reset/detach/default-policy follow-up (DX1014-DX1020)",
+    "Scene repeated-maintenance replay defect correction (DX1029)",
+    "Editable dual-robot example configuration repair (DX1030)",
+    "CCLC versus Manager owner namespace join correction (DX1033-DX1034)"
+  ],
+  "outcome": "deployed_and_usable",
+  "source_base_commit": "d3920e13f0f9560a6b83fd8329570a6bb64d17c2",
+  "source_postimages": {
+    "manyforge_composer/frontend/src/App.tsx": "1ba96b2d23100321e84108c73c070c6aa7ac3e5210c4ede8b8db5fd81829367f",
+    "manyforge_composer/frontend/src/components/ScenarioDocumentCommands.tsx": "84ee36fb94022dfdbeb3e484c24fa608e726b67ee96c9a73a1908f667ea193b7",
+    "manyforge_composer/frontend/src/state/scenarioClose.ts": "6c5b73f19db6addcc00db2fe6e2f214605f3633095c9ab6ceba6be99a290ada9",
+    "manyforge_composer/frontend/src/hooks/useProgramWorkspace.ts": "f64ce7208ef110c84d079c2dce0bcc0bc55dd5d3fc771b3e71fe92d157f785d1",
+    "manyforge_composer/frontend/src/types/api.ts": "746faf2cd9f9016f2f8b2dde1633f20371431c34114cafbcfe3a2329409699a2",
+    "manyforge_composer/backend/routes_headless.py": "af8af710ec37b3feae601062a670b98cde590f4b057ae206f70b19bd5a9abe02",
+    "manyforge_composer/backend/routes_draft.py": "3ad07e77c8821034cc7dc39a383532f945804c434746ab5c2b76e7d01537b72f",
+    "manyforge_composer/frontend/src/state/scenarioClose.test.ts": "2e046966d0abfc7c3025da64e036a8ac392afe655259e17c26901dd90e19411d",
+    "manyforge_composer/frontend/src/components/ScenarioDocumentCommands.handoff.test.tsx": "1670ea584219a5e7c26ba4e30031066b47b4fe7f4c7f41e3774eca07ef016574",
+    "manyforge_composer/frontend/src/components/ScenarioDocumentCommands.mounted.test.tsx": "05c2ea6222f712a823664119620b8b244bfbdafb80ed71a466726eb605506297",
+    "manyforge_composer/tests/test_headless_client_routes.py": "eda7818f6cf9b01c7455f9b05a98491d0deee97b5d7164d4ebb1ce05866e734f",
+    "manyforge_headless/include/manyforge_headless/headless_api_core.hpp": "40262a68590290ca38af9670bd55c7509ee739c5386037b3fc062fb7e3034583",
+    "manyforge_headless/src/headless_api_core.cpp": "21b275a753d5c0801a21e80d7baefbd2e81dfb2ba0204fe5587c18c86cb9b3e7",
+    "manyforge_headless/resources/operator-alarm-catalog.v1.yaml": "3130fd676a8ce6e720199051dd21ae9101f8851c76dbeb9cbf488c73d1cbb628",
+    "manyforge_headless/python/bindings.cpp": "10b1db10a38cf5a048b04aa39c3773ff74887d877bab4c9f6029361a260cd021",
+    "manyforge_headless_api/cli.py": "ce8ab995e8e2bb24bcb9cde9cb7f616650996c6f5f000ae44f1ad3aa34f82c38",
+    "manyforge_headless_api/native.py": "c33da0f97f17b97b290baacf3bb25dde5557125d8ada4a5e6568ba9b6256a096",
+    "manyforge_headless_api/service.py": "5ef5326a5f8a4e109980cf1d1aa4f5c2c60144640e1939123af557fa411643fb",
+    "scripts/dev-workbench.py": "e14607386888436be0a8e418fd725b1528c5a84d75c513dd26e08f42da2e8d93",
+    "manyforge_composer/frontend/src/components/HeadlessRuntimeSurfaces.tsx": "badcf111e1114ec5e60c6abe9d59314fcce98f7405ce5d35ac0c3f2841148250",
+    "manyforge_composer/frontend/src/components/WorkbenchNotifications.tsx": "9135796d6d02b3471be975be48d1641c5901562a9a3afc1ef90060cc82c5ab9b",
+    "manyforge_composer/frontend/src/state/workbenchNotices.tsx": "6886716946db2e1ec5e5976bce76b24a8a9fdb0863d14fc98330cea799668f54",
+    "manyforge_headless/test/test_headless_api_core.cpp": "1f29feeb5809bf161450bb3769a3a1c388d9037a0dd336ac5b69d47b326d8e6c",
+    "manyforge_headless/test/test_operator_alarm_catalog.cpp": "68c81da8234a84b9147d49504bdb6d4bfba23fea44210b5edf42d3f847bd71ad",
+    "manyforge_headless_api/tests/test_previous_session_report.py": "c3a9b1f0c019303eb2e35453edc3679f139465ed73cf1ce7c86025dba38df48a",
+    "tests/test_dev_workbench.py": "92d295f4609ef90bc05658659570c362a71282be231ee76251ab8a0c9c4964f0",
+    "manyforge_composer/frontend/src/App.test.tsx": "26593a327e497b7df723d08bb8778cceb8c90151d5acbc14f0f9600915831c64",
+    "manyforge_composer/frontend/src/components/HeadlessRuntimeSurfaces.test.ts": "edf24dea1b6619749ff0031b3ffe653b6ff3f430dbfe595de5fcc5ad56082cd8",
+    "manyforge_composer/frontend/src/state/workbenchNotices.test.tsx": "4b1fa6eaa08e8eccc428f2dec03a5ef77f1c335ac0ad59a9a99ce8aa2f330b76",
+    "manyforge_scene/src/logical_scene_owner_store.cpp": "048edb7f1119367a4301ea8d0730e2081278e2f73ecaccaa0985ff0dd16e4018",
+    "manyforge_scene/test/test_canonical_empty_scene_owner.cpp": "a70a6d0258165e02d865acf827322fdb7372589283b1bdf1e4cc3aca4f826a77",
+    "examples/ur5e_lite6_wall_workbench.scenario/deployment.yaml": "8ee865ad5288acac03e4ee3b5c5745af9a9524a8e8b26bbaaf6207d776a0391d",
+    "examples/ur5e_lite6_wall_workbench.scenario/scenario.yaml": "540d1ec80f43d5cf6ea7c954310b4828709646a5fdf5fb9e54eb1e3401356fa2"
+  },
+  "runtime": {
+    "image_id": "sha256:712e576565aad0f9982d3305efd7cad1f04c0a18d644442f2419101839ee6773",
+    "container_id": "4528c0c3518f5ca7a5d6764d82e6a59221d361b295e77543caa126802354dbe0",
+    "session_id": "5ab5f656d4a34cac91785720fc8c867c",
+    "standard_entrypoint": "scripts/compose-dev.sh",
+    "started_utc": "2026-10-16T07:47:28.618089+00:00",
+    "ready_utc": "2026-10-16T07:48:44.337879+00:00",
+    "startup_seconds": 75.71979,
+    "exit_code": 0,
+    "warm_native_build": "Seven Headless production actions: three affected translation units (Scene store, Headless API, binding) and four links. ROS host unchanged. No full build or test suite.",
+    "qualified_artifact_byte_identity": {
+      "headless/manyforge_headless_py.cpython-312-aarch64-linux-gnu.so": {
+        "user_sha256": "f8fa7fed5fca97b7f925d898b5fd1bbef53739fb4d41ea96f9275748ac59503b",
+        "qualified_private_sha256": "f8fa7fed5fca97b7f925d898b5fd1bbef53739fb4d41ea96f9275748ac59503b"
+      },
+      "headless/manyforge_manager_daemon": {
+        "user_sha256": "f1a6fbf34e52b6e69f36afe1fb2a6a4ac9ac890106ccdd2d6cb0aefe45443f04",
+        "qualified_private_sha256": "f1a6fbf34e52b6e69f36afe1fb2a6a4ac9ac890106ccdd2d6cb0aefe45443f04"
+      },
+      "headless/libmanyforge_event_historian.a": {
+        "user_sha256": "f5663c7f4736e444284ad2a44030f90905454b92a7c26caa1fea01d80231d19e",
+        "qualified_private_sha256": "f5663c7f4736e444284ad2a44030f90905454b92a7c26caa1fea01d80231d19e"
+      },
+      "headless/manyforge_component_manager/manyforge_scene/libmanyforge_scene.a": {
+        "user_sha256": "3dd7b57f951fa548bc264fe4f696942053797ffe16c1568e58080b05f2b8ac0f",
+        "qualified_private_sha256": "3dd7b57f951fa548bc264fe4f696942053797ffe16c1568e58080b05f2b8ac0f"
+      },
+      "isaac/roboplan/manyforge_ros2_control_execution_host": {
+        "user_sha256": "cab0a1f4c9f729d2201d8e92460100a496f04f18374630c84d1fe335dd3b087c",
+        "qualified_private_sha256": "cab0a1f4c9f729d2201d8e92460100a496f04f18374630c84d1fe335dd3b087c"
+      }
+    }
+  },
+  "readiness": {
+    "health": "ready",
+    "canonical_empty": true,
+    "logical_scene_objects": 0,
+    "cycle_state": "idle_after_reset",
+    "component_overview": "No components",
+    "browser_errors": [],
+    "browser_live_feed_sockets": 0,
+    "browser_geometry_count": 0,
+    "browser_previous_session_warning_present": false,
+    "served_modules_verified": [
+      "Scenario Close corrected owner/publication join",
+      "App previous-session alarm handoff/registration",
+      "Existing collapsed-by-default inspector"
+    ]
+  },
+  "preservation": {
+    "saved_files_total": 64,
+    "unchanged_saved_files": 62,
+    "approved_saved_source_updates": [
+      "ur5e_lite6_wall_workbench.scenario/deployment.yaml",
+      "ur5e_lite6_wall_workbench.scenario/scenario.yaml"
+    ],
+    "all_other_saved_bytes_preserved": true,
+    "closed_predecessor_session_id": "e05f1389830b440089a63c3d018161bf",
+    "closed_session_files_byte_exact": 24,
+    "archive_read_only": true,
+    "history_prior_ids_preserved": 1030,
+    "history_count_after": 1033,
+    "history_added_events": [
+      {
+        "sequence": 1033,
+        "event_id": "event-6319cbfd38d047a8cdfe46ac3e9f8dd9",
+        "event_type": "client_incident_activated",
+        "severity": "ERROR",
+        "message": "Viewer scene unverified",
+        "occurred_at_wall": "2026-10-16T07:48:58.908137314Z"
+      },
+      {
+        "sequence": 1032,
+        "event_id": "event-a54337b94d7ec608475cc8d40d2d6ab9",
+        "event_type": "client_incident_activated",
+        "severity": "ERROR",
+        "message": "Control disconnected",
+        "occurred_at_wall": "2026-10-16T07:48:58.907878341Z"
+      },
+      {
+        "sequence": 1031,
+        "event_id": "event-b3d40d3b1eeb9e2e76e257d0ff219f78",
+        "event_type": "previous_session_report",
+        "severity": "INFO",
+        "message": "Previous workbench session e05f1389830b440089a63c3d018161bf: effects are unknown; owned processes stopped normally. The new cell is empty; no previous state was adopted or replayed. Unknown journal families: manager, program_cycle, scene. Previous journal events may be absent from History. All previous journals are kept for investigation.",
+        "occurred_at_wall": "unknown"
+      }
+    ],
+    "history_purged": false,
+    "previous_session_history_coverage": "not_imported",
+    "existing_older_archives_retained": true
+  },
+  "qualification_receipts": [
+    "previous-session-ack.v1.json",
+    "previous-session-ack-browser.v1.json",
+    "scene-maintenance-replay.v1.json",
+    "final-fixes-private-gui.v1.json"
+  ],
+  "coverage_limits": [
+    "Private GUI exercised actual repaired dual Load, idle free-object Close including default policy and editor clear, and actual previous-session ACK followed by quiet browser reload.",
+    "Terminal Reset-first and carried-object detach branches were covered by focused owning tests; they were not exercised by this actual GUI session.",
+    "No performance or physical/simulator qualification is claimed.",
+    "Existing acknowledgement crash-window and retained-History pruning recurrence remain accepted limits.",
+    "History captured two client incident activations after restart (Control disconnected; Viewer scene unverified). The final fresh browser was quiet; subsequent server-side settlement of those incidents was not re-read after user testing began. They were not purged."
+  ],
+  "deployment_diagnostics": {
+    "preflight_attempts_before_effects": 2,
+    "reason": "Diagnostic helper assumed a loaded Deployment document; corrected to permit document=null only under positive canonical-empty Manager facts. No source/runtime effects occurred in the two refused preflights.",
+    "failed_preflight_logs_retained": true
+  },
+  "agent_issued_on_user": {
+    "restart": 1,
+    "load": 0,
+    "activate": 0,
+    "run": 0,
+    "reset": 0,
+    "acknowledge": 0
+  },
+  "cleanup": {
+    "owned_private_workbench_stopped_normally": true,
+    "owned_diagnostic_browsers_closed": true,
+    "private_source_build_graphs_and_evidence_retained": true,
+    "user_workbench_left_running": true
+  },
+  "raw_receipt_identifier": "dx1034-final-live-batch-20261016",
+  "index_changed_by_deployment": false
+}

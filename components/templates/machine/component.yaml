@@ -1,0 +1,17 @@
+# Component descriptor of one machine: the owner (connection, driver process,
+# controller state, power) and its member slots. Guide:
+# docs/authoring/ADDING_A_COMPONENT.md. Each member model is a curated robot
+# or a model-form io_device. Edit, then run
+#   scripts/manyforge component check <this folder>
+#   scripts/manyforge component register <this folder>
+api_version: manyforge.component_package.v1
+kind: machine
+id: __ID__
+version: 1.0.0
+title: <TODO what the machine is>
+license: Apache-2.0
+default_owner_id: __NAME__             # the owner's id when added; members <owner_id>_<role>
+members:
+  - {role: arm, model: <TODO vendor.robot model>}
+lanes:                            # one row per lane with a vendor adapter
+  real: {adapter: <TODO adapter family>}

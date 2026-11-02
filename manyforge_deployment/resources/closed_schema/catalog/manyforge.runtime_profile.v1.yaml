@@ -1,0 +1,152 @@
+api_version: manyforge.closed_schema.v1
+schema_id: manyforge.runtime_profile.v1
+schema_revision: sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7
+schema_purpose: artifact_document
+root_definition_id: runtime_profile
+definitions:
+  - definition_id: runtime_profile
+    value_schema:
+      kind: object
+      fields:
+        - field_id: api_version
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - manyforge.runtime_profile.v1
+              - kind: string_format
+                value: api_version
+        - field_id: runtime_profile_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: runtime_profile_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+        - field_id: configuration_schema_ref
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: value_schema_ref
+        - field_id: process_contract
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: process_contract
+        - field_id: supervision_contract
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: supervision_contract
+        - field_id: offered_runtime_role_ids
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 256
+            collection:
+              kind: scalar_set
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: string_format
+                  value: portable_id
+        - field_id: source_endpoint_role_ids
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 256
+            collection:
+              kind: scalar_set
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: string_format
+                  value: portable_id
+  - definition_id: value_schema_ref
+    value_schema:
+      kind: object
+      fields:
+        - field_id: schema_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: api_version
+        - field_id: schema_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+  - definition_id: process_contract
+    value_schema:
+      kind: object
+      fields:
+        - field_id: lifecycle_control
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - manager_managed
+                  - externally_managed
+              - kind: string_format
+                value: portable_id
+  - definition_id: supervision_contract
+    value_schema:
+      kind: object
+      fields:
+        - field_id: status_endpoint_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id

@@ -1,0 +1,395 @@
+import type { ManagerApplyPhase, ProgramCycleStatus } from './api';
+import type { Nanoseconds } from './nanoseconds';
+import type { ExecutionOwnerStatus } from './robotControl';
+
+export type SourceFreshness = 'fresh' | 'stale' | 'unavailable';
+
+export interface HeadlessSourceSection {
+  available: boolean;
+  freshness: SourceFreshness;
+  knownGaps: string[];
+  payload: Record<string, unknown> | null;
+  sourceGeneration: number | null;
+  sourceOwnerEpoch: string | null;
+  sourceOwnerId: string | null;
+  receiverAgeNs: number | null;
+}
+
+/** One active configuration: retained bundle and graph revision. */
+export interface ActiveConfigurationIdentity {
+  retainedBundleId: string;
+  graphRevision: string;
+}
+
+export interface HeadlessRuntimeSnapshot {
+  schemaVersion: 'manyforge.headless_runtime_snapshot.v1';
+  /** The configuration Manager publishes as active; null before one. */
+  activeConfiguration: ActiveConfigurationIdentity | null;
+  complete: boolean;
+  initialSceneFailure?: { state: 'failed' | 'unknown'; reason: { code: string; message: string } } | null;
+  projectionGeneration: number;
+  projectionOwnerEpoch: string;
+  projectionOwnerId: string;
+  reasons: string[];
+  unavailableSections: string[];
+  sections: {
+    manager: HeadlessSourceSection;
+    logicalScene: HeadlessSourceSection;
+    sceneRuntime: HeadlessSourceSection;
+  };
+}
+
+export type AlarmLifecycleState =
+  | 'active_unacknowledged'
+  | 'active_acknowledged'
+  | 'returned_unacknowledged'
+  | 'returned_acknowledged';
+
+export type AlarmPriority = 'critical' | 'high' | 'medium' | 'low';
+
+export interface AlarmSubject {
+  subjectKind: string;
+  subjectId: string;
+  resourceIds: string[];
+}
+
+export interface AlarmMembership {
+  conditionId: string;
+  activationId: string;
+  recordRevision: number;
+}
+
+/**
+ * One record that gates motion (spec 530 §10.1 `motion_attention_membership`):
+ * an acknowledgement-gated record while unacknowledged, a condition interlock
+ * while active. The complete, unpaginated set.
+ */
+export interface AlarmMotionAttentionMember extends AlarmMembership {
+  lifecycleState: AlarmLifecycleState;
+  definitionId: string;
+  subject: AlarmSubject;
+}
+
+export interface OperatorAlarmRecord extends AlarmMembership {
+  activatedAtNs: Nanoseconds;
+  definitionId: string;
+  lifecycleState: AlarmLifecycleState;
+  active: boolean;
+  acknowledged: boolean;
+  priority: AlarmPriority;
+  alarmClass: string;
+  title: string;
+  message: string;
+  consequence: string;
+  operatorResponse: string;
+  occurrenceCount: number;
+  acknowledgementRequired: boolean;
+  requiresMotionAttention: boolean;
+  subject: AlarmSubject;
+  details: Record<string, unknown>;
+}
+
+/**
+ * The motion-attention projection the Kernel acknowledged holding (spec 530
+ * §11). The Kernel admits Program motion by this copy alone, which lags the
+ * owner snapshot by up to one publication period plus its deadline.
+ */
+export interface KernelAlarmAttention {
+  ownerEpoch: string;
+  generation: number;
+  reconciled: boolean;
+  activeConfiguration: ActiveConfigurationIdentity | null;
+}
+
+export interface OperatorAlarmSnapshot {
+  schemaVersion: 'manyforge.operator_alarm_snapshot.v2';
+  ownerId: string;
+  ownerEpoch: string;
+  generation: number;
+  stateRevision: number;
+  reconciled: boolean;
+  healthState: string;
+  liveCount: number;
+  unacknowledgedCount: number;
+  activeCount: number;
+  activeAcknowledgedCount: number;
+  motionAttentionCount: number;
+  motionAttentionMembership: AlarmMotionAttentionMember[];
+  unacknowledgedMembership: AlarmMembership[];
+  alarms: OperatorAlarmRecord[];
+  truncated: boolean;
+  /** The Kernel-held copy; null when none is known to be current. */
+  kernelAttention: KernelAlarmAttention | null;
+}
+
+export type ComponentOverviewReadiness =
+  | 'ready'
+  | 'waiting'
+  | 'degraded'
+  | 'fault'
+  | 'offline';
+
+export type ComponentOverviewComponentStatus =
+  | 'not_applicable'
+  | 'healthy'
+  | 'waiting'
+  | 'warning'
+  | 'fault'
+  | 'offline';
+
+export interface ComponentOverviewComponent {
+  id: string;
+  label: string;
+  status: ComponentOverviewComponentStatus;
+  detail: string;
+  required: boolean;
+  requiredFor: string[];
+  ownerId: string | null;
+  ownerEpoch: string | null;
+  generation: number | null;
+  reasonCode: string | null;
+  scope: string;
+  contributorIds: string[];
+}
+
+export interface ComponentOverviewProjection {
+  schemaVersion: 'manyforge.component_overview.v2';
+  overviewRevision: string;
+  readiness: ComponentOverviewReadiness;
+  summaryLabel: string;
+  profileLabel: string;
+  authorityLabel: string;
+  userMessage: string;
+  capabilities: string[];
+  components: ComponentOverviewComponent[];
+  maintenanceOperation: {
+    applyId: string;
+    applyGeneration: number;
+    phase: ManagerApplyPhase;
+    affectedRuntimeUnitIds: string[];
+    reasonCode: 'planned_maintenance_in_progress';
+  } | null;
+  basis: {
+    runtimeProjectionOwnerEpoch: string | null;
+    runtimeProjectionGeneration: number | null;
+    managerSourceOwnerEpoch: string | null;
+    logicalSceneSourceOwnerEpoch: string | null;
+    logicalSceneSourceGeneration: number | null;
+    sceneRuntimeSourceOwnerEpoch: string | null;
+    sceneRuntimeSourceGeneration: number | null;
+    alarmOwnerEpoch: string | null;
+    alarmGeneration: number | null;
+    alarmStateRevision: number | null;
+    admissionGeneration: number | null;
+    programRunnerOwnerEpoch: string | null;
+    programCycleGeneration: number | null;
+    appliedProgramOwnerEpoch: string | null;
+    appliedProgramGeneration: number | null;
+    executionOwnerEpoch: string | null;
+    executionPublicationGeneration: number | null;
+  };
+}
+
+export interface AuthoringWorkspaceIdentity {
+  workspaceEpoch: string;
+  workspaceRevision: number;
+  programDraftId: string;
+  programDraftRevision: number;
+  deploymentDraftId: string;
+  deploymentDraftRevision: number;
+}
+
+/**
+ * The authoring workspace was contained after an in-memory install violated
+ * its contract. It persists until Composer restarts (a normal cold start).
+ */
+export interface AuthoringWorkspaceContainment {
+  cause: string;
+  /** The file the containing operation wrote first, or ``null``. */
+  savedPath: string | null;
+}
+
+export interface ComposerHeadlessState {
+  schemaVersion: 'manyforge.composer_headless_state.v2';
+  complete: true;
+  runtime: HeadlessRuntimeSnapshot;
+  alarms: OperatorAlarmSnapshot;
+  componentOverview: ComponentOverviewProjection;
+  authoringAdmission: {
+    authoringAllowed: boolean;
+    admissionGeneration: number;
+  };
+  /**
+   * The backend's one held-run rule: a Program run exists, nothing of it is
+   * moving and nothing can start, so a Draft edit is admitted (the backend
+   * applies the same rule to each edit).
+   */
+  heldRunDraftEditAllowed: boolean;
+  executionControlStatus: ExecutionOwnerStatus | null;
+  programCycle: ProgramCycleStatus;
+  /**
+   * The one composite authoring workspace identity: the workspace epoch and
+   * revision plus both Draft identities. It replaces the old Program-only
+   * `draftIdentity`, because an ordinary edit, Save, whole-project Load or
+   * Deployment edit all advance the same workspace revision.
+   */
+  authoringWorkspace: AuthoringWorkspaceIdentity;
+  /** Published with the identity; non-null while authoring is contained. */
+  authoringWorkspaceContainment: AuthoringWorkspaceContainment | null;
+  receiverEpoch: string;
+  snapshotSequence: number;
+}
+
+export interface HistorianEvent {
+  schemaVersion: 'manyforge.historian_event.v2';
+  eventId: string;
+  component: string;
+  eventType: string;
+  severity: string;
+  occurredAtNs: string;
+  occurredAtWall: string;
+  payload: Record<string, unknown>;
+}
+
+export interface HistorianStoredEvent {
+  sequence: number;
+  event: HistorianEventSummary;
+}
+
+export interface HistorianDiscovery {
+  schemaVersion: 'manyforge.historian_discovery.v1';
+  kind: 'program_run_id' | 'component' | 'channel' | 'event_type';
+  values: string[];
+  truncated: boolean;
+  nextAfter: string | null;
+}
+
+export interface HistorianPage {
+  schemaVersion: 'manyforge.historian_summary_page.v2';
+  events: HistorianStoredEvent[];
+  nextBeforeSequence: number | null;
+  truncated: boolean;
+  timeWindow: { startUtcNs: string | null; endUtcNs: string | null };
+  retention: HistorianRetention | null;
+}
+
+export interface HistorianCaptureRetention {
+  liveCount: string;
+  openCount: string;
+  protectedCount: string;
+  protectedBytes: string;
+  liveCaptureLimit: string;
+  protectedByteLimit: string;
+  retiredCount: string;
+  releasedRows: string;
+  releasedBytes: string;
+  lastRetiredCaptureId: string | null;
+}
+
+export type HistorianCaptureUncertainty =
+  | 'context_pruned_before_capture'
+  | 'writer_delivery_loss_before_capture'
+  | 'writer_delivery_loss_during_capture'
+  | 'context_spans_writer_restart'
+  | 'tail_interrupted_by_restart';
+
+/** One failure capture: protected retained context, never a state dump. */
+export interface HistorianCapture {
+  captureId: string;
+  state: 'open' | 'closed' | 'truncated' | 'closed_by_restart';
+  closeReason: 'tail_rows' | 'tail_duration' | 'capture_bytes' | 'restart' | null;
+  closureRecorded: boolean;
+  firstSequence: number;
+  triggerSequence: number;
+  lastSequence: number;
+  triggerEventId: string;
+  trigger: {
+    eventType: string | null;
+    component: string | null;
+    conditionSeverity: string | null;
+    message: string | null;
+  } | null;
+  openedAtUtcNs: string | null;
+  precedingRows: number;
+  precedingLimit: 'rows' | 'bytes' | 'history_start' | 'pruned';
+  tailRows: number;
+  captureBytes: string;
+  triggerCount: number;
+  recordedTriggers: Array<{ sequence: number; eventId: string }>;
+  unrecordedTriggerCount: number;
+  retainedRows: number;
+  missingSequences: number;
+  writerDeliveryLossBefore: number;
+  writerDeliveryLossDuring: number;
+  coverage: 'complete' | 'uncertain';
+  uncertainty: HistorianCaptureUncertainty[];
+  contents: 'retained_event_context';
+}
+
+export interface HistorianCapturePage {
+  schemaVersion: 'manyforge.historian_capture_page.v1';
+  captures: HistorianCapture[];
+  truncated: boolean;
+  nextBeforeCaptureId: string | null;
+  retention: HistorianRetention;
+}
+
+export interface HistorianRetention {
+  schemaVersion: 'manyforge.historian_retention.v2';
+  captures: HistorianCaptureRetention;
+  partitionRowLimit: string;
+  partitionRecordByteLimit: string;
+  databasePageByteLimit: string;
+  durationGuaranteed: false;
+  priorPruningKnown: boolean;
+  partitions: Array<{
+    partition: 'routine' | 'important';
+    retainedCount: string;
+    retainedBytes: string;
+    prunedCount: string;
+    prunedBytes: string;
+    lastPrunedSequence: string | null;
+    unknownTimeCount: string;
+    regressedTimeCount: string;
+    lossCounterSaturated: boolean;
+    firstRecordedUtcNs: string | null;
+    lastRecordedUtcNs: string | null;
+  }>;
+}
+
+export interface HistorianEventSummary {
+  schemaVersion: 'manyforge.historian_event_summary.v2';
+  eventId: string;
+  component: string;
+  eventType: string;
+  severity: string;
+  occurredAtNs: string;
+  occurredAtWall: string;
+  message: string;
+  programRunId: string | null;
+  operationId: string | null;
+  conditionId: string | null;
+  conditionSeverity: string;
+  occurredAtUtcNs: string | null;
+  clockOwner: string | null;
+  wallClockRegressed: boolean;
+}
+
+export type HistorianDetailSectionName =
+  | 'incident'
+  | 'executionDigest'
+  | 'blackboard'
+  | 'latency';
+
+export interface HistorianDetailSection {
+  available: boolean;
+  reason: string | null;
+  value: unknown;
+}
+
+export interface HistorianDetail {
+  schemaVersion: 'manyforge.historian_detail.v2';
+  sequence: number;
+  event: HistorianEvent;
+  sections: Record<HistorianDetailSectionName, HistorianDetailSection>;
+}

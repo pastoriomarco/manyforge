@@ -1,0 +1,43 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
+# `scripts/manyforge component check manyforge_example_models/models/ur5_roboplan`.
+# RoboPlan's UR5 example arm (its structural model, model family
+# `ur5_roboplan`): it gives the model family its lane rows.
+api_version: manyforge.component_package.v1
+kind: robot
+id: universal_robots.ur5_roboplan
+version: 1.0.0
+title: Universal Robots UR5 (RoboPlan example)
+license: BSD-3-Clause
+provenance:
+  source: roboplan_example_models/models/ur_robot_model
+  notes: README.md
+model:
+  urdf: ur5.urdf
+  srdf: ur5.srdf
+  package_name: roboplan_example_models
+roles:
+  root_frame: world
+  frames:
+    base: base_link
+    flange: tool0
+  groups:
+    arm: arm
+  joints:
+    arm_joints: [shoulder_pan_joint, shoulder_lift_joint, elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint]
+  collision_bodies:
+    arm_collision: [base_link, forearm_link, shoulder_link, upper_arm_link, wrist_1_link, wrist_2_link, wrist_3_link]
+tcps:
+  - {id: flange, frame: tool0}
+limits:
+  max_tcp_linear_speed_mps: 1.0
+lanes:
+  mock:                           # Mock lane adapter (manyforge_ros2_control_execution/lane/)
+    adapter: mock
+    controller: joint_trajectory_controller
+    arrival_tolerance_rad: 0.01     # every arm joint's JTC goal
+    controllers_file: mock_controllers.yaml
+    hard_stop_completion_timeout_s: 0.5
+    gripper_result_timeout_s: 15.0
+defaults:
+  initial_joint_positions_rad: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+  maximum_tcp_linear_speed_mps: 0.25

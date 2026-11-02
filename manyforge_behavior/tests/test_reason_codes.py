@@ -1,9 +1,7 @@
-from manyforge_behavior.pick_stage_causes import PickStageFailureCause
 from manyforge_behavior.reason_codes import ReasonCode
 
 
-def test_pick_stage_causes_are_backed_by_shared_reason_codes() -> None:
-    assert PickStageFailureCause is ReasonCode
+def test_shared_reason_codes_retain_machine_values() -> None:
     assert ReasonCode.RAW_IK_FAILURE.value == "raw_ik_failure"
     assert (
         ReasonCode.COLLISION_VALIDATION_WORKER_EXCEPTION.value

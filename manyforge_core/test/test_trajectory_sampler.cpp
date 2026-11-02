@@ -733,6 +733,72 @@ TEST(TrajectorySampler,
             "trajectory_sample_segment_hint_mismatch");
 }
 
+TEST(TrajectorySampler, JointOriginDoesNotChangeInterpolatedDerivatives) {
+  for (bool acceleration : {false, true}) {
+    TrajectoryDTO trajectory;
+    trajectory.joint_names = {"moving"};
+    trajectory.waypoints = {WaypointPV(0.0, {0.0}, {0.2}), WaypointPV(0.001, {0.125}, {0.3})};
+    if (acceleration) {
+      trajectory.waypoints[0].accelerations_rad_s2 = {0.5};
+      trajectory.waypoints[1].accelerations_rad_s2 = {-0.25};
+    }
+    for (double origin : {-1024.0, 1024.0}) {
+      auto translated = trajectory;
+      for (auto& point : translated.waypoints) point.positions_rad[0] += origin;
+      // The displacement is exactly representable at either origin. It is
+      // the identical physical polynomial, not a position-tolerance test.
+      for (double t : {0.0001, 0.00037, 0.0008}) {
+        SCOPED_TRACE(acceleration);
+        SCOPED_TRACE(origin);
+        SCOPED_TRACE(t);
+        const auto local = sample_trajectory(trajectory, t);
+        const auto moved = sample_trajectory(translated, t);
+        ASSERT_TRUE(local.ok());
+        ASSERT_TRUE(moved.ok());
+        EXPECT_DOUBLE_EQ(local.value().velocities_rad_s[0], moved.value().velocities_rad_s[0]);
+        EXPECT_DOUBLE_EQ(local.value().accelerations_rad_s2[0],
+                         moved.value().accelerations_rad_s2[0]);
+        EXPECT_NEAR(local.value().positions_rad[0] + origin, moved.value().positions_rad[0],
+                    kPosAbsTol);
+      }
+    }
+    trajectory.waypoints[0].positions_rad[0] = 1e20;
+    trajectory.waypoints[1].positions_rad[0] = 1.0;
+    // Avoid losing the exact requested endpoint in origin + displacement.
+    const auto endpoint = sample_trajectory(trajectory, 0.001);
+    ASSERT_TRUE(endpoint.ok());
+    EXPECT_DOUBLE_EQ(endpoint.value().positions_rad[0], 1.0);
+    trajectory.waypoints[0].positions_rad[0] = -1e308;
+    trajectory.waypoints[1].positions_rad[0] = 1e308;
+    for (const auto& point : trajectory.waypoints) {
+      const auto exact = sample_trajectory(trajectory, point.time_from_start_s);
+      ASSERT_TRUE(exact.ok());
+      EXPECT_DOUBLE_EQ(exact.value().positions_rad[0], point.positions_rad[0]);
+      EXPECT_DOUBLE_EQ(exact.value().velocities_rad_s[0], point.velocities_rad_s[0]);
+      if (acceleration) {
+        EXPECT_DOUBLE_EQ(exact.value().accelerations_rad_s2[0], point.accelerations_rad_s2[0]);
+      }
+    }
+  }
+}
+
+TEST(TrajectorySampler, StationaryJointHasExactZeroDerivativesAtNonzeroOrigin) {
+  for (bool with_acceleration : {false, true}) {
+    TrajectoryDTO trajectory;
+    trajectory.joint_names = {"stationary"};
+    for (double t : {0.0, 0.001})
+      trajectory.waypoints.push_back(
+          {t, {1.57}, {0.0}, with_acceleration ? std::vector<double>{0.0} : std::vector<double>{}});
+    for (double t : {0.000071, 0.000397, 0.000811}) {
+      const auto result = sample_trajectory(trajectory, t);
+      ASSERT_TRUE(result.ok());
+      EXPECT_DOUBLE_EQ(result.value().positions_rad[0], 1.57);
+      EXPECT_DOUBLE_EQ(result.value().velocities_rad_s[0], 0.0);
+      EXPECT_DOUBLE_EQ(result.value().accelerations_rad_s2[0], 0.0);
+    }
+  }
+}
+
 TEST(TrajectorySampler, ValidateForSamplingMatchesClassicRejections) {
   using manyforge::core::validate_trajectory_for_sampling;
 

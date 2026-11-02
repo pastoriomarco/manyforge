@@ -1,167 +1,141 @@
 #pragma once
 
-#include <atomic>
-#include <cstdint>
-#include <map>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <string>
-
-#include <roboplan/core/scene.hpp>
-#include <roboplan/core/path_utils.hpp>
-#include <roboplan/core/types.hpp>
-#include <roboplan_rrt/rrt.hpp>
-#include <roboplan_toppra/toppra.hpp>
-#include <roboplan_simple_ik/simple_ik.hpp>
-
 #include <manyforge_core/ports/iplanner_backend.hpp>
+#include <manyforge_roboplan/roboplan_candidate_computer.hpp>
+#include <memory>
+#include <shared_mutex>
+#include <vector>
 
 namespace manyforge::roboplan_backend {
 
-class RoboPlanSceneProjection;
+struct RoboPlanWorkerModelDTO;
 
-/// Result of sampling per-joint peak velocity/acceleration against requested
-/// absolute caps (Phase 4-P5.1K). Consumed by the conservative retiming loop in
-/// RoboPlanPlannerBackend::plan and exercised directly by unit tests.
-struct JointCapMeasurement {
-  /// False when a capped dimension lacked a complete set of samples for a capped
-  /// joint (the cap cannot be verified, so the caller MUST fail closed rather
-  /// than treat the missing peak as zero). `incomplete_dimension` /
-  /// `incomplete_joint` name the first offending case.
-  bool samples_complete = true;
-  std::string incomplete_dimension;  // "velocity" | "acceleration"
-  std::string incomplete_joint;
-  /// Worst measured/cap ratio per dimension across capped joints; > 1.0 means a
-  /// cap is still violated on this pass. 1.0 when satisfied (or no cap).
-  double worst_vel_ratio = 1.0;
-  double worst_acc_ratio = 1.0;
-  std::string worst_vel_joint;
-  std::string worst_acc_joint;
-  double worst_vel_peak = 0.0;  // rad/s
-  double worst_acc_peak = 0.0;  // rad/s^2
+struct RoboPlanCandidateProjectionDTO final {
+  core::ProjectionLeaseBindingDTO projection_binding;
+  core::CollisionWorldSnapshotPtr world;
+  std::shared_ptr<const core::CollisionPolicySnapshot> policy;
+  /// Planning-only allowance for this operation's resolved grasp pairs.
+  /// Coordinator and runtime contact constraints remain authoritative.
+  std::optional<std::string> contact_policy_id{};
+  /// The Kernel's clearance margins for this operation. They do not change
+  /// the selected worker generation; they are sent with each plan request.
+  std::shared_ptr<const core::CollisionClearanceMargins> clearance_margins{};
 };
 
-/// Optional qualification-only collision counter sampled at planner stage
-/// boundaries. Production adapters leave the probe unavailable; benchmark
-  /// builds can provide an interposed RoboPlan Scene/CollisionContext counter
-  /// without changing planner behavior or linking two RoboPlan versions into
-  /// one process.
-struct RoboPlanCollisionProbeSnapshot {
-  bool available = false;
-  std::uint64_t query_count = 0;
-  std::uint64_t query_duration_ns = 0;
-};
-
-struct RoboPlanAllocationProbeSnapshot {
-  bool available = false;
-  std::uint64_t allocation_count = 0;
-  std::uint64_t allocation_bytes = 0;
-};
-
-struct RoboPlanPlanningStageMetrics {
-  std::uint64_t duration_ns = 0;
-  std::uint64_t collision_query_count = 0;
-  std::uint64_t collision_query_duration_ns = 0;
-  std::uint64_t allocation_count = 0;
-  std::uint64_t allocation_bytes = 0;
-};
-
-/// One immutable planner invocation measurement. It intentionally contains
-/// backend-stage facts only; dispatch, authoritative validation, and runtime
-/// collision evidence remain owned by their respective ManyForge surfaces.
-struct RoboPlanPlanningPipelineMetrics {
-  std::map<std::string, RoboPlanPlanningStageMetrics> stages;
-  std::uint64_t total_duration_ns = 0;
-  std::uint64_t total_collision_query_count = 0;
-  std::uint64_t total_collision_query_duration_ns = 0;
-  bool collision_probe_available = false;
-  bool measurement_complete = true;
-  bool succeeded = false;
-  std::string error_code;
-  std::size_t waypoint_count = 0;
-  double trajectory_duration_s = 0.0;
-  std::optional<std::uint32_t> rng_base_seed;
-  std::optional<std::uint32_t> rng_seed;
-  std::optional<int> shortcut_rng_seed_argument;
-  std::uint32_t planning_attempt_index = 0;
-};
-
-/// NRT qualification observer. Implementations must be thread-safe and must
-/// not throw. The planner calls this surface only when enabled; production
-/// factories do not install an observer.
-class IRoboPlanPlanningPerformanceObserver {
+/// Private candidate-computation transport used by the addressed planner
+/// adapter. The production implementation is a supervised worker process;
+/// focused tests may provide an in-memory implementation. No public caller can
+/// select a model, generated group, or worker through this surface.
+class IRoboPlanCandidateClient {
  public:
-  virtual ~IRoboPlanPlanningPerformanceObserver() = default;
-  virtual RoboPlanCollisionProbeSnapshot collision_probe_snapshot()
-      const noexcept = 0;
-  /// Optional NRT qualification hook. Production factories do not install an
-  /// observer, so allocation attribution adds no production-path work.
-  virtual RoboPlanAllocationProbeSnapshot allocation_probe_snapshot()
-      const noexcept {
-    return {};
+  virtual ~IRoboPlanCandidateClient() = default;
+
+  [[nodiscard]] virtual const RoboPlanCandidateBindingDTO& binding() const noexcept = 0;
+
+  [[nodiscard]] virtual core::Result<core::TrajectoryDTO> compute(
+      const RoboPlanCandidateRequestDTO& request) = 0;
+
+  [[nodiscard]] virtual core::Result<std::vector<double>> solve_ik(
+      const core::Pose3DTO& goal, const core::ResolvedFrameDTO& base_frame,
+      const core::ResolvedFrameDTO& tcp_frame, const core::ControlledStateDTO& seed_state,
+      double timeout_s) = 0;
+
+  /// True only for production clients whose worker scene is selected from the
+  /// exact Kernel-retained projection before planning or IK.
+  [[nodiscard]] virtual bool requires_retained_projection() const noexcept { return false; }
+
+  /// Select one immutable retained projection. Fixed-model test clients keep
+  /// this no-op; a client reporting `true` above must replace its worker
+  /// generation whenever the selected identity changes.
+  [[nodiscard]] virtual core::Result<void> select_retained_projection(
+      const RoboPlanCandidateProjectionDTO&) {
+    return core::Result<void>::Ok();
   }
-  /// Atomically admit one invocation into the observer's lifetime. Returning
-  /// false excludes the invocation from measurement after capture admission
-  /// has closed, even if the planner retained an older observer snapshot.
-  virtual bool try_begin_invocation(const core::PlanRequestDTO&) noexcept {
-    return true;
+
+  /// Replace the cell planning model a retained-projection worker is built
+  /// from. The worker is retired and the projection selection cleared, so no
+  /// later request can plan before its exact projection is reselected against
+  /// the replacement model. Fixed-model clients have no replaceable model.
+  [[nodiscard]] virtual core::Result<void> replace_retained_model(
+      const RoboPlanWorkerModelDTO& model);
+
+  /// Replace the planner settings (seed, collision-check step; cell context)
+  /// a retained-projection worker is started with. A worker started with
+  /// other settings is retired; the next request starts one with these.
+  /// Fixed test clients keep their own.
+  [[nodiscard]] virtual core::Result<void> replace_retained_settings(
+      const RoboPlanCandidateComputerConfig&) {
+    return core::Result<void>::Ok();
   }
-  virtual void record(
-      const core::PlanRequestDTO& request,
-      const core::PlanResultDTO& result,
-      const RoboPlanPlanningPipelineMetrics& metrics) noexcept = 0;
+
+  /// Non-blocking cancellation of only the currently active request.
+  virtual void request_cancel() noexcept = 0;
 };
 
-/// Sample peak |velocity| / |acceleration| per capped joint from `traj` and
-/// compare against the requested absolute caps. Caps are keyed by joint name;
-/// only joints present in `traj.joint_names` are measured. If a capped
-/// dimension is missing a sample for any waypoint of a capped joint, the
-/// returned measurement has `samples_complete == false` and records the
-/// offending dimension/joint (the trajectory cannot prove cap compliance).
-JointCapMeasurement measure_joint_cap_peaks(
-    const roboplan::JointTrajectory& traj,
-    const std::map<std::string, double>& vel_cap_by_name,
-    const std::map<std::string, double>& acc_cap_by_name);
+struct RoboPlanPlannerBackendConfig final {
+  /// Used only when IkRequestDTO::timeout_s is <= 0.
+  double default_single_shot_ik_timeout_s{0.05};
+};
 
-/// Native C++ planner backend wrapping RoboPlan RRT + PathShortcutter + TOPPRA + IK.
-/// No Python trampolines — all calls stay in C++.
+/// Resource-addressed IPlannerBackend adapter for RoboPlan 0.8.
+///
+/// This boundary validates the complete Kernel-issued participant/projection
+/// identity, strips it to the exact private candidate contract, and restores
+/// only portable resources and frame identities in the result. Opaque native
+/// planning runs behind IRoboPlanCandidateClient so Stop can terminate a
+/// wedged worker without depending on RoboPlan cooperative cancellation.
 class RoboPlanPlannerBackend final : public core::IPlannerBackend {
  public:
-  RoboPlanPlannerBackend(
-      std::shared_ptr<RoboPlanSceneProjection> projection,
-      std::shared_ptr<roboplan::Scene> live_scene,
-      const roboplan::RRTOptions& rrt_options,
-      std::shared_ptr<std::mutex> scene_mutex = nullptr,
-      std::optional<roboplan::SimpleIkOptions> ik_options = std::nullopt,
-      std::optional<roboplan::SimpleIkOptions> single_shot_ik_options =
-          std::nullopt,
-      std::optional<std::uint32_t> rng_seed = std::nullopt,
-      std::shared_ptr<IRoboPlanPlanningPerformanceObserver>
-          performance_observer = nullptr);
+  RoboPlanPlannerBackend(core::ProjectionLeaseBindingDTO projection_binding,
+                         RoboPlanCandidateBindingDTO candidate_binding,
+                         std::unique_ptr<IRoboPlanCandidateClient> candidate_client,
+                         RoboPlanPlannerBackendConfig config = {});
 
-  core::PlanResultDTO plan(const core::PlanRequestDTO& request) override;
+  RoboPlanPlannerBackend(const RoboPlanPlannerBackend&) = delete;
+  RoboPlanPlannerBackend& operator=(const RoboPlanPlannerBackend&) = delete;
 
+  [[nodiscard]] core::PlanResultDTO plan(const core::PlanRequestDTO& request) override;
   void request_cancel() override;
+  [[nodiscard]] core::IkResultDTO solve_ik(const core::IkRequestDTO& request) override;
 
-  void set_performance_observer(
-      std::shared_ptr<IRoboPlanPlanningPerformanceObserver> observer) noexcept;
+  /// Construction-time structural/scene-lineage anchor. Individual planning
+  /// calls carry their own exact current projection lease; the adapter must
+  /// not freeze the logical-scene revision at process startup.
+  [[nodiscard]] core::ProjectionLeaseBindingDTO projection_binding() const {
+    std::shared_lock lock(projection_mutex_);
+    return projection_binding_;
+  }
 
-  core::IkResultDTO solve_ik(const core::IkRequestDTO& request) override;
+  /// Re-anchor an unchanged planner/controller to the candidate Scene product
+  /// under the Manager's Apply fence. An in-flight plan/IK query finishes on
+  /// its predecessor lease before the new lease becomes visible.
+  [[nodiscard]] core::Result<void> RebindProjection(
+      const core::ProjectionLeaseBindingDTO& expected_predecessor,
+      core::ProjectionLeaseBindingDTO candidate);
+
+  /// Replace the cell planning model of this unchanged planner under the
+  /// Manager's Apply fence, when a retained controller's candidate product
+  /// carries another cell planning model. An in-flight plan/IK query finishes
+  /// on its predecessor model before the replacement becomes visible.
+  [[nodiscard]] core::Result<void> ReplaceRetainedModel(
+      const RoboPlanWorkerModelDTO& model);
+
+  /// Replace the planner settings of this unchanged planner under the
+  /// Manager's Apply fence (they are cell context: a retained component
+  /// takes the candidate's). An in-flight query finishes on the old ones.
+  [[nodiscard]] core::Result<void> ReplaceRetainedSettings(
+      const RoboPlanCandidateComputerConfig& settings);
+
+  [[nodiscard]] const RoboPlanCandidateBindingDTO& candidate_binding() const noexcept {
+    return candidate_binding_;
+  }
 
  private:
-  core::TrajectoryDTO convert_trajectory(const roboplan::JointTrajectory& traj);
-
-  std::shared_ptr<RoboPlanSceneProjection> projection_;
-  std::shared_ptr<roboplan::Scene> live_scene_;
-  roboplan::RRTOptions rrt_options_;
-  std::shared_ptr<std::mutex> scene_mutex_;
-  roboplan::SimpleIkOptions ik_options_;
-  roboplan::SimpleIkOptions single_shot_ik_options_;
-  std::optional<std::uint32_t> rng_seed_;
-  std::atomic<std::shared_ptr<IRoboPlanPlanningPerformanceObserver>>
-      performance_observer_;
-  std::atomic_bool cancel_requested_{false};
+  mutable std::shared_mutex projection_mutex_;
+  core::ProjectionLeaseBindingDTO projection_binding_;
+  RoboPlanCandidateBindingDTO candidate_binding_;
+  std::unique_ptr<IRoboPlanCandidateClient> candidate_client_;
+  RoboPlanPlannerBackendConfig config_;
 };
 
 }  // namespace manyforge::roboplan_backend

@@ -1,0 +1,75 @@
+{
+  "schema_version": "manyforge.stop_terminal_freshness_native.v1",
+  "status": "PASS_FOCUSED_NATIVE_ONLY_NOT_DEPLOYED",
+  "started_utc": "2026-10-16T08:12:15.920543+00:00",
+  "finished_utc": "2026-10-16T08:12:34.376513+00:00",
+  "source": {
+    "base_commit": "d3920e13f0f9560a6b83fd8329570a6bb64d17c2",
+    "freeze_manifest_sha256": "fb02c0799df55436afcb7fe6057025fa29ede011b47be3148b38890770bc27a3",
+    "owned_paths": [
+      {
+        "path": "manyforge_core/src/participant_stop_stage_helper.cpp",
+        "pre_sha256": "cfb265f908f5b80aed13cdcb8593dbc3cf62e9b3ae4898671e9e57f60d1f2bec",
+        "post_sha256": "864d859ca9d43ca209055c110730242aa05522844ead8d92a3ad464b20a50555"
+      },
+      {
+        "path": "manyforge_core/test/test_participant_stop_stage_helper.cpp",
+        "pre_sha256": "246e7d8ac944480eff5cb6c9498fbba1d07254db0e2de0a8490c27ffc58a6429",
+        "post_sha256": "0f8539c56f554291313d6174dbb966890c4b1908dff6abcb288f73a5ec598a50"
+      }
+    ],
+    "core_and_content_identity_files_verified": 521,
+    "context_mismatches": 0
+  },
+  "environment": {
+    "architecture": "aarch64",
+    "image_id": "sha256:38e8d72a6b700059332aa63baa63e7a21c672376ad6582102fc62088081f74ab",
+    "graph": "retained isolated ROS integration graph",
+    "parallel_jobs": 2
+  },
+  "build": {
+    "command": "cmake --build /runner/build/ros-integration --parallel 2 --target test_participant_stop_stage_helper",
+    "actions": [
+      "compile participant_stop_stage_helper.cpp",
+      "compile test_participant_stop_stage_helper.cpp",
+      "link manyforge_core shared library",
+      "link test_participant_stop_stage_helper"
+    ],
+    "ros_or_host_targets_built": false,
+    "elapsed_build_and_tests_s": 18.455977401987184,
+    "exit_code": 0,
+    "dry_run_note": "CMake CONFIGURE_DEPENDS hides target actions in standard Ninja dry-run. An evidence-only manifest copy omitted the manifest-regeneration edge to inspect the target plan; actual build used unchanged standard graph."
+  },
+  "tests": {
+    "command": "/runner/build/ros-integration/core/test_participant_stop_stage_helper --gtest_output=xml:/evidence/tests.xml",
+    "cases": 59,
+    "passed": 59,
+    "failed": 0,
+    "disabled": 0,
+    "errors": 0,
+    "elapsed_s": 0.028,
+    "new_cases": 4,
+    "new_scripted_variants": 14
+  },
+  "effects": {
+    "live_source_modified": false,
+    "live_graph_modified": false,
+    "live_runtime_commands": false,
+    "artifact_deployment": false,
+    "private_runtime_started": false
+  },
+  "limits": [
+    "Focused ROS-free Core fixture only; no real hardware or ROS provider behavior qualified.",
+    "Provider binding-epoch source proof reviewed separately.",
+    "No live deployment of the Stop source slice."
+  ],
+  "raw_evidence_identifier": "post-m1-r4-inventory-20261016/terminal-freshness-freeze01/native-gate01",
+  "artifacts_sha256": {
+    "receipt.json": "7cf33b3ae0153733cb62176c8c549c0975613cbab9aeb17c06e8036f859f204b",
+    "build.log": "4583c064e9b54d2fab8523b3fd6dfbbefd506ecc70f1ee65489eaa782a8c2d66",
+    "tests.log": "87e516eb85dc5b1497c1cfc1394d4508f607d9d06f01c1181307ca5dab8388be",
+    "tests.xml": "be8fee7fbf06e0510793724e6ae44f7e22c26b0a5191e9b4200f0b86b803dcde",
+    "core-input-verification.json": "ba109197b09293ef9e659f6f44438c0835f3430f8d25865c18cdd5c4ba55b09a",
+    "dryrun-target-only.log": "2d623a3c95cce81d7ab684f2d8b60975a7eac8bec9f4c4061b78b42f22209eda"
+  }
+}

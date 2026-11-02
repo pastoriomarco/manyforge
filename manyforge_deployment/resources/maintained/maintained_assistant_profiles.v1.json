@@ -1,0 +1,283 @@
+{
+  "api_version": "manyforge.maintained_assistant_profiles.v1",
+  "mode_profiles": {
+    "scene_authoring": {
+      "composer-assistant": {
+        "enabled": true,
+        "description": "Scene and Program authoring mode for Composer: edits land in the Program Draft.",
+        "grant_policy": {
+          "session_kind": null,
+          "approval_mode": null,
+          "review_policy": "required"
+        },
+        "catalog": {
+          "skills": [],
+          "tools": [
+            "blackboard_draft_remove_keys",
+            "blackboard_draft_remove_namespaces",
+            "blackboard_draft_upsert_keys",
+            "blackboard_draft_upsert_namespaces",
+            "catalog_read",
+            "deployment_capabilities_read",
+            "inspect_isaac_scene",
+            "program_draft_remove_parameters",
+            "program_draft_upsert_parameters",
+            "program_read",
+            "scene_draft_add_object",
+            "scene_draft_remove_objects",
+            "scene_draft_update_object",
+            "scene_draft_upsert_objects",
+            "scene_inspect",
+            "skills_read",
+            "tree_draft_change_node_kind",
+            "tree_draft_delete_node",
+            "tree_draft_insert_node",
+            "tree_draft_move_node",
+            "tree_draft_rename_node",
+            "tree_draft_replace_subtree",
+            "tree_draft_update_node_params",
+            "tree_draft_wrap_node"
+          ],
+          "nodes": [
+            "fallback",
+            "gripper.command_position",
+            "inverter",
+            "logic.set_value",
+            "logic.wait_for_value",
+            "motion.follow_cartesian_path",
+            "motion.move_to_joint_target",
+            "motion.move_to_pose",
+            "parallel",
+            "repeat",
+            "retry",
+            "scene.add_object",
+            "scene.attach_carried_object",
+            "scene.detach_carried_object",
+            "scene.remove_object",
+            "scene.update_object_pose",
+            "scene.upsert_object",
+            "sequence",
+            "simulation.reset",
+            "simulation.set_entity_pose",
+            "simulation.set_state",
+            "simulation.step",
+            "timer"
+          ]
+        }
+      }
+    }
+  },
+  "profiles": [
+    {
+      "profile_id": "assistant_scene_authoring",
+      "audit_policy": {
+        "store_full_prompts": false,
+        "store_full_responses": false,
+        "redact_argument_values": true
+      },
+      "prompt_templates": {},
+      "model_endpoints": [
+        {
+          "model_endpoint_alias": "assistant_model",
+          "model_id": "gemma4-12b-it-gguf",
+          "site_overlay_value_ref": "resources.assistant_scene_authoring.assistant_model",
+          "endpoint_value": "http://127.0.0.1:8100/v1/manyforge/assistant",
+          "historical_profile_ref": "thor_gemma4_12b_gguf",
+          "request_contract": {
+            "default_timeout_s": 180.0,
+            "max_output_tokens": 8192,
+            "supported_image_transports": [],
+            "supports_image_input": false,
+            "supports_json_object": true,
+            "supports_response_tools": true,
+            "tool_call_family": "openai_chat_tools"
+          }
+        }
+      ],
+      "provider_alias": {
+        "provider_alias_id": "assistant_provider",
+        "provider_kind": "nemoclaw",
+        "bridge_external_resource_alias": "assistant_bridge",
+        "site_overlay_value_ref": "resources.assistant_scene_authoring.assistant_bridge",
+        "endpoint_value": "http://127.0.0.1:8100/v1/manyforge/assistant"
+      },
+      "mode_profile_id": "scene_authoring"
+    },
+    {
+      "profile_id": "semantic_shape_selection",
+      "audit_policy": {
+        "store_full_prompts": false,
+        "store_full_responses": false,
+        "redact_argument_values": true
+      },
+      "prompt_templates": {
+        "select_scene_object_v1": {
+          "version": "1",
+          "template_text": "You are selecting the next object for a perception-guided pick cycle. Use the authoritative backend scene manifest as the primary source of truth for object IDs, poses, shapes, sizes, and spatial semantics. If an image is attached, use it only as auxiliary evidence for attributes that are not already explicit in the manifest. Selection request: `{{ selection_request_text }}`\nAuthoritative scene context JSON: {{ scene_context_json }}\nYou must answer by calling the `select_scene_object` tool. Use the exact candidate object ID when outcome=`selected`. Use an empty string for `selected_object_id` when outcome is `no_match` or `ambiguous`.",
+          "variables": {
+            "candidate_object_ids": "string_list",
+            "scene_context_json": "string",
+            "selection_request_text": "string"
+          },
+          "response_contract": {
+            "response_mode": "tool_call",
+            "tool_name": "select_scene_object",
+            "tool_description": "Choose one candidate object from the current runtime scene context."
+          }
+        }
+      },
+      "model_endpoints": [
+        {
+          "model_endpoint_alias": "assistant_model",
+          "model_id": "cosmos-reason2-8b",
+          "site_overlay_value_ref": "resources.semantic_shape_selection.assistant_model",
+          "endpoint_value": "http://127.0.0.1:8200/v1/manyforge/assistant",
+          "historical_profile_ref": "thor_cosmos_reason2_8b",
+          "request_contract": {
+            "default_timeout_s": 180.0,
+            "max_output_tokens": 8192,
+            "supported_image_transports": [
+              "http_url",
+              "inline_data_url"
+            ],
+            "supports_image_input": true,
+            "supports_json_object": true,
+            "supports_response_tools": true,
+            "tool_call_family": "openai_chat_tools"
+          }
+        },
+        {
+          "model_endpoint_alias": "selection_model",
+          "model_id": "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge",
+          "site_overlay_value_ref": "resources.semantic_shape_selection.selection_model",
+          "endpoint_value": "http://127.0.0.1:8000/v1",
+          "historical_profile_ref": "thor_manyforge_qwen36",
+          "request_contract": {
+            "default_timeout_s": 30.0,
+            "max_output_tokens": 384,
+            "supported_image_transports": [],
+            "supports_image_input": false,
+            "supports_json_object": true,
+            "supports_response_tools": true,
+            "tool_call_family": "openai_chat_tools"
+          }
+        }
+      ],
+      "provider_alias": {
+        "provider_alias_id": "assistant_provider",
+        "provider_kind": "direct",
+        "bridge_external_resource_alias": "assistant_bridge",
+        "site_overlay_value_ref": "resources.semantic_shape_selection.assistant_bridge",
+        "endpoint_value": "http://127.0.0.1:8200/v1/manyforge/assistant"
+      },
+      "mode_profile_id": "scene_authoring"
+    },
+    {
+      "profile_id": "vision_bin_selection",
+      "audit_policy": {
+        "store_full_prompts": false,
+        "store_full_responses": false,
+        "redact_argument_values": true
+      },
+      "prompt_templates": {
+        "choose_bin_target_v1": {
+          "version": "1",
+          "template_text": "You are selecting the next object for a pick-and-place cycle. Inspect the attached scene snapshot and choose exactly one target: the left object (`left_part`) or the right object (`right_part`). Prefer a target that is clearly visible and isolated. Return JSON only with: - `pick_left_bin`: boolean - `selected_object_id`: string, one of `left_part` or `right_part` - `confidence`: number from 0.0 to 1.0 - `reason`: short string",
+          "variables": {},
+          "response_contract": {
+            "response_mode": "json_object"
+          }
+        }
+      },
+      "model_endpoints": [
+        {
+          "model_endpoint_alias": "vision_model",
+          "model_id": "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge",
+          "site_overlay_value_ref": "resources.vision_bin_selection.vision_model",
+          "endpoint_value": "http://127.0.0.1:8000/v1",
+          "historical_profile_ref": "thor_manyforge_qwen36",
+          "request_contract": {
+            "default_timeout_s": 30.0,
+            "max_output_tokens": 512,
+            "supported_image_transports": [
+              "http_url",
+              "inline_data_url"
+            ],
+            "supports_image_input": true,
+            "supports_json_object": true,
+            "supports_response_tools": true,
+            "tool_call_family": "openai_chat_tools"
+          }
+        }
+      ],
+      "provider_alias": null,
+      "mode_profile_id": null
+    },
+    {
+      "profile_id": "vision_pose_selection",
+      "audit_policy": {
+        "store_full_prompts": false,
+        "store_full_responses": false,
+        "redact_argument_values": true
+      },
+      "prompt_templates": {
+        "infer_grasp_pose_v1": {
+          "version": "1",
+          "template_text": "You are planning a top-down pick for a UR5 cell. Inspect the attached scene snapshot and choose exactly one visible target: `left_part` or `right_part`. Return JSON only with: - `selected_object_id`: string, one of `left_part` or `right_part` - `approach_pose`: object with `position_m` and `orientation_rpy_deg` - `grasp_pose`: object with `position_m` and `orientation_rpy_deg` - `confidence`: number from 0.0 to 1.0 - `reason`: short string Both poses must be expressed in `base_link`. Use a top-down tool orientation `[180.0, 0.0, -90.0]`. `approach_pose` should be above the part, and `grasp_pose` should be the final descend target.",
+          "variables": {},
+          "response_contract": {
+            "response_mode": "json_object"
+          }
+        }
+      },
+      "model_endpoints": [
+        {
+          "model_endpoint_alias": "assistant_model",
+          "model_id": "cosmos-reason2-8b",
+          "site_overlay_value_ref": "resources.vision_pose_selection.assistant_model",
+          "endpoint_value": "http://127.0.0.1:8200/v1/manyforge/assistant",
+          "historical_profile_ref": "thor_cosmos_reason2_8b",
+          "request_contract": {
+            "default_timeout_s": 180.0,
+            "max_output_tokens": 8192,
+            "supported_image_transports": [
+              "http_url",
+              "inline_data_url"
+            ],
+            "supports_image_input": true,
+            "supports_json_object": true,
+            "supports_response_tools": true,
+            "tool_call_family": "openai_chat_tools"
+          }
+        },
+        {
+          "model_endpoint_alias": "vision_model",
+          "model_id": "cosmos-reason2-8b",
+          "site_overlay_value_ref": "resources.vision_pose_selection.vision_model",
+          "endpoint_value": "http://127.0.0.1:8000/v1",
+          "historical_profile_ref": "thor_cosmos_reason2_8b",
+          "request_contract": {
+            "default_timeout_s": 120.0,
+            "max_output_tokens": 512,
+            "supported_image_transports": [
+              "http_url",
+              "inline_data_url"
+            ],
+            "supports_image_input": true,
+            "supports_json_object": true,
+            "supports_response_tools": true,
+            "tool_call_family": "openai_chat_tools"
+          }
+        }
+      ],
+      "provider_alias": {
+        "provider_alias_id": "assistant_provider",
+        "provider_kind": "direct",
+        "bridge_external_resource_alias": "assistant_bridge",
+        "site_overlay_value_ref": "resources.vision_pose_selection.assistant_bridge",
+        "endpoint_value": "http://127.0.0.1:8200/v1/manyforge/assistant"
+      },
+      "mode_profile_id": "scene_authoring"
+    }
+  ]
+}

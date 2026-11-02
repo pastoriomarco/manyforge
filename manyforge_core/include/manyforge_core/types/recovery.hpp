@@ -1,10 +1,9 @@
 #pragma once
 
+#include <cstdint>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/interrupt.hpp>
-
-#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -46,14 +45,18 @@ enum class AtRestEvidence {
 enum class RecoveryClass {
   kNone,
   kRuntimeCollision,
-  kStopFaultIntervention,
   kFailedValidation,
   kOrdinaryOperatorStop,
   kUnknownFault,
+  /// A Stop the Program's own configuration requested (interrupt rule trip,
+  /// carried object lost), settled at its first stage: the Program's
+  /// ordinary failure, never an operator hold. Published by the addressed
+  /// Kernel only; a participant engine never derives it.
+  kOrdinaryProgramStop,
 };
 
-/// Shared recovery action identifiers. The first four are valid non-resetting
-/// kernel commands. `reset_cycle` is offer-only: assessments may advertise it
+/// Shared recovery and motion-free closure action identifiers. `reset_cycle`
+/// is offer-only: assessments may advertise it
 /// and untrusted wire input may contain it, but ApplyRecoveryAction always
 /// rejects it because the existing cycle Reset route owns execution
 /// (spec/230 §3.7.1).
@@ -65,6 +68,8 @@ enum class RecoveryAction {
   /// Offer-only action. ApplyRecoveryAction always rejects this value because
   /// the existing cycle Reset command is its sole execution path.
   kResetCycle,
+  /// Retire settled ownership without motion, Reset or fault clearance.
+  kCloseOperation,
 };
 
 /// Assessment status published to consumers.
@@ -76,8 +81,52 @@ enum class RecoveryAssessmentStatus {
   kResetRequired,   ///< Only the cycle Reset route can clear this state.
 };
 
+/// Automatic retry is narrower than the existing manual recovery actions.
+enum class MotionRetryCause {
+  kNotEligible,
+  kPlanningNoEffect,
+  kCollisionStopNominal,
+};
+
+enum class MotionRetryEffect {
+  kKnownNoEffect,
+  kEffectObserved,
+  kEffectUncertain,
+};
+
+/// Closed Kernel-owned reasons; adapter error text never becomes policy.
+enum class MotionRetryIneligibilityReason {
+  kNone,
+  kNotRetryableState,
+  kFailureCauseNotRetryable,
+  kDispatchAbsenceUnproven,
+  kEffectUncertain,
+  kEffectObserved,
+  kValidationNotConclusiveCollision,
+  kStopOwnerActive,
+  kStrongerAuthorityActive,
+  kLatchPresent,
+  kStopNotSettled,
+  kStopNotNominal,
+  kStopNotControlled,
+  kObservationNotQualified,
+  kCollisionNotConclusive,
+  kOperationInFlight,
+  kProgramScopeRequired,
+};
+
+struct MotionRetryEligibilityDTO final {
+  bool eligible{false};
+  MotionRetryCause cause{MotionRetryCause::kNotEligible};
+  MotionRetryEffect effect{MotionRetryEffect::kEffectUncertain};
+  MotionRetryIneligibilityReason reason{MotionRetryIneligibilityReason::kNotRetryableState};
+
+  friend bool operator==(const MotionRetryEligibilityDTO&,
+                         const MotionRetryEligibilityDTO&) = default;
+};
+
 /// Immutable record that a stop authority reached a definitive result.
-/// Keyed by (execution_id, latch_id, stop_owner kind+generation); a late
+/// Keyed by (execution_id, stop_owner kind+generation); a late
 /// completion from an older owner generation can never overwrite or become
 /// authoritative for a newer generation (spec/230 §3.7.1).
 struct KernelStopCertificateDTO {
@@ -85,21 +134,16 @@ struct KernelStopCertificateDTO {
   std::string certificate_id;
   /// Strictly increasing publication counter across all certificates.
   std::uint64_t certificate_revision = 0;
-  StopCertificateOutcome completion_result =
-      StopCertificateOutcome::kBackendPreemptFailed;
+  StopCertificateOutcome completion_result = StopCertificateOutcome::kBackendPreemptFailed;
   StopOwnerKind stop_owner = StopOwnerKind::kOperatorStopWorker;
   std::uint64_t stop_owner_generation = 0;
   std::uint64_t execution_id = 0;
-  /// Interrupt latch this stop belongs to; empty for ordinary operator /
-  /// motion-trip stops that carry no latch.
-  std::string latch_id;
   std::uint64_t control_command_epoch = 0;
   std::string requested_stop_mode;
   std::string executed_stop_mode;
   std::string command_source;
   /// Meaningful for fault-preempt certificates; `kNoneRequired` otherwise.
-  InterruptPreemptionResult preemption_result =
-      InterruptPreemptionResult::kNoneRequired;
+  InterruptPreemptionResult preemption_result = InterruptPreemptionResult::kNoneRequired;
   bool backend_stop_confirmed = false;
   std::uint64_t observed_state_sequence = 0;
   std::string observed_state_source_id;
@@ -151,15 +195,14 @@ struct KernelRecoveryAssessmentDTO {
   ExecutionState execution_state = ExecutionState::kIdle;
   RecoveryClass recovery_class = RecoveryClass::kNone;
   RecoveryAssessmentStatus status = RecoveryAssessmentStatus::kUnavailable;
-  std::string latch_id;
   std::string source_id;
   std::string policy_id;
-  InterruptPreemptionResult preemption_result =
-      InterruptPreemptionResult::kNoneRequired;
+  InterruptPreemptionResult preemption_result = InterruptPreemptionResult::kNoneRequired;
   bool stop_owner_active = false;
   std::uint64_t stop_owner_generation = 0;
   bool backend_stop_confirmed = false;
   std::string stop_certificate_id;
+  std::uint64_t stop_certificate_revision = 0;
   /// Observation facts. `observed_state_available=false` until RT-8C wires
   /// the dedicated publication; freshness/at-rest are then fail-closed.
   bool observed_state_available = false;
@@ -171,7 +214,6 @@ struct KernelRecoveryAssessmentDTO {
   bool observed_state_measured = false;
   std::int64_t observed_state_valid_until_ns = 0;
   bool stronger_authority_active = false;
-  bool queued_latch_present = false;
   bool retry_admissible = false;
   std::vector<RecoveryAction> allowed_actions;
   /// Stable machine-readable reason for the current status.
@@ -179,6 +221,13 @@ struct KernelRecoveryAssessmentDTO {
   /// Bounded references to native events / certificate ids backing this
   /// assessment (spec/500 correlation spine).
   std::vector<std::string> evidence_refs;
+
+  MotionRetryEligibilityDTO retry_eligibility;
+  /// General motion-free retirement permission, independent of retry policy.
+  bool eligible_close{false};
+
+  friend bool operator==(const KernelRecoveryAssessmentDTO&,
+                         const KernelRecoveryAssessmentDTO&) = default;
 };
 
 /// Request for the single generation-bound kernel recovery command.
@@ -189,13 +238,15 @@ struct KernelRecoveryActionRequestDTO {
   std::uint64_t expected_assessment_revision = 0;
   std::uint64_t expected_control_command_epoch = 0;
   std::uint64_t expected_execution_id = 0;
-  std::string expected_latch_id;
   std::string expected_stop_certificate_id;
   std::uint64_t expected_stop_owner_generation = 0;
   std::string reason;
+  /// The addressed owner requires exact captured node scope and effect proof.
+  /// False preserves manual recovery continuation; close_operation requires false.
+  bool fresh_motion_attempt{false};
 };
 
-/// Result of `ApplyRecoveryAction`. On rejection the kernel state, latch,
+/// Result of `ApplyRecoveryAction`. On rejection the kernel state,
 /// certificate, stop owner, backend command, and control epoch are unchanged
 /// and `resulting_assessment` carries the newest assessment.
 struct KernelRecoveryActionResultDTO {
@@ -212,5 +263,8 @@ const char* at_rest_evidence_name(AtRestEvidence evidence);
 const char* recovery_class_name(RecoveryClass recovery_class);
 const char* recovery_action_name(RecoveryAction action);
 const char* recovery_assessment_status_name(RecoveryAssessmentStatus status);
+const char* motion_retry_cause_name(MotionRetryCause cause);
+const char* motion_retry_effect_name(MotionRetryEffect effect);
+const char* motion_retry_ineligibility_reason_name(MotionRetryIneligibilityReason reason);
 
 }  // namespace manyforge::core

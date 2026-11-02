@@ -1,0 +1,25 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md): the Mock I/O of
+# a pneumatic gripper, a valve output and a grasp sensor that echoes it, as in
+# examples/mock_lite6_pneumatic_pick_and_place.scenario.
+api_version: manyforge.component_package.v1
+kind: io_device
+id: manyforge.mock_pneumatic_gripper_io
+version: 1.0.0
+title: Mock pneumatic gripper I/O (valve and grasp sensor)
+license: Apache-2.0
+signals:
+  - signal_name: valve
+    direction: output
+    value_type: bool
+    provider: {profile: mock_output, channel: pneumatic_valve}
+  - signal_name: workpiece_grasped
+    direction: input
+    value_type: bool
+    provider:
+      profile: mock
+      initial_value: false
+      ingress_depth: 64
+      echo: {output_signal_name: valve, delay_ms: 100}
+    freshness: {mode: provider_validity}
+    transition_capability: sampled_only
+    update_mode: change_only

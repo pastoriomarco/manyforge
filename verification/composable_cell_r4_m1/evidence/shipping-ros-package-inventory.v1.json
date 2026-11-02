@@ -1,0 +1,111 @@
+{
+  "schema_version": "manyforge.shipping_ros_package_inventory.v1",
+  "status": "READ_ONLY_INSTALLED_METADATA",
+  "captured_utc": "2026-10-16T09:11:21.677345+00:00",
+  "image_id": "sha256:712e576565aad0f9982d3305efd7cad1f04c0a18d644442f2419101839ee6773",
+  "ros_distro": "lyrical",
+  "packages": {
+    "hardware_interface": {
+      "package_xml_present": true,
+      "package_version": "6.9.0",
+      "installed_header_sample_count": 18,
+      "package_named_library_present": true,
+      "plugin_classes": [
+        {
+          "name": "mock_components/GenericSystem",
+          "type": "mock_components::GenericSystem",
+          "base_class_type": "hardware_interface::SystemInterface"
+        }
+      ]
+    },
+    "controller_interface": {
+      "package_xml_present": true,
+      "package_version": "6.9.0",
+      "installed_header_sample_count": 16,
+      "package_named_library_present": true,
+      "plugin_classes": []
+    },
+    "ros2_control": {
+      "package_xml_present": true,
+      "package_version": "6.9.0",
+      "installed_header_sample_count": 0,
+      "package_named_library_present": false,
+      "plugin_classes": []
+    },
+    "ros2_controllers": {
+      "package_xml_present": true,
+      "package_version": "6.9.0",
+      "installed_header_sample_count": 0,
+      "package_named_library_present": false,
+      "plugin_classes": []
+    },
+    "joint_trajectory_controller": {
+      "package_xml_present": true,
+      "package_version": "6.9.0",
+      "installed_header_sample_count": 7,
+      "package_named_library_present": true,
+      "plugin_classes": [
+        {
+          "name": "joint_trajectory_controller/JointTrajectoryController",
+          "type": "joint_trajectory_controller::JointTrajectoryController",
+          "base_class_type": "controller_interface::ControllerInterface"
+        }
+      ]
+    },
+    "forward_command_controller": {
+      "package_xml_present": true,
+      "package_version": "6.9.0",
+      "installed_header_sample_count": 5,
+      "package_named_library_present": true,
+      "plugin_classes": [
+        {
+          "name": "forward_command_controller/ForwardCommandController",
+          "type": "forward_command_controller::ForwardCommandController",
+          "base_class_type": "controller_interface::ControllerInterface"
+        },
+        {
+          "name": "forward_command_controller/MultiInterfaceForwardCommandController",
+          "type": "forward_command_controller::MultiInterfaceForwardCommandController",
+          "base_class_type": "controller_interface::ControllerInterface"
+        }
+      ]
+    },
+    "position_controllers": {
+      "package_xml_present": false,
+      "package_version": null,
+      "installed_header_sample_count": 0,
+      "package_named_library_present": false,
+      "plugin_classes": []
+    }
+  },
+  "debian_package_versions": [
+    "ros-lyrical-controller-interface\t6.9.0-1noble.20260819.155450",
+    "ros-lyrical-forward-command-controller\t6.9.0-1noble.20260819.155838",
+    "ros-lyrical-hardware-interface\t6.9.0-1noble.20260819.153823",
+    "ros-lyrical-joint-trajectory-controller\t6.9.0-1noble.20260819.155727",
+    "ros-lyrical-ros2-control\t6.9.0-1noble.20260819.162632",
+    "ros-lyrical-ros2-controllers\t6.9.0-1noble.20260819.162659"
+  ],
+  "position_controllers_absent": true,
+  "source_checkout_candidates_present": {
+    "image/ros/lyrical/src": false,
+    "image/manyforge/ros2_control": false,
+    "image/manyforge/ros2_controllers": false,
+    "source/.docker/ros2_control": false,
+    "source/.docker/ros2_controllers": false
+  },
+  "limits": [
+    "Header samples are capped at18 paths per package; counts are not full header inventories.",
+    "No source checkout found in five conventional locations; this is not an exhaustive filesystem search.",
+    "Plugin classes are installed XML declarations; no plugin load or ROS service invocation was performed.",
+    "Missing optional position_controllers made the combined dpkg query exit1; installed package results remain explicit."
+  ],
+  "effects": {
+    "build": false,
+    "restart": false,
+    "ros_service_calls": false,
+    "runtime_commands": []
+  },
+  "raw_evidence_identifier": "dx1057-shipping-ros-inventory-20261016",
+  "raw_inventory_sha256": "4e324927899d08a66b7e2af9deaf50db196ecfc2014cc719a0feca24d0a202e4"
+}

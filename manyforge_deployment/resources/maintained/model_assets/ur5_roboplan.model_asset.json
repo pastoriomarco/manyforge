@@ -1,0 +1,178 @@
+{
+  "api_version": "manyforge.model_asset.v1",
+  "collision_body_role_bindings": [
+    {
+      "collision_body_role_id": "arm_collision",
+      "source_link_names": [
+        "base_link",
+        "forearm_link",
+        "shoulder_link",
+        "upper_arm_link",
+        "wrist_1_link",
+        "wrist_2_link",
+        "wrist_3_link"
+      ]
+    },
+    {
+      "collision_body_role_id": "gripper_collision",
+      "source_link_names": [
+        "ee_link",
+        "tool0"
+      ]
+    },
+    {
+      "collision_body_role_id": "tool_collision",
+      "source_link_names": [
+        "ee_link",
+        "tool0"
+      ]
+    }
+  ],
+  "expanded_source": {
+    "artifacts": [
+      {
+        "byte_size": 28984,
+        "content_digest": "sha256:c7af57d109de6a73f57943613bb000346518df06bb5ae119a2e80cf00bcbebde",
+        "logical_uri": "asset://ur5_roboplan/meshes/collision/base.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 52584,
+        "content_digest": "sha256:8e79aa80a532494ba5320c30b40363ff63d228e3d59e2904703dca341dcba2ac",
+        "logical_uri": "asset://ur5_roboplan/meshes/collision/forearm.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 33784,
+        "content_digest": "sha256:1d62e23a8c3ff9e6334fb157c805e6202037bcfca65bc6a36c5c9ae866751b3b",
+        "logical_uri": "asset://ur5_roboplan/meshes/collision/shoulder.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 58884,
+        "content_digest": "sha256:55c11ac0ad1e144f230849b2033532e8b140b2e818ea497296d08dfb88757440",
+        "logical_uri": "asset://ur5_roboplan/meshes/collision/upperarm.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 35184,
+        "content_digest": "sha256:0a1fd12150140efdee91650dcb4c2d0443065551a9207a2d2dbde58ff1fb4eb7",
+        "logical_uri": "asset://ur5_roboplan/meshes/collision/wrist1.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 35184,
+        "content_digest": "sha256:c1d9f7843366068cb331f3f5c43fa716d3eceeb8c80216eccbbc878905dab123",
+        "logical_uri": "asset://ur5_roboplan/meshes/collision/wrist2.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 22384,
+        "content_digest": "sha256:cf7220397b56f1d3047be9465eea1181d471b40fc82728052e31c97588585b4b",
+        "logical_uri": "asset://ur5_roboplan/meshes/collision/wrist3.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 153711,
+        "content_digest": "sha256:2059aec60ceea5793181d52ecd07a25bac2a88f90182b96c4cf66f07cfb78de7",
+        "logical_uri": "asset://ur5_roboplan/meshes/visual/base.dae",
+        "media_type": "model/vnd.collada+xml"
+      },
+      {
+        "byte_size": 1470273,
+        "content_digest": "sha256:d7b40d794f81ba1658a442be9e7f193d445053564444a29f952b6bf7028706a2",
+        "logical_uri": "asset://ur5_roboplan/meshes/visual/forearm.dae",
+        "media_type": "model/vnd.collada+xml"
+      },
+      {
+        "byte_size": 1008635,
+        "content_digest": "sha256:2bfa801f928dd92ec8a83826f84aa30ad511d53f4760f5f83c7385a1bc924aa1",
+        "logical_uri": "asset://ur5_roboplan/meshes/visual/shoulder.dae",
+        "media_type": "model/vnd.collada+xml"
+      },
+      {
+        "byte_size": 2005857,
+        "content_digest": "sha256:0577221909b0b76445c4dd21c02aca97f04b5185fef7b33f5a484db679e3de34",
+        "logical_uri": "asset://ur5_roboplan/meshes/visual/upperarm.dae",
+        "media_type": "model/vnd.collada+xml"
+      },
+      {
+        "byte_size": 949559,
+        "content_digest": "sha256:1cc29d29a40f2eefc89a280236dac1317babcb583538e7b31fdbc621f6a284a0",
+        "logical_uri": "asset://ur5_roboplan/meshes/visual/wrist1.dae",
+        "media_type": "model/vnd.collada+xml"
+      },
+      {
+        "byte_size": 948372,
+        "content_digest": "sha256:d8cc770127fc7cc3c587594660971811b52092df75b6178895828f74df37ea0f",
+        "logical_uri": "asset://ur5_roboplan/meshes/visual/wrist2.dae",
+        "media_type": "model/vnd.collada+xml"
+      },
+      {
+        "byte_size": 124800,
+        "content_digest": "sha256:8ee319c507ad0e0db4d77594cc03192f1660a3d0db03bae6f827518876d027af",
+        "logical_uri": "asset://ur5_roboplan/meshes/visual/wrist3.dae",
+        "media_type": "model/vnd.collada+xml"
+      },
+      {
+        "byte_size": 1227,
+        "content_digest": "sha256:061863824f959636985ab588a0167d4d1b83e0ecfe71d7b9d926490bc99ad4e1",
+        "logical_uri": "asset://ur5_roboplan/model.srdf",
+        "media_type": "application/xml"
+      },
+      {
+        "byte_size": 8954,
+        "content_digest": "sha256:2480f3d94e3ec0e84eee77934149d92e7bb142ce961bf4af1c51e626c7fe4354",
+        "logical_uri": "asset://ur5_roboplan/model.urdf",
+        "media_type": "application/xml"
+      }
+    ],
+    "srdf_logical_uri": "asset://ur5_roboplan/model.srdf",
+    "urdf_logical_uri": "asset://ur5_roboplan/model.urdf"
+  },
+  "frame_role_bindings": [
+    {
+      "frame_role_id": "base",
+      "source_link_name": "base_link"
+    },
+    {
+      "frame_role_id": "flange",
+      "source_link_name": "tool0"
+    },
+    {
+      "frame_role_id": "gripper_tcp",
+      "source_link_name": "tool0"
+    },
+    {
+      "frame_role_id": "root",
+      "source_link_name": "world"
+    },
+    {
+      "frame_role_id": "tcp",
+      "source_link_name": "tool0"
+    }
+  ],
+  "instance_cardinality": "multiple_per_cell",
+  "model_asset_id": "ur5_roboplan",
+  "model_group_role_bindings": [
+    {
+      "model_group_role_id": "arm",
+      "source_group_name": "arm"
+    }
+  ],
+  "model_revision": "sha256:a491f1f549b9b5ab2e4aa06c1852e51cd0bca9c2a837679d3cfb8eda6e4b8fef",
+  "resource_role_bindings": [
+    {
+      "resource_role_id": "arm_joints",
+      "source_joint_names": [
+        "shoulder_pan_joint",
+        "shoulder_lift_joint",
+        "elbow_joint",
+        "wrist_1_joint",
+        "wrist_2_joint",
+        "wrist_3_joint"
+      ]
+    }
+  ],
+  "root_frame_role_id": "root"
+}

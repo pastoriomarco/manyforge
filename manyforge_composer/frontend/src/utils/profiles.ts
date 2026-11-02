@@ -1,22 +1,23 @@
-export function parseProfile(profile: string | null | undefined): [number, number] | null {
+export function parseProfile(
+  profile: string | null | undefined,
+): [number, number] | null {
   const match = /^v(\d+)(?:\.(\d+))?$/.exec(profile ?? '');
-  if (!match) {
-    return null;
-  }
+  if (!match) return null;
   return [Number(match[1]), Number(match[2] ?? '0')];
 }
 
 export function profileSatisfies(
-  minProfile: string | null | undefined,
+  minimumProfile: string | null | undefined,
   targetProfile: string | null | undefined,
 ): boolean {
-  if (!minProfile || !targetProfile || minProfile === targetProfile) {
+  if (!minimumProfile || !targetProfile || minimumProfile === targetProfile) {
     return true;
   }
-  const min = parseProfile(minProfile);
+  const minimum = parseProfile(minimumProfile);
   const target = parseProfile(targetProfile);
-  if (min == null || target == null) {
-    return minProfile === targetProfile;
+  if (minimum === null || target === null) {
+    return minimumProfile === targetProfile;
   }
-  return target[0] > min[0] || (target[0] === min[0] && target[1] >= min[1]);
+  return target[0] > minimum[0]
+    || (target[0] === minimum[0] && target[1] >= minimum[1]);
 }

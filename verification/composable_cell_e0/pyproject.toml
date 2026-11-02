@@ -1,0 +1,9 @@
+[build-system]
+requires = []
+build-backend = "unavailable_build_backend"
+backend-path = ["."]
+
+[project]
+name = "manyforge-e0-binding-proof"
+version = "0.0.0"
+requires-python = ">=3.12"

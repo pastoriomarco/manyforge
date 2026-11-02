@@ -1,0 +1,88 @@
+api_version: manyforge.closed_schema_registry.v1
+dialect_api_version: manyforge.closed_schema.v1
+bootstrap_contract_digest: sha256:29a2fef8e781ca406eaaad448e46fb6061fe18e99e2c1cd39f303e2e0d815834
+example_schemas:
+  - schema_id: manyforge.closed_schema.example_command.v1
+    schema_revision: sha256:37985bd40f1c50cca9a82e3952bf407ddecca0d1c32d7787cd903bfffbf5fce7
+    relative_path: examples/manyforge.closed_schema.example_command.v1.yaml
+    qualification: dialect_example_only
+  - schema_id: manyforge.closed_schema.example_inventory.v1
+    schema_revision: sha256:dd5840f1d78b171d86631d73b333625011c81fcae9b54221ab3ea63c65446c55
+    relative_path: examples/manyforge.closed_schema.example_inventory.v1.yaml
+    qualification: dialect_example_only
+catalog_schemas:
+  - record_kind: capability_definition
+    schema_id: manyforge.capability_definition.v1
+    schema_revision: sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0
+    relative_path: catalog/manyforge.capability_definition.v1.yaml
+    qualification: qualified
+  - record_kind: command_schema
+    schema_id: manyforge.command_schema.v1
+    schema_revision: sha256:4f23fe66c0dd587d998a52a7b166bddd22d7ab8e5b28caacc48373ff373dcd84
+    relative_path: catalog/manyforge.command_schema.v1.yaml
+    qualification: qualified
+  - record_kind: component_type
+    schema_id: manyforge.component_type.v1
+    schema_revision: sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde
+    relative_path: catalog/manyforge.component_type.v1.yaml
+    qualification: qualified
+  - record_kind: contact_policy
+    schema_id: manyforge.contact_policy.v1
+    schema_revision: sha256:c7ad633867abbe4583dee2eda51dca5b33bd8e8827777a8ac9ab86b2aba20490
+    relative_path: catalog/manyforge.contact_policy.v1.yaml
+    qualification: qualified
+  - record_kind: control_interface_contract
+    schema_id: manyforge.control_interface_contract.v1
+    schema_revision: sha256:4abdf2c402d8e6e818bc26df59ce1c9cdc911d1e807144bdf525d2f69d0a449d
+    relative_path: catalog/manyforge.control_interface_contract.v1.yaml
+    qualification: qualified
+  - record_kind: controller_topology
+    schema_id: manyforge.controller_topology.v1
+    schema_revision: sha256:7415c5e2df17491366755b401337e3ad96dd96703357b20c9e0d08bf3f46a9f6
+    relative_path: catalog/manyforge.controller_topology.v1.yaml
+    qualification: qualified
+  - record_kind: model_asset
+    schema_id: manyforge.model_asset.v1
+    schema_revision: sha256:397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6
+    relative_path: catalog/manyforge.model_asset.v1.yaml
+    qualification: qualified
+  - record_kind: provider_manifest
+    schema_id: manyforge.provider_manifest.v1
+    schema_revision: sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc
+    relative_path: catalog/manyforge.provider_manifest.v1.yaml
+    qualification: qualified
+  - record_kind: runtime_profile
+    schema_id: manyforge.runtime_profile.v1
+    schema_revision: sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7
+    relative_path: catalog/manyforge.runtime_profile.v1.yaml
+    qualification: qualified
+  - record_kind: stop_evidence_policy
+    schema_id: manyforge.stop_evidence_policy.v2
+    schema_revision: sha256:d55eb024cdd03360b1833671b656c962b2608227a1f1b47ed67cc019b5442f13
+    relative_path: catalog/manyforge.stop_evidence_policy.v2.yaml
+    qualification: qualified
+value_schemas:
+  - schema_id: manyforge.value_schema.provider_contract.empty.v1
+    schema_revision: sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270
+    relative_path: value/manyforge.value_schema.provider_contract.empty.v1.yaml
+    qualification: qualified
+  - schema_id: manyforge.value_schema.provider_contract.motion_controlled_stop.v1
+    schema_revision: sha256:65e6f4462981225916834490d4e3cb4d42b70611a2287e1b76fdb1cbcabcb113
+    relative_path: value/manyforge.value_schema.provider_contract.motion_controlled_stop.v1.yaml
+    qualification: qualified
+  - schema_id: manyforge.value_schema.runtime.empty.v1
+    schema_revision: sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785
+    relative_path: value/manyforge.value_schema.runtime.empty.v1.yaml
+    qualification: qualified
+  - schema_id: manyforge.value_schema.runtime.io_provider_execution.v1
+    schema_revision: sha256:500cfe739120003e06057cdf78a94f006eb4fc4ef157a7f55f70ab4d1aa45b1d
+    relative_path: value/manyforge.value_schema.runtime.io_provider_execution.v1.yaml
+    qualification: qualified
+  - schema_id: manyforge.value_schema.runtime.pose_source.v2
+    schema_revision: sha256:a7e77850ee255f3bfc989e5105e1c37ca7c767fa63768160e75e81bb8e6e7173
+    relative_path: value/manyforge.value_schema.runtime.pose_source.v2.yaml
+    qualification: qualified
+  - schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
+    schema_revision: sha256:1c557174fd45649c43d2e20239ec614635ca31aa79608d87727e35edcf8c2c90
+    relative_path: value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml
+    qualification: qualified

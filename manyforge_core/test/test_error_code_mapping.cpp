@@ -12,6 +12,10 @@ TEST(ErrorCodeMappingTest, MapsPublicErrorDtoCodes) {
             ErrorCode::kMissingReference);
   EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorAmbiguousReference, "", {}}),
             ErrorCode::kAmbiguousReference);
+  EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorStaleGeneration, "", {}}),
+            ErrorCode::kStaleGeneration);
+  EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorAuthoringNotReady, "", {}}),
+            ErrorCode::kAuthoringNotReady);
   EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorValidationLimitsViolation, "", {}}),
             ErrorCode::kValidationLimitsViolation);
   EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorValidationCollision, "", {}}),
@@ -31,10 +35,6 @@ TEST(ErrorCodeMappingTest, MapsPublicErrorDtoCodes) {
             ErrorCode::kExecutionTimeout);
   EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorStopFailed, "", {}}),
             ErrorCode::kStopFailed);
-  EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorPauseFailed, "", {}}),
-            ErrorCode::kPauseFailed);
-  EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorResumeFailed, "", {}}),
-            ErrorCode::kResumeFailed);
   EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorResetFailed, "", {}}),
             ErrorCode::kResetFailed);
   EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorInvalidRequest, "", {}}),

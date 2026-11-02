@@ -1,0 +1,285 @@
+#pragma once
+
+#include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
+#include <manyforge_component_manager/manager_apply_fence_coordinator.hpp>
+#include <manyforge_component_manager/manager_apply_fence_release_coordinator.hpp>
+#include <manyforge_component_manager/manager_planned_maintenance_coordinator.hpp>
+#include <manyforge_component_manager/manager_runtime_convergence_coordinator.hpp>
+#include <manyforge_component_manager/manager_selected_bundle_transition_coordinator.hpp>
+#include <manyforge_component_manager/manager_selected_runtime_composition_coordinator.hpp>
+#include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
+#include <manyforge_core/types/scene_transaction.hpp>
+
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace manyforge::component_manager {
+
+/// Read-only semantic join for one actual local pneumatic+None occurrence.
+/// The caller first validates the actual inventory response against this exact
+/// expected request, including the live host/publication/Manager epochs. This
+/// function neither discovers an owner nor turns authored mode into presence.
+[[nodiscard]] manyforge::core::Result<void>
+ValidateManagerPneumaticNoneProcessOwner(
+    const manyforge::deployment::RetainedBundle &verified_predecessor,
+    const manyforge::deployment::SiteFacts &site_facts,
+    const ManagerComponentProcessInventoryRequestDTO &expected_inventory_request,
+    const ManagerComponentProcessOccurrenceDTO &occurrence);
+
+class ManagerNamedApplyCoordinatorError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+/// Certain, pre-effect rejection of a new Apply while another Apply or an
+/// affected operation is active. It is deliberately not caller authorization
+/// and never invokes Stop.
+class ManagerNamedApplyBusyError final
+    : public ManagerNamedApplyCoordinatorError {
+public:
+  using ManagerNamedApplyCoordinatorError::ManagerNamedApplyCoordinatorError;
+};
+
+/// Exact public selection normalized by the Manager after ingress.
+/// `candidate_retained_bundle_id` comes from one independently verified,
+/// bounded prepared activation; the caller never authors that internal identity.
+struct ManagerNamedApplyRequestDTO final {
+  manyforge::core::PublicRequestContextDTO request_context;
+  manyforge::core::DeploymentArtifactId deployment_artifact_id;
+  manyforge::core::DeploymentRevision deployment_revision;
+  manyforge::core::RetainedBundleId expected_current_retained_bundle_id;
+  manyforge::core::GraphRevision expected_current_graph_revision;
+  manyforge::core::RetainedBundleId candidate_retained_bundle_id;
+  ManagerApplyPreparedActivationDTO prepared_activation;
+  std::optional<manyforge::core::AdmissionGeneration>
+      expected_admission_generation;
+  std::optional<manyforge::core::CellAdmissionClaimDTO>
+      parent_authoring_claim;
+  ManagerSceneInitialization scene_initialization{
+      ManagerSceneInitialization::kPreserve};
+
+  [[nodiscard]] bool valid() const noexcept;
+
+  friend bool operator==(const ManagerNamedApplyRequestDTO &,
+                         const ManagerNamedApplyRequestDTO &) = default;
+};
+
+enum class ManagerApplySettlementAttempt { kInitial, kOrdinaryHeartbeat };
+
+enum class FailedApplyAcknowledgementState { kAvailable, kAcknowledged, kUnavailable };
+[[nodiscard]] const char *ToString(FailedApplyAcknowledgementState state) noexcept;
+
+enum class ManagerNamedApplyResultState {
+  kPending,
+  kSucceeded,
+  kFailed,
+  kUnknownEffect,
+};
+
+struct ManagerNamedApplyResult final {
+  manyforge::core::ApplyId apply_id;
+  manyforge::core::ApplyGeneration apply_generation;
+  ManagerNamedApplyResultState state;
+  bool request_replayed;
+  std::optional<ManagerApplyTerminalOutcomeDTO> terminal_outcome;
+  // A durable successful Apply can still retain its original parent claim.
+  // Only the ordinary heartbeat retries this settlement, not Apply progression.
+  bool settlement_pending{false};
+};
+
+/// Single-progression-owner composition of the I4 named-Apply phase owners.
+///
+/// This class adds no replacement state machine: it routes each durable phase
+/// to the already qualified I4 coordinator that owns it. A new request first
+/// resolves the exact current publication and sealed bundles. It samples the
+/// Kernel admission state once before the first Acquire; Acquire then performs
+/// the atomic reject-if-busy compare-and-swap. Same-process progression reuses
+/// one captured pair of verified bundles and never repeats a completed external
+/// effect. A restarted Manager cannot reconstruct that capture and records the
+/// interrupted operation as unknown rather than resuming it automatically.
+class ManagerNamedApplyCoordinator final {
+public:
+  /// Exact, verified Program/Binding projection captured before any Apply
+  /// effect. The source may read retained products; it must not select a
+  /// mutable public or authoring workspace.
+  using InitialSceneSource = std::function<std::vector<manyforge::core::AddObjectRequestDTO>(
+      const ManagerApplyPreparedActivationDTO &,
+      const manyforge::deployment::RetainedBundle &)>;
+  /// Fresh caller continuation after the host accepted the Apply (CONTRACTS
+  /// §15). It runs before Scene Begin and publication. Retained or recovered
+  /// acceptance cannot reconstruct this callback.
+  using OriginalPrepareAcknowledgement = std::function<void(
+      const ManagerApplyIntentDTO &,
+      const manyforge::deployment::RetainedBundle &,
+      const HostApplyResult &)>;
+  using ApplyIdFactory = std::function<manyforge::core::ApplyId()>;
+  using ApplyProgressObserver =
+      std::function<void(const ManagerApplyIntentDTO &)>;
+  /// Prepare actual successor required-owner renewal before successful parent
+  /// release. Heartbeat retries may only reuse that heartbeat's current proof.
+  /// This callback never authorizes release; the exact Kernel guards still run.
+  using SuccessfulSettlementPreparation = std::function<bool(
+      const ManagerApplyIntentDTO &, ManagerApplySettlementAttempt)>;
+
+  ManagerNamedApplyCoordinator(
+      SqliteManagerApplyJournal &apply_journal,
+      IManagerActiveRuntimePlanSource &active_plan_source,
+      const manyforge::deployment::IVerifiedRetainedBundleSource
+          &retained_bundle_source,
+      const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+          &artifact_source,
+      manyforge::core::IActiveBundlePublicationStore &publication_store,
+      manyforge::core::IManagerSceneProjectionMaintenancePort &scene_owner,
+      manyforge::core::IManagerSceneProjectionBootstrapPort
+          *bootstrap_scene_owner,
+      manyforge::core::IManagerKernelApplyFencePort &kernel_fence,
+      manyforge::core::IKernelCellAdmissionPort &cell_admission,
+      IManagerSelectedRuntimeCompositionPort &runtime_composition,
+      IRuntimeUnitProcessPort &process_port,
+      IRuntimeUnitProgressPort &progress_port,
+      ManagerPlannedMaintenanceCoordinator &planned_maintenance,
+      manyforge::core::RuntimeEpoch manager_runtime_epoch,
+      std::string operating_system,
+      std::vector<std::string> launch_environment_contracts,
+      RuntimeObservationReducer::Clock clock_ns,
+      ApplyIdFactory apply_id_factory,
+      InitialSceneSource initial_scene_source,
+      RuntimePreStartGuard pre_start_guard = {},
+      ApplyProgressObserver apply_progress_observer = {},
+      SuccessfulSettlementPreparation successful_settlement_preparation = {},
+      manyforge::deployment::SiteFacts site_facts = {});
+
+  /// Validate and durably accept one exact request without advancing any
+  /// runtime effect. Exact replay returns terminal evidence when it already
+  /// exists; otherwise the sole progression owner resumes it through
+  /// RecoverIncompleteApply().
+  [[nodiscard]] ManagerNamedApplyResult
+  AcceptOrReplay(const ManagerNamedApplyRequestDTO &request,
+                 OriginalPrepareAcknowledgement original_prepare_acknowledgement = {});
+
+  /// Resume the sole nonterminal Apply, if any. More than one nonterminal
+  /// transaction is an integrity failure because this coordinator owns one
+  /// serialized progression lane. An Apply progresses only with this
+  /// process's captured original claim and inputs.
+  [[nodiscard]] std::optional<ManagerNamedApplyResult> RecoverIncompleteApply();
+
+  /// Advisory availability of acknowledgement for a failed, before-effect
+  /// Apply. The release path must check the current owner facts again.
+  [[nodiscard]] FailedApplyAcknowledgementState FailedApplyAcknowledgementStatus(
+      const manyforge::core::ApplyId &apply_id,
+      manyforge::core::ApplyGeneration apply_generation);
+
+  /// Release only this acknowledged, proven-before-effect Apply's held fence
+  /// and claim. The original terminal failure is retained.
+  void AcknowledgeFailedApply(const manyforge::core::ApplyId &apply_id,
+                              manyforge::core::ApplyGeneration apply_generation,
+                              const manyforge::core::RequestId &request_id,
+                              const std::string &source_label);
+
+  /// New (R3, N7): release the fence and claim that a failed Apply still
+  /// holds, whatever it changed in the cell; New's own Apply then stops and
+  /// removes everything the host has. Returns the released Apply, or none
+  /// when no failed Apply holds the cell. The original failure is retained.
+  [[nodiscard]] std::optional<manyforge::core::NamedApplyPublicationTransactionDTO>
+  ReleaseFailedApplyForNew(const manyforge::core::RequestId &request_id,
+                           const std::string &source_label);
+
+  /// Nonblocking metadata read by the ordinary heartbeat. An earlier beat
+  /// cannot schedule a later Apply's settlement; this is only a scheduling tag.
+  [[nodiscard]] std::optional<manyforge::core::NamedApplyPublicationTransactionDTO>
+  PendingSettlementForHeartbeat();
+  /// The existing Apply progress lane consumes this exact heartbeat tag. It
+  /// reuses the journal/claim replay protocol without repeating Apply effects.
+  [[nodiscard]] std::optional<ManagerNamedApplyResult>
+  RetryPendingSettlementOnHeartbeat(
+      const manyforge::core::NamedApplyPublicationTransactionDTO &expected);
+
+  ManagerNamedApplyCoordinator(const ManagerNamedApplyCoordinator &) = delete;
+  ManagerNamedApplyCoordinator &
+  operator=(const ManagerNamedApplyCoordinator &) = delete;
+
+private:
+  struct CapturedApplyInputs final {
+    manyforge::core::ApplyId apply_id;
+    manyforge::core::ApplyGeneration apply_generation;
+    std::shared_ptr<const manyforge::deployment::RetainedBundle> predecessor;
+    std::shared_ptr<const manyforge::deployment::RetainedBundle> candidate;
+    OriginalPrepareAcknowledgement original_prepare_acknowledgement{};
+    bool prepare_acknowledgement_consumed{};
+    std::optional<manyforge::core::CellAdmissionClaimDTO> original_parent_claim{};
+    bool original_preparation_completed{};
+    std::optional<manyforge::core::ActiveBundlePublicationReceiptDTO> original_predecessor_publication{};
+    std::optional<manyforge::core::QualifiedSceneConfigurationAdoptionRequestDTO> original_configuration_adoption{};
+    bool original_scene_stage_consumed{};
+    bool original_scene_stage_completed{};
+    bool original_scene_begin_consumed{};
+    bool original_scene_complete_consumed{};
+    std::optional<manyforge::core::ProjectionMaintenanceInitializationStatusDTO> original_scene_completed{};
+  };
+
+  [[nodiscard]] ManagerNamedApplyResult
+  Continue(const ManagerApplyIntentDTO &intent, bool request_replayed);
+  [[nodiscard]] bool HasOriginalConfigurationCapture(const ManagerApplyIntentDTO &intent) const;
+  [[nodiscard]] manyforge::core::QualifiedSceneConfigurationAdoptionRequestDTO
+  CaptureOriginalConfigurationAdoption(const ManagerApplyIntentDTO &intent,
+      const std::optional<manyforge::core::ApplyFenceAcquireAttemptQueryDTO> &staging_attempt = std::nullopt);
+  [[nodiscard]] ManagerNamedApplyResult ContinueOriginalConfiguration(
+      const PersistedManagerApplyIntent &intent, bool request_replayed);
+  [[nodiscard]] ManagerNamedApplyResult FinishOriginalConfigurationPublication(
+      const PersistedManagerApplyIntent &intent, bool request_replayed);
+  [[nodiscard]] manyforge::core::ApplyId MintApplyId();
+  /// The release of AcknowledgeFailedApply (before effect) or of
+  /// ReleaseFailedApplyForNew (`for_new`, any failure that holds its fence),
+  /// for a caller holding operation_mutex_.
+  void ReleaseFailedApply(const manyforge::core::ApplyId &apply_id,
+                          manyforge::core::ApplyGeneration apply_generation,
+                          const manyforge::core::RequestId &request_id,
+                          const std::string &source_label, bool for_new);
+  [[nodiscard]] bool SettleSuccessfulAdmission(
+      const PersistedManagerApplyIntent &intent,
+      const PersistedManagerApplyTerminalOutcome &terminal,
+      ManagerApplySettlementAttempt attempt);
+  [[nodiscard]] ManagerNamedApplyResult PendingSettlementResult(
+      const ManagerApplyIntentDTO &intent, bool replayed) const;
+
+  SqliteManagerApplyJournal &apply_journal_;
+  IManagerActiveRuntimePlanSource &active_plan_source_;
+  const manyforge::deployment::IVerifiedRetainedBundleSource
+      &retained_bundle_source_;
+  const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+      &artifact_source_;
+  // Borrow the existing constructor-supplied publication store as a reader.
+  // Its lifetime already covers this coordinator and the nested consumers.
+  const manyforge::core::IActiveBundlePublicationReader &publication_reader_;
+  manyforge::core::IManagerSceneProjectionMaintenancePort &scene_owner_;
+  manyforge::core::IManagerKernelApplyFencePort &kernel_fence_;
+  manyforge::core::IKernelCellAdmissionPort &cell_admission_;
+  IManagerSelectedRuntimeCompositionPort &runtime_composition_port_;
+  manyforge::core::RuntimeEpoch manager_runtime_epoch_;
+  ApplyIdFactory apply_id_factory_;
+  InitialSceneSource initial_scene_source_;
+  ApplyProgressObserver apply_progress_observer_;
+  SuccessfulSettlementPreparation successful_settlement_preparation_;
+  /// This machine's site facts: every component spec is derived with them.
+  manyforge::deployment::SiteFacts site_facts_;
+  ManagerApplyFenceCoordinator fence_coordinator_;
+  ManagerPlannedMaintenanceCoordinator &planned_maintenance_;
+  ManagerActiveRuntimeCoordinator active_runtime_coordinator_;
+  ManagerApplyRuntimeConvergenceCoordinator runtime_coordinator_;
+  ManagerSelectedRuntimeCompositionCoordinator runtime_composition_coordinator_;
+  ManagerSelectedBundleTransitionCoordinator selected_bundle_coordinator_;
+  ManagerApplyFenceReleaseCoordinator fence_release_coordinator_;
+  std::optional<CapturedApplyInputs> captured_apply_inputs_;
+  // Scheduling reference only. Intent, terminal and exact parent remain owned
+  // by the existing journal/capture; no duplicate settlement result is cached.
+  std::optional<manyforge::core::NamedApplyPublicationTransactionDTO>
+      pending_settlement_;
+  std::mutex operation_mutex_;
+};
+
+} // namespace manyforge::component_manager

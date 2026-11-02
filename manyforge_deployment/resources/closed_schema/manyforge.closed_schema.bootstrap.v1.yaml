@@ -1,0 +1,96 @@
+api_version: manyforge.closed_schema_bootstrap_manifest.v1
+dialect_api_version: manyforge.closed_schema.v1
+bootstrap_contract_digest: sha256:29a2fef8e781ca406eaaad448e46fb6061fe18e99e2c1cd39f303e2e0d815834
+identity:
+  content_identity_prefix: manyforge.content-identity.v1
+  identity_domain: schema-revision
+  omitted_fields:
+    - schema_revision
+  canonicalization: RFC8785
+  digest_algorithm: SHA-256
+  rendering: sha256-lowercase-hex
+root_fields:
+  - api_version
+  - definitions
+  - root_definition_id
+  - schema_id
+  - schema_purpose
+  - schema_revision
+schema_purposes:
+  - artifact_document
+  - value
+node_kinds:
+  - kind: array
+    exact_fields:
+      - collection
+      - item_schema
+      - kind
+      - max_items
+      - min_items
+  - kind: local_ref
+    exact_fields:
+      - definition_id
+      - kind
+  - kind: object
+    exact_fields:
+      - fields
+      - kind
+    closed: true
+  - kind: scalar
+    exact_fields:
+      - constraints
+      - kind
+      - scalar_type
+  - kind: tagged_union
+    exact_fields:
+      - alternatives
+      - kind
+      - tag_field
+constraint_kinds:
+  - enum
+  - exclusive_maximum
+  - exclusive_minimum
+  - max_length
+  - maximum
+  - min_length
+  - minimum
+  - string_format
+collection_kinds:
+  - keyed_record_set
+  - ordered
+  - scalar_set
+default_kinds:
+  - absent
+  - materialized
+string_formats:
+  - api_version
+  - portable_id
+  - sha256_digest
+limits:
+  max_alternatives: 256
+  max_array_items: 250000
+  max_collection_depth: 64
+  max_constraints: 8
+  max_definitions: 1024
+  max_encoded_document_bytes: 16777216
+  max_enum_values: 1024
+  max_fields: 1024
+  max_key_path_segments: 16
+  max_key_paths: 16
+  max_normalized_aggregate_scalar_bytes: 16777216
+  max_normalized_value_depth: 64
+  max_normalized_value_nodes: 250000
+  max_safe_integer: 9007199254740991
+  max_scalar_utf8_bytes: 1048576
+  max_schema_depth: 64
+  max_schema_nodes: 250000
+  max_schema_string_code_points: 1048576
+  max_total_document_nodes: 250000
+prohibitions:
+  - definition_ref_cycles
+  - executable_hooks
+  - external_refs
+  - latest_aliases
+  - open_objects
+  - unclassified_arrays
+  - wildcard_refs

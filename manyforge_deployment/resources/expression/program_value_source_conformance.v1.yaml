@@ -1,0 +1,287 @@
+# Executable specification of the Program checks on path-keyed value sources
+# (docs/authoring/EXPRESSIONS.md sections 9 and 10): the Python Program
+# validator (manyforge_behavior/tests/test_program_expressions.py) and the C++
+# Program contract (manyforge_deployment/test/test_program_contract.cpp) run
+# every case, so both refuse the same sources.
+#
+# Each suite builds its own valid base Program, adds `parameters` and
+# `blackboard_keys` below, and puts one case node in its tree. A case node is a
+# `nodes` template with `parameters` replaced key by key and `value_sources`
+# set. `accepted` cases must load; `refused` cases must be refused with an
+# error that contains `reason`.
+schema: manyforge.program_value_source_conformance.v1
+
+parameters:
+  - {parameter_id: label, type: string, default: tray}
+  - {parameter_id: pitch, type: float64, default: 0.05}
+  - {parameter_id: start, type: int64, default: 1}
+
+blackboard_keys:
+  - key: answer
+    type: model_response
+    access: read_write
+    persistence: run
+    fields: [{field: text, type: string}]
+  - {key: index, type: int64, access: read_write, persistence: run}
+  - {key: out, type: stored_pose, access: read_write, persistence: run}
+  - {key: place, type: stored_pose, access: read_write, persistence: run}
+  - key: plan
+    type: pick_planning_result
+    access: read_write
+    persistence: run
+    fields: [{field: approach_s, type: float64}]
+  - {key: ratio, type: float64, access: read_write, persistence: run}
+  - {key: sink, type: float64, access: write, persistence: run}
+
+nodes:
+  offset:
+    node_id: geometry.offset_pose
+    instance_id: offset
+    parameters:
+      pose:
+        frame_ref: {kind: cell_frame}
+        position_m: [0.1, 0.2, 0.3]
+        orientation: {rpy_deg: [0.0, 0.0, 90.0]}
+      offset: {position_m: [0.0, 0.0, 0.1], rpy_deg: [0.0, 0.0, 0.0]}
+      output_key: out
+  set_pose:
+    node_id: logic.set_value
+    instance_id: set
+    parameters:
+      key: place
+      value:
+        frame_ref: {kind: cell_frame}
+        position_m: [0.1, 0.2, 0.3]
+        orientation: {rpy_deg: [0.0, 0.0, 90.0]}
+  set_count:
+    node_id: logic.set_value
+    instance_id: set
+    parameters: {key: index, value: 0}
+  move:
+    node_id: motion.move_to_joint_target
+    instance_id: move
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint: {target_role: arm, frame_role: tcp}
+      goal: [{joint_name: joint1, position_rad: 0.0}]
+  probe:
+    node_id: motion.probe_search
+    instance_id: probe
+    parameters: {}
+  check:
+    node_id: gripper.check_status
+    instance_id: check
+    parameters: {}
+  query:
+    node_id: assistant.query_model
+    instance_id: query
+    parameters:
+      model_endpoint_alias: model
+      prompt_template_id: template
+      template_variables: {count: 1}
+      output_key: answer
+
+accepted:
+  - name: field formulas and a nested key binding
+    node: offset
+    value_sources:
+      offset.position_m[2]: {kind: expression, expression: "key.index * param.pitch"}
+      pose.orientation.rpy_deg[2]: {kind: expression, expression: "key.index * 45.0"}
+      pose.position_m[0]: {kind: blackboard_key, reference: ratio}
+  - name: a whole-value source keeps its literal
+    node: offset
+    value_sources:
+      pose: {kind: blackboard_key, reference: place}
+  - name: pose fields of a key-typed value from a parameter and a key field
+    node: set_pose
+    value_sources:
+      value.orientation.rpy_deg[1]: {kind: blackboard_field, reference: plan, field: approach_s}
+      value.position_m[2]: {kind: program_parameter, reference: pitch}
+  - name: a key-typed value from a parameter of the key type
+    node: set_count
+    value_sources:
+      value: {kind: program_parameter, reference: start}
+  - name: template variable map entries supplied by sources alone
+    node: query
+    value_sources:
+      template_variables.label: {kind: program_parameter, reference: label}
+      template_variables.ratio: {kind: blackboard_key, reference: ratio}
+
+refused:
+  - name: list index past the literal list
+    node: offset
+    value_sources:
+      offset.position_m[3]: {kind: expression, expression: "1.0"}
+    reason: names no value in the node's parameters
+  - name: list index past the literal list for a binding
+    node: offset
+    value_sources:
+      pose.position_m[5]: {kind: blackboard_key, reference: ratio}
+    reason: names no value in the node's parameters
+  - name: list index past a key-typed pose literal
+    node: set_pose
+    value_sources:
+      value.position_m[3]: {kind: program_parameter, reference: pitch}
+    reason: names no value in the node's parameters
+  - name: template variable of a type outside the template value types
+    node: query
+    value_sources:
+      template_variables.pose: {kind: blackboard_key, reference: place}
+    reason: incompatible with the destination schema
+  - name: template variable formula
+    node: query
+    value_sources:
+      template_variables.label: {kind: expression, expression: '"tray"'}
+    reason: an expression computes only a bool, int64, float64 or string value
+  - name: field absent from the literal
+    node: offset
+    value_sources:
+      offset.missing: {kind: expression, expression: "1.0"}
+    reason: names no value in the node's parameters
+  - name: rpy component of an xyzw literal
+    node: offset
+    parameters:
+      pose:
+        frame_ref: {kind: cell_frame}
+        position_m: [0.1, 0.2, 0.3]
+        orientation: {xyzw: [0.0, 0.0, 0.0, 1.0]}
+    value_sources:
+      pose.orientation.rpy_deg[0]: {kind: expression, expression: "1.0"}
+    reason: names no value in the node's parameters
+  - name: quaternion component formula
+    node: offset
+    parameters:
+      pose:
+        frame_ref: {kind: cell_frame}
+        position_m: [0.1, 0.2, 0.3]
+        orientation: {xyzw: [0.0, 0.0, 0.0, 1.0]}
+    value_sources:
+      pose.orientation.xyzw[3]: {kind: expression, expression: "1.0"}
+    reason: quaternion components depend on each other
+  - name: quaternion component binding
+    node: offset
+    parameters:
+      pose:
+        frame_ref: {kind: cell_frame}
+        position_m: [0.1, 0.2, 0.3]
+        orientation: {xyzw: [0.0, 0.0, 0.0, 1.0]}
+    value_sources:
+      pose.orientation.xyzw[3]: {kind: blackboard_key, reference: ratio}
+    reason: quaternion components depend on each other
+  - name: nested choice from a binding
+    node: offset
+    value_sources:
+      pose.frame_ref.kind: {kind: program_parameter, reference: label}
+    reason: nested text, choice and identifier fields stay literal
+  - name: nested target role selector
+    node: offset
+    parameters:
+      pose:
+        frame_ref: {kind: target_frame, target_role: arm, frame_role: tcp}
+        position_m: [0.1, 0.2, 0.3]
+        orientation: {rpy_deg: [0.0, 0.0, 90.0]}
+    value_sources:
+      pose.frame_ref.target_role: {kind: program_parameter, reference: label}
+    reason: cannot dynamically select runtime/binding semantics
+  - name: nested frame role selector
+    node: offset
+    parameters:
+      pose:
+        frame_ref: {kind: target_frame, target_role: arm, frame_role: tcp}
+        position_m: [0.1, 0.2, 0.3]
+        orientation: {rpy_deg: [0.0, 0.0, 90.0]}
+    value_sources:
+      pose.frame_ref.frame_role: {kind: blackboard_key, reference: ratio}
+    reason: cannot dynamically select runtime/binding semantics
+  - name: blackboard key selector
+    node: offset
+    value_sources:
+      output_key: {kind: program_parameter, reference: label}
+    reason: cannot dynamically select runtime/binding semantics
+  - name: effect target selector
+    node: move
+    value_sources:
+      target_role: {kind: program_parameter, reference: label}
+    reason: cannot dynamically select runtime/binding semantics
+  - name: effect condition selector
+    node: check
+    value_sources:
+      expected_state: {kind: program_parameter, reference: label}
+    reason: cannot dynamically select runtime/binding semantics
+  - name: contact policy selector
+    node: probe
+    value_sources:
+      contact_policy_id: {kind: program_parameter, reference: label}
+    reason: cannot dynamically select runtime/binding semantics
+  - name: pose into a frame reference
+    node: offset
+    value_sources:
+      pose.frame_ref: {kind: blackboard_key, reference: place}
+    reason: incompatible with the destination schema
+  - name: pose into a coordinate
+    node: offset
+    value_sources:
+      offset.position_m[0]: {kind: blackboard_key, reference: place}
+    reason: incompatible with the destination schema
+  - name: int64 into a float coordinate
+    node: offset
+    value_sources:
+      offset.position_m[0]: {kind: program_parameter, reference: start}
+    reason: incompatible with the destination schema
+  - name: write-only key
+    node: offset
+    value_sources:
+      offset.position_m[0]: {kind: blackboard_key, reference: sink}
+    reason: does not permit reads
+  - name: undeclared key
+    node: offset
+    value_sources:
+      offset.position_m[0]: {kind: blackboard_key, reference: absent}
+    reason: names no blackboard key
+  - name: undeclared parameter
+    node: offset
+    value_sources:
+      offset.position_m[0]: {kind: program_parameter, reference: absent}
+    reason: names no Program parameter
+  - name: undeclared key field
+    node: offset
+    value_sources:
+      offset.position_m[0]: {kind: blackboard_field, reference: plan, field: absent}
+    reason: names no declared field
+  - name: key-typed value from another type
+    node: set_count
+    value_sources:
+      value: {kind: blackboard_key, reference: ratio}
+    reason: does not match the 'int64' type of key 'index'
+  - name: fields of a scalar key-typed value
+    node: set_count
+    value_sources:
+      value.x: {kind: expression, expression: "1"}
+    reason: int64 values have no fields
+  - name: whole value bound beside its own field
+    node: offset
+    value_sources:
+      pose: {kind: blackboard_key, reference: place}
+      pose.position_m[0]: {kind: expression, expression: "1.0"}
+    reason: overlaps the value_sources entry 'pose'
+  - name: formula of the wrong type
+    node: offset
+    value_sources:
+      offset.position_m[0]: {kind: expression, expression: "key.index > 1"}
+    reason: "offset.position_m[0].expression: destination_type_mismatch"
+  - name: formula for a whole value
+    node: offset
+    value_sources:
+      pose: {kind: expression, expression: "1.0"}
+    reason: an expression computes only a bool, int64, float64 or string value
+  - name: formula for a choice
+    node: offset
+    value_sources:
+      offset_frame: {kind: expression, expression: '"pose"'}
+    reason: an expression computes only a bool, int64, float64 or string value
+  - name: unknown parameter
+    node: offset
+    value_sources:
+      absent: {kind: expression, expression: "1.0"}
+    reason: supplies unknown catalog parameter

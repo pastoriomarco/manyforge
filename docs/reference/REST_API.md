@@ -1,151 +1,176 @@
 <!--
   THIS FILE IS GENERATED — do not hand-edit. Source of truth: code.
   Regenerate with:
-    cd /workspace
-    python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-07-26 09:13:16 UTC
+    cd <repository-root>
+    python3 scripts/regen-public-contracts.py structural-rest
+  Last regenerated: 2026-11-02 09:06:59 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
 # Composer REST API
-FastAPI app, served by `python -m manyforge_composer ...` on the port specified by `--port` (default `9000`). The live schema is available at `/openapi.json` and `/docs` while Composer is running.
 
-OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
+This is the structural, authoring, and thin runtime-client Composer surface retained during the composable-cell runtime cutover. Catalog reads, sandboxed artifact browsing, structural URDF assets, health, and the strict revision-fenced Program Draft/Saved workflow remain available. When Headless and the independent Program runner are configured, Composer also forwards scenario, Applied, Program Run, status, explicit Program Stop, component actions and the server-run Apply/Load/New requests without owning their state. Generic `/api/control/state` and `/api/control/commands` expose the same state-conditioned ingress used by the versioned `/ws/control` session; callers submit once and observe backend-owned lifecycle state. Complete product launch and remaining provider-specific capabilities remain unavailable. Build-owned skills are discovered and expanded into ordinary Program trees through `/api/skills`; expansion does not edit Draft or execute a command. The catch-all `/api/{unavailable_path}` operations return the typed runtime-unavailable response for former product routes.
+
+**Real robot.** A real robot's address is a site fact (`device_addresses` in the `manyforge.site.v1` site settings file); a Scenario names only its key (`configuration.device_address_ref` of the machine owner). Component states, faults, the cell latch and readiness are readable here; the site file, robot power, network and e-stop are the operator's. See [Real robot setup](../operations/REAL_ROBOT_SETUP.md).
+
+The live schema is available at `/openapi.json` and `/docs` while the API process is running.
+
+OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 
 ## Routes
 
 | Method | Path | Tag | Summary |
 |---|---|---|---|
-| `DELETE` | `/api/assistant/bridge/principal-binding/{principal}` | assistant | Unbind Principal |
-| `PUT` | `/api/assistant/bridge/principal-binding/{principal}` | assistant | Bind Principal |
-| `POST` | `/api/assistant/bridge/tools/{tool_id}` | assistant | Execute Bridge Tool |
-| `POST` | `/api/assistant/chat` | assistant | Chat |
-| `GET` | `/api/assistant/modes/{mode}` | assistant | Describe Assistant Mode |
-| `GET` | `/api/assistant/proposals` | assistant | List Proposals |
-| `POST` | `/api/assistant/proposals/stage` | assistant | Stage Proposals |
-| `POST` | `/api/assistant/proposals/{proposal_id}/discard` | assistant | Discard Proposal |
-| `POST` | `/api/assistant/proposals/{proposal_id}/materialize` | assistant | Materialize Proposal |
-| `GET` | `/api/assistant/providers` | assistant | List Providers |
-| `GET` | `/api/assistant/requests/{request_id}` | assistant | Get Request Status |
-| `POST` | `/api/assistant/requests/{request_id}/cancel` | assistant | Cancel Request |
-| `GET` | `/api/assistant/tools` | assistant | List Tools |
-| `POST` | `/api/assistant/tools/inspect-isaac-scene` | assistant | Inspect Isaac Scene |
-| `POST` | `/api/assistant/tools/propose-scene-object-nodes` | assistant | Propose Scene Nodes |
-| `POST` | `/api/assistant/tools/propose-scene-objects` | assistant | Propose Scene Objects |
-| `GET` | `/api/capabilities` | skills | Get Capabilities |
+| `POST` | `/api/assistant/bridge/tools/{tool_id}` | assistant-draft-callback | Invoke Draft Tool |
+| `GET` | `/api/assistant/modes` | headless-runtime-client | Assistant Modes |
+| `GET` | `/api/assistant/modes/{mode_id}` | headless-runtime-client | Assistant Mode |
+| `POST` | `/api/assistant/requests` | assistant-provider-client | Submit |
+| `GET` | `/api/assistant/requests/{request_id}` | assistant-provider-client | Status |
+| `POST` | `/api/assistant/requests/{request_id}/cancel` | assistant-provider-client | Cancel |
+| `POST` | `/api/authoring/reset-apply-contexts` | composer-authoring-workspace | Record Reset Apply |
+| `GET` | `/api/authoring/submission-outcome` | composer-authoring-workspace | Read Submission Outcome |
+| `GET` | `/api/authoring/workspace` | composer-authoring-workspace | Read Authoring Workspace |
 | `GET` | `/api/catalog` | catalog | Get Catalog |
 | `GET` | `/api/catalog/{entry_id}` | catalog | Get Catalog Entry |
-| `POST` | `/api/cycle/full-stop` | cycle | Full Stop Cycle |
-| `POST` | `/api/cycle/recovery-actions` | cycle | Apply Recovery Action |
-| `POST` | `/api/cycle/reset` | cycle | Reset Cycle |
-| `POST` | `/api/cycle/run` | cycle | Run Cycle |
-| `GET` | `/api/cycle/status` | cycle | Get Status |
-| `POST` | `/api/cycle/stop` | cycle | Stop Cycle |
-| `PUT` | `/api/cycle/velocity-scale` | cycle | Set Velocity Scale |
-| `POST` | `/api/debug/collision/compare-positions` | debug | Debug Collision Compare Positions |
-| `GET` | `/api/debug/collision/compare-trajectory/{move_id}` | debug | Debug Collision Compare Trajectory Waypoint |
-| `GET` | `/api/debug/export` | debug | Debug Export |
-| `GET` | `/api/debug/export/ros2-medkit` | debug | Debug Export Ros2 Medkit |
-| `GET` | `/api/debug/qualification/environment` | debug | Debug Qualification Environment |
-| `POST` | `/api/debug/qualification/planning-cache/invalidate` | debug | Debug Invalidate Planning Cache |
-| `POST` | `/api/debug/qualification/planning-capture/drain` | debug | Debug Drain Planning Capture |
-| `POST` | `/api/debug/qualification/planning-capture/start` | debug | Debug Start Planning Capture |
-| `POST` | `/api/debug/qualification/planning-capture/stop` | debug | Debug Stop Planning Capture |
-| `GET` | `/api/debug/qualification/scene-authority-snapshot` | debug | Debug Scene Authority Snapshot |
-| `GET` | `/api/debug/scene-trace` | debug | Debug Scene Trace |
-| `POST` | `/api/debug/signals/publish` | debug | Debug Publish Signal |
-| `GET` | `/api/deployment` | program | Get Deployment |
-| `PUT` | `/api/deployment` | program | Update Deployment |
-| `GET` | `/api/deployment/full` | program | Get Full Deployment |
-| `POST` | `/api/deployment/load` | program | Load Deployment |
-| `POST` | `/api/deployment/save` | program | Save Deployment |
-| `GET` | `/api/deployment/saved/full` | program | Get Saved Full Deployment |
-| `POST` | `/api/direct/abort` | direct | Abort Intervention |
-| `POST` | `/api/direct/cartesian-jog` | direct | Cartesian Jog |
-| `POST` | `/api/direct/execute` | direct | Execute Intervention |
-| `POST` | `/api/direct/heartbeat` | direct | Renew Intervention Lease |
-| `POST` | `/api/direct/joint-jog` | direct | Joint Jog |
-| `GET` | `/api/direct/pending-recovery` | direct | Get Pending Delegated Recovery |
-| `POST` | `/api/direct/promote` | direct | Promote Intervention Blackboard |
-| `GET` | `/api/direct/status` | direct | Get Intervention Status |
-| `GET` | `/api/execution/alarms` | execution | Get Operator Alarms |
-| `POST` | `/api/execution/alarms/acknowledge-all` | execution | Acknowledge All Operator Alarms |
-| `POST` | `/api/execution/alarms/{condition_id}/acknowledge` | execution | Acknowledge Operator Alarm |
-| `GET` | `/api/execution/blackboard` | execution | Get Blackboard Snapshot |
-| `GET` | `/api/execution/channels` | execution | Get Execution Channels |
-| `GET` | `/api/execution/digest` | execution | Get Execution Digest |
-| `GET` | `/api/execution/history` | execution | Get Execution History |
-| `GET` | `/api/execution/latency-histograms` | execution | Get Latency Histograms |
-| `GET` | `/api/execution/runs` | execution | List Execution Runs |
+| `GET` | `/api/cell/latch` | headless-runtime-client | Cell Latch |
+| `GET` | `/api/components` | headless-runtime-client | Components |
+| `POST` | `/api/components/actions` | headless-runtime-client | Component Group Action |
+| `POST` | `/api/components/{component_id}/actions` | headless-runtime-client | Component Action |
+| `GET` | `/api/composer/settings` | composer-settings | Read Settings |
+| `PUT` | `/api/composer/settings` | composer-settings | Replace Settings |
+| `DELETE` | `/api/composer/settings/profiles/{name}` | composer-settings | Delete Profile |
+| `POST` | `/api/composer/settings/profiles/{name}` | composer-settings | Save Profile |
+| `POST` | `/api/composer/settings/profiles/{name}/load` | composer-settings | Load Profile |
+| `POST` | `/api/composer/settings/reset-damaged` | composer-settings | Reset Damaged |
+| `POST` | `/api/composer/settings/restore-defaults` | composer-settings | Restore Defaults |
+| `POST` | `/api/control/commands` | headless-runtime-client | Submit Control Command |
+| `GET` | `/api/control/state` | headless-runtime-client | Control Projection |
+| `POST` | `/api/cycle/recovery-actions` | headless-runtime-client | Cycle Recovery Action |
+| `GET` | `/api/cycle/status` | headless-runtime-client | Program Cycle Status |
+| `GET` | `/api/debug/export` | headless-runtime-client | Debug Export |
+| `GET` | `/api/debug/export/ros2-medkit` | headless-runtime-client | Normalized Trace Export |
+| `POST` | `/api/deployment/apply` | composer-deployment-draft | Apply Deployment |
+| `GET` | `/api/deployment/assistant-profiles` | composer-deployment-draft | Read Assistant Profiles |
+| `GET` | `/api/deployment/component-catalog` | composer-deployment-draft | Read Component Catalog |
+| `POST` | `/api/deployment/discard` | composer-deployment-draft | Discard |
+| `POST` | `/api/deployment/draft/components` | composer-deployment-draft | Add Components |
+| `POST` | `/api/deployment/draft/controlled-stop` | composer-deployment-draft | Update Controlled Stop |
+| `POST` | `/api/deployment/draft/motion-target-limit` | composer-deployment-draft | Update Motion Target Limit |
+| `POST` | `/api/deployment/draft/mutations` | composer-deployment-draft | Mutate Draft |
+| `GET` | `/api/deployment/effective` | composer-deployment-draft | Effective Values |
+| `POST` | `/api/deployment/open-draft` | composer-deployment-draft | Open Draft |
+| `POST` | `/api/deployment/preview` | composer-deployment-draft | Preview Deployment |
+| `POST` | `/api/deployment/revert` | composer-deployment-draft | Revert |
+| `POST` | `/api/deployment/revert/preview` | composer-deployment-draft | Preview Revert |
+| `POST` | `/api/deployment/save` | composer-deployment-draft | Save Draft |
+| `POST` | `/api/deployment/save-as` | composer-deployment-draft | Save Draft As |
+| `GET` | `/api/deployment/workspace` | composer-deployment-draft | Read Workspace |
+| `GET` | `/api/execution/alarms` | headless-runtime-client | Alarms |
+| `POST` | `/api/execution/alarms/acknowledge-all` | headless-runtime-client | Acknowledge All |
+| `GET` | `/api/execution/alarms/metrics` | headless-runtime-client | Alarm Metrics |
+| `POST` | `/api/execution/alarms/{condition_id}/acknowledge` | headless-runtime-client | Acknowledge Alarm |
+| `POST` | `/api/execution/capability-command-previews` | headless-runtime-client | Execution Preview Capability Command |
+| `GET` | `/api/execution/control-state` | headless-runtime-client | Execution Control State |
+| `GET` | `/api/execution/diagnostics` | headless-runtime-client | Execution Diagnostics |
+| `POST` | `/api/execution/full-stop` | headless-runtime-client | Execution Full Stop |
+| `GET` | `/api/execution/history` | headless-runtime-client | History |
+| `GET` | `/api/execution/history/captures` | headless-runtime-client | History Captures |
+| `GET` | `/api/execution/history/discovery` | headless-runtime-client | History Discovery |
+| `GET` | `/api/execution/history/export` | headless-runtime-client | History Export |
+| `GET` | `/api/execution/history/health` | headless-runtime-client | Historian Health |
+| `POST` | `/api/execution/history/reconcile` | headless-runtime-client | Historian Reconcile |
+| `GET` | `/api/execution/history/{sequence}` | headless-runtime-client | Historian Detail |
+| `GET` | `/api/execution/identity` | headless-runtime-client | Execution Identity |
+| `POST` | `/api/execution/io-signals/mock-input` | headless-runtime-client | Execution Set Mock Io Input |
+| `POST` | `/api/execution/io-signals/read` | headless-runtime-client | Execution Read Io Signal |
+| `POST` | `/api/execution/manual-handover` | headless-runtime-client | Execution Read Manual Handover |
+| `POST` | `/api/execution/motion-previews` | headless-runtime-client | Execution Preview Motion |
+| `POST` | `/api/execution/operations` | headless-runtime-client | Execution Submit |
+| `GET` | `/api/execution/operations/{operation_id}` | headless-runtime-client | Execution Read |
+| `POST` | `/api/execution/operations/{operation_id}/acknowledge-completed` | headless-runtime-client | Execution Acknowledge Completed |
+| `POST` | `/api/execution/operations/{operation_id}/reset` | headless-runtime-client | Execution Reset |
+| `POST` | `/api/execution/pick-place/plans/pick` | headless-runtime-client | Execution Plan Pick |
+| `POST` | `/api/execution/pick-place/plans/place` | headless-runtime-client | Execution Plan Place |
+| `GET` | `/api/execution/program-runs/{program_run_id}/admitted-speeds` | headless-runtime-client | Program Run Admitted Speeds |
+| `GET` | `/api/execution/runtime-scale-control` | headless-runtime-client | Execution Get Runtime Scale Control |
+| `POST` | `/api/execution/runtime-scale-control` | headless-runtime-client | Execution Set Runtime Scale Control |
+| `POST` | `/api/execution/stops` | headless-runtime-client | Execution Stop |
+| `GET` | `/api/execution/targets` | headless-runtime-client | Execution Targets |
 | `GET` | `/api/files/browse` | files | Browse Filesystem |
 | `GET` | `/api/health` |  | Health |
-| `GET` | `/api/infra/heartbeat` | infra | Infra Heartbeat |
-| `GET` | `/api/infra/model-endpoints` | infra | Infra Model Endpoints |
-| `GET` | `/api/infra/status` | infra | Infra Status |
-| `GET` | `/api/kernel/events` | kernel | Get Kernel Events |
-| `GET` | `/api/kernel/metrics` | kernel | Get Kernel Metrics |
-| `GET` | `/api/kernel/snapshot` | kernel | Get Kernel Snapshot |
-| `POST` | `/api/kernel/stop` | kernel | Kernel Stop |
-| `GET` | `/api/nodes/diagnostics` | nodes | Node Diagnostics |
-| `GET` | `/api/nodes/discovered` | nodes | Discovered Nodes |
-| `POST` | `/api/nodes/reload` | nodes | Reload Nodes |
-| `GET` | `/api/nodes/{node_id}/source` | nodes | Node Source |
-| `GET` | `/api/program` | program | Get Program |
-| `POST` | `/api/program/load` | program | Load Program |
-| `GET` | `/api/program/runtime-overrides` | program | Get Runtime Override Status |
-| `POST` | `/api/program/runtime-overrides` | program | Apply Runtime Override |
-| `POST` | `/api/program/runtime-overrides/activate` | program | Activate Runtime Overrides |
-| `POST` | `/api/program/runtime-overrides/clear` | program | Clear Runtime Overrides |
-| `GET` | `/api/program/runtime-overrides/materialized-tree` | program | Get Materialized Runtime Override Tree |
-| `POST` | `/api/program/runtime-overrides/promote` | program | Promote Runtime Overrides |
-| `POST` | `/api/program/runtime-overrides/revalidate` | program | Revalidate Runtime Overrides |
-| `DELETE` | `/api/program/runtime-overrides/{node_name}` | program | Remove Runtime Override |
-| `POST` | `/api/program/save` | program | Save Program |
-| `GET` | `/api/program/saved` | program | Get Saved Program |
-| `GET` | `/api/program/saved/tree` | program | Get Saved Program Tree |
-| `GET` | `/api/program/tree` | program | Get Program Tree |
-| `PUT` | `/api/program/tree` | program | Update Program Tree |
-| `POST` | `/api/program/validate` | program | Validate Program Tree |
-| `POST` | `/api/robot-control/candidates` | robot-control | Create Candidate |
-| `GET` | `/api/robot-control/candidates/{candidate_id}` | robot-control | Get Candidate |
-| `POST` | `/api/robot-control/candidates/{candidate_id}/execute` | robot-control | Execute Candidate |
-| `POST` | `/api/robot-control/candidates/{candidate_id}/revert` | robot-control | Revert Candidate |
-| `POST` | `/api/robot-lifecycle/disable` | robot-lifecycle | Disable |
-| `POST` | `/api/robot-lifecycle/enable` | robot-lifecycle | Enable |
-| `POST` | `/api/robot-lifecycle/reconcile` | robot-lifecycle | Reconcile |
-| `POST` | `/api/robot-lifecycle/recovery/{action_id}` | robot-lifecycle | Recovery |
-| `GET` | `/api/robot-lifecycle/status` | robot-lifecycle | Status |
-| `POST` | `/api/runtime/external/{provider_id}` | runtime | Update External Runtime Status |
-| `GET` | `/api/runtime/status` | runtime | Runtime Status |
-| `GET` | `/api/scenarios` | scenarios | List Scenarios |
-| `GET` | `/api/scene/diagnostics` | scene | Get Scene Diagnostics |
-| `POST` | `/api/scene/edit` | scene | Edit Scene |
-| `GET` | `/api/scene/frames` | scene | Get Scene Frames |
-| `POST` | `/api/scene/frames/gizmo-size` | scene | Set Frame Gizmo Size |
-| `POST` | `/api/scene/frames/visibility` | scene | Set Frame Visibility |
-| `POST` | `/api/scene/gripper/command` | scene | Command Gripper |
-| `GET` | `/api/scene/object-meshes/{asset_hash}.glb` | scene-object-meshes | Get Scene Object Mesh |
-| `POST` | `/api/scene/objects/frame-visibility` | scene | Set Object Frame Visibility |
-| `POST` | `/api/scene/objects/gizmo-size` | scene | Set Object Axes Gizmo Size |
-| `GET` | `/api/scene/pointcloud/status` | scene-pointcloud | Pointcloud Status |
-| `POST` | `/api/scene/pose-sources/apply` | scene | Apply Pose Source Updates |
-| `POST` | `/api/scene/pose-sources/{pose_source_id}/snapshot` | scene | Update Pose Source Snapshot |
-| `POST` | `/api/scene/preview-link-poses` | scene | Preview Link Poses |
-| `POST` | `/api/scene/program-resource/update` | scene | Update Program Scene Resource |
-| `GET` | `/api/scene/snapshot` | scene | Get Scene Snapshot |
-| `GET` | `/api/scene/snapshot/status` | scene-snapshot | Snapshot Status |
-| `POST` | `/api/scene/snapshot/upload/{request_id}` | scene-snapshot | Upload Snapshot |
-| `GET` | `/api/scene/snapshots/{snapshot_id}` | scene | Get Published Scene Snapshot |
-| `GET` | `/api/scene/state` | scene | Get Scene State |
-| `GET` | `/api/scene/urdf/collision-meshes/{link_name}/{collision_index}` | scene-urdf | Get Collision Mesh |
-| `GET` | `/api/scene/urdf/manifest` | scene-urdf | Get Manifest |
-| `GET` | `/api/scene/urdf/meshes/{link_name}/{visual_index}` | scene-urdf | Get Mesh |
-| `GET` | `/api/scene/urdf/models/{model_key}/collision-meshes/{link_name}/{collision_index}` | scene-urdf | Get Model Collision Mesh |
-| `GET` | `/api/scene/urdf/models/{model_key}/meshes/{link_name}/{visual_index}` | scene-urdf | Get Model Mesh |
-| `GET` | `/api/scene/viewer/status` | scene-viewer | Viewer Status |
-| `POST` | `/api/session/apply` | program | Apply Session |
-| `POST` | `/api/simulation/entity-state` | simulation | Set Entity State |
-| `POST` | `/api/simulation/reset` | simulation | Reset Simulation |
-| `POST` | `/api/simulation/state` | simulation | Set Simulation State |
-| `POST` | `/api/simulation/step` | simulation | Step Simulation |
-| `GET` | `/api/skills` | skills | Get Skills |
+| `GET` | `/api/io` | headless-runtime-client | Io Signals |
+| `POST` | `/api/io/{signal_id}/set` | headless-runtime-client | Set Io Output |
+| `POST` | `/api/manager/apply/acknowledge` | headless-runtime-client | Manager Apply Acknowledge |
+| `GET` | `/api/manager/apply/status` | headless-runtime-client | Manager Apply Status |
+| `GET` | `/api/manager/diff` | headless-runtime-client | Manager Diff |
+| `GET` | `/api/manager/graph` | headless-runtime-client | Manager Graph |
+| `GET` | `/api/manager/status` | headless-runtime-client | Manager Status |
+| `GET` | `/api/node-environment` | headless-runtime-client | Node Environment |
+| `GET` | `/api/nodes/environment` | node-environment | Get Node Environment |
+| `GET` | `/api/program/applied` | headless-runtime-client | Program Applied |
+| `GET` | `/api/program/applied/status` | headless-runtime-client | Program Applied Status |
+| `POST` | `/api/program/apply` | composer-draft | Apply Draft |
+| `POST` | `/api/program/cycle/reset` | headless-runtime-client | Program Cycle Reset |
+| `GET` | `/api/program/diagnostics/health` | headless-runtime-client | Program Diagnostic Health |
+| `POST` | `/api/program/discard` | composer-draft | Discard Draft |
+| `GET` | `/api/program/draft` | composer-draft | Read Draft |
+| `POST` | `/api/program/draft/expression-check` | composer-draft | Check Expression |
+| `POST` | `/api/program/draft/mutations` | composer-draft | Mutate Draft |
+| `GET` | `/api/program/draft/scene-meshes/resolve` | headless-scene-mesh-client | Resolve Program Draft Scene Mesh |
+| `GET` | `/api/program/draft/scene-meshes/{asset_hash}.glb` | headless-scene-mesh-client | Get Program Draft Scene Mesh |
+| `POST` | `/api/program/new-draft` | composer-draft | New Draft |
+| `POST` | `/api/program/open-draft` | composer-draft | Open Draft |
+| `GET` | `/api/program/persistent-values` | headless-runtime-client | Program Persistent Values |
+| `POST` | `/api/program/persistent-values` | headless-runtime-client | Set Program Persistent Value |
+| `POST` | `/api/program/persistent-values/clear` | headless-runtime-client | Clear Program Persistent Values |
+| `POST` | `/api/program/persistent-values/reset` | headless-runtime-client | Reset Program Persistent Value |
+| `GET` | `/api/program/readiness` | headless-runtime-client | Program Readiness |
+| `POST` | `/api/program/revert` | composer-draft | Revert Draft |
+| `GET` | `/api/program/runs` | headless-runtime-client | Program Runs |
+| `POST` | `/api/program/runs` | headless-runtime-client | Program Run Start |
+| `GET` | `/api/program/runs/{program_run_id}` | headless-runtime-client | Program Run Read |
+| `POST` | `/api/program/runs/{program_run_id}/blackboard-values` | headless-runtime-client | Write Runtime Blackboard |
+| `POST` | `/api/program/runs/{program_run_id}/full-stop` | headless-runtime-client | Program Run Full Stop |
+| `POST` | `/api/program/runs/{program_run_id}/manual-result` | headless-runtime-client | Stage Manual Result |
+| `POST` | `/api/program/runs/{program_run_id}/motion-start` | headless-runtime-client | Program Run Motion Start |
+| `POST` | `/api/program/runs/{program_run_id}/motion-stop` | headless-runtime-client | Program Run Motion Stop |
+| `POST` | `/api/program/runs/{program_run_id}/node-correction-previews` | headless-runtime-client | Program Node Correction Preview |
+| `POST` | `/api/program/runs/{program_run_id}/reset` | headless-runtime-client | Program Run Reset Full Stop |
+| `POST` | `/api/program/runs/{program_run_id}/resume-full-stop` | headless-runtime-client | Program Run Resume Full Stop |
+| `POST` | `/api/program/runs/{program_run_id}/resume-motion` | headless-runtime-client | Program Run Motion Resume |
+| `GET` | `/api/program/runs/{program_run_id}/runtime-controls` | headless-runtime-client | Program Runtime Controls |
+| `POST` | `/api/program/runs/{program_run_id}/stop` | headless-runtime-client | Program Run Stop |
+| `POST` | `/api/program/save` | composer-draft | Save Draft |
+| `POST` | `/api/program/save-as` | composer-draft | Save Draft As |
+| `POST` | `/api/program/scene-preparations` | headless-runtime-client | Program Scene Prepare |
+| `POST` | `/api/program/validate` | composer-draft | Validate Program Source |
+| `GET` | `/api/program/workspace` | composer-draft | Read Workspace |
+| `GET` | `/api/runtime` | headless-runtime-client | Runtime |
+| `GET` | `/api/scenario-documents` | composer-scenario-documents | List Documents |
+| `POST` | `/api/scenario-documents/discard` | composer-scenario-documents | Discard Scenario |
+| `POST` | `/api/scenario-documents/export` | composer-scenario-documents | Export Document |
+| `POST` | `/api/scenario-documents/save` | composer-scenario-documents | Save Document |
+| `POST` | `/api/scenario/load` | composer-scenario-documents | Load Document |
+| `POST` | `/api/scenario/new` | composer-scenario-documents | New Document |
+| `GET` | `/api/scenarios/current` | headless-runtime-client | Current Scenario |
+| `GET` | `/api/scene` | headless-runtime-client | Scene |
+| `GET` | `/api/scene/object-meshes/resolve` | headless-scene-mesh-client | Resolve Scene Object Mesh |
+| `GET` | `/api/scene/object-meshes/{asset_hash}.glb` | headless-scene-mesh-client | Get Scene Object Mesh |
+| `POST` | `/api/scene/pointcloud/observations` | headless-pointcloud-observer-client | Publish Pointcloud |
+| `GET` | `/api/scene/pointcloud/status` | headless-pointcloud-observer-client | Pointcloud Status |
+| `GET` | `/api/scene/snapshot/render` | headless-viewer-snapshot-client | Render Snapshot |
+| `GET` | `/api/scene/snapshot/status` | headless-viewer-snapshot-client | Snapshot Status |
+| `POST` | `/api/scene/snapshot/upload/{request_id}` | headless-viewer-snapshot-client | Upload Snapshot |
+| `POST` | `/api/scene/transactions` | headless-runtime-client | Scene Commit |
+| `GET` | `/api/scene/urdf/manifest` | structural-urdf | Get Manifest |
+| `GET` | `/api/scene/urdf/models/{model_key}/collision-meshes/{link_name}/{collision_index}` | structural-urdf | Get Model Collision Mesh |
+| `GET` | `/api/scene/urdf/models/{model_key}/meshes/{link_name}/{visual_index}` | structural-urdf | Get Model Mesh |
+| `GET` | `/api/scene/viewer/status` | headless-viewer-observation-client | Viewer Status |
+| `GET` | `/api/skills` | headless-runtime-client | Skills |
+| `POST` | `/api/skills/expand` | headless-runtime-client | Expand Skill |
+| `GET` | `/api/source-model` | headless-runtime-client | Source Model |
+| `DELETE` | `/api/{unavailable_path}` |  | Unavailable Api |
+| `GET` | `/api/{unavailable_path}` |  | Unavailable Api |
+| `PATCH` | `/api/{unavailable_path}` |  | Unavailable Api |
+| `POST` | `/api/{unavailable_path}` |  | Unavailable Api |
+| `PUT` | `/api/{unavailable_path}` |  | Unavailable Api |

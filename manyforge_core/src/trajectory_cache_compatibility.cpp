@@ -39,20 +39,6 @@ double translation_distance_m(const Pose3DTO& a, const Pose3DTO& b) {
   return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-bool positions_match_by_index(const std::vector<double>& a,
-                              const std::vector<double>& b,
-                              double tolerance_rad) {
-  if (a.size() != b.size()) {
-    return false;
-  }
-  for (size_t i = 0; i < a.size(); ++i) {
-    if (std::abs(a[i] - b[i]) > tolerance_rad) {
-      return false;
-    }
-  }
-  return true;
-}
-
 bool names_cover_positions(const std::vector<std::string>& names,
                            size_t position_count) {
   return !names.empty() && names.size() == position_count &&
@@ -62,50 +48,41 @@ bool names_cover_positions(const std::vector<std::string>& names,
 
 CacheCompatibilityResult cached_joint_goal_matches_request(
     const TrajectoryWaypointDTO& end_wp,
+    const std::vector<ResourceId>& trajectory_resources,
     const std::vector<std::string>& trajectory_joint_names,
-    const JointGoalDTO& joint_goal,
+    const ResolvedJointGoalDTO& joint_goal,
     double tolerance_rad) {
-  if (end_wp.positions_rad.size() != joint_goal.positions_rad.size()) {
-    return incompatible_cache("goal_changed");
+  if (trajectory_resources.size() != trajectory_joint_names.size() ||
+      trajectory_joint_names.size() != end_wp.positions_rad.size() ||
+      joint_goal.resources.empty() ||
+      joint_goal.resources.size() != joint_goal.joint_names.size() ||
+      joint_goal.resources.size() != joint_goal.positions_rad.size()) {
+    return incompatible_cache("goal_unverifiable");
   }
-
-  const bool trajectory_names_complete =
-      names_cover_positions(trajectory_joint_names, end_wp.positions_rad.size());
-  const bool goal_names_complete = names_cover_positions(
-      joint_goal.joint_names, joint_goal.positions_rad.size());
-
-  if (trajectory_names_complete && goal_names_complete) {
-    for (size_t goal_idx = 0; goal_idx < joint_goal.joint_names.size();
-         ++goal_idx) {
-      const auto& goal_name = joint_goal.joint_names[goal_idx];
-      const auto matches = std::count(trajectory_joint_names.begin(),
-                                      trajectory_joint_names.end(), goal_name);
-      if (matches != 1) {
-        return incompatible_cache("goal_unverifiable");
-      }
-      const auto traj_it = std::find(trajectory_joint_names.begin(),
-                                     trajectory_joint_names.end(), goal_name);
-      const auto traj_idx =
-          static_cast<size_t>(std::distance(trajectory_joint_names.begin(),
-                                            traj_it));
-      if (std::abs(end_wp.positions_rad[traj_idx] -
-                   joint_goal.positions_rad[goal_idx]) > tolerance_rad) {
-        return incompatible_cache("goal_changed");
-      }
+  for (size_t goal_idx = 0; goal_idx < joint_goal.resources.size();
+       ++goal_idx) {
+    const auto& goal_resource = joint_goal.resources[goal_idx];
+    if (std::count(joint_goal.resources.begin(), joint_goal.resources.end(),
+                   goal_resource) != 1 ||
+        std::count(trajectory_resources.begin(), trajectory_resources.end(),
+                   goal_resource) != 1) {
+      return incompatible_cache("goal_unverifiable");
     }
-    return compatible_cache();
+    const auto trajectory_resource =
+        std::find(trajectory_resources.begin(), trajectory_resources.end(),
+                  goal_resource);
+    const auto trajectory_index = static_cast<size_t>(
+        std::distance(trajectory_resources.begin(), trajectory_resource));
+    if (joint_goal.joint_names[goal_idx] !=
+        trajectory_joint_names[trajectory_index]) {
+      return incompatible_cache("goal_unverifiable");
+    }
+    if (std::abs(end_wp.positions_rad[trajectory_index] -
+                 joint_goal.positions_rad[goal_idx]) > tolerance_rad) {
+      return incompatible_cache("goal_changed");
+    }
   }
-
-  if (trajectory_joint_names.empty() && joint_goal.joint_names.empty() &&
-      positions_match_by_index(end_wp.positions_rad, joint_goal.positions_rad,
-                               tolerance_rad)) {
-    return compatible_cache();
-  }
-
-  if (trajectory_joint_names.empty() && joint_goal.joint_names.empty()) {
-    return incompatible_cache("goal_changed");
-  }
-  return incompatible_cache("goal_unverifiable");
+  return compatible_cache();
 }
 
 CacheCompatibilityResult cached_pose_goal_matches_request(
@@ -114,7 +91,9 @@ CacheCompatibilityResult cached_pose_goal_matches_request(
     const TrajectoryWaypointDTO& end_wp,
     const Pose3DTO& requested_goal,
     const ExecuteRequestDTO& request) {
-  if (request.tcp_frame.empty() || request.base_frame.empty()) {
+  const auto& tcp_frame = compiled_frame_name(request.binding.tcp_frame);
+  const auto& base_frame = compiled_frame_name(request.binding.base_frame);
+  if (tcp_frame.empty() || base_frame.empty()) {
     return incompatible_cache("goal_unverifiable");
   }
   RobotStateDTO final_state;
@@ -124,7 +103,7 @@ CacheCompatibilityResult cached_pose_goal_matches_request(
 
   try {
     auto final_tcp_pose_result = kinematics.forward_kinematics(
-        FkRequestDTO{final_state, request.tcp_frame, request.base_frame});
+        FkRequestDTO{final_state, tcp_frame, base_frame});
     if (!final_tcp_pose_result.ok()) {
       return incompatible_cache("fk_failed");
     }
@@ -160,11 +139,17 @@ CacheCompatibilityResult cached_trajectory_matches_request_goal(
   if (trajectory.waypoints.empty()) {
     return incompatible_cache("empty_trajectory");
   }
+  if (trajectory.resources != request.binding.resources ||
+      trajectory.joint_names !=
+          request.binding.model_group_binding.compiled_joint_names) {
+    return incompatible_cache("resource_projection_changed");
+  }
 
   const auto& end_wp = trajectory.waypoints.back();
-  if (const auto* joint_goal = std::get_if<JointGoalDTO>(&request.motion)) {
+  if (const auto* joint_goal =
+          std::get_if<ResolvedJointGoalDTO>(&request.motion)) {
     return cached_joint_goal_matches_request(
-        end_wp, trajectory.joint_names, *joint_goal,
+        end_wp, trajectory.resources, trajectory.joint_names, *joint_goal,
         request.tolerances.joint_position_tol_rad);
   }
 

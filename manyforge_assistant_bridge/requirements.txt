@@ -1,3 +1,2 @@
-fastapi>=0.111
-uvicorn[standard]>=0.30
-httpx>=0.27
+# Runtime dependencies are declared and pinned through pyproject.toml. This
+# compatibility file intentionally carries no second dependency declaration.

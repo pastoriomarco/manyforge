@@ -1,0 +1,140 @@
+api_version: manyforge.closed_schema.v1
+schema_id: manyforge.closed_schema.example_inventory.v1
+schema_revision: sha256:dd5840f1d78b171d86631d73b333625011c81fcae9b54221ab3ea63c65446c55
+schema_purpose: artifact_document
+root_definition_id: inventory
+definitions:
+  - definition_id: inventory
+    value_schema:
+      kind: object
+      fields:
+        - field_id: api_version
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - manyforge.closed_schema.example_inventory.v1
+              - kind: string_format
+                value: api_version
+        - field_id: enabled
+          presence: optional
+          default:
+            kind: materialized
+            value: true
+          value_schema:
+            kind: scalar
+            scalar_type: boolean
+            constraints: []
+        - field_id: inventory_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: labels
+          presence: optional
+          default:
+            kind: materialized
+            value: []
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 32
+            collection:
+              kind: scalar_set
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: string_format
+                  value: portable_id
+        - field_id: resources
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 64
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - resource_id
+            item_schema:
+              kind: local_ref
+              definition_id: resource
+        - field_id: retries
+          presence: optional
+          default:
+            kind: materialized
+            value: 3
+          value_schema:
+            kind: scalar
+            scalar_type: integer
+            constraints:
+              - kind: maximum
+                value: 10
+              - kind: minimum
+                value: 0
+        - field_id: steps
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 16
+            collection:
+              kind: ordered
+            item_schema:
+              kind: local_ref
+              definition_id: step
+  - definition_id: resource
+    value_schema:
+      kind: object
+      fields:
+        - field_id: resource_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+  - definition_id: step
+    value_schema:
+      kind: object
+      fields:
+        - field_id: name
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: max_length
+                value: 64
+              - kind: min_length
+                value: 1

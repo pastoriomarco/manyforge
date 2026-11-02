@@ -1,0 +1,113 @@
+{
+  "attachment_edges": [],
+  "control_bindings": [
+    {
+      "binding_revision": 1,
+      "capability_id": "capability.joint_trajectory",
+      "command_target_id": "target.arm",
+      "control_binding_id": "binding.lite6.a.arm",
+      "control_domain_id": "domain.a",
+      "controllable_component_id": "component.lite6.a",
+      "controller_topology_id": "topology.lite6.a",
+      "endpoints": [
+        "/a/joint_trajectory"
+      ],
+      "interface_contract_revision": 1,
+      "resource_ids": [
+        "a.joint1",
+        "a.joint2"
+      ],
+      "route_id": "route.joint_trajectory",
+      "topology_revision": 1
+    },
+    {
+      "binding_revision": 1,
+      "capability_id": "capability.joint_trajectory",
+      "command_target_id": "target.arm",
+      "control_binding_id": "binding.lite6.b.arm",
+      "control_domain_id": "domain.b",
+      "controllable_component_id": "component.lite6.b",
+      "controller_topology_id": "topology.lite6.b",
+      "endpoints": [
+        "/b/joint_trajectory"
+      ],
+      "interface_contract_revision": 1,
+      "resource_ids": [
+        "b.joint1",
+        "b.joint2"
+      ],
+      "route_id": "route.joint_trajectory",
+      "topology_revision": 1
+    }
+  ],
+  "control_domains": [
+    {
+      "control_domain_id": "domain.a",
+      "controller_topology_id": "topology.lite6.a",
+      "interface_contract_revision": 1,
+      "runtime_unit_id": "runtime.control.a",
+      "topology_revision": 1
+    },
+    {
+      "control_domain_id": "domain.b",
+      "controller_topology_id": "topology.lite6.b",
+      "interface_contract_revision": 1,
+      "runtime_unit_id": "runtime.control.b",
+      "topology_revision": 1
+    }
+  ],
+  "controllable_components": [
+    {
+      "component_type_id": "type.lite6",
+      "control_binding_ids": [
+        "binding.lite6.a.arm"
+      ],
+      "controllable_component_id": "component.lite6.a",
+      "model_instance_id": "model.lite6.a"
+    },
+    {
+      "component_type_id": "type.lite6",
+      "control_binding_ids": [
+        "binding.lite6.b.arm"
+      ],
+      "controllable_component_id": "component.lite6.b",
+      "model_instance_id": "model.lite6.b"
+    }
+  ],
+  "graph_revision": 1,
+  "model_instances": [
+    {
+      "model_asset_id": "asset.lite6",
+      "model_instance_id": "model.lite6.a",
+      "parent_frame": "world",
+      "prefix": "a_"
+    },
+    {
+      "model_asset_id": "asset.lite6",
+      "model_instance_id": "model.lite6.b",
+      "parent_frame": "world",
+      "prefix": "b_"
+    }
+  ],
+  "runtime_units": [
+    {
+      "command": [
+        "fake-control-domain",
+        "a"
+      ],
+      "dependencies": [],
+      "kind": "control_domain",
+      "runtime_unit_id": "runtime.control.a"
+    },
+    {
+      "command": [
+        "fake-control-domain",
+        "b"
+      ],
+      "dependencies": [],
+      "kind": "control_domain",
+      "runtime_unit_id": "runtime.control.b"
+    }
+  ],
+  "schema": "manyforge.experimental.composable_cell.i1a.v0"
+}

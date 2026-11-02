@@ -24,7 +24,9 @@ def test_required_module_inventory_uses_upstream_package_namespaces() -> None:
     assert _MODULE.REQUIRED_MODULES == (
         "pinocchio",
         "coal",
+        "roboplan_common",
         "roboplan.core",
+        "roboplan.filters",
         "roboplan.example_models",
         "roboplan.simple_ik",
         "roboplan.optimal_ik",
@@ -103,6 +105,33 @@ def test_linkage_rejects_unresolved_library(
         )
 
 
+def test_linkage_rejects_roboplan_library_outside_selected_distribution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cmeel_prefix = tmp_path / "site-packages/cmeel.prefix"
+    cmeel_prefix.mkdir(parents=True)
+    selected = tmp_path / "site-packages/lib"
+    selected.mkdir(parents=True)
+    competing = tmp_path / "usr/local/lib/libroboplan.so"
+    competing.parent.mkdir(parents=True)
+    competing.touch()
+    monkeypatch.setattr(
+        _MODULE.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout=f"libroboplan.so => {competing} (0x0)\n"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="resolved outside"):
+        _MODULE._check_linkage(  # noqa: SLF001
+            tmp_path / "extension.so",
+            cmeel_prefix,
+            selected,
+        )
+
+
 def test_cmeel_prefix_requires_exactly_one_active_generation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -119,3 +148,68 @@ def test_cmeel_prefix_requires_exactly_one_active_generation(
 
     with pytest.raises(RuntimeError, match="exactly one active cmeel.prefix"):
         _MODULE._cmeel_prefix()  # noqa: SLF001
+
+
+def test_installation_derives_cmeel_library_root_from_recorded_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    site_packages = tmp_path / "site-packages"
+    library = site_packages / "cmeel.prefix/lib/libroboplan.so"
+    extension = site_packages / "roboplan/core/_core_ext.so"
+    library.parent.mkdir(parents=True)
+    extension.parent.mkdir(parents=True)
+    library.touch()
+    extension.touch()
+    files = (
+        Path("cmeel.prefix/lib/libroboplan.so"),
+        Path("roboplan/core/_core_ext.so"),
+    )
+    distribution = SimpleNamespace(
+        files=files,
+        locate_file=lambda path: site_packages / path,
+    )
+    monkeypatch.setattr(_MODULE, "ROBOPLAN_DISTRIBUTIONS", ("roboplan-core",))
+    monkeypatch.setattr(_MODULE, "ROBOPLAN_LIBRARIES", ("libroboplan.so",))
+    monkeypatch.setattr(
+        _MODULE.importlib.metadata,
+        "distribution",
+        lambda _name: distribution,
+    )
+
+    root, selected = _MODULE._roboplan_installation(  # noqa: SLF001
+        [SimpleNamespace(__name__="roboplan.core._core_ext", __file__=extension)]
+    )
+
+    assert root == library.parent.resolve()
+    assert selected == [library.resolve()]
+
+
+def test_installation_rejects_duplicate_recorded_library(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    site_packages = tmp_path / "site-packages"
+    first = site_packages / "cmeel.prefix/lib/libroboplan.so"
+    second = site_packages / "other/lib/libroboplan.so"
+    for library in (first, second):
+        library.parent.mkdir(parents=True)
+        library.touch()
+    files = (
+        Path("cmeel.prefix/lib/libroboplan.so"),
+        Path("other/lib/libroboplan.so"),
+    )
+    distribution = SimpleNamespace(
+        files=files,
+        locate_file=lambda path: site_packages / path,
+    )
+    monkeypatch.setattr(_MODULE, "ROBOPLAN_DISTRIBUTIONS", ("roboplan-core",))
+    monkeypatch.setattr(_MODULE, "ROBOPLAN_LIBRARIES", ("libroboplan.so",))
+    monkeypatch.setattr(
+        _MODULE.importlib.metadata,
+        "distribution",
+        lambda _name: distribution,
+    )
+
+    with pytest.raises(RuntimeError, match="expected one recorded RoboPlan library"):
+        _MODULE._roboplan_installation([])  # noqa: SLF001

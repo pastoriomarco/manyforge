@@ -51,7 +51,7 @@ def test_forwarder_reports_drive_real_fault_manager_lifecycle():
             pytest.skip("no running fault_manager (/fault_manager/report_fault)")
         assert list_client.wait_for_service(timeout_sec=3.0)
 
-        source_id = f"/manyforge/itest_{uuid.uuid4().hex[:8]}/composer"
+        source_id = f"/manyforge/itest_{uuid.uuid4().hex[:8]}/runtime"
         forwarder = FaultForwarder(source_id=source_id)
 
         def call(request):

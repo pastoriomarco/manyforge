@@ -1,0 +1,1204 @@
+{
+  "schema_version": "manyforge.composer_style_inventory.v1",
+  "stylesheets": [
+    {
+      "path": "src/styles/tokens.css",
+      "lines": 347
+    },
+    {
+      "path": "src/styles/base.css",
+      "lines": 113
+    },
+    {
+      "path": "src/styles/shared/buttons.css",
+      "lines": 84
+    },
+    {
+      "path": "src/styles/shared/status.css",
+      "lines": 201
+    },
+    {
+      "path": "src/styles/surfaces/document-controls.css",
+      "lines": 407
+    },
+    {
+      "path": "src/styles/surfaces/scene.css",
+      "lines": 446
+    },
+    {
+      "path": "src/styles/surfaces/program-authoring.css",
+      "lines": 1579
+    },
+    {
+      "path": "src/styles/surfaces/program-canvas.css",
+      "lines": 925
+    },
+    {
+      "path": "src/styles/surfaces/viewer.css",
+      "lines": 1209
+    },
+    {
+      "path": "src/styles/surfaces/shell.css",
+      "lines": 978
+    },
+    {
+      "path": "src/styles/surfaces/inspector.css",
+      "lines": 332
+    },
+    {
+      "path": "src/styles/surfaces/robot-control.css",
+      "lines": 622
+    },
+    {
+      "path": "src/styles/surfaces/deployment.css",
+      "lines": 712
+    },
+    {
+      "path": "src/styles/surfaces/observability.css",
+      "lines": 786
+    },
+    {
+      "path": "src/styles/surfaces/assistant.css",
+      "lines": 118
+    },
+    {
+      "path": "src/styles/surfaces/reference.css",
+      "lines": 276
+    }
+  ],
+  "counts": {
+    "hex_distinct": 201,
+    "hex_groups_within_8": 177,
+    "rgb_distinct": 65,
+    "duplicate_selectors": 121,
+    "classes_defined": 644,
+    "classes_used_without_rule": 26,
+    "classes_never_referenced": 117,
+    "ts_color_literals": 41
+  },
+  "histograms": {
+    "font_size": {
+      "var(--mf-font-size-068)": 97,
+      "var(--mf-font-size-072)": 43,
+      "var(--mf-font-size-076)": 34,
+      "var(--mf-font-size-065)": 31,
+      "var(--mf-font-size-058)": 19,
+      "var(--mf-font-size-062)": 18,
+      "var(--mf-font-size-080)": 13,
+      "var(--inspector-label-font-size)": 9,
+      "var(--mf-font-size-084)": 6,
+      "var(--mf-font-size-056)": 4,
+      "var(--inspector-help-font-size)": 4,
+      "var(--mf-font-size-100)": 3,
+      "var(--mf-font-size-096)": 2,
+      "var(--mf-font-size-088)": 2,
+      "var(--mf-font-size-105)": 2,
+      "var(--mf-font-size-130)": 1,
+      "var(--mf-font-size-125)": 1,
+      "var(--mf-font-size-120)": 1,
+      "clamp(1.25rem, 2.4vw, 1.75rem)": 1,
+      "var(--mf-font-size-112)": 1,
+      "inherit": 1,
+      "0": 1,
+      "var(--inspector-control-font-size)": 1,
+      "var(--mf-font-size-052)": 1
+    },
+    "font_weight": {
+      "var(--mf-font-weight-bold)": 18,
+      "var(--mf-font-weight-semibold)": 11,
+      "var(--mf-font-weight-heavy)": 2,
+      "var(--mf-font-weight-regular)": 2
+    },
+    "border_radius": {
+      "var(--mf-radius-md-sm)": 38,
+      "var(--mf-radius-md)": 28,
+      "0": 17,
+      "var(--mf-radius-lg)": 15,
+      "var(--mf-radius-pill)": 15,
+      "var(--mf-radius-sm)": 11,
+      "var(--mf-radius-xl)": 8,
+      "var(--mf-radius-2xl)": 4,
+      "50%": 2,
+      "var(--mf-radius-xs)": 2,
+      "var(--mf-radius-md-sm) 0 0 var(--mf-radius-md-sm)": 1
+    },
+    "gap": {
+      "0.35rem": 36,
+      "0.4rem": 33,
+      "0.25rem": 30,
+      "0.55rem": 28,
+      "0.45rem": 25,
+      "0.5rem": 19,
+      "0.3rem": 18,
+      "0.75rem": 12,
+      "0.65rem": 12,
+      "0.6rem": 12,
+      "0.2rem": 12,
+      "0.7rem": 10,
+      "1rem": 8,
+      "0.12rem": 6,
+      "0.15rem": 6,
+      "0.32rem": 5,
+      "0.28rem": 5,
+      "0": 4,
+      "0.18rem": 4,
+      "0.1rem": 3,
+      "var(--inspector-section-gap)": 3,
+      "0.42rem": 3,
+      "0.05rem": 2,
+      "0.8rem": 2,
+      "0.35rem 0.7rem": 1,
+      "0.25rem 0.65rem": 1,
+      "0.35rem 0.65rem": 1,
+      "0.14rem": 1,
+      "0.45rem 0.65rem": 1,
+      "0.55rem 1.2rem": 1,
+      "0.45rem 0.8rem": 1,
+      "0.45rem 0.4rem": 1,
+      "0.35rem 0.6rem": 1,
+      "0.4rem 0.7rem": 1,
+      "0.5rem 0.4rem": 1,
+      "1px": 1,
+      "0.3rem 0.7rem": 1,
+      "0.85rem": 1,
+      "0.4rem 1rem": 1,
+      "0.45rem 1rem": 1
+    },
+    "z_index": {
+      "var(--mf-z-sticky)": 6,
+      "var(--mf-z-raised)": 5,
+      "var(--mf-z-controls)": 4,
+      "var(--mf-z-popover)": 4,
+      "var(--mf-z-dropdown)": 1,
+      "var(--mf-z-popover-2)": 1,
+      "var(--mf-z-notification)": 1,
+      "var(--mf-z-raised-2)": 1,
+      "var(--mf-z-canvas-overlay)": 1,
+      "var(--mf-z-overlay)": 1,
+      "var(--mf-z-dropdown-2)": 1,
+      "var(--mf-z-modal)": 1,
+      "var(--mf-z-modal-2)": 1
+    }
+  },
+  "near_duplicate_color_groups": [
+    [
+      "#142b37",
+      "#1a2c38"
+    ],
+    [
+      "#203542",
+      "#213744"
+    ],
+    [
+      "#304b59",
+      "#31505d"
+    ],
+    [
+      "#355464",
+      "#365563"
+    ],
+    [
+      "#478b9e",
+      "#4e8998"
+    ],
+    [
+      "#557788",
+      "#587985"
+    ],
+    [
+      "#58b9d0",
+      "#60bed5"
+    ],
+    [
+      "#5fc39f",
+      "#65c59b"
+    ],
+    [
+      "#657d8a",
+      "#667b86",
+      "#677b87"
+    ],
+    [
+      "#66c7dc",
+      "#68cadd"
+    ],
+    [
+      "#759aa6",
+      "#7894a1"
+    ],
+    [
+      "#7c8d94",
+      "#7d8d96"
+    ],
+    [
+      "#80574c",
+      "#86524c"
+    ],
+    [
+      "#91a5af",
+      "#91a7b2"
+    ],
+    [
+      "#9daab4",
+      "#9fb1bb"
+    ],
+    [
+      "#b7dce7",
+      "#b8dfe8"
+    ],
+    [
+      "#b98b3d",
+      "#c18b3c"
+    ],
+    [
+      "#c6d3d9",
+      "#c6d6dd"
+    ],
+    [
+      "#d5a34b",
+      "#d6a64a"
+    ],
+    [
+      "#d86f66",
+      "#df7169"
+    ],
+    [
+      "#d9f4fa",
+      "#dffaff"
+    ],
+    [
+      "#e3f2f6",
+      "#e6f6fa",
+      "#e8f0f7"
+    ]
+  ],
+  "duplicate_selectors": [
+    {
+      "selector": "|:root",
+      "count": 2
+    },
+    {
+      "selector": "|button",
+      "count": 2
+    },
+    {
+      "selector": "|input",
+      "count": 2
+    },
+    {
+      "selector": "|select",
+      "count": 3
+    },
+    {
+      "selector": "|textarea",
+      "count": 3
+    },
+    {
+      "selector": "|.document-save-as-path",
+      "count": 2
+    },
+    {
+      "selector": "|.confirmation-check",
+      "count": 4
+    },
+    {
+      "selector": "|.document-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.document-identity",
+      "count": 2
+    },
+    {
+      "selector": "|.document-controls",
+      "count": 2
+    },
+    {
+      "selector": "|.dialog-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-apply-impact ul",
+      "count": 2
+    },
+    {
+      "selector": "|.document-source-notice ul",
+      "count": 2
+    },
+    {
+      "selector": "|.source-occurrence-panel",
+      "count": 2
+    },
+    {
+      "selector": "|.scene-authoring-heading",
+      "count": 2
+    },
+    {
+      "selector": "|.source-occurrence-facts",
+      "count": 2
+    },
+    {
+      "selector": "|.scene-owner-identity",
+      "count": 2
+    },
+    {
+      "selector": "|.scene-commit-error",
+      "count": 2
+    },
+    {
+      "selector": "|.scene-commit-success",
+      "count": 2
+    },
+    {
+      "selector": "|.program-workspace-header-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.program-staging-heading",
+      "count": 2
+    },
+    {
+      "selector": "|.program-property-heading",
+      "count": 2
+    },
+    {
+      "selector": "|.program-node-identity",
+      "count": 2
+    },
+    {
+      "selector": "|.program-feedback",
+      "count": 2
+    },
+    {
+      "selector": "|.program-authoring-grid",
+      "count": 2
+    },
+    {
+      "selector": "|.program-properties",
+      "count": 2
+    },
+    {
+      "selector": "|.program-declarations",
+      "count": 3
+    },
+    {
+      "selector": "|.program-authoring-empty",
+      "count": 2
+    },
+    {
+      "selector": "|.program-subpanel-header h3",
+      "count": 2
+    },
+    {
+      "selector": "|.program-declarations h4",
+      "count": 2
+    },
+    {
+      "selector": "|.program-filter",
+      "count": 2
+    },
+    {
+      "selector": "|.program-inline-message",
+      "count": 2
+    },
+    {
+      "selector": "|.program-node-identity > span",
+      "count": 2
+    },
+    {
+      "selector": "|.program-node-identity > span:last-child",
+      "count": 2
+    },
+    {
+      "selector": "|.program-policy-actions-row",
+      "count": 2
+    },
+    {
+      "selector": "|.program-policy-help",
+      "count": 2
+    },
+    {
+      "selector": "|.program-policy-blocked",
+      "count": 2
+    },
+    {
+      "selector": "|.program-policy-fieldset",
+      "count": 2
+    },
+    {
+      "selector": "|.program-policy-actions legend",
+      "count": 2
+    },
+    {
+      "selector": "|.program-policy-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.program-variant-editor",
+      "count": 2
+    },
+    {
+      "selector": "|.program-waypoint",
+      "count": 4
+    },
+    {
+      "selector": "|.program-variant-editor label",
+      "count": 2
+    },
+    {
+      "selector": "|.program-vector-editor",
+      "count": 2
+    },
+    {
+      "selector": "|.program-form-hint",
+      "count": 2
+    },
+    {
+      "selector": "|.program-declaration-list small",
+      "count": 2
+    },
+    {
+      "selector": "|.program-parameter-constraints label > span",
+      "count": 2
+    },
+    {
+      "selector": "|.program-template-form",
+      "count": 2
+    },
+    {
+      "selector": "|.contact-policy-checks",
+      "count": 2
+    },
+    {
+      "selector": "@media (max-width: 48rem)|.program-policy-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.program-inspector",
+      "count": 2
+    },
+    {
+      "selector": "|.program-declaration-navigator button strong",
+      "count": 2
+    },
+    {
+      "selector": "|.program-declaration-navigator button small",
+      "count": 2
+    },
+    {
+      "selector": "|.program-schema-list",
+      "count": 2
+    },
+    {
+      "selector": "|.program-schema-object",
+      "count": 3
+    },
+    {
+      "selector": "|.program-settings-editor",
+      "count": 2
+    },
+    {
+      "selector": "|.program-settings-section",
+      "count": 2
+    },
+    {
+      "selector": "|.program-motion-number",
+      "count": 2
+    },
+    {
+      "selector": "|.node-palette-copy strong",
+      "count": 2
+    },
+    {
+      "selector": "|.node-palette-copy small",
+      "count": 2
+    },
+    {
+      "selector": "|.program-palette",
+      "count": 3
+    },
+    {
+      "selector": "|.program-tree-surface",
+      "count": 3
+    },
+    {
+      "selector": "|.program-canvas-toolbar",
+      "count": 3
+    },
+    {
+      "selector": "|.program-canvas-help",
+      "count": 3
+    },
+    {
+      "selector": "|.program-canvas-toolbar .canvas-view-controls button",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-options > summary",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-axes-list strong",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-axes-list small",
+      "count": 2
+    },
+    {
+      "selector": "|.transport-group-column button",
+      "count": 2
+    },
+    {
+      "selector": "|.transport-group-scale",
+      "count": 2
+    },
+    {
+      "selector": "|.transport-group-scale span",
+      "count": 2
+    },
+    {
+      "selector": "|.transport-group-scale output",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-object-quick-panel",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-object-quick-panel dl",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-inspector-section .viewer-options-body",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-inspector-section .viewer-object-quick-panel",
+      "count": 2
+    },
+    {
+      "selector": "|.app-shell",
+      "count": 2
+    },
+    {
+      "selector": "|.workbench",
+      "count": 2
+    },
+    {
+      "selector": "|.workbench-workspace",
+      "count": 4
+    },
+    {
+      "selector": "|.workbench-commands",
+      "count": 2
+    },
+    {
+      "selector": "|.workbench-pane",
+      "count": 2
+    },
+    {
+      "selector": "|.workbench-pane > .panel",
+      "count": 2
+    },
+    {
+      "selector": "|.workbench-workspace .panel",
+      "count": 2
+    },
+    {
+      "selector": "@media (max-width: 76rem)|.workbench-navigation",
+      "count": 2
+    },
+    {
+      "selector": "@media (max-width: 76rem)|.workbench-workspace",
+      "count": 3
+    },
+    {
+      "selector": "@media (max-width: 76rem)|.workbench-commands",
+      "count": 2
+    },
+    {
+      "selector": "|.workbench-inspector",
+      "count": 2
+    },
+    {
+      "selector": "|.workbench-commands .workbench-pane",
+      "count": 2
+    },
+    {
+      "selector": "|.central-inspector-header",
+      "count": 2
+    },
+    {
+      "selector": "|.central-inspector-body",
+      "count": 2
+    },
+    {
+      "selector": "|.central-inspector-section :is( .central-inspector-body",
+      "count": 9
+    },
+    {
+      "selector": "|.robot-control-boundary",
+      "count": 2
+    },
+    {
+      "selector": "|.robot-control-pose-note",
+      "count": 2
+    },
+    {
+      "selector": "|.robot-control-move-to",
+      "count": 2
+    },
+    {
+      "selector": "|.robot-control-preset",
+      "count": 2
+    },
+    {
+      "selector": "|.robot-control-stored-move",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-run-gate",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-field-error",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-binding-row",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-binding-row strong",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-binding-row span",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-advanced-document",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-runtime-unit",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-joint-effective",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-focused-field > textarea",
+      "count": 2
+    },
+    {
+      "selector": "|.cclc-provider-card",
+      "count": 2
+    },
+    {
+      "selector": "|.history-panel > header",
+      "count": 2
+    },
+    {
+      "selector": "|.kernel-error-panel p",
+      "count": 2
+    },
+    {
+      "selector": "|.runtime-capabilities",
+      "count": 2
+    },
+    {
+      "selector": "|.runtime-components",
+      "count": 2
+    },
+    {
+      "selector": "|.runtime-components strong",
+      "count": 2
+    },
+    {
+      "selector": "|.runtime-components small",
+      "count": 4
+    },
+    {
+      "selector": "|.runtime-source-row strong",
+      "count": 2
+    },
+    {
+      "selector": "|h3)",
+      "count": 2
+    },
+    {
+      "selector": "|.runtime-status-summary",
+      "count": 2
+    },
+    {
+      "selector": "|.runtime-status-summary small",
+      "count": 2
+    },
+    {
+      "selector": "|.assistant-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.catalog-entry-list button.selected",
+      "count": 2
+    },
+    {
+      "selector": "|.entry-copy strong",
+      "count": 2
+    },
+    {
+      "selector": "|.entry-copy small",
+      "count": 2
+    },
+    {
+      "selector": "@media (max-width: 48rem)|.catalog-browser",
+      "count": 2
+    }
+  ],
+  "classes_used_without_rule": [
+    {
+      "class": "artifact-panel",
+      "files": [
+        "src/components/ArtifactBrowser.tsx"
+      ]
+    },
+    {
+      "class": "catalog-panel",
+      "files": [
+        "src/components/CatalogPanel.tsx"
+      ]
+    },
+    {
+      "class": "deployment-applied-comparison",
+      "files": [
+        "src/components/DeploymentFocusedEditor.tsx"
+      ]
+    },
+    {
+      "class": "deployment-composition-panel",
+      "files": [
+        "src/components/DeploymentCompositionPanel.tsx"
+      ]
+    },
+    {
+      "class": "history-correlation-filters",
+      "files": [
+        "src/components/ExecutionHistoryPanel.tsx"
+      ]
+    },
+    {
+      "class": "history-retention",
+      "files": [
+        "src/components/ExecutionHistoryPanel.tsx"
+      ]
+    },
+    {
+      "class": "overlay-close",
+      "files": [
+        "src/components/OverlayPanel.tsx"
+      ]
+    },
+    {
+      "class": "palette-error",
+      "files": [
+        "src/components/ProgramNodePalette.tsx"
+      ]
+    },
+    {
+      "class": "program-history-list",
+      "files": [
+        "src/components/DeploymentCompositionPanel.tsx"
+      ]
+    },
+    {
+      "class": "program-motion-bindings",
+      "files": [
+        "src/components/ProgramSettingsEditor.tsx"
+      ]
+    },
+    {
+      "class": "program-motion-defaults",
+      "files": [
+        "src/components/ProgramSettingsEditor.tsx"
+      ]
+    },
+    {
+      "class": "program-notice-dismiss",
+      "files": [
+        "src/components/ProgramNoticeRail.tsx"
+      ]
+    },
+    {
+      "class": "program-notice-dismiss-all",
+      "files": [
+        "src/components/ProgramNoticeRail.tsx"
+      ]
+    },
+    {
+      "class": "program-notice-expand",
+      "files": [
+        "src/components/ProgramNoticeRail.tsx"
+      ]
+    },
+    {
+      "class": "program-palette-category-toggle",
+      "files": [
+        "src/components/ProgramNodePalette.tsx"
+      ]
+    },
+    {
+      "class": "program-schema-tuple",
+      "files": [
+        "src/components/property/ProgramSchemaValueEditor.tsx"
+      ]
+    },
+    {
+      "class": "program-side-rail-left",
+      "files": [
+        "src/components/ProgramWorkspace.tsx"
+      ]
+    },
+    {
+      "class": "program-topology-node-type",
+      "files": [
+        "src/components/ProgramTreeCanvas.tsx"
+      ]
+    },
+    {
+      "class": "program-tree-action-row-placement",
+      "files": [
+        "src/components/ProgramTreeCanvas.tsx"
+      ]
+    },
+    {
+      "class": "program-tree-action-row-type-commands",
+      "files": [
+        "src/components/ProgramTreeCanvas.tsx"
+      ]
+    },
+    {
+      "class": "runtime-detail-group",
+      "files": [
+        "src/components/ProgramRuntimePanel.tsx"
+      ]
+    },
+    {
+      "class": "scene-shape-fields",
+      "files": [
+        "src/components/SceneAuthoringWorkspace.tsx"
+      ]
+    },
+    {
+      "class": "transport-full-stop",
+      "files": [
+        "src/components/ProgramRuntimePanel.tsx"
+      ]
+    },
+    {
+      "class": "transport-group-stop",
+      "files": [
+        "src/components/ProgramRuntimePanel.tsx"
+      ]
+    },
+    {
+      "class": "transport-settings-button",
+      "files": [
+        "src/components/ProgramRuntimePanel.tsx"
+      ]
+    },
+    {
+      "class": "viewer-inspector-slot",
+      "files": [
+        "src/App.tsx"
+      ]
+    }
+  ],
+  "classes_never_referenced": [
+    "app-footer",
+    "app-title",
+    "artifact-browser-panel",
+    "attention-error",
+    "attention-warning",
+    "availability-connected",
+    "availability-copy",
+    "availability-details",
+    "availability-dot",
+    "availability-meta",
+    "availability-notice",
+    "boundary-dot",
+    "boundary-dot-connected",
+    "bt-node-handle",
+    "collapsed-rail-slot",
+    "commands-collapsed",
+    "declaration-error",
+    "deployment-candidate-summary",
+    "document-operation-status",
+    "gate-list",
+    "header-boundary",
+    "health-error",
+    "identity-current",
+    "identity-dirty",
+    "identity-refreshing",
+    "identity-unavailable",
+    "inspector-collapsed",
+    "lower-grid",
+    "message-error",
+    "navigation-collapsed",
+    "notice-error",
+    "overlay-info",
+    "overlay-status",
+    "pane-toolbar",
+    "phase-failed",
+    "phase-intervention_required",
+    "phase-unavailable",
+    "program-actions-disclosure",
+    "program-actions-popover",
+    "program-apply-actions",
+    "program-artifact-actions",
+    "program-canvas-message",
+    "program-canvas-node-button",
+    "program-canvas-shortcuts",
+    "program-empty-state",
+    "program-identity-strip",
+    "program-inline-message",
+    "program-policy-actions-row",
+    "program-policy-blocked",
+    "program-settings-summary",
+    "program-staging-card",
+    "program-staging-heading",
+    "program-tree-edges",
+    "program-tree-scroll",
+    "program-tree-stage",
+    "program-workspace-header",
+    "program-workspace-header-actions",
+    "react-flow",
+    "react-flow__controls",
+    "react-flow__controls-button",
+    "react-flow__handle",
+    "react-flow__node",
+    "react-flow__pane",
+    "readiness-degraded",
+    "readiness-fault",
+    "readiness-offline",
+    "readiness-ready",
+    "readiness-waiting",
+    "robot-control-boundary",
+    "robot-control-evidence",
+    "runtime-observability-overlay",
+    "runtime-status-panel",
+    "scenario-deployment-browser",
+    "scenario-status-changed",
+    "scenario-status-incomplete",
+    "scenario-status-ready",
+    "scenario-status-unsupported",
+    "scenario-status-version_changed",
+    "scene-authoring-grid",
+    "scene-owner-identity",
+    "severity-critical",
+    "severity-error",
+    "severity-info",
+    "severity-warning",
+    "stability-deprecated",
+    "stability-experimental",
+    "stability-stable",
+    "standing-alarm-chip",
+    "state-applied",
+    "state-different",
+    "state-incomplete",
+    "state-modified",
+    "state-saved",
+    "state-unavailable",
+    "state-unsaved",
+    "status-degraded",
+    "status-error",
+    "status-failure",
+    "status-fault",
+    "status-healthy",
+    "status-offline",
+    "status-pill-connected",
+    "status-ready",
+    "status-running",
+    "status-success",
+    "status-waiting",
+    "status-warning",
+    "structural-scope",
+    "unavailable-banner",
+    "unavailable-copy",
+    "unavailable-icon",
+    "viewer-contract",
+    "viewer-controls",
+    "viewer-options",
+    "viewer-options-popover",
+    "viewer-state-overlay",
+    "workbench-navigation"
+  ],
+  "ts_color_literals": [
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#677b87"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#e2b94e"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#65c59b"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#d86f66"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#d5a34b"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#7d8d96"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#9daab4"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#6798c1"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#b07088"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#9674b4"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#b7a78f"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#91a5af"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#29404d"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#081019"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#dbeaff"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#121d27"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#243341"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#496071"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#aebdcc"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#ffb44a"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#6f2a12"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#ef766f"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#65d3f2"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#144c62"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#5fa84a"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#173d16"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#e4ac55"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#573411"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#43d7ec"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#0c5060"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#8c6fe0"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#251a48"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#58ddff"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#f2bb56"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#ff7066"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#62421d"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#153c49"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#43d7ec"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#0c5060"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#75d7ff"
+    },
+    {
+      "file": "src/styles/tokens.ts",
+      "color": "#ffffff"
+    }
+  ]
+}

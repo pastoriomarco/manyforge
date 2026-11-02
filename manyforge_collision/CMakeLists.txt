@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_collision VERSION 0.1.0 LANGUAGES CXX)
+project(manyforge_collision VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+option(BUILD_TESTING "Build unit tests" ON)
 
 add_compile_options(-Wall -Wextra -Werror -Wno-deprecated-copy)
 add_compile_definitions(COAL_DISABLE_HPP_FCL_WARNINGS)
@@ -65,6 +66,7 @@ endforeach()
 
 find_package(Eigen3 REQUIRED)
 find_package(pinocchio REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 if(NOT TARGET manyforge_core)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_core
@@ -84,7 +86,25 @@ target_link_libraries(manyforge_collision
   manyforge_core
   Eigen3::Eigen
   pinocchio::pinocchio
+  OpenSSL::Crypto
 )
 
 target_compile_definitions(manyforge_collision PRIVATE
   MANYFORGE_COLLISION_ENGINE_VERSION="${MANYFORGE_COLLISION_ENGINE_VERSION}")
+
+if(BUILD_TESTING)
+  enable_testing()
+  find_package(GTest QUIET)
+
+  # The old strategy probe depended on NativeKernelBundle. Keep its historical
+  # target name as an explicit source-level gate; owner-neutral distributions
+  # and fixed contracts are compiled by the active focused tests below.
+  add_executable(perf_collision_strategy EXCLUDE_FROM_ALL
+    test/perf/perf_collision_strategy.cpp)
+  target_include_directories(perf_collision_strategy PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../tests/cpp")
+
+  add_subdirectory(
+    "${CMAKE_CURRENT_SOURCE_DIR}/../tests/cpp"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_integration_tests")
+endif()

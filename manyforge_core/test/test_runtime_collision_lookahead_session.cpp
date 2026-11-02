@@ -14,7 +14,9 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -146,20 +148,40 @@ TrajectoryDTO trajectory() {
   return value;
 }
 
-RuntimeCollisionQueryBundlePtr make_bundle(std::uint64_t epoch, std::uint64_t revision,
+RuntimeCollisionQueryBundlePtr make_bundle(std::uint64_t revision,
                                            CollisionPolicySnapshot policy) {
   auto world = std::make_shared<CollisionWorldSnapshot>();
   world->revision = {revision, "world-" + std::to_string(revision)};
   world->snapshot_format_version = 1;
   return build_runtime_collision_query_bundle(
-      CollisionWorldPolicySnapshotBundle{world, std::move(policy)}, epoch);
+      CollisionWorldPolicySnapshotBundle{world, std::move(policy)});
 }
 
-RuntimeCollisionQueryBundlePtr make_bundle(std::uint64_t epoch, std::uint64_t revision) {
+RuntimeCollisionQueryBundlePtr make_bundle(std::uint64_t revision) {
   CollisionPolicySnapshot policy;
   policy.policy_id = "free";
   policy.revision = {1, "policy"};
-  return make_bundle(epoch, revision, std::move(policy));
+  return make_bundle(revision, std::move(policy));
+}
+
+ProjectionRevisionDTO make_projection_revision(
+    std::uint64_t revision, char content_digit = '2',
+    std::string retained_bundle_id = "bundle:lookahead",
+    std::string graph_revision = "graph:lookahead",
+    char scene_digit = '1') {
+  return ProjectionRevisionDTO{
+      RetainedBundleId(std::move(retained_bundle_id)),
+      GraphRevision(std::move(graph_revision)),
+      SceneRevision{SceneId("sha256:" + std::string(64U, scene_digit)), revision,
+                    ContentDigest("sha256:" +
+                                  std::string(64U, content_digit))}};
+}
+
+RuntimeCollisionQueryBundlePtr with_projection_revision(
+    RuntimeCollisionQueryBundlePtr source, ProjectionRevisionDTO revision) {
+  auto bundle = std::make_shared<RuntimeCollisionQueryBundle>(*source);
+  bundle->projection_revision = std::move(revision);
+  return bundle;
 }
 
 RuntimeCollisionQueryBundlePtr with_contact_grasp_world_bodies(
@@ -167,9 +189,10 @@ RuntimeCollisionQueryBundlePtr with_contact_grasp_world_bodies(
   auto bundle = std::make_shared<RuntimeCollisionQueryBundle>(*source);
   auto world = std::make_shared<CollisionWorldSnapshot>(*source->world);
   CollisionWorldBody object;
-  object.body_id = "object/part/shape/0";
+  object.body_id = "scene/part/shape/0";
   CollisionWorldBody finger;
-  finger.body_id = "robot/arm/link/finger_left/collision/0";
+  finger.body_id =
+      "component/arm/model/arm_model/body/finger_left/collision/0";
   world->bodies = {std::move(object), std::move(finger)};
   world->body_count = static_cast<std::int64_t>(world->bodies.size());
   bundle->world = std::move(world);
@@ -254,31 +277,6 @@ RuntimeContactReleaseStateSnapshot separated_contact_release_state(
   return snapshot;
 }
 
-RuntimeCollisionQueryBundlePtr make_dynamic_bundle(
-    std::uint64_t epoch, std::uint64_t revision,
-    std::int64_t source_timestamp_ns, std::int64_t freshness_budget_ns) {
-  auto base = make_bundle(epoch, revision);
-  auto world = std::make_shared<CollisionWorldSnapshot>(*base->world);
-  CollisionWorldBody body;
-  body.body_id = "object/dynamic_box/shape/0";
-  body.owner_kind = CollisionOwnerKind::kDetachedObject;
-  body.frame_id = "universe";
-  body.pose.orientation.w = 1.0;
-  body.source_id = "vision";
-  body.source_timestamp_ns = source_timestamp_ns;
-  body.source_freshness_budget_ns = freshness_budget_ns;
-  world->bodies.push_back(body);
-  world->body_count = 1;
-
-  auto bundle = std::make_shared<RuntimeCollisionQueryBundle>(*base);
-  bundle->world = std::move(world);
-  bundle->body_freshness = {CollisionWorldBodyFreshness{
-      body.body_id, body.source_id, source_timestamp_ns,
-      freshness_budget_ns}};
-  bundle->lookup_order_valid = true;
-  return bundle;
-}
-
 struct ResultSink {
   void push(RuntimeCollisionLookaheadResult value) {
     std::lock_guard<std::mutex> lock(mutex);
@@ -324,6 +322,35 @@ RuntimeCollisionLookaheadSession::AuthorityCallback accept_test_authority() {
     return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
   };
 }
+
+// Schedules through ManualScheduler and records the host containment that a
+// production scheduler would hand to the addressed Kernel.
+class FaultRecordingScheduler final : public IScheduler {
+ public:
+  ScheduleHandle schedule(TimePoint deadline, std::function<void()> callback,
+                          SchedulerPriority priority = SchedulerPriority::Lifecycle) override {
+    return inner.schedule(deadline, std::move(callback), priority);
+  }
+  void cancel(ScheduleHandle handle) override { inner.cancel(handle); }
+  void contain_safety_path_fault(std::string_view reason_code) noexcept override {
+    std::lock_guard<std::mutex> lock(mutex);
+    reasons.emplace_back(reason_code);
+    cv.notify_all();
+  }
+
+  std::vector<std::string> wait_for_reasons(std::size_t count) {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (!cv.wait_for(lock, std::chrono::seconds(2), [&] { return reasons.size() >= count; })) {
+      ADD_FAILURE() << "lookahead fault containment timed out";
+    }
+    return reasons;
+  }
+
+  ManualScheduler inner;
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::vector<std::string> reasons;
+};
 
 TrajectoryDTO dense_trajectory(std::size_t waypoint_count,
                                double step_s = 0.01) {
@@ -383,7 +410,7 @@ RuntimeCollisionLookaheadResult run_bounded_handoff_case(
   bounded.require_strictly_decreasing_penetration = false;
   bounded.allow_recontact = false;
   policy.support_contacts.push_back(bounded);
-  publisher.bundle = make_bundle(1, 10, std::move(policy));
+  publisher.bundle = make_bundle(10, std::move(policy));
 
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
@@ -620,7 +647,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, MapsEarliestFailureBackToOriginalTraj
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
                                         ExecutionProgressAuthorityProfile::kCommandedSimulation,
                                         "isaac", 0);
@@ -667,7 +694,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
     release.require_separation_by_end = true;
     release.require_strictly_decreasing_penetration = false;
     policy.support_contacts.push_back(release);
-    publisher.bundle = make_bundle(1, 10, std::move(policy));
+    publisher.bundle = make_bundle(10, std::move(policy));
 
     ExecutionProgressPublication progress(
         ExecutionProgressSourceKind::kBackendCommanded,
@@ -720,8 +747,21 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   EXPECT_EQ(terminal_violation->second, "final_sample_not_separated");
 }
 
-TEST(RuntimeCollisionLookaheadSessionTest,
-     TransfersEnteringSeparatedStateAndRejectsFutureRecontact) {
+CollisionResult clear_lookahead_result() {
+  CollisionResult result;
+  result.engine_status = CollisionEngineStatus::kOk;
+  result.decision = CollisionDecisionResult::kPass;
+  return result;
+}
+
+// Runs one release lookahead from cursor 0 with the monitor's entering state
+// and one engine result per local sample index (the last entry repeats).
+RuntimeCollisionLookaheadResult run_release_handoff_case(
+    SupportContactPolicyEntry release,
+    const std::function<RuntimeContactReleaseStateSnapshot(
+        const RuntimeCollisionQueryBundlePtr&)>& entering_state,
+    std::vector<std::optional<double>> clearances_by_sample,
+    std::int64_t horizon_ns, std::size_t max_samples) {
   const CollisionPairId pair{"gripper", "object"};
   FakeClock clock;
   clock.set(1'000'000'000);
@@ -730,26 +770,28 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   CollisionPolicySnapshot policy;
   policy.policy_id = "contact-release";
   policy.revision = {9, "lookahead-entering-release-state"};
-  SupportContactPolicyEntry release;
   release.pair = pair;
-  release.max_start_penetration_m = 0.01;
-  release.require_separation_by_end = false;
-  release.require_strictly_decreasing_penetration = false;
   policy.support_contacts.push_back(release);
-  publisher.bundle = make_bundle(1, 10, std::move(policy));
+  publisher.bundle = make_bundle(10, std::move(policy));
 
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
       ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
-  ASSERT_TRUE(progress.publish(3, 0, clock.now(), clock.now()).published);
-  auto engine =
-      std::make_shared<TestLookaheadEngine>("lookahead-entering-state");
-  engine->forced_result = support_contact_result(pair, -0.001);
+  EXPECT_TRUE(progress.publish(3, 0, clock.now(), clock.now()).published);
+  auto engine = std::make_shared<TestLookaheadEngine>("lookahead-entering-state");
+  engine->result_for_query =
+      [pair, clearances_by_sample](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    const auto index = std::min<std::size_t>(
+        static_cast<std::size_t>(std::max<std::int64_t>(query.waypoint_index.value_or(0), 0)),
+        clearances_by_sample.size() - 1);
+    const auto clearance = clearances_by_sample[index];
+    return clearance ? support_contact_result(pair, *clearance) : clear_lookahead_result();
+  };
   ResultSink sink;
   RuntimeCollisionLookaheadSession::Config config;
   config.workers = 1;
-  config.horizon_ns = 150'000'000;
-  config.max_samples = 2;
+  config.horizon_ns = horizon_ns;
+  config.max_samples = max_samples;
   RuntimeCollisionLookaheadSession session(
       config, clock, scheduler, publisher, progress, {engine},
       [&sink](const RuntimeCollisionLookaheadSession*,
@@ -758,20 +800,76 @@ TEST(RuntimeCollisionLookaheadSessionTest,
       },
       accept_test_authority());
   session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "");
-  const auto contact_state =
-      separated_contact_release_state(publisher.bundle, 0.004, 0.002);
-  ASSERT_TRUE(contact_state.valid);
-  ASSERT_TRUE(request_until_started(session, clock, publisher, contact_state));
+  const auto contact_state = entering_state(publisher.bundle);
+  EXPECT_TRUE(contact_state.valid);
+  if (!request_until_started(session, clock, publisher, contact_state)) {
+    ADD_FAILURE() << "lookahead request did not start";
+    return RuntimeCollisionLookaheadResult{};
+  }
+  return sink.wait();
+}
 
-  const auto result = sink.wait();
-  EXPECT_EQ(result.termination,
-            RuntimeCollisionLookaheadTermination::kTimeHorizon);
-  EXPECT_EQ(result.status, RuntimeCollisionLookaheadResultStatus::kCollision);
-  EXPECT_EQ(result.reason, "runtime_lookahead_collision");
-  const auto violation = result.failure_details.find(
-      "collision_result_contact_release_violation");
-  ASSERT_NE(violation, result.failure_details.end());
-  EXPECT_EQ(violation->second, "recontact_after_release");
+std::optional<std::string> release_violation(const RuntimeCollisionLookaheadResult& result) {
+  const auto violation = result.failure_details.find("collision_result_contact_release_violation");
+  if (violation == result.failure_details.end()) {
+    return std::nullopt;
+  }
+  return violation->second;
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     SeedsSeparationFromFirstPlannedSampleAndRejectsPlannedRecontact) {
+  // LKA-1: the monitor observed separation, but the cursor trails it; the
+  // planned samples from the cursor are still in contact. That is the plan's
+  // own continued contact, not a recontact.
+  SupportContactPolicyEntry release;
+  release.max_start_penetration_m = 0.01;
+  release.require_separation_by_end = false;
+  release.require_strictly_decreasing_penetration = false;
+  const auto separated = [](const RuntimeCollisionQueryBundlePtr& bundle) {
+    return separated_contact_release_state(bundle, 0.004, 0.002);
+  };
+  const auto lagging = run_release_handoff_case(release, separated, {-0.001}, 150'000'000, 3);
+  EXPECT_EQ(lagging.termination, RuntimeCollisionLookaheadTermination::kTimeHorizon);
+  EXPECT_EQ(lagging.status, RuntimeCollisionLookaheadResultStatus::kClear);
+  EXPECT_FALSE(release_violation(lagging).has_value());
+
+  // A recontact within the plan itself is still rejected.
+  const auto planned = run_release_handoff_case(
+      release, separated, {-0.001, std::nullopt, -0.001}, 150'000'000, 3);
+  EXPECT_EQ(planned.status, RuntimeCollisionLookaheadResultStatus::kCollision);
+  EXPECT_EQ(planned.reason, "runtime_lookahead_collision");
+  EXPECT_EQ(release_violation(planned), std::optional<std::string>{"recontact_after_release"});
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     WithdrawalObservedAfterMotionStartWithCursorAtZeroIsNotStopped) {
+  // mock_lite6_signal_moves end_rest: the monitor's first tick observed the
+  // withdrawal 0-40 ms in (0.8 mm), while the cursor is still 0, so the first
+  // planned samples are deeper (0.98 mm) than that observation. The plan
+  // itself withdraws strictly and separates by its end.
+  SupportContactPolicyEntry release;
+  release.max_start_penetration_m = 0.002;
+  const auto observed = [](const RuntimeCollisionQueryBundlePtr& bundle) {
+    return active_contact_release_state(bundle, 0.0008);
+  };
+  const auto withdrawal = run_release_handoff_case(
+      release, observed, {-0.00098, -0.00083, -0.00047, std::nullopt}, 1'000'000'000, 4);
+  EXPECT_EQ(withdrawal.termination, RuntimeCollisionLookaheadTermination::kTrajectoryEnd);
+  EXPECT_EQ(withdrawal.status, RuntimeCollisionLookaheadResultStatus::kClear);
+  EXPECT_FALSE(release_violation(withdrawal).has_value());
+
+  // A planned increase beyond the tolerance is still rejected.
+  const auto increase = run_release_handoff_case(
+      release, observed, {-0.00098, -0.00100, -0.00047, std::nullopt}, 1'000'000'000, 4);
+  EXPECT_EQ(increase.status, RuntimeCollisionLookaheadResultStatus::kCollision);
+  EXPECT_EQ(release_violation(increase), std::optional<std::string>{"penetration_increased"});
+
+  // The plan must still separate by its end.
+  const auto stays = run_release_handoff_case(
+      release, observed, {-0.00098, -0.00083, -0.00047, -0.0002}, 1'000'000'000, 4);
+  EXPECT_EQ(stays.status, RuntimeCollisionLookaheadResultStatus::kCollision);
+  EXPECT_EQ(release_violation(stays), std::optional<std::string>{"final_sample_not_separated"});
 }
 
 TEST(RuntimeCollisionLookaheadSessionTest,
@@ -836,7 +934,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
       ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
@@ -883,7 +981,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
       ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
@@ -935,7 +1033,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, PreparesChangedSnapshotOnceBeforeWork
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
                                         ExecutionProgressAuthorityProfile::kCommandedSimulation,
                                         "isaac", 0);
@@ -969,7 +1067,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, FailsClosedWhenSnapshotPreparationFai
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
                                         ExecutionProgressAuthorityProfile::kCommandedSimulation,
                                         "isaac", 0);
@@ -1000,7 +1098,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
       ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
@@ -1057,14 +1155,16 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   grasp.terminal_window_start_fraction = 0.8;
   policy.contact_grasps.push_back(std::move(grasp));
   publisher.bundle = with_contact_grasp_world_bodies(
-      make_bundle(1, 10, std::move(policy)));
+      make_bundle(10, std::move(policy)));
   ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
                                         ExecutionProgressAuthorityProfile::kCommandedSimulation,
                                         "isaac", 0);
   ASSERT_TRUE(progress.publish(3, 50'000'000, clock.now(), clock.now()).published);
   auto engine = std::make_shared<TestLookaheadEngine>("lookahead-grasp");
   engine->collision_local_waypoint = 2;
-  engine->collision_pair = {"object/part/shape/0", "robot/arm/link/finger_left/collision/0"};
+  engine->collision_pair = {
+      "component/arm/model/arm_model/body/finger_left/collision/0",
+      "scene/part/shape/0"};
   ResultSink sink;
   RuntimeCollisionLookaheadSession::Config config;
   config.workers = 1;
@@ -1088,8 +1188,8 @@ TEST(RuntimeCollisionLookaheadSessionTest,
             "contact_grasp/part");
   EXPECT_EQ(result.failure_details.at("policy_mode"), "contact_grasp");
   EXPECT_EQ(result.failure_details.at("zone_id"),
-            "contact_grasp_pair:object/part/shape/0<->"
-            "robot/arm/link/finger_left/collision/0");
+            "contact_grasp_pair:component/arm/model/arm_model/body/"
+            "finger_left/collision/0<->scene/part/shape/0");
   EXPECT_EQ(result.failure_details.at("contact_present"), "true");
   EXPECT_EQ(result.failure_details.at("distance_request_mode"),
             "selected_colliding_pairs");
@@ -1126,7 +1226,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   grasp.terminal_window_start_fraction = 0.8;
   policy.contact_grasps.push_back(std::move(grasp));
   publisher.bundle = with_contact_grasp_world_bodies(
-      make_bundle(1, 10, std::move(policy)));
+      make_bundle(10, std::move(policy)));
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
       ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
@@ -1135,15 +1235,16 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   auto engine =
       std::make_shared<TestLookaheadEngine>("lookahead-grasp-missing-metric");
   const CollisionPairId pair{
-      "object/part/shape/0",
-      "robot/arm/link/finger_left/collision/0"};
+      "component/arm/model/arm_model/body/finger_left/collision/0",
+      "scene/part/shape/0"};
   CollisionResult incomplete;
   incomplete.in_collision = true;
   incomplete.normalized_pairs = {pair};
   incomplete.engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
   incomplete.decision = CollisionDecisionResult::kInconclusiveFail;
   incomplete.raw_diagnostics["missing_selected_distance_pairs"] =
-      "object/part/shape/0 <-> robot/arm/link/finger_left/collision/0";
+      "component/arm/model/arm_model/body/finger_left/collision/0 <-> "
+      "scene/part/shape/0";
   engine->forced_result = std::move(incomplete);
   ResultSink sink;
   RuntimeCollisionLookaheadSession::Config config;
@@ -1171,8 +1272,8 @@ TEST(RuntimeCollisionLookaheadSessionTest,
             "contact_grasp/part");
   EXPECT_EQ(result.failure_details.at("policy_mode"), "contact_grasp");
   EXPECT_EQ(result.failure_details.at("zone_id"),
-            "contact_grasp_pair:object/part/shape/0<->"
-            "robot/arm/link/finger_left/collision/0");
+            "contact_grasp_pair:component/arm/model/arm_model/body/"
+            "finger_left/collision/0<->scene/part/shape/0");
   EXPECT_EQ(result.failure_details.at("classification"),
             "diagnostic_incomplete");
   EXPECT_EQ(result.failure_details.at("contact_present"), "true");
@@ -1199,7 +1300,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, ClearResultCannotCertifyARevisionPubl
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
                                         ExecutionProgressAuthorityProfile::kCommandedSimulation,
                                         "isaac", 0);
@@ -1209,7 +1310,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, ClearResultCannotCertifyARevisionPubl
   engine->on_check = [&]() {
     if (!replaced.exchange(true)) {
       std::lock_guard<std::mutex> lock(publisher.mutex);
-      publisher.bundle = make_bundle(2, 11);
+      publisher.bundle = make_bundle(11);
     }
   };
   ResultSink sink;
@@ -1229,12 +1330,87 @@ TEST(RuntimeCollisionLookaheadSessionTest, ClearResultCannotCertifyARevisionPubl
 }
 
 TEST(RuntimeCollisionLookaheadSessionTest,
+     StampsTheObservedProjectionOnTheResult) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  const auto forward = make_projection_revision(11U, '3');
+  publisher.bundle = with_projection_revision(make_bundle(10), forward);
+  ExecutionProgressPublication progress(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+  ASSERT_TRUE(progress.publish(9, 0, clock.now(), clock.now()).published);
+  auto engine =
+      std::make_shared<TestLookaheadEngine>("lookahead-projection-forward");
+  ResultSink sink;
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [&sink](const RuntimeCollisionLookaheadSession*,
+              RuntimeCollisionLookaheadResult result) {
+        sink.push(std::move(result));
+      },
+      accept_test_authority());
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  ASSERT_TRUE(request_until_started(session, clock, publisher));
+
+  const auto result = sink.wait();
+  EXPECT_EQ(result.status, RuntimeCollisionLookaheadResultStatus::kClear);
+  ASSERT_TRUE(result.projection_revision.has_value());
+  EXPECT_EQ(*result.projection_revision, forward);
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     ClearResultCannotCertifyAProjectionSupersededDuringTheJob) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  const auto admission = make_projection_revision(10U, '2');
+  publisher.bundle =
+      with_projection_revision(make_bundle(10), admission);
+  ExecutionProgressPublication progress(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+  ASSERT_TRUE(progress.publish(9, 0, clock.now(), clock.now()).published);
+  auto engine = std::make_shared<TestLookaheadEngine>(
+      "lookahead-projection-superseded");
+  std::atomic<bool> replaced{false};
+  engine->on_check = [&]() {
+    if (!replaced.exchange(true)) {
+      std::lock_guard<std::mutex> lock(publisher.mutex);
+      publisher.bundle = with_projection_revision(
+          publisher.bundle, make_projection_revision(11U, '3'));
+    }
+  };
+  ResultSink sink;
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [&sink](const RuntimeCollisionLookaheadSession*,
+              RuntimeCollisionLookaheadResult result) {
+        sink.push(std::move(result));
+      },
+      accept_test_authority());
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  ASSERT_TRUE(request_until_started(session, clock, publisher));
+
+  const auto result = sink.wait();
+  EXPECT_EQ(result.status,
+            RuntimeCollisionLookaheadResultStatus::kSupersededRevision);
+  EXPECT_EQ(result.reason, "runtime_lookahead_revision_superseded");
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
      AuthorityBoundaryRejectsResultFromPreviousArmGeneration) {
   FakeClock clock;
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
                                         ExecutionProgressAuthorityProfile::kCommandedSimulation,
                                         "isaac", 0);
@@ -1265,6 +1441,42 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   EXPECT_EQ(session.status().stale_generation_results_total, 1u);
 }
 
+TEST(RuntimeCollisionLookaheadSessionTest, PreparingReplacementArmDoesNotReplaceCurrentAuthority) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
+                                        ExecutionProgressAuthorityProfile::kCommandedSimulation,
+                                        "isaac", 0);
+  auto engine = std::make_shared<TestLookaheadEngine>("lookahead-staged");
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult) {},
+      accept_test_authority());
+  auto curve = std::make_shared<const TrajectoryDTO>(trajectory());
+  session.arm(7, 9, curve, "old");
+  const auto old = session.status();
+  auto prepared = RuntimeCollisionLookaheadSession::prepare_arm(8, 10, curve, "new");
+  EXPECT_EQ(session.status().execution_id, 7U);
+  EXPECT_EQ(session.status().arm_generation, old.arm_generation);
+  EXPECT_TRUE(session.accept_result_for_current_arm(old.execution_id, old.execution_generation,
+                                                    old.arm_generation, old.permit_generation));
+  session.publish_prepared_arm(std::move(prepared));
+  const auto next = session.status();
+  EXPECT_EQ(next.execution_id, 8U);
+  EXPECT_EQ(next.execution_generation, 10U);
+  EXPECT_TRUE(next.armed);
+  EXPECT_FALSE(session.accept_result_for_current_arm(old.execution_id, old.execution_generation,
+                                                     old.arm_generation, old.permit_generation));
+  EXPECT_TRUE(session.accept_result_for_current_arm(next.execution_id, next.execution_generation,
+                                                    next.arm_generation, next.permit_generation));
+  EXPECT_THROW((void)RuntimeCollisionLookaheadSession::prepare_arm(0, 11, curve, "bad"),
+               std::invalid_argument);
+  EXPECT_EQ(session.status().execution_id, 8U);
+}
+
 TEST(RuntimeCollisionLookaheadSessionTest, RejectsQueryBudgetLongerThanTheCycleBudget) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -1289,7 +1501,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, RejectsMissingAuthorityCallback) {
   FakeClock clock;
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
       ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
@@ -1341,7 +1553,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
                                         ExecutionProgressAuthorityProfile::kCommandedSimulation,
                                         "isaac", 0);
@@ -1410,7 +1622,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
       ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
@@ -1451,7 +1663,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
 
   {
     std::lock_guard<std::mutex> lock(publisher.mutex);
-    publisher.bundle = make_bundle(2, 11);
+    publisher.bundle = make_bundle(11);
   }
   clock.advance(1'000'000);
   ASSERT_TRUE(
@@ -1459,7 +1671,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   session.request(clock.now(), publisher.published_runtime_collision_query_bundle(), {});
   {
     std::lock_guard<std::mutex> lock(publisher.mutex);
-    publisher.bundle = make_bundle(3, 12);
+    publisher.bundle = make_bundle(12);
   }
   clock.advance(1'000'000);
   ASSERT_TRUE(
@@ -1478,7 +1690,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   ASSERT_EQ(history.results.size(), 2u);
   EXPECT_EQ(history.results[0].status,
             RuntimeCollisionLookaheadResultStatus::kSupersededRevision);
-  EXPECT_EQ(history.results[1].runtime_bundle_epoch, 3u);
+  EXPECT_EQ(history.results[1].collision_world_revision.revision_id, 12u);
   EXPECT_EQ(history.results[1].status,
             RuntimeCollisionLookaheadResultStatus::kClear);
   EXPECT_EQ(history.results[1].cursor_time_ns, 200'000'000);
@@ -1492,7 +1704,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
       ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
@@ -1521,7 +1733,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
       ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
@@ -1588,7 +1800,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
       ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
@@ -1623,51 +1835,12 @@ TEST(RuntimeCollisionLookaheadSessionTest,
 }
 
 TEST(RuntimeCollisionLookaheadSessionTest,
-     DynamicBodyFreshnessMustStillBeValidAfterCollisionWorkCompletes) {
-  FakeClock clock;
-  clock.set(1'000'000'000);
-  ManualScheduler scheduler;
-  TestPublisher publisher;
-  publisher.bundle =
-      make_dynamic_bundle(1, 10, clock.now(), 50'000'000);
-  ExecutionProgressPublication progress(
-      ExecutionProgressSourceKind::kBackendCommanded,
-      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
-  ASSERT_TRUE(progress.publish(9, 0, clock.now(), clock.now()).published);
-  auto engine = std::make_shared<TestLookaheadEngine>(
-      "lookahead-completion-freshness");
-  engine->clock_to_advance = &clock;
-  engine->simulated_query_duration_ns = 60'000'000;
-  ResultSink sink;
-  RuntimeCollisionLookaheadSession::Config config;
-  config.workers = 1;
-  config.max_samples = 2;
-  config.horizon_ns = 1;
-  config.query_budget_ns = 75'000'000;
-  config.cycle_budget_ns = 100'000'000;
-  config.dynamic_body_max_age_cap_ns = 500'000'000;
-  RuntimeCollisionLookaheadSession session(
-      config, clock, scheduler, publisher, progress, {engine},
-      [&sink](const RuntimeCollisionLookaheadSession*,
-              RuntimeCollisionLookaheadResult result) {
-        sink.push(std::move(result));
-      }, accept_test_authority());
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
-  ASSERT_TRUE(request_until_started(session, clock, publisher));
-
-  const auto result = sink.wait();
-  EXPECT_EQ(result.status, RuntimeCollisionLookaheadResultStatus::kInconclusive);
-  EXPECT_EQ(result.reason, "stale_dynamic_collision_body");
-  EXPECT_EQ(result.cycle_duration_ns, 60'000'000);
-}
-
-TEST(RuntimeCollisionLookaheadSessionTest,
      CompleteCycleDurationIncludesAdmissionToWorkerStartJitter) {
   FakeClock clock;
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
       ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
@@ -1737,7 +1910,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
       ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
@@ -1790,7 +1963,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
-  publisher.bundle = make_bundle(1, 10);
+  publisher.bundle = make_bundle(10);
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
       ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
@@ -1844,7 +2017,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
     clock.set(1'000'000'000);
     ManualScheduler scheduler;
     TestPublisher publisher;
-    publisher.bundle = make_bundle(1, 10);
+    publisher.bundle = make_bundle(10);
     ExecutionProgressPublication progress(
         ExecutionProgressSourceKind::kBackendCommanded,
         ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
@@ -1890,4 +2063,181 @@ TEST(RuntimeCollisionLookaheadSessionTest,
 }
 
 }  // namespace
+TEST(RuntimeCollisionLookaheadSessionTest, EarlyFailureDiagnosticsDoNotInventWorldOrSelection) {
+  for (const auto& reason : {"runtime_lookahead_deadline_exceeded", "progress_cursor_invalid",
+                             "progress_generation_mismatch", "progress_cursor_stale"}) {
+    SCOPED_TRACE(reason);
+    FakeClock clock;
+    clock.set(1'000'000'000);
+    ManualScheduler scheduler;
+    TestPublisher publisher;
+    publisher.bundle = make_bundle(42);  // Present, but not read before these failures.
+    ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
+                                          ExecutionProgressAuthorityProfile::kCommandedSimulation,
+                                          "isaac", 100'000'000);
+    const auto expected_reason = std::string(reason);
+    if (expected_reason != "progress_cursor_invalid") {
+      const auto generation = expected_reason == "progress_generation_mismatch" ? 8U : 9U;
+      const auto received = expected_reason == "progress_cursor_stale" ? 700'000'000 : clock.now();
+      ASSERT_TRUE(progress.publish(generation, 30'000'000, received, received).published);
+    }
+    auto engine = std::make_shared<TestLookaheadEngine>("early-diagnostics");
+    ResultSink sink;
+    RuntimeCollisionLookaheadSession::Config config;
+    config.workers = 1;
+    RuntimeCollisionLookaheadSession session(
+        config, clock, scheduler, publisher, progress, {engine},
+        [&sink](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult result) {
+          sink.push(std::move(result));
+        }, accept_test_authority());
+    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+    const auto requested_at = expected_reason == "runtime_lookahead_deadline_exceeded"
+                                  ? clock.now() - config.cycle_budget_ns : clock.now();
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (session.status().jobs_started_total == 0 && std::chrono::steady_clock::now() < limit) {
+      session.request(requested_at, publisher.bundle, {});
+      std::this_thread::yield();
+    }
+    ASSERT_GT(session.status().jobs_started_total, 0U);
+    const auto result = sink.wait();
+    EXPECT_EQ(result.reason, expected_reason);
+    EXPECT_TRUE(result.job_context_observed);
+    EXPECT_FALSE(result.selection_computed);
+    EXPECT_FALSE(result.validation_completed);
+    EXPECT_EQ(result.requested_at_ns, requested_at);
+    EXPECT_EQ(result.cycle_deadline_ns, requested_at + config.cycle_budget_ns);
+    EXPECT_FALSE(result.checked_input_details.contains("collision_world_revision_id"));
+    EXPECT_FALSE(result.checked_input_details.contains("lookahead_bundle_present"));
+    if (expected_reason == "runtime_lookahead_deadline_exceeded") {
+      EXPECT_EQ(result.checked_input_details.at("lookahead_deadline_checked_at_ns"),
+                std::to_string(clock.now()));
+      EXPECT_FALSE(result.checked_input_details.contains("lookahead_cursor_valid"));
+    } else {
+      EXPECT_EQ(result.checked_input_details.at("lookahead_cursor_valid"),
+                expected_reason == "progress_cursor_invalid" ? "false" : "true");
+      if (expected_reason == "progress_cursor_stale") {
+        EXPECT_EQ(result.checked_input_details.at("lookahead_cursor_received_timestamp_ns"),
+                  "700000000");
+        EXPECT_EQ(result.checked_input_details.at("lookahead_cursor_freshness_checked_at_ns"),
+                  "1000000000");
+        EXPECT_EQ(result.checked_input_details.at("lookahead_cursor_freshness_budget_ns"),
+                  "100000000");
+      }
+    }
+    EXPECT_EQ(engine->check_calls.load(), 0U);
+  }
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest, BundleRefusalRetainsOnlyObservedBundleContext) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  auto invalid_bundle = std::make_shared<RuntimeCollisionQueryBundle>(*make_bundle(42));
+  invalid_bundle->policy.reset();
+  publisher.bundle = invalid_bundle;
+  ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
+                                        ExecutionProgressAuthorityProfile::kCommandedSimulation,
+                                        "isaac", 0);
+  ASSERT_TRUE(progress.publish(9, 30'000'000, clock.now(), clock.now()).published);
+  auto engine = std::make_shared<TestLookaheadEngine>("bundle-diagnostics");
+  ResultSink sink;
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [&sink](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult result) {
+        sink.push(std::move(result));
+      }, accept_test_authority());
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  ASSERT_TRUE(request_until_started(session, clock, publisher));
+  const auto result = sink.wait();
+  EXPECT_EQ(result.reason, "runtime_lookahead_bundle_invalid");
+  EXPECT_EQ(result.checked_input_details.at("collision_world_revision_id"), "42");
+  EXPECT_EQ(result.checked_input_details.at("collision_world_content_hash"), "world-42");
+  EXPECT_EQ(result.checked_input_details.at("lookahead_world_present"), "true");
+  EXPECT_EQ(result.checked_input_details.at("lookahead_policy_present"), "false");
+  EXPECT_FALSE(result.checked_input_details.contains("lookahead_observed_projection_present"));
+  EXPECT_FALSE(result.selection_computed);
+  EXPECT_FALSE(result.validation_completed);
+  EXPECT_EQ(engine->check_calls.load(), 0U);
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     ThrowingAuthorityCallbackIsContainedInsteadOfTerminating) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  FaultRecordingScheduler scheduler;
+  TestPublisher publisher;
+  publisher.bundle = make_bundle(10);
+  ExecutionProgressPublication progress(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+  ASSERT_TRUE(progress.publish(9, 0, clock.now(), clock.now()).published);
+  auto engine = std::make_shared<TestLookaheadEngine>("lookahead-authority-throws");
+  engine->collision_local_waypoint = 0;
+  std::atomic<int> observer_calls{0};
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  config.max_samples = 2;
+  config.horizon_ns = 1;
+  {
+    RuntimeCollisionLookaheadSession session(
+        config, clock, scheduler, publisher, progress, {engine},
+        [&observer_calls](const RuntimeCollisionLookaheadSession*,
+                          RuntimeCollisionLookaheadResult) {
+          observer_calls.fetch_add(1, std::memory_order_relaxed);
+        },
+        [](const RuntimeCollisionLookaheadSession*,
+           RuntimeCollisionLookaheadResult&) -> RuntimeCollisionLookaheadAuthorityDisposition {
+          throw std::runtime_error("addressed Stop handoff failed");
+        });
+    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+    ASSERT_TRUE(request_until_started(session, clock, publisher));
+
+    EXPECT_EQ(scheduler.wait_for_reasons(1U),
+              std::vector<std::string>{"runtime_collision_lookahead_authority_exception"});
+    EXPECT_FALSE(session.status().accepting_clear_permits);
+  }  // Joins the worker, which survived the throw.
+  EXPECT_EQ(observer_calls.load(std::memory_order_relaxed), 0);
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     ThrowingResultObserverAfterAuthorityIsContainedInsteadOfTerminating) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  FaultRecordingScheduler scheduler;
+  TestPublisher publisher;
+  publisher.bundle = make_bundle(10);
+  ExecutionProgressPublication progress(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+  ASSERT_TRUE(progress.publish(9, 0, clock.now(), clock.now()).published);
+  auto engine = std::make_shared<TestLookaheadEngine>("lookahead-observer-throws");
+  engine->collision_local_waypoint = 0;
+  std::atomic<int> authority_calls{0};
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  config.max_samples = 2;
+  config.horizon_ns = 1;
+  {
+    RuntimeCollisionLookaheadSession session(
+        config, clock, scheduler, publisher, progress, {engine},
+        [](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult) {
+          throw std::runtime_error("evidence emission failed");
+        },
+        [&authority_calls](const RuntimeCollisionLookaheadSession*,
+                           RuntimeCollisionLookaheadResult&) {
+          authority_calls.fetch_add(1, std::memory_order_relaxed);
+          return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
+        });
+    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+    ASSERT_TRUE(request_until_started(session, clock, publisher));
+
+    EXPECT_EQ(scheduler.wait_for_reasons(1U),
+              std::vector<std::string>{"runtime_collision_lookahead_result_observer_exception"});
+  }  // Joins the worker, which survived the throw.
+  EXPECT_EQ(authority_calls.load(std::memory_order_relaxed), 1);
+}
+
 }  // namespace manyforge::core

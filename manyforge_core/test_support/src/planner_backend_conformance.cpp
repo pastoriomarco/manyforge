@@ -42,33 +42,9 @@ const char* motion_capability_key(PlannerMotionCapability motion) noexcept {
   return "planning.motion.unknown";
 }
 
-const char* profile_name(PlanningProfileDTO profile) noexcept {
-  switch (profile) {
-    case PlanningProfileDTO::kFirstFeasible:
-      return "first_feasible";
-    case PlanningProfileDTO::kBalanced:
-      return "balanced";
-    case PlanningProfileDTO::kQualityBounded:
-      return "quality_bounded";
-  }
-  return "unknown";
-}
-
-const char* profile_capability_key(PlanningProfileDTO profile) noexcept {
-  switch (profile) {
-    case PlanningProfileDTO::kFirstFeasible:
-      return "planning.profile.first_feasible";
-    case PlanningProfileDTO::kBalanced:
-      return "planning.profile.balanced";
-    case PlanningProfileDTO::kQualityBounded:
-      return "planning.profile.quality_bounded";
-  }
-  return "planning.profile.unknown";
-}
-
 std::optional<PlannerMotionCapability> motion_capability(
-    const MotionSpecDTO& motion) noexcept {
-  if (std::holds_alternative<JointGoalDTO>(motion)) {
+    const ResolvedMotionSpecDTO& motion) noexcept {
+  if (std::holds_alternative<ResolvedJointGoalDTO>(motion)) {
     return PlannerMotionCapability::kJoint;
   }
   if (std::holds_alternative<PoseGoalDTO>(motion)) {
@@ -89,19 +65,6 @@ bool supports_motion(const PlannerCapabilityProfile& capabilities,
       return capabilities.pose_goal;
     case PlannerMotionCapability::kCartesian:
       return capabilities.cartesian_path;
-  }
-  return false;
-}
-
-bool supports_profile(const PlannerCapabilityProfile& capabilities,
-                      PlanningProfileDTO profile) noexcept {
-  switch (profile) {
-    case PlanningProfileDTO::kFirstFeasible:
-      return capabilities.profile_first_feasible;
-    case PlanningProfileDTO::kBalanced:
-      return capabilities.profile_balanced;
-    case PlanningProfileDTO::kQualityBounded:
-      return capabilities.profile_quality_bounded;
   }
   return false;
 }
@@ -218,7 +181,8 @@ void validate_pose_goal(const std::string& case_id,
   final_state.joint_names = trajectory.joint_names;
   final_state.positions_rad = trajectory.waypoints.back().positions_rad;
   const auto actual = fk(
-      FkRequestDTO{final_state, request.tcp_frame, request.base_frame});
+      FkRequestDTO{final_state, compiled_frame_name(request.tcp_frame),
+                   compiled_frame_name(request.base_frame)});
   if (!actual.ok()) {
     add_violation(report, case_id, "goal.pose_fk",
                   "forward kinematics failed: " + actual.error().message);
@@ -261,7 +225,8 @@ void validate_cartesian_samples(const std::string& case_id,
     state.joint_names = trajectory.joint_names;
     state.positions_rad = waypoint.positions_rad;
     const auto pose =
-        fk(FkRequestDTO{state, request.tcp_frame, request.base_frame});
+        fk(FkRequestDTO{state, compiled_frame_name(request.tcp_frame),
+                        compiled_frame_name(request.base_frame)});
     if (!pose.ok() || !finite_pose(pose.value())) {
       add_violation(report, case_id, "cartesian.sample_fk",
                     pose.ok() ? "sample FK returned non-finite pose"
@@ -312,17 +277,23 @@ void validate_trajectory(const PlannerConformanceCase& test_case,
   }
   const auto trajectory_index = unique_name_index(trajectory.joint_names);
   const auto start_index = unique_name_index(request.start_state.joint_names);
+  const auto start_positions =
+      angular_position_projection(request.start_state);
   if (!trajectory_index.has_value()) {
     add_violation(report, test_case.id, "trajectory.joint_names",
                   "trajectory joint names are empty or duplicated");
     return;
   }
-  if (!start_index.has_value() ||
-      request.start_state.positions_rad.size() !=
+  if (!start_index.has_value() || !start_positions.ok() ||
+      start_positions.value().size() !=
           request.start_state.joint_names.size()) {
     add_violation(report, test_case.id, "request.start_state",
                   "request start state is malformed");
     return;
+  }
+  if (trajectory.resources != request.resources) {
+    add_violation(report, test_case.id, "trajectory.resource_projection",
+                  "trajectory resources differ from the resolved request");
   }
   if (trajectory_index->size() != start_index->size()) {
     add_violation(report, test_case.id, "model.canonical_joint_set",
@@ -390,7 +361,7 @@ void validate_trajectory(const PlannerConformanceCase& test_case,
         continue;
       }
       if (std::abs(first.positions_rad[found->second] -
-                   request.start_state.positions_rad[start_position]) >
+                   start_positions.value()[start_position]) >
           request.tolerances.joint_position_tol_rad + kNumericEpsilon) {
         add_violation(report, test_case.id, "trajectory.start_state",
                       "trajectory start differs for joint " + name);
@@ -398,7 +369,8 @@ void validate_trajectory(const PlannerConformanceCase& test_case,
     }
   }
 
-  if (const auto* goal = std::get_if<JointGoalDTO>(&request.motion)) {
+  if (const auto* goal =
+          std::get_if<ResolvedJointGoalDTO>(&request.motion)) {
     const auto goal_index = unique_name_index(goal->joint_names);
     if (!goal_index.has_value() ||
         goal->positions_rad.size() != goal->joint_names.size()) {
@@ -443,8 +415,6 @@ void validate_plan_case(const PlannerConformanceCase& test_case,
   }
   const bool motion_supported =
       supports_motion(input.capabilities, *capability);
-  const bool profile_supported = supports_profile(
-      input.capabilities, test_case.request.planning_profile);
   const auto started = std::chrono::steady_clock::now();
   const PlanResultDTO result = input.planner->plan(test_case.request);
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -455,13 +425,9 @@ void validate_plan_case(const PlannerConformanceCase& test_case,
                       std::to_string(elapsed.count()) + " ms");
   }
 
-  if (!motion_supported || !profile_supported) {
-    const std::string expected_capability =
-        !motion_supported
-            ? motion_capability_key(*capability)
-            : profile_capability_key(test_case.request.planning_profile);
-    validate_unsupported_error(test_case.id, result, expected_capability,
-                               report);
+  if (!motion_supported) {
+    validate_unsupported_error(test_case.id, result,
+                               motion_capability_key(*capability), report);
     return;
   }
   if (!result.trajectory.has_value() || result.error.has_value()) {
@@ -475,12 +441,11 @@ void validate_plan_case(const PlannerConformanceCase& test_case,
     }
     return;
   }
-  if (result.scene_revision.revision_id !=
-          test_case.request.scene_binding.revision.revision_id ||
-      result.scene_revision.content_hash !=
-          test_case.request.scene_binding.revision.content_hash) {
-    add_violation(report, test_case.id, "scene.exact_revision_acknowledgement",
-                  "planner result did not acknowledge the retained revision");
+  if (result.projection_revision !=
+      test_case.request.projection_binding.projection_revision) {
+    add_violation(
+        report, test_case.id, "projection.exact_revision_acknowledgement",
+        "planner result did not acknowledge the retained composite revision");
   }
   validate_trajectory(test_case, *result.trajectory, input, report);
 }
@@ -493,8 +458,7 @@ void validate_matrix_completeness(const PlannerBackendConformanceInput& input,
     if (!motion.has_value()) {
       continue;
     }
-    const std::string key = std::string(motion_name(*motion)) + "." +
-                            profile_name(test_case.request.planning_profile);
+    const std::string key = motion_name(*motion);
     if (!seen.insert(key).second) {
       add_violation(report, test_case.id, "matrix.unique_case",
                     "duplicate portable matrix cell " + key);
@@ -503,15 +467,10 @@ void validate_matrix_completeness(const PlannerBackendConformanceInput& input,
   for (const auto motion : {PlannerMotionCapability::kJoint,
                             PlannerMotionCapability::kPose,
                             PlannerMotionCapability::kCartesian}) {
-    for (const auto profile : {PlanningProfileDTO::kFirstFeasible,
-                               PlanningProfileDTO::kBalanced,
-                               PlanningProfileDTO::kQualityBounded}) {
-      const std::string key = std::string(motion_name(motion)) + "." +
-                              profile_name(profile);
-      if (!seen.contains(key)) {
-        add_violation(report, "matrix", "matrix.required_case",
-                      "missing portable matrix cell " + key);
-      }
+    const std::string key = motion_name(motion);
+    if (!seen.contains(key)) {
+      add_violation(report, "matrix", "matrix.required_case",
+                    "missing portable matrix cell " + key);
     }
   }
 }
@@ -568,6 +527,7 @@ void validate_ik(const PlannerIkConformanceCase& test_case,
     return;
   }
   if (result.joint_names.empty() ||
+      result.resources != test_case.request.resources ||
       result.positions_rad.size() != result.joint_names.size() ||
       !unique_name_index(result.joint_names).has_value() ||
       !std::all_of(result.positions_rad.begin(), result.positions_rad.end(),
@@ -597,7 +557,8 @@ void validate_ik(const PlannerIkConformanceCase& test_case,
   if (input.forward_kinematics) {
     RobotStateDTO state{result.joint_names, result.positions_rad, {}};
     const auto pose = input.forward_kinematics(FkRequestDTO{
-        state, test_case.request.tcp_frame, test_case.request.base_frame});
+        state, compiled_frame_name(test_case.request.tcp_frame),
+        compiled_frame_name(test_case.request.base_frame)});
     if (!pose.ok()) {
       add_violation(report, test_case.id, "ik.fk_verification",
                     "FK verification failed: " + pose.error().message);
@@ -685,21 +646,14 @@ std::vector<PlannerConformanceCase> make_portable_planner_matrix(
       requests{{{PlannerMotionCapability::kJoint, &joint_request},
                 {PlannerMotionCapability::kPose, &pose_request},
                 {PlannerMotionCapability::kCartesian, &cartesian_request}}};
-  const std::array<PlanningProfileDTO, 3> profiles{
-      PlanningProfileDTO::kFirstFeasible, PlanningProfileDTO::kBalanced,
-      PlanningProfileDTO::kQualityBounded};
   std::vector<PlannerConformanceCase> cases;
-  cases.reserve(requests.size() * profiles.size());
+  cases.reserve(requests.size());
   for (const auto& [motion, request] : requests) {
-    for (const auto profile : profiles) {
-      PlannerConformanceCase test_case;
-      test_case.id = std::string(motion_name(motion)) + "." +
-                     profile_name(profile);
-      test_case.request = *request;
-      test_case.request.move_id += "_" + test_case.id;
-      test_case.request.planning_profile = profile;
-      cases.push_back(std::move(test_case));
-    }
+    const std::string case_id = motion_name(motion);
+    PlannerConformanceCase test_case{case_id, *request};
+    test_case.request.move_id =
+        MoveId(request->move_id.value() + "_" + case_id);
+    cases.push_back(std::move(test_case));
   }
   return cases;
 }

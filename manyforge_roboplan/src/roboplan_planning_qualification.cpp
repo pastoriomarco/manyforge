@@ -50,13 +50,10 @@ bool RoboPlanPlanningQualificationRecorder::try_begin_invocation(
 }
 
 void RoboPlanPlanningQualificationRecorder::record(
-    const core::PlanRequestDTO& request, const core::PlanResultDTO& result,
-    const RoboPlanPlanningPipelineMetrics& metrics) noexcept {
+  const core::PlanRequestDTO& request, const core::PlanResultDTO& result,
+  const RoboPlanPlanningPipelineMetrics& metrics) noexcept {
   try {
-    RoboPlanPlanningQualificationRecord record;
-    record.request = request;
-    record.result = result;
-    record.metrics = metrics;
+    RoboPlanPlanningQualificationRecord record{0U, request, result, metrics};
 
     std::lock_guard<std::mutex> lock(mutex_);
     record.sequence = next_sequence_++;

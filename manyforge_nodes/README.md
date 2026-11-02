@@ -1,9 +1,13 @@
-# Installed External Nodes
+# Reserved Trusted-Extension Location
 
-Composer scans each immediate subdirectory of this folder as one trusted
-external node. Copy reviewed node folders here; do not place untrusted uploads
-or assistant-generated code in this directory.
+This directory is **not scanned** by the current ManyForge runtime. Copying a
+folder here does not install, validate, authorize, or enable an external node.
 
-The path is `/workspace/manyforge_nodes` inside the standard ManyForge
-containers. See [`../docs/operations/EXTERNAL_NODES.md`](../docs/operations/EXTERNAL_NODES.md)
-for the descriptor, validation, deployment, reload, and resource contracts.
+The former filesystem-root loader and `manyforge.external_node.v0` contract
+were deleted in commit `c42087c`. Trusted extensions return only through the
+content-addressed v2 package/compiler boundary: implementation availability at
+I5/H0 and addressed execution at I6/N. No path loader or Python factory table
+will be restored.
+
+Program nodes are built in. For a build-time node example, see
+[`../manyforge_example_nodes/README.md`](../manyforge_example_nodes/README.md).

@@ -1,0 +1,1475 @@
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <iterator>
+#include <manyforge_core/geometry/pose_math.hpp>
+#include <manyforge_core/collision/collision_policy_evaluator.hpp>
+#include <manyforge_roboplan/process_contained_candidate_client.hpp>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+
+#include <manyforge_collision/scene_asset_root.hpp>
+
+#include "roboplan_worker_protocol.hpp"
+
+extern char **environ;
+
+namespace manyforge::roboplan_backend {
+namespace {
+
+using Clock = std::chrono::steady_clock;
+using worker_protocol::Frame;
+using worker_protocol::MessageType;
+
+constexpr std::size_t kHeaderBytes = 16U;
+constexpr std::chrono::milliseconds kPollSlice{20};
+constexpr std::size_t kMaximumProjectedWorkerGeometries = 65'536U;
+constexpr std::size_t kMaximumProjectedWorkerAllowedPairs = 262'144U;
+
+[[nodiscard]] core::ErrorDTO
+error(core::ErrorCode code, std::string message, std::string reason,
+      std::map<std::string, std::string> details = {}) {
+  details["reason"] = std::move(reason);
+  return {std::string(core::to_string(code)), std::move(message),
+          std::move(details)};
+}
+
+[[nodiscard]] std::string
+native_geometry_name(const std::string_view body_id,
+                     const std::size_t geometry_index) {
+  constexpr char kHex[] = "0123456789abcdef";
+  std::string result = "manyforge_scene_";
+  result.reserve(result.size() + body_id.size() * 2U + 24U);
+  for (const unsigned char byte : body_id) {
+    result.push_back(kHex[(byte >> 4U) & 0x0fU]);
+    result.push_back(kHex[byte & 0x0fU]);
+  }
+  result += "_geometry_" + std::to_string(geometry_index);
+  return result;
+}
+
+/// A relative scene mesh whose bytes differ from the collision model's
+/// pinned digest; reported with reason `scene_mesh_content_changed`.
+class SceneMeshContentChangedError final : public std::invalid_argument {
+public:
+  using std::invalid_argument::invalid_argument;
+};
+
+struct ProjectedMesh final {
+  std::optional<std::filesystem::path> resolved_mesh_path;
+  std::optional<std::string> scene_mesh_content_digest;
+};
+
+[[nodiscard]] ProjectedMesh
+project_mesh(const RoboPlanWorkerModelDTO &model,
+             const ProcessContainedCandidateClientConfig &config,
+             const std::string &uri) {
+  constexpr std::string_view kAssetPrefix = "asset://";
+  if (!uri.starts_with(kAssetPrefix)) {
+    // Program scene mesh: resolved only inside the worker, below its own
+    // scene-asset root descriptor. Here only its syntax and the collision
+    // model's pinned digest are bound into the projection.
+    if (!config.scene_asset_root_fd.has_value() ||
+        uri.find("://") != uri.npos) {
+      throw std::invalid_argument(
+          "retained worker mesh has no exact staged asset path");
+    }
+    if (!collision::is_plain_relative_resource_path(uri)) {
+      throw std::invalid_argument("retained worker mesh asset path is invalid");
+    }
+    if (!config.scene_mesh_content_digest) {
+      throw std::invalid_argument(
+          "retained worker scene mesh has no content digest source");
+    }
+    auto digest = config.scene_mesh_content_digest(uri);
+    if (!digest.ok()) {
+      const auto reason = digest.error().details.find("reason");
+      if (reason != digest.error().details.end() &&
+          reason->second == collision::kSceneMeshContentChangedReason) {
+        throw SceneMeshContentChangedError(digest.error().message);
+      }
+      throw std::invalid_argument("retained worker scene mesh is unavailable: " +
+                                  digest.error().message);
+    }
+    return ProjectedMesh{std::nullopt, std::move(digest.value())};
+  }
+  const auto relative_text = uri.substr(kAssetPrefix.size());
+  if (model.package_paths.size() != 1U) {
+    throw std::invalid_argument(
+        "retained worker mesh has no exact staged asset path");
+  }
+  if (!collision::is_plain_relative_resource_path(relative_text)) {
+    throw std::invalid_argument("retained worker mesh asset path is invalid");
+  }
+  const std::filesystem::path relative(relative_text);
+  std::error_code filesystem_error;
+  const auto root = std::filesystem::canonical(model.package_paths.front(),
+                                               filesystem_error);
+  if (filesystem_error || !std::filesystem::is_directory(root)) {
+    throw std::invalid_argument(
+        "retained worker package root cannot be resolved");
+  }
+  const auto selected = std::filesystem::canonical(root / relative,
+                                                   filesystem_error);
+  if (filesystem_error || !std::filesystem::is_regular_file(selected)) {
+    throw std::invalid_argument("retained worker mesh asset is unavailable");
+  }
+  const auto [root_end, selected_end] = std::mismatch(
+      root.begin(), root.end(), selected.begin(), selected.end());
+  static_cast<void>(selected_end);
+  if (root_end != root.end()) {
+    throw std::invalid_argument(
+        "retained worker mesh escapes its staged package root");
+  }
+  return ProjectedMesh{selected, std::nullopt};
+}
+
+[[nodiscard]] core::CollisionShapeDTO
+projected_shape(const core::CollisionGeometryDescriptor &geometry) {
+  switch (geometry.geometry_kind) {
+  case core::CollisionGeometryKind::kBox:
+    if (!geometry.box_dimensions_m.has_value()) {
+      break;
+    }
+    return core::BoxShapeDTO{*geometry.box_dimensions_m};
+  case core::CollisionGeometryKind::kSphere:
+    if (!geometry.sphere_radius_m.has_value()) {
+      break;
+    }
+    return core::SphereShapeDTO{*geometry.sphere_radius_m};
+  case core::CollisionGeometryKind::kCylinder:
+    if (!geometry.cylinder_radius_m.has_value() ||
+        !geometry.cylinder_height_m.has_value()) {
+      break;
+    }
+    return core::CylinderShapeDTO{*geometry.cylinder_radius_m,
+                                  *geometry.cylinder_height_m};
+  case core::CollisionGeometryKind::kConvexMesh:
+  case core::CollisionGeometryKind::kTriangleMesh:
+    if (!geometry.source_uri.has_value()) {
+      break;
+    }
+    return core::MeshShapeDTO{
+        *geometry.source_uri,
+        geometry.mesh_scale.value_or(core::Vector3DTO{1.0, 1.0, 1.0})};
+  case core::CollisionGeometryKind::kCapsule:
+  case core::CollisionGeometryKind::kCompound:
+    break;
+  }
+  throw std::invalid_argument(
+      "retained collision geometry cannot be projected into RoboPlan");
+}
+
+/// Logical collision body id to its native worker-scene names.
+using NativeBodies = std::map<core::CollisionBodyId, std::vector<std::string>>;
+using NativePairs = std::set<std::pair<std::string, std::string>>;
+
+/// Adds the canonical native pairs of one logical pair.
+void add_native_pairs(const NativeBodies &native_bodies,
+                      const core::CollisionPairId &pair, NativePairs &out) {
+  const auto left = native_bodies.find(pair.body_a);
+  const auto right = native_bodies.find(pair.body_b);
+  if (left == native_bodies.end() || right == native_bodies.end()) {
+    throw std::invalid_argument(
+        "retained collision policy names an absent body");
+  }
+  for (const auto &first : left->second) {
+    for (const auto &second : right->second) {
+      if (first == second) {
+        continue;
+      }
+      out.emplace(std::min(first, second), std::max(first, second));
+      if (out.size() > kMaximumProjectedWorkerAllowedPairs) {
+        throw std::invalid_argument(
+            "retained worker projection exceeds the allowed-pair bound");
+      }
+    }
+  }
+}
+
+[[nodiscard]] RoboPlanWorkerModelDTO
+project_worker_model(const RoboPlanWorkerModelDTO &base,
+                     const ProcessContainedCandidateClientConfig &config,
+                     const RoboPlanCandidateProjectionDTO &projection,
+                     NativeBodies &native_bodies_out) {
+  if (!projection.projection_binding.valid() || !projection.world ||
+      !projection.policy) {
+    throw std::invalid_argument("retained RoboPlan projection is incomplete");
+  }
+  RoboPlanWorkerModelDTO model = base;
+  model.geometries.clear();
+  model.allowed_collision_pairs.clear();
+  std::map<core::CollisionBodyId, std::vector<std::string>> native_bodies;
+  for (const auto &body : projection.world->bodies) {
+    if (body.body_id.empty() || body.frame_id.empty() ||
+        body.geometries.empty()) {
+      throw std::invalid_argument("retained collision body is incomplete");
+    }
+    auto &names = native_bodies[body.body_id];
+    if (body.owner_kind == core::CollisionOwnerKind::kComponentModelBody) {
+      names.push_back(body.frame_id);
+      continue;
+    }
+    for (std::size_t index = 0U; index < body.geometries.size(); ++index) {
+      const auto &geometry = body.geometries[index];
+      auto shape = projected_shape(geometry);
+      ProjectedMesh mesh_source;
+      if (const auto *mesh = std::get_if<core::MeshShapeDTO>(&shape)) {
+        mesh_source = project_mesh(model, config, mesh->resource_uri);
+      }
+      const auto name = native_geometry_name(body.body_id, index);
+      names.push_back(name);
+      model.geometries.push_back(RoboPlanWorkerGeometryDTO{
+          name, body.frame_id, std::move(shape),
+          core::multiply_poses(body.pose, geometry.local_pose),
+          std::move(mesh_source.resolved_mesh_path),
+          std::move(mesh_source.scene_mesh_content_digest)});
+      if (model.geometries.size() > kMaximumProjectedWorkerGeometries) {
+        throw std::invalid_argument(
+            "retained worker projection exceeds the geometry bound");
+      }
+    }
+  }
+
+  // The selected contact policy's pairs are not part of the worker scene:
+  // they travel with each request (native_contact_pairs).
+  NativePairs allowed;
+  for (const auto &pair : projection.policy->allowed_static_static_pairs) {
+    add_native_pairs(native_bodies, pair, allowed);
+  }
+  for (const auto &pair : projection.policy->allowed_touch_link_pairs) {
+    add_native_pairs(native_bodies, pair, allowed);
+  }
+  for (const auto &contact : projection.policy->support_contacts) {
+    add_native_pairs(native_bodies, contact.pair, allowed);
+  }
+  model.allowed_collision_pairs.assign(allowed.begin(), allowed.end());
+  native_bodies_out = std::move(native_bodies);
+  return model;
+}
+
+/// The selected contact policy's allowed pairs as native worker-scene pairs.
+/// Only the bound operation's exact body/object pairs are relaxed for
+/// candidate generation; the final coordinator still checks window/depth.
+[[nodiscard]] std::vector<std::pair<std::string, std::string>>
+native_contact_pairs(const NativeBodies &native_bodies,
+                     const RoboPlanCandidateProjectionDTO &projection) {
+  if (!projection.contact_policy_id) {
+    return {};
+  }
+  const auto active = std::find_if(
+      projection.policy->contact_grasps.begin(),
+      projection.policy->contact_grasps.end(), [&](const auto &entry) {
+        return entry.policy_id == *projection.contact_policy_id;
+      });
+  if (active == projection.policy->contact_grasps.end()) {
+    return {};
+  }
+  NativePairs allowed;
+  for (const auto &pair : core::build_selected_collision_distance_pairs(
+           *projection.policy, *projection.world, *projection.contact_policy_id)) {
+    if (core::contact_grasp_pair_matches(pair, *active)) {
+      add_native_pairs(native_bodies, pair, allowed);
+    }
+  }
+  return {allowed.begin(), allowed.end()};
+}
+
+/// The Kernel's logical clearance margins as native worker-scene pairs. Two
+/// logical pairs on the same native names keep the smaller margin.
+[[nodiscard]] std::vector<RoboPlanPairMarginDTO>
+native_pair_margins(const NativeBodies &native_bodies,
+                    const core::CollisionClearanceMargins *margins) {
+  if (margins == nullptr) {
+    return {};
+  }
+  std::map<std::pair<std::string, std::string>, double> native;
+  for (const auto &entry : margins->pairs) {
+    const auto left = native_bodies.find(entry.pair.body_a);
+    const auto right = native_bodies.find(entry.pair.body_b);
+    if (left == native_bodies.end() || right == native_bodies.end()) {
+      throw std::invalid_argument(
+          "retained clearance margin names an absent body");
+    }
+    for (const auto &first : left->second) {
+      for (const auto &second : right->second) {
+        if (first == second) {
+          continue;
+        }
+        const auto [found, inserted] = native.emplace(
+            std::pair{std::min(first, second), std::max(first, second)},
+            entry.margin_m);
+        if (!inserted) {
+          found->second = std::min(found->second, entry.margin_m);
+        }
+      }
+    }
+  }
+  std::vector<RoboPlanPairMarginDTO> result;
+  result.reserve(native.size());
+  for (const auto &[pair, margin] : native) {
+    result.push_back(RoboPlanPairMarginDTO{pair.first, pair.second, margin});
+  }
+  return result;
+}
+
+class UniqueFd final {
+public:
+  UniqueFd() = default;
+  explicit UniqueFd(int descriptor) : descriptor_(descriptor) {}
+  ~UniqueFd() { reset(); }
+
+  UniqueFd(const UniqueFd &) = delete;
+  UniqueFd &operator=(const UniqueFd &) = delete;
+  UniqueFd(UniqueFd &&other) noexcept
+      : descriptor_(std::exchange(other.descriptor_, -1)) {}
+  UniqueFd &operator=(UniqueFd &&other) noexcept {
+    if (this != &other) {
+      reset(std::exchange(other.descriptor_, -1));
+    }
+    return *this;
+  }
+
+  [[nodiscard]] int get() const noexcept { return descriptor_; }
+  [[nodiscard]] explicit operator bool() const noexcept {
+    return descriptor_ >= 0;
+  }
+  [[nodiscard]] int release() noexcept {
+    return std::exchange(descriptor_, -1);
+  }
+  void reset(int replacement = -1) noexcept {
+    if (descriptor_ >= 0) {
+      static_cast<void>(::close(descriptor_));
+    }
+    descriptor_ = replacement;
+  }
+
+private:
+  int descriptor_{-1};
+};
+
+enum class RequestFailureKind {
+  kCancelled,
+  kTimeout,
+  kTransport,
+  kProtocol,
+  kSceneMeshContentChanged,
+};
+
+class RequestFailure final : public std::runtime_error {
+public:
+  RequestFailure(RequestFailureKind kind, std::string detail)
+      : std::runtime_error(std::move(detail)), kind(kind) {}
+  RequestFailureKind kind;
+};
+
+class ProcessSignalHandle final {
+public:
+  explicit ProcessSignalHandle(UniqueFd pidfd) : pidfd_(std::move(pidfd)) {}
+
+  void kill() const noexcept {
+#if defined(SYS_pidfd_send_signal)
+    if (pidfd_) {
+      static_cast<void>(
+          ::syscall(SYS_pidfd_send_signal, pidfd_.get(), SIGKILL, nullptr, 0));
+    }
+#endif
+  }
+
+private:
+  UniqueFd pidfd_;
+};
+
+struct ActiveRequest final {
+  std::atomic_bool cancelled{false};
+  std::atomic<std::shared_ptr<ProcessSignalHandle>> process;
+};
+
+struct WorkerProcess final {
+  pid_t pid{-1};
+  UniqueFd socket;
+  std::shared_ptr<ProcessSignalHandle> signal;
+  bool reaped{false};
+};
+
+[[nodiscard]] UniqueFd open_pidfd(pid_t pid) {
+#if defined(SYS_pidfd_open)
+  const auto descriptor = static_cast<int>(::syscall(SYS_pidfd_open, pid, 0));
+  if (descriptor < 0) {
+    throw std::runtime_error("pidfd_open failed: " +
+                             std::string(std::strerror(errno)));
+  }
+  const int flags = ::fcntl(descriptor, F_GETFD);
+  if (flags < 0 || ::fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) != 0) {
+    const int saved = errno;
+    static_cast<void>(::close(descriptor));
+    throw std::runtime_error("could not seal pidfd: " +
+                             std::string(std::strerror(saved)));
+  }
+  return UniqueFd(descriptor);
+#else
+  static_cast<void>(pid);
+  throw std::runtime_error("pidfd_open is unavailable on this platform");
+#endif
+}
+
+void make_nonblocking(int descriptor) {
+  const int flags = ::fcntl(descriptor, F_GETFL);
+  if (flags < 0 || ::fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != 0) {
+    throw std::runtime_error("could not make worker transport nonblocking: " +
+                             std::string(std::strerror(errno)));
+  }
+}
+
+[[nodiscard]] int bounded_poll_timeout(Clock::time_point deadline) {
+  const auto now = Clock::now();
+  if (now >= deadline) {
+    return 0;
+  }
+  const auto remaining =
+      std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+  return static_cast<int>(std::max<std::int64_t>(
+      1, std::min<std::int64_t>(kPollSlice.count(), remaining.count())));
+}
+
+void check_request(const std::shared_ptr<ActiveRequest> &request,
+                   Clock::time_point deadline) {
+  if (request && request->cancelled.load(std::memory_order_acquire)) {
+    throw RequestFailure(RequestFailureKind::kCancelled,
+                         "worker request was cancelled");
+  }
+  if (Clock::now() >= deadline) {
+    throw RequestFailure(RequestFailureKind::kTimeout,
+                         "worker request exceeded its deadline");
+  }
+}
+
+void wait_ready(int descriptor, short events,
+                const std::shared_ptr<ActiveRequest> &request,
+                Clock::time_point deadline) {
+  for (;;) {
+    check_request(request, deadline);
+    pollfd item{descriptor, events, 0};
+    int status = 0;
+    do {
+      status = ::poll(&item, 1U, bounded_poll_timeout(deadline));
+    } while (status < 0 && errno == EINTR);
+    if (status < 0) {
+      throw RequestFailure(RequestFailureKind::kTransport,
+                           "worker transport poll failed");
+    }
+    if (status == 0) {
+      continue;
+    }
+    // request_cancel() publishes cancellation before signalling the exact
+    // pidfd. Prefer that causal state over the resulting socket HUP so the
+    // public outcome remains deterministic across scheduler interleavings.
+    check_request(request, deadline);
+    if ((item.revents & (POLLERR | POLLNVAL)) != 0) {
+      throw RequestFailure(RequestFailureKind::kTransport,
+                           "worker transport became invalid");
+    }
+    if ((item.revents & events) != 0) {
+      return;
+    }
+    if ((item.revents & POLLHUP) != 0) {
+      throw RequestFailure(RequestFailureKind::kTransport,
+                           "worker process closed its transport");
+    }
+  }
+}
+
+void write_controlled(int descriptor, const void *input, std::size_t size,
+                      const std::shared_ptr<ActiveRequest> &request,
+                      Clock::time_point deadline) {
+  const auto *bytes = static_cast<const char *>(input);
+  std::size_t offset = 0U;
+  while (offset < size) {
+    wait_ready(descriptor, POLLOUT, request, deadline);
+    const auto count = ::send(descriptor, bytes + offset, size - offset,
+                              MSG_NOSIGNAL | MSG_DONTWAIT);
+    if (count < 0 &&
+        (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+      continue;
+    }
+    if (count < 0) {
+      throw RequestFailure(RequestFailureKind::kTransport,
+                           "worker transport write failed");
+    }
+    if (count == 0) {
+      throw RequestFailure(RequestFailureKind::kTransport,
+                           "worker transport write made no progress");
+    }
+    offset += static_cast<std::size_t>(count);
+  }
+}
+
+void read_controlled(int descriptor, void *output, std::size_t size,
+                     const std::shared_ptr<ActiveRequest> &request,
+                     Clock::time_point deadline) {
+  auto *bytes = static_cast<char *>(output);
+  std::size_t offset = 0U;
+  while (offset < size) {
+    wait_ready(descriptor, POLLIN, request, deadline);
+    const auto count =
+        ::recv(descriptor, bytes + offset, size - offset, MSG_DONTWAIT);
+    if (count < 0 &&
+        (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+      continue;
+    }
+    if (count < 0) {
+      throw RequestFailure(RequestFailureKind::kTransport,
+                           "worker transport read failed");
+    }
+    if (count == 0) {
+      throw RequestFailure(RequestFailureKind::kTransport,
+                           "worker process exited without a response");
+    }
+    offset += static_cast<std::size_t>(count);
+  }
+}
+
+void put_u16(std::array<unsigned char, kHeaderBytes> &header,
+             std::size_t offset, std::uint16_t value) {
+  header[offset] = static_cast<unsigned char>(value & 0xffU);
+  header[offset + 1U] = static_cast<unsigned char>((value >> 8U) & 0xffU);
+}
+
+void put_u32(std::array<unsigned char, kHeaderBytes> &header,
+             std::size_t offset, std::uint32_t value) {
+  for (unsigned shift = 0U; shift < 32U; shift += 8U) {
+    header[offset++] = static_cast<unsigned char>((value >> shift) & 0xffU);
+  }
+}
+
+void put_u64(std::array<unsigned char, kHeaderBytes> &header,
+             std::size_t offset, std::uint64_t value) {
+  for (unsigned shift = 0U; shift < 64U; shift += 8U) {
+    header[offset++] = static_cast<unsigned char>((value >> shift) & 0xffU);
+  }
+}
+
+[[nodiscard]] std::uint16_t
+get_u16(const std::array<unsigned char, kHeaderBytes> &header,
+        std::size_t offset) {
+  return static_cast<std::uint16_t>(header[offset]) |
+         (static_cast<std::uint16_t>(header[offset + 1U]) << 8U);
+}
+
+[[nodiscard]] std::uint32_t
+get_u32(const std::array<unsigned char, kHeaderBytes> &header,
+        std::size_t offset) {
+  std::uint32_t value = 0U;
+  for (unsigned shift = 0U; shift < 32U; shift += 8U) {
+    value |= static_cast<std::uint32_t>(header[offset++]) << shift;
+  }
+  return value;
+}
+
+[[nodiscard]] std::uint64_t
+get_u64(const std::array<unsigned char, kHeaderBytes> &header,
+        std::size_t offset) {
+  std::uint64_t value = 0U;
+  for (unsigned shift = 0U; shift < 64U; shift += 8U) {
+    value |= static_cast<std::uint64_t>(header[offset++]) << shift;
+  }
+  return value;
+}
+
+void send_frame(int descriptor, MessageType type, std::string_view payload,
+                std::size_t maximum_payload,
+                const std::shared_ptr<ActiveRequest> &request,
+                Clock::time_point deadline) {
+  if (payload.size() > maximum_payload) {
+    throw RequestFailure(
+        RequestFailureKind::kProtocol,
+        "outgoing worker payload exceeds its configured bound");
+  }
+  std::array<unsigned char, kHeaderBytes> header{};
+  put_u32(header, 0U, worker_protocol::kFrameMagic);
+  put_u16(header, 4U, worker_protocol::kProtocolVersion);
+  put_u16(header, 6U, static_cast<std::uint16_t>(type));
+  put_u64(header, 8U, payload.size());
+  write_controlled(descriptor, header.data(), header.size(), request, deadline);
+  if (!payload.empty()) {
+    write_controlled(descriptor, payload.data(), payload.size(), request,
+                     deadline);
+  }
+}
+
+[[nodiscard]] Frame receive_frame(int descriptor, std::size_t maximum_payload,
+                                  const std::shared_ptr<ActiveRequest> &request,
+                                  Clock::time_point deadline) {
+  std::array<unsigned char, kHeaderBytes> header{};
+  read_controlled(descriptor, header.data(), header.size(), request, deadline);
+  if (get_u32(header, 0U) != worker_protocol::kFrameMagic ||
+      get_u16(header, 4U) != worker_protocol::kProtocolVersion) {
+    throw RequestFailure(RequestFailureKind::kProtocol,
+                         "worker response has an invalid magic or version");
+  }
+  const auto raw_type = get_u16(header, 6U);
+  if (raw_type < static_cast<std::uint16_t>(MessageType::kInitialize) ||
+      raw_type > static_cast<std::uint16_t>(MessageType::kProtocolError)) {
+    throw RequestFailure(RequestFailureKind::kProtocol,
+                         "worker response has an invalid type");
+  }
+  const auto size = get_u64(header, 8U);
+  if (size > maximum_payload ||
+      size > std::numeric_limits<std::size_t>::max()) {
+    throw RequestFailure(RequestFailureKind::kProtocol,
+                         "worker response exceeds its configured byte bound");
+  }
+  std::string payload(static_cast<std::size_t>(size), '\0');
+  if (!payload.empty()) {
+    read_controlled(descriptor, payload.data(), payload.size(), request,
+                    deadline);
+  }
+  return {static_cast<MessageType>(raw_type), std::move(payload)};
+}
+
+[[nodiscard]] Clock::time_point
+request_deadline(double timeout_s, std::chrono::milliseconds grace,
+                 std::optional<Clock::time_point> started) {
+  if (!std::isfinite(timeout_s) || timeout_s <= 0.0) {
+    throw RequestFailure(RequestFailureKind::kProtocol,
+                         "worker request timeout is invalid");
+  }
+  if (started &&
+      timeout_s >
+          std::chrono::duration<double>(std::chrono::hours(24)).count()) {
+    throw RequestFailure(RequestFailureKind::kProtocol,
+                         "worker request timeout is outside its hard bound");
+  }
+  const auto duration = std::chrono::duration<double>(timeout_s) + grace;
+  const auto bounded = std::chrono::duration_cast<Clock::duration>(duration);
+  if (bounded <= Clock::duration::zero() || bounded > std::chrono::hours(24)) {
+    throw RequestFailure(RequestFailureKind::kProtocol,
+                         "worker request timeout is outside its hard bound");
+  }
+  return started.value_or(Clock::now()) + bounded;
+}
+
+[[nodiscard]] core::ErrorDTO
+request_failure_error(const RequestFailure &failure, bool ik) {
+  switch (failure.kind) {
+  case RequestFailureKind::kCancelled:
+    return error(core::ErrorCode::kPlanningFailed,
+                 ik ? "RoboPlan IK was cancelled"
+                    : "RoboPlan planning was cancelled",
+                 "planning_cancelled_by_interrupt");
+  case RequestFailureKind::kTimeout:
+    return error(core::ErrorCode::kPlanningTimeout,
+                 ik ? "RoboPlan IK exceeded its deadline"
+                    : "RoboPlan planning exceeded its deadline",
+                 "planning_timeout");
+  case RequestFailureKind::kProtocol:
+    return error(core::ErrorCode::kInvariantViolation,
+                 "RoboPlan worker protocol rejected a message",
+                 ik ? "native_ik_worker_protocol_failure"
+                    : "native_planner_worker_protocol_failure");
+  case RequestFailureKind::kTransport:
+    return error(ik ? core::ErrorCode::kIkFailed
+                    : core::ErrorCode::kPlanningFailed,
+                 "RoboPlan worker became unavailable",
+                 ik ? "native_ik_worker_unavailable"
+                    : "native_planner_worker_unavailable");
+  case RequestFailureKind::kSceneMeshContentChanged:
+    return error(ik ? core::ErrorCode::kIkFailed
+                    : core::ErrorCode::kPlanningFailed,
+                 "Scene mesh bytes differ from the bytes the collision model "
+                 "loaded",
+                 std::string(collision::kSceneMeshContentChangedReason));
+  }
+  return error(core::ErrorCode::kInternalError, "RoboPlan worker failed",
+               "native_worker_failure");
+}
+
+} // namespace
+
+struct ProcessContainedRoboPlanCandidateClient::Impl final {
+  struct ProjectionSelection final {
+    core::ProjectionRevisionDTO projection_revision;
+    core::CollisionWorldRevision world_revision;
+    core::CollisionPolicyRevision policy_revision;
+    /// Not part of the worker identity: the margins and the selected contact
+    /// policy's pairs travel with each request.
+    NativeBodies native_bodies;
+    std::vector<RoboPlanPairMarginDTO> pair_margins;
+    std::vector<std::pair<std::string, std::string>> contact_pairs;
+
+    [[nodiscard]] bool
+    matches(const RoboPlanCandidateProjectionDTO &candidate) const noexcept {
+      return candidate.world && candidate.policy &&
+             projection_revision ==
+                 candidate.projection_binding.projection_revision &&
+             world_revision.revision_id ==
+                 candidate.world->revision.revision_id &&
+             world_revision.content_hash ==
+                 candidate.world->revision.content_hash &&
+             policy_revision == candidate.policy->revision;
+    }
+  };
+
+  Impl(RoboPlanWorkerModelDTO model_value,
+       RoboPlanCandidateBindingDTO binding_value,
+       RoboPlanCandidateComputerConfig candidate_config_value,
+       ProcessContainedCandidateClientConfig config_value)
+      : base_model(model_value), model(std::move(model_value)),
+        binding(std::move(binding_value)),
+        candidate_config(std::move(candidate_config_value)),
+        config(std::move(config_value)) {
+    validate_config();
+    if (!config.require_retained_projection) {
+      start_worker(nullptr, Clock::now() + config.startup_timeout);
+    }
+  }
+
+  ~Impl() {
+    auto active = active_request.exchange(nullptr, std::memory_order_acq_rel);
+    if (active) {
+      active->cancelled.store(true, std::memory_order_release);
+      if (auto signal = active->process.load(std::memory_order_acquire)) {
+        signal->kill();
+      }
+    }
+    std::lock_guard lock(request_mutex);
+    shutdown_worker();
+  }
+
+  void validate_config() {
+    if (!config.worker_executable.is_absolute() ||
+        !std::filesystem::is_regular_file(config.worker_executable) ||
+        ::access(config.worker_executable.c_str(), X_OK) != 0 ||
+        config.startup_timeout <= std::chrono::milliseconds::zero() ||
+        config.startup_timeout > std::chrono::minutes(5) ||
+        config.request_transport_grace < std::chrono::milliseconds::zero() ||
+        config.request_transport_grace > std::chrono::seconds(10) ||
+        config.shutdown_timeout <= std::chrono::milliseconds::zero() ||
+        config.shutdown_timeout > std::chrono::seconds(10) ||
+        config.maximum_request_bytes == 0U ||
+        config.maximum_request_bytes > 64U * 1024U * 1024U ||
+        config.maximum_response_bytes == 0U ||
+        config.maximum_response_bytes > 256U * 1024U * 1024U) {
+      throw std::invalid_argument(
+          "RoboPlan process-contained client configuration is invalid");
+    }
+    if (config.retained_package_root_fd.has_value()) {
+      const int retained_root_fd = *config.retained_package_root_fd;
+      if (retained_root_fd < 6 || retained_root_fd == 7) {
+        throw std::invalid_argument(
+            "RoboPlan retained package descriptor must name its exact "
+            "inherited root");
+      }
+      struct stat status {};
+      const int flags = ::fcntl(retained_root_fd, F_GETFD);
+      if (::fstat(retained_root_fd, &status) != 0 ||
+          !S_ISDIR(status.st_mode) ||
+          flags < 0 || (flags & FD_CLOEXEC) != 0) {
+        throw std::invalid_argument(
+            "RoboPlan retained package descriptor is not inherited");
+      }
+    }
+    if (config.scene_asset_root_fd.has_value()) {
+      // The descriptor is duplicated (close-on-exec) at each spawn and mapped
+      // to the worker's reserved FD, so it must not alias a descriptor that
+      // spawn itself rewrites or the separate retained package root.
+      const int scene_root_fd = *config.scene_asset_root_fd;
+      struct stat status {};
+      if (scene_root_fd <= worker_protocol::kProtocolDescriptor ||
+          (config.retained_package_root_fd.has_value() &&
+           (scene_root_fd == *config.retained_package_root_fd ||
+            scene_root_fd == 6)) ||
+          ::fstat(scene_root_fd, &status) != 0 || !S_ISDIR(status.st_mode)) {
+        throw std::invalid_argument(
+            "RoboPlan scene-asset root descriptor is invalid");
+      }
+    }
+  }
+
+  [[nodiscard]] core::Result<void>
+  select_projection(const RoboPlanCandidateProjectionDTO &projection) {
+    if (!config.require_retained_projection) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidStateTransition,
+                "Fixed RoboPlan worker cannot select a retained projection",
+                "native_planner_projection_selection_unavailable"));
+    }
+    const auto margin_failure = [](const std::exception &exception) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidRequest,
+                "Retained RoboPlan worker projection failed: " +
+                    std::string(exception.what()),
+                "native_planner_projection_selection_failed"));
+    };
+    if (const auto current = selection.load(std::memory_order_acquire);
+        current && current->matches(projection)) {
+      std::vector<RoboPlanPairMarginDTO> margins;
+      std::vector<std::pair<std::string, std::string>> contact_pairs;
+      try {
+        margins = native_pair_margins(current->native_bodies,
+                                      projection.clearance_margins.get());
+        contact_pairs = native_contact_pairs(current->native_bodies, projection);
+      } catch (const std::exception &exception) {
+        return margin_failure(exception);
+      }
+      if (margins != current->pair_margins ||
+          contact_pairs != current->contact_pairs) {
+        auto updated = std::make_shared<ProjectionSelection>(*current);
+        updated->pair_margins = std::move(margins);
+        updated->contact_pairs = std::move(contact_pairs);
+        selection.store(std::move(updated), std::memory_order_release);
+      }
+      return core::Result<void>::Ok();
+    }
+    RoboPlanWorkerModelDTO source;
+    std::uint64_t source_generation = 0U;
+    {
+      std::lock_guard lock(request_mutex);
+      source = base_model;
+      source_generation = base_model_generation;
+    }
+    RoboPlanWorkerModelDTO projected;
+    NativeBodies native_bodies;
+    std::vector<RoboPlanPairMarginDTO> pair_margins;
+    std::vector<std::pair<std::string, std::string>> contact_pairs;
+    try {
+      projected = project_worker_model(source, config, projection, native_bodies);
+      pair_margins =
+          native_pair_margins(native_bodies, projection.clearance_margins.get());
+      contact_pairs = native_contact_pairs(native_bodies, projection);
+    } catch (const SceneMeshContentChangedError &exception) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidRequest,
+                "Retained RoboPlan worker projection failed: " +
+                    std::string(exception.what()),
+                std::string(collision::kSceneMeshContentChangedReason)));
+    } catch (const std::exception &exception) {
+      return margin_failure(exception);
+    }
+    std::lock_guard lock(request_mutex);
+    if (active_request.load(std::memory_order_acquire)) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidStateTransition,
+                "RoboPlan worker projection changed during an active request",
+                "native_planner_projection_selection_busy"));
+    }
+    if (source_generation != base_model_generation) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidStateTransition,
+                "RoboPlan worker model changed during projection selection",
+                "native_planner_projection_selection_busy"));
+    }
+    if (const auto current = selection.load(std::memory_order_acquire);
+        current && current->matches(projection)) {
+      auto updated = std::make_shared<ProjectionSelection>(*current);
+      updated->pair_margins = std::move(pair_margins);
+      updated->contact_pairs = std::move(contact_pairs);
+      selection.store(std::move(updated), std::memory_order_release);
+      return core::Result<void>::Ok();
+    }
+    // A new revision whose worker scene is byte-identical keeps the worker:
+    // it would rebuild exactly the scene it already holds.
+    if (!loads_same_scene(projected)) {
+      shutdown_worker();
+    }
+    model = std::move(projected);
+    selection.store(
+        std::make_shared<const ProjectionSelection>(ProjectionSelection{
+            projection.projection_binding.projection_revision,
+            projection.world->revision, projection.policy->revision,
+            std::move(native_bodies), std::move(pair_margins),
+            std::move(contact_pairs)}),
+        std::memory_order_release);
+    return core::Result<void>::Ok();
+  }
+
+  /// Compares the initialization the worker loads, so equal bytes mean an
+  /// identical worker scene. A relative scene mesh is re-hashed by each new
+  /// worker generation, so such a projection always restarts the worker.
+  /// Guarded by request_mutex.
+  [[nodiscard]] bool
+  loads_same_scene(const RoboPlanWorkerModelDTO &projected) const {
+    if (std::any_of(projected.geometries.begin(), projected.geometries.end(),
+                    [](const auto &geometry) {
+                      return geometry.scene_mesh_content_digest.has_value();
+                    })) {
+      return false;
+    }
+    try {
+      return worker_protocol::encode_initialization(
+                 worker_protocol::WorkerInitializationDTO{
+                     model, binding, candidate_config}) ==
+             worker_protocol::encode_initialization(
+                 worker_protocol::WorkerInitializationDTO{
+                     projected, binding, candidate_config});
+    } catch (const std::exception &) {
+      return false;
+    }
+  }
+
+  [[nodiscard]] core::Result<void>
+  replace_model(const RoboPlanWorkerModelDTO &replacement) {
+    if (!config.require_retained_projection) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidStateTransition,
+                "Fixed RoboPlan worker cannot replace its planning model",
+                "native_planner_model_replacement_unavailable"));
+    }
+    if (replacement.native_scene_name.empty() ||
+        !replacement.urdf_path.is_absolute() ||
+        !replacement.srdf_path.is_absolute() ||
+        replacement.package_paths.empty() ||
+        !replacement.geometries.empty() ||
+        !replacement.allowed_collision_pairs.empty()) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidRequest,
+                "Retained RoboPlan model replacement is not one base model",
+                "native_planner_model_replacement_invalid"));
+    }
+    std::lock_guard lock(request_mutex);
+    if (active_request.load(std::memory_order_acquire)) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidStateTransition,
+                "RoboPlan worker model changed during an active request",
+                "native_planner_model_replacement_busy"));
+    }
+    // The selected projection was resolved against the previous model. Clear
+    // it with the worker so the next request reprojects onto this model.
+    shutdown_worker();
+    base_model = replacement;
+    ++base_model_generation;
+    model = replacement;
+    selection.store(nullptr, std::memory_order_release);
+    return core::Result<void>::Ok();
+  }
+
+  [[nodiscard]] core::Result<void>
+  replace_settings(const RoboPlanCandidateComputerConfig &replacement) {
+    std::lock_guard lock(request_mutex);
+    // Equal initialization bytes: the running worker already has them.
+    if (worker_protocol::encode_initialization(
+            worker_protocol::WorkerInitializationDTO{model, binding, candidate_config}) ==
+        worker_protocol::encode_initialization(
+            worker_protocol::WorkerInitializationDTO{model, binding, replacement})) {
+      return core::Result<void>::Ok();
+    }
+    if (active_request.load(std::memory_order_acquire)) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidStateTransition,
+                "RoboPlan worker settings changed during an active request",
+                "native_planner_settings_replacement_busy"));
+    }
+    shutdown_worker();
+    candidate_config = replacement;
+    return core::Result<void>::Ok();
+  }
+
+  [[nodiscard]] bool worker_alive() {
+    if (!worker.has_value()) {
+      return false;
+    }
+    int status = 0;
+    const auto result = ::waitpid(worker->pid, &status, WNOHANG);
+    if (result == 0) {
+      return true;
+    }
+    if (result == worker->pid || (result < 0 && errno == ECHILD)) {
+      worker->reaped = true;
+      worker.reset();
+      return false;
+    }
+    if (result < 0 && errno != EINTR) {
+      worker.reset();
+      return false;
+    }
+    return true;
+  }
+
+  void start_worker(const std::shared_ptr<ActiveRequest> &request,
+                    Clock::time_point deadline) {
+    if (worker_alive()) {
+      if (request) {
+        request->process.store(worker->signal, std::memory_order_release);
+        check_request(request, deadline);
+      }
+      return;
+    }
+
+    int sockets[2]{-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+      throw std::runtime_error("could not create planner worker socket: " +
+                               std::string(std::strerror(errno)));
+    }
+    UniqueFd parent_socket(sockets[0]);
+    UniqueFd child_socket(sockets[1]);
+
+    posix_spawn_file_actions_t actions;
+    if (::posix_spawn_file_actions_init(&actions) != 0) {
+      throw std::runtime_error("could not initialize planner spawn actions");
+    }
+    struct ActionGuard final {
+      posix_spawn_file_actions_t *actions;
+      ~ActionGuard() { ::posix_spawn_file_actions_destroy(actions); }
+    } guard{&actions};
+    UniqueFd duplicated_child;
+    int child_descriptor = child_socket.get();
+    const int parent_descriptor = parent_socket.get();
+    const int protocol_descriptor = worker_protocol::kProtocolDescriptor;
+    if (child_descriptor == protocol_descriptor) {
+      const int duplicate =
+          ::fcntl(child_descriptor, F_DUPFD_CLOEXEC, protocol_descriptor + 1);
+      if (duplicate < 0) {
+        throw std::runtime_error(
+            "could not duplicate planner transport for worker executable");
+      }
+      duplicated_child.reset(duplicate);
+      child_descriptor = duplicate;
+    }
+    // In the managed child, FD 3 is the Manager channel. Close it before
+    // the protocol dup2 below; FD 3 then becomes only the worker transport.
+    if (config.retained_package_root_fd.has_value() &&
+        ::posix_spawn_file_actions_addclose(&actions, 3) != 0) {
+      throw std::runtime_error(
+          "could not close the inherited Manager channel for worker");
+    }
+    if ((child_descriptor != protocol_descriptor &&
+         ::posix_spawn_file_actions_adddup2(&actions, child_descriptor,
+                                            protocol_descriptor) != 0) ||
+        (parent_descriptor != protocol_descriptor &&
+         ::posix_spawn_file_actions_addclose(&actions, parent_descriptor) !=
+             0) ||
+        (child_descriptor != protocol_descriptor &&
+         ::posix_spawn_file_actions_addclose(&actions, child_descriptor) !=
+             0)) {
+      throw std::runtime_error("could not configure planner spawn actions");
+    }
+    if (config.retained_package_root_fd.has_value()) {
+      const int source_root_fd = *config.retained_package_root_fd;
+      if (::posix_spawn_file_actions_adddup2(&actions, source_root_fd, 6) !=
+              0 ||
+          (source_root_fd != 6 &&
+           ::posix_spawn_file_actions_addclose(&actions, source_root_fd) !=
+               0) ||
+          ::posix_spawn_file_actions_addclose(&actions, 4) != 0 ||
+          ::posix_spawn_file_actions_addclose(&actions, 5) != 0) {
+        throw std::runtime_error(
+            "could not preserve the retained package descriptor for worker");
+      }
+    }
+    // The scene-asset root is mapped last from a close-on-exec copy above
+    // every rewritten descriptor, so no earlier action can clobber it.
+    UniqueFd scene_root_copy;
+    if (config.scene_asset_root_fd.has_value()) {
+      const int source_scene_fd = *config.scene_asset_root_fd;
+      const int scene_target = worker_protocol::kSceneAssetRootDescriptor;
+      scene_root_copy.reset(
+          ::fcntl(source_scene_fd, F_DUPFD_CLOEXEC, scene_target + 1));
+      if (!scene_root_copy ||
+          (source_scene_fd != scene_target &&
+           ::posix_spawn_file_actions_addclose(&actions, source_scene_fd) !=
+               0) ||
+          ::posix_spawn_file_actions_adddup2(&actions, scene_root_copy.get(),
+                                             scene_target) != 0) {
+        throw std::runtime_error(
+            "could not preserve the scene-asset root descriptor for worker");
+      }
+    }
+
+    const std::string executable = config.worker_executable.string();
+    const std::string parent_pid = std::to_string(::getpid());
+    std::array<char *, 4U> arguments{const_cast<char *>(executable.c_str()),
+                                     const_cast<char *>("--parent-pid"),
+                                     const_cast<char *>(parent_pid.c_str()),
+                                     nullptr};
+    pid_t child = -1;
+    const int spawned = ::posix_spawn(&child, executable.c_str(), &actions,
+                                      nullptr, arguments.data(), environ);
+    if (spawned != 0) {
+      throw std::runtime_error("could not spawn planner worker: " +
+                               std::string(std::strerror(spawned)));
+    }
+    child_socket.reset();
+    scene_root_copy.reset();
+
+    try {
+      auto signal = std::make_shared<ProcessSignalHandle>(open_pidfd(child));
+      make_nonblocking(parent_socket.get());
+      worker.emplace(
+          WorkerProcess{child, std::move(parent_socket), signal, false});
+      if (request) {
+        request->process.store(signal, std::memory_order_release);
+        check_request(request, deadline);
+      }
+      const auto initialization = worker_protocol::encode_initialization(
+          worker_protocol::WorkerInitializationDTO{model, binding,
+                                                   candidate_config});
+      send_frame(worker->socket.get(), MessageType::kInitialize, initialization,
+                 config.maximum_request_bytes, request, deadline);
+      auto ready =
+          receive_frame(worker->socket.get(), config.maximum_response_bytes,
+                        request, deadline);
+      if (ready.type == MessageType::kProtocolError) {
+        if (worker_protocol::decode_protocol_error(ready.payload) ==
+            worker_protocol::kSceneMeshContentChangedDetail) {
+          throw RequestFailure(RequestFailureKind::kSceneMeshContentChanged,
+                               "worker scene mesh content changed");
+        }
+        throw RequestFailure(RequestFailureKind::kProtocol,
+                             "worker rejected initialization");
+      }
+      if (ready.type != MessageType::kReady || !ready.payload.empty()) {
+        throw RequestFailure(RequestFailureKind::kProtocol,
+                             "worker readiness response is malformed");
+      }
+    } catch (...) {
+      if (worker.has_value()) {
+        terminate_worker();
+      } else {
+        static_cast<void>(::kill(child, SIGKILL));
+        while (::waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
+        }
+      }
+      throw;
+    }
+  }
+
+  void reap_until(Clock::time_point deadline) noexcept {
+    if (!worker.has_value() || worker->reaped) {
+      return;
+    }
+    for (;;) {
+      const auto result = ::waitpid(worker->pid, nullptr, WNOHANG);
+      if (result == worker->pid || (result < 0 && errno == ECHILD)) {
+        worker->reaped = true;
+        return;
+      }
+      if (result < 0 && errno != EINTR) {
+        return;
+      }
+      if (Clock::now() >= deadline) {
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
+
+  void terminate_worker() noexcept {
+    if (!worker.has_value()) {
+      return;
+    }
+    worker->signal->kill();
+    reap_until(Clock::now() + config.shutdown_timeout);
+    worker.reset();
+  }
+
+  void shutdown_worker() noexcept {
+    if (!worker_alive()) {
+      return;
+    }
+    try {
+      const auto deadline = Clock::now() + config.shutdown_timeout;
+      send_frame(worker->socket.get(), MessageType::kShutdown, {},
+                 config.maximum_request_bytes, nullptr, deadline);
+      reap_until(deadline);
+    } catch (...) {
+    }
+    if (worker.has_value() && !worker->reaped) {
+      terminate_worker();
+    } else {
+      worker.reset();
+    }
+  }
+
+  template <typename Value, typename Encode, typename Decode>
+  [[nodiscard]] core::Result<Value>
+  transact(MessageType request_type, MessageType response_type,
+           double timeout_s, bool ik, Encode encode, Decode decode,
+           bool whole_preparation_budget = false) {
+    const auto request_started = Clock::now();
+    auto active = std::make_shared<ActiveRequest>();
+    std::shared_ptr<ActiveRequest> expected;
+    if (!active_request.compare_exchange_strong(expected, active,
+                                                std::memory_order_acq_rel,
+                                                std::memory_order_acquire)) {
+      return core::Result<Value>::Err(
+          error(core::ErrorCode::kInvalidStateTransition,
+                "RoboPlan candidate client already has an active request",
+                "native_planner_concurrent_request_rejected"));
+    }
+    struct ActiveGuard final {
+      std::atomic<std::shared_ptr<ActiveRequest>> &slot;
+      std::shared_ptr<ActiveRequest> value;
+      ~ActiveGuard() {
+        value->process.store(nullptr, std::memory_order_release);
+        auto expected = value;
+        static_cast<void>(slot.compare_exchange_strong(
+            expected, nullptr, std::memory_order_acq_rel,
+            std::memory_order_acquire));
+      }
+    } active_guard{active_request, active};
+    std::string_view diagnostic_phase = "waiting_for_client_lock";
+    std::optional<Clock::time_point> client_lock_acquired;
+    std::optional<Clock::time_point> worker_ready;
+    std::optional<Clock::time_point> send_completed;
+    std::lock_guard lock(request_mutex);
+    if (whole_preparation_budget)
+      client_lock_acquired = Clock::now();
+
+    if (config.require_retained_projection &&
+        !selection.load(std::memory_order_acquire)) {
+      return core::Result<Value>::Err(
+          error(core::ErrorCode::kInvalidStateTransition,
+                "RoboPlan worker has no selected retained projection",
+                "native_planner_projection_not_selected"));
+    }
+
+    try {
+      const auto deadline = request_deadline(
+          timeout_s,
+          whole_preparation_budget ? std::chrono::milliseconds::zero()
+                                   : config.request_transport_grace,
+          whole_preparation_budget ? std::optional{request_started}
+                                   : std::nullopt);
+      diagnostic_phase = "waiting_for_worker";
+      start_worker(active,
+                   std::min(deadline, Clock::now() + config.startup_timeout));
+      if (whole_preparation_budget) {
+        worker_ready = Clock::now();
+        check_request(active, deadline);
+      }
+      diagnostic_phase = "encoding_request";
+      const std::string payload = encode(deadline);
+      diagnostic_phase = "sending_request";
+      send_frame(worker->socket.get(), request_type, payload,
+                 config.maximum_request_bytes, active, deadline);
+      if (whole_preparation_budget)
+        send_completed = Clock::now();
+      diagnostic_phase = "awaiting_result";
+      auto response =
+          receive_frame(worker->socket.get(), config.maximum_response_bytes,
+                        active, deadline);
+      check_request(active, deadline);
+      if (response.type == MessageType::kProtocolError) {
+        static_cast<void>(
+            worker_protocol::decode_protocol_error(response.payload));
+        throw RequestFailure(RequestFailureKind::kProtocol,
+                             "worker rejected request");
+      }
+      if (response.type != response_type) {
+        throw RequestFailure(RequestFailureKind::kProtocol,
+                             "worker returned an unexpected response type");
+      }
+      try {
+        diagnostic_phase = "decoding_result";
+        auto result = decode(response.payload);
+        if (whole_preparation_budget) {
+          check_request(active, deadline);
+        }
+        return result;
+      } catch (const std::invalid_argument &) {
+        throw RequestFailure(RequestFailureKind::kProtocol,
+                             "worker response payload is malformed");
+      }
+    } catch (const RequestFailure &failure) {
+      auto diagnosed = request_failure_error(failure, ik);
+      if (whole_preparation_budget) {
+        const auto elapsed = [&](Clock::time_point stamp) {
+          return std::to_string(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  stamp - request_started)
+                  .count());
+        };
+        diagnosed.details.try_emplace("moving_worker_phase", diagnostic_phase);
+        diagnosed.details.try_emplace("moving_worker_request_elapsed_ns",
+                                      elapsed(Clock::now()));
+        if (client_lock_acquired)
+          diagnosed.details.try_emplace("moving_worker_lock_wait_ns",
+                                        elapsed(*client_lock_acquired));
+        if (worker_ready)
+          diagnosed.details.try_emplace("moving_worker_ready_after_ns",
+                                        elapsed(*worker_ready));
+        if (send_completed)
+          diagnosed.details.try_emplace("moving_worker_send_completed_after_ns",
+                                        elapsed(*send_completed));
+        diagnosed.details.try_emplace(
+            "moving_worker_pid", std::to_string(worker ? worker->pid : -1));
+      }
+      terminate_worker();
+      return core::Result<Value>::Err(std::move(diagnosed));
+    } catch (...) {
+      terminate_worker();
+      return core::Result<Value>::Err(error(
+          ik ? core::ErrorCode::kIkFailed : core::ErrorCode::kPlanningFailed,
+          "RoboPlan worker transport failed",
+          ik ? "native_ik_worker_unavailable"
+             : "native_planner_worker_unavailable"));
+    }
+  }
+
+  // base_model and its generation are guarded by request_mutex.
+  RoboPlanWorkerModelDTO base_model;
+  std::uint64_t base_model_generation{0U};
+  RoboPlanWorkerModelDTO model;
+  RoboPlanCandidateBindingDTO binding;
+  RoboPlanCandidateComputerConfig candidate_config;
+  ProcessContainedCandidateClientConfig config;
+  std::mutex request_mutex;
+  std::optional<WorkerProcess> worker;
+  std::atomic<std::shared_ptr<const ProjectionSelection>> selection;
+  std::atomic<std::shared_ptr<ActiveRequest>> active_request;
+};
+
+ProcessContainedRoboPlanCandidateClient::
+    ProcessContainedRoboPlanCandidateClient(
+        RoboPlanWorkerModelDTO model, RoboPlanCandidateBindingDTO binding,
+        RoboPlanCandidateComputerConfig candidate_config,
+        ProcessContainedCandidateClientConfig config)
+    : impl_(std::make_unique<Impl>(std::move(model), std::move(binding),
+                                   std::move(candidate_config),
+                                   std::move(config))) {}
+
+ProcessContainedRoboPlanCandidateClient::
+    ~ProcessContainedRoboPlanCandidateClient() = default;
+
+const RoboPlanCandidateBindingDTO &
+ProcessContainedRoboPlanCandidateClient::binding() const noexcept {
+  return impl_->binding;
+}
+
+core::Result<core::TrajectoryDTO>
+ProcessContainedRoboPlanCandidateClient::compute(
+    const RoboPlanCandidateRequestDTO &selected_request) {
+  // The selected projection's clearance margins and contact-policy pairs
+  // travel with this plan.
+  auto request = selected_request;
+  if (const auto selected = impl_->selection.load(std::memory_order_acquire)) {
+    request.collision_pair_margins = selected->pair_margins;
+    request.contact_allowed_pairs = selected->contact_pairs;
+  }
+  return impl_->transact<core::TrajectoryDTO>(
+      MessageType::kPlan, MessageType::kPlanResult,
+      request.moving_replacement
+          ? request.moving_replacement->remaining_preparation_budget_s
+          : request.planning_timeout_s,
+      false,
+      [&request](Clock::time_point deadline) {
+        if (!request.moving_replacement) {
+          return worker_protocol::encode_candidate_request(request);
+        }
+        auto remaining = request;
+        const auto now = Clock::now();
+        remaining.moving_replacement->remaining_preparation_budget_s =
+            std::chrono::duration<double>(deadline - now).count();
+        std::optional<std::int64_t> planning_deadline_ns;
+        if (const auto planning = request.moving_replacement->remaining_planning_budget_s) {
+          if (!std::isfinite(*planning) || *planning <= 0.0 ||
+              *planning > std::chrono::duration<double>(std::chrono::hours(24)).count())
+            throw RequestFailure(RequestFailureKind::kProtocol,
+                                 "moving planning budget is invalid");
+          // The worker shares this host's steady clock. Carry the absolute cap
+          // so socket transfer and decoding cannot restart its planning budget.
+          const auto planning_deadline = deadline -
+              std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(
+                  std::max(0.0, request.moving_replacement->remaining_preparation_budget_s -
+                                    *planning)));
+          const double available =
+              std::chrono::duration<double>(planning_deadline - now).count();
+          if (available <= 0.0)
+            throw RequestFailure(RequestFailureKind::kTimeout,
+                                 "moving planning budget expired before dispatch");
+          remaining.moving_replacement->remaining_planning_budget_s = available;
+          planning_deadline_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     planning_deadline.time_since_epoch()).count();
+        }
+        return worker_protocol::encode_candidate_request(remaining, planning_deadline_ns);
+      },
+      [](std::string_view bytes) {
+        return worker_protocol::decode_trajectory_result(bytes);
+      },
+      request.moving_replacement.has_value());
+}
+
+core::Result<std::vector<double>>
+ProcessContainedRoboPlanCandidateClient::solve_ik(
+    const core::Pose3DTO &goal, const core::ResolvedFrameDTO &base_frame,
+    const core::ResolvedFrameDTO &tcp_frame,
+    const core::ControlledStateDTO &seed_state, double timeout_s) {
+  // The selected contact policy's pairs travel with this solve.
+  std::vector<std::pair<std::string, std::string>> contact_pairs;
+  if (const auto selected = impl_->selection.load(std::memory_order_acquire)) {
+    contact_pairs = selected->contact_pairs;
+  }
+  return impl_->transact<std::vector<double>>(
+      MessageType::kIk, MessageType::kIkResult, timeout_s, true,
+      [&goal, &base_frame, &tcp_frame, &seed_state, timeout_s,
+       &contact_pairs](Clock::time_point) {
+        return worker_protocol::encode_ik_request(
+            worker_protocol::WorkerIkRequestDTO{goal, base_frame, tcp_frame,
+                                                seed_state, timeout_s,
+                                                contact_pairs});
+      },
+      [](std::string_view bytes) {
+        return worker_protocol::decode_ik_result(bytes);
+      });
+}
+
+bool ProcessContainedRoboPlanCandidateClient::requires_retained_projection()
+    const noexcept {
+  return impl_->config.require_retained_projection;
+}
+
+core::Result<void>
+ProcessContainedRoboPlanCandidateClient::select_retained_projection(
+    const RoboPlanCandidateProjectionDTO &projection) {
+  return impl_->select_projection(projection);
+}
+
+core::Result<void>
+ProcessContainedRoboPlanCandidateClient::replace_retained_model(
+    const RoboPlanWorkerModelDTO &model) {
+  return impl_->replace_model(model);
+}
+
+core::Result<void>
+ProcessContainedRoboPlanCandidateClient::replace_retained_settings(
+    const RoboPlanCandidateComputerConfig &settings) {
+  return impl_->replace_settings(settings);
+}
+
+void ProcessContainedRoboPlanCandidateClient::request_cancel() noexcept {
+  auto request = impl_->active_request.load(std::memory_order_acquire);
+  if (!request) {
+    return;
+  }
+  request->cancelled.store(true, std::memory_order_release);
+  if (auto process = request->process.load(std::memory_order_acquire)) {
+    process->kill();
+  }
+}
+
+} // namespace manyforge::roboplan_backend

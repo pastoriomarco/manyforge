@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<robot name="composable_arm">
+  <group name="arm">
+    <chain base_link="arm_base" tip_link="tool_mount"/>
+  </group>
+</robot>

@@ -1,0 +1,13 @@
+#pragma once
+
+#include <string_view>
+
+namespace manyforge::deployment::detail {
+
+inline constexpr char @MANYFORGE_EMBEDDED_SCHEMA_SYMBOL@Data[] =
+    R"@MANYFORGE_EMBEDDED_SCHEMA_DELIMITER@(@MANYFORGE_EMBEDDED_SCHEMA_YAML@)@MANYFORGE_EMBEDDED_SCHEMA_DELIMITER@";
+inline constexpr std::string_view @MANYFORGE_EMBEDDED_SCHEMA_SYMBOL@{
+    @MANYFORGE_EMBEDDED_SCHEMA_SYMBOL@Data,
+    sizeof(@MANYFORGE_EMBEDDED_SCHEMA_SYMBOL@Data) - 1U};
+
+}  // namespace manyforge::deployment::detail

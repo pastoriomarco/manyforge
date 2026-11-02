@@ -3,12 +3,12 @@
 # Source this file in every shell that launches a ROS 2 participant for the
 # Isaac Lite6 trocar FoundationPose workflow:
 #
-#   source /home/tndlux/workspaces/dev_ws/src/manyforge/config/ros/isaac_lite6_trocar_foundationpose.env.sh
+#   source "${MANYFORGE_ROOT}/config/ros/isaac_lite6_trocar_foundationpose.env.sh"
 #
 # Contexts:
 # - Isaac Sim laptop shell before ./isaac-sim.sh
 # - Isaac ROS 4.4 perception container on Thor/Jetson
-# - ManyForge launcher shell before scripts/launch.sh
+# - ManyForge shell before ./scripts/compose-dev.sh start
 #
 # Override the host IPs before sourcing when the topology changes:
 #

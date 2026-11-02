@@ -1,0 +1,1128 @@
+"""Fixed presentation reduction over identified runtime-owner projections.
+
+The Overview deliberately owns no health or execution state.  It copies the
+current projections, verifies their shared retained coordinates, and reduces
+them into the small operator vocabulary used by Composer and later Component
+Manager clients.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
+import hashlib
+from typing import Any
+
+import rfc8785
+
+from .component_model import ComponentModel, owner_ids
+
+
+COMPONENT_OVERVIEW_VERSION = "manyforge.component_overview.v2"
+
+_HEALTHY = "healthy"
+_WAITING = "waiting"
+_WARNING = "warning"
+_FAULT = "fault"
+_OFFLINE = "offline"
+_NOT_APPLICABLE = "not_applicable"
+
+_ADMITTED_MANAGER_APPLY_PHASES = {
+    "fence_held",
+    "runtime_convergence_pending",
+    "runtime_staged_ready",
+    "scene_stage_pending",
+    "scene_staged",
+    "activation_selected",
+    "scene_activated",
+    "private_materialized",
+    "command_surfaces_retired",
+    "active_bundle_published",
+    "scene_finalized",
+    "fence_release_pending",
+}
+
+
+def _affected_runtime_unit_ids(
+    operation: Mapping[str, Any], active_graph: Mapping[str, Any]
+) -> list[str]:
+    """Map the durable fence component scope through the active graph.
+
+    An incomplete intent alone is not maintenance.  Only the accepted fence
+    scope proves which active runtime units Manager is authorized to remove.
+    """
+    fence = _mapping(operation.get("fence"))
+    scope = _mapping(fence.get("scope"))
+    component_ids = {
+        value
+        for value in _sequence(scope.get("controllable_component_ids"))
+        if isinstance(value, str) and value
+    }
+    affected: set[str] = set()
+    for component in _sequence(active_graph.get("controllable_components")):
+        if not isinstance(component, Mapping):
+            continue
+        if component.get("controllable_component_id") not in component_ids:
+            continue
+        affected.update(
+            value
+            for value in _sequence(component.get("runtime_unit_ids"))
+            if isinstance(value, str) and value
+        )
+    return sorted(affected)
+
+
+@dataclass(frozen=True, slots=True)
+class ComponentOverviewFacts:
+    """One immutable capture of every owner fact used by the reducer."""
+
+    runtime: Mapping[str, Any] | None
+    alarms: Mapping[str, Any] | None
+    authoring_admission: Mapping[str, Any] | None
+    program_cycle: Mapping[str, Any] | None
+    applied_program: Mapping[str, Any] | None
+    source_model: Mapping[str, Any] | None
+    execution_identity_response: Mapping[str, Any] | None
+    execution_targets_response: Mapping[str, Any] | None
+    execution_control_response: Mapping[str, Any] | None
+    # Component model v2: the host's published component model (or None).
+    component_model: ComponentModel | None
+    errors: Mapping[str, Mapping[str, Any]]
+    # Read for Execute readiness (§10) only; the Overview doesn't use it.
+    applied_program_status: Mapping[str, Any] | None = None
+
+    def reduce(self) -> dict[str, Any]:
+        return build_component_overview(
+            **{
+                field.name: getattr(self, field.name)
+                for field in fields(self)
+                if field.name != "applied_program_status"
+            }
+        )
+
+
+def _mapping(value: object) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _sequence(value: object) -> list[Any]:
+    return list(value) if isinstance(value, (list, tuple)) else []
+
+
+def _bounded_reason(value: object, fallback: str) -> str:
+    if isinstance(value, str) and value:
+        return value[:256]
+    return fallback
+
+
+def _source_status(source: Mapping[str, Any]) -> tuple[str, str | None]:
+    if source.get("available") is not True:
+        return _OFFLINE, "source_unavailable"
+    freshness = source.get("freshness")
+    if freshness == "stale":
+        return _WAITING, "source_stale"
+    if freshness != "fresh":
+        return _OFFLINE, "source_freshness_unknown"
+    gaps = _sequence(source.get("known_gaps"))
+    if gaps:
+        return _WARNING, _bounded_reason(gaps[0], "source_gap")
+    return _HEALTHY, None
+
+
+def _error_status(error: Mapping[str, Any]) -> str:
+    code = str(error.get("code", ""))
+    if any(token in code for token in ("unavailable", "not_found", "not_configured")):
+        return _OFFLINE
+    return _FAULT
+
+
+def _component(
+    tile_id: str,
+    label: str,
+    status: str,
+    detail: str,
+    *,
+    required: bool,
+    required_for: tuple[str, ...],
+    owner_id: object = None,
+    owner_epoch: object = None,
+    generation: object = None,
+    reason_code: object = None,
+    scope: str,
+    contributor_ids: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    return {
+        "id": tile_id,
+        "label": label,
+        "status": status,
+        "detail": detail,
+        "required": required,
+        "required_for": list(required_for),
+        "owner_id": owner_id if isinstance(owner_id, str) and owner_id else None,
+        "owner_epoch": (
+            owner_epoch if isinstance(owner_epoch, str) and owner_epoch else None
+        ),
+        "generation": (
+            generation
+            if isinstance(generation, int)
+            and not isinstance(generation, bool)
+            and generation >= 0
+            else None
+        ),
+        "reason_code": (
+            reason_code if isinstance(reason_code, str) and reason_code else None
+        ),
+        "scope": scope,
+        "contributor_ids": list(contributor_ids),
+    }
+
+
+_LIFECYCLE_STATUS = {
+    "enabled": _HEALTHY,
+    "prepared": _WAITING,
+    "not_prepared": _WAITING,
+    "fault": _FAULT,
+    "offline": _OFFLINE,
+}
+
+
+def _component_state_tiles(
+    components: list[dict[str, Any]],
+    model: ComponentModel | None,
+    errors: Mapping[str, Mapping[str, Any]],
+) -> tuple[str, ...]:
+    """Append `component:<id>` tiles (or one `components` tile when the
+    model can't be read) and return their ids."""
+
+    if model is None:
+        error = _fact_error(errors, "component_model")
+        components.append(
+            _component(
+                "components",
+                "Components",
+                _OFFLINE,
+                "component states are unavailable",
+                required=True,
+                required_for=("Execute / Control",),
+                reason_code=_bounded_reason(
+                    error.get("code"), "component_model_unavailable"
+                ),
+                scope="component",
+            )
+        )
+        return ("components",)
+    tile_ids: list[str] = []
+    owners = owner_ids(model.component_states)
+    for state in model.component_states:
+        lifecycle = state["lifecycle"]
+        if lifecycle == "fault":
+            reason = state.get("fault", {}).get("code")
+            detail = state.get("fault", {}).get("message", "fault")
+        else:
+            reason = state.get("reason", {}).get("code")
+            detail = state.get("reason", {}).get("message", lifecycle.replace("_", " "))
+        tile_id = f"component:{state['component_id']}"
+        components.append(
+            _component(
+                tile_id,
+                state["component_id"],
+                # An owner has no Enable: `prepared` is its usable state (§16).
+                _HEALTHY
+                if lifecycle == "prepared" and state["component_id"] in owners
+                else _LIFECYCLE_STATUS[lifecycle],
+                detail,
+                required=True,
+                required_for=("Execute / Control",),
+                owner_id=state["component_id"],
+                reason_code=reason,
+                scope="component",
+            )
+        )
+        tile_ids.append(tile_id)
+    return tuple(tile_ids)
+
+
+def _response_payload(
+    response: Mapping[str, Any],
+    field: str,
+) -> tuple[Mapping[str, Any], Mapping[str, Any] | None]:
+    if response.get("ok") is not True:
+        error = _mapping(response.get("error"))
+        return {}, {
+            "code": _bounded_reason(error.get("code"), "owner_response_rejected"),
+            "message": _bounded_reason(
+                error.get("message"), "owner rejected the focused projection"
+            ),
+        }
+    payload = response.get(field)
+    if not isinstance(payload, Mapping):
+        return {}, {
+            "code": "owner_projection_invalid",
+            "message": f"focused owner response has no {field} projection",
+        }
+    return payload, None
+
+
+def _fact_error(
+    errors: Mapping[str, Mapping[str, Any]],
+    fact: str,
+) -> Mapping[str, Any]:
+    return _mapping(errors.get(fact))
+
+
+def _scope_status(
+    components_by_id: Mapping[str, Mapping[str, Any]],
+    contributors: tuple[str, ...],
+) -> str:
+    statuses = [
+        str(components_by_id[tile_id]["status"])
+        for tile_id in contributors
+        if tile_id in components_by_id
+    ]
+    if not statuses:
+        return _OFFLINE
+    for candidate in (_FAULT, _OFFLINE, _WAITING, _WARNING):
+        if candidate in statuses:
+            return candidate
+    return _HEALTHY
+
+
+def _current_empty_physical_graph(
+    runtime: Mapping[str, Any],
+    manager_source: Mapping[str, Any],
+    manager: Mapping[str, Any],
+) -> bool:
+    """Recognize a current zero-physical graph, not its Scenario/Close origin."""
+
+    active = _mapping(manager.get("active"))
+    graph = _mapping(active.get("cell_graph"))
+    publication = _mapping(active.get("publication"))
+    projection = _mapping(publication.get("projection_revision"))
+    generation = manager_source.get("source_generation")
+    publication_generation = publication.get("publication_generation")
+    apply_records = _mapping(manager.get("apply")).get("records")
+    return (
+        runtime.get("complete") is True
+        and manager_source.get("available") is True
+        and manager_source.get("freshness") == "fresh"
+        and manager_source.get("known_gaps") == []
+        and all(
+            isinstance(manager_source.get(field), str) and manager_source[field]
+            for field in ("source_owner_id", "source_owner_epoch")
+        )
+        and type(generation) is int
+        and generation > 0
+        and manager.get("manager_ready") is True
+        and _mapping(manager.get("runtime")).get("converged") is True
+        and isinstance(apply_records, list)
+        and all(
+            isinstance(row, Mapping) and row.get("incomplete") is False
+            for row in apply_records
+        )
+        and type(active.get("canonical_empty")) is bool
+        and all(
+            graph.get(field) == []
+            for field in (
+                "model_instances", "controllable_components", "control_bindings",
+                "control_domains",
+            )
+        )
+        and isinstance(manager.get("cell_id"), str)
+        and bool(manager["cell_id"])
+        and graph.get("cell_id") == manager["cell_id"]
+        and type(publication_generation) is int
+        and publication_generation > 0
+        and all(
+            isinstance(active.get(field), str)
+            and bool(active[field])
+            and active[field] == runtime.get(runtime_field) == projection.get(field)
+            for field, runtime_field in (
+                ("graph_revision", "active_graph_revision"),
+                ("retained_bundle_id", "active_retained_bundle_id"),
+            )
+        )
+        and graph.get("graph_revision") == active.get("graph_revision")
+    )
+
+
+def build_component_overview(
+    *,
+    runtime: Mapping[str, Any] | None,
+    alarms: Mapping[str, Any] | None,
+    authoring_admission: Mapping[str, Any] | None,
+    program_cycle: Mapping[str, Any] | None,
+    applied_program: Mapping[str, Any] | None,
+    source_model: Mapping[str, Any] | None,
+    execution_identity_response: Mapping[str, Any] | None,
+    execution_targets_response: Mapping[str, Any] | None,
+    execution_control_response: Mapping[str, Any] | None,
+    component_model: ComponentModel | None = None,
+    errors: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build one bounded, read-only Component Overview projection.
+
+    Inputs remain the authoritative owner snapshots.  This function performs
+    only schema-safe selection, exact coordinate comparison, and a fixed
+    presentation reduction; it never fills in a missing capability.
+    """
+
+    errors = errors or {}
+    runtime = _mapping(runtime)
+    alarms = _mapping(alarms)
+    authoring_admission = _mapping(authoring_admission)
+    program_cycle = _mapping(program_cycle)
+    applied_program = _mapping(applied_program)
+    source_model = _mapping(source_model)
+    execution_identity_response = _mapping(execution_identity_response)
+    execution_targets_response = _mapping(execution_targets_response)
+    execution_control_response = _mapping(execution_control_response)
+
+    components: list[dict[str, Any]] = []
+    sections = _mapping(runtime.get("sections"))
+    manager_section = _mapping(sections.get("manager"))
+    manager_source_status, manager_source_reason = _source_status(manager_section)
+    manager_payload = _mapping(manager_section.get("payload"))
+    manager_runtime = _mapping(manager_payload.get("runtime"))
+    manager_apply = _mapping(manager_payload.get("apply"))
+    active = _mapping(manager_payload.get("active"))
+    active_graph = _mapping(active.get("cell_graph"))
+    pending_maintenance = [
+        _mapping(record)
+        for record in _sequence(manager_apply.get("records"))
+        if isinstance(record, Mapping) and record.get("incomplete") is True
+    ]
+    maintenance_operation: dict[str, Any] | None = None
+    if len(pending_maintenance) == 1:
+        operation = pending_maintenance[0]
+        apply_id = operation.get("apply_id")
+        apply_generation = operation.get("apply_generation")
+        phase = operation.get("phase")
+        if (
+            isinstance(apply_id, str)
+            and bool(apply_id)
+            and isinstance(apply_generation, int)
+            and not isinstance(apply_generation, bool)
+            and apply_generation >= 1
+            and phase in _ADMITTED_MANAGER_APPLY_PHASES
+        ):
+            affected_runtime_unit_ids = _affected_runtime_unit_ids(
+                operation, active_graph
+            )
+            desired_runtime_unit_ids = sorted(
+                row.get("runtime_unit_id")
+                for row in _sequence(manager_runtime.get("desired_units"))
+                if isinstance(row, Mapping)
+                and isinstance(row.get("runtime_unit_id"), str)
+                and row.get("runtime_unit_id")
+            )
+            # Current planned maintenance tears down the complete active
+            # runtime. Do not suppress health unless the durable admitted
+            # scope proves that it covers every required desired unit.
+            if (
+                not desired_runtime_unit_ids
+                or affected_runtime_unit_ids != desired_runtime_unit_ids
+            ):
+                affected_runtime_unit_ids = []
+            else:
+                maintenance_operation = {
+                    "apply_id": apply_id,
+                    "apply_generation": apply_generation,
+                    "phase": phase,
+                    "affected_runtime_unit_ids": affected_runtime_unit_ids,
+                    "reason_code": "planned_maintenance_in_progress",
+                }
+    active_graph_revision = active.get("graph_revision")
+    active_bundle_id = active.get("retained_bundle_id")
+    manager_status = manager_source_status
+    manager_reason = manager_source_reason
+    if _fact_error(errors, "runtime"):
+        manager_status = _error_status(_fact_error(errors, "runtime"))
+        manager_reason = _bounded_reason(
+            _fact_error(errors, "runtime").get("code"), "runtime_projection_unavailable"
+        )
+    elif (
+        manager_status == _HEALTHY
+        and maintenance_operation is not None
+        and manager_payload.get("manager_ready") is not True
+    ):
+        manager_status = _WAITING
+        manager_reason = "planned_maintenance_in_progress"
+    elif manager_status == _HEALTHY and manager_payload.get("manager_ready") is not True:
+        manager_status = _WAITING
+        manager_reason = "manager_not_ready"
+    elif manager_status == _HEALTHY and manager_runtime.get("converged") is not True:
+        manager_status = _WAITING
+        manager_reason = "manager_runtime_converging"
+    components.append(
+        _component(
+            "manager",
+            "Manager",
+            manager_status,
+            (
+                "active graph and required runtime units are converged"
+                if manager_status == _HEALTHY
+                else "Manager graph or runtime convergence is not current"
+            ),
+            required=True,
+            required_for=("Observe / Render", "Plan / Preview", "Execute / Control"),
+            owner_id=manager_section.get("source_owner_id"),
+            owner_epoch=manager_section.get("source_owner_epoch"),
+            generation=_mapping(active.get("publication")).get(
+                "publication_generation"
+            ),
+            reason_code=manager_reason,
+            scope="composition",
+        )
+    )
+
+    runtime_profiles: list[str] = []
+    for desired in _sequence(manager_runtime.get("desired_units")):
+        profile = _mapping(desired).get("runtime_profile_id")
+        if isinstance(profile, str) and profile and profile not in runtime_profiles:
+            runtime_profiles.append(profile)
+
+    # Component model v2 (R4): one tile per component, taken from its
+    # ComponentState as the execution host publishes it; nothing re-derived.
+    component_tile_ids = _component_state_tiles(components, component_model, errors)
+
+    applied_error = _fact_error(errors, "applied_program")
+    applied_source = _mapping(applied_program.get("source"))
+    applied_status = _HEALTHY
+    applied_reason: str | None = None
+    applied_detail: str | None = None
+    if applied_error.get("code") == "program_not_selected":
+        # An Applied `no_program` outcome is a normal state: Execute is
+        # unavailable, not an error (spec 450, Scenario New).
+        applied_reason = "program_not_selected"
+        applied_detail = "no Program is selected; Execute is unavailable"
+    elif applied_error:
+        applied_status = _error_status(applied_error)
+        applied_reason = _bounded_reason(
+            applied_error.get("code"), "applied_program_unavailable"
+        )
+    elif not applied_program:
+        applied_status = _OFFLINE
+        applied_reason = "applied_program_unavailable"
+    elif (
+        active_graph_revision is not None
+        and active_bundle_id is not None
+        and (
+            applied_program.get("graph_revision") != active_graph_revision
+            or applied_program.get("retained_bundle_id") != active_bundle_id
+        )
+    ):
+        applied_status = _FAULT
+        applied_reason = "applied_program_composition_mismatch"
+    components.append(
+        _component(
+            "applied_program",
+            "Applied Program and admission",
+            applied_status,
+            (
+                applied_detail
+                if applied_detail is not None
+                else f"{applied_program.get('program_id')} · {applied_program.get('scenario_id')}"
+                if applied_status == _HEALTHY
+                else "no exact Applied Program matches the active composition"
+            ),
+            required=True,
+            required_for=("Execute / Control",),
+            owner_id=applied_source.get("source_owner_id"),
+            owner_epoch=applied_source.get("source_owner_epoch"),
+            generation=applied_source.get("source_generation"),
+            reason_code=applied_reason,
+            scope="program",
+        )
+    )
+
+    admission_error = _fact_error(errors, "authoring_admission")
+    admission_status = _HEALTHY if authoring_admission else _error_status(admission_error)
+    components.append(
+        _component(
+            "authoring_admission",
+            "Authoring admission",
+            admission_status,
+            (
+                "authoring is currently available"
+                if authoring_admission.get("authoring_allowed") is True
+                else "authoring is currently locked by an owner-issued claim"
+            ),
+            required=False,
+            required_for=("Program and Deployment editing",),
+            generation=authoring_admission.get("admission_generation"),
+            reason_code=(
+                None
+                if authoring_admission
+                else _bounded_reason(admission_error.get("code"), "admission_unavailable")
+            ),
+            scope="authoring",
+        )
+    )
+
+    for section_id, label in (
+        ("logical_scene", "Logical scene"),
+        ("scene_runtime", "Scene runtime"),
+    ):
+        section = _mapping(sections.get(section_id))
+        status, reason = _source_status(section)
+        components.append(
+            _component(
+                section_id,
+                label,
+                status,
+                (
+                    "owner projection is current"
+                    if status == _HEALTHY
+                    else "owner projection is missing, stale, or degraded"
+                ),
+                required=True,
+                required_for=("Observe / Render", "Plan / Preview"),
+                owner_id=section.get("source_owner_id"),
+                owner_epoch=section.get("source_owner_epoch"),
+                # Scene-runtime generation advances for pose samples. The
+                # exact value remains in basis, not operator-visible health.
+                generation=(
+                    None
+                    if section_id == "scene_runtime"
+                    else section.get("source_generation")
+                ),
+                reason_code=reason,
+                scope="scene",
+            )
+        )
+
+    source_model_error = _fact_error(errors, "source_model")
+    source_model_source = _mapping(source_model.get("source"))
+    viewer_status, viewer_reason = _source_status(source_model_source)
+    if source_model_error:
+        viewer_status = _error_status(source_model_error)
+        viewer_reason = _bounded_reason(
+            source_model_error.get("code"), "source_model_unavailable"
+        )
+    elif source_model and (
+        active_graph_revision is not None
+        and active_bundle_id is not None
+        and (
+            source_model.get("graph_revision") != active_graph_revision
+            or source_model.get("retained_bundle_id") != active_bundle_id
+        )
+    ):
+        viewer_status = _FAULT
+        viewer_reason = "source_model_composition_mismatch"
+    components.append(
+        _component(
+            "viewer_model",
+            "Viewer and model",
+            viewer_status,
+            (
+                "current retained source model is available"
+                if viewer_status == _HEALTHY
+                else "current retained source model is unavailable or mismatched"
+            ),
+            required=True,
+            required_for=("Observe / Render", "Plan / Preview"),
+            owner_id=source_model_source.get("source_owner_id"),
+            owner_epoch=source_model_source.get("source_owner_epoch"),
+            generation=source_model_source.get("source_generation"),
+            reason_code=viewer_reason,
+            scope="model",
+        )
+    )
+
+    identity, identity_response_error = _response_payload(
+        execution_identity_response, "identity"
+    )
+    identity_error = _fact_error(errors, "execution_identity") or _mapping(
+        identity_response_error
+    )
+    execution_status = _HEALTHY
+    execution_reason: str | None = None
+    if identity_error:
+        execution_status = _error_status(identity_error)
+        execution_reason = _bounded_reason(
+            identity_error.get("code"), "execution_owner_unavailable"
+        )
+    elif not identity:
+        execution_status = _OFFLINE
+        execution_reason = "execution_owner_unavailable"
+    elif (
+        active_graph_revision is not None
+        and active_bundle_id is not None
+        and (
+            identity.get("graph_revision") != active_graph_revision
+            or identity.get("retained_bundle_id") != active_bundle_id
+        )
+    ):
+        execution_status = _FAULT
+        execution_reason = "execution_owner_composition_mismatch"
+    components.append(
+        _component(
+            "execution_owner",
+            "Execution owner",
+            execution_status,
+            (
+                f"addressed owner for {identity.get('cell_id')} is current"
+                if execution_status == _HEALTHY
+                else "addressed execution owner is unavailable or mismatched"
+            ),
+            required=True,
+            required_for=("Plan / Preview", "Execute / Control"),
+            owner_epoch=identity.get("owner_epoch"),
+            generation=identity.get("active_publication_generation"),
+            reason_code=execution_reason,
+            scope="execution",
+        )
+    )
+
+    targets, targets_response_error = _response_payload(
+        execution_targets_response, "targets"
+    )
+    targets_error = _fact_error(errors, "execution_targets") or _mapping(
+        targets_response_error
+    )
+    # execution_targets.v3 (H1a-IF.2): component-owned targets, no primary.
+    commandable_rows = [
+        (_mapping(component), _mapping(target))
+        for component in _sequence(targets.get("components"))
+        if isinstance(component, Mapping)
+        for target in _sequence(_mapping(component).get("targets"))
+        if isinstance(target, Mapping) and _mapping(target).get("command") is not None
+    ]
+    planning_capabilities = {
+        value
+        for _component_row, target in commandable_rows
+        if target.get("presentation") == "motion"
+        for value in _sequence(
+            _mapping(target.get("command")).get("planning_capability_ids")
+        )
+        if isinstance(value, str)
+    }
+    direct_control_rows = [
+        {
+            "controllable_component_id": component.get("controllable_component_id"),
+            "command_target_id": target.get("command_target_id"),
+        }
+        for component, target in commandable_rows
+    ]
+    target_status = _HEALTHY if direct_control_rows else _OFFLINE
+    target_reason: str | None = None
+    if targets_error:
+        target_status = _error_status(targets_error)
+        target_reason = _bounded_reason(
+            targets_error.get("code"), "execution_target_unavailable"
+        )
+    elif not direct_control_rows:
+        target_reason = "execution_target_unavailable"
+    components.append(
+        _component(
+            "execution_target",
+            "Execution target",
+            target_status,
+            (
+                (
+                    f"{len(direct_control_rows)} addressed targets available"
+                    if len(direct_control_rows) > 1
+                    else f"{direct_control_rows[0].get('controllable_component_id')} / "
+                    f"{direct_control_rows[0].get('command_target_id')}"
+                )
+                if target_status == _HEALTHY
+                else "no addressed target is currently offered"
+            ),
+            required=True,
+            required_for=("Plan / Preview", "Execute / Control"),
+            owner_epoch=identity.get("owner_epoch"),
+            generation=identity.get("active_publication_generation"),
+            reason_code=target_reason,
+            scope="execution",
+        )
+    )
+
+    capability_ids = {
+        row.get("capability_id")
+        for row in _sequence(active_graph.get("control_bindings"))
+        if isinstance(row, Mapping) and isinstance(row.get("capability_id"), str)
+    }
+    collision_available = any(
+        capability.startswith("execution.contact.")
+        for capability in capability_ids
+        if isinstance(capability, str)
+    )
+    planner_available = bool(planning_capabilities)
+    planner_status = (
+        _HEALTHY
+        if planner_available and collision_available and target_status == _HEALTHY
+        else _OFFLINE
+    )
+    components.append(
+        _component(
+            "planner_collision",
+            "Planner and collision",
+            planner_status,
+            (
+                "addressed planning and collision contracts are available"
+                if planner_status == _HEALTHY
+                else "planning or collision contract is unavailable"
+            ),
+            required=True,
+            required_for=("Plan / Preview",),
+            owner_epoch=identity.get("owner_epoch"),
+            generation=identity.get("active_publication_generation"),
+            reason_code=(None if planner_status == _HEALTHY else "planning_contract_unavailable"),
+            scope="planning",
+        )
+    )
+
+    control_state, control_response_error = _response_payload(
+        execution_control_response, "control_state"
+    )
+    control_error = _fact_error(errors, "execution_control") or _mapping(
+        control_response_error
+    )
+    cell_stop_action = _mapping(control_state.get("cell_stop_action"))
+    stop_offered = "execution.stop.soft" in capability_ids
+    stop_status = _HEALTHY if stop_offered and not control_error else _OFFLINE
+    stop_reason: str | None = None
+    if control_error:
+        stop_status = _error_status(control_error)
+        stop_reason = _bounded_reason(control_error.get("code"), "stop_state_unavailable")
+    elif not stop_offered:
+        stop_reason = "controlled_stop_capability_unavailable"
+    components.append(
+        _component(
+            "stop_capability",
+            "Controlled Stop",
+            stop_status,
+            (
+                "controlled-Stop contract is present"
+                if stop_status == _HEALTHY
+                else "controlled-Stop contract or current owner state is unavailable"
+            ),
+            required=True,
+            required_for=("Execute / Control",),
+            owner_epoch=identity.get("owner_epoch"),
+            generation=(
+                cell_stop_action.get("expected_stop_generation")
+                or identity.get("active_publication_generation")
+            ),
+            reason_code=stop_reason,
+            scope="stop",
+        )
+    )
+
+    cycle_error = _fact_error(errors, "program_cycle")
+    cycle_status = _HEALTHY if program_cycle else _error_status(cycle_error)
+    cycle_reason = None if program_cycle else _bounded_reason(
+        cycle_error.get("code"), "program_runner_unavailable"
+    )
+    cycle_state = program_cycle.get("state")
+    components.append(
+        _component(
+            "program_runner",
+            "Program Runner",
+            cycle_status,
+            (
+                f"cycle state {str(cycle_state).replace('_', ' ')}"
+                if cycle_status == _HEALTHY
+                else "Program cycle owner is unavailable"
+            ),
+            required=True,
+            required_for=("Execute / Control",),
+            owner_epoch=program_cycle.get("program_runner_owner_epoch"),
+            generation=program_cycle.get("cycle_generation"),
+            reason_code=cycle_reason,
+            scope="program",
+        )
+    )
+
+    alarm_error = _fact_error(errors, "alarms")
+    active_alarms = [
+        alarm
+        for alarm in _sequence(alarms.get("alarms"))
+        if isinstance(alarm, Mapping)
+        and alarm.get("lifecycle_state")
+        in {"active_unacknowledged", "active_acknowledged"}
+    ]
+    active_count = alarms.get("active_count")
+    if not isinstance(active_count, int) or isinstance(active_count, bool):
+        active_count = len(active_alarms)
+    motion_attention = alarms.get("motion_attention_count")
+    if not isinstance(motion_attention, int) or isinstance(motion_attention, bool):
+        motion_attention = sum(
+            1 for alarm in active_alarms if alarm.get("requires_motion_attention") is True
+        )
+    if alarm_error:
+        alarm_status = _error_status(alarm_error)
+        alarm_reason = _bounded_reason(alarm_error.get("code"), "alarm_owner_unavailable")
+    elif active_count > 0:
+        severe = motion_attention > 0 or any(
+            alarm.get("priority") in {"critical", "high"} for alarm in active_alarms
+        )
+        alarm_status = _FAULT if severe else _WARNING
+        alarm_reason = "active_functional_alarm"
+    else:
+        alarm_status = _HEALTHY
+        alarm_reason = None
+    components.append(
+        _component(
+            "operator_alarms",
+            "Current functional alarms",
+            alarm_status,
+            (
+                "no active functional alarm"
+                if alarm_status == _HEALTHY
+                else f"{active_count} active owner-issued condition(s)"
+            ),
+            required=True,
+            required_for=("scope named by each alarm",),
+            owner_id=alarms.get("owner_id"),
+            owner_epoch=alarms.get("owner_epoch"),
+            generation=alarms.get("generation"),
+            reason_code=alarm_reason,
+            scope="alarms",
+        )
+    )
+
+    # A verified zero-physical graph has no equipment prerequisites.
+    # Keep the ordinary reduction intact if any actual source/owner fault is
+    # present; in particular, no missing or unexpected error proves absence.
+    empty_prerequisites = {
+        "applied_program", "execution_owner", "execution_target",
+        "planner_collision", "stop_capability", "components",
+    }
+    absent_empty_owner = (
+        all(
+            error.get("code") == "execution_owner_not_ready"
+            for error in (identity_error, targets_error, control_error)
+        )
+        and not identity
+    )
+    # A warm logical Apply retains a real native owner. Its current, mutually
+    # matching empty projections prove absence of equipment just as the cold
+    # absent-owner case does; a missing or faulted projection cannot do so.
+    current_empty_owner = (
+        not identity_error and not targets_error and not control_error
+        and execution_status == _HEALTHY
+        and identity.get("cell_id") == manager_payload.get("cell_id")
+        and isinstance(identity.get("owner_epoch"), str)
+        and bool(identity["owner_epoch"])
+        and type(identity.get("active_publication_generation")) is int
+        and identity.get("active_publication_generation")
+        == _mapping(active.get("publication")).get("publication_generation")
+        and execution_targets_response.get("identity") == identity
+        and execution_control_response.get("identity") == identity
+        and targets.get("components") == []
+        and control_state.get("observed_targets") == []
+        and control_state.get("manual_operations") == []
+        and control_state.get("runtime_scale_control", False) is None
+        and cell_stop_action.get("available") is True
+    )
+    quiet_empty = (
+        _current_empty_physical_graph(runtime, manager_section, manager_payload)
+        and not applied_program
+        and applied_error.get("code") in {
+            "program_applied_selection_not_found", "program_not_selected"
+        }
+        and (absent_empty_owner or current_empty_owner)
+        and not commandable_rows
+        and not capability_ids
+        and all(
+            component["status"] == _HEALTHY
+            for component in components
+            if component["id"] not in empty_prerequisites
+        )
+    )
+    empty_reason = (
+        "canonical_empty" if _mapping(manager_payload.get("active")).get("canonical_empty") is True
+        else "no_physical_components"
+    )
+    if quiet_empty:
+        for component in components:
+            if component["id"] in empty_prerequisites:
+                component.update(
+                    required=False,
+                    status=(_NOT_APPLICABLE if component["id"] in {
+                        "execution_target", "planner_collision", "stop_capability"
+                    } else _OFFLINE),
+                    detail=("No robot in this Scenario" if component["id"] in {
+                        "execution_target", "planner_collision", "stop_capability"
+                    } else "No components"), reason_code=empty_reason,
+                )
+
+    components_by_id = {component["id"]: component for component in components}
+    scopes = (
+        (
+            "observe_render",
+            "Observe / Render",
+            ("manager", "logical_scene", "scene_runtime", "viewer_model"),
+        ),
+        (
+            "plan_preview",
+            "Plan / Preview",
+            (
+                "manager",
+                "logical_scene",
+                "viewer_model",
+                "execution_owner",
+                "execution_target",
+                "planner_collision",
+            ),
+        ),
+        (
+            "execute_control",
+            "Execute / Control",
+            (
+                "manager",
+                "applied_program",
+                "program_runner",
+                "execution_owner",
+                "execution_target",
+                "stop_capability",
+                *component_tile_ids,
+            ),
+        ),
+    )
+    scope_components: list[dict[str, Any]] = []
+    for tile_id, label, contributors in scopes:
+        empty_scope = quiet_empty and tile_id in {"plan_preview", "execute_control"}
+        status = (
+            _NOT_APPLICABLE if empty_scope and tile_id == "execute_control"
+            else _OFFLINE if empty_scope
+            else _scope_status(components_by_id, contributors)
+        )
+        scope_components.append(
+            _component(
+                tile_id,
+                label,
+                status,
+                (
+                    "No robot in this Scenario"
+                    if empty_scope and tile_id == "execute_control"
+                    else "No components"
+                    if empty_scope
+                    else f"{label} prerequisites are current"
+                    if status == _HEALTHY
+                    else f"one or more {label} prerequisites are not current"
+                ),
+                required=not empty_scope,
+                required_for=(label,),
+                reason_code=(
+                    empty_reason if empty_scope else
+                    None if status == _HEALTHY else f"{tile_id}_unavailable"
+                ),
+                scope="functional_scope",
+                contributor_ids=contributors,
+            )
+        )
+
+    if quiet_empty:
+        components_by_id["viewer_model"].update(
+            required=False, status=_NOT_APPLICABLE,
+            detail="No robot in this Scenario", reason_code=empty_reason,
+        )
+
+    functional_statuses = [
+        component["status"] for component in scope_components if component["required"]
+    ]
+    if alarm_status == _FAULT or _FAULT in functional_statuses:
+        readiness = "fault"
+    elif all(status == _OFFLINE for status in functional_statuses):
+        readiness = "offline"
+    elif _WAITING in functional_statuses:
+        readiness = "waiting"
+    elif _OFFLINE in functional_statuses or _WARNING in functional_statuses:
+        readiness = "degraded"
+    else:
+        readiness = "ready"
+
+    labels = {
+        "ready": "Application surfaces ready",
+        "waiting": "Runtime convergence in progress",
+        "degraded": "Some functional scopes unavailable",
+        "fault": "Functional intervention required",
+        "offline": "Required runtime is off",
+    }
+    messages = {
+        "ready": "Observe, plan, and execute scopes are current for the active composition.",
+        "waiting": "Required owners are converging automatically; no operator retry is required.",
+        "degraded": "A named scope is unavailable while the remaining healthy scopes stay usable.",
+        "fault": "An owner-issued fault or exact-coordinate mismatch affects a required scope.",
+        "offline": "No complete current projection exists for the required runtime scopes.",
+    }
+    if quiet_empty:
+        labels["ready"] = "No components"
+        messages["ready"] = "No components are loaded. The empty workspace is ready for authoring."
+    if maintenance_operation is not None and readiness == "waiting":
+        labels["waiting"] = "Deployment maintenance in progress"
+        messages["waiting"] = (
+            "Controls remain disabled while Manager applies the admitted "
+            "Deployment transition."
+        )
+    profile_label = ", ".join(runtime_profiles)
+    if not profile_label:
+        profile_label = str(active_graph.get("cell_id") or manager_payload.get("cell_id") or "No active profile")
+
+    overview = {
+        "schema_version": COMPONENT_OVERVIEW_VERSION,
+        "readiness": readiness,
+        "summary_label": labels[readiness],
+        "profile_label": profile_label,
+        "authority_label": "owner-issued scoped facts",
+        "user_message": messages[readiness],
+        "capabilities": [label for _tile_id, label, _contributors in scopes],
+        "components": [*scope_components, *components],
+        "maintenance_operation": maintenance_operation,
+        "basis": {
+            "runtime_projection_owner_epoch": runtime.get("projection_owner_epoch"),
+            "runtime_projection_generation": runtime.get("projection_generation"),
+            "manager_source_owner_epoch": manager_section.get("source_owner_epoch"),
+            "logical_scene_source_owner_epoch": _mapping(
+                sections.get("logical_scene")
+            ).get("source_owner_epoch"),
+            "logical_scene_source_generation": _mapping(
+                sections.get("logical_scene")
+            ).get("source_generation"),
+            "scene_runtime_source_owner_epoch": _mapping(
+                sections.get("scene_runtime")
+            ).get("source_owner_epoch"),
+            "scene_runtime_source_generation": _mapping(
+                sections.get("scene_runtime")
+            ).get("source_generation"),
+            "alarm_owner_epoch": alarms.get("owner_epoch"),
+            "alarm_generation": alarms.get("generation"),
+            "alarm_state_revision": alarms.get("state_revision"),
+            "admission_generation": authoring_admission.get("admission_generation"),
+            "program_runner_owner_epoch": program_cycle.get("program_runner_owner_epoch"),
+            "program_cycle_generation": program_cycle.get("cycle_generation"),
+            "applied_program_owner_epoch": applied_source.get("source_owner_epoch"),
+            "applied_program_generation": applied_source.get("source_generation"),
+            "execution_owner_epoch": identity.get("owner_epoch"),
+            "execution_publication_generation": identity.get("active_publication_generation"),
+        },
+    }
+    # The revision identifies operator-visible meaning, not receiver
+    # bookkeeping.  Keep the latter in ``basis`` for diagnostics without
+    # making an otherwise identical Overview look new on every source pulse.
+    revision_value = {
+        **overview,
+        "basis": {
+            key: value
+            for key, value in overview["basis"].items()
+            if key
+            not in {
+                "runtime_projection_generation",
+                "alarm_state_revision",
+                "scene_runtime_source_generation",
+            }
+        },
+    }
+    overview["overview_revision"] = "sha256:" + hashlib.sha256(
+        rfc8785.dumps(revision_value)
+    ).hexdigest()
+    return overview
+
+
+__all__ = [
+    "COMPONENT_OVERVIEW_VERSION",
+    "ComponentOverviewFacts",
+    "build_component_overview",
+]

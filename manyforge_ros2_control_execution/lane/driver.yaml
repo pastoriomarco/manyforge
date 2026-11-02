@@ -1,0 +1,11 @@
+# Mock lane driver (CONTRACTS §12): no vendor driver. The hardware is stock
+# ros2_control mock hardware, installed with ros2_control in every image
+# (the pinned controller overlay of Dockerfile.ros-lyrical-full).
+source:
+  repository: https://github.com/ros-controls/ros2_control
+  package: mock_components
+hardware_plugin: mock_components/GenericSystem
+# No base config files of its own: a vendor's model runs that vendor's
+# controllers (`lanes.mock.vendor`), any other model its own file
+# (`lanes.mock.controllers_file`).
+base_files: []

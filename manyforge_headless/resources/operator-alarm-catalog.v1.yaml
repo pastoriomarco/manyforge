@@ -1,0 +1,377 @@
+schema_version: manyforge.operator_alarm_catalog.v1
+catalog_version: 2.9.0
+descriptor_digest: sha256:366e2643d348456d350b638b9b2c2ab22828f2475e05f26b6d9f6b1941623413
+definitions:
+  - definition_id: manyforge.motion.runtime_collision
+    version: 2
+    title: Runtime collision stop
+    message_template: "Collision stop on {subject_id}"
+    alarm_class: motion
+    priority: critical
+    priority_rationale: >-
+      A collision-triggered motion stop requires immediate awareness before
+      recovery; priority does not imply a safety-rated annunciator.
+    consequence: >-
+      Motion remains stopped and attempting recovery without inspecting the
+      contact can repeat or worsen the collision episode. Acknowledgement
+      never gates motion.
+    operator_response: >-
+      Inspect the normalized contact pair and recovery offer, remove or repair
+      the cause, then use the permitted recovery action. Acknowledge the alarm
+      to move it to History.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.kernel.runtime_collision_condition
+    clear_authority: manyforge.kernel.runtime_collision_condition
+    adapter_id: manyforge.alarm_adapter.kernel_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 32
+
+  - definition_id: manyforge.motion.runtime_monitor_observation_lost
+    version: 1
+    title: Robot position feedback lost
+    message_template: "Position feedback lost during motion on {subject_id}"
+    alarm_class: motion
+    priority: critical
+    priority_rationale: >-
+      Motion stopped because the robot's measured position stopped arriving;
+      it requires immediate awareness before recovery. Priority does not imply
+      a safety-rated annunciator.
+    consequence: >-
+      Motion remains stopped. Nothing was detected in contact, but the robot's
+      position was not confirmed while it stopped, so recovering without
+      checking the robot can repeat the stop. Acknowledgement never gates
+      motion.
+    operator_response: >-
+      Check the robot controller, its connection and the robot component's
+      status (an open component incident names its cause), then use the
+      permitted recovery action. Acknowledge the alarm to move it to History.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.kernel.runtime_collision_condition
+    clear_authority: manyforge.kernel.runtime_collision_condition
+    adapter_id: manyforge.alarm_adapter.kernel_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 32
+
+  - definition_id: manyforge.motion.execution_fault
+    version: 2
+    title: Motion execution fault
+    message_template: "Operation fault on {subject_id}"
+    alarm_class: motion
+    priority: high
+    priority_rationale: >-
+      The current motion/recovery context cannot proceed without prompt
+      operator attention but is not a reported collision condition.
+    consequence: >-
+      The affected execution remains stopped or unavailable until the recovery
+      context is resolved or reset. Acknowledgement never gates motion.
+    operator_response: >-
+      Review the fault and recovery offer, repair the reported cause, then
+      select an enabled recovery or safe reset. Acknowledge the alarm to move
+      it to History.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.kernel.operation_condition
+    clear_authority: manyforge.kernel.operation_condition
+    adapter_id: manyforge.alarm_adapter.kernel_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 32
+
+  - definition_id: manyforge.program.operation_failure
+    version: 1
+    title: Program operation failed
+    message_template: "Program operation failed"
+    alarm_class: motion
+    priority: high
+    priority_rationale: >-
+      An actual operation failure has reached the operator-facing Program
+      failure hold or terminal failure and needs prompt operator attention.
+    consequence: >-
+      The affected Program failure remains unresolved until an accepted
+      operator release or completed Reset resolves that exact occurrence.
+      Acknowledgement never gates work: it gates no motion.
+    operator_response: >-
+      Review the original operation failure and recovery offer, repair the
+      cause, then use an enabled release or Reset; acknowledge the alarm to
+      move it to History.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.program_runner.failure_condition
+    clear_authority: manyforge.program_runner.failure_condition
+    adapter_id: manyforge.alarm_adapter.program_condition
+    runtime_modes:
+      - program
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 32
+
+  - definition_id: manyforge.scene.pose_apply_fault
+    version: 2
+    title: Observed pose could not be applied
+    message_template: "Pose apply failed on {subject_id}"
+    alarm_class: scene
+    priority: high
+    priority_rationale: >-
+      Execution must not use a scene whose required observed object cannot be
+      updated after initialization is complete.
+    consequence: >-
+      The planning scene can remain stale or inconsistent with the required
+      observation source. Acknowledgement never gates motion.
+    operator_response: >-
+      Inspect source health and object/policy compatibility, restore a valid
+      observation or configuration, and wait for a successful matching apply.
+      Acknowledge the alarm to move it to History.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.runtime.scene_pose_condition
+    clear_authority: manyforge.runtime.scene_pose_condition
+    adapter_id: manyforge.alarm_adapter.runtime_scene_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 16
+
+  - definition_id: manyforge.runtime.scene_initialization_fault
+    version: 2
+    title: Runtime scene initialization failed
+    message_template: "Scene initialization failed for {subject_id}"
+    alarm_class: runtime_health
+    priority: high
+    priority_rationale: >-
+      A definitive reset or authored-scene seed failure leaves the current
+      runtime unsuitable for motion until repaired or replaced.
+    consequence: >-
+      Pose updates and motion admission remain fenced because the authored
+      scene is not known to be established. Acknowledgement never gates
+      motion.
+    operator_response: >-
+      Inspect reset/seed diagnostics, restore the backend, then retry the
+      matching initialization or load a valid program/deployment. Acknowledge
+      the alarm to move it to History.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.runtime.scene_initialization_condition
+    clear_authority: manyforge.runtime.scene_initialization_condition
+    adapter_id: manyforge.alarm_adapter.runtime_health_condition
+    runtime_modes:
+      - all
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 16
+
+  - definition_id: manyforge.runtime.provider_unavailable
+    version: 2
+    title: Required runtime provider unavailable
+    message_template: "Required provider {subject_id} is unavailable"
+    alarm_class: runtime_health
+    priority: high
+    priority_rationale: >-
+      A required external state or execution provider is explicitly unavailable
+      after initialization and trustworthy motion cannot proceed.
+    consequence: >-
+      Observed state, scene projection, or execution feedback may be
+      unavailable or stale for the affected runtime lane. Acknowledgement
+      never gates motion.
+    operator_response: >-
+      Restore the named provider and wait for an explicit fresh ready status;
+      absence of another failure does not clear this alarm. Acknowledge the
+      alarm to move it to History.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.runtime.provider_health_condition
+    clear_authority: manyforge.runtime.provider_health_condition
+    adapter_id: manyforge.alarm_adapter.runtime_health_condition
+    runtime_modes:
+      - all
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 16
+
+  - definition_id: manyforge.runtime.alarm_scope_unavailable
+    version: 2
+    title: Fault alarm scope unavailable
+    message_template: "A current fault in {subject_id} could not be raised as its own alarm"
+    alarm_class: runtime_health
+    priority: high
+    priority_rationale: >-
+      A current motion fault whose resource scope the alarm owner refused has
+      no alarm of its own and does not gate motion on its resources, so the
+      fault is otherwise visible only in History.
+    consequence: >-
+      Motion can be admitted on the refused fault's resources without that
+      fault being reviewed, acknowledged, or recovered.
+    operator_response: >-
+      Review the refused faults named in the alarm details and History, then
+      apply a configuration that contains their resources or recover or reset
+      the faults. No acknowledgement is required: the alarm blocks motion
+      exactly while active and returns to normal when no refused fault remains.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.headless.alarm_scope_refusal_condition
+    clear_authority: manyforge.headless.alarm_scope_refusal_condition
+    adapter_id: manyforge.alarm_adapter.runtime_health_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: false
+    acknowledgement_reason_required: false
+    requires_motion_attention: true
+    max_evidence_refs: 16
+
+  - definition_id: manyforge.runtime.previous_session_unclean
+    version: 1
+    title: ManyForge did not close correctly last time
+    message_template: "ManyForge did not close correctly last time. The cell started empty; nothing from the previous session was resumed. Its records are kept; details in History."
+    alarm_class: runtime_health
+    priority: medium
+    priority_rationale: >-
+      An unclosed previous session or readable unresolved durable work needs
+      operator awareness but does not constrain the new empty cell.
+    consequence: >-
+      The previous session remains retained evidence; its runtime state is
+      never adopted or resumed.
+    operator_response: >-
+      Acknowledge after reading; consult History for the retained session
+      record. Acknowledgement does not change its records or protection.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.workbench.session_condition
+    clear_authority: manyforge.workbench.session_condition
+    adapter_id: manyforge.alarm_adapter.workbench_session_condition
+    runtime_modes:
+      - all
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 1
+
+  - definition_id: manyforge.runtime.program_runner_loss
+    version: 1
+    title: Program Runner lost during a run
+    message_template: "Program Runner lost during a run; restart the Workbench"
+    alarm_class: runtime_health
+    priority: high
+    priority_rationale: >-
+      An unrecoverable Workbench runtime fault requires prompt operator
+      attention and a Workbench restart.
+    consequence: >-
+      The Program owner is unavailable. Motion containment remains owned by
+      the existing Manager-presence lease and Stop certificate; this alarm
+      does not prove that motion has stopped. Acknowledgement never gates
+      motion.
+    operator_response: >-
+      Review the fault details and containment status, then restart the
+      Workbench. Acknowledge the alarm to move it to History. Acknowledgement
+      does not clear the fault.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.kernel.runtime_fault_condition
+    clear_authority: manyforge.kernel.runtime_fault_condition
+    adapter_id: manyforge.alarm_adapter.runtime_fault_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 1
+
+  - definition_id: manyforge.runtime.operation_journal_write_fault
+    version: 1
+    title: Operation history write failed
+    message_template: "Operation history write failed; new motion is inhibited"
+    alarm_class: runtime_health
+    priority: high
+    priority_rationale: >-
+      An unrecoverable Workbench runtime fault requires prompt operator
+      attention and a Workbench restart.
+    consequence: >-
+      The operation journal has failed and admission remains closed.
+      Unresolved write outcomes remain retained; no automatic write retry or
+      in-app Reset clears this fault. Acknowledgement never gates motion.
+    operator_response: >-
+      Review the fault details and containment status, then restart the
+      Workbench. Acknowledge the alarm to move it to History. Acknowledgement
+      does not clear the fault.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.kernel.runtime_fault_condition
+    clear_authority: manyforge.kernel.runtime_fault_condition
+    adapter_id: manyforge.alarm_adapter.runtime_fault_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 1
+
+  - definition_id: manyforge.runtime.kernel_internal_fault
+    version: 1
+    title: Internal fault
+    message_template: "Internal fault; new motion is inhibited until restart"
+    alarm_class: runtime_health
+    priority: high
+    priority_rationale: >-
+      An unrecoverable Workbench runtime fault requires prompt operator
+      attention and a Workbench restart.
+    consequence: >-
+      A callback on the Stop or safety path failed. The Kernel requested one
+      Full Stop, not retried, and new motion stays blocked until the execution
+      host restarts; Execute's readiness shows it as
+      execution_host_internal_fault. The details name the first typed cause,
+      whether that Full Stop was accepted (or its refusal code) and how many
+      later failures followed. Acknowledgement never gates motion.
+    operator_response: >-
+      Review the fault details and containment status, then restart the
+      Workbench. Acknowledge the alarm to move it to History. Acknowledgement
+      does not clear the fault.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.kernel.runtime_fault_condition
+    clear_authority: manyforge.kernel.runtime_fault_condition
+    adapter_id: manyforge.alarm_adapter.runtime_fault_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 1
+
+  - definition_id: scene.carried_object_lost
+    version: 1
+    title: Carried object lost
+    message_template: "Carried object lost: {subject_id}"
+    alarm_class: scene
+    priority: high
+    priority_rationale: >-
+      A carried object left its grasp; the motion was stopped and the object
+      detached, and the operator should check the cell.
+    consequence: >-
+      The Program node that was moving fails with carried_object_lost; the
+      object is an ordinary world object at its observed pose.
+    operator_response: >-
+      Read the detail text, check the object and the gripper, acknowledge, then
+      continue or reset the Program.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.runtime.scene_pose_condition
+    clear_authority: manyforge.runtime.scene_pose_condition
+    adapter_id: manyforge.alarm_adapter.runtime_scene_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 1

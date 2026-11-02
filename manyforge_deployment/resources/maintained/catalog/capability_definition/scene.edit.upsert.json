@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:01668536a12a75af7024ce6dd1248ce5fd18f25f75d1fadfb953b4b7da0ed1f2",
+  "capability_id": "scene.edit.upsert",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

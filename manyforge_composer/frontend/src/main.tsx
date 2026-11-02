@@ -1,17 +1,22 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
-import './index.css';
-import { seedCameraFromUrl } from './store/viewerSelectionStore';
+import './styles/index.css';
+import { OperationalErrorProvider } from './state/operationalErrors';
+import { WorkbenchNoticeProvider } from './state/workbenchNotices';
+import { ComposerSettingsProvider } from './hooks/useComposerSettings';
+import { boundDevMeasureBuffer } from './utils/devMeasureBuffer';
 
-// Read `?cam=x,y,z&target=x,y,z` once and stash it for the Scene
-// Viewer's first mount to consume. Day 4 contract item — programmatic
-// camera control for "frame to selection" and similar features will
-// reuse the same store action.
-seedCameraFromUrl();
+if (import.meta.env.DEV) boundDevMeasureBuffer();
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <App />
-  </React.StrictMode>
+    <OperationalErrorProvider>
+      <WorkbenchNoticeProvider>
+        <ComposerSettingsProvider>
+          <App />
+        </ComposerSettingsProvider>
+      </WorkbenchNoticeProvider>
+    </OperationalErrorProvider>
+  </React.StrictMode>,
 );

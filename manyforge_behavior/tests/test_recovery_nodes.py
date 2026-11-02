@@ -1,391 +1,132 @@
-"""Tests for FallbackOverrideNode and RecoverySkillNode (OP-6).
+"""Cutover gates for recovery-authoring behavior nodes."""
 
-Follows the test_repeat_retry.py / test_nodes.py pattern: direct py_trees
-construction, tree.tick() assertions, blackboard verification.
-"""
-
-import py_trees
 import pytest
+import py_trees
 
-from manyforge_behavior.blackboard_namespace import read_namespace_bundle
-from manyforge_behavior.nodes.recovery import FallbackOverrideNode, RecoverySkillNode
+from manyforge_behavior.nodes.recovery import (
+    RECOVERY_NODE_RESTORATION_GATES,
+    FallbackOverrideNode,
+    RecoveryNodeUnavailableError,
+    RecoverySkillNode,
+)
+from manyforge_behavior.program import ProgramNodePolicy
+from manyforge_behavior.program_runtime import ProgramRunAttemptSource
+from manyforge_behavior.program_scheduling import ProgramInterventionRegistry
+from manyforge_behavior.recovery import (
+    RecoveryAwareNode,
+    recovery_policy_is_actionable,
+    recovery_retry_permitted,
+)
 
 
-@pytest.fixture(autouse=True)
-def reset_blackboard():
-    py_trees.blackboard.Blackboard.enable_activity_stream()
-    yield
-    py_trees.blackboard.Blackboard.clear()
+@pytest.mark.parametrize(
+    "policy,used,expected",
+    [
+        ({}, 0, False),
+        ({"allow_intervention": False, "max_retries": 0}, 0, False),
+        # A positive budget never enables a forbidden intervention.
+        ({"allow_intervention": False, "max_retries": 5}, 0, False),
+        ({"allow_intervention": True, "max_retries": 2}, 0, True),
+        ({"allow_intervention": True, "max_retries": 2}, 1, True),
+        ({"allow_intervention": True, "max_retries": 2}, 2, False),
+        # Zero is Unlimited, including far beyond the former 255 bound.
+        ({"allow_intervention": True, "max_retries": 0}, 0, True),
+        ({"allow_intervention": True, "max_retries": 0}, 256, True),
+        ({"allow_intervention": True, "max_retries": 0}, 2**53 - 1, True),
+    ],
+)
+def test_recovery_retry_predicate_is_one_source_independent_budget(
+    policy, used, expected
+) -> None:
+    assert recovery_retry_permitted(policy, retries_used=used) is expected
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def test_recovery_predicate_rejects_inexact_inputs() -> None:
+    with pytest.raises(ValueError):
+        recovery_retry_permitted({"allow_intervention": True}, retries_used=-1)
+    with pytest.raises(ValueError):
+        recovery_retry_permitted(
+            {"allow_intervention": True, "max_retries": True}, retries_used=0
+        )
 
-class ConfigurableLeaf(py_trees.behaviour.Behaviour):
-    """Leaf that reads behaviour from the action-node ``_params`` convention."""
 
-    def __init__(self, name, fail_until=0, **params):
-        super().__init__(name)
-        self.tick_count = 0
-        self.fail_until = fail_until
-        self._params = dict(params)
+@pytest.mark.parametrize(
+    "recovery,held",
+    [
+        ({"allow_intervention": True, "max_retries": 0}, True),
+        ({"allow_intervention": True, "max_retries": 1}, True),
+        ({"allow_intervention": False, "max_retries": 3}, False),
+    ],
+)
+def test_only_an_allowed_intervention_holds_a_failed_attempt(recovery, held) -> None:
+    policy = ProgramNodePolicy(
+        instance_id="move", recovery_policy=recovery, operator_stop_policy="inherit"
+    )
+    assert recovery_policy_is_actionable(policy) is held
 
-    def initialise(self):
-        pass
 
-    def update(self):
-        self.tick_count += 1
-        if self.tick_count <= self.fail_until:
+@pytest.mark.parametrize("action", ["retry", "manual_success"])
+def test_parallel_recovery_never_reinvokes_an_unresolved_sibling(action):
+    attempts = ProgramRunAttemptSource("run")
+    registry = ProgramInterventionRegistry(maximum_retained_runs=1)
+    registry.register_run("run", ["a", "b"])
+
+    class FailingOwner(py_trees.behaviour.Behaviour):
+        def __init__(self, name):
+            super().__init__(name)
+            self.calls = 0
+            self.attempt_identity = None
+
+        def initialise(self):
+            self.attempt_identity = attempts.begin(self.name)
+
+        def update(self):
+            self.calls += 1
             return py_trees.common.Status.FAILURE
-        return py_trees.common.Status.SUCCESS
+
+    children = [FailingOwner("a"), FailingOwner("b")]
+    held = [RecoveryAwareNode(
+        child=child, node_instance_id=child.name, attempt_source=attempts,
+        recovery_port=registry,
+        policy=ProgramNodePolicy(
+            instance_id=child.name, operator_stop_policy="hold",
+            recovery_policy={"allow_intervention": True, "max_retries": 0},
+        ),
+    ) for child in children]
+    root = py_trees.composites.Parallel(
+        name="parallel", children=held,
+        policy=py_trees.common.ParallelPolicy.SuccessOnAll(synchronise=True),
+    )
+    list(root.tick())
+    first, second = registry.read_all("run")
+    assert [child.calls for child in children] == [1, 1]
+    registry.resolve(first.identity, action=action)
+    list(root.tick())
+    assert [child.calls for child in children] == [1, 1]
+    assert children[1].attempt_identity == second.identity
+    assert registry.read_all("run") == (second,)
+    if action == "manual_success":
+        assert held[0].presented_status is py_trees.common.Status.SUCCESS
+        held[0].observe_while_operator_stop_held()
+        assert held[0].status is py_trees.common.Status.SUCCESS
+        assert registry.read_all("run") == (second,)
+    list(root.tick())
+    assert children[0].calls == (2 if action == "retry" else 1)
+    assert children[1].calls == 1
+    assert children[1].attempt_identity == second.identity
 
 
-class AlwaysFail(py_trees.behaviour.Behaviour):
-    def update(self):
-        return py_trees.common.Status.FAILURE
+@pytest.mark.parametrize("node_type", [FallbackOverrideNode, RecoverySkillNode])
+def test_recovery_nodes_fail_before_child_or_offer_access(node_type: type) -> None:
+    class PoisonInput:
+        def __getattribute__(self, name: str) -> object:
+            raise AssertionError(f"recovery input was accessed: {name}")
 
+    poison = PoisonInput()
+    with pytest.raises(
+        RecoveryNodeUnavailableError,
+        match="composable_cell_recovery_node_unavailable",
+    ):
+        node_type(poison, child=poison, offer=poison)
 
-class AlwaysSucceed(py_trees.behaviour.Behaviour):
-    def update(self):
-        return py_trees.common.Status.SUCCESS
-
-
-class RunningThenSucceed(py_trees.behaviour.Behaviour):
-    """Returns RUNNING for a configurable number of ticks, then SUCCESS."""
-    def __init__(self, name, running_ticks=1):
-        super().__init__(name)
-        self._running_ticks = running_ticks
-        self._ticks = 0
-
-    def initialise(self):
-        self._ticks = 0
-
-    def update(self):
-        self._ticks += 1
-        if self._ticks <= self._running_ticks:
-            return py_trees.common.Status.RUNNING
-        return py_trees.common.Status.SUCCESS
-
-
-# ---------------------------------------------------------------------------
-# FallbackOverrideNode tests
-# ---------------------------------------------------------------------------
-
-class TestFallbackOverrideNode:
-
-    def test_child_succeeds_immediately(self):
-        """When the child succeeds on first tick, the decorator returns SUCCESS."""
-        child = ConfigurableLeaf("child", fail_until=0, speed=1.0)
-        node = FallbackOverrideNode(
-            "fallback", child, fallback_params={"speed": 0.5}, max_retries=2,
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.SUCCESS
-
-    def test_child_fails_then_retries_with_overrides(self):
-        """Child fails once, fallback params applied, retried, succeeds."""
-        child = ConfigurableLeaf("child", fail_until=1, speed=1.0)
-        node = FallbackOverrideNode(
-            "fallback", child, fallback_params={"speed": 0.5}, max_retries=2,
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        # Tick 1: child fails, decorator returns RUNNING (will retry)
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.RUNNING
-        # Verify fallback params were applied to child
-        assert child._params["speed"] == 0.5
-
-        # Tick 2: child succeeds with overridden params
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.SUCCESS
-
-    def test_retries_exhausted(self):
-        """When retries are exhausted, returns FAILURE."""
-        child = ConfigurableLeaf("child", fail_until=100, speed=1.0)
-        node = FallbackOverrideNode(
-            "fallback", child, fallback_params={"speed": 0.5}, max_retries=2,
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        # Tick 1: child fails, retry 1
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.RUNNING
-
-        # Tick 2: child fails again, retry 2
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.RUNNING
-
-        # Tick 3: child fails, retries exhausted
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.FAILURE
-
-    def test_zero_retries(self):
-        """max_retries=0: child gets one attempt, no retries."""
-        child = ConfigurableLeaf("child", fail_until=100)
-        node = FallbackOverrideNode(
-            "fallback", child, fallback_params={}, max_retries=0,
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.FAILURE
-
-    def test_params_restored_across_runs(self):
-        """Fallback param overrides from a previous run do not leak into the next."""
-        child = ConfigurableLeaf("child", fail_until=1, speed=1.0, accel=0.8)
-        node = FallbackOverrideNode(
-            "fallback", child, fallback_params={"speed": 0.3}, max_retries=2,
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        # Run 1: fails then succeeds
-        tree.tick()  # fail → apply override
-        assert child._params["speed"] == 0.3
-        tree.tick()  # succeed
-
-        # Force re-initialise for a fresh run
-        # (simulates cycle_manager re-entering the tree)
-        node.initialise()
-        child.tick_count = 0
-        child.fail_until = 0
-
-        # After re-init, original speed must be restored
-        assert child._params["speed"] == 1.0
-        assert child._params["accel"] == 0.8
-
-    def test_blackboard_recovery_metadata(self):
-        """Recovery events are recorded on the blackboard."""
-        child = ConfigurableLeaf("child", fail_until=1)
-        node = FallbackOverrideNode(
-            "fallback", child, fallback_params={"x": 1}, max_retries=2,
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        tree.tick()  # fail → retry
-        tree.tick()  # succeed
-
-        bb = py_trees.blackboard.Client(name="reader")
-        bundle = read_namespace_bundle(bb, "_recovery/fallback")
-        assert bundle["meta"]["status"] == "succeeded"
-        assert bundle["value"]["retry_count"] == 1
-
-    def test_child_running_propagated(self):
-        """When child returns RUNNING, decorator also returns RUNNING."""
-        child = RunningThenSucceed("child", running_ticks=2)
-        node = FallbackOverrideNode(
-            "fallback", child, fallback_params={}, max_retries=1,
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.RUNNING
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.RUNNING
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.SUCCESS
-
-
-# ---------------------------------------------------------------------------
-# RecoverySkillNode tests
-# ---------------------------------------------------------------------------
-
-def _make_skill_expander(recovery_behaviour):
-    """Create a skill_expander that returns a fixed behaviour."""
-    def expander(skill_id, params):
-        return recovery_behaviour
-    return expander
-
-
-class TestRecoverySkillNode:
-
-    def test_child_succeeds_no_recovery(self):
-        """When child succeeds, no recovery skill is invoked."""
-        child = ConfigurableLeaf("child", fail_until=0)
-        expander = _make_skill_expander(AlwaysSucceed("recovery"))
-        node = RecoverySkillNode(
-            "recovery_node", child,
-            recovery_skill_id="fix_it",
-            recovery_params={},
-            max_retries=2,
-            skill_expander=expander,
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.SUCCESS
-
-    def test_recovery_skill_runs_on_failure(self):
-        """Child fails → recovery skill runs and succeeds → child retried."""
-        child = ConfigurableLeaf("child", fail_until=1)
-        recovery = AlwaysSucceed("recovery_skill")
-        expander = _make_skill_expander(recovery)
-        node = RecoverySkillNode(
-            "recovery_node", child,
-            recovery_skill_id="fix_it",
-            max_retries=2,
-            skill_expander=expander,
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        # Tick 1: child fails → recovery started (instant succeed) → RUNNING (will retry child)
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.RUNNING
-
-        # Tick 2: child succeeds on second attempt
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.SUCCESS
-
-    def test_recovery_skill_fails_aborts(self):
-        """If the recovery skill itself fails, the decorator returns FAILURE."""
-        child = ConfigurableLeaf("child", fail_until=100)
-        recovery = AlwaysFail("bad_recovery")
-        expander = _make_skill_expander(recovery)
-        node = RecoverySkillNode(
-            "recovery_node", child,
-            recovery_skill_id="fix_it",
-            max_retries=2,
-            skill_expander=expander,
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        # Tick 1: child fails → recovery skill fails → FAILURE
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.FAILURE
-
-    def test_retries_exhausted(self):
-        """When max_retries exceeded, returns FAILURE even if recovery succeeds."""
-        child = ConfigurableLeaf("child", fail_until=100)
-        recovery = AlwaysSucceed("recovery_skill")
-        expander = _make_skill_expander(recovery)
-        node = RecoverySkillNode(
-            "recovery_node", child,
-            recovery_skill_id="fix_it",
-            max_retries=1,
-            skill_expander=expander,
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        # Tick 1: child fails → recovery succeeds → RUNNING
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.RUNNING
-
-        # Tick 2: child fails again → retries exhausted → FAILURE
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.FAILURE
-
-    def test_no_skill_expander(self):
-        """Without skill_expander, decorator returns FAILURE on child failure."""
-        child = ConfigurableLeaf("child", fail_until=100)
-        node = RecoverySkillNode(
-            "recovery_node", child,
-            recovery_skill_id="fix_it",
-            max_retries=2,
-            skill_expander=None,
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.FAILURE
-
-    def test_unknown_skill_id(self):
-        """If skill_expander returns None (unknown skill), returns FAILURE."""
-        child = ConfigurableLeaf("child", fail_until=100)
-        expander = _make_skill_expander(None)  # always returns None
-        node = RecoverySkillNode(
-            "recovery_node", child,
-            recovery_skill_id="nonexistent",
-            max_retries=2,
-            skill_expander=expander,
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.FAILURE
-
-    def test_blackboard_recovery_metadata(self):
-        """Recovery metadata is written to the blackboard."""
-        child = ConfigurableLeaf("child", fail_until=1)
-        recovery = AlwaysSucceed("recovery_skill")
-        expander = _make_skill_expander(recovery)
-        node = RecoverySkillNode(
-            "recovery_node", child,
-            recovery_skill_id="fix_it",
-            max_retries=2,
-            skill_expander=expander,
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        tree.tick()  # fail → recovery → RUNNING
-        tree.tick()  # succeed
-
-        bb = py_trees.blackboard.Client(name="reader")
-        bundle = read_namespace_bundle(bb, "_recovery/recovery_node")
-        assert bundle["meta"]["status"] == "succeeded"
-        assert bundle["value"]["recovery_skill_id"] == "fix_it"
-
-    def test_child_running_propagated(self):
-        """When child returns RUNNING, decorator also returns RUNNING."""
-        child = RunningThenSucceed("child", running_ticks=2)
-        node = RecoverySkillNode(
-            "recovery_node", child,
-            recovery_skill_id="fix_it",
-            max_retries=1,
-            skill_expander=_make_skill_expander(AlwaysSucceed("recovery")),
-        )
-        tree = py_trees.trees.BehaviourTree(root=node)
-        tree.setup()
-
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.RUNNING
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.RUNNING
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.SUCCESS
-
-
-class TestRecoveryCatalogEntries:
-    """Verify catalog entries exist for recovery nodes."""
-
-    def test_catalog_has_recovery_entries(self):
-        from pathlib import Path
-        from manyforge_behavior.catalog import NodeCatalog
-
-        catalog_path = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
-        catalog = NodeCatalog(catalog_path)
-
-        fallback_entry = None
-        recovery_entry = None
-        for entry in catalog.entries:
-            if entry.id == "fallback_override_node":
-                fallback_entry = entry
-            elif entry.id == "recovery_skill_node":
-                recovery_entry = entry
-
-        assert fallback_entry is not None, "fallback_override_node not in catalog"
-        assert recovery_entry is not None, "recovery_skill_node not in catalog"
-
-        assert fallback_entry.kind == "decorator"
-        assert fallback_entry.children_min == 1
-        assert fallback_entry.children_max == 1
-
-        assert recovery_entry.kind == "decorator"
-        assert recovery_entry.children_min == 1
-        assert recovery_entry.children_max == 1
+    assert RECOVERY_NODE_RESTORATION_GATES == ("I6", "N", "I8", "P5")

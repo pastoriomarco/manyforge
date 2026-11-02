@@ -1,0 +1,127 @@
+diff --git a/roboplan_toppra/include/roboplan_toppra/toppra.hpp b/roboplan_toppra/include/roboplan_toppra/toppra.hpp
+index 890c68e..3e5a4ff 100644
+--- a/roboplan_toppra/include/roboplan_toppra/toppra.hpp
++++ b/roboplan_toppra/include/roboplan_toppra/toppra.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <cstddef>
++#include <functional>
+ #include <string>
+ #include <vector>
+ 
+@@ -68,6 +69,14 @@ struct TOPPRAOptions {
+   /// @details Checked before converting the solver duration to an integer
+   /// sample count or allocating output storage. Must be strictly positive.
+   size_t max_output_samples = 1'000'000;
++
++  /// @brief Optional upper bound on the path speed at each TOPP-RA grid point.
++  /// @details Called at every grid point with the joint group positions and the path tangent
++  /// dq/ds (one entry per collapsed group coordinate, planar joints in their body frames). It
++  /// returns the largest allowed ds/dt there, or infinity for no bound. The bound is intersected
++  /// with the joint velocity limits, e.g. to cap a frame's Cartesian speed with
++  /// ds/dt <= v_max / ||J(q) dq/ds||. Not enforced between grid points.
++  std::function<double(const Eigen::VectorXd& q, const Eigen::VectorXd& dq_ds)> max_path_velocity;
+ };
+ 
+ /// @brief Trajectory time parameterizer using the TOPP-RA algorithm.
+diff --git a/roboplan_toppra/src/toppra.cpp b/roboplan_toppra/src/toppra.cpp
+index e2c048f..31b51fb 100644
+--- a/roboplan_toppra/src/toppra.cpp
++++ b/roboplan_toppra/src/toppra.cpp
+@@ -1,3 +1,4 @@
++#include <algorithm>
+ #include <chrono>
+ #include <cmath>
+ #include <numbers>
+@@ -61,6 +62,34 @@ private:
+   toppra::GeometricPathPtr path_;
+   std::vector<size_t> planar_q_indices_;
+ };
++
++/// @brief Bounds the path speed at each grid point with TOPPRAOptions::max_path_velocity.
++class PathVelocityBound : public toppra::LinearConstraint {
++public:
++  PathVelocityBound(const roboplan::Scene& scene, const std::string& group_name,
++                    std::function<double(const Eigen::VectorXd&, const Eigen::VectorXd&)> bound)
++      : toppra::LinearConstraint(0, 0, true, false, true), scene_{scene}, group_name_{group_name},
++        bound_{std::move(bound)} {}
++
++private:
++  void computeParams_impl(const toppra::GeometricPath& path, const toppra::Vector& gridpoints,
++                          toppra::Vectors&, toppra::Vectors&, toppra::Vectors&, toppra::Matrices&,
++                          toppra::Vectors&, toppra::Bounds&, toppra::Bounds& xbound) override {
++    for (Eigen::Index i = 0; i < gridpoints.size(); ++i) {
++      const auto q = roboplan::expandContinuousJointPositions(
++                         scene_, group_name_, path.eval_single(gridpoints[i], 0))
++                         .value();
++      // Same ceiling as toppra::constraint::LinearJointVelocity, so "no bound" stays finite.
++      const double sd_max = std::min(1e8, bound_(q, path.eval_single(gridpoints[i], 1)));
++      xbound[i][0] = 0.0;
++      xbound[i][1] = sd_max * sd_max;
++    }
++  }
++
++  const roboplan::Scene& scene_;
++  std::string group_name_;
++  std::function<double(const Eigen::VectorXd&, const Eigen::VectorXd&)> bound_;
++};
+ }  // namespace
+ 
+ namespace roboplan {
+@@ -240,6 +269,10 @@ PathParameterizerTOPPRA::generate(const JointPath& path, const TOPPRAOptions& op
+       acc_lower_limits_ * options.acceleration_scale,
+       acc_upper_limits_ * options.acceleration_scale);
+   toppra::LinearConstraintPtrs constraints = {vel_constraint, acc_constraint};
++  if (options.max_path_velocity) {
++    constraints.push_back(
++        std::make_shared<PathVelocityBound>(*scene_, group_name_, options.max_path_velocity));
++  }
+ 
+   auto maybe_path_pos_vecs = getPathPositionVectors(path);
+   if (!maybe_path_pos_vecs) {
+diff --git a/roboplan_toppra/test/test_toppra.cpp b/roboplan_toppra/test/test_toppra.cpp
+index 06ae1ac..a94e887 100644
+--- a/roboplan_toppra/test/test_toppra.cpp
++++ b/roboplan_toppra/test/test_toppra.cpp
+@@ -493,6 +493,40 @@ TEST_F(RoboPlanToppraTest, LinearBlendSolvesWhenRidingTheAccelerationLimit) {
+   ASSERT_TRUE(result.has_value()) << result.error();
+ }
+ 
++// A path-velocity bound caps a speed that is not a joint limit, here the joint-space speed norm,
++// at every grid point. Only the stretches near the cap slow down, so the bounded trajectory is
++// faster than stretching the unbounded one uniformly down to the same cap.
++TEST_F(RoboPlanToppraTest, PathVelocityBoundCapsSpeedOnlyWhereItBinds) {
++  auto path = createTestPathLong();
++  auto toppra = PathParameterizerTOPPRA(scene, "arm");
++  TOPPRAOptions options;
++  const auto unbounded = toppra.generate(path, options);
++  ASSERT_TRUE(unbounded.has_value()) << unbounded.error();
++  double unbounded_peak = 0.0;
++  for (const auto& velocity : unbounded->velocities) {
++    unbounded_peak = std::max(unbounded_peak, velocity.norm());
++  }
++
++  const double cap = 0.5 * unbounded_peak;
++  size_t calls = 0;
++  options.max_path_velocity = [&](const Eigen::VectorXd& q, const Eigen::VectorXd& dq_ds) {
++    ++calls;
++    EXPECT_EQ(q.size(), 6);
++    EXPECT_EQ(dq_ds.size(), 6);
++    const double norm = dq_ds.norm();
++    return norm > 0.0 ? cap / norm : std::numeric_limits<double>::infinity();
++  };
++  const auto bounded = toppra.generate(path, options);
++  ASSERT_TRUE(bounded.has_value()) << bounded.error();
++  EXPECT_GT(calls, 0U);
++  for (const auto& velocity : bounded->velocities) {
++    EXPECT_LE(velocity.norm(), cap * 1.02);
++  }
++  // The uniformly stretched unbounded trajectory is feasible for the bounded problem.
++  EXPECT_LT(bounded->times.back(), unbounded->times.back() * (unbounded_peak / cap));
++  EXPECT_GT(bounded->times.back(), unbounded->times.back());
++}
++
+ // TOPP-RA's path coordinates for a planar joint are world-frame (x, y, theta), but its velocity
+ // limits, like Pinocchio's velocities, are in the joint's body frame. Driving along world x while
+ // turning a quarter turn sweeps that motion from the body's x axis onto its slower y axis, so the

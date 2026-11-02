@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:7ce48309e3a8f884850dd1285cbd66e19da631fbbfd27d269828fb7048832a57",
+  "capability_id": "scene.pose.observe",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "target_binding"
+}

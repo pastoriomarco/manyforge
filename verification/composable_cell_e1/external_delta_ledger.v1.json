@@ -1,0 +1,1821 @@
+{
+  "schema": "manyforge.composable_cell.e1.external_delta_ledger.v1",
+  "status": "frozen",
+  "roboplan_decision": "adopt_roboplan_0_6_0",
+  "roboplan_decision_record": {
+    "decision": "adopt_roboplan_0_6_0",
+    "authority": "explicit maintainer confirmation",
+    "date": "2026-08-06",
+    "selected_source_id": "roboplan_0_6_0_candidate",
+    "rejected_source_id": "roboplan_0_5_1_control",
+    "rationale": "Adopt the current upstream release before I6 so one focused adapter is restored and qualified once against the long-lived baseline. Four small upstream-ready dependency-internal fixes preserve correctness and bounds; historical authority and integration patches move to ManyForge boundaries; exact source closure, compatibility, containment, sanitizer, packaging, and performance evidence shows no safety, reliability, or supportability blocker.",
+    "accepted_tradeoffs": [
+      "The exact E1 UR5 joint-RRT fixture is about 12-13% slower, roughly 1.4-1.8 ms, while remaining inside its fixed absolute bounds; Cartesian planning is about 56% faster and other measured workloads, memory, cancellation, replacement, and recovery are comparable or better.",
+      "Retiring patch 0007 accepts 6.6% more allocation calls and 17.6% more allocated bytes on its isolated fixture because the measured runtime benefit is negligible and RoboPlan 0.6 exposes no safe reusable-scratch hook; I6 retains ordinary end-to-end allocation and performance gates."
+    ]
+  },
+  "purpose": "Preserve every behavior supplied by a consumed external delta, assign it to its future owner, and carry only externally unavoidable fixes with upstream-ready evidence.",
+  "selected_outcome_qualification": {
+    "state": "qualified",
+    "selected_source_id": "roboplan_0_6_0_candidate",
+    "required_lanes": [
+      {
+        "id": "native_amd64",
+        "status": "passed",
+        "evidence": [
+          "verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json#native_amd64"
+        ]
+      },
+      {
+        "id": "native_aarch64",
+        "status": "passed",
+        "evidence": [
+          "verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json#native_aarch64"
+        ]
+      },
+      {
+        "id": "ros_isaac_amd64",
+        "status": "passed",
+        "evidence": [
+          "verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json#ros_isaac_amd64"
+        ]
+      },
+      {
+        "id": "ros_isaac_aarch64",
+        "status": "passed",
+        "evidence": [
+          "verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json#ros_isaac_aarch64"
+        ]
+      }
+    ],
+    "python_install_metadata": {
+      "status": "passed",
+      "evidence": [
+        "verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json#selected_source_checks"
+      ]
+    },
+    "result_record": {
+      "path": "verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json",
+      "sha256": "d53b4dad37845d6b972222bde3832fc048af27be36951bc9e7f508ff22a431a3"
+    },
+    "selection_rule": "After Adopt/No-go, all four exact selected dependency lanes and source-installed Python metadata must pass before the ledger can freeze; the rejected generation remains nonselectable evidence only."
+  },
+  "planner_source_closures": [
+    {
+      "id": "roboplan_0_5_1_control_closure",
+      "base_image_sha256": "9dcf29cd84e7df0c9539a0edb872afce6b3bcf2b4da62ea57731f7bfba4f7c1c",
+      "source_identity_refs": [
+        "roboplan_0_5_1_control"
+      ],
+      "identity_sha256": "b80c04cf937568fcc0ea494c950644ade4d9da89f7f518f08d53d0292559d092"
+    },
+    {
+      "id": "roboplan_0_6_0_candidate_closure",
+      "base_image_sha256": "9dcf29cd84e7df0c9539a0edb872afce6b3bcf2b4da62ea57731f7bfba4f7c1c",
+      "source_identity_refs": [
+        "roboplan_0_6_0_candidate",
+        "proxsuite_0_7_3_candidate_dependency",
+        "proxsuite_cmake_module_candidate_dependency",
+        "toppra_0_6_8_candidate_dependency"
+      ],
+      "identity_sha256": "f46cd93eafada18a5850fb34d49ccac7b0d9f56a3824ca3dbb00f16d5ea9a5a1"
+    }
+  ],
+  "frozen_sources": [
+    {
+      "id": "roboplan_0_5_1_control",
+      "identity": {
+        "commit": "e06d1a2f1b749c38742aee9e401bbe97fa967f7b",
+        "source_content_sha256": "c03adcab09d97c96ca5e9be27b3a2b6634761e2aea545de3a20869466c201b23",
+        "build_content_sha256": "b1ae7936cfdaccaa26cba0c8dfb945838b18ecd193b03a6f79c1a9ce67e240f3",
+        "git_archive_sha256": "693de4ac185659e285ecde18cfdd3d407b25abc8d3529a9847cf268bcbb3ac4e",
+        "tree": "d918767326a19d44886c0a4560cabe5a4ebe044d",
+        "version": "0.5.1"
+      },
+      "source_url": "https://github.com/open-planning/roboplan.git",
+      "license": {
+        "path": "LICENSE",
+        "spdx": "MIT",
+        "sha256": "50bcdd76cbb58183440f5d9cc77eac68c401ac6c1d1f5f9204c1bda72a24e8a8"
+      },
+      "role": "nonselectable historical control and exact rollback evidence"
+    },
+    {
+      "id": "roboplan_0_6_0_candidate",
+      "identity": {
+        "commit": "d2e5162eda2f51f5599ecd60375b65346d0b2944",
+        "source_content_sha256": "43933c3ced7948d747b287afbc0d99137e0c26828228b24c0fbac63284b52f3b",
+        "build_content_sha256": "f022073b2bcedb55634ff7937caac63f034062fe7e29b79b52f07b585b4faded",
+        "git_archive_sha256": "1adbea399e614e03cb1c1eefb25c6c8841aebdd7a32bec87117adef50c421241",
+        "tree": "60b5791cd34288fc19eea2777a2fc6867c3af0b2",
+        "version": "0.6.0"
+      },
+      "source_url": "https://github.com/open-planning/roboplan.git",
+      "license": {
+        "path": "LICENSE",
+        "spdx": "MIT",
+        "sha256": "eb1aefeda6ceb10afdf5f0a35fdd9c372d643fc7632a561c32b3226e68ed4d4d"
+      },
+      "role": "frozen RoboPlan 0.6.0 operator-directed restoration source retained until UA7 qualification"
+    },
+    {
+      "id": "roboplan_0_7_0_ua1_foundation",
+      "identity": {
+        "commit": "099dfa5ccd80b191eb3d6da9f4795f808a63913f",
+        "source_content_sha256": "d117c17658a0765f66c39187739e7af4b6533dac68a8aeb5f7dabc3b8fc67bef",
+        "build_content_sha256": "c63dcf4a4e1d4a33285b7493c08438a8d30e621fb88ab70a27223096d0c19ef8",
+        "git_archive_sha256": "189ba1dccb9d30c0dd2cc7fbfcc4de0d710060cf56c36dd1a2144a904cf27345",
+        "tree": "3ce46cce8b51b21a0eb7b803858cb0750524e5be",
+        "version": "0.7.0"
+      },
+      "source_url": "https://github.com/open-planning/roboplan.git",
+      "license": {
+        "path": "LICENSE",
+        "spdx": "MIT",
+        "sha256": "eb1aefeda6ceb10afdf5f0a35fdd9c372d643fc7632a561c32b3226e68ed4d4d"
+      },
+      "role": "UI6-I-UA1 exact RoboPlan 0.7.0 foundation source; the frozen 0.6 record remains operator-directed restoration evidence until UA7 qualification"
+    },
+    {
+      "id": "proxsuite_0_7_3_candidate_dependency",
+      "identity": {
+        "archive_sha256": "e634babff534c8812c6dbc6b022b1d01f9a2a4a9a73cf87a6dc299a4de996904",
+        "source_content_sha256": "17761fe7724951d48d3b2a846e27f681473b8a39f873c8866e6f83ed55923644",
+        "build_content_sha256": "17761fe7724951d48d3b2a846e27f681473b8a39f873c8866e6f83ed55923644",
+        "commit": "b93d7778ffc3299d84b5cb0851022a29bf24a596",
+        "git_archive_sha256": "2e176ec09db027d6fb1d15383f69c6ec10d6345828a2a2a6a18e7a9b2e233504",
+        "tree": "66f7dcd274efe11d1e6816b73e49cf9663671988",
+        "tag_object": "d032c98f65d9c90575bf06dffa564693e502f875",
+        "version": "v0.7.3"
+      },
+      "source_url": "https://github.com/Simple-Robotics/proxsuite.git",
+      "license": {
+        "path": "LICENSE",
+        "spdx": "BSD-2-Clause",
+        "sha256": "46a9320ade0b503d65bd458e6b614a144704e66c17807b081e29d94365485b3d"
+      },
+      "submodules": [
+        {
+          "path": "bindings/python/external/nanobind",
+          "commit": "22acf11a2dac212e857f0d06ce80f808cac8fdad",
+          "state": "uninitialized"
+        },
+        {
+          "path": "cmake-module",
+          "commit": "30795190916d0297092e37bc1f7b50f5d76fc09c",
+          "state": "initialized",
+          "source_id": "proxsuite_cmake_module_candidate_dependency"
+        },
+        {
+          "path": "external/cereal",
+          "commit": "ddd467244713ea4fe63733628992efcdd6a9187d",
+          "state": "uninitialized"
+        }
+      ],
+      "role": "exact ProxSuite solver dependency shared by the frozen RoboPlan 0.6 restoration closure and the UI6-I-UA1 RoboPlan 0.7 foundation"
+    },
+    {
+      "id": "proxsuite_cmake_module_candidate_dependency",
+      "identity": {
+        "commit": "30795190916d0297092e37bc1f7b50f5d76fc09c",
+        "source_content_sha256": "059d62318c35a99beeb355484253e5c308299456d73f6a17e2cc2ef3bd77f86e",
+        "build_content_sha256": "059d62318c35a99beeb355484253e5c308299456d73f6a17e2cc2ef3bd77f86e",
+        "git_archive_sha256": "c0686305eab24155fc90e06a268678abf8403a00655491f1bcad93c4a10b713e",
+        "tree": "dba231b7e06d3fe6712f7dfb9ad3342ec21bbda9"
+      },
+      "source_url": "https://github.com/jrl-umi3218/jrl-cmakemodules.git",
+      "license": {
+        "path": "LICENSE",
+        "spdx": "LGPL-3.0-only",
+        "sha256": "09ba2945cb6c99e33d9ecc608f0fddb5f3b4af8b5096a1811bc750fe29d617fc"
+      },
+      "role": "selected exact initialized ProxSuite v0.7.3 CMake submodule used by source builds"
+    },
+    {
+      "id": "toppra_0_6_8_candidate_dependency",
+      "identity": {
+        "commit": "cbbc89d46208fddfaa3e1aab52ab44553751b510",
+        "source_content_sha256": "37bbda44a95600992a27a78842919fb795ed2140bb0ce975fcabe5990dad5c20",
+        "build_content_sha256": "37bbda44a95600992a27a78842919fb795ed2140bb0ce975fcabe5990dad5c20",
+        "git_archive_sha256": "28ff34ef2643ea62306d523a5b575659493c9082a8c37b385761527203c85b2c",
+        "tree": "4fee36b7f1bdd39cb5f10bc103254634757c417e",
+        "version": "0.6.8"
+      },
+      "source_url": "https://github.com/hungpham2511/toppra.git",
+      "license": {
+        "path": "LICENSE",
+        "spdx": "MIT",
+        "sha256": "80d9415117d2a3cbee058702e8776bcb1986c7c6fcb69f1b81176f10d88db952"
+      },
+      "role": "selected RoboPlan 0.6 time-parameterization dependency"
+    },
+    {
+      "id": "toppra_0_6_10_ua1_dependency",
+      "identity": {
+        "commit": "8121e9af72f5aa589b515aa15e0dc408344c3220",
+        "source_content_sha256": "f8f1f5e8cdc0eeac08dc3e2f9302324ccb58f172ec9045ceef7f35c54c34bb1f",
+        "build_content_sha256": "f8f1f5e8cdc0eeac08dc3e2f9302324ccb58f172ec9045ceef7f35c54c34bb1f",
+        "git_archive_sha256": "317d40160fd514adf1738ef24840dd81e62782740065b7e79179fde848a49e6c",
+        "tree": "bb6b2027b5834755c9db2cae0a9a6d924d5f8db7",
+        "version": "0.6.10"
+      },
+      "source_url": "https://github.com/hungpham2511/toppra.git",
+      "license": {
+        "path": "LICENSE",
+        "spdx": "MIT",
+        "sha256": "80d9415117d2a3cbee058702e8776bcb1986c7c6fcb69f1b81176f10d88db952"
+      },
+      "role": "UI6-I-UA1 exact RoboPlan 0.7 time-parameterization dependency"
+    },
+    {
+      "id": "xarm_jazzy_functional_base",
+      "identity": {
+        "commit": "2589f4304d03aaf9b6b1ff6691ec7deb739f4090",
+        "tree": "a319ad4afb54c4dfd3d6205d57f58a878cd3f6c7"
+      },
+      "role": "upstream-like functional comparison base"
+    },
+    {
+      "id": "xarm_jazzy_no_gazebo_base",
+      "identity": {
+        "commit": "50064477f39ecd69ab006488630c837cdcb8d83e",
+        "tree": "5b7ab25ecf7f5d030b891824f2cd308ea72c3a57"
+      },
+      "role": "qualified reduction base for the composable-cell xArm branch"
+    },
+    {
+      "id": "xarm_composable_cell_current",
+      "identity": {
+        "commit": "c3172e57c1c1bb2982fc008304ad6bc886357c87",
+        "tree": "00056796f565dddfa6098d1b1c2661de102671b6"
+      },
+      "role": "current xArm relocation source routed to I10/I12"
+    },
+    {
+      "id": "xarm_sdk_control",
+      "identity": {
+        "commit": "2b6b595a956c2558e867c08001fda454212b271a"
+      },
+      "role": "xArm SDK gitlink at the no-Gazebo base"
+    },
+    {
+      "id": "xarm_sdk_current",
+      "identity": {
+        "commit": "d84a2b7d533ff988bf1c2197ed50dd0d6723cf30",
+        "tree": "877e766849cd271fc13d5d3f44d837156fdd2eca"
+      },
+      "role": "xArm SDK gitlink at the current composable-cell branch"
+    },
+    {
+      "id": "manymove_main_control",
+      "identity": {
+        "commit": "f3a4c65e154744403d721d6ef25d2a8ea5f3f1e3",
+        "tree": "ae831c37fe1e3b28ff2d6cc8f8ff31ec56b60c34"
+      },
+      "role": "ManyMove main comparison base"
+    },
+    {
+      "id": "manymove_historical_acceptance",
+      "identity": {
+        "commit": "1a73f42c66b78101913350b04f53378fffb49aa8",
+        "tree": "5aa30f53f16cc13229da3b771380adafd9fc30dc"
+      },
+      "role": "historical maintained-consumer and acceptance input"
+    },
+    {
+      "id": "roboplan_0_8_0_foundation",
+      "identity": {
+        "commit": "2a6b447e648b1a3337f10cbab995cda0c0a71d55",
+        "source_content_sha256": "0c9037719c4b4b82d7f44f0fce846235248d8dc6f5cbe68b7e15a785c640d750",
+        "build_content_sha256": "656f331ca9c3f13d0b54e71cdecb029f7b1ba57969c1ebb9531807186b6dc52c",
+        "git_archive_sha256": "24fca37e25bfd5c57a69b23777873ce62f1a2db8daba84f000b3e3801b3a8c92",
+        "tree": "56319fede36b09817b343eefdf43215ee0173f95",
+        "version": "0.8.0"
+      },
+      "source_url": "https://github.com/open-planning/roboplan.git",
+      "license": {
+        "path": "LICENSE",
+        "spdx": "MIT",
+        "sha256": "eb1aefeda6ceb10afdf5f0a35fdd9c372d643fc7632a561c32b3226e68ed4d4d"
+      },
+      "role": "M9 exact RoboPlan 0.8.0 source; build content is the tree after the 0.8 patch series"
+    },
+    {
+      "id": "proxsuite_0_8_2_dependency",
+      "identity": {
+        "commit": "6ae71b84730bf30453d70764073d186f5fe7ad69",
+        "source_content_sha256": "62086f9ce469f6a80fa0214271754bd17e0d84fa2ef19dd5512a800e60ac421c",
+        "build_content_sha256": "62086f9ce469f6a80fa0214271754bd17e0d84fa2ef19dd5512a800e60ac421c",
+        "git_archive_sha256": "8db5c4ee531ce799a7d13fcd683dc9036a3d3f2c920ab1a6895a020e429c0fd9",
+        "tree": "9415ea0be7a30660eb98d3247132304f07de0a5e",
+        "tag_object": "6a45b115194ceb8a0c273ee4f7e4481229a63598",
+        "version": "v0.8.2"
+      },
+      "source_url": "https://github.com/Simple-Robotics/proxsuite.git",
+      "license": {
+        "path": "LICENSE",
+        "spdx": "BSD-2-Clause",
+        "sha256": "46a9320ade0b503d65bd458e6b614a144704e66c17807b081e29d94365485b3d"
+      },
+      "role": "exact ProxSuite solver dependency of RoboPlan 0.8 OInK (>=0.8.2,<0.9 required); no submodules; built without serialization"
+    },
+    {
+      "id": "jrl_cmakemodules_2_3_0_dependency",
+      "identity": {
+        "commit": "984234828e97557b82d30262ffa3a851b6be2383",
+        "source_content_sha256": "fb7a90ba71012c8dedee97c143547d942b37324a84cd6d53401d86dcc6c2a89b",
+        "build_content_sha256": "fb7a90ba71012c8dedee97c143547d942b37324a84cd6d53401d86dcc6c2a89b",
+        "git_archive_sha256": "f2e4df0244c87ccda653c4ba261c141e7a2266ffd758ae0c800a100eaf76abee",
+        "tree": "ec1728de4c2bf3081ed547f29b49e51d32edade9",
+        "tag_object": "df4fd283e8e0cfb25729782c21ae2b7da7f03ffe",
+        "version": "v2.3.0"
+      },
+      "source_url": "https://github.com/jrl-umi3218/jrl-cmakemodules.git",
+      "license": {
+        "path": "LICENSE",
+        "spdx": "LGPL-3.0-only",
+        "sha256": "09ba2945cb6c99e33d9ecc608f0fddb5f3b4af8b5096a1811bc750fe29d617fc"
+      },
+      "role": "exact CMake module source ProxSuite 0.8.2 configures with (JRL_CMAKEMODULES_SOURCE_DIR); build-time only, nothing installed; the version ProxSuite 0.8.2 locks"
+    },
+    {
+      "id": "nanoflann_2_0_1_dependency",
+      "identity": {
+        "commit": "18f4edf753e813644a7a12711a86139777a8ef00",
+        "source_content_sha256": "8b03dcd45f4b9741681f58651c6ba39f190d94388bc09dcc8300c513b0b76cec",
+        "build_content_sha256": "8b03dcd45f4b9741681f58651c6ba39f190d94388bc09dcc8300c513b0b76cec",
+        "git_archive_sha256": "82e6193a2d82db94a24260e9fb0acdccb14afccfe9f25f47b8afc5ce2f77c7b0",
+        "tree": "aee5f414ac32a44eea1618ee6117680d7dda435a",
+        "version": "2.0.1"
+      },
+      "source_url": "https://github.com/jlblancoc/nanoflann.git",
+      "license": {
+        "path": "COPYING",
+        "spdx": "BSD-2-Clause",
+        "sha256": "12e2e0baacf7fa6291e6058a7cd0e680d9b7c1e29df791ac2695e3cb9517b9d7"
+      },
+      "role": "exact header-only K-D tree source of RoboPlan 0.8 RRT (>=2.0.1 required), linked privately; replaces RoboPlan's configure-time fetch"
+    }
+  ],
+  "planning_capability_responsibility": [
+    {
+      "id": "portable_program_and_request_meaning",
+      "portable_semantic_owner": "ManyForge Program, retained-product, and Kernel contracts",
+      "adapter_responsibility": "Translate one validated portable request into planner-native inputs without planner-native types escaping.",
+      "planner_prerequisite": "Accept the adapter's finite native problem and return a candidate or attributable failure.",
+      "restoration_gate": "I6",
+      "acceptance_evidence": [
+        "unchanged portable request reaches reference and selected RoboPlan adapters",
+        "retained I3 product semantics and projection identities remain unchanged"
+      ]
+    },
+    {
+      "id": "logical_scene_truth",
+      "portable_semantic_owner": "ManyForge logical-scene owner",
+      "adapter_responsibility": "Construct a fresh planner-native scene for one exact retained projection generation and acknowledge that generation.",
+      "planner_prerequisite": "Provide native scene and collision structures whose lifetime can remain adapter-private.",
+      "restoration_gate": "I6",
+      "acceptance_evidence": [
+        "source-destruction and generation-mismatch regressions",
+        "scene reconstruction and collision parity corpus"
+      ]
+    },
+    {
+      "id": "native_object_lifetime_and_concurrency",
+      "portable_semantic_owner": "ManyForge selected-adapter lifecycle contract",
+      "adapter_responsibility": "Own the native Scene, every borrowed context, request scratch, synchronization, and worker generation for their complete use.",
+      "planner_prerequisite": "No hidden global mutable state that defeats per-adapter isolation.",
+      "restoration_gate": "E1 feasibility, I6 implementation",
+      "acceptance_evidence": [
+        "ASan/UBSan lifetime matrix",
+        "focused TSan/concurrency isolation matrix",
+        "late-result generation rejection"
+      ]
+    },
+    {
+      "id": "candidate_planning_algorithms",
+      "portable_semantic_owner": "Planner backend for algorithmic candidate computation only",
+      "adapter_responsibility": "Select only an advertised qualified mode and normalize its result.",
+      "planner_prerequisite": "RoboPlan RRT, IK, Cartesian, OInK, and TOPPRA behavior required by the selected capability profile.",
+      "restoration_gate": "I6",
+      "acceptance_evidence": [
+        "upstream package corpus",
+        "current ManyForge planner-option and deterministic-seed corpus",
+        "capability profile rejects unadvertised optional modes"
+      ]
+    },
+    {
+      "id": "trajectory_and_collision_acceptance",
+      "portable_semantic_owner": "ManyForge independent trajectory and collision validators",
+      "adapter_responsibility": "Return an attributable candidate plus exact source/projection metadata; never self-certify portable acceptance.",
+      "planner_prerequisite": "Expose sufficient candidate samples and metadata for independent validation.",
+      "restoration_gate": "I6",
+      "acceptance_evidence": [
+        "trajectory-invariant corpus",
+        "independent collision replay",
+        "candidate rejected on mismatched projection generation"
+      ]
+    },
+    {
+      "id": "cancellation_and_deadline",
+      "portable_semantic_owner": "ManyForge request lifecycle and structured outcome contract",
+      "adapter_responsibility": "Use qualified cooperative cancellation when available; otherwise kill a bounded generation-bound worker, distinguish cancel from deadline, reject late results, and replace it before later admission.",
+      "planner_prerequisite": "Run inside a killable process when no nonblocking cooperative hook exists.",
+      "restoration_gate": "E1 feasibility, I6 implementation",
+      "acceptance_evidence": [
+        "pre-start and in-flight cancellation",
+        "deadline distinction",
+        "cancellation-to-kill and worker-replacement bounds",
+        "post-replacement first-success case"
+      ]
+    },
+    {
+      "id": "observable_progress",
+      "portable_semantic_owner": "ManyForge monotonic lifecycle progress contract",
+      "adapter_responsibility": "Normalize native progress when trustworthy or expose coarse lifecycle phases without fabricating solver-internal progress.",
+      "planner_prerequisite": "None beyond bounded invocation; native detailed progress is optional.",
+      "restoration_gate": "I6",
+      "acceptance_evidence": [
+        "progress is monotonic",
+        "opaque solver reports only truthful coarse phases"
+      ]
+    },
+    {
+      "id": "bounded_resources_and_arithmetic",
+      "portable_semantic_owner": "ManyForge request validation and adapter resource policy",
+      "adapter_responsibility": "Reject non-finite or unrepresentable inputs before dispatch and enforce CPU, memory, output, request, and replacement bounds around the native worker.",
+      "planner_prerequisite": "No dependency-internal undefined conversion or allocation can occur for admitted inputs; otherwise the smallest internal fix is required.",
+      "restoration_gate": "E1 proof, I6 implementation",
+      "acceptance_evidence": [
+        "extreme, subnormal, and non-finite input corpus",
+        "finite duration-to-cardinality proof",
+        "resident and peak-memory bounds",
+        "stalled worker containment"
+      ]
+    },
+    {
+      "id": "capability_advertisement",
+      "portable_semantic_owner": "ManyForge deployment-selected capability profile",
+      "adapter_responsibility": "Advertise only modes proven by the common conformance suite for that exact source/dependency identity.",
+      "planner_prerequisite": "Implement each advertised native mode; optional 0.6 features may remain unadvertised.",
+      "restoration_gate": "I6",
+      "acceptance_evidence": [
+        "profile and implementation identity agree",
+        "constrained RRT and other optional features remain unavailable until separately qualified"
+      ]
+    },
+    {
+      "id": "structured_error_mapping",
+      "portable_semantic_owner": "ManyForge public error taxonomy",
+      "adapter_responsibility": "Map dependency outcomes, crashes, resource termination, cancellation, deadline, and invalid results without exposing unstable native strings as semantics.",
+      "planner_prerequisite": "Return or throw an observable native outcome; process termination remains classifiable by the adapter.",
+      "restoration_gate": "I6",
+      "acceptance_evidence": [
+        "planner-option and structured-error corpus",
+        "worker crash/resource/cancel/deadline classifications"
+      ]
+    },
+    {
+      "id": "dispatch_and_recovery_admission",
+      "portable_semantic_owner": "ManyForge Kernel dispatch and adapter health state",
+      "adapter_responsibility": "Admit work only to a healthy exact generation and block subsequent work during bounded worker replacement.",
+      "planner_prerequisite": "No direct authority over dispatch or recovery admission.",
+      "restoration_gate": "I6",
+      "acceptance_evidence": [
+        "late and mismatched results cannot publish",
+        "replacement completes or fails closed within a named bound",
+        "normal warmed-worker throughput remains within budget"
+      ]
+    },
+    {
+      "id": "planner_replaceability",
+      "portable_semantic_owner": "ManyForge focused planner ports and common conformance suite",
+      "adapter_responsibility": "Implement only focused backend, scene-projection, and applicable kinematics/reference/validation ports; do not recover a combined planner/context authority.",
+      "planner_prerequisite": "RoboPlan and future MoveIt2 integrations remain external components selected through explicit adapters.",
+      "restoration_gate": "E1 boundary audit, later adapter milestone",
+      "acceptance_evidence": [
+        "static planner-portability audit",
+        "future MoveIt2 mapping requires no Kernel, Program, scene, collision, or execution redesign"
+      ]
+    }
+  ],
+  "deltas": [
+    {
+      "id": "roboplan_patch_0001_isolated_scene_clone",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_5_1_control",
+        "roboplan_0_6_0_candidate"
+      ],
+      "local_sources": [
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0001-explicit-isolated-scene-clone.patch",
+          "repository_commit": "ec2d17baa0d5f5b6d8126b608b82814371d758ee",
+          "blob": "9f3690dd553e9c695e25be78dbefa832ca6cb028",
+          "sha256": "cfa676dca94d8a8e9d4f61fb76b4988dc0810a5484b4d3a42416b5d294363344"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/native_lifetime/test_e1_roboplan_native_lifetime.cpp",
+          "sha256": "c3e9f433f30345af0fc2c996264e5045310210177665970f478aa3380a2ef899"
+        },
+        {
+          "kind": "repository_path",
+          "path": "manyforge_roboplan/test/test_roboplan_scene_generation.cpp",
+          "sha256": "cd9defadd3ee5900226ebf49e12c8c709405780846fe2478b737ebd21861207a"
+        }
+      ],
+      "guarantee": "The qualified 0.5 lane can deep-clone and transactionally replace a Scene without retaining pointer-bearing collision scratch from another generation.",
+      "consuming_surfaces": [
+        "historical manyforge_roboplan scene-generation contract",
+        "native and ROS Docker RoboPlan source builds"
+      ],
+      "owner_gate": "E1 decision and I6 adapter",
+      "acceptance_evidence": [
+        "fresh immutable native Scene per retained projection",
+        "5/5 native source-destruction, reconstruction, wrong-generation, concurrent-isolation, and ASan/UBSan cases",
+        "five historical Scene-generation successor cases and common selected-adapter conformance pass against the corrected candidate",
+        "final selected-outcome result verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final E1 contract cases with one intended optional historical-data skip"
+      ],
+      "rollback_source": "RoboPlan 0.5.1 plus the exact cfa676dc patch",
+      "removal_condition": "Delete when the selected adapter reconstructs one request-private native Scene from the ManyForge logical snapshot and clone/replacement behavior is no longer consumed, or when selected upstream supplies an equivalent proven contract.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "move_to_manyforge_boundary",
+        "rationale": "The selected adapter shape reconstructs one private native Scene per retained projection generation and structurally owns it longer than every native consumer. The five-case ASan/UBSan lifetime matrix, exact-source corpus, retained consumers, and comparable Scene/collision measurements are green without a clone/replace dependency API."
+      }
+    },
+    {
+      "id": "roboplan_patch_0002_cartesian_cancellation",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_5_1_control",
+        "roboplan_0_6_0_candidate"
+      ],
+      "local_sources": [
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0002-cartesian-planner-cooperative-cancellation.patch",
+          "repository_commit": "ec2d17baa0d5f5b6d8126b608b82814371d758ee",
+          "blob": "4b2c39316e7d7b0be5e76eda4c4f8258983c8d32",
+          "sha256": "344123b71a6eb2bcf8217ca7aea77413f68e70c5e96a397f6deb856c0cf8c9bf"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/planner_worker_containment.py",
+          "sha256": "5a516f06e94a4c7bd86ae8de1fc6bff316899fc4f451085054c2505f33a368e2"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/conformance/CMakeLists.txt",
+          "sha256": "2e64ff231ae906efafd8ccb818df8283f25e3a08ba43f17e25b83add0ca682ef"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/conformance/test_e1_roboplan_candidate_conformance.cpp",
+          "sha256": "3b37e55e022791e8d597a077424e3b1800a171288106277e1063f5a56835a6ff"
+        },
+        {
+          "kind": "repository_path",
+          "path": "tests/test_composable_cell_e1_planner_worker_containment.py",
+          "sha256": "28b7a090c9da729418256cefb296bce97ed05ec146783c9c7b7010d5336bbb97"
+        }
+      ],
+      "guarantee": "The historical bounded Cartesian path can observe cooperative cancellation and progress between its visible work phases.",
+      "consuming_surfaces": [
+        "historical ManyForge Cartesian planner adapter",
+        "bounded cancellation/progress qualification corpus"
+      ],
+      "owner_gate": "E1 containment decision and I6 adapter",
+      "acceptance_evidence": [
+        "22-case Docker finite-admission, caller-bound projection, actual-candidate bootstrap, sealed-result, orphan-cleanup, and warmed-worker containment suite",
+        "common selected-adapter conformance executable covers 11 supported-or-exact-rejection cases and advertises only joint, pose, Cartesian, first-feasible, and IK",
+        "five interleaved 200-operation actual-RRT control/candidate probes with exact worker module/runtime/thread attestation, cancel/deadline distinction, process-group kill, generation fencing, bounded replacement, resource exhaustion, and post-replacement success"
+      ],
+      "rollback_source": "RoboPlan 0.5.1 plus the exact 344123b7 patch",
+      "removal_condition": "Delete when the adapter-owned hybrid cooperative-or-killable-worker path meets the complete portable cancellation, deadline, progress, and recovery contract without a dependency callback.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "move_to_manyforge_boundary",
+        "rationale": "Actual RoboPlan RRT work remains warm on the normal path, while cancel and deadline kill and replace the generation-bound worker with no late-result publication. Five fresh cohorts show comparable memory, kill, replacement, and recovery behavior. The separately disclosed RRT median regression does not weaken cancellation and does not justify restoring a dependency callback when the bounded worker meets the portable contract."
+      }
+    },
+    {
+      "id": "roboplan_patch_0003_collision_context_generation",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_5_1_control",
+        "roboplan_0_6_0_candidate"
+      ],
+      "local_sources": [
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0003-own-collision-context-scene-generation.patch",
+          "repository_commit": "ec2d17baa0d5f5b6d8126b608b82814371d758ee",
+          "blob": "cc6a5222a636572496ec182cabc1799d7d99a01d",
+          "sha256": "0e83a7b644bf033e9d00d3ec1f638f8126593602c04416ab9fc70e98d186c81c"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/native_lifetime/test_e1_roboplan_native_lifetime.cpp",
+          "sha256": "c3e9f433f30345af0fc2c996264e5045310210177665970f478aa3380a2ef899"
+        }
+      ],
+      "guarantee": "Every historical CollisionContext and planner consumer retains the exact immutable Scene generation whose model storage it borrows.",
+      "consuming_surfaces": [
+        "historical IK, OInK, RRT, TOPPRA, Cartesian, and path utility calls",
+        "scene source-lifetime sanitizer corpus"
+      ],
+      "owner_gate": "E1 lifetime decision and I6 adapter",
+      "acceptance_evidence": [
+        "adapter/worker owns Scene longer than all native consumers",
+        "5/5 source-destruction, exact-generation mismatch, ASan/UBSan, and concurrent-isolation cases",
+        "actual-candidate warmed worker generation is invalidated and replaced after cancel/deadline"
+      ],
+      "rollback_source": "RoboPlan 0.5.1 plus the exact 0e83a7b6 patch",
+      "removal_condition": "Delete when planner-native contexts remain unexported inside a worker generation whose Scene lifetime structurally encloses every consumer, or when upstream contexts own equivalent lifetime.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "move_to_manyforge_boundary",
+        "rationale": "Raw 0.6 CollisionContext is safe when it never escapes a worker generation whose owned Scene lifetime encloses it. The five-case native sanitizer matrix and actual-candidate generation-replacement probes prove this ownership shape, so the dependency does not need shared Scene ownership or exported generation authority."
+      }
+    },
+    {
+      "id": "roboplan_patch_0004_build_helper_arguments",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_5_1_control",
+        "roboplan_0_6_0_candidate"
+      ],
+      "local_sources": [
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0004-configurable-source-build-cmake-arguments.patch",
+          "repository_commit": "ec2d17baa0d5f5b6d8126b608b82814371d758ee",
+          "blob": "f647b8dec4a574616b2a6c97fd803efca0a66308",
+          "sha256": "8867a87ea695b4196e9d05b424c1a4be0219fe9017ab21fa8e89aeb7b89ac086"
+        },
+        {
+          "kind": "repository_path",
+          "path": "scripts/ci/build-roboplan-source-stack.sh",
+          "sha256": "a38bc4bd8768a273811350d3d060f5b126efe678e5942e4084e6e96f835a8130"
+        },
+        {
+          "kind": "repository_path",
+          "path": "scripts/ci/verify-external-source-closure.py",
+          "sha256": "ba48a758dc5076ba055c4f156e66f695b56c7dfaab674a4a3bf7c100b0999e78"
+        },
+        {
+          "kind": "repository_path",
+          "path": "Dockerfile",
+          "sha256": "ad25fd4c644b1e95b3029f65ac8bc0c91a746b2e6e2f7cfa3d36f7195002ec16"
+        },
+        {
+          "kind": "repository_path",
+          "path": "Dockerfile.ros-jazzy-full",
+          "sha256": "f0fc82d5c3a177e88db80f9db2327c5a6e5c286c524383636c695116d9a68c96"
+        },
+        {
+          "kind": "repository_path",
+          "path": "tests/test_roboplan_source_stack_builder.py",
+          "sha256": "57c64e80b2316d9c25a9b34e71fc89e61fea92f566c4543302952e956365a015"
+        }
+      ],
+      "guarantee": "Pass caller-owned CMake arguments without scalar word splitting and build from an explicit source prefix.",
+      "consuming_surfaces": [
+        "native and ROS Docker source builds"
+      ],
+      "owner_gate": "E1",
+      "acceptance_evidence": [
+        "tests/test_roboplan_source_stack_builder.py",
+        "clean raw 0.6 source-stack build with just-built libraries ahead of ambient same-soname generations",
+        "native and ROS Docker build inputs call exact content/license/Git preflight before configuration",
+        "explicit ROBOPLAN_REF experiments are visibly non-qualification while canonical builds fail closed"
+      ],
+      "rollback_source": "Historical ec2d17b Git blob f647b8d and the unmodified upstream build helper.",
+      "removal_condition": "Already met: source-build orchestration and prefix selection are ManyForge integration responsibilities.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "move_to_manyforge_boundary",
+        "rationale": "The mutation changed only RoboPlan's convenience helper. The checked ManyForge builder now owns arguments, exact content/license preflight, build/install prefixes, same-soname isolation, and explicit separation of qualified versus development-override builds without changing dependency semantics."
+      }
+    },
+    {
+      "id": "roboplan_patch_0005_scene_scratch_construction",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_5_1_control",
+        "roboplan_0_6_0_candidate"
+      ],
+      "local_sources": [
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0005-construct-scene-scratch-without-copy-assignment.patch",
+          "repository_commit": "ec2d17baa0d5f5b6d8126b608b82814371d758ee",
+          "blob": "d28ad707fc0192fc398f947eb50f432a51828868",
+          "sha256": "e13cdc712cd98c411f8f1a0dbc2ee9944fed536745fc92ddf64e60c41ed2b537"
+        },
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0005-construct-roboplan-060-scene-scratch-without-assignment.patch",
+          "repository_commit": "6ff42c4cf70be415159624adba1428100a2ee116",
+          "blob": "35806c9659394d552ae0742ec1e98831d35c905e",
+          "sha256": "00ca95fea84dcf1180d80f8abd2782897a3911fef80ae639131d75f834250184"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/patches/0005-construct-roboplan-060-scene-scratch-without-assignment.patch",
+          "sha256": "00ca95fea84dcf1180d80f8abd2782897a3911fef80ae639131d75f834250184"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/sanitizers/CMakeLists.txt",
+          "sha256": "9adac6d5eb5fdfe518e47facceafd9148527ab758cc994e922e938ba5e553734"
+        }
+      ],
+      "guarantee": "Construct Pinocchio Data and GeometryData only after their owning models exist, avoiding assignment through uninitialized pointer-bearing or Eigen solver state.",
+      "consuming_surfaces": [
+        "RoboPlan Scene construction and geometry mutation",
+        "strict scene lifetime sanitizer corpus"
+      ],
+      "owner_gate": "E1 dependency-internal correctness decision",
+      "acceptance_evidence": [
+        "raw 0.6 Release upstream suite",
+        "raw 0.6 UBSan invalid Eigen ComputationInfo read at scene.cpp:185 through pinocchio::Data assignment",
+        "candidate 0.6 complete 47-case roboplan ASan/UBSan suite and 128 repeated Scene mutation cases",
+        "corrected exact disconnected full-stack build and 47/47 source-installed Python corpus",
+        "5/5 adapter-shaped native lifetime ASan/UBSan cases, five historical Scene-generation behaviors, and comparable Scene/collision performance",
+        "final selected-outcome result verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final E1 contract cases with one intended optional historical-data skip",
+        "third_party/roboplan/upstream/roboplan-060-scene-scratch-construction-ubsan.md",
+        "Pinocchio-version compatibility analysis"
+      ],
+      "rollback_source": "RoboPlan 0.5.1 plus the exact e13cdc71 patch",
+      "removal_condition": "Delete only if raw selected upstream construction is sanitizer-clean and semantically safe for the exact Pinocchio closure; otherwise carry the smallest reproduction-backed fix and submit it upstream.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "submit_upstream_and_carry_until_released",
+        "rationale": "Clean 0.6 reproducibly reads invalid Eigen solver state while assigning model-bound Pinocchio scratch. The smallest optional/emplace correction preserves the public API and copy/move traits and is green under focused and cumulative sanitizer, Release, binding, retained-consumer, lifetime, and performance evidence. An adapter cannot make dependency-internal construction defined.",
+        "upstream_dossier": "third_party/roboplan/upstream/roboplan-060-scene-scratch-construction-ubsan.md",
+        "dossier_fields": [
+          "exact_upstream_source",
+          "dependency_closure",
+          "minimal_reproduction",
+          "impact",
+          "smallest_patch",
+          "focused_regression",
+          "sanitizer_evidence",
+          "compatibility_risk",
+          "intended_upstream_contract",
+          "removal_predicate"
+        ]
+      },
+      "superseded_by": "roboplan_patch_0010_scene_scratch_construction"
+    },
+    {
+      "id": "roboplan_patch_0006_cartesian_duration_arithmetic",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_5_1_control",
+        "roboplan_0_6_0_candidate"
+      ],
+      "local_sources": [
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0006-bound-cartesian-duration-arithmetic.patch",
+          "repository_commit": "ec2d17baa0d5f5b6d8126b608b82814371d758ee",
+          "blob": "4f92fe487beccd23b4399d70c03955c432e437b2",
+          "sha256": "c0b699d5f2eb28edda43290710b328aca6837cee2290ec5b3a339b1d1051a581"
+        },
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0006-bound-roboplan-060-toppra-output-samples.patch",
+          "repository_commit": "6ff42c4cf70be415159624adba1428100a2ee116",
+          "blob": "ae85585dd87fbcec708c54738bd66b64da998277",
+          "sha256": "ba886434bdca4eafb6f59ce630b1b4a4957a2c7ffb0c7e3c140a1bab5c5fac6a"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/patches/0006-bound-roboplan-060-toppra-output-samples.patch",
+          "sha256": "ba886434bdca4eafb6f59ce630b1b4a4957a2c7ffb0c7e3c140a1bab5c5fac6a"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/planner_worker_containment.py",
+          "sha256": "5a516f06e94a4c7bd86ae8de1fc6bff316899fc4f451085054c2505f33a368e2"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/roboplan_offline_benchmark.py",
+          "sha256": "26ddaec8979d41fb20b369c57d9c012d8993ca0c56e3f0eb29b7d0f779ed84d2"
+        }
+      ],
+      "guarantee": "Reject non-finite or excessive Cartesian duration and step budgets before integer conversion, reserve, or whole-trace retries.",
+      "consuming_surfaces": [
+        "historical bounded Cartesian planner",
+        "extreme-speed and acceleration resource regressions"
+      ],
+      "owner_gate": "E1 arithmetic/containment decision and I6 adapter",
+      "acceptance_evidence": [
+        "finite and representable adapter input proof",
+        "raw 0.6 non-finite dt reaches an unstructured vector::reserve exception with exact candidate libraries selected",
+        "candidate 0.6 complete 17-case TOPPRA Release and ASan/UBSan suites",
+        "candidate 0.6 Python max_output_samples constructor/property/default compatibility",
+        "third_party/roboplan/upstream/roboplan-060-toppra-output-sample-bound.md",
+        "22-case pre-dispatch finite/sample-budget, caller-bound projection, actual-candidate bootstrap, sealed-result, and worker peak-memory/resource-termination suite",
+        "corrected exact disconnected four-patch source stack builds and its source-installed Python corpus passes 47/47",
+        "final selected-outcome result verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final E1 contract cases with one intended optional historical-data skip",
+        "five fresh interleaved performance cohorts show no material TOPPRA regression and a material Cartesian improvement"
+      ],
+      "rollback_source": "RoboPlan 0.5.1 plus the exact c0b699d5 patch",
+      "removal_condition": "Delete when adapter validation proves every admitted input and output cardinality finite and bounded before dependency allocation; carry and upstream only the smallest internal derived-value guard that cannot be enforced externally.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "submit_upstream_and_carry_until_released",
+        "rationale": "ManyForge owns pre-dispatch finite/resource policy and worker containment, while the solver-derived final duration and reserve cardinality exist only inside RoboPlan. Clean 0.6 admits NaN and reaches an unstructured vector::reserve failure. The smallest dependency option/guard is green under focused and cumulative Release, sanitizer, binding, containment, exact-source, and performance evidence.",
+        "upstream_dossier": "third_party/roboplan/upstream/roboplan-060-toppra-output-sample-bound.md",
+        "dossier_fields": [
+          "exact_upstream_source",
+          "dependency_closure",
+          "minimal_reproduction",
+          "impact",
+          "smallest_patch",
+          "focused_regression",
+          "sanitizer_evidence",
+          "compatibility_risk",
+          "intended_upstream_contract",
+          "removal_predicate"
+        ]
+      },
+      "superseded_by": "roboplan_patch_0011_toppra_output_sample_bound"
+    },
+    {
+      "id": "roboplan_patch_0007_serialized_collision_view",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_5_1_control",
+        "roboplan_0_6_0_candidate"
+      ],
+      "local_sources": [
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0007-explicit-serialized-collision-query-view.patch",
+          "repository_commit": "ec2d17baa0d5f5b6d8126b608b82814371d758ee",
+          "blob": "627a9e3765710da76ceadea4f936554b69a86b5d",
+          "sha256": "d14a8eb7b2f99dfc37a59475e0add3514fe1d96d78a818ca4c7ce658cbc2e14d"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/roboplan_offline_benchmark.py",
+          "sha256": "26ddaec8979d41fb20b369c57d9c012d8993ca0c56e3f0eb29b7d0f779ed84d2"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/aggregate_performance_evidence.py",
+          "sha256": "1ab2c513766d4363b3903faf7d4b5dc517d964be44d79a10fcc961abc26328a9"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/evidence/roboplan-060-comparable-performance.v1.json",
+          "sha256": "38b9193731775d8cf66ec537fe6da7a6d8d5f5adae44e35045c5af44613a5539"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/patch0007_ab/CMakeLists.txt",
+          "sha256": "30f809a66f337b748b0c70d312519050029a6a0cf47d143ea5b405b5f7209088"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/patch0007_ab/patch0007_collision_reuse_ab.cpp",
+          "sha256": "bb2310271a40787f4dfc281d28a85cec186ae98ad90e4a664dd1e8f13dc54d41"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/evidence/roboplan-051-patch0007-collision-reuse-ab.v1.json",
+          "sha256": "ad086267ba5396c51fc4e6d2a50726ebb87dc8dd62a2e652150a679d4e6c8b30"
+        },
+        {
+          "kind": "repository_path",
+          "path": "tests/test_composable_cell_e1_performance_evidence.py",
+          "sha256": "5bb3f982a8bd706196aa08d58149abf65b4523971892dc4674b1ffb4c0153643"
+        }
+      ],
+      "guarantee": "Keep collision workspaces request-private and generation-safe, and avoid allocation churn only when measured practical benefit justifies the required dependency surface.",
+      "consuming_surfaces": [
+        "historical performance-qualified RoboPlan adapters",
+        "collision allocation/latency and timeout-candidate regressions"
+      ],
+      "owner_gate": "E1 measured performance disposition and I6 adapter performance qualification",
+      "acceptance_evidence": [
+        "five fresh interleaved Release control/candidate offline and actual-worker cohorts with exact binary/source/closure identities",
+        "candidate joint RRT has a reproducible material 12-13% median/throughput regression (about 1.4-1.8 ms), while Cartesian is about 56% faster and collision, IK, TOPPRA, memory, kill, replacement, and recovery remain comparable or better",
+        "verification/composable_cell_e1/evidence/roboplan-060-comparable-performance.v1.json",
+        "direct five-batch 0.5.1 A/B: reusable scratch changes p50 by -0.45% and throughput by +0.74% while reducing operator-new calls by 6.6% and bytes by 17.6%",
+        "verification/composable_cell_e1/evidence/roboplan-051-patch0007-collision-reuse-ab.v1.json",
+        "exact 0.6 RRT::plan constructs a fresh request-private CollisionContext internally and exposes no reuse hook; the candidate remains inside the frozen memory, latency, throughput, containment, and recovery bounds without patch 0007",
+        "joint RRT, pose IK, TOPPRA, Cartesian, exact-generation mismatch, sealed trajectory transfer, parity, sanitizer, and recovery cases"
+      ],
+      "rollback_source": "Historical ec2d17b patch blob 627a9e3; current candidate removes only its integration-only source-prefix hunk.",
+      "removal_condition": "Delete the broad dependency API when raw 0.6 provides request-private generation-safe scratch and the direct A/B shows no practical latency/throughput benefit sufficient to justify a new upstream hook; retain the evidence for ordinary I6 allocation and performance regression checks.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "delete_upstream_equivalent",
+        "rationale": "Raw 0.6 already constructs request-private generation-safe collision scratch, so the correctness and lifetime guarantee has an upstream equivalent. Its only public RRT::plan entrypoint creates a fresh CollisionContext and exposes no safe injection hook. The direct 0.5.1 A/B attributes 6.6% fewer operator-new calls and 17.6% fewer bytes to reuse, but only -0.45% p50 and +0.74% throughput; candidate memory and containment remain inside the frozen bounds. Adding and maintaining a new lifetime-bearing dependency API for that negligible runtime gain is not justified. I6 retains ordinary allocation/performance regression checks, not a promise to reproduce this retired internal optimization. The separate 0.6 joint-RRT regression remains an explicit Adopt/No-go tradeoff."
+      }
+    },
+    {
+      "id": "roboplan_patch_0008_dynotree_variant_initialization",
+      "dependency": "RoboPlan embedded DynoTree",
+      "source_identity_refs": [
+        "roboplan_0_6_0_candidate"
+      ],
+      "local_sources": [
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0008-initialize-roboplan-060-dynotree-variant-state.patch",
+          "repository_commit": "6ff42c4cf70be415159624adba1428100a2ee116",
+          "blob": "9afdb74a86d87954e928e845c2f981239e0cc932",
+          "sha256": "e705472bfa05feecc8cf0b669018968966687a5a911047307be01f421ac2cbdd"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/patches/0008-initialize-roboplan-060-dynotree-variant-state.patch",
+          "sha256": "e705472bfa05feecc8cf0b669018968966687a5a911047307be01f421ac2cbdd"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/sanitizers/CMakeLists.txt",
+          "sha256": "9adac6d5eb5fdfe518e47facceafd9148527ab758cc994e922e938ba5e553734"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/sanitizers/test_e1_dynotree_state_contract.cpp",
+          "sha256": "8c2d0cb5bd8ec1b77d34935f7a2739935d6f3b07e71b7f8c21effd7a21a8269a"
+        }
+      ],
+      "guarantee": "DynoTree state-space alternatives enter std::variant with deterministic initialized bounds and neutral weights rather than indeterminate fixed-size Eigen coefficients.",
+      "consuming_surfaces": [
+        "RoboPlan RRT and constrained-RRT state-space construction",
+        "selected RoboPlan Python RRT binding"
+      ],
+      "owner_gate": "E1 dependency-internal reliability decision",
+      "acceptance_evidence": [
+        "raw exact 0.6 emits eight -Wmaybe-uninitialized paths and fails when that warning is promoted to an error",
+        "corrected warning-as-error Release build and 15/15 RRT cases",
+        "corrected 17/17 RRT ASan/UBSan plus aggregate/default-state cases and complete 47/47 source-installed Python corpus",
+        "fresh five-cohort performance evidence records a release-level joint-RRT regression without attributing it to this initialization patch",
+        "third_party/roboplan/upstream/roboplan-060-dynotree-variant-initialization.md"
+      ],
+      "rollback_source": "Exact raw RoboPlan 0.6.0 embedded DynoTree header.",
+      "removal_condition": "Delete when selected upstream initializes the same state deterministically and the warning-as-error, RRT sanitizer/binding, retained-consumer, and performance rows pass without the local patch.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "submit_upstream_and_carry_until_released",
+        "rationale": "The warning traces reach moves of default-created fixed-size Eigen state into a variant. Aggregate-compatible default member initialization for fixed and dynamic state is the smallest dependency-local correction, eliminates indeterminate state, changes no algorithm or public API, and is green under the corrected focused build, sanitizer, package, and final selected-outcome replay rows.",
+        "upstream_dossier": "third_party/roboplan/upstream/roboplan-060-dynotree-variant-initialization.md",
+        "dossier_fields": [
+          "exact_upstream_source",
+          "dependency_closure",
+          "minimal_reproduction",
+          "impact",
+          "smallest_patch",
+          "focused_regression",
+          "sanitizer_evidence",
+          "compatibility_risk",
+          "intended_upstream_contract",
+          "removal_predicate"
+        ]
+      },
+      "superseded_by": "roboplan_patch_0012_dynotree_variant_initialization"
+    },
+    {
+      "id": "roboplan_patch_0009_pinocchio_scratch_direct_initialization",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_6_0_candidate"
+      ],
+      "local_sources": [
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0009-direct-initialize-roboplan-060-pinocchio-scratch.patch",
+          "repository_commit": "6ff42c4cf70be415159624adba1428100a2ee116",
+          "blob": "281a11fb1c9ad3434d4dfd547640de104bea94cf",
+          "sha256": "af8526dad047c046c6cd5a33a0513a3c94fca321da22c658d54e0efa33a5f858"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/patches/0009-direct-initialize-roboplan-060-pinocchio-scratch.patch",
+          "sha256": "af8526dad047c046c6cd5a33a0513a3c94fca321da22c658d54e0efa33a5f858"
+        },
+        {
+          "kind": "repository_path",
+          "path": "verification/composable_cell_e1/sanitizers/CMakeLists.txt",
+          "sha256": "9adac6d5eb5fdfe518e47facceafd9148527ab758cc994e922e938ba5e553734"
+        }
+      ],
+      "guarantee": "PoseConstraint and Simple IK construct model-sized Pinocchio scratch directly from the final model instead of assigning over default objects with indeterminate Eigen solver state.",
+      "consuming_surfaces": [
+        "RoboPlan constrained RRT PoseConstraint",
+        "RoboPlan Simple IK",
+        "selected RoboPlan Python RRT and Simple IK bindings"
+      ],
+      "owner_gate": "E1 dependency-internal correctness decision",
+      "acceptance_evidence": [
+        "raw exact 0.6 constrained-RRT UBSan invalid Eigen ComputationInfo read at constraints.cpp:56",
+        "corrected native lifetime 5/5, RRT 15/15, and Simple IK 4/4 ASan/UBSan cases",
+        "corrected Release RRT 15/15 and Simple IK 4/4, ASan/UBSan RRT 17/17 and Simple IK 4/4, and complete Python corpus 47/47",
+        "common selected-adapter conformance and five historical Scene-generation behaviors pass; final selected-outcome result records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final E1 contract cases with one intended optional historical-data skip",
+        "fresh performance evidence discloses the release-level joint-RRT regression rather than making a blanket per-patch no-regression claim",
+        "third_party/roboplan/upstream/roboplan-060-pinocchio-scratch-direct-initialization.md"
+      ],
+      "rollback_source": "Exact raw RoboPlan 0.6.0 PoseConstraint and Simple IK constructors.",
+      "removal_condition": "Delete when selected upstream directly initializes both model-bound scratch members, the raw UBSan reproduction no longer reports, and the focused/cumulative Release, sanitizer, binding, retained-consumer, and performance rows pass without the local patch.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "submit_upstream_and_carry_until_released",
+        "rationale": "Clean 0.6 repeats the sanitizer-confirmed Scene construction defect in PoseConstraint and Simple IK. Direct member initialization is the smallest fix, changes no public contract, removes one whole-object assignment, and is green under the corrected focused Release, sanitizer, package, conformance, Scene, and final selected-outcome replay evidence.",
+        "upstream_dossier": "third_party/roboplan/upstream/roboplan-060-pinocchio-scratch-direct-initialization.md",
+        "dossier_fields": [
+          "exact_upstream_source",
+          "dependency_closure",
+          "minimal_reproduction",
+          "impact",
+          "smallest_patch",
+          "focused_regression",
+          "sanitizer_evidence",
+          "compatibility_risk",
+          "intended_upstream_contract",
+          "removal_predicate"
+        ]
+      },
+      "superseded_by": "roboplan_patch_0013_pose_constraint_scratch_direct_initialization"
+    },
+    {
+      "id": "roboplan_patch_0010_scene_scratch_construction",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_8_0_foundation"
+      ],
+      "local_sources": [
+        {
+          "kind": "repository_path",
+          "path": "third_party/roboplan/patches/0010-construct-roboplan-080-scene-scratch-without-assignment.patch",
+          "sha256": "ffd0fdf2e69381ffcfc260193c4d035b9f791d57aea5e921720831c8d7d85b90"
+        },
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0010-construct-roboplan-070-scene-scratch-without-assignment.patch",
+          "repository_commit": "0703ea48de8b5d8487ae9f54d9f488c589ea2829",
+          "blob": "5881d15142f8a66a39d1f1530a764d4283d14b10",
+          "sha256": "57b699cb2dec5604f091ad5170c6e187caa7132cc14dd2b0b58b726c04d4930b"
+        }
+      ],
+      "guarantee": "Construct RoboPlan 0.8 Scene-owned Pinocchio Data and GeometryData only after their owning models exist, avoiding assignment through uninitialized pointer-bearing or Eigen solver state.",
+      "consuming_surfaces": [
+        "RoboPlan 0.8 roboplan_core Scene construction and refreshCollisionData geometry mutation",
+        "manyforge_roboplan_scene_factory retained-model Scene construction"
+      ],
+      "owner_gate": "M9 RoboPlan 0.8 upgrade; dependency-internal correctness decision",
+      "acceptance_evidence": [
+        "M9-R1 0.8 source inspection: Scene still default-constructs model_data_ and collision_model_data_ and reassigns GeometryData in refreshCollisionData",
+        "M9-R1 Thor arm64 image manyforge-ros-lyrical-full:m9-rp08: patched upstream roboplan_core 8/8 in Release and ASan+UBSan; ManyForge RoboPlan adapter tests 96/96",
+        "third_party/roboplan/patches.sha256 lists this patch in the 0.8 patch series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_8_0_foundation",
+        "third_party/roboplan/upstream/roboplan-060-scene-scratch-construction-ubsan.md retains the clean 0.6 UBSan reproduction"
+      ],
+      "rollback_source": "Exact raw RoboPlan 0.8.0 roboplan_core Scene constructor and refreshCollisionData; the frozen 0.6 restoration closure carries roboplan_patch_0005_scene_scratch_construction.",
+      "removal_condition": "Delete after a released upstream source supplies equivalent defined construction and the focused Scene, mutation, lifetime, sanitizer, binding, and performance evidence passes without it.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "submit_upstream_and_carry_until_released",
+        "rationale": "Re-ported 0.8 successor of the E1 0.6 correction. RoboPlan 0.8 centralizes the reassignment in refreshCollisionData but still default-constructs and then assigns nontrivial Pinocchio scratch; an adapter cannot make dependency-internal construction defined, so the smallest construction fix is carried until an upstream release supplies it.",
+        "upstream_dossier": "third_party/roboplan/upstream/roboplan-060-scene-scratch-construction-ubsan.md",
+        "dossier_fields": [
+          "exact_upstream_source",
+          "dependency_closure",
+          "minimal_reproduction",
+          "impact",
+          "smallest_patch",
+          "focused_regression",
+          "sanitizer_evidence",
+          "compatibility_risk",
+          "intended_upstream_contract",
+          "removal_predicate"
+        ]
+      },
+      "supersedes": "roboplan_patch_0005_scene_scratch_construction"
+    },
+    {
+      "id": "roboplan_patch_0011_toppra_output_sample_bound",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_8_0_foundation"
+      ],
+      "local_sources": [
+        {
+          "kind": "repository_path",
+          "path": "third_party/roboplan/patches/0011-bound-roboplan-080-toppra-output-samples.patch",
+          "sha256": "7ce3cea3ae91c373dfe0ab6f0ae765cf81a39a3c3a1afe0746c5d8972a7a565a"
+        },
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0011-bound-roboplan-070-toppra-output-samples.patch",
+          "repository_commit": "0703ea48de8b5d8487ae9f54d9f488c589ea2829",
+          "blob": "638d4a70569831ba9e8fbb0a52144be7d735bb27",
+          "sha256": "7ddf2e2f899678876d36016a334743d03daff9ed8c9c7c51b39f5dc1936ecb05"
+        }
+      ],
+      "guarantee": "Reject non-finite RoboPlan 0.8 TOPPRA solver output and prove the output-sample cardinality bound before integer conversion or allocation.",
+      "consuming_surfaces": [
+        "RoboPlan 0.8 roboplan_toppra time parameterization (joint moves and TimeOptimal Cartesian timing)",
+        "RoboPlan 0.8 Python TOPPRA max_output_samples option"
+      ],
+      "owner_gate": "M9 RoboPlan 0.8 upgrade; dependency-internal correctness decision",
+      "acceptance_evidence": [
+        "M9-R1 0.8 source inspection: PathParameterizerTOPPRA::generate still converts the solver duration to a sample count without a finiteness or cardinality check",
+        "M9-R1 Thor arm64 image manyforge-ros-lyrical-full:m9-rp08: patched upstream test_toppra 20/20 under ASan+UBSan including the patch's own cases; in Release 19/20, the one failure (LinearBlendIsFastAndRespectsLimitsOnSharpCorner) fails identically on raw 0.8.0",
+        "third_party/roboplan/patches.sha256 lists this patch in the 0.8 patch series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_8_0_foundation",
+        "third_party/roboplan/upstream/roboplan-060-toppra-output-sample-bound.md retains the clean 0.6 reproduction"
+      ],
+      "rollback_source": "Exact raw RoboPlan 0.8.0 roboplan_toppra; the frozen 0.6 restoration closure carries roboplan_patch_0006_cartesian_duration_arithmetic.",
+      "removal_condition": "Delete after an upstream release supplies the same derived-output guard and the finite/extreme-input, allocation, TOPPRA, binding, sanitizer, and containment evidence passes without it.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "submit_upstream_and_carry_until_released",
+        "rationale": "Re-ported 0.8 successor of the E1 0.6 guard. The solver-derived duration and sample cardinality exist only inside RoboPlan, so the smallest dependency-local guard is carried until an upstream release supplies it. RoboPlan 0.8 Bounded Cartesian timing samples its own trajectory outside TOPP-RA; that loop is deliberately not patched: the planning deadline bounds it (the worker process is killed) and ManyForge rejects any result above maximum_trajectory_samples.",
+        "upstream_dossier": "third_party/roboplan/upstream/roboplan-060-toppra-output-sample-bound.md",
+        "dossier_fields": [
+          "exact_upstream_source",
+          "dependency_closure",
+          "minimal_reproduction",
+          "impact",
+          "smallest_patch",
+          "focused_regression",
+          "sanitizer_evidence",
+          "compatibility_risk",
+          "intended_upstream_contract",
+          "removal_predicate"
+        ]
+      },
+      "supersedes": "roboplan_patch_0006_cartesian_duration_arithmetic"
+    },
+    {
+      "id": "roboplan_patch_0012_dynotree_variant_initialization",
+      "dependency": "RoboPlan embedded DynoTree",
+      "source_identity_refs": [
+        "roboplan_0_7_0_ua1_foundation"
+      ],
+      "local_sources": [
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0012-initialize-roboplan-070-dynotree-variant-state.patch",
+          "repository_commit": "0703ea48de8b5d8487ae9f54d9f488c589ea2829",
+          "blob": "20209b0d945fbbc7bd3317411d04225c76bbf80f",
+          "sha256": "aab3c280517c7759ab28f094a87cb3aa6bd261f8ec7e727ff12d9adfc7db980a"
+        }
+      ],
+      "guarantee": "RoboPlan 0.7 DynoTree fixed and dynamic state-space alternatives enter std::variant with deterministic initialized bounds and neutral weights.",
+      "consuming_surfaces": [
+        "RoboPlan 0.7 RRT and constrained-RRT state-space construction",
+        "RoboPlan 0.7 Python RRT binding"
+      ],
+      "owner_gate": "UI6-I-UA1 dependency-internal correctness decision; UA7 selected-closure qualification",
+      "acceptance_evidence": [
+        "UI6-I-UA1 0.7 source inspection: the upstream RRT state-space fix does not initialize these lower, upper, and weight members",
+        "UI6-I-UA1 focused container qualification: exact patched upstream RRT 16/16 including the warning-as-error construction check, and independent DynoTree initialization 2/2",
+        "third_party/roboplan/upstream/roboplan-060-dynotree-variant-initialization.md retains the clean 0.6 reproduction",
+        "RoboPlan 0.8 replaced the embedded DynoTree with nanoflann K-D trees (upstream #376); the patched header no longer exists in roboplan_0_8_0_foundation"
+      ],
+      "rollback_source": "Exact raw RoboPlan 0.7.0 embedded DynoTree header; the frozen 0.6 restoration closure carries roboplan_patch_0008_dynotree_variant_initialization.",
+      "removal_condition": "Delete after an upstream release provides equivalent initialization and the warning-as-error, RRT, sanitizer, binding, and conformance rows pass without it.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "delete_upstream_equivalent",
+        "rationale": "Retired with the RoboPlan 0.8 upgrade: upstream removed DynoTree, so the initialization defect and its patch have no target in the selected source. The 0.7 body stays bound to its exact Git blob."
+      },
+      "supersedes": "roboplan_patch_0008_dynotree_variant_initialization"
+    },
+    {
+      "id": "roboplan_patch_0013_pose_constraint_scratch_direct_initialization",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_8_0_foundation"
+      ],
+      "local_sources": [
+        {
+          "kind": "repository_path",
+          "path": "third_party/roboplan/patches/0013-direct-initialize-roboplan-080-pose-constraint-scratch.patch",
+          "sha256": "3ee83f1eec89c89be215f638ecd0aadb6bfcb61cb95f9cccd51c71c3e9274cd7"
+        },
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0013-direct-initialize-roboplan-070-pose-constraint-scratch.patch",
+          "repository_commit": "0703ea48de8b5d8487ae9f54d9f488c589ea2829",
+          "blob": "3c34b72766a864f7dfd285e8ecfac0605a250d8c",
+          "sha256": "db7acbac01e3868495966bc79fa0fbc0f0d37f0a3af88596a5a76b66a29998ce"
+        }
+      ],
+      "guarantee": "RoboPlan 0.8 PoseConstraint (now in roboplan_core) constructs model-sized Pinocchio scratch directly from the final model instead of assigning over default objects with indeterminate Eigen solver state.",
+      "consuming_surfaces": [
+        "RoboPlan 0.8 roboplan_core PoseConstraint used by constrained RRT",
+        "RoboPlan 0.8 Python core and RRT bindings"
+      ],
+      "owner_gate": "M9 RoboPlan 0.8 upgrade; dependency-internal correctness decision",
+      "acceptance_evidence": [
+        "M9-R1 0.8 source inspection: PoseConstraint (moved to roboplan_core/src/core/constraints.cpp) still assigns pinocchio::Data after default construction",
+        "M9-R1 Thor arm64 image manyforge-ros-lyrical-full:m9-rp08: patched upstream roboplan_core 8/8 and roboplan_rrt in Release and ASan+UBSan",
+        "third_party/roboplan/patches.sha256 lists this patch in the 0.8 patch series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_8_0_foundation",
+        "third_party/roboplan/upstream/roboplan-060-pinocchio-scratch-direct-initialization.md retains the clean 0.6 reproduction"
+      ],
+      "rollback_source": "Exact raw RoboPlan 0.8.0 PoseConstraint constructor; the frozen 0.6 restoration closure carries roboplan_patch_0009_pinocchio_scratch_direct_initialization.",
+      "removal_condition": "Delete after an upstream release supplies equivalent PoseConstraint construction and the constrained/unconstrained RRT, sanitizer, binding, and conformance evidence passes without it.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "submit_upstream_and_carry_until_released",
+        "rationale": "Re-ported 0.8 successor of the PoseConstraint half of the E1 0.6 correction; PoseConstraint moved from roboplan_rrt to roboplan_core in 0.8 and still default-constructs and then assigns this scratch. Direct member initialization remains the smallest fix and changes no public contract.",
+        "upstream_dossier": "third_party/roboplan/upstream/roboplan-060-pinocchio-scratch-direct-initialization.md",
+        "dossier_fields": [
+          "exact_upstream_source",
+          "dependency_closure",
+          "minimal_reproduction",
+          "impact",
+          "smallest_patch",
+          "focused_regression",
+          "sanitizer_evidence",
+          "compatibility_risk",
+          "intended_upstream_contract",
+          "removal_predicate"
+        ]
+      },
+      "supersedes": "roboplan_patch_0009_pinocchio_scratch_direct_initialization"
+    },
+    {
+      "id": "roboplan_patch_0014_image_owned_native_dependency_metadata",
+      "dependency": "RoboPlan Python distribution metadata",
+      "source_identity_refs": [
+        "roboplan_0_8_0_foundation",
+        "toppra_0_6_10_ua1_dependency"
+      ],
+      "local_sources": [
+        {
+          "kind": "repository_path",
+          "path": "third_party/roboplan/patches/0014-describe-image-owned-native-dependencies.patch",
+          "sha256": "c10938afb5132888c01ac980296335e71e20f3f9f28d43d1c7cd232b15874d8e"
+        },
+        {
+          "kind": "repository_path",
+          "path": "scripts/ci/check-roboplan-dependency-stack.py",
+          "sha256": "b20ede53fbe045d405aea7c79d3c8360e3a85bd055090b6d95b5a20025a040b6"
+        },
+        {
+          "kind": "repository_path",
+          "path": "tests/test_roboplan_dependency_stack.py",
+          "sha256": "08d9e60f5623e86092f24e1c0855e473f1acd4129e0b0e0a28b3b37741a52f6e"
+        }
+      ],
+      "guarantee": "The roboplan_core and roboplan_toppra 0.8 distributions do not require cmeel Eigen, yaml-cpp, or TOPPRA wheels whose native libraries the image deliberately supplies from its verified closure, so pip check stays truthful without a second TOPPRA generation or placeholder distribution metadata. Build requirements are unchanged.",
+      "consuming_surfaces": [
+        "native and ROS image RoboPlan Python distribution installation and pip check",
+        "installed RoboPlan dependency-stack verification"
+      ],
+      "owner_gate": "M9 RoboPlan 0.8 upgrade; image dependency closure",
+      "acceptance_evidence": [
+        "both production Dockerfiles install every RoboPlan 0.8 distribution once from the patched source and then run pip check",
+        "scripts/ci/check-roboplan-dependency-stack.py requires libtoppra and libproxsuite to resolve from the exact source-built closure rather than a competing wheel generation",
+        "tests/test_roboplan_dependency_stack.py",
+        "third_party/roboplan/patches.sha256 lists this patch in the 0.8 patch series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_8_0_foundation"
+      ],
+      "rollback_source": "Exact raw RoboPlan 0.8.0 roboplan_core and roboplan_toppra pyproject.toml dependency lists.",
+      "removal_condition": "Delete when the image's native dependency supply matches RoboPlan's declared wheel requirements, or upstream offers an image-supplied native dependency mode, and pip check plus the dependency-stack linkage verifier pass without it.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "move_to_manyforge_boundary",
+        "rationale": "Native Eigen, yaml-cpp, and exact TOPPRA 0.6.10 supply is owned by ManyForge's verified image closure. The metadata-only patch makes RoboPlan's runtime wheel requirements describe that boundary instead of installing competing cmeel generations. It corrects no upstream defect: ordinary wheel consumers still need those requirements, so it is not submitted upstream."
+      }
+    },
+    {
+      "id": "roboplan_patch_0015_scene_collision_pair_margins",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_8_0_foundation"
+      ],
+      "local_sources": [
+        {
+          "kind": "repository_path",
+          "path": "third_party/roboplan/patches/0015-roboplan-080-scene-collision-pair-margins.patch",
+          "sha256": "1f167b9843784a20a99c3841e9b76ed9da3ce469a2a8081bed6d4dd3b8a53b5a"
+        },
+        {
+          "kind": "historical_git_path",
+          "path": "third_party/roboplan/patches/0015-roboplan-070-scene-collision-pair-margins.patch",
+          "repository_commit": "0703ea48de8b5d8487ae9f54d9f488c589ea2829",
+          "blob": "44d87d70ff2490a3bf700d078a1f8e9d29309587",
+          "sha256": "fdcb0fb10d84f2df9f3f33bb7c37c8c9a5e4ddd9cd9767595894e06a63f93fb1"
+        }
+      ],
+      "guarantee": "RoboPlan 0.8 Scene accepts one finite, non-negative coal security margin per collision pair, rebuilds its broadphase so AABB inflation includes the margins, and SceneContext copies the margins, so RRT and path checks treat bodies closer than their pair margin as colliding.",
+      "consuming_surfaces": [
+        "RoboPlan 0.8 Scene and SceneContext collision checks",
+        "RoboPlan 0.8 RRT and path collision checks in the ManyForge candidate worker"
+      ],
+      "owner_gate": "M9 RoboPlan 0.8 upgrade; dependency-internal correctness decision",
+      "acceptance_evidence": [
+        "RoboPlanSceneTest.TestCollisionPairMargins carried in the patch",
+        "ManyForge worker-protocol, candidate-client, and kernel clearance tests",
+        "M9-R1 Thor arm64 image manyforge-ros-lyrical-full:m9-rp08: patched upstream roboplan_core (TestCollisionPairMargins) 8/8 in Release and ASan+UBSan; ManyForge RoboPlan adapter tests 96/96",
+        "third_party/roboplan/patches.sha256 lists this patch in the 0.8 patch series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_8_0_foundation"
+      ],
+      "rollback_source": "Exact raw RoboPlan 0.8.0 Scene and SceneContext; without the patch every pair keeps coal's default margin of zero.",
+      "removal_condition": "Delete after an upstream release provides an equivalent per-pair collision margin that reaches SceneContext-based planners, and the focused Scene, RRT, worker-protocol, and kernel clearance rows pass without it.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "submit_upstream_and_carry_until_released",
+        "rationale": "RoboPlan 0.8 still exposes no mutable path to coal's per-pair security margin, and its SceneContext rebuilds collision requests with margin zero. Writing the requests and rebuilding the broadphase is the smallest additive API; ManyForge keeps clearance policy and validation authority.",
+        "upstream_dossier": "third_party/roboplan/upstream/roboplan-070-scene-collision-pair-margins.md",
+        "dossier_fields": [
+          "exact_upstream_source",
+          "dependency_closure",
+          "minimal_reproduction",
+          "impact",
+          "smallest_patch",
+          "focused_regression",
+          "sanitizer_evidence",
+          "compatibility_risk",
+          "intended_upstream_contract",
+          "removal_predicate"
+        ]
+      }
+    },
+    {
+      "id": "roboplan_patch_0016_toppra_path_velocity_bound",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_8_0_foundation"
+      ],
+      "local_sources": [
+        {
+          "kind": "repository_path",
+          "path": "third_party/roboplan/patches/0016-toppra-velocity-bound-hook.patch",
+          "sha256": "c4615d623f2308d5b65ab59843c3707f88ddb2f84dc389863f08800dcdb8c3b1"
+        }
+      ],
+      "guarantee": "RoboPlan 0.8 TOPP-RA accepts an optional per-grid-point bound on the path speed ds/dt, evaluated from the group positions and path tangent at every grid point of its standard grid and intersected with the joint limits; unset, timing is unchanged.",
+      "consuming_surfaces": [
+        "RoboPlan 0.8 PathParameterizerTOPPRA::generate",
+        "ManyForge candidate worker joint-move timing (RP-3 TCP speed bound at 0.98 of the limit)"
+      ],
+      "owner_gate": "M9 RoboPlan 0.8 upgrade; RP-3 / PLAN-1 item 2 planning speed decision",
+      "acceptance_evidence": [
+        "RoboPlanToppraTest.PathVelocityBoundCapsSpeedOnlyWhereItBinds carried in the patch",
+        "ManyForge candidate-computer and Cartesian trajectory TCP speed tests",
+        "third_party/roboplan/patches.sha256 lists this patch in the 0.8 patch series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_8_0_foundation"
+      ],
+      "rollback_source": "Exact raw RoboPlan 0.8.0 roboplan_toppra; without the patch TOPP-RA times within the joint limits only and the TCP cap needs a uniform stretch.",
+      "removal_condition": "Delete after an upstream release provides an equivalent per-grid-point path-velocity bound or extra-constraint hook in PathParameterizerTOPPRA::generate, and the focused TOPP-RA and ManyForge candidate-computer rows pass without it.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "submit_upstream_and_carry_until_released",
+        "rationale": "RoboPlan 0.8 builds a fixed TOPP-RA constraint list with no way to add a non-joint speed bound. One optional hook evaluated per grid point is the smallest additive API; ManyForge keeps the TCP speed policy.",
+        "upstream_dossier": "third_party/roboplan/upstream/roboplan-080-toppra-path-velocity-bound.md",
+        "dossier_fields": [
+          "exact_upstream_source",
+          "dependency_closure",
+          "minimal_reproduction",
+          "impact",
+          "smallest_patch",
+          "focused_regression",
+          "sanitizer_evidence",
+          "compatibility_risk",
+          "intended_upstream_contract",
+          "removal_predicate"
+        ]
+      }
+    },
+    {
+      "id": "roboplan_patch_0017_runtime_collision_pair_toggle",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_8_0_foundation"
+      ],
+      "local_sources": [
+        {
+          "kind": "repository_path",
+          "path": "third_party/roboplan/patches/0017-runtime-collision-pair-toggle.patch",
+          "sha256": "5090faba4b04b910d7e08ad19efb1b7a9abb4f46d14cc9e30046d1235d1a29d5"
+        }
+      ],
+      "guarantee": "RoboPlan 0.8 Scene activates or deactivates existing collision pairs between named bodies by flipping only their active flags, so the pair list keeps its order and per-pair margins and nothing is rebuilt; SceneContext copies the flags, so RRT and IK see the toggles.",
+      "consuming_surfaces": [
+        "RoboPlan 0.8 Scene and SceneContext collision checks",
+        "ManyForge candidate worker per-request contact-policy pairs for planning and IK"
+      ],
+      "owner_gate": "M9 RoboPlan 0.8 upgrade; dependency-internal correctness decision",
+      "acceptance_evidence": [
+        "RoboPlanSceneTest.TestSetCollisionPairsActive carried in the patch",
+        "ManyForge worker-protocol and candidate-client contact-pair rows",
+        "third_party/roboplan/patches.sha256 lists this patch; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_8_0_foundation"
+      ],
+      "rollback_source": "Exact raw RoboPlan 0.8.0 Scene and SceneContext; without the patch pairs can only be removed or re-added (setCollisions), which reorders the pair list, resets margins and leaves SceneContexts all-active.",
+      "removal_condition": "Delete after an upstream release provides a runtime per-pair activation that keeps pair order and margins and reaches SceneContext-based planners, and the focused Scene, worker-protocol and candidate-client rows pass without it.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "submit_upstream_and_carry_until_released",
+        "rationale": "RoboPlan 0.8 changes allowed collisions only by removing or re-adding pairs and reassigning the collision data, which reorders pairs, zeroes margins and invalidates contexts, and its SceneContext rebuilds every pair as active. Flipping GeometryData::activeCollisionPairs, which Pinocchio's narrow-phase, distance and broadphase paths already honour, is the smallest additive API.",
+        "upstream_dossier": "third_party/roboplan/upstream/roboplan-080-runtime-collision-pair-toggle.md",
+        "dossier_fields": [
+          "exact_upstream_source",
+          "dependency_closure",
+          "minimal_reproduction",
+          "impact",
+          "smallest_patch",
+          "focused_regression",
+          "sanitizer_evidence",
+          "compatibility_risk",
+          "intended_upstream_contract",
+          "removal_predicate"
+        ]
+      }
+    },
+    {
+      "id": "roboplan_patch_0018_cartesian_time_optimal_path_velocity_bound",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_8_0_foundation"
+      ],
+      "local_sources": [
+        {
+          "kind": "repository_path",
+          "path": "third_party/roboplan/patches/0018-cartesian-time-optimal-path-velocity-bound.patch",
+          "sha256": "2f6fcb8521a8e06e4651b3a49b14ceabc53c4df8bbe615ef70f1ad36d14ea62e"
+        }
+      ],
+      "guarantee": "RoboPlan 0.8 TimeOptimal Cartesian timing accepts an optional per-grid-point path-velocity bound (CartesianPlannerOptions::toppra_max_path_velocity) and passes it to TOPP-RA (patch 0016); unset, timing is unchanged.",
+      "consuming_surfaces": [
+        "RoboPlan 0.8 CartesianPathPlanner::timeOptimal",
+        "ManyForge candidate worker time_optimal Cartesian timing (CT-1, TCP speed bound)"
+      ],
+      "owner_gate": "M9 RoboPlan 0.8 upgrade; CT-1 / RP-3 planning speed decision",
+      "acceptance_evidence": [
+        "ManyForge candidate-computer time_optimal Cartesian TCP speed rows",
+        "third_party/roboplan/patches.sha256 lists this patch in the 0.8 patch series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_8_0_foundation"
+      ],
+      "rollback_source": "Exact raw RoboPlan 0.8.0 roboplan_cartesian_planning; without the patch TimeOptimal Cartesian timing ignores the tool speed limit and the TCP cap needs a uniform stretch.",
+      "removal_condition": "Delete after an upstream release lets TimeOptimal Cartesian timing take an equivalent path-velocity bound, and the candidate-computer time_optimal rows pass without it.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "submit_upstream_and_carry_until_released",
+        "rationale": "RoboPlan 0.8 timeOptimal builds its own TOPPRAOptions from CartesianPlannerOptions, so a caller cannot pass the 0016 path-velocity bound. Copying one optional option is the smallest additive API; ManyForge keeps the TCP speed policy.",
+        "upstream_dossier": "third_party/roboplan/upstream/roboplan-080-cartesian-time-optimal-path-velocity-bound.md",
+        "dossier_fields": [
+          "exact_upstream_source",
+          "dependency_closure",
+          "minimal_reproduction",
+          "impact",
+          "smallest_patch",
+          "focused_regression",
+          "sanitizer_evidence",
+          "compatibility_risk",
+          "intended_upstream_contract",
+          "removal_predicate"
+        ]
+      }
+    },
+    {
+      "id": "roboplan_patch_0019_bounded_cartesian_curvature_speed_cap",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_8_0_foundation"
+      ],
+      "local_sources": [
+        {
+          "kind": "repository_path",
+          "path": "third_party/roboplan/patches/0019-bounded-cartesian-curvature-speed-cap.patch",
+          "sha256": "5271e2994912ea56c7860b6773405ba3ceb7d86ef6a2643790dcca148eb5bd0f"
+        }
+      ],
+      "guarantee": "RoboPlan 0.8 Bounded Cartesian timing also holds the tool's lateral acceleration v^2/r on curves within max_linear_acceleration: each sample's path speed is capped from the curvature of the circle through the neighbouring waypoints inside its run (the same half-limit split as the joint q'' term), so only the curved part of a run slows; straight runs and stops are unchanged.",
+      "consuming_surfaces": [
+        "RoboPlan 0.8 CartesianPathPlanner::timeBounded",
+        "ManyForge candidate worker constant_speed Cartesian timing through RP-2 rounded corners"
+      ],
+      "owner_gate": "M9 RoboPlan 0.8 upgrade; RP-2 corner blend radius decision",
+      "acceptance_evidence": [
+        "CartesianPlannerTest.BoundedModeSlowsOnlyOnCurves carried in the patch (fails on unpatched 0.8.0: arc speed 0.098 vs cap 0.066 m/s, tool acceleration up to 0.97 vs 0.44 m/s^2)",
+        "ManyForge planning benchmark run_cart.sh constant_speed U path with 10 mm blends",
+        "third_party/roboplan/patches.sha256 lists this patch in the 0.8 patch series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_8_0_foundation"
+      ],
+      "rollback_source": "Exact raw RoboPlan 0.8.0 roboplan_cartesian_planning; without the patch Bounded timing ignores path curvature, and a rounded corner's lateral acceleration needs a uniform stretch of the whole trajectory.",
+      "removal_condition": "Delete after an upstream release bounds the tool's lateral (curvature) acceleration in Bounded Cartesian timing, and the RoboPlan curve test and the candidate-computer constant_speed rounded-corner rows pass without it.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "submit_upstream_and_carry_until_released",
+        "rationale": "RoboPlan 0.8 timeBounded limits the path speed from the commanded Cartesian maxima and the joint limits only; on a 10 mm arc at 0.15 m/s the lateral acceleration is 2.25 m/s^2 against 0.4. CartesianPlannerOptions offers no per-sample speed input, so the cap can only be added inside the per-sample speed loop, mirroring its joint-curvature term.",
+        "upstream_dossier": "third_party/roboplan/upstream/roboplan-080-bounded-cartesian-curvature-speed-cap.md",
+        "dossier_fields": [
+          "exact_upstream_source",
+          "dependency_closure",
+          "minimal_reproduction",
+          "impact",
+          "smallest_patch",
+          "focused_regression",
+          "sanitizer_evidence",
+          "compatibility_risk",
+          "intended_upstream_contract",
+          "removal_predicate"
+        ]
+      }
+    },
+    {
+      "id": "roboplan_0_6_proxsuite_fetch_closure",
+      "dependency": "ProxSuite",
+      "source_identity_refs": [
+        "roboplan_0_6_0_candidate",
+        "proxsuite_0_7_3_candidate_dependency",
+        "proxsuite_cmake_module_candidate_dependency"
+      ],
+      "local_sources": [
+        {
+          "kind": "historical_git_path",
+          "path": "scripts/ci/build-roboplan-source-closure.sh",
+          "repository_commit": "6ff42c4cf70be415159624adba1428100a2ee116",
+          "blob": "f686bbfd39ef5b69378a9c916c43e9042b56b093",
+          "sha256": "35bcf668a23159b55e599b12da3afa41a877c1430e8e57e773104bfa642a745f"
+        },
+        {
+          "kind": "historical_git_path",
+          "path": "scripts/ci/build-roboplan-source-stack.sh",
+          "repository_commit": "6ff42c4cf70be415159624adba1428100a2ee116",
+          "blob": "68609f4063c1c8a087946107c2bb055eca5274a0",
+          "sha256": "4f92187bc90b50b977e3a1a044e642b98ca247019442d2270f0d325b4691741c"
+        },
+        {
+          "kind": "repository_path",
+          "path": "scripts/ci/verify-external-source-closure.py",
+          "sha256": "ba48a758dc5076ba055c4f156e66f695b56c7dfaab674a4a3bf7c100b0999e78"
+        }
+      ],
+      "guarantee": "OInK builds against one exact ProxSuite source and required CMake submodule without configure-time network or ambient-version substitution.",
+      "consuming_surfaces": [
+        "RoboPlan 0.6 OInK source build"
+      ],
+      "owner_gate": "E1 selected RoboPlan 0.6 source closure",
+      "acceptance_evidence": [
+        "offline exact-source four-patch candidate build with exact proxsuite_DIR attestation",
+        "pre-configure canonical content/license/commit/tree/submodule/archive identity verification",
+        "145/145 OInK upstream cases against the separately installed exact source",
+        "checked source-closure orchestration contract"
+      ],
+      "rollback_source": "Exact RoboPlan 0.5.1 dependency closure.",
+      "removal_condition": "Retain exact source materialization until an equivalently frozen selected dependency replaces ProxSuite and passes the affected source, package, conformance, sanitizer, and lane evidence.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "move_to_manyforge_boundary",
+        "rationale": "The approved RoboPlan 0.6 adoption selects exact ProxSuite v0.7.3 plus only its declared CMake submodule. ManyForge-owned setup and closure builders materialize and verify that source before configuration, disable fetch fallback, and attest the exact OInK CMake selection; no RoboPlan build-helper patch or ambient solver is retained."
+      },
+      "superseded_by": "roboplan_0_7_proxsuite_source_closure"
+    },
+    {
+      "id": "roboplan_0_6_toppra_fetch_closure",
+      "dependency": "TOPPRA",
+      "source_identity_refs": [
+        "roboplan_0_6_0_candidate",
+        "toppra_0_6_8_candidate_dependency"
+      ],
+      "local_sources": [
+        {
+          "kind": "historical_git_path",
+          "path": "scripts/ci/build-roboplan-source-closure.sh",
+          "repository_commit": "6ff42c4cf70be415159624adba1428100a2ee116",
+          "blob": "f686bbfd39ef5b69378a9c916c43e9042b56b093",
+          "sha256": "35bcf668a23159b55e599b12da3afa41a877c1430e8e57e773104bfa642a745f"
+        },
+        {
+          "kind": "historical_git_path",
+          "path": "scripts/ci/build-roboplan-source-stack.sh",
+          "repository_commit": "6ff42c4cf70be415159624adba1428100a2ee116",
+          "blob": "68609f4063c1c8a087946107c2bb055eca5274a0",
+          "sha256": "4f92187bc90b50b977e3a1a044e642b98ca247019442d2270f0d325b4691741c"
+        },
+        {
+          "kind": "repository_path",
+          "path": "scripts/ci/verify-external-source-closure.py",
+          "sha256": "ba48a758dc5076ba055c4f156e66f695b56c7dfaab674a4a3bf7c100b0999e78"
+        }
+      ],
+      "guarantee": "RoboPlan retiming builds against exact TOPPRA 0.6.8 source rather than a mutable tag, configure-time network fetch, or ambient installation.",
+      "consuming_surfaces": [
+        "RoboPlan 0.6 TOPPRA and Cartesian source builds"
+      ],
+      "owner_gate": "E1 selected RoboPlan 0.6 source closure",
+      "acceptance_evidence": [
+        "offline exact-source four-patch candidate build with exact toppra_DIR and ldd attestation",
+        "pre-configure canonical content/license/commit/tree identity verification",
+        "exact TOPPRA 1/1, RoboPlan TOPPRA 17/17, and Cartesian 11/11 source cases",
+        "checked source-closure orchestration contract"
+      ],
+      "rollback_source": "Exact RoboPlan 0.5.1 dependency closure.",
+      "removal_condition": "Retain exact source materialization until an equivalently frozen selected dependency replaces TOPPRA and passes the affected source, package, Cartesian, sanitizer, and lane evidence.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "move_to_manyforge_boundary",
+        "rationale": "The approved RoboPlan 0.6 adoption selects exact TOPPRA 0.6.8 source. ManyForge-owned setup and closure builders materialize and verify it before configuration, disable fetch fallback, and attest the exact RoboPlan TOPPRA CMake selection; no mutable tag, ambient package, or configure-time download remains."
+      },
+      "superseded_by": "roboplan_0_7_toppra_source_closure"
+    },
+    {
+      "id": "xarm_no_gazebo_reduction",
+      "dependency": "xarm_ros2",
+      "source_identity_refs": [
+        "xarm_jazzy_functional_base",
+        "xarm_jazzy_no_gazebo_base"
+      ],
+      "local_sources": [
+        {
+          "kind": "external_git_range",
+          "path": "xarm_ros2:2589f4304d03aaf9b6b1ff6691ec7deb739f4090..50064477f39ecd69ab006488630c837cdcb8d83e",
+          "sha256": "9a950581dd8ca8b7b4bf3d9b4d9396bd22c7ec3d0a0d1d5678d5c8e88b502eb7"
+        }
+      ],
+      "guarantee": "Use the established Jazzy no-Gazebo reduction while retaining the functional upstream-like source as an exact rollback and comparison base.",
+      "consuming_surfaces": [
+        "xArm Docker/source lane",
+        "future I10 real-robot adapter"
+      ],
+      "owner_gate": "I10",
+      "acceptance_evidence": [
+        "46-path deletion inventory digest b409d50382a23a28d4bb96f6f7b62d8dfef76024a942776095c0b2cedf558c0b",
+        "I10 native and physical xArm qualification"
+      ],
+      "rollback_source": "xArm Jazzy functional base 2589f4304d03aaf9b6b1ff6691ec7deb739f4090.",
+      "removal_condition": "Reconcile only at I10 against the selected maintained xArm source; E1 cannot restore Gazebo or alter physical qualification scope.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "defer_to_owner_gate",
+        "rationale": "This is an xArm product-source reduction whose correctness depends on I10 native and physical evidence, not the E1 planner-dependency decision."
+      }
+    },
+    {
+      "id": "xarm_supervised_runtime_family",
+      "dependency": "xarm_ros2",
+      "source_identity_refs": [
+        "xarm_jazzy_no_gazebo_base",
+        "xarm_composable_cell_current"
+      ],
+      "local_sources": [
+        {
+          "kind": "external_git_range",
+          "path": "xarm_ros2:50064477f39ecd69ab006488630c837cdcb8d83e..c3172e57c1c1bb2982fc008304ad6bc886357c87",
+          "sha256": "e76063840a6f2862b8583b2b1763563ff294e03b6048bd16c6527c0e5ac735b3"
+        }
+      ],
+      "guarantee": "Read-only driver admission, supervised lifecycle/session ownership, transport-loss handling, ready-state sequencing, guarded controller shutdown, unpredictable owner epochs, monotonic lifecycle progress, and motion admission.",
+      "consuming_surfaces": [
+        "xarm_api supervised driver/session",
+        "xarm_controller supervised hardware boundary",
+        "xarm_msgs lifecycle command/state contracts",
+        "future I10 xArm adapter"
+      ],
+      "owner_gate": "I10",
+      "acceptance_evidence": [
+        "12 exact commits from 226b5964 through c3172e57",
+        "34-path delta inventory digest 72ddd0f189b5effe1b36ed3759d130f75d9bdbb785890d6a0748aea5639d24fa",
+        "retained XC behavior ledger and I10 fake/native/physical evidence"
+      ],
+      "rollback_source": "xArm no-Gazebo base 50064477f39ecd69ab006488630c837cdcb8d83e plus the retained XC evidence history.",
+      "removal_condition": "At I10, upstream or move generic ManyForge policy only when equivalent behavior and physical reliability are proven; retain focused device/transport mechanics in the adapter or fork as required.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "defer_to_owner_gate",
+        "rationale": "The behavior is required, but source ownership and upstreamability cannot be decided without I10 adapter integration and attended physical evidence."
+      }
+    },
+    {
+      "id": "xarm_sdk_gitlink_delta",
+      "dependency": "xArm-CPLUS-SDK",
+      "source_identity_refs": [
+        "xarm_sdk_control",
+        "xarm_sdk_current",
+        "xarm_composable_cell_current"
+      ],
+      "local_sources": [
+        {
+          "kind": "external_git_range",
+          "path": "xarm_sdk:2b6b595a956c2558e867c08001fda454212b271a..d84a2b7d533ff988bf1c2197ed50dd0d6723cf30",
+          "sha256": "f0b844fc67df89b92228012d8dee00e8a1d27bb97ed935f27a791477f97397c2"
+        }
+      ],
+      "guarantee": "SDK transport/thread shutdown hardening, hidden-bug and security fixes, sensor-error correction, and inverse-kinematics parameter support used by the current xArm branch.",
+      "consuming_surfaces": [
+        "xarm_api transport session",
+        "future I10 xArm adapter"
+      ],
+      "owner_gate": "I10",
+      "acceptance_evidence": [
+        "exact ten-commit SDK range",
+        "transport-loss/shutdown fake evidence",
+        "attended physical reconnect, shutdown, and motion-admission matrix"
+      ],
+      "rollback_source": "SDK gitlink 2b6b595a956c2558e867c08001fda454212b271a.",
+      "removal_condition": "At I10, compare against the then-current supported upstream SDK and retain only deltas still required by reproducible transport and physical tests.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "defer_to_owner_gate",
+        "rationale": "SDK convergence is coupled to the exact I10 device/transport qualification matrix and cannot be inferred from source diff alone."
+      }
+    },
+    {
+      "id": "xarm_fork_builder_surface",
+      "dependency": "xarm_ros2 uf_ros_lib",
+      "source_identity_refs": [
+        "xarm_composable_cell_current",
+        "manymove_historical_acceptance"
+      ],
+      "local_sources": [
+        {
+          "kind": "external_git_range",
+          "path": "xarm_ros2:c3172e57:uf_ros_lib builder source set",
+          "sha256": "9444d8e1f5fc400ccb3e98e415979029df30de656470b31b170d7873b9dce5af"
+        }
+      ],
+      "guarantee": "Single- and dual-robot MoveIt configuration generation plus xArm ROS-control parameter helpers used directly by maintained ManyMove launches.",
+      "consuming_surfaces": [
+        "16 exact ManyMove MoveItConfigsBuilder launch files",
+        "7 exact ManyMove DualMoveItConfigsBuilder launch files"
+      ],
+      "consumer_inventory": {
+        "MoveItConfigsBuilder": [
+          "manymove_bringup/launch/lite_cumotion_movegroup_fake_cpp_trees.launch.py",
+          "manymove_bringup/launch/lite_foundationpose_movegroup_fake_cpp_trees.launch.py",
+          "manymove_bringup/launch/lite_isaac_sim_movegroup_fake_cpp_trees.launch.py",
+          "manymove_bringup/launch/lite_movegroup_fake_cpp_trees.launch.py",
+          "manymove_bringup/launch/lite_moveitcpp_fake_cpp_trees.launch.py",
+          "manymove_bringup/launch/mixed_pipelines_lite_movegroup_fake_cpp_trees.launch.py",
+          "manymove_bringup/launch/mixed_pipelines_lite_moveitcpp_fake_cpp_trees.launch.py",
+          "manymove_bringup/launch/tutorial_01.launch.py",
+          "manymove_bringup/launch/uf850_movegroup_fake_cpp_trees.launch.py",
+          "manymove_bringup/launch/uf850_moveitcpp_fake_cpp_trees.launch.py",
+          "manymove_bringup/launch/xarm7_movegroup_fake_cpp_trees.launch.py",
+          "manymove_bringup/launch/xarm7_moveitcpp_fake_cpp_trees.launch.py",
+          "manymove_planner/launch/lite_movegroup_fake_action_server_node.launch.py",
+          "manymove_planner/launch/lite_movegroup_real_action_server.launch.py",
+          "manymove_planner/launch/lite_moveitcpp_fake_action_server.launch.py",
+          "manymove_planner/launch/lite_moveitcpp_real_action_server.launch.py"
+        ],
+        "DualMoveItConfigsBuilder": [
+          "manymove_bringup/launch/collision_test_movegroup.launch.py",
+          "manymove_bringup/launch/collision_test_moveitcpp.launch.py",
+          "manymove_bringup/launch/dual_movegroup_fake_app.launch.py",
+          "manymove_bringup/launch/dual_movegroup_fake_cpp_trees.launch.py",
+          "manymove_bringup/launch/dual_moveitcpp_fake_app.launch.py",
+          "manymove_bringup/launch/dual_moveitcpp_fake_cpp_trees.launch.py",
+          "manymove_planner/launch/dual_moveitcpp_fake_action_server.launch.py"
+        ]
+      },
+      "consumer_inventory_sha256": "76d38efebc0d5df9ab6ebd599aaf96425bf802fb97ca3f7bf4cfb8fe3b3b5ef1",
+      "owner_gate": "I12",
+      "acceptance_evidence": [
+        "exact 23-file consumer inventory digest 76d38efebc0d5df9ab6ebd599aaf96425bf802fb97ca3f7bf4cfb8fe3b3b5ef1",
+        "I12 maintained-consumer migration and two-instance/mixed-composition evidence"
+      ],
+      "rollback_source": "xArm c3172e57 uf_ros_lib builder files plus ManyMove 1a73f42 launch consumers.",
+      "removal_condition": "Delete fork-only builder dependence only after every maintained consumer is migrated at I12 and equivalent single/dual composition behavior passes; do not add a ManyForge compatibility facade in E1.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "defer_to_owner_gate",
+        "rationale": "The builder behavior is required acceptance input, while final consumer migration and source deletion belong to I12 after composition is proven."
+      }
+    },
+    {
+      "id": "manymove_historical_acceptance_delta",
+      "dependency": "ManyMove",
+      "source_identity_refs": [
+        "manymove_main_control",
+        "manymove_historical_acceptance"
+      ],
+      "local_sources": [
+        {
+          "kind": "external_git_range",
+          "path": "manymove:f3a4c65e154744403d721d6ef25d2a8ea5f3f1e3..1a73f42c66b78101913350b04f53378fffb49aa8",
+          "sha256": "e0464c886bb80dc3b6fe73f3ea00c93a43be82d63fe77db0b161f0a36b90d92b"
+        }
+      ],
+      "guarantee": "Retain the historical Docker/source-overlay fixes, FoundationPose action split, Isaac/tree behavior changes, planner action-server fixes, and their tests as restoration and migration inputs.",
+      "consuming_surfaces": [
+        "historical ManyMove native, Isaac, and xArm workflows",
+        "future I9-I12 maintained-consumer restoration"
+      ],
+      "owner_gate": "I9-I12",
+      "acceptance_evidence": [
+        "18-path branch delta inventory digest 1b74e7bf0674087c294c9c4af95891f3949108200af84a0d5ba0fc9a280e0c5b",
+        "exact 12-commit historical range",
+        "I9 simulator, I10 robot, and I12 maintained-consumer evidence"
+      ],
+      "rollback_source": "ManyMove main f3a4c65e plus historical acceptance commit 1a73f42c and its tests.",
+      "removal_condition": "Disposition each behavior in its owning I9-I12 slice; no historical function or test is discarded merely because current main lacks it.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "defer_to_owner_gate",
+        "rationale": "E1 preserves and routes these external application behaviors; it does not pull simulator, robot, or final consumer implementation forward."
+      }
+    }
+  ]
+}

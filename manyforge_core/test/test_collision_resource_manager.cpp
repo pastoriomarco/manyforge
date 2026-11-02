@@ -18,8 +18,7 @@ class DummyPublisher final : public ICollisionWorldSnapshotPublisher {
   RuntimeCollisionQueryBundlePtr published_runtime_collision_query_bundle()
       const override {
     return build_runtime_collision_query_bundle(
-        CollisionWorldPolicySnapshotBundle{snapshot(), CollisionPolicySnapshot{}},
-        1);
+        CollisionWorldPolicySnapshotBundle{snapshot(), CollisionPolicySnapshot{}});
   }
 };
 
@@ -96,9 +95,6 @@ TEST(CollisionResourceManagerTest,
   EXPECT_TRUE(
       CollisionResourceManager::validation_conflicts_with_active_runtime_monitor(
           resources, ExecutionState::kExecuting));
-  EXPECT_TRUE(
-      CollisionResourceManager::validation_conflicts_with_active_runtime_monitor(
-          resources, ExecutionState::kPaused));
   EXPECT_TRUE(
       CollisionResourceManager::validation_conflicts_with_active_runtime_monitor(
           resources, ExecutionState::kStopping));

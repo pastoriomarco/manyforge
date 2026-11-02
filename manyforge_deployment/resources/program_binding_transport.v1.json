@@ -1,0 +1,258 @@
+{
+  "api_version": "manyforge.program_binding_transport_descriptor.v1",
+  "binding_api_version": "manyforge.program_binding.v2",
+  "limits": {
+    "compiled_text_bytes": 4096,
+    "identity_bytes": 128,
+    "nested_rows": 4096,
+    "node_policy_rows": 100000,
+    "provenance_rows": 16384,
+    "role_rows": 4096,
+    "max_retries": 255
+  },
+  "scalars": {
+    "digest": {
+      "kind": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "identity": {
+      "kind": "string",
+      "maximum_utf8_bytes": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "text": {
+      "kind": "string",
+      "minimum_utf8_bytes": 1,
+      "maximum_utf8_bytes": 4096
+    }
+  },
+  "enums": {
+    "operator_stop_policy": [
+      "inherit",
+      "hold",
+      "continue"
+    ],
+    "intervention_stop_scope": [
+      "all",
+      "own_groups"
+    ]
+  },
+  "records": {
+    "binding": [
+      "api_version",
+      "program_binding_id",
+      "program_id",
+      "program_revision",
+      "retained_bundle_id",
+      "graph_revision",
+      "node_environment",
+      "component_role_bindings",
+      "target_role_bindings",
+      "node_policies",
+      "contact_grasp_bindings",
+      "provenance"
+    ],
+    "node_environment": [
+      "catalog_id",
+      "content_version",
+      "catalog_digest",
+      "environment_digest"
+    ],
+    "component": [
+      "component_role_id",
+      "controllable_component_id",
+      "component_type_id",
+      "component_type_revision",
+      "model_role_bindings"
+    ],
+    "model": [
+      "model_role_id",
+      "model_instance_id",
+      "model_revision"
+    ],
+    "target": [
+      "target_role_id",
+      "component_role_id",
+      "controllable_component_id",
+      "command_target_id",
+      "frame_role_bindings",
+      "resource_role_bindings",
+      "collision_body_role_bindings",
+      "capability_bindings",
+      "signal_role_bindings",
+      "pneumatic_io",
+      "robot_tcps",
+      "default_tcp"
+    ],
+    "frame": [
+      "frame_role_id",
+      "model_instance_id",
+      "model_revision",
+      "compiled_frame_name",
+      "contact_body_role_ids"
+    ],
+    "tcp_entry": [
+      "component_id",
+      "target_id",
+      "frame_role_id"
+    ],
+    "robot_tcp": [
+      "entry",
+      "frame",
+      "end_effector",
+      "component_default"
+    ],
+    "resource": [
+      "resource_role_id",
+      "resource_ids",
+      "compiled_resource_names"
+    ],
+    "collision": [
+      "collision_body_role_id",
+      "model_instance_id",
+      "model_revision",
+      "compiled_collision_body_names"
+    ],
+    "capability": [
+      "capability_id",
+      "capability_definition_revision",
+      "control_binding",
+      "capability_provider_binding",
+      "command_schema"
+    ],
+    "node_policy": [
+      "instance_id",
+      "recovery_policy",
+      "operator_stop_policy"
+    ],
+    "recovery_policy": [
+      "allow_intervention",
+      "max_retries",
+      "intervention_stop_scope"
+    ],
+    "control": [
+      "control_binding_id",
+      "control_binding_revision"
+    ],
+    "provider": [
+      "capability_provider_binding_id",
+      "capability_provider_binding_revision"
+    ],
+    "command_schema": [
+      "command_schema_id",
+      "command_schema_revision"
+    ],
+    "contact": [
+      "contact_policy_id",
+      "contact_policy_revision",
+      "runtime_object_id",
+      "allowed_body_bindings",
+      "max_penetration_m",
+      "terminal_window_start_fraction",
+      "bodies_from_motion_endpoint"
+    ],
+    "contact_body": [
+      "component_role_id",
+      "target_role_id",
+      "controllable_component_id",
+      "command_target_id",
+      "model_role_id",
+      "collision_body_role_id",
+      "model_instance_id",
+      "model_revision",
+      "collision_body_ids"
+    ],
+    "provenance": [
+      "binding_compiler_contract_digest",
+      "role_assignment_digest",
+      "source_records",
+      "resolved_output_records"
+    ],
+    "provenance_record": [
+      "record_kind",
+      "record_id",
+      "revision"
+    ],
+    "signal": [
+      "resource_role_id",
+      "signal_name",
+      "value_type",
+      "direction",
+      "transition_capability",
+      "signal_descriptor_digest"
+    ],
+    "pneumatic_io": ["outputs", "inputs"],
+    "pneumatic_output": ["target_role_id", "resource_role_id", "open_value", "close_value"],
+    "pneumatic_input": ["input", "target_role_id", "resource_role_id"],
+    "contact_release": [
+      "contact_policy_id",
+      "contact_policy_revision",
+      "runtime_object_id",
+      "allowed_body_bindings",
+      "mode",
+      "release_evidence_mode",
+      "enforce_max_start_penetration",
+      "max_start_penetration_m",
+      "min_release_progress_m",
+      "release_tolerance_m",
+      "require_strictly_decreasing_penetration",
+      "require_separation_by_end",
+      "allow_recontact",
+      "bodies_from_motion_endpoint"
+    ]
+  },
+  "optional_record_fields": {
+    "recovery_policy": [
+      "intervention_stop_scope"
+    ],
+    "target": [
+      "signal_role_bindings",
+      "pneumatic_io",
+      "robot_tcps",
+      "default_tcp"
+    ],
+    "frame": [
+      "contact_body_role_ids"
+    ],
+    "contact": [
+      "bodies_from_motion_endpoint"
+    ],
+    "contact_release": [
+      "bodies_from_motion_endpoint"
+    ]
+  },
+  "catalog_record_kinds": [
+    "model_asset",
+    "runtime_profile",
+    "component_type",
+    "control_interface_contract",
+    "controller_topology",
+    "provider_manifest",
+    "command_schema",
+    "capability_definition",
+    "contact_policy",
+    "stop_evidence_policy"
+  ],
+  "formulas": {
+    "collision_body_id": "component/{controllable_component_id}/model/{model_instance_id}/body/{collision_body_role_id}/collision/{index}"
+  },
+  "invariants": [
+    "closed_records",
+    "bounded_scalars",
+    "bounded_tables",
+    "canonical_sorted_unique",
+    "node_policy_enums_and_cross_fields",
+    "node_policy_sparse_rows",
+    "resource_vector_correspondence",
+    "resource_vector_independent_uniqueness",
+    "collision_name_uniqueness",
+    "capability_has_resolution",
+    "target_component_correspondence",
+    "robot_tcp_entry_frame_correspondence",
+    "robot_tcp_sorted_unique",
+    "finite_contact_ranges",
+    "contact_target_collision_model_correspondence",
+    "generated_collision_body_ids",
+    "provenance_kind_and_tuple_order"
+  ]
+}

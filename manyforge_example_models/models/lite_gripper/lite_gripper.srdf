@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<!--
+  Static ManyForge SRDF for UFACTORY Lite6 + lite pneumatic gripper.
+  Materialized from xarm_moveit_config/srdf/xarm.srdf.xacro through
+  ManyMove's Lite6 bringup with prefix='', robot_type=lite, dof=6,
+  add_gripper=true.
+-->
+<robot name="lite_gripper">
+  <group name="lite_gripper">
+    <link name="lite_gripper_base_link"/>
+    <link name="lite_gripper_left_finger"/>
+    <link name="lite_gripper_right_finger"/>
+    <link name="link_tcp"/>
+    <joint name="left_finger_joint"/>
+    <joint name="right_finger_joint"/>
+  </group>
+  <group_state name="open" group="lite_gripper">
+    <joint name="left_finger_joint" value="0.0081"/>
+    <joint name="right_finger_joint" value="0.0081"/>
+  </group_state>
+  <group_state name="close" group="lite_gripper">
+    <joint name="left_finger_joint" value="0"/>
+    <joint name="right_finger_joint" value="0"/>
+  </group_state>
+  <group_state name="closed" group="lite_gripper">
+    <joint name="left_finger_joint" value="0"/>
+    <joint name="right_finger_joint" value="0"/>
+  </group_state>
+  <end_effector name="lite_gripper" parent_link="link_tcp" group="lite_gripper"/>
+  <disable_collisions link1="lite_gripper_left_finger" link2="lite_gripper_base_link" reason="Adjacent"/>
+  <disable_collisions link1="lite_gripper_right_finger" link2="lite_gripper_base_link" reason="Adjacent"/>
+  <disable_collisions link1="lite_gripper_left_finger" link2="lite_gripper_right_finger" reason="Never"/>
+</robot>

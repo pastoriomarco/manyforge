@@ -1,4 +1,4 @@
-// Copyright 2026 Flexin Group SRL
+// Copyright 2026 Marco Pastorio
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,276 +14,162 @@
 
 #pragma once
 
-#include <span>
-
-#include <cstddef>
+#include <array>
+#include <chrono>
 #include <cstdint>
+#include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include <manyforge_robot_lifecycle/contract.hpp>
+#include <manyforge_core/types/component_lifecycle.hpp>
+#include <manyforge_core/types/geometry.hpp>
 
-namespace manyforge::xarm_control
-{
+namespace manyforge::xarm_control {
 
-using manyforge::robot_lifecycle::ConfirmationClass;
-using manyforge::robot_lifecycle::FactState;
-
-struct XArmObservedState
-{
-  /// Fresh startup/configuration epoch generated inside the sole xarm_ros2
-  /// transport owner. It is not a deployment identifier.
-  std::string transport_owner_component_epoch;
-  /// Receiver-local evidence that the xarm_ros2 owner executor progressed.
-  ///
-  /// This is deliberately independent of robot-observation freshness. During
-  /// one explicitly bounded lifecycle primitive, owner progress may remain
-  /// healthy while motion admission is closed on stale robot state.
-  std::uint64_t transport_owner_progress_sequence = 0;
-  std::int64_t transport_owner_published_timestamp_ns = 0;
-  std::int64_t transport_owner_received_timestamp_ns = 0;
-  bool transport_owner_progress_healthy = false;
-  std::string transport_owner_progress_reason;
-  /// Increment whenever any semantic field below changes. Timestamp-only
-  /// freshness renewal retains this generation.
-  std::uint64_t generation = 0;
-  /// Monotonic timestamps in the coordinator process's steady-clock domain.
-  /// A backend must not manufacture a future lease without a fresh report.
-  std::int64_t source_timestamp_ns = 0;
-  std::int64_t fresh_until_ns = 0;
-  FactState transport_connected = FactState::kUnknown;
-  FactState identity_verified = FactState::kUnknown;
-  FactState position_valid = FactState::kUnknown;
-  FactState position_ever_initialized = FactState::kUnknown;
-  FactState stationary = FactState::kUnknown;
-  FactState controller_shutdown_eligible = FactState::kUnknown;
-  FactState motion_enabled = FactState::kUnknown;
-  FactState vendor_control_ready = FactState::kUnknown;
-  FactState hardware_component_active = FactState::kFalse;
-  FactState trajectory_controller_active = FactState::kFalse;
-  FactState fault_present = FactState::kUnknown;
-  FactState recovery_required = FactState::kUnknown;
-  int identity_axis = -1;
-  int identity_device_type = -1;
-  int mode = -1;
+/// The status fields of the latest `xarm_msgs/msg/RobotMsg` report of the
+/// driver (`<driver namespace>/robot_states`, 5 Hz with `report_type: rich`).
+/// The pose is never read. The joint angles are never a measured state (under
+/// an e-stop the controller reports all zeros; measured joints come only from
+/// the joint state broadcaster): they serve only the Enable gate's agreement
+/// check, with no vendor error.
+struct XArmObservedState {
+  /// Receipt of the latest report on the adapter's clock; absent before the
+  /// first report.
+  std::optional<std::int64_t> received_timestamp_ns;
   int state = -1;
-  int command_count = -1;
-  int brake_mask = -1;
-  int servo_enable_mask = -1;
+  int mode = -1;
   int error_code = -1;
   int warning_code = -1;
-  std::uint64_t report_sample_count = 0;
-  std::uint64_t joint_read_attempt_count = 0;
-  std::uint64_t joint_read_success_count = 0;
-  std::uint64_t joint_write_attempt_count = 0;
-  std::uint64_t lifecycle_command_attempt_count = 0;
-  std::uint64_t shutdown_controller_attempt_count = 0;
-  std::vector<std::string> blocking_reason_codes;
+  /// One bit per axis, set while that axis's motor is enabled (`mt_able`).
+  int motion_enable_mask = -1;
+  /// `angle`, in axis order (radians); compared with the measured joints only.
+  std::vector<double> joint_angles_rad;
+  /// The controller's TCP offset (`offset`: x, y, z in mm, then roll, pitch,
+  /// yaw in radians), as `set_tcp_offset` takes it.
+  std::vector<double> tcp_offset{};
 };
 
-enum class XArmConditionKind
-{
-  kTransportConnected,
-  kIdentityVerified,
-  kPositionValid,
-  kMotionEnabled,
-  kVendorControlReady,
-  kHardwareComponentActive,
-  kTrajectoryControllerActive,
-  kFaultPresent,
-  kRecoveryRequired,
-  kWarningPresent,
-  kStationary,
-  kControllerShutdownEligible,
-  kModeEquals,
-  kStateEquals,
-  kReadyStateRequestEligible,
-};
-
-struct XArmStateCondition
-{
-  XArmConditionKind kind = XArmConditionKind::kTransportConnected;
-  /// Boolean facts use 0/1. Mode/state conditions use the exact vendor value.
-  int expected_value = 0;
-};
-
-/// The complete ROS-facing lifecycle command vocabulary.
-///
-/// These are semantic operations, not pass-through SDK calls. In particular,
-/// callers cannot supply raw mode, state, servo, or system-control values.
-enum class XArmLifecycleCommand : std::uint8_t
-{
-  kClearError = 1,
-  kClearWarning = 2,
-  kEnableMotion = 3,
-  kDisableMotion = 4,
-  kSelectJointServoMode = 5,
-  kSetReadyState = 6,
-  kSetStoppedState = 7,
-  kShutdownController = 8,
-  kActivateHardwareComponent = 9,
-  kActivateTrajectoryControllers = 10,
-  kDeactivateTrajectoryControllers = 11,
-  kDeactivateHardwareComponent = 12,
-};
-
-/// Whether the NRT transport obtained an authoritative owner result.
-///
-/// A request that was dispatched but did not return before its deadline must
-/// never be treated as a known rejection or automatically sent again. The
-/// physical primitive may already have run.
-enum class XArmLifecycleResultState : std::uint8_t
-{
-  kNotDispatched,
-  /// Accepted by the adapter's single NRT lifecycle worker. This is an
-  /// internal hand-off state, not an authoritative robot result and never an
-  /// audit terminal. The matching worker completion must be fenced back into
-  /// the same lifecycle transaction before its result can be interpreted.
-  kExecutionDeferred,
-  kResponseReceived,
-  kOutcomeUnknownAfterDispatch,
-};
-
-struct XArmLifecycleCommandResult
-{
-  XArmLifecycleResultState state =
-    XArmLifecycleResultState::kNotDispatched;
-  bool permitted = false;
-  bool attempted = false;
-  int return_code = -1;
-  std::string reason;
-  std::uint64_t observed_generation = 0;
-  bool process_restart_required = false;
-};
-
-/// One bounded, NRT audit record for an attempted restricted primitive.
-///
-/// The generic lifecycle transaction remains robot-family neutral. This
-/// xArm-specific record preserves the exact adapter-to-owner operation and
-/// vendor return without leaking either into manyforge_robot_lifecycle.
-struct XArmPrimitiveAuditRecord
-{
-  std::uint64_t sequence = 0;
-  std::int64_t occurred_at_ns = 0;
-  std::uint64_t transaction_generation = 0;
-  /// Outer generic intent or directly requested diagnostic primitive.
-  std::string action_id;
-  /// Adapter-owned primitive stage selected within the outer intent.
-  std::string stage_action_id;
-  std::size_t step_index = 0;
-  std::string transport_request_id;
-  std::uint64_t expected_observation_generation = 0;
-  XArmLifecycleCommand command = XArmLifecycleCommand::kClearError;
-  XArmLifecycleCommandResult result;
-};
-
-struct XArmActionPlan
-{
-  std::string action_id;
-  std::string label;
-  ConfirmationClass confirmation = ConfirmationClass::kExplicit;
-  std::string side_effect_summary;
-  std::string expected_postcondition;
-  std::int64_t timeout_ns = 0;
-  std::vector<XArmStateCondition> preconditions;
-  std::vector<XArmLifecycleCommand> steps;
-  std::vector<XArmStateCondition> postconditions;
-  /// The physical-controller shutdown channel disappears after acceptance.
-  /// Such a plan succeeds on one authoritative return code rather than a
-  /// later observation through the intentionally lost session.
-  bool terminal_on_known_success = false;
-};
-
-struct XArmTargetStage
-{
-  /// References one adapter-internal XArmActionPlan.
-  std::string action_id;
-  /// The stage is eligible only when every condition is currently true.
-  std::vector<XArmStateCondition> eligibility;
-};
-
-/// One cross-vendor target intent mapped to an xArm-specific resumable plan.
-///
-/// The coordinator executes at most one newly eligible stage for each fresh
-/// observation generation. The generic supervisor retains the outer request,
-/// deadline, replay identity, and final transaction result.
-struct XArmTargetPlan
-{
-  std::string action_id;
-  std::string label;
-  ConfirmationClass confirmation = ConfirmationClass::kExplicit;
-  std::string side_effect_summary;
-  std::string expected_postcondition;
-  std::int64_t timeout_ns = 0;
-  std::vector<XArmStateCondition> preconditions;
-  std::vector<XArmTargetStage> stages;
-  std::vector<XArmStateCondition> postconditions;
-};
-
-struct JointStateSample
-{
-  std::uint64_t generation = 0;
-  std::vector<double> positions;
-  std::vector<double> velocities;
-};
-
-struct JointCommandView
-{
-  std::span<const double> positions;
-  std::span<const double> velocities;
-};
-
-enum class XArmCommandGateUpdateState : std::uint8_t
-{
-  kRejected,
-  kPending,
-  kApplied,
-};
-
-/// Result of one desired command-gate lease update.
-///
-/// Production may apply the ROS service asynchronously. An open gate is
-/// usable only when kApplied carries a still-future effective_valid_until_ns.
-/// A pending or rejected update always leaves coordinator admission closed.
-struct XArmCommandGateUpdate
-{
-  XArmCommandGateUpdateState state =
-    XArmCommandGateUpdateState::kRejected;
-  std::int64_t effective_valid_until_ns = 0;
-};
-
-class IXArmHardwareBackend
-{
+/// Read seam of the driver's status; the production one is the
+/// `robot_states` subscription, tests provide a deterministic one.
+class IXArmStatusSource {
 public:
-  virtual ~IXArmHardwareBackend() = default;
-
-  IXArmHardwareBackend(const IXArmHardwareBackend &) = delete;
-  IXArmHardwareBackend & operator=(const IXArmHardwareBackend &) = delete;
-
-  [[nodiscard]] virtual std::string_view owner_id() const noexcept = 0;
-  [[nodiscard]] virtual XArmObservedState observe(
-    std::int64_t now_ns) const = 0;
-  /// NRT lifecycle and observation calls may run concurrently with the
-  /// controller-manager read/write loop. Implementations must synchronize
-  /// that boundary. Production read/write implementations must remain
-  /// bounded and non-blocking.
-  virtual XArmLifecycleCommandResult execute_lifecycle(
-    XArmLifecycleCommand command,
-    std::string_view request_id,
-    std::uint64_t expected_generation) = 0;
-  virtual bool read_joint_state(JointStateSample & sample) = 0;
-  virtual bool write_joint_command(
-    const JointCommandView & command) = 0;
-  /// Synchronize the transport command gate with the immutable admission
-  /// lease. A false return means the backend remains closed.
-  virtual XArmCommandGateUpdate set_command_gate(
-    bool open, std::int64_t valid_until_ns) = 0;
-  virtual void set_hardware_component_active(bool active) = 0;
-  virtual void set_trajectory_controller_active(bool active) = 0;
-
-protected:
-  IXArmHardwareBackend() = default;
+  virtual ~IXArmStatusSource() = default;
+  /// Copy of the latest received report; no wait and no effect.
+  [[nodiscard]] virtual XArmObservedState observe() const = 0;
 };
 
-}  // namespace manyforge::xarm_control
+/// `robot_states` arrives at 5 Hz (best effort, keep last 1); a report older
+/// than five periods is stale.
+inline constexpr std::int64_t kXArmStatusFreshnessNs = 1'000'000'000;
+/// One `robot_states` period (5 Hz): the pause between reads of a wait.
+inline constexpr std::int64_t kXArmReportPeriodNs = 200'000'000;
+/// An own operation explains the robot's mode and state changes until a
+/// report received after it shows joint-servo mode out of state 5, or for
+/// at most this long after it ended (the vendor plugin deactivates and
+/// reactivates its controllers after an activation through blocking
+/// controller-manager calls; the former `kOwnPrimitiveSettleNs`).
+inline constexpr std::int64_t kXArmOwnOperationSettleNs = 5'000'000'000LL;
+/// The Enable gate's default largest difference between a measured joint and
+/// the controller's reported angle of the same axis while stopped (per robot:
+/// `lanes.real.joint_agreement_tolerance_rad`).
+inline constexpr double kXArmJointAgreementToleranceRad = 0.02;
+
+/// Controller modes and states (XARM_CONTROLLER_FACTS, "Controller states and
+/// modes").
+inline constexpr int kXArmJointServoMode = 1;
+inline constexpr int kXArmMovingState = 1;
+inline constexpr int kXArmReadyState = 2;
+inline constexpr int kXArmConfigChangedState = 5;
+
+/// One vendor call is bounded by the shared component call cap.
+inline constexpr std::chrono::nanoseconds kXArmServiceResponseTimeout{
+    core::kComponentCallResponseCapNs};
+
+enum class XArmServiceCallOutcome : std::uint8_t {
+  /// Refused before the request left (service missing, cancelled first).
+  kNotSent,
+  /// The driver answered `ret == 0`.
+  kSucceeded,
+  /// Sent, but no answer in time, cancelled, or a non-zero vendor return:
+  /// never retried.
+  kUnknown,
+};
+
+struct XArmServiceCallResult final {
+  XArmServiceCallOutcome outcome{XArmServiceCallOutcome::kNotSent};
+  /// Typed reason token (`xarm_service_*`); empty on success.
+  std::string reason;
+  /// The vendor's `ret`, when an answer arrived.
+  std::optional<std::int32_t> vendor_return;
+};
+
+/// One `get_err_warn_code` read: the call, and the controller's error and
+/// warning codes when it answered `ret == 0`.
+struct XArmErrWarnRead final {
+  XArmServiceCallResult call;
+  std::optional<int> error;
+  std::optional<int> warning;
+};
+
+/// The vendor-neutral code of a robot controller that did not answer a call
+/// within its bound.
+inline constexpr std::string_view kRobotControllerUnresponsiveCode =
+    "robot_controller_unresponsive";
+
+/// A sent vendor call that got no answer within its bound, as opposed to an
+/// answer that refused or failed.
+[[nodiscard]] inline bool XArmCallUnanswered(const std::string_view reason) {
+  return reason == "xarm_service_timeout" || reason == "xarm_service_no_response";
+}
+
+/// The two I/O banks of an xArm-family robot: the control box's (CI/DI
+/// inputs, CO/DO outputs) and the tool's (TI inputs, TO outputs).
+enum class XArmIoBank : std::uint8_t { kController, kTool };
+
+/// `system_control` values (the fork's service, CONTRACTS §13).
+inline constexpr int kXArmSystemShutdown = 1;
+inline constexpr int kXArmSystemReboot = 2;
+
+/// The driver services the adapters call, each request once, never retried,
+/// bounded by `timeout` and following `cancellation`. ROS-free; the
+/// production implementation is `XArmDriverServices`.
+class IXArmDriver {
+public:
+  virtual ~IXArmDriver() = default;
+  [[nodiscard]] virtual XArmServiceCallResult CleanError(std::chrono::nanoseconds timeout,
+                                                         std::stop_token cancellation) const = 0;
+  /// `clean_warn`: clears the controller's warning.
+  [[nodiscard]] virtual XArmServiceCallResult CleanWarn(std::chrono::nanoseconds timeout,
+                                                        std::stop_token cancellation) const = 0;
+  [[nodiscard]] virtual XArmErrWarnRead GetErrWarnCode(std::chrono::nanoseconds timeout,
+                                                       std::stop_token cancellation) const = 0;
+  [[nodiscard]] virtual XArmServiceCallResult SetState(int state, std::chrono::nanoseconds timeout,
+                                                       std::stop_token cancellation) const = 0;
+  /// `set_tcp_offset`: the TCP in the flange frame, sent as `xarm_tcp_offset`.
+  [[nodiscard]] virtual XArmServiceCallResult
+  SetTcpOffset(const core::Pose3DTO &tcp_in_flange, std::chrono::nanoseconds timeout,
+               std::stop_token cancellation) const = 0;
+  /// `set_tcp_load`: kg and the centre of mass in metres in the flange frame.
+  [[nodiscard]] virtual XArmServiceCallResult
+  SetTcpLoad(double mass_kg, const std::array<double, 3> &center_of_mass_m,
+             std::chrono::nanoseconds timeout, std::stop_token cancellation) const = 0;
+  /// `set_cgpio_digital` / `set_tgpio_digital` with the driver's defaults
+  /// (no `sync=False`, no delay).
+  [[nodiscard]] virtual XArmServiceCallResult
+  SetDigitalOutput(XArmIoBank bank, int ionum, bool value, std::chrono::nanoseconds timeout,
+                   std::stop_token cancellation) const = 0;
+  /// The fork's `system_control` (1 = shut down, 2 = reboot).
+  [[nodiscard]] virtual XArmServiceCallResult
+  SystemControl(int value, std::chrono::nanoseconds timeout,
+                std::stop_token cancellation) const = 0;
+};
+
+/// The driver's TCP offset of a pose in the flange frame: `[x, y, z]` in
+/// millimetres, then `[roll, pitch, yaw]` in radians (the driver's SDK runs
+/// with `is_radian`), fixed axes X-Y-Z, so R = Rz(yaw) Ry(pitch) Rx(roll), as
+/// xArm Studio shows it.
+[[nodiscard]] std::array<double, 6> xarm_tcp_offset(const core::Pose3DTO &pose);
+
+} // namespace manyforge::xarm_control

@@ -1,52 +1,88 @@
-"""Probe Isaac Sim/USD collider data for ManyForge scene export planning.
+"""Owner-neutral collider geometry and scene-authoring helpers.
 
-Run this script inside Isaac Sim's Python/Kit environment with a scene already
-loaded, for example:
+The former 2,793-line Isaac/USD/PhysX probe is pinned at source blob
+``380c7dc4ff873aa510290b5f6df5a080e9698ab0``.  Live stage discovery,
+temporary-stage recooking, update-loop ownership, report publication, and the
+``manyforge.isaac.collider_report.v0.1`` contract are unavailable until I9/I.
+They are deliberately not kept behind this module's gate as dormant bodies.
 
-    ./python.sh /path/to/manyforge/scripts/isaac-collider-probe.py \
-        --output /tmp/isaac_colliders.json \
-        --pretty
-
-The script is intentionally read-only.  It inventories collider prims, authored
-USD physics metadata, transforms, bounding boxes, and optionally attempts to
-request PhysX cooked convex collision representations.
+The retained functions are bounded transforms, convex-buffer normalization,
+shape recommendation, and primitive OBJ generation.  Their exact historical
+source cohorts and all 13 focused test definitions are exposed by
+``unavailable_payload`` so future I9 work can recover behavior without treating
+the old wire as a compatibility obligation.
 """
 
 from __future__ import annotations
 
-import argparse
+import hashlib
 import json
 import math
-import platform
+import os
+import re
+import stat
 import sys
-import traceback
-from dataclasses import asdict, dataclass, field
+import tempfile
+from dataclasses import dataclass, field
+from numbers import Integral, Real
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, Final, Iterable
 
 
-_SUPPORTED_MANYFORGE_MESH_EXTENSIONS = {
-    ".obj",
-    ".stl",
-    ".dae",
-    ".ply",
-    ".off",
-    ".glb",
-    ".gltf",
-}
+UNAVAILABLE_EXIT_CODE: Final = 78
+UNAVAILABLE_REASON_CODE: Final = "composable_cell_runtime_unavailable"
+RESTORATION_GATE: Final = "I9/I"
+HISTORICAL_SOURCE_BLOB: Final = "380c7dc4ff873aa510290b5f6df5a080e9698ab0"
+HISTORICAL_WRAPPER_BLOB: Final = "f1b78ac419838a403ae74753749a55bbb30b629a"
+HISTORICAL_TEST_BLOB: Final = "bdbbbcd839a90161bc3425626093863e24b3a0b8"
+UNAVAILABLE_MESSAGE: Final = (
+    f"{UNAVAILABLE_REASON_CODE}: live Isaac collider inspection requires the "
+    f"{RESTORATION_GATE} restoration gate"
+)
 
 _MESH_SOURCE_PREFERENCES = {"auto", "original", "collider", "primitive"}
 
+# These bounds apply before materializing caller-controlled iterables or
+# generating tessellated geometry.  They are deliberately independent of the
+# unavailable live probe's former CLI limits.
+MAX_COLLIDERS: Final = 4_096
+MAX_OBJECT_MESH_RECORDS: Final = 4_096
+MAX_VERTICES: Final = 262_144
+MAX_INDICES: Final = 786_432
+MAX_POLYGONS: Final = 262_144
+MAX_FACES: Final = 524_288
+MAX_SEGMENTS: Final = 1_024
+MAX_RINGS: Final = 1_024
+MAX_SAMPLE_ITEMS: Final = 4_096
+MAX_OBJ_OUTPUT_BYTES: Final = 16 * 1024 * 1024
+MAX_PATH_BYTES: Final = 4_096
+MAX_TEXT_BYTES: Final = 4_096
+MAX_FILENAME_COMPONENT_BYTES: Final = 96
+MAX_EXTRA_FIELDS: Final = 128
+MAX_SAMPLE_DEPTH: Final = 16
+MAX_SAMPLE_NODES: Final = 16_384
+MAX_SAMPLE_TEXT_BYTES: Final = 1024 * 1024
 
-@dataclass
-class ProbeError:
-    scope: str
-    message: str
-    traceback: str | None = None
+_SAFE_FILENAME_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+_OBJ_CORE_RECORD_FIELDS: Final = frozenset(
+    {
+        "source",
+        "source_root",
+        "prim_path",
+        "mesh_resource_uri",
+        "mesh_resource_candidates",
+        "pose",
+        "mesh_scale",
+        "point_count",
+        "face_count",
+    }
+)
 
 
 @dataclass
 class CookedConvexSummary:
+    """Owner-neutral evidence extracted from an already supplied convex buffer."""
+
     attempted: bool
     available: bool
     result: str | None = None
@@ -59,6 +95,8 @@ class CookedConvexSummary:
 
 @dataclass
 class ColliderRecord:
+    """Data-only input to the retained recommendation and export algorithms."""
+
     path: str
     name: str
     type_name: str
@@ -84,868 +122,193 @@ class ColliderRecord:
     errors: list[str] = field(default_factory=list)
 
 
-@dataclass
-class ProbeReport:
-    probe_version: str
-    environment: dict[str, Any]
-    stage: dict[str, Any]
-    filters: dict[str, Any]
-    summary: dict[str, Any]
-    probed_prims: list["PrimRecord"]
-    colliders: list[ColliderRecord]
-    object_meshes: dict[str, list[dict[str, Any]]]
-    errors: list[ProbeError]
+def unavailable_payload() -> dict[str, object]:
+    """Describe the removed I9 owner and the exact retained source evidence."""
 
-
-@dataclass
-class PrimRecord:
-    path: str
-    name: str
-    type_name: str
-    active: bool
-    visibility: str | None
-    computed_visibility: str | None
-    purpose: str | None
-    applied_schemas: list[str]
-    parent_path: str | None
-    xformable: bool
-    local_transform: list[list[float]] | None
-    world_transform: list[list[float]] | None
-    local_aabb: dict[str, Any] | None
-    world_aabb: dict[str, Any] | None
-    errors: list[str] = field(default_factory=list)
-
-
-@dataclass
-class ProbeOptions:
-    stage: str | None = None
-    include_subtree: list[str] = field(default_factory=list)
-    exclude_subtree: list[str] = field(default_factory=list)
-    max_colliders: int | None = None
-    cooked_convex: bool = True
-    include_cooked_samples: bool = False
-    max_sample_items: int = 8
-    include_tracebacks: bool = False
-    include_hidden: bool = False
-    purpose: list[str] = field(default_factory=list)
-    probe_prim: list[str] = field(default_factory=list)
-    mesh_export_dir: str | None = None
-    mesh_source_preference: str = "auto"
-
-
-def capture_probe_report(options: ProbeOptions) -> ProbeReport:
-    """Capture a collider report from the current Isaac Sim stage or a USD file."""
-    errors: list[ProbeError] = []
-
-    try:
-        modules = _load_isaac_modules()
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to import Isaac/Omniverse Python modules. Run this inside "
-            "Isaac Sim's Python/Kit environment."
-        ) from exc
-
-    try:
-        stage = _get_stage(modules, options.stage)
-    except Exception as exc:
-        errors.append(_probe_error("stage", exc, options.include_tracebacks))
-        return _empty_report(options, modules, errors)
-
-    colliders: list[ColliderRecord] = []
-    stage_id = _stage_id(modules, stage)
-    cooking = _acquire_cooking_interface(modules) if options.cooked_convex else None
-    bbox_cache = _make_bbox_cache(modules)
-
-    probed_prims = _inspect_requested_prims(
-        modules=modules,
-        stage=stage,
-        bbox_cache=bbox_cache,
-        prim_paths=options.probe_prim,
-        include_tracebacks=options.include_tracebacks,
-        errors=errors,
-    )
-
-    for prim in stage.Traverse():
-        try:
-            path = str(prim.GetPath())
-            if not _path_included(path, options.include_subtree, options.exclude_subtree):
-                continue
-            if not options.include_hidden and not _prim_is_visible(modules, prim):
-                continue
-            if not _purpose_allowed(modules, prim, options.purpose):
-                continue
-            if not _has_collision_api(modules, prim):
-                continue
-            record = _inspect_collider(
-                modules=modules,
-                stage=stage,
-                stage_id=stage_id,
-                prim=prim,
-                bbox_cache=bbox_cache,
-                cooking=cooking,
-                cooked_enabled=options.cooked_convex,
-                include_cooked_samples=options.include_cooked_samples,
-                max_sample_items=options.max_sample_items,
-            )
-            colliders.append(record)
-            if options.max_colliders is not None and len(colliders) >= options.max_colliders:
-                break
-        except Exception as exc:
-            errors.append(_probe_error(str(prim.GetPath()), exc, options.include_tracebacks))
-
-    object_meshes = _inspect_object_meshes(
-        modules=modules,
-        stage=stage,
-        colliders=colliders,
-        mesh_export_dir=options.mesh_export_dir,
-        errors=errors,
-        include_tracebacks=options.include_tracebacks,
-    )
-
-    return ProbeReport(
-        probe_version="0.1",
-        environment=_environment_info(modules),
-        stage=_stage_info(modules, stage, stage_id),
-        filters={
-            "include_subtree": options.include_subtree,
-            "exclude_subtree": options.exclude_subtree,
-            "max_colliders": options.max_colliders,
-            "cooked_convex": options.cooked_convex,
-            "include_cooked_samples": options.include_cooked_samples,
-            "include_hidden": options.include_hidden,
-            "purpose": options.purpose,
-            "probe_prim": options.probe_prim,
-            "mesh_export_dir": options.mesh_export_dir,
-            "mesh_source_preference": options.mesh_source_preference,
-        },
-        summary=_summary(colliders, errors),
-        probed_prims=probed_prims,
-        colliders=colliders,
-        object_meshes=object_meshes,
-        errors=errors,
-    )
-
-
-def main() -> int:
-    args = _parse_args()
-    options = _options_from_args(args)
-    try:
-        report = capture_probe_report(options)
-    except Exception as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
-    _write_payload(_profile_payload(report, args.output_profile), args)
-    return 0 if not report.errors else 1
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--stage",
-        default=None,
-        help=(
-            "Optional USD stage file to open. If omitted, use the currently "
-            "loaded Isaac Sim stage."
+    return {
+        "schema_version": "manyforge.qualification_unavailable.v1",
+        "reason_code": UNAVAILABLE_REASON_CODE,
+        "message": UNAVAILABLE_MESSAGE,
+        "restoration_gate": RESTORATION_GATE,
+        "historical_source_blob": HISTORICAL_SOURCE_BLOB,
+        "historical_wrapper_blob": HISTORICAL_WRAPPER_BLOB,
+        "historical_test_blob": HISTORICAL_TEST_BLOB,
+        "future_owner": (
+            "I9 retained-product Isaac adapter and its owner-issued collider "
+            "inspection/evidence boundary"
         ),
-    )
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="JSON output path. If omitted, write JSON to stdout.",
-    )
-    parser.add_argument(
-        "--include-subtree",
-        action="append",
-        default=[],
-        help="Only include collider prims under this path. May be repeated.",
-    )
-    parser.add_argument(
-        "--exclude-subtree",
-        action="append",
-        default=[],
-        help="Exclude collider prims under this path. May be repeated.",
-    )
-    parser.add_argument(
-        "--max-colliders",
-        type=int,
-        default=None,
-        help="Optional maximum number of collider prims to inspect.",
-    )
-    parser.add_argument(
-        "--no-cooked-convex",
-        action="store_false",
-        dest="cooked_convex",
-        help="Disable PhysX cooked convex collision representation requests.",
-    )
-    parser.set_defaults(cooked_convex=True)
-    parser.add_argument(
-        "--include-cooked-samples",
-        action="store_true",
-        help="Include small vertex/index/polygon samples from cooked convex data.",
-    )
-    parser.add_argument(
-        "--max-sample-items",
-        type=int,
-        default=8,
-        help="Maximum sampled items per cooked convex array when samples are enabled.",
-    )
-    parser.add_argument(
-        "--pretty",
-        action="store_true",
-        help="Pretty-print JSON output.",
-    )
-    parser.add_argument(
-        "--include-hidden",
-        action="store_true",
-        help="Include collider prims whose computed USD visibility is invisible.",
-    )
-    parser.add_argument(
-        "--purpose",
-        action="append",
-        default=[],
-        choices=["default", "render", "proxy", "guide", "all"],
-        help=(
-            "Only include collider prims with this computed USD purpose. "
-            "May be repeated. Defaults to all purposes."
+        "removed_contracts": ["manyforge.isaac.collider_report.v0.1"],
+        "removed_source_cohorts": [
+            {
+                "lines": "28-46",
+                "responsibility": (
+                    "live USD asset-extension discovery constants and the "
+                    "report-only error envelope"
+                ),
+            },
+            {
+                "lines": "87-950",
+                "responsibility": (
+                    "report/options DTOs, CLI parsing, Isaac module and stage "
+                    "discovery, collider inspection, PhysX lookup, and temporary "
+                    "stage recooking"
+                ),
+            },
+            {
+                "lines": "1027-1041,1116-1318",
+                "responsibility": (
+                    "cooking-prim discovery, environment/stage capture, report "
+                    "summary, output-profile serialization, and v0.1 publication"
+                ),
+            },
+            {
+                "lines": "1319-1372,1513-1517,1630-1989",
+                "responsibility": (
+                    "report-level grouping/warnings plus live USD object-mesh "
+                    "discovery and export"
+                ),
+            },
+            {
+                "lines": "2200-2210,2219-2240,2244-2653,2744-2793",
+                "responsibility": (
+                    "stage-path grouping, live USD/API/schema inspection, report "
+                    "sanitization, error capture, and executable dispatch"
+                ),
+            },
+        ],
+        "retained_source_cohorts": [
+            "48-84: collider evidence DTOs",
+            "951-1024,1043-1113: convex normalization and triangulation",
+            "1373-1510,1518-1628: pure shape recommendation and transforms",
+            "1990-2197,2211-2216: primitive OBJ construction and naming",
+            "2241-2242,2654-2742: bounded numeric/transform helpers",
+        ],
+        "historical_acceptance": (
+            "all 13 definitions in the historical test blob remain focused "
+            "I9 acceptance inputs and executable tests of retained helpers; "
+            "their exact line/name/outcome mapping is "
+            "tests/test_isaac_collider_probe_lib.py::"
+            "HISTORICAL_ACCEPTANCE_COHORTS"
         ),
-    )
-    parser.add_argument(
-        "--probe-prim",
-        action="append",
-        default=[],
-        help=(
-            "Also report transform/AABB metadata for this prim path even if it "
-            "is not a collider. May be repeated."
-        ),
-    )
-    parser.add_argument(
-        "--mesh-export-dir",
-        default=None,
-        help=(
-            "Optional directory where each logical object's original USD mesh "
-            "subtree is exported as an OBJ for ManyForge mesh scene resources."
-        ),
-    )
-    parser.add_argument(
-        "--mesh-source-preference",
-        choices=sorted(_MESH_SOURCE_PREFERENCES),
-        default="auto",
-        help=(
-            "Select which mesh source should drive LLM scene-resource "
-            "recommendations. auto prefers original visual/object meshes when "
-            "available; collider ignores original meshes and prefers directly "
-            "usable collider meshes; primitive forces primitive/AABB fallback."
-        ),
-    )
-    parser.add_argument(
-        "--output-profile",
-        choices=["raw_inventory", "llm_scene_authoring"],
-        default="raw_inventory",
-        help="Select raw probe JSON or compact LLM scene-authoring JSON.",
-    )
-    parser.add_argument(
-        "--include-tracebacks",
-        action="store_true",
-        help="Include Python tracebacks in error records.",
-    )
-    return parser.parse_args()
-
-
-def _options_from_args(args: argparse.Namespace) -> ProbeOptions:
-    return ProbeOptions(
-        stage=args.stage,
-        include_subtree=args.include_subtree,
-        exclude_subtree=args.exclude_subtree,
-        max_colliders=args.max_colliders,
-        cooked_convex=args.cooked_convex,
-        include_cooked_samples=args.include_cooked_samples,
-        max_sample_items=args.max_sample_items,
-        include_tracebacks=args.include_tracebacks,
-        include_hidden=args.include_hidden,
-        purpose=args.purpose,
-        probe_prim=args.probe_prim,
-        mesh_export_dir=args.mesh_export_dir,
-        mesh_source_preference=args.mesh_source_preference,
-    )
-
-
-def _load_isaac_modules() -> dict[str, Any]:
-    from pxr import Gf, PhysicsSchemaTools, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, UsdUtils
-
-    modules: dict[str, Any] = {
-        "Gf": Gf,
-        "PhysicsSchemaTools": PhysicsSchemaTools,
-        "PhysxSchema": PhysxSchema,
-        "Sdf": Sdf,
-        "Usd": Usd,
-        "UsdGeom": UsdGeom,
-        "UsdPhysics": UsdPhysics,
-        "UsdUtils": UsdUtils,
+        "exit_code": UNAVAILABLE_EXIT_CODE,
     }
 
-    try:
-        import omni.usd
 
-        modules["omni.usd"] = omni.usd
-    except Exception:
-        modules["omni.usd"] = None
+def main(argv: list[str] | None = None) -> int:
+    """Fail before argument parsing, Isaac imports, stage access, or file writes."""
 
-    try:
-        import omni.kit.app
-
-        modules["omni.kit.app"] = omni.kit.app
-    except Exception:
-        modules["omni.kit.app"] = None
-
-    try:
-        import omni.physx.bindings._physx as physx_bindings
-
-        modules["omni.physx.bindings._physx"] = physx_bindings
-    except Exception:
-        modules["omni.physx.bindings._physx"] = None
-
-    return modules
+    del argv
+    print(json.dumps(unavailable_payload(), sort_keys=True), file=sys.stderr)
+    return UNAVAILABLE_EXIT_CODE
 
 
-def _get_stage(modules: dict[str, Any], stage_path: str | None) -> Any:
-    Usd = modules["Usd"]
-    if stage_path:
-        stage = Usd.Stage.Open(stage_path)
-        if stage is None:
-            raise RuntimeError(f"Could not open USD stage: {stage_path}")
-        return stage
-
-    omni_usd = modules.get("omni.usd")
-    if omni_usd is None:
-        raise RuntimeError("omni.usd is not available and --stage was not provided")
-    stage = omni_usd.get_context().get_stage()
-    if stage is None:
-        raise RuntimeError("No Isaac Sim stage is currently loaded")
-    return stage
-
-
-def _stage_id(modules: dict[str, Any], stage: Any) -> int | None:
-    try:
-        return int(modules["UsdUtils"].StageCache.Get().GetId(stage).ToLongInt())
-    except Exception:
-        return None
-
-
-def _make_bbox_cache(modules: dict[str, Any]) -> Any:
-    Usd = modules["Usd"]
-    UsdGeom = modules["UsdGeom"]
-    included_purposes = [
-        UsdGeom.Tokens.default_,
-        UsdGeom.Tokens.render,
-        UsdGeom.Tokens.proxy,
-        UsdGeom.Tokens.guide,
-    ]
-    return UsdGeom.BBoxCache(Usd.TimeCode.Default(), included_purposes, useExtentsHint=True)
-
-
-def _inspect_requested_prims(
+def _bounded_items(
+    values: Iterable[Any] | None,
     *,
-    modules: dict[str, Any],
-    stage: Any,
-    bbox_cache: Any,
-    prim_paths: list[str],
-    include_tracebacks: bool,
-    errors: list[ProbeError],
-) -> list[PrimRecord]:
-    records: list[PrimRecord] = []
-    for prim_path in prim_paths:
-        try:
-            prim = stage.GetPrimAtPath(prim_path)
-            if prim is None or not prim.IsValid():
-                raise RuntimeError(f"Prim not found: {prim_path}")
-            records.append(_inspect_prim(modules, prim, bbox_cache))
-        except Exception as exc:
-            errors.append(_probe_error(prim_path, exc, include_tracebacks))
-    return records
+    maximum: int,
+    label: str,
+) -> list[Any]:
+    """Materialize at most ``maximum`` items, including unsized iterables."""
 
-
-def _inspect_prim(modules: dict[str, Any], prim: Any, bbox_cache: Any) -> PrimRecord:
-    errors: list[str] = []
-    world_matrix = _world_matrix(modules, prim, errors)
-    return PrimRecord(
-        path=str(prim.GetPath()),
-        name=prim.GetName(),
-        type_name=prim.GetTypeName(),
-        active=bool(prim.IsActive()),
-        visibility=_visibility_attr(modules, prim),
-        computed_visibility=_computed_visibility(modules, prim),
-        purpose=_computed_purpose(modules, prim),
-        applied_schemas=list(prim.GetAppliedSchemas()),
-        parent_path=_parent_path(prim),
-        xformable=_is_xformable(modules, prim),
-        local_transform=_local_transform(modules, prim, errors),
-        world_transform=_matrix_to_rows(world_matrix) if world_matrix is not None else None,
-        local_aabb=_aabb(modules, bbox_cache, prim, local=True, errors=errors),
-        world_aabb=_aabb(modules, bbox_cache, prim, local=False, errors=errors),
-        errors=errors,
-    )
-
-
-def _inspect_collider(
-    *,
-    modules: dict[str, Any],
-    stage: Any,
-    stage_id: int | None,
-    prim: Any,
-    bbox_cache: Any,
-    cooking: Any,
-    cooked_enabled: bool,
-    include_cooked_samples: bool,
-    max_sample_items: int,
-) -> ColliderRecord:
-    UsdPhysics = modules["UsdPhysics"]
-    PhysxSchema = modules["PhysxSchema"]
-    path = str(prim.GetPath())
-    errors: list[str] = []
-
-    collision_api = _make_api(UsdPhysics.CollisionAPI, prim)
-    collision_enabled = _attr_value(_api_attr(collision_api, "GetCollisionEnabledAttr"))
-
-    mesh_api = None
-    if _has_api(prim, UsdPhysics.MeshCollisionAPI):
-        mesh_api = _inspect_api_attrs(
-            _make_api(UsdPhysics.MeshCollisionAPI, prim),
-            [
-                "GetApproximationAttr",
-            ],
-        )
-
-    world_matrix = _world_matrix(modules, prim, errors)
-    cooked = _inspect_cooked_convex(
-        modules=modules,
-        stage=stage,
-        stage_id=stage_id,
-        prim=prim,
-        world_matrix=world_matrix,
-        cooking=cooking,
-        enabled=cooked_enabled,
-        include_samples=include_cooked_samples,
-        max_sample_items=max_sample_items,
-    )
-
-    return ColliderRecord(
-        path=path,
-        name=prim.GetName(),
-        type_name=prim.GetTypeName(),
-        active=bool(prim.IsActive()),
-        visibility=_visibility_attr(modules, prim),
-        computed_visibility=_computed_visibility(modules, prim),
-        purpose=_computed_purpose(modules, prim),
-        applied_schemas=list(prim.GetAppliedSchemas()),
-        parent_path=_parent_path(prim),
-        rigid_body_path=_ancestor_with_api(prim, UsdPhysics.RigidBodyAPI),
-        articulation_root_path=_ancestor_with_api(prim, UsdPhysics.ArticulationRootAPI),
-        xformable=_is_xformable(modules, prim),
-        local_transform=_local_transform(modules, prim, errors),
-        world_transform=_matrix_to_rows(world_matrix) if world_matrix is not None else None,
-        local_aabb=_aabb(modules, bbox_cache, prim, local=True, errors=errors),
-        world_aabb=_aabb(modules, bbox_cache, prim, local=False, errors=errors),
-        collision_enabled=bool(collision_enabled) if collision_enabled is not None else None,
-        collision_api=_inspect_api_attrs(
-            collision_api,
-            [
-                "GetCollisionEnabledAttr",
-                "GetFilteredGroupsRel",
-                "GetSimulationOwnerRel",
-            ],
-        ),
-        mesh_collision_api=mesh_api,
-        physx_collision_schemas=_physx_collision_schemas(PhysxSchema, prim),
-        geometry_schema=_geometry_schema(modules, prim),
-        cooked_convex=cooked,
-        errors=errors,
-    )
-
-
-def _inspect_cooked_convex(
-    *,
-    modules: dict[str, Any],
-    stage: Any,
-    stage_id: int | None,
-    prim: Any,
-    world_matrix: Any,
-    cooking: Any,
-    enabled: bool,
-    include_samples: bool,
-    max_sample_items: int,
-) -> CookedConvexSummary:
-    if not enabled:
-        return CookedConvexSummary(attempted=False, available=False, error="disabled")
-    if cooking is None:
-        return CookedConvexSummary(
-            attempted=True,
-            available=False,
-            error="omni.physx cooking interface is not available",
-        )
-    if stage_id is None:
-        return CookedConvexSummary(
-            attempted=True,
-            available=False,
-            error="stage id is not available",
-        )
-
-    target_inverse = _inverse_matrix(world_matrix)
-    attempted_paths: list[str] = []
-    last_result: str | None = None
-    last_error: str | None = None
-    for cooking_prim in _cooking_prim_candidates(modules, prim):
-        source_path = str(cooking_prim.GetPath())
-        attempted_paths.append(source_path)
-        try:
-            prim_id = modules["PhysicsSchemaTools"].sdfPathToInt(source_path)
-        except Exception as exc:
-            last_error = f"could not encode prim path for PhysX: {exc}"
-            continue
-
-        source_world = _world_matrix(modules, cooking_prim, [])
-        callback_payload: dict[str, Any] = {}
-
-        def on_result(result: Any, convexes: list[Any]) -> None:
-            callback_payload["result"] = _enum_name(result)
-            callback_payload["convexes"] = [
-                _convex_summary(
-                    convex,
-                    world_matrix,
-                    include_samples,
-                    max_sample_items,
-                    source_world_matrix=source_world,
-                    target_inverse_matrix=target_inverse,
-                )
-                for convex in list(convexes)
-            ]
-
-        try:
-            cooking.request_convex_collision_representation(
-                int(stage_id),
-                int(prim_id),
-                False,
-                on_result,
-            )
-        except Exception as exc:
-            last_error = f"request_convex_collision_representation failed: {exc}"
-            continue
-
-        if "result" not in callback_payload:
-            last_error = "PhysX cooking callback was not invoked"
-            continue
-
-        convexes = callback_payload.get("convexes", [])
-        result = callback_payload["result"]
-        last_result = result
-        if not convexes:
-            continue
-        return CookedConvexSummary(
-            attempted=True,
-            available=True,
-            result=result,
-            source_path=source_path,
-            attempted_paths=attempted_paths,
-            convex_count=len(convexes),
-            convexes=convexes,
-        )
-
-    for cooking_prim in _cooking_prim_candidates(modules, prim):
-        source_path = str(cooking_prim.GetPath())
-        if source_path not in attempted_paths:
-            attempted_paths.append(source_path)
-        source_world = _world_matrix(modules, cooking_prim, [])
-        try:
-            convexes = _direct_convex_mesh_data(
-                cooking,
-                source_path,
-                world_matrix,
-                include_samples,
-                max_sample_items,
-                source_world_matrix=source_world,
-                target_inverse_matrix=target_inverse,
-            )
-        except Exception as exc:
-            last_error = f"get_convex_mesh_data failed: {exc}"
-            continue
-        if not convexes:
-            continue
-        return CookedConvexSummary(
-            attempted=True,
-            available=True,
-            result="DIRECT_CONVEX_MESH_DATA",
-            source_path=source_path,
-            attempted_paths=attempted_paths,
-            convex_count=len(convexes),
-            convexes=convexes,
-        )
-
-    try:
-        recook_path, convexes = _temporary_recook_descendant_mesh(
-            modules=modules,
-            stage=stage,
-            stage_id=stage_id,
-            prim=prim,
-            cooking=cooking,
-            target_world_matrix=world_matrix,
-            target_inverse_matrix=target_inverse,
-            include_samples=include_samples,
-            max_sample_items=max_sample_items,
-        )
-    except Exception as exc:
-        last_error = f"temporary descendant-mesh recook failed: {exc}"
-    else:
-        if recook_path:
-            attempted_paths.append(recook_path)
-        if convexes:
-            return CookedConvexSummary(
-                attempted=True,
-                available=True,
-                result="TEMPORARY_DESCENDANT_MESH_RECOOK",
-                source_path=recook_path,
-                attempted_paths=attempted_paths,
-                convex_count=len(convexes),
-                convexes=convexes,
-            )
-
-    return CookedConvexSummary(
-        attempted=True,
-        available=False,
-        result=last_result,
-        attempted_paths=attempted_paths,
-        convex_count=0,
-        convexes=[],
-        error=last_error,
-    )
-
-
-def _direct_convex_mesh_data(
-    cooking: Any,
-    source_path: str,
-    world_matrix: Any,
-    include_samples: bool,
-    max_sample_items: int,
-    *,
-    source_world_matrix: Any | None,
-    target_inverse_matrix: Any | None,
-) -> list[dict[str, Any]]:
-    get_count = getattr(cooking, "get_nb_convex_mesh_data", None)
-    get_data = getattr(cooking, "get_convex_mesh_data", None)
-    if get_count is None or get_data is None:
+    if values is None:
         return []
-    count = int(get_count(source_path))
-    convexes = []
-    for index in range(count):
-        data = get_data(source_path, index)
-        if not isinstance(data, dict):
-            continue
-        convexes.append(
-            _convex_data_summary(
-                data,
-                world_matrix,
-                include_samples,
-                max_sample_items,
-                source_world_matrix=source_world_matrix,
-                target_inverse_matrix=target_inverse_matrix,
-            )
-        )
-    return convexes
-
-
-def _temporary_recook_descendant_mesh(
-    *,
-    modules: dict[str, Any],
-    stage: Any,
-    stage_id: int,
-    prim: Any,
-    cooking: Any,
-    target_world_matrix: Any,
-    target_inverse_matrix: Any,
-    include_samples: bool,
-    max_sample_items: int,
-) -> tuple[str | None, list[dict[str, Any]]]:
-    """Cook a transient mesh copy when CollisionAPI is authored on an Xform.
-
-    PhysX's collision-representation API expects the prim carrying CollisionAPI
-    to also be parseable as collision geometry. Some Isaac assets author
-    MeshCollisionAPI on an Xform with the actual UsdGeom.Mesh below it; PhysX
-    then returns RESULT_ERROR_INVALID_PARSING even though the runtime UI shows a
-    convex-decomposition setting. This fallback creates a temporary cook-only
-    mesh from the descendant visual mesh, copies the collision approximation
-    settings, requests the cooked representation, and removes the temp prim.
-    """
+    if isinstance(values, (str, bytes, bytearray)):
+        raise ValueError(f"{label} must be an item collection")
     try:
-        if prim.IsA(modules["UsdGeom"].Mesh):
-            return None, []
-    except Exception:
-        return None, []
+        supplied_count = len(values)  # type: ignore[arg-type]
+    except (AttributeError, TypeError):
+        supplied_count = None
+    if supplied_count is not None and supplied_count > maximum:
+        raise ValueError(f"{label} exceeds the {maximum}-item bound")
 
-    mesh_prims = [
-        descendant
-        for descendant in _iter_prim_subtree(prim)
-        if _prim_is_active_mesh(modules, descendant)
+    bounded: list[Any] = []
+    try:
+        iterator = iter(values)
+    except TypeError as exc:
+        raise ValueError(f"{label} must be an item collection") from exc
+    for item in iterator:
+        if len(bounded) >= maximum:
+            raise ValueError(f"{label} exceeds the {maximum}-item bound")
+        bounded.append(item)
+    return bounded
+
+
+def _exact_int(
+    value: Any,
+    *,
+    label: str,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{label} must be an integer, not bool")
+    result = int(value)
+    if minimum is not None and result < minimum:
+        raise ValueError(f"{label} must be at least {minimum}")
+    if maximum is not None and result > maximum:
+        raise ValueError(f"{label} must be at most {maximum}")
+    return result
+
+
+def _finite_real(value: Any, *, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{label} must be a real number, not bool")
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be finite") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{label} must be finite")
+    return result
+
+
+def _finite_vector3(value: Any, *, label: str) -> list[float]:
+    items = _bounded_items(value, maximum=3, label=label)
+    if len(items) != 3:
+        raise ValueError(f"{label} must contain exactly three coordinates")
+    return [
+        _finite_real(item, label=f"{label}[{index}]")
+        for index, item in enumerate(items)
     ]
-    if not mesh_prims:
-        return None, []
-
-    temp_root = f"/__manyforge_probe_cooking_{_object_id_hint(str(prim.GetPath()))}"
-    temp_path = f"{temp_root}/collision_mesh"
-    Sdf = modules["Sdf"]
-    UsdGeom = modules["UsdGeom"]
-    UsdPhysics = modules["UsdPhysics"]
-    PhysxSchema = modules["PhysxSchema"]
-
-    stage.RemovePrim(Sdf.Path(temp_root))
-    try:
-        UsdGeom.Xform.Define(stage, Sdf.Path(temp_root))
-        mesh = UsdGeom.Mesh.Define(stage, Sdf.Path(temp_path))
-        temp_prim = mesh.GetPrim()
-        points, face_counts, face_indices = _merged_mesh_geometry_in_target_frame(
-            modules=modules,
-            mesh_prims=mesh_prims,
-            target_inverse_matrix=target_inverse_matrix,
-        )
-        if not points or not face_counts or not face_indices:
-            return temp_path, []
-
-        Gf = modules["Gf"]
-        mesh.CreatePointsAttr([Gf.Vec3f(*point) for point in points])
-        mesh.CreateFaceVertexCountsAttr(face_counts)
-        mesh.CreateFaceVertexIndicesAttr(face_indices)
-        UsdPhysics.CollisionAPI.Apply(temp_prim)
-        mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(temp_prim)
-        approximation = None
-        if _has_api(prim, UsdPhysics.MeshCollisionAPI):
-            source_mesh_collision = _make_api(UsdPhysics.MeshCollisionAPI, prim)
-            approximation = _attr_value(_api_attr(source_mesh_collision, "GetApproximationAttr"))
-        if not approximation and _has_api(prim, getattr(PhysxSchema, "PhysxConvexDecompositionCollisionAPI", None)):
-            approximation = "convexDecomposition"
-        if approximation:
-            _set_api_attr(mesh_collision, "CreateApproximationAttr", approximation)
-        _copy_collision_schema_attrs(
-            modules=modules,
-            source_prim=prim,
-            target_prim=temp_prim,
-        )
-
-        prim_id = modules["PhysicsSchemaTools"].sdfPathToInt(temp_path)
-        source_world_matrix = target_world_matrix
-        callback_payload: dict[str, Any] = {}
-
-        def on_result(result: Any, convexes: list[Any]) -> None:
-            callback_payload["result"] = _enum_name(result)
-            callback_payload["convexes"] = [
-                _convex_summary(
-                    convex,
-                    target_world_matrix,
-                    include_samples,
-                    max_sample_items,
-                    source_world_matrix=source_world_matrix,
-                    target_inverse_matrix=target_inverse_matrix,
-                )
-                for convex in list(convexes)
-            ]
-
-        cooking.request_convex_collision_representation(
-            int(stage_id),
-            int(prim_id),
-            False,
-            on_result,
-        )
-        convexes = callback_payload.get("convexes", [])
-        if convexes:
-            return temp_path, convexes
-        direct_convexes = _direct_convex_mesh_data(
-            cooking,
-            temp_path,
-            target_world_matrix,
-            include_samples,
-            max_sample_items,
-            source_world_matrix=source_world_matrix,
-            target_inverse_matrix=target_inverse_matrix,
-        )
-        return temp_path, direct_convexes
-    finally:
-        stage.RemovePrim(Sdf.Path(temp_root))
 
 
-def _prim_is_active_mesh(modules: dict[str, Any], prim: Any) -> bool:
-    try:
-        return bool(prim.IsActive() and prim.IsA(modules["UsdGeom"].Mesh))
-    except Exception:
-        return False
-
-
-def _merged_mesh_geometry_in_target_frame(
+def _bounded_text(
+    value: Any,
     *,
-    modules: dict[str, Any],
-    mesh_prims: list[Any],
-    target_inverse_matrix: Any,
-) -> tuple[list[list[float]], list[int], list[int]]:
-    points: list[list[float]] = []
-    face_counts: list[int] = []
-    face_indices: list[int] = []
-    for prim in mesh_prims:
-        try:
-            mesh = modules["UsdGeom"].Mesh(prim)
-            prim_points = mesh.GetPointsAttr().Get() or []
-            prim_face_counts = mesh.GetFaceVertexCountsAttr().Get() or []
-            prim_face_indices = mesh.GetFaceVertexIndicesAttr().Get() or []
-            prim_world = _world_matrix(modules, prim, [])
-        except Exception:
-            continue
-        point_offset = len(points)
-        for point in prim_points:
-            world_point = _transform_point(prim_world, point)
-            target_point = _transform_point(target_inverse_matrix, world_point)
-            points.append(_rounded_list(target_point, digits=9))
-        face_counts.extend(int(count) for count in prim_face_counts)
-        face_indices.extend(point_offset + int(index) for index in prim_face_indices)
-    return points, face_counts, face_indices
+    label: str,
+    maximum_bytes: int = MAX_TEXT_BYTES,
+    allow_empty: bool = False,
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    if "\x00" in value:
+        raise ValueError(f"{label} must not contain a NUL byte")
+    if not allow_empty and not value:
+        raise ValueError(f"{label} must not be empty")
+    if len(value.encode("utf-8")) > maximum_bytes:
+        raise ValueError(f"{label} exceeds the {maximum_bytes}-byte bound")
+    return value
 
 
-def _copy_collision_schema_attrs(
+def _safe_filename_component(
+    value: Any,
     *,
-    modules: dict[str, Any],
-    source_prim: Any,
-    target_prim: Any,
-) -> None:
-    PhysxSchema = modules["PhysxSchema"]
-    schema_methods = [
-        (
-            getattr(PhysxSchema, "PhysxConvexHullCollisionAPI", None),
-            ["HullVertexLimit", "MinThickness"],
-        ),
-        (
-            getattr(PhysxSchema, "PhysxConvexDecompositionCollisionAPI", None),
-            ["HullVertexLimit", "MaxConvexHulls", "VoxelResolution"],
-        ),
-        (
-            getattr(PhysxSchema, "PhysxSDFMeshCollisionAPI", None),
-            ["SdfResolution", "SdfSubgridResolution", "SdfBitsPerSubgridPixel", "SdfMargin"],
-        ),
-    ]
-    for schema_cls, names in schema_methods:
-        if schema_cls is None or not _has_api(source_prim, schema_cls):
-            continue
-        source_api = _make_api(schema_cls, source_prim)
-        target_api = schema_cls.Apply(target_prim)
-        for name in names:
-            value = _attr_value(_api_attr(source_api, f"Get{name}Attr"))
-            if value is not None:
-                _set_api_attr(target_api, f"Create{name}Attr", value)
-
-
-def _set_api_attr(api: Any, create_method_name: str, value: Any) -> None:
-    try:
-        attr = getattr(api, create_method_name)()
-    except Exception:
-        getter = "Get" + create_method_name.removeprefix("Create")
-        attr = _api_attr(api, getter)
-    if attr is not None:
-        try:
-            attr.Set(value)
-        except Exception:
-            pass
+    label: str,
+    allow_empty: bool = False,
+) -> str:
+    component = _bounded_text(
+        value,
+        label=label,
+        maximum_bytes=MAX_FILENAME_COMPONENT_BYTES,
+        allow_empty=allow_empty,
+    )
+    if not component and allow_empty:
+        return component
+    if _SAFE_FILENAME_COMPONENT.fullmatch(component) is None:
+        raise ValueError(
+            f"{label} must contain only ASCII letters, digits, '_' or '-'"
+        )
+    return component
 
 
 def _convex_summary(
@@ -957,32 +320,59 @@ def _convex_summary(
     source_world_matrix: Any | None = None,
     target_inverse_matrix: Any | None = None,
 ) -> dict[str, Any]:
-    raw_vertices = list(getattr(convex, "vertices", []) or [])
+    sample_limit = _exact_int(
+        max_sample_items,
+        label="max_sample_items",
+        minimum=0,
+        maximum=MAX_SAMPLE_ITEMS,
+    )
+    raw_vertices = _bounded_items(
+        getattr(convex, "vertices", None),
+        maximum=MAX_VERTICES,
+        label="convex vertices",
+    )
     vertices = _convex_vertices_in_target_frame(
         raw_vertices,
         source_world_matrix,
         target_inverse_matrix,
     )
-    indices = list(getattr(convex, "indices", []) or [])
-    polygons = list(getattr(convex, "polygons", []) or [])
-    faces = _convex_faces(indices, polygons)
+    indices = _bounded_items(
+        getattr(convex, "indices", None),
+        maximum=MAX_INDICES,
+        label="convex indices",
+    )
+    polygons = _bounded_items(
+        getattr(convex, "polygons", None),
+        maximum=MAX_POLYGONS,
+        label="convex polygons",
+    )
+    faces = _convex_faces(indices, polygons, vertex_count=len(vertices))
     summary: dict[str, Any] = {
         "vertex_count": len(vertices),
         "index_count": len(indices),
         "polygon_count": len(polygons),
-        "vertices": [_rounded_list(_vector_to_list(item), digits=9) for item in vertices],
+        "vertices": [
+            _rounded_list(_vector_to_list(item), digits=9) for item in vertices
+        ],
         "faces": faces,
         "local_aabb": _points_aabb(vertices),
-        "world_aabb": _points_aabb(
-            [_transform_point(world_matrix, vertex) for vertex in vertices]
-        ) if world_matrix is not None else None,
+        "world_aabb": (
+            _points_aabb(
+                [_transform_point(world_matrix, vertex) for vertex in vertices]
+            )
+            if world_matrix is not None
+            else None
+        ),
     }
     if include_samples:
-        summary["vertices_sample"] = [_vector_to_list(item) for item in vertices[:max_sample_items]]
-        summary["indices_sample"] = [int(item) for item in indices[:max_sample_items]]
-        summary["polygons_sample"] = [
-            _plain_value(item) for item in polygons[:max_sample_items]
+        summary["vertices_sample"] = [
+            _vector_to_list(item) for item in vertices[:sample_limit]
         ]
+        summary["indices_sample"] = [
+            _exact_int(item, label="sampled convex index", minimum=0)
+            for item in indices[:sample_limit]
+        ]
+        summary["polygons_sample"] = _plain_value(polygons[:sample_limit])
     return summary
 
 
@@ -995,49 +385,62 @@ def _convex_data_summary(
     source_world_matrix: Any | None,
     target_inverse_matrix: Any | None,
 ) -> dict[str, Any]:
-    raw_vertices = list(data.get("vertices") or [])
+    if not isinstance(data, dict):
+        raise ValueError("convex data must be an object")
+    sample_limit = _exact_int(
+        max_sample_items,
+        label="max_sample_items",
+        minimum=0,
+        maximum=MAX_SAMPLE_ITEMS,
+    )
+    raw_vertices = _bounded_items(
+        data.get("vertices"),
+        maximum=MAX_VERTICES,
+        label="convex vertices",
+    )
     vertices = _convex_vertices_in_target_frame(
         raw_vertices,
         source_world_matrix,
         target_inverse_matrix,
     )
-    indices = list(data.get("indices") or [])
-    polygons = list(data.get("polygons") or [])
-    faces = _convex_faces(indices, polygons)
+    indices = _bounded_items(
+        data.get("indices"),
+        maximum=MAX_INDICES,
+        label="convex indices",
+    )
+    polygons = _bounded_items(
+        data.get("polygons"),
+        maximum=MAX_POLYGONS,
+        label="convex polygons",
+    )
+    faces = _convex_faces(indices, polygons, vertex_count=len(vertices))
     summary: dict[str, Any] = {
         "vertex_count": len(vertices),
         "index_count": len(indices),
         "polygon_count": len(polygons),
-        "vertices": [_rounded_list(_vector_to_list(item), digits=9) for item in vertices],
+        "vertices": [
+            _rounded_list(_vector_to_list(item), digits=9) for item in vertices
+        ],
         "faces": faces,
         "local_aabb": _points_aabb(vertices),
-        "world_aabb": _points_aabb(
-            [_transform_point(world_matrix, vertex) for vertex in vertices]
-        ) if world_matrix is not None else None,
+        "world_aabb": (
+            _points_aabb(
+                [_transform_point(world_matrix, vertex) for vertex in vertices]
+            )
+            if world_matrix is not None
+            else None
+        ),
     }
     if include_samples:
-        summary["vertices_sample"] = [_vector_to_list(item) for item in vertices[:max_sample_items]]
-        summary["indices_sample"] = [int(item) for item in indices[:max_sample_items]]
-        summary["polygons_sample"] = [
-            _plain_value(item) for item in polygons[:max_sample_items]
+        summary["vertices_sample"] = [
+            _vector_to_list(item) for item in vertices[:sample_limit]
         ]
+        summary["indices_sample"] = [
+            _exact_int(item, label="sampled convex index", minimum=0)
+            for item in indices[:sample_limit]
+        ]
+        summary["polygons_sample"] = _plain_value(polygons[:sample_limit])
     return summary
-
-
-def _cooking_prim_candidates(modules: dict[str, Any], prim: Any) -> list[Any]:
-    candidates = [prim]
-    try:
-        if prim.IsA(modules["UsdGeom"].Mesh):
-            return candidates
-    except Exception:
-        return candidates
-    for descendant in _iter_prim_subtree(prim):
-        try:
-            if descendant.IsActive() and descendant.IsA(modules["UsdGeom"].Mesh):
-                candidates.append(descendant)
-        except Exception:
-            continue
-    return candidates
 
 
 def _convex_vertices_in_target_frame(
@@ -1045,19 +448,57 @@ def _convex_vertices_in_target_frame(
     source_world_matrix: Any | None,
     target_inverse_matrix: Any | None,
 ) -> list[list[float]]:
+    bounded_vertices = _bounded_items(
+        vertices,
+        maximum=MAX_VERTICES,
+        label="convex vertices",
+    )
+    if source_world_matrix is None and target_inverse_matrix is None:
+        return [_vector_to_list(vertex) for vertex in bounded_vertices]
     if source_world_matrix is None or target_inverse_matrix is None:
-        return [_vector_to_list(vertex) for vertex in vertices]
-    transformed = []
-    for vertex in vertices:
+        raise ValueError(
+            "source_world_matrix and target_inverse_matrix must be supplied together"
+        )
+    transformed: list[list[float]] = []
+    for vertex in bounded_vertices:
         world_point = _transform_point(source_world_matrix, vertex)
         transformed.append(_transform_point(target_inverse_matrix, world_point))
     return transformed
 
 
-def _convex_faces(indices: list[Any], polygons: list[Any]) -> list[list[int]]:
+def _convex_faces(
+    indices: list[Any],
+    polygons: list[Any],
+    *,
+    vertex_count: int,
+) -> list[list[int]]:
+    bounded_indices = _bounded_items(
+        indices,
+        maximum=MAX_INDICES,
+        label="convex indices",
+    )
+    bounded_polygons = _bounded_items(
+        polygons,
+        maximum=MAX_POLYGONS,
+        label="convex polygons",
+    )
+    validated_vertex_count = _exact_int(
+        vertex_count,
+        label="convex vertex_count",
+        minimum=0,
+        maximum=MAX_VERTICES,
+    )
+    index_values = [
+        _exact_int(
+            item,
+            label=f"convex indices[{index}]",
+            minimum=0,
+            maximum=validated_vertex_count - 1,
+        )
+        for index, item in enumerate(bounded_indices)
+    ]
     faces: list[list[int]] = []
-    index_values = [int(item) for item in indices]
-    for polygon in polygons:
+    for polygon_number, polygon in enumerate(bounded_polygons):
         base = _first_int_attr(
             polygon,
             "mIndexBase",
@@ -1077,17 +518,47 @@ def _convex_faces(indices: list[Any], polygons: list[Any]) -> list[list[int]]:
             "vertexCount",
             "vertex_count",
         )
-        if base is None or count is None or count < 3:
+        if base is None and count is None:
             continue
+        if base is None or count is None:
+            raise ValueError(
+                f"convex polygons[{polygon_number}] must supply both index base "
+                "and vertex count"
+            )
+        base = _exact_int(
+            base,
+            label=f"convex polygons[{polygon_number}].index_base",
+            minimum=0,
+            maximum=len(index_values),
+        )
+        count = _exact_int(
+            count,
+            label=f"convex polygons[{polygon_number}].vertex_count",
+            minimum=3,
+            maximum=MAX_INDICES,
+        )
+        if base + count > len(index_values):
+            raise ValueError(
+                f"convex polygons[{polygon_number}] index range exceeds the "
+                "supplied index buffer"
+            )
+        new_faces = count - 2
+        if len(faces) + new_faces > MAX_FACES:
+            raise ValueError(f"convex faces exceeds the {MAX_FACES}-item bound")
         polygon_indices = index_values[base : base + count]
-        if len(polygon_indices) < 3:
-            continue
         for index in range(1, len(polygon_indices) - 1):
-            faces.append([polygon_indices[0], polygon_indices[index], polygon_indices[index + 1]])
+            faces.append(
+                [
+                    polygon_indices[0],
+                    polygon_indices[index],
+                    polygon_indices[index + 1],
+                ]
+            )
     if not faces and len(index_values) >= 3 and len(index_values) % 3 == 0:
-        # Isaac/PhysX can expose polygon objects without Python-visible
-        # base/count fields. In that case the cooked convex index buffer is
-        # already triangle-flat, which is enough for an OBJ collider export.
+        # Some already-extracted PhysX polygon objects expose no Python-visible
+        # base/count fields while their supplied index buffer is triangle-flat.
+        if len(index_values) // 3 > MAX_FACES:
+            raise ValueError(f"convex faces exceeds the {MAX_FACES}-item bound")
         faces = [
             [index_values[index], index_values[index + 1], index_values[index + 2]]
             for index in range(0, len(index_values), 3)
@@ -1098,276 +569,17 @@ def _convex_faces(indices: list[Any], polygons: list[Any]) -> list[list[int]]:
 def _first_int_attr(value: Any, *names: str) -> int | None:
     for name in names:
         if isinstance(value, dict) and name in value:
-            try:
-                return int(value[name])
-            except Exception:
-                continue
+            return _exact_int(value[name], label=name)
         try:
             attr = getattr(value, name)
-        except Exception:
+        except AttributeError:
             continue
         try:
-            return int(attr() if callable(attr) else attr)
-        except Exception:
-            continue
-    return None
-
-
-def _acquire_cooking_interface(modules: dict[str, Any]) -> Any:
-    physx_bindings = modules.get("omni.physx.bindings._physx")
-    if physx_bindings is None:
-        return None
-    try:
-        return physx_bindings.acquire_physx_cooking_interface()
-    except Exception:
-        return None
-
-
-def _environment_info(modules: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "python": sys.version,
-        "executable": sys.executable,
-        "platform": platform.platform(),
-        "kit": _kit_info(modules),
-        "extensions": _extension_info(
-            modules,
-            [
-                "omni.physx",
-                "omni.usd",
-                "isaacsim.core.api",
-                "omni.isaac.core",
-            ],
-        ),
-    }
-
-
-def _kit_info(modules: dict[str, Any]) -> dict[str, Any]:
-    omni_kit_app = modules.get("omni.kit.app")
-    if omni_kit_app is None:
-        return {"available": False}
-    try:
-        app = omni_kit_app.get_app()
-    except Exception as exc:
-        return {"available": False, "error": str(exc)}
-    info: dict[str, Any] = {"available": True}
-    for key, method_name in [
-        ("app_name", "get_app_name"),
-        ("app_version", "get_app_version"),
-        ("build_version", "get_build_version"),
-    ]:
-        try:
-            method = getattr(app, method_name)
-            info[key] = method()
-        except Exception:
-            pass
-    return info
-
-
-def _extension_info(modules: dict[str, Any], extension_names: list[str]) -> dict[str, Any]:
-    omni_kit_app = modules.get("omni.kit.app")
-    if omni_kit_app is None:
-        return {}
-    try:
-        manager = omni_kit_app.get_app().get_extension_manager()
-    except Exception:
-        return {}
-
-    results: dict[str, Any] = {}
-    for extension_name in extension_names:
-        try:
-            extension_id = manager.get_enabled_extension_id(extension_name)
-            data = manager.get_extension_dict(extension_id) if extension_id else None
-            results[extension_name] = {
-                "enabled": bool(extension_id),
-                "id": extension_id,
-                "version": _dict_get(data, ["package", "version"]),
-                "path": manager.get_extension_path(extension_id) if extension_id else None,
-            }
+            candidate = attr() if callable(attr) else attr
         except Exception as exc:
-            results[extension_name] = {"enabled": False, "error": str(exc)}
-    return results
-
-
-def _stage_info(modules: dict[str, Any], stage: Any, stage_id: int | None) -> dict[str, Any]:
-    UsdGeom = modules["UsdGeom"]
-    root_layer = stage.GetRootLayer()
-    session_layer = stage.GetSessionLayer()
-    return {
-        "stage_id": stage_id,
-        "root_layer": root_layer.identifier if root_layer else None,
-        "session_layer": session_layer.identifier if session_layer else None,
-        "meters_per_unit": _safe_call(lambda: float(UsdGeom.GetStageMetersPerUnit(stage))),
-        "up_axis": _safe_call(lambda: str(UsdGeom.GetStageUpAxis(stage))),
-        "default_prim": _safe_call(
-            lambda: str(stage.GetDefaultPrim().GetPath())
-            if stage.GetDefaultPrim().IsValid()
-            else None
-        ),
-    }
-
-
-def _summary(colliders: list[ColliderRecord], errors: list[ProbeError]) -> dict[str, Any]:
-    type_counts: dict[str, int] = {}
-    approximation_counts: dict[str, int] = {}
-    cooked_counts = {"attempted": 0, "available": 0, "failed": 0}
-    for collider in colliders:
-        type_counts[collider.type_name] = type_counts.get(collider.type_name, 0) + 1
-        approximation = None
-        if collider.mesh_collision_api:
-            approximation = collider.mesh_collision_api.get("approximation")
-        if approximation:
-            approximation_counts[str(approximation)] = approximation_counts.get(str(approximation), 0) + 1
-        if collider.cooked_convex.attempted:
-            cooked_counts["attempted"] += 1
-            if collider.cooked_convex.available:
-                cooked_counts["available"] += 1
-            elif collider.cooked_convex.error:
-                cooked_counts["failed"] += 1
-
-    return {
-        "collider_count": len(colliders),
-        "type_counts": type_counts,
-        "mesh_approximation_counts": approximation_counts,
-        "cooked_convex": cooked_counts,
-        "error_count": len(errors),
-    }
-
-
-def _empty_report(
-    options: ProbeOptions,
-    modules: dict[str, Any] | None,
-    errors: list[ProbeError],
-) -> ProbeReport:
-    return ProbeReport(
-        probe_version="0.1",
-        environment=_environment_info(modules or {}) if modules else {},
-        stage={},
-        filters={
-            "include_subtree": options.include_subtree,
-            "exclude_subtree": options.exclude_subtree,
-            "max_colliders": options.max_colliders,
-            "cooked_convex": options.cooked_convex,
-            "include_hidden": options.include_hidden,
-            "purpose": options.purpose,
-            "probe_prim": options.probe_prim,
-            "mesh_export_dir": options.mesh_export_dir,
-            "mesh_source_preference": options.mesh_source_preference,
-        },
-        summary={"collider_count": 0, "error_count": len(errors)},
-        probed_prims=[],
-        colliders=[],
-        object_meshes={},
-        errors=errors,
-    )
-
-
-def _write_payload(payload: dict[str, Any], args: argparse.Namespace) -> None:
-    text = json.dumps(
-        _json_safe(payload),
-        allow_nan=False,
-        indent=2 if args.pretty else None,
-        sort_keys=True,
-    )
-    if args.output:
-        Path(args.output).write_text(text + "\n", encoding="utf-8")
-    else:
-        print(text)
-
-
-def _profile_payload(report: ProbeReport, output_profile: str) -> dict[str, Any]:
-    if output_profile == "llm_scene_authoring":
-        return _llm_scene_authoring_payload(report)
-    return asdict(report)
-
-
-def _llm_scene_authoring_payload(report: ProbeReport) -> dict[str, Any]:
-    groups: dict[str, list[ColliderRecord]] = {}
-    for collider in report.colliders:
-        groups.setdefault(_logical_object_root(collider.path), []).append(collider)
-
-    mesh_source_preference = _mesh_source_preference_from_filters(report.filters)
-    objects = [
-        _llm_object_summary(
-            root,
-            colliders,
-            report.object_meshes.get(root, []),
-            mesh_source_preference=mesh_source_preference,
-        )
-        for root, colliders in sorted(groups.items(), key=lambda item: item[0])
-    ]
-    return {
-        "version": "manyforge.isaac.collider_report.v0.1",
-        "output_profile": "llm_scene_authoring",
-        "success": not report.errors,
-        "stage": report.stage,
-        "filters": report.filters,
-        "summary": {
-            "object_count": len(objects),
-            "collider_count": len(report.colliders),
-            "probed_prim_count": len(report.probed_prims),
-            "error_count": len(report.errors),
-            "recommended_review": True,
-        },
-        "probed_prims": [asdict(item) for item in report.probed_prims],
-        "objects": objects,
-        "object_meshes": report.object_meshes,
-        "warnings": _llm_report_warnings(report, objects),
-        "errors": [asdict(error) for error in report.errors],
-    }
-
-
-def _llm_object_summary(
-    root: str,
-    colliders: list[ColliderRecord],
-    object_meshes: list[dict[str, Any]],
-    *,
-    mesh_source_preference: str = "auto",
-) -> dict[str, Any]:
-    union_aabb = _union_aabbs([collider.world_aabb for collider in colliders])
-    type_counts = _count_values(collider.type_name for collider in colliders)
-    schema_counts = _count_values(
-        collider.geometry_schema.get("schema") for collider in colliders
-    )
-    approximation_counts = _count_values(
-        (collider.mesh_collision_api or {}).get("approximation")
-        for collider in colliders
-    )
-    cooked_valid = sum(1 for collider in colliders if collider.cooked_convex.available)
-    warnings = _llm_object_warnings(colliders, union_aabb)
-    recommendation = _manyforge_shape_recommendation(
-        root=root,
-        colliders=colliders,
-        object_meshes=object_meshes,
-        union_aabb=union_aabb,
-        warnings=warnings,
-        mesh_source_preference=mesh_source_preference,
-    )
-    return {
-        "id_hint": _object_id_hint(root),
-        "source_root": root,
-        "runtime_pose_source_hint": root,
-        "collider_count": len(colliders),
-        "collider_paths": [collider.path for collider in colliders],
-        "type_counts": type_counts,
-        "geometry_schema_counts": schema_counts,
-        "mesh_approximation_counts": approximation_counts,
-        "world_aabb": union_aabb,
-        "object_meshes": object_meshes,
-        "collider_mesh_candidates": _collider_mesh_candidates(colliders, union_aabb),
-        "cooked_convex_valid_count": cooked_valid,
-        "visibility": sorted(
-            {
-                collider.computed_visibility
-                for collider in colliders
-                if collider.computed_visibility
-            }
-        ),
-        "purpose": sorted(
-            {collider.purpose for collider in colliders if collider.purpose}
-        ),
-        "recommended_manyforge_shape": recommendation,
-        "warnings": warnings,
-    }
+            raise ValueError(f"could not read integer attribute {name}") from exc
+        return _exact_int(candidate, label=name)
+    return None
 
 
 def _manyforge_shape_recommendation(
@@ -1379,58 +591,84 @@ def _manyforge_shape_recommendation(
     warnings: list[str],
     mesh_source_preference: str = "auto",
 ) -> dict[str, Any] | None:
+    bounded_colliders = _bounded_items(
+        colliders,
+        maximum=MAX_COLLIDERS,
+        label="colliders",
+    )
+    bounded_object_meshes = _bounded_items(
+        object_meshes,
+        maximum=MAX_OBJECT_MESH_RECORDS,
+        label="object mesh records",
+    )
+    bounded_root = _bounded_text(root, label="source root")
     preference = (
         mesh_source_preference
         if mesh_source_preference in _MESH_SOURCE_PREFERENCES
         else "auto"
     )
     if preference in {"auto", "original"}:
-        object_mesh = _preferred_original_mesh_record(object_meshes)
+        object_mesh = _preferred_original_mesh_record(bounded_object_meshes)
         if object_mesh is not None:
             warnings.append(
-                "Mesh recommendation requires the mesh resource path to be readable by the ManyForge runtime."
+                "Mesh recommendation requires the mesh resource path to be "
+                "readable by the ManyForge runtime."
             )
             return {
                 "shape": {
                     "type": "mesh",
                     "mesh_resource_uri": object_mesh["mesh_resource_uri"],
-                    "mesh_scale": object_mesh.get("mesh_scale", [1.0, 1.0, 1.0]),
+                    "mesh_scale": object_mesh.get(
+                        "mesh_scale", [1.0, 1.0, 1.0]
+                    ),
                 },
                 "pose": object_mesh["pose"],
-                "confidence": "high" if object_mesh.get("source") == "exported_original_mesh" else "medium",
+                "confidence": (
+                    "high"
+                    if object_mesh.get("source") == "exported_original_mesh"
+                    else "medium"
+                ),
                 "reason": (
                     "Using the original object mesh exported from Isaac."
                     if object_mesh.get("source") == "exported_original_mesh"
-                    else "Using an existing original object mesh asset discovered in the USD composition."
+                    else (
+                        "Using an existing original object mesh asset discovered "
+                        "in the USD composition."
+                    )
                 ),
-                "source_root": root,
+                "source_root": bounded_root,
                 "mesh_source": object_mesh.get("source"),
                 "mesh_source_prim_path": object_mesh.get("prim_path"),
             }
         if preference == "original":
             warnings.append(
-                "Original mesh source was requested, but no usable original mesh was found; falling back to collider/primitive geometry."
+                "Original mesh source was requested, but no usable original mesh "
+                "was found; falling back to collider/primitive geometry."
             )
 
     if preference in {"auto", "original", "collider"}:
         collider_mesh = _preferred_collider_mesh_record(
-            object_meshes,
-            colliders,
+            bounded_object_meshes,
+            bounded_colliders,
             union_aabb,
         )
         if collider_mesh is not None:
-            if len(_collider_mesh_candidates(colliders, union_aabb)) > 1:
+            if len(_collider_mesh_candidates(bounded_colliders, union_aabb)) > 1:
                 warnings.append(
-                    "Multiple collider mesh candidates were found; using the first candidate in collider traversal order."
+                    "Multiple collider mesh candidates were found; using the "
+                    "first candidate in collider traversal order."
                 )
             warnings.append(
-                "Mesh recommendation requires the mesh resource path to be readable by the ManyForge runtime."
+                "Mesh recommendation requires the mesh resource path to be "
+                "readable by the ManyForge runtime."
             )
             return {
                 "shape": {
                     "type": "mesh",
                     "mesh_resource_uri": collider_mesh["mesh_resource_uri"],
-                    "mesh_scale": collider_mesh.get("mesh_scale", [1.0, 1.0, 1.0]),
+                    "mesh_scale": collider_mesh.get(
+                        "mesh_scale", [1.0, 1.0, 1.0]
+                    ),
                 },
                 "pose": collider_mesh["pose"],
                 "confidence": collider_mesh["confidence"],
@@ -1438,23 +676,26 @@ def _manyforge_shape_recommendation(
                     "Using a directly usable Isaac collider mesh because "
                     f"mesh_source_preference={preference!r}."
                 ),
-                "source_root": root,
+                "source_root": bounded_root,
                 "mesh_source": collider_mesh["source"],
                 "mesh_source_prim_path": collider_mesh["prim_path"],
             }
         if preference == "collider":
             warnings.append(
-                "Collider mesh source was requested, but no directly usable collider mesh was found; falling back to collider primitive/AABB geometry."
+                "Collider mesh source was requested, but no directly usable "
+                "collider mesh was found; falling back to collider "
+                "primitive/AABB geometry."
             )
 
     if preference == "primitive":
         warnings.append(
-            "Primitive mesh source preference requested; original and collider mesh assets were ignored."
+            "Primitive mesh source preference requested; original and collider "
+            "mesh assets were ignored."
         )
 
     return _primitive_shape_recommendation(
-        root=root,
-        colliders=colliders,
+        root=bounded_root,
+        colliders=bounded_colliders,
         union_aabb=union_aabb,
         warnings=warnings,
     )
@@ -1467,16 +708,28 @@ def _primitive_shape_recommendation(
     union_aabb: dict[str, Any] | None,
     warnings: list[str],
 ) -> dict[str, Any] | None:
+    bounded_root = _bounded_text(root, label="source root")
+    bounded_colliders = _bounded_items(
+        colliders,
+        maximum=MAX_COLLIDERS,
+        label="colliders",
+    )
     if union_aabb is None:
         return None
-    size = union_aabb["size"]
-    if any(float(component) <= 0.0 for component in size):
+    if not isinstance(union_aabb, dict):
+        raise ValueError("union_aabb must be an object")
+    size = _finite_vector3(union_aabb.get("size"), label="union_aabb.size")
+    center = _finite_vector3(
+        union_aabb.get("center"),
+        label="union_aabb.center",
+    )
+    if any(component <= 0.0 for component in size):
         return None
 
     confidence = "medium"
     reason = "Using world AABB as a conservative box."
-    if len(colliders) == 1:
-        collider = colliders[0]
+    if len(bounded_colliders) == 1:
+        collider = bounded_colliders[0]
         schema = collider.geometry_schema.get("schema")
         approximation = (collider.mesh_collision_api or {}).get("approximation")
         if schema == "cube" or approximation == "boundingCube":
@@ -1484,14 +737,14 @@ def _primitive_shape_recommendation(
             reason = "Source collider is an authored cube or boundingCube approximation."
         elif approximation in {"convexHull", "convexDecomposition", "sdf", "none"}:
             confidence = "medium"
-    elif len(colliders) > 8:
+    elif len(bounded_colliders) > 8:
         confidence = "low"
         reason = "Using world AABB as a conservative box over many collider fragments."
         warnings.append(
-            "Object has many collider fragments; a single world-AABB box may be overly conservative."
+            "Object has many collider fragments; a single world-AABB box may be "
+            "overly conservative."
         )
     else:
-        confidence = "medium"
         reason = "Using world AABB as a conservative box over grouped collider fragments."
 
     return {
@@ -1501,32 +754,107 @@ def _primitive_shape_recommendation(
         },
         "pose": {
             "frame_id": "universe",
-            "position_m": _rounded_list(union_aabb["center"]),
+            "position_m": _rounded_list(center),
             "orientation_rpy_deg": [0.0, 0.0, 0.0],
         },
         "confidence": confidence,
         "reason": reason,
-        "source_root": root,
+        "source_root": bounded_root,
     }
 
 
-def _mesh_source_preference_from_filters(filters: dict[str, Any]) -> str:
-    value = filters.get("mesh_source_preference", "auto")
-    return value if isinstance(value, str) and value in _MESH_SOURCE_PREFERENCES else "auto"
-
-
-def _preferred_original_mesh_record(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _preferred_original_mesh_record(
+    records: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    bounded_records = _bounded_items(
+        records,
+        maximum=MAX_OBJECT_MESH_RECORDS,
+        label="object mesh records",
+    )
     for source in ("exported_original_mesh", "referenced_original_mesh"):
-        for record in records:
+        for index, record in enumerate(bounded_records):
+            if not isinstance(record, dict):
+                raise ValueError(f"object mesh records[{index}] must be an object")
             if record.get("source") == source and record.get("mesh_resource_uri"):
-                return record
-    for record in records:
-        if (
-            record.get("mesh_resource_uri")
-            and record.get("source") not in {"referenced_collider_mesh"}
-        ):
-            return record
+                return _validated_supplied_mesh_record(
+                    record,
+                    label=f"object mesh records[{index}]",
+                )
+    for index, record in enumerate(bounded_records):
+        if not isinstance(record, dict):
+            raise ValueError(f"object mesh records[{index}] must be an object")
+        if record.get("mesh_resource_uri") and record.get("source") not in {
+            "referenced_collider_mesh"
+        }:
+            return _validated_supplied_mesh_record(
+                record,
+                label=f"object mesh records[{index}]",
+            )
     return None
+
+
+def _validated_supplied_mesh_record(
+    record: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        raise ValueError(f"{label} must be an object")
+    source = _bounded_text(record.get("source"), label=f"{label}.source")
+    uri = _bounded_text(
+        record.get("mesh_resource_uri"),
+        label=f"{label}.mesh_resource_uri",
+    )
+    pose = _validated_pose(record.get("pose"), label=f"{label}.pose")
+    scale = _finite_vector3(
+        record.get("mesh_scale", [1.0, 1.0, 1.0]),
+        label=f"{label}.mesh_scale",
+    )
+    if any(abs(component) <= 1e-12 for component in scale):
+        raise ValueError(f"{label}.mesh_scale must not contain zero")
+    candidates = _bounded_items(
+        record.get("mesh_resource_candidates", [uri]),
+        maximum=MAX_OBJECT_MESH_RECORDS,
+        label=f"{label}.mesh_resource_candidates",
+    )
+    result = {
+        "source": source,
+        "prim_path": (
+            _bounded_text(record["prim_path"], label=f"{label}.prim_path")
+            if record.get("prim_path") is not None
+            else None
+        ),
+        "mesh_resource_uri": uri,
+        "mesh_resource_candidates": [
+            _bounded_text(item, label=f"{label}.mesh_resource_candidates[{index}]")
+            for index, item in enumerate(candidates)
+        ],
+        "pose": pose,
+        "mesh_scale": scale,
+    }
+    for key in ("convex_hull_count",):
+        if key in record:
+            result[key] = record[key]
+    return result
+
+
+def _validated_pose(value: Any, *, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object")
+    return {
+        "frame_id": _bounded_text(
+            value.get("frame_id"),
+            label=f"{label}.frame_id",
+        ),
+        "position_m": _finite_vector3(
+            value.get("position_m"),
+            label=f"{label}.position_m",
+        ),
+        "orientation_rpy_deg": _finite_vector3(
+            value.get("orientation_rpy_deg"),
+            label=f"{label}.orientation_rpy_deg",
+        ),
+    }
 
 
 def _preferred_collider_mesh_record(
@@ -1534,24 +862,44 @@ def _preferred_collider_mesh_record(
     colliders: list[ColliderRecord],
     fallback_aabb: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
+    bounded_object_meshes = _bounded_items(
+        object_meshes,
+        maximum=MAX_OBJECT_MESH_RECORDS,
+        label="object mesh records",
+    )
+    bounded_colliders = _bounded_items(
+        colliders,
+        maximum=MAX_COLLIDERS,
+        label="colliders",
+    )
     for source in (
         "exported_cooked_convex_collider_mesh",
         "exported_primitive_collider_mesh",
         "exported_collider_mesh",
         "referenced_collider_mesh",
     ):
-        for record in object_meshes:
+        for index, record in enumerate(bounded_object_meshes):
+            if not isinstance(record, dict):
+                raise ValueError(f"object mesh records[{index}] must be an object")
             if record.get("source") == source and record.get("mesh_resource_uri"):
+                validated_record = _validated_supplied_mesh_record(
+                    record,
+                    label=f"object mesh records[{index}]",
+                )
                 return {
                     "source": source,
-                    "prim_path": record.get("prim_path"),
-                    "mesh_resource_uri": record["mesh_resource_uri"],
-                    "mesh_resource_candidates": record.get("mesh_resource_candidates", []),
-                    "pose": record["pose"],
-                    "mesh_scale": record.get("mesh_scale", [1.0, 1.0, 1.0]),
-                    "confidence": "high" if source != "referenced_collider_mesh" else "medium",
+                    "prim_path": validated_record.get("prim_path"),
+                    "mesh_resource_uri": validated_record["mesh_resource_uri"],
+                    "mesh_resource_candidates": validated_record[
+                        "mesh_resource_candidates"
+                    ],
+                    "pose": validated_record["pose"],
+                    "mesh_scale": validated_record["mesh_scale"],
+                    "confidence": (
+                        "high" if source != "referenced_collider_mesh" else "medium"
+                    ),
                 }
-    candidates = _collider_mesh_candidates(colliders, fallback_aabb)
+    candidates = _collider_mesh_candidates(bounded_colliders, fallback_aabb)
     return candidates[0] if candidates else None
 
 
@@ -1559,27 +907,64 @@ def _collider_mesh_candidates(
     colliders: list[ColliderRecord],
     fallback_aabb: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
+    bounded_colliders = _bounded_items(
+        colliders,
+        maximum=MAX_COLLIDERS,
+        label="colliders",
+    )
     candidates: list[dict[str, Any]] = []
-    for collider in colliders:
+    for collider_number, collider in enumerate(bounded_colliders):
         schema = collider.geometry_schema.get("schema")
         mesh_resource_uri = collider.geometry_schema.get("mesh_resource_uri")
-        if schema != "mesh" or not isinstance(mesh_resource_uri, str) or not mesh_resource_uri:
+        if (
+            schema != "mesh"
+            or not isinstance(mesh_resource_uri, str)
+            or not mesh_resource_uri
+        ):
             continue
         approximation = (collider.mesh_collision_api or {}).get("approximation")
-        aabb = collider.world_aabb or fallback_aabb
+        aabb = (
+            collider.world_aabb
+            if collider.world_aabb is not None
+            else fallback_aabb
+        )
         if aabb is None:
             continue
         candidates.append(
             {
                 "source": "referenced_collider_mesh",
-                "prim_path": collider.path,
-                "mesh_resource_uri": mesh_resource_uri,
-                "mesh_resource_candidates": list(
-                    collider.geometry_schema.get("mesh_resource_candidates") or [mesh_resource_uri]
+                "prim_path": _bounded_text(
+                    collider.path,
+                    label=f"colliders[{collider_number}].path",
                 ),
+                "mesh_resource_uri": _bounded_text(
+                    mesh_resource_uri,
+                    label=f"colliders[{collider_number}].mesh_resource_uri",
+                ),
+                "mesh_resource_candidates": [
+                    _bounded_text(
+                        item,
+                        label=(
+                            f"colliders[{collider_number}]."
+                            f"mesh_resource_candidates[{index}]"
+                        ),
+                    )
+                    for index, item in enumerate(
+                        _bounded_items(
+                            collider.geometry_schema.get(
+                                "mesh_resource_candidates"
+                            )
+                            or [mesh_resource_uri],
+                            maximum=MAX_OBJECT_MESH_RECORDS,
+                            label="mesh resource candidates",
+                        )
+                    )
+                ],
                 "pose": _mesh_pose_from_collider(collider, aabb),
                 "mesh_scale": _mesh_scale_from_transform(collider.world_transform),
-                "confidence": "high" if approximation in {"none", "convexHull"} else "medium",
+                "confidence": (
+                    "high" if approximation in {"none", "convexHull"} else "medium"
+                ),
                 "mesh_approximation": approximation,
             }
         )
@@ -1590,23 +975,38 @@ def _mesh_pose_from_collider(
     collider: ColliderRecord,
     fallback_aabb: dict[str, Any],
 ) -> dict[str, Any]:
-    matrix = collider.world_transform
-    return _mesh_pose_from_transform(matrix, fallback_aabb)
+    if collider.world_transform is None:
+        raise ValueError(
+            f"mesh collider {collider.path!r} has no world transform"
+        )
+    return _mesh_pose_from_transform(collider.world_transform, fallback_aabb)
 
 
 def _mesh_pose_from_transform(
     matrix: list[list[float]] | None,
     fallback_aabb: dict[str, Any],
 ) -> dict[str, Any]:
-    if matrix and len(matrix) >= 4 and all(isinstance(row, list) and len(row) >= 4 for row in matrix[:4]):
+    if matrix is not None:
+        rows = _matrix_to_rows(matrix)
         return {
             "frame_id": "universe",
-            "position_m": _rounded_list([matrix[3][0], matrix[3][1], matrix[3][2]]),
-            "orientation_rpy_deg": _rounded_list(_rpy_deg_from_row_major_transform(matrix)),
+            "position_m": _rounded_list(
+                [rows[3][0], rows[3][1], rows[3][2]]
+            ),
+            "orientation_rpy_deg": _rounded_list(
+                _rpy_deg_from_row_major_transform(rows)
+            ),
         }
+    if not isinstance(fallback_aabb, dict):
+        raise ValueError("fallback_aabb must be an object")
     return {
         "frame_id": "universe",
-        "position_m": _rounded_list(fallback_aabb["center"]),
+        "position_m": _rounded_list(
+            _finite_vector3(
+                fallback_aabb.get("center"),
+                label="fallback_aabb.center",
+            )
+        ),
         "orientation_rpy_deg": [0.0, 0.0, 0.0],
     }
 
@@ -1614,377 +1014,18 @@ def _mesh_pose_from_transform(
 def _mesh_scale_from_transform(matrix: Any) -> list[float]:
     if matrix is None:
         return [1.0, 1.0, 1.0]
-    rows = matrix if isinstance(matrix, list) else _matrix_to_rows(matrix)
-    if len(rows) < 3 or any(
-        not isinstance(row, list) or len(row) < 3
-        for row in rows[:3]
-    ):
-        return [1.0, 1.0, 1.0]
+    rows = _matrix_to_rows(matrix)
     scale = []
-    for row in rows[:3]:
-        length = math.sqrt(sum(float(row[col]) * float(row[col]) for col in range(3)))
-        scale.append(round(length if length > 1e-12 else 1.0, 9))
+    for row_index, row in enumerate(rows[:3]):
+        length = math.sqrt(
+            sum(row[col] * row[col] for col in range(3))
+        )
+        if not math.isfinite(length) or length <= 1e-12:
+            raise ValueError(
+                f"transform row {row_index} has a non-finite or zero scale"
+            )
+        scale.append(round(length, 9))
     return scale
-
-
-def _llm_object_warnings(
-    colliders: list[ColliderRecord],
-    union_aabb: dict[str, Any] | None,
-) -> list[str]:
-    warnings: list[str] = []
-    if union_aabb is None:
-        warnings.append("No usable world AABB was available.")
-    if any(collider.computed_visibility == "invisible" for collider in colliders):
-        warnings.append("One or more collider prims are hidden.")
-    if any(not collider.collision_enabled for collider in colliders):
-        warnings.append("One or more collider prims have collision disabled or unset.")
-    if any((collider.mesh_collision_api or {}).get("approximation") in {"convexDecomposition", "sdf"} for collider in colliders):
-        warnings.append(
-            "Source uses complex mesh approximation; primitive or mesh export must be reviewed."
-        )
-    if any(collider.cooked_convex.attempted and not collider.cooked_convex.available for collider in colliders):
-        warnings.append("Cooked convex data was not available for one or more colliders.")
-    return warnings
-
-
-def _llm_report_warnings(
-    report: ProbeReport,
-    objects: list[dict[str, Any]],
-) -> list[str]:
-    warnings: list[str] = []
-    if report.errors:
-        warnings.append("Probe completed with errors; inspect the errors field.")
-    if any(
-        obj["source_root"].startswith("/World/ur10") or "robotiq" in obj["source_root"].lower()
-        for obj in objects
-    ):
-        warnings.append(
-            "Robot or gripper geometry appears in the report. Exclude URDF-owned subtrees before generating a ManyForge scene."
-        )
-    if len(objects) > 50:
-        warnings.append(
-            "Large object count; assistant tooling should preserve the full report but use grouped views, search, and explicit user selection before generating a ManyForge scene."
-        )
-    return warnings
-
-
-def _inspect_object_meshes(
-    *,
-    modules: dict[str, Any],
-    stage: Any,
-    colliders: list[ColliderRecord],
-    mesh_export_dir: str | None,
-    errors: list[ProbeError],
-    include_tracebacks: bool,
-) -> dict[str, list[dict[str, Any]]]:
-    roots = sorted({_logical_object_root(collider.path) for collider in colliders})
-    object_meshes: dict[str, list[dict[str, Any]]] = {}
-    for root in roots:
-        try:
-            root_colliders = [
-                collider for collider in colliders if _logical_object_root(collider.path) == root
-            ]
-            records = _object_mesh_records(
-                modules=modules,
-                stage=stage,
-                source_root=root,
-                colliders=root_colliders,
-                mesh_export_dir=mesh_export_dir,
-            )
-            if records:
-                object_meshes[root] = records
-        except Exception as exc:
-            errors.append(_probe_error(f"{root}:object_mesh", exc, include_tracebacks))
-    return object_meshes
-
-
-def _object_mesh_records(
-    *,
-    modules: dict[str, Any],
-    stage: Any,
-    source_root: str,
-    colliders: list[ColliderRecord],
-    mesh_export_dir: str | None,
-) -> list[dict[str, Any]]:
-    root_prim = stage.GetPrimAtPath(source_root)
-    if root_prim is None or not root_prim.IsValid():
-        return []
-
-    mesh_prims = [
-        prim
-        for prim in _iter_prim_subtree(root_prim)
-        if _is_original_mesh_prim(modules, prim)
-    ]
-    collider_mesh_prims = [
-        prim
-        for prim in _iter_prim_subtree(root_prim)
-        if _is_collider_mesh_prim(modules, prim)
-    ]
-    if not mesh_prims and not collider_mesh_prims and not colliders:
-        return []
-
-    records: list[dict[str, Any]] = []
-    root_aabb = _aabb(modules, _make_bbox_cache(modules), root_prim, local=False, errors=[])
-    root_world = _world_matrix(modules, root_prim, [])
-    if mesh_export_dir:
-        exported = _export_original_mesh_obj(
-            modules=modules,
-            source_root=source_root,
-            root_world=root_world,
-            mesh_prims=mesh_prims,
-            mesh_export_dir=mesh_export_dir,
-            fallback_aabb=root_aabb,
-            source="exported_original_mesh",
-            filename_suffix="visual",
-        )
-        if exported is not None:
-            records.append(exported)
-        exported_collider = _export_original_mesh_obj(
-            modules=modules,
-            source_root=source_root,
-            root_world=root_world,
-            mesh_prims=collider_mesh_prims,
-            mesh_export_dir=mesh_export_dir,
-            fallback_aabb=root_aabb,
-            source="exported_collider_mesh",
-            filename_suffix="collider",
-        )
-        if exported_collider is not None:
-            records.append(exported_collider)
-        cooked_collider = _export_cooked_convex_collider_obj(
-            source_root=source_root,
-            root_world=root_world,
-            colliders=colliders,
-            mesh_export_dir=mesh_export_dir,
-            fallback_aabb=root_aabb,
-        )
-        if cooked_collider is not None:
-            records.append(cooked_collider)
-        primitive_collider = _export_primitive_collider_obj(
-            source_root=source_root,
-            root_world=root_world,
-            colliders=colliders,
-            mesh_export_dir=mesh_export_dir,
-            fallback_aabb=root_aabb,
-        )
-        if primitive_collider is not None:
-            records.append(primitive_collider)
-
-    for prim in mesh_prims:
-        schema = _geometry_schema(modules, prim)
-        candidates = schema.get("mesh_resource_candidates") or []
-        if not candidates:
-            continue
-        prim_aabb = (
-            _aabb(modules, _make_bbox_cache(modules), prim, local=False, errors=[])
-            or root_aabb
-            or {"center": [0.0, 0.0, 0.0]}
-        )
-        prim_world = _world_transform(modules, prim, [])
-        records.append(
-            {
-                "source": "referenced_original_mesh",
-                "source_root": source_root,
-                "prim_path": str(prim.GetPath()),
-                "mesh_resource_uri": candidates[0],
-                "mesh_resource_candidates": candidates,
-                "pose": _mesh_pose_from_transform(prim_world, prim_aabb),
-                "mesh_scale": _mesh_scale_from_transform(prim_world),
-                "point_count": schema.get("points_count"),
-                "face_count": schema.get("face_vertex_counts_count"),
-            }
-        )
-    for prim in collider_mesh_prims:
-        schema = _geometry_schema(modules, prim)
-        candidates = schema.get("mesh_resource_candidates") or []
-        if not candidates:
-            continue
-        prim_aabb = (
-            _aabb(modules, _make_bbox_cache(modules), prim, local=False, errors=[])
-            or root_aabb
-            or {"center": [0.0, 0.0, 0.0]}
-        )
-        prim_world = _world_transform(modules, prim, [])
-        records.append(
-            {
-                "source": "referenced_collider_mesh",
-                "source_root": source_root,
-                "prim_path": str(prim.GetPath()),
-                "mesh_resource_uri": candidates[0],
-                "mesh_resource_candidates": candidates,
-                "pose": _mesh_pose_from_transform(prim_world, prim_aabb),
-                "mesh_scale": _mesh_scale_from_transform(prim_world),
-                "point_count": schema.get("points_count"),
-                "face_count": schema.get("face_vertex_counts_count"),
-            }
-        )
-    return records
-
-
-def _iter_prim_subtree(prim: Any) -> Any:
-    yield prim
-    try:
-        children = prim.GetChildren()
-    except Exception:
-        return
-    for child in children:
-        yield from _iter_prim_subtree(child)
-
-
-def _is_original_mesh_prim(modules: dict[str, Any], prim: Any) -> bool:
-    try:
-        if not prim.IsA(modules["UsdGeom"].Mesh):
-            return False
-    except Exception:
-        return False
-    if not prim.IsActive():
-        return False
-    if _has_collision_api(modules, prim):
-        return False
-    purpose = _computed_purpose(modules, prim) or "default"
-    return purpose != "guide"
-
-
-def _is_collider_mesh_prim(modules: dict[str, Any], prim: Any) -> bool:
-    try:
-        return bool(prim.IsA(modules["UsdGeom"].Mesh) and _has_collision_api(modules, prim))
-    except Exception:
-        return False
-
-
-def _export_original_mesh_obj(
-    *,
-    modules: dict[str, Any],
-    source_root: str,
-    root_world: Any,
-    mesh_prims: list[Any],
-    mesh_export_dir: str,
-    fallback_aabb: dict[str, Any] | None,
-    source: str,
-    filename_suffix: str,
-) -> dict[str, Any] | None:
-    vertices: list[list[float]] = []
-    faces: list[list[int]] = []
-    root_inverse = None
-    if root_world is not None:
-        try:
-            root_inverse = root_world.GetInverse()
-        except Exception:
-            root_inverse = None
-
-    for prim in mesh_prims:
-        try:
-            mesh = modules["UsdGeom"].Mesh(prim)
-            points = mesh.GetPointsAttr().Get() or []
-            face_counts = mesh.GetFaceVertexCountsAttr().Get() or []
-            face_indices = mesh.GetFaceVertexIndicesAttr().Get() or []
-            world = _world_matrix(modules, prim, [])
-        except Exception:
-            continue
-        index_base = len(vertices)
-        for point in points:
-            world_point = _transform_point(world, point)
-            local_point = (
-                _transform_point(root_inverse, world_point)
-                if root_inverse is not None
-                else world_point
-            )
-            vertices.append(_rounded_list(local_point, digits=9))
-        cursor = 0
-        for count_value in face_counts:
-            count = int(count_value)
-            polygon = [
-                index_base + int(face_indices[cursor + offset]) + 1
-                for offset in range(count)
-            ]
-            cursor += count
-            if len(polygon) < 3:
-                continue
-            for index in range(1, len(polygon) - 1):
-                faces.append([polygon[0], polygon[index], polygon[index + 1]])
-
-    if not vertices or not faces:
-        return None
-
-    export_dir = Path(mesh_export_dir).expanduser()
-    export_dir.mkdir(parents=True, exist_ok=True)
-    suffix = f"_{filename_suffix}" if filename_suffix else ""
-    mesh_path = export_dir / f"{_object_id_hint(source_root)}{suffix}.obj"
-    lines = [f"# ManyForge {source} export from Isaac source root {source_root}"]
-    lines.extend(f"v {vertex[0]:.9g} {vertex[1]:.9g} {vertex[2]:.9g}" for vertex in vertices)
-    lines.extend(f"f {face[0]} {face[1]} {face[2]}" for face in faces)
-    mesh_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    pose = _mesh_pose_from_transform(
-        _matrix_to_rows(root_world) if root_world is not None else None,
-        fallback_aabb or {"center": [0.0, 0.0, 0.0]},
-    )
-    scale = _mesh_scale_from_transform(
-        _matrix_to_rows(root_world) if root_world is not None else None
-    )
-    uri = mesh_path.resolve().as_uri()
-    return {
-        "source": source,
-        "source_root": source_root,
-        "prim_path": source_root,
-        "mesh_resource_uri": uri,
-        "mesh_resource_candidates": [uri],
-        "pose": pose,
-        "mesh_scale": scale,
-        "point_count": len(vertices),
-        "face_count": len(faces),
-    }
-
-
-def _export_cooked_convex_collider_obj(
-    *,
-    source_root: str,
-    root_world: Any,
-    colliders: list[ColliderRecord],
-    mesh_export_dir: str,
-    fallback_aabb: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    vertices: list[list[float]] = []
-    faces: list[list[int]] = []
-    root_inverse = _inverse_matrix(root_world)
-    hull_count = 0
-
-    for collider in colliders:
-        if not collider.cooked_convex.available:
-            continue
-        collider_world = collider.world_transform
-        for convex in collider.cooked_convex.convexes:
-            convex_vertices = convex.get("vertices") or []
-            convex_faces = convex.get("faces") or []
-            if not convex_vertices or not convex_faces:
-                continue
-            hull_count += 1
-            index_base = len(vertices)
-            for vertex in convex_vertices:
-                world_point = _transform_point(collider_world, vertex)
-                local_point = (
-                    _transform_point(root_inverse, world_point)
-                    if root_inverse is not None
-                    else world_point
-                )
-                vertices.append(_rounded_list(local_point, digits=9))
-            for face in convex_faces:
-                if len(face) < 3:
-                    continue
-                faces.append([index_base + int(item) + 1 for item in face[:3]])
-
-    return _write_obj_mesh_record(
-        source="exported_cooked_convex_collider_mesh",
-        source_root=source_root,
-        prim_path=source_root,
-        root_world=root_world,
-        vertices=vertices,
-        faces=faces,
-        mesh_export_dir=mesh_export_dir,
-        fallback_aabb=fallback_aabb,
-        filename_suffix="collider_cooked",
-        extra={"convex_hull_count": hull_count},
-    )
 
 
 def _export_primitive_collider_obj(
@@ -1995,17 +1036,32 @@ def _export_primitive_collider_obj(
     mesh_export_dir: str,
     fallback_aabb: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
+    """Write supplied primitive collider data; never discovers an Isaac stage."""
+
+    bounded_colliders = _bounded_items(
+        colliders,
+        maximum=MAX_COLLIDERS,
+        label="colliders",
+    )
     vertices: list[list[float]] = []
     faces: list[list[int]] = []
-    root_inverse = _inverse_matrix(root_world)
+    root_inverse = _inverse_matrix(root_world) if root_world is not None else None
     primitive_count = 0
 
-    for collider in colliders:
+    for collider in bounded_colliders:
         primitive = _primitive_collider_mesh(collider)
         if primitive is None:
             continue
+        if collider.world_transform is None:
+            raise ValueError(
+                f"collider {collider.path!r} has no world transform for OBJ export"
+            )
         primitive_count += 1
         primitive_vertices, primitive_faces = primitive
+        if len(vertices) + len(primitive_vertices) > MAX_VERTICES:
+            raise ValueError(f"OBJ vertices exceeds the {MAX_VERTICES}-item bound")
+        if len(faces) + len(primitive_faces) > MAX_FACES:
+            raise ValueError(f"OBJ faces exceeds the {MAX_FACES}-item bound")
         index_base = len(vertices)
         for vertex in primitive_vertices:
             world_point = _transform_point(collider.world_transform, vertex)
@@ -2016,7 +1072,13 @@ def _export_primitive_collider_obj(
             )
             vertices.append(_rounded_list(local_point, digits=9))
         for face in primitive_faces:
-            faces.append([index_base + int(item) + 1 for item in face])
+            validated_face = _validate_face(
+                face,
+                vertex_count=len(primitive_vertices),
+                one_based=False,
+                label=f"collider {collider.path!r} primitive face",
+            )
+            faces.append([index_base + item + 1 for item in validated_face])
 
     return _write_obj_mesh_record(
         source="exported_primitive_collider_mesh",
@@ -2045,71 +1107,350 @@ def _write_obj_mesh_record(
     filename_suffix: str,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    if not vertices or not faces:
+    bounded_vertices = _bounded_items(
+        vertices,
+        maximum=MAX_VERTICES,
+        label="OBJ vertices",
+    )
+    bounded_faces = _bounded_items(
+        faces,
+        maximum=MAX_FACES,
+        label="OBJ faces",
+    )
+    if not bounded_vertices or not bounded_faces:
         return None
 
-    export_dir = Path(mesh_export_dir).expanduser()
-    export_dir.mkdir(parents=True, exist_ok=True)
-    suffix = f"_{filename_suffix}" if filename_suffix else ""
-    mesh_path = export_dir / f"{_object_id_hint(source_root)}{suffix}.obj"
-    lines = [f"# ManyForge {source} export from Isaac source root {source_root}"]
-    lines.extend(f"v {vertex[0]:.9g} {vertex[1]:.9g} {vertex[2]:.9g}" for vertex in vertices)
-    lines.extend(f"f {face[0]} {face[1]} {face[2]}" for face in faces)
-    mesh_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
+    validated_vertices = [
+        _finite_vector3(vertex, label=f"OBJ vertices[{index}]")
+        for index, vertex in enumerate(bounded_vertices)
+    ]
+    validated_faces = [
+        _validate_face(
+            face,
+            vertex_count=len(validated_vertices),
+            one_based=True,
+            label=f"OBJ faces[{index}]",
+        )
+        for index, face in enumerate(bounded_faces)
+    ]
+    safe_source = _safe_filename_component(source, label="OBJ source")
+    safe_suffix = _safe_filename_component(
+        filename_suffix,
+        label="OBJ filename suffix",
+        allow_empty=True,
+    )
+    bounded_source_root = _bounded_text(source_root, label="source_root")
+    bounded_prim_path = _bounded_text(prim_path, label="prim_path")
     root_rows = _matrix_to_rows(root_world) if root_world is not None else None
-    uri = mesh_path.resolve().as_uri()
+    pose = _mesh_pose_from_transform(
+        root_rows,
+        (
+            fallback_aabb
+            if fallback_aabb is not None
+            else {"center": [0.0, 0.0, 0.0]}
+        ),
+    )
+    mesh_scale = _mesh_scale_from_transform(root_rows)
+    validated_extra = _validated_obj_extra(extra)
+
+    export_dir = _resolve_export_directory(mesh_export_dir)
+    suffix = f"_{safe_suffix}" if safe_suffix else ""
+    mesh_name = f"{_object_id_hint(bounded_source_root)}{suffix}.obj"
+    mesh_path = export_dir / mesh_name
+    if len(os.fsencode(mesh_path)) > MAX_PATH_BYTES:
+        raise ValueError("OBJ output path exceeds its byte bound")
+    if mesh_path.parent != export_dir or not mesh_path.is_relative_to(export_dir):
+        raise ValueError("OBJ output path escapes the export directory")
+    if os.path.lexists(mesh_path):
+        raise FileExistsError(f"refusing to overwrite OBJ output: {mesh_path}")
+
+    _write_obj_exclusive(
+        mesh_path,
+        source=safe_source,
+        source_hint=_object_id_hint(bounded_source_root),
+        vertices=validated_vertices,
+        faces=validated_faces,
+    )
+    uri = mesh_path.as_uri()
     record = {
-        "source": source,
-        "source_root": source_root,
-        "prim_path": prim_path,
+        "source": safe_source,
+        "source_root": bounded_source_root,
+        "prim_path": bounded_prim_path,
         "mesh_resource_uri": uri,
         "mesh_resource_candidates": [uri],
-        "pose": _mesh_pose_from_transform(root_rows, fallback_aabb or {"center": [0.0, 0.0, 0.0]}),
-        "mesh_scale": _mesh_scale_from_transform(root_rows),
-        "point_count": len(vertices),
-        "face_count": len(faces),
+        "pose": pose,
+        "mesh_scale": mesh_scale,
+        "point_count": len(validated_vertices),
+        "face_count": len(validated_faces),
     }
-    if extra:
-        record.update(extra)
+    record.update(validated_extra)
     return record
 
 
-def _inverse_matrix(matrix: Any) -> Any:
-    if matrix is None:
-        return None
+def _validate_face(
+    face: Any,
+    *,
+    vertex_count: int,
+    one_based: bool,
+    label: str,
+) -> list[int]:
+    items = _bounded_items(face, maximum=3, label=label)
+    if len(items) != 3:
+        raise ValueError(f"{label} must contain exactly three vertex indices")
+    minimum = 1 if one_based else 0
+    maximum = vertex_count if one_based else vertex_count - 1
+    return [
+        _exact_int(
+            item,
+            label=f"{label}[{index}]",
+            minimum=minimum,
+            maximum=maximum,
+        )
+        for index, item in enumerate(items)
+    ]
+
+
+def _validated_obj_extra(extra: dict[str, Any] | None) -> dict[str, Any]:
+    if extra is None:
+        return {}
+    if not isinstance(extra, dict):
+        raise ValueError("OBJ extra fields must be an object")
+    if len(extra) > MAX_EXTRA_FIELDS:
+        raise ValueError(
+            f"OBJ extra fields exceeds the {MAX_EXTRA_FIELDS}-item bound"
+        )
+    validated: dict[str, Any] = {}
+    for key, value in extra.items():
+        bounded_key = _bounded_text(key, label="OBJ extra field name")
+        if bounded_key in _OBJ_CORE_RECORD_FIELDS:
+            raise ValueError(
+                f"OBJ extra field must not override core field {bounded_key!r}"
+            )
+        validated[bounded_key] = value
+    return validated
+
+
+def _resolve_export_directory(mesh_export_dir: str | Path) -> Path:
+    raw_value = os.fspath(mesh_export_dir)
+    path_text = _bounded_text(
+        raw_value,
+        label="mesh_export_dir",
+        maximum_bytes=MAX_PATH_BYTES,
+    )
+    raw_directory = Path(path_text).expanduser()
+    if raw_directory.is_symlink():
+        raise ValueError(
+            f"mesh export directory must not be a symlink: {raw_directory}"
+        )
     try:
-        return matrix.GetInverse()
+        raw_directory.mkdir(parents=True, exist_ok=True)
+        metadata = raw_directory.lstat()
+    except OSError as exc:
+        raise ValueError(
+            f"cannot prepare mesh export directory {raw_directory}: {exc}"
+        ) from exc
+    if not stat.S_ISDIR(metadata.st_mode) or raw_directory.is_symlink():
+        raise ValueError(
+            f"mesh export path is not a non-symlink directory: {raw_directory}"
+        )
+    try:
+        resolved = raw_directory.resolve(strict=True)
+        resolved_metadata = resolved.lstat()
+    except OSError as exc:
+        raise ValueError(
+            f"cannot resolve mesh export directory {raw_directory}: {exc}"
+        ) from exc
+    if not stat.S_ISDIR(resolved_metadata.st_mode) or resolved.is_symlink():
+        raise ValueError(
+            f"resolved mesh export path is not a directory: {resolved}"
+        )
+    return resolved
+
+
+def _write_bounded_obj_line(
+    stream: BinaryIO,
+    line: str,
+    written_bytes: int,
+) -> int:
+    encoded = (line + "\n").encode("ascii")
+    if len(encoded) > MAX_OBJ_OUTPUT_BYTES - written_bytes:
+        raise ValueError(
+            f"OBJ output exceeds the {MAX_OBJ_OUTPUT_BYTES}-byte bound"
+        )
+    stream.write(encoded)
+    return written_bytes + len(encoded)
+
+
+def _write_obj_exclusive(
+    mesh_path: Path,
+    *,
+    source: str,
+    source_hint: str,
+    vertices: list[list[float]],
+    faces: list[list[int]],
+) -> None:
+    """Stream to a private regular file, then atomically publish without replace."""
+
+    if mesh_path.parent.resolve(strict=True) != mesh_path.parent:
+        raise ValueError("OBJ destination parent is not normalized")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{mesh_path.name}.",
+        suffix=".tmp",
+        dir=mesh_path.parent,
+    )
+    temporary = Path(temporary_name)
+    temporary_metadata: os.stat_result | None = None
+    published = False
+    try:
+        try:
+            stream = os.fdopen(descriptor, "wb")
+        except Exception:
+            os.close(descriptor)
+            raise
+        with stream:
+            temporary_metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(temporary_metadata.st_mode):
+                raise ValueError("OBJ staging output is not a regular file")
+            written_bytes = _write_bounded_obj_line(
+                stream,
+                f"# ManyForge {source} export for {source_hint}",
+                0,
+            )
+            for vertex in vertices:
+                written_bytes = _write_bounded_obj_line(
+                    stream,
+                    f"v {vertex[0]:.9g} {vertex[1]:.9g} {vertex[2]:.9g}",
+                    written_bytes,
+                )
+            for face in faces:
+                written_bytes = _write_bounded_obj_line(
+                    stream,
+                    f"f {face[0]} {face[1]} {face[2]}",
+                    written_bytes,
+                )
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        if os.path.lexists(mesh_path):
+            raise FileExistsError(f"refusing to overwrite OBJ output: {mesh_path}")
+        try:
+            os.link(temporary, mesh_path, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"refusing to overwrite OBJ output: {mesh_path}"
+            ) from exc
+        published = True
+        published_metadata = mesh_path.lstat()
+        if (
+            temporary_metadata is None
+            or not stat.S_ISREG(published_metadata.st_mode)
+            or mesh_path.is_symlink()
+            or published_metadata.st_dev != temporary_metadata.st_dev
+            or published_metadata.st_ino != temporary_metadata.st_ino
+        ):
+            raise ValueError("published OBJ output is not the staged regular file")
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_descriptor = os.open(mesh_path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     except Exception:
-        return None
+        if published and temporary_metadata is not None:
+            try:
+                published_metadata = mesh_path.lstat()
+                if (
+                    stat.S_ISREG(published_metadata.st_mode)
+                    and published_metadata.st_dev == temporary_metadata.st_dev
+                    and published_metadata.st_ino == temporary_metadata.st_ino
+                ):
+                    mesh_path.unlink()
+            except OSError:
+                pass
+        raise
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
-def _primitive_collider_mesh(collider: ColliderRecord) -> tuple[list[list[float]], list[list[int]]] | None:
+def _inverse_matrix(matrix: Any) -> list[list[float]]:
+    """Return an exact finite 4x4 inverse or reject a singular transform."""
+
+    rows = _matrix_to_rows(matrix)
+    augmented = [
+        row[:] + [1.0 if row_index == column else 0.0 for column in range(4)]
+        for row_index, row in enumerate(rows)
+    ]
+    for column in range(4):
+        pivot_row = max(
+            range(column, 4),
+            key=lambda candidate: abs(augmented[candidate][column]),
+        )
+        pivot = augmented[pivot_row][column]
+        if not math.isfinite(pivot) or abs(pivot) <= 1e-15:
+            raise ValueError("transform matrix is singular")
+        if pivot_row != column:
+            augmented[column], augmented[pivot_row] = (
+                augmented[pivot_row],
+                augmented[column],
+            )
+        divisor = augmented[column][column]
+        augmented[column] = [item / divisor for item in augmented[column]]
+        for row_index in range(4):
+            if row_index == column:
+                continue
+            factor = augmented[row_index][column]
+            augmented[row_index] = [
+                augmented[row_index][item] - factor * augmented[column][item]
+                for item in range(8)
+            ]
+    inverse = [row[4:] for row in augmented]
+    return [
+        [
+            _finite_real(item, label=f"inverse[{row_index}][{column}]")
+            for column, item in enumerate(row)
+        ]
+        for row_index, row in enumerate(inverse)
+    ]
+
+
+def _primitive_collider_mesh(
+    collider: ColliderRecord,
+) -> tuple[list[list[float]], list[list[int]]] | None:
     schema = collider.geometry_schema.get("schema")
     if schema == "cube":
         size = collider.geometry_schema.get("size")
-        edge = float(size) if isinstance(size, (int, float)) and float(size) > 0.0 else 1.0
+        edge = _finite_real(size, label="cube size")
+        if edge <= 0.0:
+            raise ValueError("cube size must be positive")
         return _cube_mesh(edge)
     if schema == "sphere":
         radius = collider.geometry_schema.get("radius")
-        if isinstance(radius, (int, float)) and float(radius) > 0.0:
-            return _sphere_mesh(float(radius))
+        validated_radius = _finite_real(radius, label="sphere radius")
+        if validated_radius <= 0.0:
+            raise ValueError("sphere radius must be positive")
+        return _sphere_mesh(validated_radius)
     if schema == "cylinder":
         radius = collider.geometry_schema.get("radius")
         height = collider.geometry_schema.get("height")
-        axis = str(collider.geometry_schema.get("axis") or "Z")
-        if (
-            isinstance(radius, (int, float))
-            and isinstance(height, (int, float))
-            and float(radius) > 0.0
-            and float(height) > 0.0
-        ):
-            return _cylinder_mesh(float(radius), float(height), axis)
+        axis = collider.geometry_schema.get("axis", "Z")
+        validated_radius = _finite_real(radius, label="cylinder radius")
+        validated_height = _finite_real(height, label="cylinder height")
+        if validated_radius <= 0.0 or validated_height <= 0.0:
+            raise ValueError("cylinder radius and height must be positive")
+        if not isinstance(axis, str) or axis.upper() not in {"X", "Y", "Z"}:
+            raise ValueError("cylinder axis must be X, Y, or Z")
+        return _cylinder_mesh(validated_radius, validated_height, axis)
     return None
 
 
 def _cube_mesh(edge: float) -> tuple[list[list[float]], list[list[int]]]:
-    half = edge / 2.0
+    validated_edge = _finite_real(edge, label="cube edge")
+    if validated_edge <= 0.0:
+        raise ValueError("cube edge must be positive")
+    half = validated_edge / 2.0
     vertices = [
         [-half, -half, -half],
         [half, -half, -half],
@@ -2121,66 +1462,149 @@ def _cube_mesh(edge: float) -> tuple[list[list[float]], list[list[int]]]:
         [-half, half, half],
     ]
     faces = [
-        [0, 1, 2], [0, 2, 3],
-        [4, 6, 5], [4, 7, 6],
-        [0, 4, 5], [0, 5, 1],
-        [1, 5, 6], [1, 6, 2],
-        [2, 6, 7], [2, 7, 3],
-        [3, 7, 4], [3, 4, 0],
+        [0, 1, 2],
+        [0, 2, 3],
+        [4, 6, 5],
+        [4, 7, 6],
+        [0, 4, 5],
+        [0, 5, 1],
+        [1, 5, 6],
+        [1, 6, 2],
+        [2, 6, 7],
+        [2, 7, 3],
+        [3, 7, 4],
+        [3, 4, 0],
     ]
     return vertices, faces
 
 
-def _sphere_mesh(radius: float, segments: int = 16, rings: int = 8) -> tuple[list[list[float]], list[list[int]]]:
-    vertices: list[list[float]] = [[0.0, 0.0, radius]]
-    for ring in range(1, rings):
-        phi = math.pi * ring / rings
-        z = radius * math.cos(phi)
-        ring_radius = radius * math.sin(phi)
-        for segment in range(segments):
-            theta = 2.0 * math.pi * segment / segments
-            vertices.append([ring_radius * math.cos(theta), ring_radius * math.sin(theta), z])
-    vertices.append([0.0, 0.0, -radius])
+def _sphere_mesh(
+    radius: float,
+    segments: int = 16,
+    rings: int = 8,
+) -> tuple[list[list[float]], list[list[int]]]:
+    validated_radius = _finite_real(radius, label="sphere radius")
+    if validated_radius <= 0.0:
+        raise ValueError("sphere radius must be positive")
+    validated_segments = _exact_int(
+        segments,
+        label="sphere segments",
+        minimum=3,
+        maximum=MAX_SEGMENTS,
+    )
+    validated_rings = _exact_int(
+        rings,
+        label="sphere rings",
+        minimum=2,
+        maximum=MAX_RINGS,
+    )
+    vertex_count = 2 + validated_segments * (validated_rings - 1)
+    face_count = 2 * validated_segments * (validated_rings - 1)
+    if vertex_count > MAX_VERTICES:
+        raise ValueError(f"sphere vertices exceeds the {MAX_VERTICES}-item bound")
+    if face_count > MAX_FACES:
+        raise ValueError(f"sphere faces exceeds the {MAX_FACES}-item bound")
+
+    vertices: list[list[float]] = [[0.0, 0.0, validated_radius]]
+    for ring in range(1, validated_rings):
+        phi = math.pi * ring / validated_rings
+        z = validated_radius * math.cos(phi)
+        ring_radius = validated_radius * math.sin(phi)
+        for segment in range(validated_segments):
+            theta = 2.0 * math.pi * segment / validated_segments
+            vertices.append(
+                [
+                    ring_radius * math.cos(theta),
+                    ring_radius * math.sin(theta),
+                    z,
+                ]
+            )
+    vertices.append([0.0, 0.0, -validated_radius])
 
     faces: list[list[int]] = []
     south = len(vertices) - 1
-    for segment in range(segments):
-        faces.append([0, 1 + segment, 1 + ((segment + 1) % segments)])
-    for ring in range(rings - 2):
-        base = 1 + ring * segments
-        next_base = base + segments
-        for segment in range(segments):
+    for segment in range(validated_segments):
+        faces.append(
+            [
+                0,
+                1 + segment,
+                1 + ((segment + 1) % validated_segments),
+            ]
+        )
+    for ring in range(validated_rings - 2):
+        base = 1 + ring * validated_segments
+        next_base = base + validated_segments
+        for segment in range(validated_segments):
             a = base + segment
-            b = base + ((segment + 1) % segments)
+            b = base + ((segment + 1) % validated_segments)
             c = next_base + segment
-            d = next_base + ((segment + 1) % segments)
+            d = next_base + ((segment + 1) % validated_segments)
             faces.append([a, c, b])
             faces.append([b, c, d])
-    last_ring = 1 + (rings - 2) * segments
-    for segment in range(segments):
-        faces.append([last_ring + segment, south, last_ring + ((segment + 1) % segments)])
+    last_ring = 1 + (validated_rings - 2) * validated_segments
+    for segment in range(validated_segments):
+        faces.append(
+            [
+                last_ring + segment,
+                south,
+                last_ring + ((segment + 1) % validated_segments),
+            ]
+        )
     return vertices, faces
 
 
-def _cylinder_mesh(radius: float, height: float, axis: str, segments: int = 24) -> tuple[list[list[float]], list[list[int]]]:
-    half = height / 2.0
+def _cylinder_mesh(
+    radius: float,
+    height: float,
+    axis: str,
+    segments: int = 24,
+) -> tuple[list[list[float]], list[list[int]]]:
+    validated_radius = _finite_real(radius, label="cylinder radius")
+    validated_height = _finite_real(height, label="cylinder height")
+    if validated_radius <= 0.0 or validated_height <= 0.0:
+        raise ValueError("cylinder radius and height must be positive")
+    if not isinstance(axis, str) or axis.upper() not in {"X", "Y", "Z"}:
+        raise ValueError("cylinder axis must be X, Y, or Z")
+    validated_segments = _exact_int(
+        segments,
+        label="cylinder segments",
+        minimum=3,
+        maximum=MAX_SEGMENTS,
+    )
+    vertex_count = 2 * validated_segments + 2
+    face_count = 4 * validated_segments
+    if vertex_count > MAX_VERTICES:
+        raise ValueError(
+            f"cylinder vertices exceeds the {MAX_VERTICES}-item bound"
+        )
+    if face_count > MAX_FACES:
+        raise ValueError(f"cylinder faces exceeds the {MAX_FACES}-item bound")
+
+    half = validated_height / 2.0
     vertices: list[list[float]] = []
     for z in (-half, half):
-        for segment in range(segments):
-            theta = 2.0 * math.pi * segment / segments
-            vertices.append(_axis_point(radius * math.cos(theta), radius * math.sin(theta), z, axis))
+        for segment in range(validated_segments):
+            theta = 2.0 * math.pi * segment / validated_segments
+            vertices.append(
+                _axis_point(
+                    validated_radius * math.cos(theta),
+                    validated_radius * math.sin(theta),
+                    z,
+                    axis,
+                )
+            )
     bottom_center = len(vertices)
     vertices.append(_axis_point(0.0, 0.0, -half, axis))
     top_center = len(vertices)
     vertices.append(_axis_point(0.0, 0.0, half, axis))
 
     faces: list[list[int]] = []
-    for segment in range(segments):
-        next_segment = (segment + 1) % segments
+    for segment in range(validated_segments):
+        next_segment = (segment + 1) % validated_segments
         bottom_a = segment
         bottom_b = next_segment
-        top_a = segments + segment
-        top_b = segments + next_segment
+        top_a = validated_segments + segment
+        top_b = validated_segments + next_segment
         faces.append([bottom_a, top_a, bottom_b])
         faces.append([bottom_b, top_a, top_b])
         faces.append([bottom_center, bottom_b, bottom_a])
@@ -2189,483 +1613,102 @@ def _cylinder_mesh(radius: float, height: float, axis: str, segments: int = 24) 
 
 
 def _axis_point(x: float, y: float, z: float, axis: str) -> list[float]:
+    values = [
+        _finite_real(x, label="axis point x"),
+        _finite_real(y, label="axis point y"),
+        _finite_real(z, label="axis point z"),
+    ]
+    if not isinstance(axis, str) or axis.upper() not in {"X", "Y", "Z"}:
+        raise ValueError("axis must be X, Y, or Z")
     axis = axis.upper()
     if axis == "X":
-        return [z, x, y]
+        return [values[2], values[0], values[1]]
     if axis == "Y":
-        return [x, z, y]
-    return [x, y, z]
-
-
-def _logical_object_root(path: str) -> str:
-    parts = [part for part in path.split("/") if part]
-    if not parts:
-        return path
-    if parts[0] == "World" and len(parts) >= 2:
-        return "/" + "/".join(parts[:2])
-    if parts[0] == "background" and len(parts) >= 2:
-        return "/" + "/".join(parts[:2])
-    return "/" + parts[0]
-
-
-def _object_id_hint(source_root: str) -> str:
-    slug = source_root.strip("/").replace("/", "__")
-    cleaned = []
-    for char in slug:
-        cleaned.append(char if char.isalnum() or char == "_" else "_")
-    return "".join(cleaned).strip("_") or "scene_object"
-
-
-def _union_aabbs(aabbs: list[dict[str, Any] | None]) -> dict[str, Any] | None:
-    valid = [aabb for aabb in aabbs if aabb is not None]
-    if not valid:
-        return None
-    minimum = [min(float(aabb["min"][index]) for aabb in valid) for index in range(3)]
-    maximum = [max(float(aabb["max"][index]) for aabb in valid) for index in range(3)]
-    return {
-        "min": _rounded_list(minimum),
-        "max": _rounded_list(maximum),
-        "size": _rounded_list([maximum[index] - minimum[index] for index in range(3)]),
-        "center": _rounded_list([(maximum[index] + minimum[index]) / 2.0 for index in range(3)]),
-    }
-
-
-def _count_values(values: Any) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for value in values:
-        key = str(value) if value is not None else "unknown"
-        counts[key] = counts.get(key, 0) + 1
-    return counts
-
-
-def _rounded_list(values: list[Any], digits: int = 6) -> list[float]:
-    return [round(float(value), digits) for value in values]
-
-
-def _path_included(
-    path: str,
-    include_subtrees: list[str],
-    exclude_subtrees: list[str],
-) -> bool:
-    if include_subtrees and not any(_path_is_under(path, prefix) for prefix in include_subtrees):
-        return False
-    return not any(_path_is_under(path, prefix) for prefix in exclude_subtrees)
-
-
-def _path_is_under(path: str, prefix: str) -> bool:
-    normalized = prefix.rstrip("/")
-    return path == normalized or path.startswith(normalized + "/")
-
-
-def _has_collision_api(modules: dict[str, Any], prim: Any) -> bool:
-    return _has_api(prim, modules["UsdPhysics"].CollisionAPI)
-
-
-def _has_api(prim: Any, api_cls: Any) -> bool:
-    try:
-        return bool(prim.HasAPI(api_cls))
-    except Exception:
-        try:
-            api = api_cls(prim)
-            return bool(api and api.GetPrim().IsValid())
-        except Exception:
-            return False
-
-
-def _make_api(api_cls: Any, prim: Any) -> Any:
-    return api_cls(prim)
-
-
-def _api_attr(api: Any, method_name: str) -> Any:
-    try:
-        method = getattr(api, method_name)
-        return method()
-    except Exception:
-        return None
-
-
-def _attr_value(attr_or_rel: Any) -> Any:
-    if attr_or_rel is None:
-        return None
-    try:
-        if hasattr(attr_or_rel, "GetTargets"):
-            return [str(item) for item in attr_or_rel.GetTargets()]
-        return _plain_value(attr_or_rel.Get())
-    except Exception:
-        return None
-
-
-def _inspect_api_attrs(api: Any, getter_names: list[str]) -> dict[str, Any]:
-    values: dict[str, Any] = {}
-    for getter_name in getter_names:
-        key = _getter_to_key(getter_name)
-        values[key] = _attr_value(_api_attr(api, getter_name))
+        return [values[0], values[2], values[1]]
     return values
 
 
-def _getter_to_key(getter_name: str) -> str:
-    if getter_name.startswith("Get"):
-        getter_name = getter_name[3:]
-    if getter_name.endswith("Attr"):
-        getter_name = getter_name[:-4]
-    if getter_name.endswith("Rel"):
-        getter_name = getter_name[:-3]
-    result = []
-    for index, char in enumerate(getter_name):
-        if char.isupper() and index > 0:
-            result.append("_")
-        result.append(char.lower())
-    return "".join(result)
+def _object_id_hint(source_root: str) -> str:
+    bounded_root = _bounded_text(source_root, label="source_root")
+    slug = bounded_root.strip("/").replace("/", "__")
+    cleaned: list[str] = []
+    for char in slug:
+        cleaned.append(
+            char if char.isascii() and (char.isalnum() or char == "_") else "_"
+        )
+    stem = "".join(cleaned).strip("_") or "scene_object"
+    stem = stem[:72].rstrip("_") or "scene_object"
+    digest = hashlib.sha256(bounded_root.encode("utf-8")).hexdigest()[:12]
+    return f"{stem}_{digest}"
 
 
-def _physx_collision_schemas(PhysxSchema: Any, prim: Any) -> dict[str, dict[str, Any]]:
-    schema_methods = {
-        "physx_collision": [
-            PhysxSchema.PhysxCollisionAPI,
-            [
-                "GetContactOffsetAttr",
-                "GetRestOffsetAttr",
-                "GetTorsionalPatchRadiusAttr",
-                "GetMinTorsionalPatchRadiusAttr",
-            ],
-        ],
-        "physx_mesh_collision": [
-            getattr(PhysxSchema, "PhysxTriangleMeshCollisionAPI", None),
-            [
-                "GetMeshSimplificationAttr",
-                "GetWeldToleranceAttr",
-            ],
-        ],
-        "physx_convex_hull_collision": [
-            getattr(PhysxSchema, "PhysxConvexHullCollisionAPI", None),
-            [
-                "GetHullVertexLimitAttr",
-                "GetMinThicknessAttr",
-            ],
-        ],
-        "physx_convex_decomposition_collision": [
-            getattr(PhysxSchema, "PhysxConvexDecompositionCollisionAPI", None),
-            [
-                "GetHullVertexLimitAttr",
-                "GetMaxConvexHullsAttr",
-                "GetVoxelResolutionAttr",
-            ],
-        ],
-        "physx_sdf_mesh_collision": [
-            getattr(PhysxSchema, "PhysxSDFMeshCollisionAPI", None),
-            [
-                "GetSdfResolutionAttr",
-                "GetSdfSubgridResolutionAttr",
-                "GetSdfBitsPerSubgridPixelAttr",
-                "GetSdfMarginAttr",
-            ],
-        ],
-    }
-
-    result: dict[str, dict[str, Any]] = {}
-    for schema_name, (schema_cls, getters) in schema_methods.items():
-        if schema_cls is None or not _has_api(prim, schema_cls):
-            continue
-        result[schema_name] = _inspect_api_attrs(_make_api(schema_cls, prim), getters)
-    return result
-
-
-def _geometry_schema(modules: dict[str, Any], prim: Any) -> dict[str, Any]:
-    UsdGeom = modules["UsdGeom"]
-    schema_candidates = [
-        ("cube", UsdGeom.Cube, ["GetSizeAttr"]),
-        ("sphere", UsdGeom.Sphere, ["GetRadiusAttr"]),
-        ("cylinder", UsdGeom.Cylinder, ["GetRadiusAttr", "GetHeightAttr", "GetAxisAttr"]),
-        ("capsule", UsdGeom.Capsule, ["GetRadiusAttr", "GetHeightAttr", "GetAxisAttr"]),
-        ("cone", UsdGeom.Cone, ["GetRadiusAttr", "GetHeightAttr", "GetAxisAttr"]),
-        ("mesh", UsdGeom.Mesh, ["GetPointsAttr", "GetFaceVertexCountsAttr", "GetFaceVertexIndicesAttr"]),
+def _rounded_list(values: list[Any], digits: int = 6) -> list[float]:
+    validated_digits = _exact_int(
+        digits,
+        label="rounding digits",
+        minimum=0,
+        maximum=15,
+    )
+    bounded_values = _bounded_items(
+        values,
+        maximum=MAX_VERTICES,
+        label="numeric values",
+    )
+    return [
+        round(_finite_real(value, label=f"numeric values[{index}]"), validated_digits)
+        for index, value in enumerate(bounded_values)
     ]
-    for schema_name, schema_cls, getters in schema_candidates:
-        try:
-            if not prim.IsA(schema_cls):
-                continue
-            schema = schema_cls(prim)
-            result = {"schema": schema_name}
-            for getter in getters:
-                key = _getter_to_key(getter)
-                attr = _api_attr(schema, getter)
-                if schema_name == "mesh":
-                    result[key + "_count"] = _attr_len(attr)
-                else:
-                    result[key] = _attr_value(attr)
-            if schema_name == "mesh":
-                mesh_candidates = _mesh_resource_candidates(prim)
-                if mesh_candidates:
-                    result["mesh_resource_uri"] = mesh_candidates[0]
-                    result["mesh_resource_candidates"] = mesh_candidates
-            return result
-        except Exception:
-            continue
-    return {"schema": prim.GetTypeName() or "unknown"}
-
-
-def _mesh_resource_candidates(prim: Any) -> list[str]:
-    candidates: list[str] = []
-    seen: set[str] = set()
-
-    for asset_path, base_path in _prim_asset_paths(prim):
-        uri = _manyforge_mesh_uri(asset_path, base_path)
-        if uri and uri not in seen:
-            candidates.append(uri)
-            seen.add(uri)
-
-    return candidates
-
-
-def _prim_asset_paths(prim: Any) -> list[tuple[str, str | None]]:
-    paths: list[tuple[str, str | None]] = []
-
-    def add(value: Any, base_path: str | None = None) -> None:
-        for asset_path in _extract_asset_paths(value):
-            paths.append((asset_path, base_path))
-
-    try:
-        add(prim.GetMetadata("references"))
-    except Exception:
-        pass
-    try:
-        add(prim.GetMetadata("payload"))
-    except Exception:
-        pass
-    try:
-        add(prim.GetAssetInfo())
-    except Exception:
-        pass
-
-    try:
-        for spec in prim.GetPrimStack():
-            layer = getattr(spec, "layer", None)
-            real_path = getattr(layer, "realPath", None) if layer is not None else None
-            base_path = str(real_path) if real_path else None
-            add(getattr(spec, "referenceList", None), base_path)
-            add(getattr(spec, "payloadList", None), base_path)
-            add(getattr(layer, "identifier", None), base_path)
-            add(real_path, base_path)
-    except Exception:
-        pass
-
-    return paths
-
-
-def _extract_asset_paths(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, (list, tuple, set)):
-        result: list[str] = []
-        for item in value:
-            result.extend(_extract_asset_paths(item))
-        return result
-    if isinstance(value, dict):
-        result = []
-        for item in value.values():
-            result.extend(_extract_asset_paths(item))
-        return result
-    result: list[str] = []
-    for attr_name in ("assetPath", "path", "resolvedPath"):
-        try:
-            attr = getattr(value, attr_name)
-        except Exception:
-            continue
-        if isinstance(attr, str) and attr:
-            result.append(attr)
-    for list_name in ("explicitItems", "prependedItems", "appendedItems", "addedItems"):
-        try:
-            items = getattr(value, list_name)
-        except Exception:
-            continue
-        result.extend(_extract_asset_paths(items))
-    return result
-
-
-def _manyforge_mesh_uri(asset_path: str, base_path: str | None) -> str | None:
-    if not asset_path or asset_path.startswith("<"):
-        return None
-    normalized = asset_path.strip("@")
-    suffix = Path(normalized.split("?", 1)[0]).suffix.lower()
-    if suffix not in _SUPPORTED_MANYFORGE_MESH_EXTENSIONS:
-        return None
-    if normalized.startswith(("package://", "file://")):
-        return normalized
-    if "://" in normalized:
-        return None
-
-    path = Path(normalized)
-    if not path.is_absolute() and base_path:
-        path = Path(base_path).parent / path
-    return path.resolve().as_uri() if path.is_absolute() else normalized
-
-
-def _attr_len(attr: Any) -> int | None:
-    if attr is None:
-        return None
-    try:
-        value = attr.Get()
-        return len(value) if value is not None else None
-    except Exception:
-        return None
-
-
-def _ancestor_with_api(prim: Any, api_cls: Any) -> str | None:
-    current = prim
-    while current and current.IsValid():
-        if _has_api(current, api_cls):
-            return str(current.GetPath())
-        current = current.GetParent()
-    return None
-
-
-def _parent_path(prim: Any) -> str | None:
-    parent = prim.GetParent()
-    if parent and parent.IsValid():
-        return str(parent.GetPath())
-    return None
-
-
-def _is_xformable(modules: dict[str, Any], prim: Any) -> bool:
-    try:
-        return prim.IsA(modules["UsdGeom"].Xformable)
-    except Exception:
-        return False
-
-
-def _is_imageable(modules: dict[str, Any], prim: Any) -> bool:
-    try:
-        return prim.IsA(modules["UsdGeom"].Imageable)
-    except Exception:
-        return False
-
-
-def _visibility_attr(modules: dict[str, Any], prim: Any) -> str | None:
-    if not _is_imageable(modules, prim):
-        return None
-    try:
-        return _plain_value(modules["UsdGeom"].Imageable(prim).GetVisibilityAttr().Get())
-    except Exception:
-        return None
-
-
-def _computed_visibility(modules: dict[str, Any], prim: Any) -> str | None:
-    if not _is_imageable(modules, prim):
-        return None
-    try:
-        return str(
-            modules["UsdGeom"].Imageable(prim).ComputeVisibility(
-                modules["Usd"].TimeCode.Default()
-            )
-        )
-    except Exception:
-        return None
-
-
-def _computed_purpose(modules: dict[str, Any], prim: Any) -> str | None:
-    if not _is_imageable(modules, prim):
-        return None
-    try:
-        purpose = modules["UsdGeom"].Imageable(prim).ComputePurpose()
-        if purpose:
-            return str(purpose)
-    except Exception:
-        pass
-    try:
-        return _plain_value(modules["UsdGeom"].Imageable(prim).GetPurposeAttr().Get())
-    except Exception:
-        return None
-
-
-def _prim_is_visible(modules: dict[str, Any], prim: Any) -> bool:
-    computed = _computed_visibility(modules, prim)
-    return computed is None or computed != "invisible"
-
-
-def _purpose_allowed(modules: dict[str, Any], prim: Any, purposes: list[str]) -> bool:
-    if not purposes or "all" in purposes:
-        return True
-    purpose = _computed_purpose(modules, prim) or "default"
-    return purpose in purposes
-
-
-def _local_transform(modules: dict[str, Any], prim: Any, errors: list[str]) -> list[list[float]] | None:
-    try:
-        if not _is_xformable(modules, prim):
-            return None
-        xformable = modules["UsdGeom"].Xformable(prim)
-        try:
-            result = xformable.GetLocalTransformation()
-        except TypeError:
-            result = xformable.GetLocalTransformation(modules["Usd"].TimeCode.Default())
-        matrix = result[0] if isinstance(result, tuple) else result
-        return _matrix_to_rows(matrix)
-    except Exception as exc:
-        errors.append(f"local transform failed: {exc}")
-        return None
-
-
-def _world_transform(modules: dict[str, Any], prim: Any, errors: list[str]) -> list[list[float]] | None:
-    matrix = _world_matrix(modules, prim, errors)
-    return _matrix_to_rows(matrix) if matrix is not None else None
-
-
-def _world_matrix(modules: dict[str, Any], prim: Any, errors: list[str]) -> Any:
-    try:
-        if not _is_xformable(modules, prim):
-            return None
-        return modules["UsdGeom"].Xformable(prim).ComputeLocalToWorldTransform(
-            modules["Usd"].TimeCode.Default()
-        )
-    except Exception as exc:
-        errors.append(f"world transform failed: {exc}")
-        return None
-
-
-def _aabb(
-    modules: dict[str, Any],
-    bbox_cache: Any,
-    prim: Any,
-    *,
-    local: bool,
-    errors: list[str],
-) -> dict[str, Any] | None:
-    try:
-        bbox = bbox_cache.ComputeLocalBound(prim) if local else bbox_cache.ComputeWorldBound(prim)
-        aligned = bbox.ComputeAlignedRange()
-        minimum = _vector_to_list(aligned.GetMin())
-        maximum = _vector_to_list(aligned.GetMax())
-        if any(_is_inf(item) for item in minimum + maximum):
-            return None
-        return {
-            "min": minimum,
-            "max": maximum,
-            "size": [maximum[index] - minimum[index] for index in range(3)],
-            "center": [(maximum[index] + minimum[index]) / 2.0 for index in range(3)],
-        }
-    except Exception as exc:
-        label = "local" if local else "world"
-        errors.append(f"{label} aabb failed: {exc}")
-        return None
 
 
 def _matrix_to_rows(matrix: Any) -> list[list[float]]:
-    return [[float(matrix[row][col]) for col in range(4)] for row in range(4)]
+    if matrix is None:
+        raise ValueError("transform matrix must not be None")
+    if isinstance(matrix, (list, tuple)):
+        if len(matrix) != 4:
+            raise ValueError("transform matrix must contain exactly four rows")
+        for row_index, row in enumerate(matrix):
+            if not isinstance(row, (list, tuple)) or len(row) != 4:
+                raise ValueError(
+                    f"transform matrix row {row_index} must contain exactly four values"
+                )
+    rows: list[list[float]] = []
+    for row_index in range(4):
+        row_values: list[float] = []
+        for column in range(4):
+            try:
+                value = matrix[row_index][column]
+            except Exception as exc:
+                raise ValueError("transform matrix must be indexable as 4x4") from exc
+            row_values.append(
+                _finite_real(
+                    value,
+                    label=f"transform[{row_index}][{column}]",
+                )
+            )
+        rows.append(row_values)
+    return rows
 
 
-def _rpy_deg_from_row_major_transform(matrix: list[list[float]]) -> list[float]:
+def _rpy_deg_from_row_major_transform(
+    matrix: list[list[float]],
+) -> list[float]:
+    rows = _matrix_to_rows(matrix)
     # Gf.Matrix4d uses row-vector transforms. Transpose the 3x3 block into the
     # conventional column-vector rotation matrix before extracting XYZ RPY.
-    rotation = [[float(matrix[col][row]) for col in range(3)] for row in range(3)]
+    rotation = [[rows[col][row] for col in range(3)] for row in range(3)]
     for col in range(3):
-        norm = math.sqrt(sum(rotation[row][col] * rotation[row][col] for row in range(3)))
-        if norm > 0.0:
-            for row in range(3):
-                rotation[row][col] /= norm
+        norm = math.sqrt(
+            sum(rotation[row][col] * rotation[row][col] for row in range(3))
+        )
+        if not math.isfinite(norm) or norm <= 1e-12:
+            raise ValueError(f"transform rotation column {col} is degenerate")
+        for row in range(3):
+            rotation[row][col] /= norm
 
-    sy = math.sqrt(rotation[0][0] * rotation[0][0] + rotation[1][0] * rotation[1][0])
+    sy = math.sqrt(
+        rotation[0][0] * rotation[0][0]
+        + rotation[1][0] * rotation[1][0]
+    )
     singular = sy < 1e-9
     if not singular:
         roll = math.atan2(rotation[2][1], rotation[2][2])
@@ -2675,118 +1718,179 @@ def _rpy_deg_from_row_major_transform(matrix: list[list[float]]) -> list[float]:
         roll = math.atan2(-rotation[1][2], rotation[1][1])
         pitch = math.atan2(-rotation[2][0], sy)
         yaw = 0.0
-    return [math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
+    return _finite_vector3(
+        [math.degrees(roll), math.degrees(pitch), math.degrees(yaw)],
+        label="orientation_rpy_deg",
+    )
 
 
 def _vector_to_list(value: Any) -> list[float]:
-    try:
-        return [float(value[0]), float(value[1]), float(value[2])]
-    except Exception:
-        return [float(item) for item in value]
+    return _finite_vector3(value, label="vector")
 
 
 def _points_aabb(points: list[Any]) -> dict[str, Any] | None:
-    if not points:
+    bounded_points = _bounded_items(
+        points,
+        maximum=MAX_VERTICES,
+        label="AABB points",
+    )
+    if not bounded_points:
         return None
-    vectors = [_vector_to_list(point) for point in points]
+    vectors = [_vector_to_list(point) for point in bounded_points]
     minimum = [min(point[index] for point in vectors) for index in range(3)]
     maximum = [max(point[index] for point in vectors) for index in range(3)]
     return {
         "min": minimum,
         "max": maximum,
         "size": [maximum[index] - minimum[index] for index in range(3)],
-        "center": [(maximum[index] + minimum[index]) / 2.0 for index in range(3)],
+        "center": [
+            (maximum[index] + minimum[index]) / 2.0 for index in range(3)
+        ],
     }
 
 
 def _transform_point(matrix: Any, point: Any) -> list[float]:
     if matrix is None:
-        return _vector_to_list(point)
-    try:
-        return _vector_to_list(matrix.Transform(point))
-    except Exception:
-        vector = _vector_to_list(point)
-        return [
-            vector[0] * float(matrix[0][0])
-            + vector[1] * float(matrix[1][0])
-            + vector[2] * float(matrix[2][0])
-            + float(matrix[3][0]),
-            vector[0] * float(matrix[0][1])
-            + vector[1] * float(matrix[1][1])
-            + vector[2] * float(matrix[2][1])
-            + float(matrix[3][1]),
-            vector[0] * float(matrix[0][2])
-            + vector[1] * float(matrix[1][2])
-            + vector[2] * float(matrix[2][2])
-            + float(matrix[3][2]),
-        ]
+        raise ValueError("transform matrix must not be None")
+    vector = _vector_to_list(point)
+    transform = getattr(matrix, "Transform", None)
+    if transform is not None:
+        if not callable(transform):
+            raise ValueError("matrix Transform attribute must be callable")
+        try:
+            transformed = transform(point)
+        except Exception as exc:
+            raise ValueError("matrix Transform operation failed") from exc
+        return _finite_vector3(transformed, label="transformed point")
+
+    rows = _matrix_to_rows(matrix)
+    transformed = [
+        vector[0] * rows[0][column]
+        + vector[1] * rows[1][column]
+        + vector[2] * rows[2][column]
+        + rows[3][column]
+        for column in range(3)
+    ]
+    return _finite_vector3(transformed, label="transformed point")
 
 
 def _plain_value(value: Any) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, (list, tuple)):
-        return [_plain_value(item) for item in value]
-    if hasattr(value, "pathString"):
-        return value.pathString
-    if hasattr(value, "GetString"):
+    remaining_nodes = MAX_SAMPLE_NODES
+    remaining_text_bytes = MAX_SAMPLE_TEXT_BYTES
+
+    def bounded_sample_text(raw: Any, *, label: str) -> str:
+        nonlocal remaining_text_bytes
+        text = _bounded_text(
+            raw,
+            label=label,
+            maximum_bytes=MAX_TEXT_BYTES,
+            allow_empty=True,
+        )
+        size = len(text.encode("utf-8"))
+        if size > remaining_text_bytes:
+            raise ValueError(
+                f"polygon sample text exceeds the {MAX_SAMPLE_TEXT_BYTES}-byte bound"
+            )
+        remaining_text_bytes -= size
+        return text
+
+    def convert(item: Any, *, depth: int, ancestors: set[int]) -> Any:
+        nonlocal remaining_nodes
+        if depth > MAX_SAMPLE_DEPTH:
+            raise ValueError(
+                f"polygon sample exceeds the {MAX_SAMPLE_DEPTH}-level depth bound"
+            )
+        if remaining_nodes <= 0:
+            raise ValueError(
+                f"polygon sample exceeds the {MAX_SAMPLE_NODES}-node bound"
+            )
+        remaining_nodes -= 1
+
+        if item is None or isinstance(item, bool):
+            return item
+        if isinstance(item, str):
+            return bounded_sample_text(item, label="polygon sample text")
+        if isinstance(item, Integral):
+            return _exact_int(
+                item,
+                label="polygon sample integer",
+                minimum=-(2**63),
+                maximum=2**63 - 1,
+            )
+        if isinstance(item, Real):
+            return _finite_real(item, label="polygon sample number")
+        if type(item) in (list, tuple, dict):
+            object_id = id(item)
+            if object_id in ancestors:
+                raise ValueError("polygon sample contains a cycle")
+            ancestors.add(object_id)
+            try:
+                if type(item) in (list, tuple):
+                    if len(item) > MAX_SAMPLE_ITEMS:
+                        raise ValueError(
+                            "polygon sample collection exceeds the "
+                            f"{MAX_SAMPLE_ITEMS}-item bound"
+                        )
+                    return [
+                        convert(child, depth=depth + 1, ancestors=ancestors)
+                        for child in item
+                    ]
+                if len(item) > MAX_SAMPLE_ITEMS:
+                    raise ValueError(
+                        "polygon sample object exceeds the "
+                        f"{MAX_SAMPLE_ITEMS}-field bound"
+                    )
+                converted: dict[str, Any] = {}
+                for key, child in item.items():
+                    name = bounded_sample_text(
+                        key,
+                        label="polygon sample field name",
+                    )
+                    converted[name] = convert(
+                        child,
+                        depth=depth + 1,
+                        ancestors=ancestors,
+                    )
+                return converted
+            finally:
+                ancestors.remove(object_id)
+
         try:
-            return value.GetString()
-        except Exception:
-            pass
-    try:
-        return _vector_to_list(value)
-    except Exception:
-        return str(value)
+            path_string = getattr(item, "pathString")
+        except AttributeError:
+            path_string = None
+        except Exception as exc:
+            raise ValueError("polygon sample pathString access failed") from exc
+        if path_string is not None:
+            return bounded_sample_text(
+                path_string,
+                label="polygon sample pathString",
+            )
+        try:
+            get_string = getattr(item, "GetString")
+        except AttributeError:
+            get_string = None
+        except Exception as exc:
+            raise ValueError("polygon sample GetString access failed") from exc
+        if get_string is not None:
+            if not callable(get_string):
+                raise ValueError("polygon sample GetString must be callable")
+            try:
+                rendered = get_string()
+            except Exception as exc:
+                raise ValueError("polygon sample GetString failed") from exc
+            return bounded_sample_text(
+                rendered,
+                label="polygon sample GetString result",
+            )
+        try:
+            return _vector_to_list(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "polygon sample value has no supported bounded representation"
+            ) from exc
 
-
-def _enum_name(value: Any) -> str:
-    name = getattr(value, "name", None)
-    if name:
-        return str(name)
-    return str(value)
-
-
-def _safe_call(fn: Any) -> Any:
-    try:
-        return fn()
-    except Exception as exc:
-        return {"error": str(exc)}
-
-
-def _dict_get(data: dict[str, Any] | None, keys: list[str]) -> Any:
-    current: Any = data
-    for key in keys:
-        if not isinstance(current, dict):
-            return None
-        current = current.get(key)
-    return current
-
-
-def _is_inf(value: float) -> bool:
-    return value == float("inf") or value == float("-inf")
-
-
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, tuple):
-        return [_json_safe(item) for item in value]
-    return value
-
-
-def _probe_error(scope: str, exc: Exception, include_traceback: bool) -> ProbeError:
-    return ProbeError(
-        scope=scope,
-        message=str(exc),
-        traceback=traceback.format_exc() if include_traceback else None,
-    )
+    return convert(value, depth=0, ancestors=set())
 
 
 if __name__ == "__main__":

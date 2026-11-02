@@ -1,291 +1,200 @@
-# ManyForge
+<p align="center">
+  <img src="docs/media/manyforge-logo.svg" alt="ManyForge logo" width="112">
+</p>
 
-Modular robot execution framework: behavior trees, motion planning, scene
-authoring, and an LLM-assisted Composer UI. It currently supports a
-self-contained ManyForge-only native lane, Isaac Sim commanded simulation,
-and an experimental supervised `real-robot` lane whose first qualified target
-is Lite6. Physical support remains robot- and cell-specific: the common
-controller/lifecycle contracts do not replace hardware qualification.
+<h1 align="center">ManyForge</h1>
 
-> **For LLMs** (Claude, ChatGPT, agentic IDEs): read
-> [`AGENTS.md`](AGENTS.md) before making any change. It tells you what
-> this repo is, how to operate it at runtime, and the branch + commit
-> workflow that applies to LLM contributors. The full contributor
-> reference is [`CONTRIBUTING.md`](CONTRIBUTING.md).
+<p align="center">
+  <b>Program robot arms visually. Run the same Program in simulation and on the real robot.</b><br>
+  A vendor-neutral manipulation framework built on ROS 2.
+</p>
 
-## Documentation map
+<p align="center">
+  <img src="docs/media/manyforge-preview.gif" alt="ManyForge Composer: authoring and running a Lite 6 pick-and-place Program" width="900">
+</p>
 
-| You want to…                                        | Start here                                                                                                                                         |
-| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Install or launch a supported scenario              | [`docs/operations/LAUNCHER_QUICKSTART.md`](docs/operations/LAUNCHER_QUICKSTART.md)                                                                 |
-| Operate, diagnose, or recover a running stack       | [`docs/INDEX.md`](docs/INDEX.md) → operator runbooks                                                                                               |
-| Understand architecture and authority boundaries    | [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md)                                                                                 |
-| Integrate through REST, MCP, or the viewer protocol | [`docs/INDEX.md`](docs/INDEX.md) → generated contracts                                                                                             |
-| Add a robot or trusted external node                | [`docs/operations/ADDING_A_ROBOT.md`](docs/operations/ADDING_A_ROBOT.md), [`docs/operations/EXTERNAL_NODES.md`](docs/operations/EXTERNAL_NODES.md) |
-| Contribute code or documentation                    | [`CONTRIBUTING.md`](CONTRIBUTING.md); LLM agents also read [`AGENTS.md`](AGENTS.md)                                                                |
+## DISCLAIMER
 
-The runtime documentation is self-contained in this repository. Private
-maintainer specifications are not required to install, operate, or integrate
-ManyForge.
+This software is released under the Apache 2.0 license (see [LICENSE](LICENSE)
+and [NOTICE](NOTICE)).
 
-## Disclaimer
+**Safety notice:** ManyForge does **not** implement functional safety. You
+**must** integrate appropriate safety measures compliant with local
+regulations, including hardware emergency stops and safety-rated controls,
+and perform a risk assessment before deploying on real hardware.
 
-This software is released under the Apache-2.0 license (see
-[`LICENSE`](LICENSE) for details).
+**Pre-1.0:** ManyForge is under active development; interfaces and file
+formats may change between minor releases.
 
-**Safety notice:** ManyForge does **not** implement functional safety. Its
-fail-closed behaviors (command gating, bounded stops, intervention
-acknowledgement) are software-level execution controls, not safety
-functions. You **must** integrate appropriate safety measures compliant
-with local regulations (hardware e-stops, safety-rated controllers, risk
-assessment) before deploying on real hardware.
+---
 
-**Experimental:** the project is under active development; pre-1.0 APIs may
-change between minor versions (see [`CHANGELOG.md`](CHANGELOG.md)).
+## What is ManyForge?
 
-## Quick Start
+ManyForge brings the way industrial robots are programmed together with ROS 2
+and modern motion planning. You build a **cell** from components (arms,
+grippers, I/O devices, sensors), compose a **Program** as a behaviour tree in
+the Composer, and execute it with collision-checked motion planning, proper
+Stops and live monitoring. The same Program runs on every lane:
 
-Requires Docker (with BuildKit) and git.
+| Lane | What runs | Use it for |
+| --- | --- | --- |
+| **Mock** | Simulated ros2_control hardware, no simulator or robot | Authoring, offline checks, CI |
+| **Isaac** | A scene open in NVIDIA Isaac Sim, through its ROS 2 bridge | Physics, perception and full-cell rehearsal |
+| **Real** | The robot through its vendor driver | Production, with the integrator's safety system |
 
-```bash
-# 1. Clone RoboPlan dependency and build the Docker image (~10 min first time)
-./scripts/setup-docker.sh
+Every lane goes through ros2_control and the stock joint trajectory
+controller, so what you rehearse in Mock or Isaac is what the robot executes.
 
-# 2. Enter the dev container
-docker compose run --rm dev bash
+### Highlights
 
-# 3. Run all tests (builds C++ automatically)
-./scripts/test-all.sh
-```
+- **Composer**: a browser-based editor for Programs, Scenes and Deployments,
+  with a live 3D view of the cell.
+- **Behaviour-tree Programs**: sequences, fallbacks, parallels, retries and
+  timers, plus motion, gripper, I/O, geometry and vision nodes.
+- **Motion you can trust**: RoboPlan planning with collision checks before
+  dispatch and runtime collision monitoring, within the vendor's TCP speed
+  limits.
+- **Stops, holds and recovery**: operator Stops per motion group, rules on
+  signals (light curtains, part-lost), retries and operator recovery.
+- **Components, not code**: arms, grippers, I/O devices and sensors are
+  configured in a Deployment; a Program runs on any compatible Deployment.
+- **Optional AI assistant**: an OpenAI-compatible model can edit the Draft
+  through the Composer's tools; you review and Apply.
 
-**Bringing up the stack?** Just run the launcher with no arguments
-and follow the prompts — same shape as the NemoClaw onboard wizard:
+### Supported robots and tools
 
-```bash
-./scripts/launch.sh
-```
+- **UFACTORY**: Lite 6 and UF850 in Mock, Lite 6 in Isaac, and
+  xArm-family robots on Real through the vendor driver (Lite 6 tested on
+  hardware), with their controller and tool I/O.
+- **Universal Robots**: UR5 and UR10e in Mock, UR10e in Isaac; a UR5e model
+  is included.
+- **Grippers**: UFACTORY Lite gripper (pneumatic) and xArm gripper, Robotiq
+  2F-85 and 2F-140, and generic valve-driven pneumatic grippers.
 
-A 7-step interactive menu walks you through lane (`manyforge-only`,
-`isaac-sim`, or the experimental `real-robot` path), assistant (on / off), and
-scenario, then brings up the
-stack. See [`docs/operations/LAUNCHER_QUICKSTART.md`](docs/operations/LAUNCHER_QUICKSTART.md)
-for the full guide — interactive wizard first, then scripted /
-non-interactive use for CI, plus the four-combination smoke-test
-matrix.
+Other robots are added as components with a vendor adapter; see
+[Adding a component](docs/authoring/ADDING_A_COMPONENT.md).
 
-**Adding a new robot?** See
-[`docs/operations/ADDING_A_ROBOT.md`](docs/operations/ADDING_A_ROBOT.md) —
-URDF/SRDF requirements, deployment-YAML schema, capability adapter
-selection, and smoke-test curls. All operator docs are catalogued at
-[`docs/INDEX.md`](docs/INDEX.md).
+## Quick start
 
-**Qualifying the physical Lite6?** Use the staged, attended procedure in
-[`docs/operations/LITE6_LIVE_QUALIFICATION.md`](docs/operations/LITE6_LIVE_QUALIFICATION.md).
-Launcher startup is observation-only; it never enables drives or dispatches a
-trajectory.
-
-## Running Tests
-
-All commands run inside the container (`docker compose run --rm dev bash`).
+Follow the [workbench guide](docs/operations/DEVELOPMENT_WORKBENCH.md) for
+host prerequisites. From the repository root, build the ROS image once (and
+again after Dockerfile changes), then start:
 
 ```bash
-# Full suite (all supported test/build suites)
-./scripts/test-all.sh all
-
-# Individual suites
-./scripts/test-all.sh cpp          # manyforge_core C++ tests
-./scripts/test-all.sh roboplan     # manyforge_roboplan C++ tests
-./scripts/test-all.sh bindings     # pybind11 bindings
-./scripts/test-all.sh python       # manyforge_behavior
-./scripts/test-all.sh integration  # end-to-end integration
-./scripts/test-all.sh composer     # Composer backend tests + frontend build
+./scripts/compose-dev.sh build
+./scripts/compose-dev.sh start --project examples/mock_lite6_pick_and_place.scenario
 ```
 
-ROS adapter tests use the separate ROS Jazzy image:
+Open **http://localhost:3000**, press **Execute**, then **Run**: the Lite 6
+picks the part and places it.
 
-```bash
-docker compose --profile ros run --rm ros-jazzy ./scripts/test-ros.sh
-```
+- The first build and the first start take a while; later starts are
+  incremental. On a Jetson (Thor, Orin), `build` selects NVIDIA's
+  `noble-jetpack` package suite by itself.
+- Omit `--project` to start with an empty workspace.
+  `./scripts/compose-dev.sh status` inspects the workbench and
+  `./scripts/compose-dev.sh stop` stops it. Starting the workbench does not run
+  its test suite or authorize robot motion.
+- The [examples](examples) folder has about 30 Scenarios: `mock_*` run
+  anywhere, `sim_*` need Isaac Sim, `real_*` need the robot.
 
-The ROS image starts from `ros:jazzy-ros-base-noble` and keeps ROS Python
-dependencies apt-managed. The default development image remains ROS-free; ROS
-wrappers/adapters live in the `manyforge_ros` lane.
+### Real robots
 
-Full ManyForge + ROS integration checks use the heavier ROS Jazzy full image:
+Machine facts (robot addresses, extra project folders) go in a site settings
+file, `{"schema":"manyforge.site.v1","device_addresses":{"lite6_main":"192.168.1.31"}}`;
+export its absolute path as `MANYFORGE_DEV_SITE_SETTINGS` before `start`.
+Scenarios name the address key, never the address. Physical robot use
+requires attended sessions and the integrator's own safety system; a
+simulated run does not qualify a physical robot. See
+[Real robot setup](docs/operations/REAL_ROBOT_SETUP.md).
 
-```bash
-docker compose --profile ros-full run --rm ros-jazzy-full ./scripts/test-ros-full.sh
-```
+### Isaac Sim
 
-The full image also starts from `ros:jazzy-ros-base-noble`, but adds a pinned
-ManyForge application venv with `--system-site-packages` so ROS Python remains
-apt-managed while Composer/FastAPI/Pydantic/RoboPlan app dependencies are
-reproducible. `test-ros-full.sh` rebuilds and exports the ROS-enabled native
-RoboPlan module before running tests, so it is the canonical local command for
-ros2_control contract coverage.
+Open the matching scene with its ROS 2 bridge and Simulation Interfaces in
+Isaac Sim separately, then load the corresponding `sim_` Scenario. The
+workbench does not start Isaac or load the world. Use the same
+`ROS_DOMAIN_ID` on both machines and leave `ROS_AUTOMATIC_DISCOVERY_RANGE`
+unset (`SUBNET`) so the two hosts discover each other. Keep Isaac at about
+real time: the arm controllers follow wall-clock time. A simulation that is
+not playing never blocks Activate or Execute; its robots show **Simulation
+not playing** and refuse new motion until it plays.
 
-To build C++ manually:
+## Using ManyForge
 
-```bash
-cd /tmp/manyforge-build/core
-cmake /workspace/manyforge_core -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-ctest --output-on-failure
-```
+A Scenario project contains the Program, Deployment, assignment and
+referenced assets.
 
-## Project Structure
+- **Save** persists authored changes; **Apply** makes the selected
+  configuration available to the runtime.
+- **New** empties the cell and opens the read-only "Untitled" Scenario:
+  compose and Apply at once, then **Save As** to name and place it.
+- **Load** is New, then Apply of the chosen Scenario; its components come up
+  prepared, not enabled.
+- **Execute** starts the Program (**Activate and execute** prepares and
+  enables every active component first). Every Program starts held: press
+  **Run** on its motion groups to move.
+- Inspect component states and **Runtime/history** before issuing motion; every
+  component action and Load/Apply outcome is recorded there. Do not infer
+  command success from a lost connection.
 
-```
-manyforge_core/          C++ library: execution kernel, state machine, DTOs, ports
-  python/                pybind11 bindings exposing the kernel to Python
-manyforge_collision/     C++ planner-neutral collision query implementation
-manyforge_roboplan/      C++ RoboPlan adapters: planner/projection, focused ports, native execution
-  python/                pybind11 bindings + NativeKernelClient wrapper
-manyforge_ros2_control_execution/  C++ ROS controller execution and exact-admission adapter
-manyforge_robot_lifecycle/  ROS-independent real-robot lifecycle supervisor
-manyforge_robot_lifecycle_msgs/  ROS IDL for same-host lifecycle admission transport
-manyforge_xarm_adapter/  Experimental xArm model/binding/observation boundary
-manyforge_xarm_control/  Experimental xArm lifecycle and sole transport-owner boundary
-manyforge_behavior/      Python behavior tree runner (py_trees), node catalog, program loader
-manyforge_composer/      Composer: FastAPI backend, React frontend, MCP server
-  backend/               REST API routes, state management, security middleware
-  frontend/              React + ReactFlow program editor UI
-  tests/                 Backend + MCP server tests
-manyforge_ros/           ROS adapters/wrappers and deterministic ROS test targets
-tests/                   End-to-end integration and benchmark tests
-scripts/                 Build/test/setup scripts
-docs/                    Architecture reference
-```
+Configured host project folders appear in Composer as `/projects/<name>`. Use
+the displayed container path or a relative path in the picker, not a pasted
+host path. After changing configured folders, stop the workbench and start it
+again to update their mounts. See
+[Project folders](docs/operations/DEVELOPMENT_WORKBENCH.md#project-folders).
+
+Previous session journals are kept under the workbench's runtime state root;
+retention is limited, see the
+[session note](docs/operations/FRESH_CHECKOUT_CHECKLIST.md).
+
+The optional Composer AI tab uses your OpenAI-compatible model server,
+configured through an `ai_model` component and an assistant profile. See the
+[assistant setup guide](docs/operations/ASSISTANT_E2E_COOKBOOK.md).
+
+The [documentation index](docs/INDEX.md) covers the workbench, authoring and
+API references; the [interrupts guide](docs/authoring/INTERRUPTS.md) explains
+signals, node rules and global rules.
 
 ## Architecture
 
-```
-Program YAML --> Behavior Runner --> ExecutionKernel (C++) --> Planner / execution adapters
-                      |                    |                         |
-                 Node Catalog       validation + stop       RoboPlan / ros2_control
-                 recovery offer     collision authority              |
-                                            |                  robot / Isaac
-                                   immutable events/facts
-                                            |
-                                     Composer / viewer
-```
+The Program runner orchestrates Program nodes. The ROS-free execution kernel
+owns motion execution and Stop semantics; ManyForge's collision layer
+validates and monitors motions. Deployment and component owners manage the
+selected configuration and component lifecycle; vendor specifics live in
+vendor adapters, so the core stays vendor- and lane-neutral. Composer presents
+and edits those owners' state; it is not the authority for robot motion. See
+[Architecture](docs/reference/ARCHITECTURE.md).
 
-The kernel owns terminal and stop authority; ManyForge's collision layer owns
-collision admission; the behavior layer owns orchestration, run identity,
-and the one versioned recovery offer. Composer owns authoring, presentation,
-the non-safety-rated condition-backed alarm manager, and a bounded observer
-data plane—not motion authority. For the full component map, deployment lanes, scene
-initialization, recovery, and observability model, see
-[`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md).
+## Safety
 
-- **manyforge_core** is ROS-free, pure C++20. All robot-framework-specific code lives in adapter packages.
-- **manyforge_roboplan** provides motion planning via RoboPlan (RRT + TOPPRA + IK).
-- Python code calls C++ through pybind11 bindings -- no duplicate state machines.
-- The Docker container includes all dependencies (Pinocchio, RoboPlan, pybind11).
-
-## Pick-and-Place Demo
-
-Run the validated end-to-end demo with RoboPlan motion planning and Composer's native 3D viewer:
-
-```bash
-./scripts/launch.sh --lane manyforge-only --assistant off --scenario ur5-pick-place --non-interactive --yes
-```
-
-Then open `http://localhost:9000` for the Composer UI and native 3D viewer.
-
-The pick-and-place demo exercises the full program load, native planning, scene-edit, run, reset, and rerun flow through the supported container path.
-
-`./scripts/demo.sh` is a backwards-compat shim that forwards to the
-command above (with `--simple` switching to the `ur5-simple-pick-place`
-scenario). New automation should call `launch.sh` directly; see
-[`docs/operations/LAUNCHER_QUICKSTART.md`](docs/operations/LAUNCHER_QUICKSTART.md)
-for all scenarios and the `--list-scenarios` verb.
-
-## LLM Operability
-
-ManyForge exposes a full API surface for autonomous LLM agent operation:
-
-- **REST API** — FastAPI backend at `http://localhost:9000/api/`. Operator-
-  facing reference: [`docs/reference/REST_API.md`](docs/reference/REST_API.md).
-  The live OpenAPI schema is also available at `http://localhost:9000/docs`
-  and `http://localhost:9000/openapi.json` once Composer is running.
-- **MCP Server** — Model Context Protocol interface over stdio. Operator-
-  facing tool contract:
-  [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md).
-- **Assistant Provider Bridge** — HTTP shim that mediates between Composer
-  and an LLM endpoint. Wire-level contract:
-  [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md).
-
-```bash
-# Start the MCP server
-python -m manyforge_composer --mcp --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml
-```
-
-## Docker Details
-
-The container runs as a non-root user (`manyforge`, uid 1000). The entrypoint
-(`docker-entrypoint.sh`) automatically:
-
-- Sets `PYTHONPATH` for `manyforge_behavior`
-- Builds pybind11 bindings if the C++ core library exists
-- Uses `/tmp/manyforge-build/` for out-of-tree builds (avoids conflicts with host build dirs)
-- Detects stale root-owned build cache volumes and asks you to remove them
-
-To rebuild the image after Dockerfile changes:
-
-```bash
-docker compose build
-```
-
-To rebuild from scratch (e.g. after RoboPlan update):
-
-```bash
-rm -rf .docker/roboplan
-./scripts/setup-docker.sh
-```
-
-### Upgrading from root-based images
-
-Older images ran as root. After rebuilding with the current Dockerfile, the
-`build-cache` Docker volume may still contain root-owned files that the new
-non-root user cannot write to. If you see "Build cache not writable" on
-startup, run:
-
-```bash
-docker compose down -v
-```
-
-This removes the stale volume. The next container start will recreate it with
-the correct ownership. The C++ build cache will be rebuilt automatically (~2
-min).
+ManyForge does **not** implement functional safety. Its software Stops,
+command gates and acknowledgement controls are not safety-rated functions.
+Integrate appropriate safety measures compliant with local regulations,
+including hardware emergency stops and safety-rated controls, and perform a
+risk assessment before using real hardware. Robot safety must be handled by
+separate hardware or controller-level solutions. Closing the browser does not
+stop the runtime.
 
 ## Versioning, releases, security
 
-- **Current version**: see [`VERSION`](VERSION) (single line, SemVer).
-  Sub-packages match this version; CI enforces with
-  `./scripts/ci/verify-version-sync.sh`.
-- **What changed**: [`CHANGELOG.md`](CHANGELOG.md) (Keep-a-Changelog format).
-- **What's next**: [`ROADMAP.md`](ROADMAP.md).
-- **License**: Apache 2.0 — see [`LICENSE`](LICENSE) and
-  [`NOTICE`](NOTICE) for third-party attribution.
-- **Reporting a security vulnerability**: see
-  [`SECURITY.md`](SECURITY.md). Do NOT use public issues for security
-  topics.
+- **Version:** [VERSION](VERSION) (SemVer). Every package declares the same
+  version; `./scripts/ci/verify-version-sync.sh` checks it.
+- **Release notes:** [CHANGELOG.md](CHANGELOG.md). Releases are `vX.Y.Z` tags
+  on `main`: `v0.1.0`, then `v0.2.0`.
+- **Pinned companions:** a release builds the UFACTORY xArm driver from the
+  fork `pastoriomarco/xarm_ros2`, branch `lyrical-no-gazebo`, at the commit in
+  `Dockerfile.ros-lyrical-full` (`XARM_SOURCE_COMMIT`) and
+  `manyforge_xarm_control/vendor/driver.yaml`; for `v0.2.0` that is
+  `46aa1147d99963a8357b89744633db428746667b`. The release procedure is in
+  [CONTRIBUTING.md](CONTRIBUTING.md#releases).
+- **Security:** report vulnerabilities as described in
+  [SECURITY.md](SECURITY.md), not in public issues.
 
-## Contributing
+## Contributing and project information
 
-Both human contributors and LLM agents are first-class. The branch
-workflow (`main` = released, `dev` = integration where work lands,
-squash-merge `dev → main` on release) and the LLM-specific commit/push
-rules are documented in [`CONTRIBUTING.md`](CONTRIBUTING.md) and
-reinforced in [`AGENTS.md`](AGENTS.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and test instructions.
+Agents should also read [AGENTS.md](AGENTS.md). Feedback is welcome: open an
+issue or a pull request.
 
-ManyForge development is spec-driven by private maintainer specs. Those
-specs are not needed to install, run, or operate ManyForge, but
-non-trivial behavior changes need maintainer audit against them.
-Without that context, contributions should stay to bounded fixes,
-tests, docs, or proposals that explicitly call out the audit need.
-
-Tested with **NemoClaw-Thor 0.1.x** for the assistant lane on Jetson
-Thor — see the companion repo at
-<https://github.com/pastoriomarco/NemoClaw-Thor>.
+ManyForge is licensed under Apache 2.0; see [LICENSE](LICENSE) and
+[NOTICE](NOTICE).

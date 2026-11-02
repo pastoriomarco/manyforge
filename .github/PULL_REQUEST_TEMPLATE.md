@@ -30,7 +30,7 @@ for the commit(s) on this branch. See AGENTS.md and CONTRIBUTING.md.
 - [ ] Bash files I touched pass `bash -n`
 - [ ] Frontend changes pass `cd manyforge_composer/frontend && npm run build`
 - [ ] AGENTS.md / CONTRIBUTING.md / README updated if workflow changed
-- [ ] **Launcher behavior change** (`scripts/launch.sh`, `scripts/lib/*.sh`, `scripts/lib/scenarios.sh`, or any `scripts/demo-*.sh` shim): `docs/operations/LAUNCHER_QUICKSTART.md` updated in this PR
+- [ ] **Workbench behavior change** (`scripts/compose-dev.sh`, `scripts/dev-workbench.py`, `scripts/lib/workbench_session.py`, `scripts/lib/export_retention.py`): `docs/operations/DEVELOPMENT_WORKBENCH.md` updated in this PR
 - [ ] For non-trivial diffs: `/codex:review` run and findings addressed
 - [ ] Spec-governed behavior checked against `manyforge_specs`, or the PR clearly states that maintainer spec audit is still required
 - [ ] No links to private spec paths (`manyforge_specs/`) introduced
@@ -38,7 +38,7 @@ for the commit(s) on this branch. See AGENTS.md and CONTRIBUTING.md.
 ## Test plan
 
 <!-- How you verified this works end-to-end. Reproduction steps,
-     scenarios run, lanes exercised (manyforge-only / isaac-sim). -->
+     scenarios run, lanes exercised (Mock / Isaac / Real). -->
 
 ## Related issues / PRs
 

@@ -1,3 +1,7 @@
+# Historical Composer assistant interaction reference
+
+> Preserved from `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1` (tree `bc749b9879d3c8f36fe7bf3036f9cc1f2ef1e60f`). The former MCP/Composer tools are unavailable, so this file is deliberately non-activatable and must not be installed or cited as a current contract. It is an interaction-design input for later thin clients over headless C++ semantic owners. The original content follows verbatim.
+
 # Role
 
 You are the ManyForge composer-assistant. Read program/scene state via
@@ -57,8 +61,7 @@ so you can pick the right family quickly.
 
 - **Scene edits (compile-time, persistent across runs)** —
   `scene.draft.add_object`, `update_object`, `upsert_objects`,
-  `remove_objects`, plus `propose_scene_objects` /
-  `propose_scene_object_nodes` for batch proposals. Use for static
+  `remove_objects`. Use for static
   collision bodies (workspace fixtures, fixed obstacles, ground).
 
 - **Tree edits (runtime, what the robot does each cycle)** —

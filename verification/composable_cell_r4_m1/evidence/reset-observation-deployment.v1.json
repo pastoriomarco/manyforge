@@ -1,0 +1,60 @@
+{
+  "schema_version": "manyforge.reset_observation_deployment.v1",
+  "status": "LIVE_FRONTEND_SERVED_USER_FUNCTIONAL_TEST_PENDING",
+  "approval": "DX1056 reviewed Reset observation frontend release",
+  "started_utc": "2026-10-16T08:53:49.514276+00:00",
+  "finished_utc": "2026-10-16T08:53:49.612077+00:00",
+  "source": {
+    "freeze_manifest_sha256": "67d90fbcb5aa6adc1d4132cfce1f5f6aebeb0d6e6c8fa13bad1a4b2c0db2f8a2",
+    "original_import_receipt_sha256": "daec2b1530137a8f262f45a441efb3d1c45c3cc18c9e254ff35f8d8015a75416",
+    "files": [
+      {
+        "path": "manyforge_composer/frontend/src/App.tsx",
+        "post_sha256": "549782901504a25574b5b48aacd7c667db4f42cd8dd5f75c6e287a624844f300",
+        "pre_sha256": "463846de3385815ea2b62a6159354841fded43d40d684a6c1e130946da289a3c"
+      },
+      {
+        "path": "manyforge_composer/frontend/src/state/scenarioClose.ts",
+        "post_sha256": "e4b67f4a1e585cda3132d84b877f45d26e26d3ae0e541a321196fb782bd73ad4",
+        "pre_sha256": "39c496b682bb3ab9aed2e69920984d137e93be6c7867eaccccbefdcca0c8be9c"
+      }
+    ],
+    "owning_gate_reported": {
+      "tests_passed": 99,
+      "typescript": "PASS",
+      "lint_errors": 0,
+      "independent_and_peer_review": "PASS"
+    }
+  },
+  "served_modules": {
+    "App.tsx": {
+      "http_status": 200,
+      "sha256": "18f4ac21cb346a6276f3d1d4f5020ffd90266e176fdfe7b64c7734e720c8e865",
+      "expected_marker": "readResetSnapshot",
+      "marker_present": true
+    },
+    "state/scenarioClose.ts": {
+      "http_status": 200,
+      "sha256": "a134a7bc6b48cad80ab5ed7287d78dcf56ec6751d88b934d808e761b5c6f9ed4",
+      "expected_marker": "resetCloseSnapshot",
+      "marker_present": true
+    }
+  },
+  "deployment": {
+    "source_preimages_verified": true,
+    "source_postimages_verified": true,
+    "existing_container_identity_preserved": true,
+    "restart": false,
+    "backend_or_native_update": false,
+    "agent_runtime_commands": [],
+    "agent_history_or_saved_write_issued": false
+  },
+  "limits": [
+    "Only accepted Reset waiting tolerates connected/synchronizing; other reads retain strict freshness.",
+    "User functional reproduction remains pending; no agent Reset/Close/Load/New/Activate/Run.",
+    "Original Stop freshness source remains not deployed."
+  ],
+  "prior_failure_receipt": "held-reset-observation-diagnosis.v1.json",
+  "raw_evidence_identifier": "dx1054-close-reset-observation-20261016/live-hotsync01",
+  "raw_receipt_sha256": "4e82223e99b58caaa9dfb6ff437214c2974417b5dea5ce08c328042c47577c92"
+}

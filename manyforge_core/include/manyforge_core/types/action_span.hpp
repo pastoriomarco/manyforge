@@ -1,10 +1,13 @@
 #pragma once
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
 
 namespace manyforge::core {
+
+inline constexpr std::size_t kMaxActionSpanFieldBytes = 512U;
 
 enum class ActionSource {
   kProgramNode,
@@ -53,6 +56,7 @@ struct ActionSpanDTO {
   std::string node_instance_id;
   std::string node_attempt_id;
   std::string parent_node_attempt_id;
+  friend bool operator==(const ActionSpanDTO&, const ActionSpanDTO&) = default;
 };
 
 }  // namespace manyforge::core

@@ -1,0 +1,103 @@
+# ManyForge's additions to the xArm vendor base files (CONTRACTS §12). Every
+# setting says why it is here; everything else is the vendor's. `${address}`
+# and `${namespace}` are instance values the generic generator fills in (the
+# robot's address from the site settings, the component's namespace).
+
+hardware:
+  parameters:
+    # The driver's topics and services sit below `<component namespace>/xarm`.
+    hw_ns: xarm
+    # ManyForge's controllers command positions (the vendor xacro's default).
+    velocity_control: "false"
+    # The plugin drops the first character of `prefix` and `robot_ip` (the
+    # vendor xacro's own `P`/`R`); the joints stay unprefixed, the component
+    # namespace separates two robots.
+    prefix: P
+    robot_ip: "R${address}"
+    # `xarm_cgpio_states` (GPIO module health and pin configuration, which the
+    # I/O components need) is published only with the rich report.
+    report_type: rich
+    # The vendor xacro's defaults for these three, written out because the
+    # plugin reads them as parameters.
+    baud_checkset: "true"
+    default_gripper_baud: "2000000"
+    # A UFactory gripper is its own component; the arm's driver doesn't add one.
+    add_gripper: "false"
+  # The plugin exports position and velocity commands (the vendor xacro).
+  joint_command_interfaces: [position, velocity]
+  # The hardware starts inactive (motors off): Enable arms it, never the
+  # launch or Prepare.
+  initial_state: inactive
+
+driver:
+  # Only these services are on (every other one in the vendor
+  # xarm_params.yaml is set off). The motion services stay off: ManyForge is
+  # the only motion authority, and the plugin arms through the SDK.
+  services:
+    - clean_error        # prepare / recover clear the controller error
+    - clean_warn         # recover clears the controller warning
+    - get_err_warn_code  # the error left after clean_error (e-stop still pressed)
+    - get_state          # the controller state, read on demand (M7's list)
+    - get_servo_angle    # the joint angles, read on demand (M7's list)
+    - set_mode           # the controller mode, set on demand (M7's list)
+    - set_state          # the re-arm after a TCP offset (the controller drops to state 5)
+    - set_tcp_offset     # Active TCP: the controller's TCP offset
+    - set_tcp_load       # Active TCP: the total payload
+    - set_cgpio_digital  # controller I/O output writes
+    - set_tgpio_digital  # tool I/O output writes
+    - system_control     # power actions: 1 = shut down, 2 = reboot (fork, CONTRACTS §13)
+  io_states:
+    # The fork's port-30000 I/O stream `xarm_io_states` (CONTRACTS §13): both
+    # I/O components read it.
+    enable: true
+    # Publish rate (Hz). A value lasting less than about one period (10 ms)
+    # can be missed, inputs included. The stream is stale (an I/O member
+    # faults while its owner is usable) after ten periods without a sample;
+    # the I/O models' `input_maximum_age_ms` (100) is the same ten periods
+    # for rules: change it with the rate.
+    rate: 100
+    # The controller's tool monitoring frequency (Hz): the tool fields of the
+    # stream lag by about this period.
+    tgpio_monitor_frequency: 100
+
+controllers:
+  # Merged onto the vendor `{model}_controllers.yaml`.
+  controller_manager:
+    ros__parameters:
+      # The JTC, not the manager, enforces the joint limits ManyForge plans with.
+      enforce_command_limits: false
+      hardware_components_initial_state:
+        # A hardware component that can't start stops the launch, so the
+        # component reports its process exit instead of running half-up.
+        shutdown_on_initial_state_failure: true
+  arm_controller:
+    ros__parameters:
+      # ManyForge's former Real values: 20 Hz goal monitoring, the stock
+      # 6.10 replacement default written out, and ManyMove's open-loop
+      # (`open_loop_control`) behaviour.
+      action_monitor_rate: 20.0
+      interpolate_from_desired_state: true
+      allow_trajectory_replacement: true
+      constraints:
+        # Stop: the JTC decelerates a cancelled goal; each joint's
+        # `max_deceleration_on_cancel` is the Deployment's Stop profile
+        # (written by the generic generator), its `goal` the model row's
+        # `arrival_tolerance_rad`.
+        decelerate_on_cancel: true
+
+# The plugin calls absolute controller-manager and RViz names; these send them
+# to this component's own.
+remappings:
+  - {from: /controller_manager/list_controllers, to: "${namespace}/controller_manager/list_controllers"}
+  - {from: /controller_manager/switch_controller, to: "${namespace}/controller_manager/switch_controller"}
+  - {from: /rviz/moveit/update_goal_state, to: "${namespace}/update_goal_state"}
+
+reboot:
+  # The longest wait for the controller to go down and answer again after
+  # `system_control(2)`, before the driver restarts.
+  controller_wait_s: 120
+  # One probe of the controller's command port (TCP 502) waits this long for
+  # a connection, and the probes repeat at this interval: short enough to see
+  # the controller go down and come back promptly, long enough for a LAN
+  # connect.
+  probe_interval_ms: 200

@@ -1,0 +1,47 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
+# `scripts/manyforge component check manyforge_example_models/models/ur10e`.
+# The arm only: a tool mounts on `flange` as its own component (merge 6).
+api_version: manyforge.component_package.v1
+kind: robot
+id: universal_robots.ur10e
+version: 1.0.0
+title: Universal Robots UR10e
+license: BSD-3-Clause
+provenance:
+  notes: README.md (cut from the combined bundle) and its licenses/
+model:
+  urdf: ur10e.urdf
+  srdf: ur10e.srdf
+  package_name: manyforge_example_models
+roles:
+  root_frame: base_link
+  frames:
+    base: base_link
+    flange: tool0
+  groups:
+    arm: arm
+  joints:
+    arm_joints: [shoulder_pan_joint, shoulder_lift_joint, elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint]
+  collision_bodies:
+    arm_collision: [base_link_inertia, forearm_link, shoulder_link, upper_arm_link, wrist_1_link, wrist_2_link, wrist_3_link]
+tcps:                             # without a tool; a mounted tool's default TCP wins (D1)
+  - {id: flange, frame: tool0}
+limits:
+  max_tcp_linear_speed_mps: 1.0
+lanes:
+  mock:                           # Mock lane adapter (manyforge_ros2_control_execution/lane/)
+    adapter: mock
+    controller: joint_trajectory_controller
+    arrival_tolerance_rad: 0.01     # every arm joint's JTC goal
+    controllers_file: mock_controllers.yaml
+    hard_stop_completion_timeout_s: 0.5
+    gripper_result_timeout_s: 15.0
+  isaac:                          # Isaac lane adapter (manyforge_isaac_adapter/lane/README.md)
+    adapter: isaac
+    controller: isaac_arm_controller
+    arrival_tolerance_rad: 0.1      # the working Isaac value (written as every arm joint's JTC `goal`)
+    goal_time_s: 1.0                # the working Isaac value (JTC `goal_time`)
+    hard_stop_completion_timeout_s: 0.5
+defaults:
+  initial_joint_positions_rad: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+  maximum_tcp_linear_speed_mps: 0.25

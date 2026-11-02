@@ -1,0 +1,52 @@
+{
+  "schema_version": "manyforge.palette_chevron_deployment.v1",
+  "status": "LIVE_FRONTEND_SERVED",
+  "approval": "DX1069 explicit palette chevron hot-sync",
+  "started_utc": "2026-10-16T09:35:22.638086+00:00",
+  "finished_utc": "2026-10-16T09:35:22.758207+00:00",
+  "source": {
+    "files": [
+      {
+        "path": "manyforge_composer/frontend/src/components/ProgramNodePalette.tsx",
+        "pre_sha256": "855d85e37f33dc4844611c9638595bab5f9963c93f1b77f86b5ef0f6be7ae01f",
+        "post_sha256": "0e9ebc73d04742ee57c1244ac28c1573393af7e43e4efa669744f20d44458095"
+      },
+      {
+        "path": "manyforge_composer/frontend/src/styles/surfaces/program-canvas.css",
+        "pre_sha256": "a9fb9d047ca74a074c03c18976f3a6a3bc13989f83caaa84ac608f03cae034ff",
+        "post_sha256": "3c4dd31008cc96b4628a0341e87322251b153813894af6c8ff50c70955698284"
+      }
+    ],
+    "peer_artifact_sha256": {
+      "sha256.txt": "096a0f2baa589423c1e0a58074da3c0ac47fee0a419efa7e9bb1b98f527d17cc",
+      "change.patch": "7e8e1bb0b5ea091c3109787e0b0984a5a4eec12c90d2699118e0f2a5c4806442"
+    },
+    "owning_gate_reported": {
+      "tests_passed": 25,
+      "typescript": "PASS",
+      "lint": "PASS"
+    }
+  },
+  "served_modules": {
+    "components/ProgramNodePalette.tsx": {
+      "http_status": 200,
+      "sha256": "f2f00587e684088cf9eb4efa59b983832b49cf1d6a5e6360233d9f8dd9dc5ce8",
+      "expected_marker": "program-palette-double-chevron",
+      "marker_present": true
+    },
+    "styles/surfaces/program-canvas.css": {
+      "http_status": 200,
+      "sha256": "44a540379c7aa00179fc11755d66a6910e4e058653e04b48764134955aee9d36",
+      "expected_marker": "program-palette-double-chevron",
+      "marker_present": true
+    }
+  },
+  "deployment": {
+    "existing_container_identity_preserved": true,
+    "restart": false,
+    "backend_or_native_update": false,
+    "runtime_commands": []
+  },
+  "raw_evidence_identifier": "t1-palette-double-chevron-20261016/live-hotsync01",
+  "raw_receipt_sha256": "f596c88e00545c20ca6fe18d159224063a6cc6d46df286ebd889c6a12a77476f"
+}

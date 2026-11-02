@@ -1,0 +1,399 @@
+api_version: manyforge.closed_schema.v1
+schema_id: manyforge.controller_topology.v1
+schema_revision: sha256:7415c5e2df17491366755b401337e3ad96dd96703357b20c9e0d08bf3f46a9f6
+schema_purpose: artifact_document
+root_definition_id: controller_topology
+definitions:
+  - definition_id: controller_topology
+    value_schema:
+      kind: object
+      fields:
+        - field_id: api_version
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - manyforge.controller_topology.v1
+              - kind: string_format
+                value: api_version
+        - field_id: controller_topology_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: topology_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+        - field_id: controllers
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 256
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - controller_role_id
+            item_schema:
+              kind: local_ref
+              definition_id: controller
+        - field_id: chain_edges
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 4096
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - upstream_controller_role_id
+                - - downstream_controller_role_id
+            item_schema:
+              kind: local_ref
+              definition_id: chain_edge
+        - field_id: activation_sets
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 256
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - activation_set_id
+            item_schema:
+              kind: local_ref
+              definition_id: activation_set
+        - field_id: legal_routes
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 256
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - control_route_id
+            item_schema:
+              kind: local_ref
+              definition_id: control_route
+  - definition_id: controller
+    value_schema:
+      kind: object
+      fields:
+        - field_id: controller_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: control_interface_claims
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 256
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - control_interface_contract_id
+            item_schema:
+              kind: local_ref
+              definition_id: control_interface_claim
+        - field_id: exported_reference_interfaces
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: ordered_interface_list
+        - field_id: exported_state_interfaces
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: ordered_interface_list
+  - definition_id: control_interface_claim
+    value_schema:
+      kind: object
+      fields:
+        - field_id: control_interface_contract_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: control_interface_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+        - field_id: claimed_directions
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 2
+            collection:
+              kind: scalar_set
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: enum
+                  values:
+                    - command
+                    - state
+                - kind: string_format
+                  value: portable_id
+  - definition_id: chain_edge
+    value_schema:
+      kind: object
+      fields:
+        - field_id: upstream_controller_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: downstream_controller_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: reference_interfaces
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: ordered_interface_list
+        - field_id: state_interfaces
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: ordered_interface_list
+  - definition_id: chain_edge_ref
+    value_schema:
+      kind: object
+      fields:
+        - field_id: upstream_controller_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: downstream_controller_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+  - definition_id: activation_set
+    value_schema:
+      kind: object
+      fields:
+        - field_id: activation_set_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: active_controller_role_ids
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 256
+            collection:
+              kind: scalar_set
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: string_format
+                  value: portable_id
+        - field_id: active_chain_edges
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 4096
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - upstream_controller_role_id
+                - - downstream_controller_role_id
+            item_schema:
+              kind: local_ref
+              definition_id: chain_edge_ref
+  - definition_id: control_route
+    value_schema:
+      kind: object
+      fields:
+        - field_id: control_route_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: control_interface_contract_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: control_interface_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+        - field_id: ordered_controller_role_ids
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 256
+            collection:
+              kind: ordered
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: string_format
+                  value: portable_id
+        - field_id: compatible_activation_set_ids
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 256
+            collection:
+              kind: scalar_set
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: string_format
+                  value: portable_id
+  - definition_id: ordered_interface_list
+    value_schema:
+      kind: array
+      min_items: 0
+      max_items: 4096
+      collection:
+        kind: ordered
+      item_schema:
+        kind: local_ref
+        definition_id: resource_interface_claim
+  - definition_id: resource_interface_claim
+    value_schema:
+      kind: object
+      fields:
+        - field_id: resource_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: interface_name
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id

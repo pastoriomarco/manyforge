@@ -1,63 +1,140 @@
+import { memo, useCallback, useRef, useState, type DragEvent } from 'react';
 import type { CatalogEntry } from '../types/api';
+import {
+  programPaletteClickIntent,
+  programPaletteDragData,
+  type ProgramPaletteActivation,
+} from '../utils/programCanvasInteraction';
+import { OverlayPanel } from './OverlayPanel';
+import { ProgramCategoryIcon } from './programNodeGlyphs';
 
-const KIND_ICONS: Record<string, string> = {
-  leaf: '⬤',       // action/condition node
-  composite: '◆',   // sequence/selector/parallel
-  decorator: '◇',   // inverter/repeat/retry
-  macro: '▦',       // runtime/code-generator expansion
-  authoring_macro: '▦', // Composer-only subtree template
-};
-
-interface Props {
+interface NodePaletteItemProps {
   entry: CatalogEntry;
   disabled?: boolean;
+  onActivate?: (activation: ProgramPaletteActivation) => void;
+  executionNote?: string;
+  executionAvailable?: boolean;
+  allowDrag?: boolean;
 }
 
-export function NodePaletteItem({ entry, disabled = false }: Props) {
-  const onDragStart = (e: React.DragEvent) => {
-    // Store the catalog entry ID for React Flow drop handler
-    e.dataTransfer.setData('application/manyforge-node', entry.id);
-    e.dataTransfer.effectAllowed = 'copy';
-    // The default drag image snapshots the whole palette row (name +
-    // description), which reads as a huge white rectangle and badly
-    // overstates where the node will land. Hand the browser a ghost the
-    // size and shape of an actual canvas node instead.
+export const NodePaletteItem = memo(function NodePaletteItem({
+  entry,
+  disabled = false,
+  onActivate,
+  executionNote,
+  executionAvailable,
+  allowDrag = false,
+}: NodePaletteItemProps) {
+  const [infoOpen, setInfoOpen] = useState(false);
+  const infoButton = useRef<HTMLButtonElement>(null);
+  const closeInfo = useCallback(() => setInfoOpen(false), []);
+  const onDragStart = (event: DragEvent<HTMLButtonElement>) => {
+    for (const [format, value] of Object.entries(programPaletteDragData(entry))) {
+      event.dataTransfer.setData(format, value);
+    }
+    event.dataTransfer.effectAllowed = 'copy';
     const ghost = document.createElement('div');
     ghost.textContent = entry.name;
-    Object.assign(ghost.style, {
-      position: 'fixed',
-      top: '-1000px',
-      left: '-1000px',
-      width: '120px',
-      padding: '8px 4px',
-      borderRadius: '4px',
-      border: '2px solid #9ca3af',
-      background: 'rgba(17, 24, 39, 0.9)',
-      color: '#e5e7eb',
-      font: '500 12px sans-serif',
-      textAlign: 'center',
-      whiteSpace: 'nowrap',
-      overflow: 'hidden',
-      textOverflow: 'ellipsis',
-      pointerEvents: 'none',
-    } as CSSStyleDeclaration);
+    ghost.className = 'node-palette-drag-ghost';
     document.body.appendChild(ghost);
-    e.dataTransfer.setDragImage(ghost, 60, 18);
+    event.dataTransfer.setDragImage(ghost, 60, 18);
     window.setTimeout(() => ghost.remove(), 0);
   };
+  const activate = () => onActivate?.(programPaletteClickIntent(entry));
+  const titleId = `node-info-${entry.id.replaceAll(/[^A-Za-z0-9_-]/g, '-')}`;
 
   return (
-    <div
-      draggable={!disabled}
-      onDragStart={onDragStart}
-      className={`flex items-start gap-2 px-2 py-1.5 rounded cursor-grab hover:bg-gray-700 active:cursor-grabbing ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
-      title={disabled ? 'Editing disabled while running or stopping' : entry.description}
-    >
-      <span className="text-xs mt-0.5 opacity-60">{KIND_ICONS[entry.kind] || '●'}</span>
-      <div className="min-w-0">
-        <div className="text-sm text-gray-200 truncate">{entry.name}</div>
-        <div className="text-xs text-gray-500 truncate">{entry.description}</div>
-      </div>
+    <div className="node-palette-row dpick">
+      <button
+        type="button"
+        draggable={!disabled && allowDrag}
+        onDragStart={onDragStart}
+        onDoubleClick={activate}
+        onKeyDown={(event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          event.preventDefault();
+          activate();
+        }}
+        disabled={disabled}
+        className={`node-palette-item${disabled ? ' disabled' : ''}${allowDrag ? ' draggable' : ''}`}
+        aria-label={disabled ? entry.name : `${entry.name}; double-click or drag to add`}
+        title={disabled
+          ? 'Authoring is currently unavailable'
+          : `Double-click or drag to add ${entry.name}`}
+      >
+        <span className="node-palette-icon" aria-hidden="true">
+          <ProgramCategoryIcon category={entry.category} catalogId={entry.id} />
+        </span>
+        <span className="node-palette-copy">
+          <strong>{entry.name}</strong>
+        </span>
+      </button>
+      <button
+        ref={infoButton}
+        type="button"
+        className={`icon-button node-info-button${executionAvailable === true ? ' execution-available' : ''}${executionAvailable === false ? ' execution-unavailable' : ''}`}
+        aria-label={`Information about ${entry.name}${executionAvailable === true ? '; execution available' : ''}${executionAvailable === false ? '; execution unavailable' : ''}`}
+        title={`Information about ${entry.name}`}
+        onClick={() => setInfoOpen(true)}
+      >
+        i
+      </button>
+      {infoOpen && <OverlayPanel
+        open={infoOpen}
+        title={entry.name}
+        titleId={titleId}
+        kind="info"
+        onClose={closeInfo}
+        returnFocusRef={infoButton}
+      >
+        <div className="node-information">
+          <p>{entry.description}</p>
+          <dl>
+            {executionNote && (
+              <div>
+                <dt>Current availability</dt>
+                <dd className={executionAvailable ? 'node-execution-available' : 'node-execution-unavailable'}>
+                  {executionNote}
+                </dd>
+              </div>
+            )}
+            <div><dt>Stable ID</dt><dd><code>{entry.id}</code></dd></div>
+            <div><dt>Category</dt><dd>{entry.category}</dd></div>
+            <div><dt>Kind</dt><dd>{entry.kind}</dd></div>
+            <div><dt>Children</dt><dd>{entry.childrenMin}–{entry.childrenMax < 0 ? 'unbounded' : entry.childrenMax}</dd></div>
+            <div><dt>Owner API</dt><dd><code>{entry.execution.ownerApi}</code></dd></div>
+            <div><dt>Execution</dt><dd>{entry.execution.blocking ? 'blocking' : 'non-blocking'} · {entry.execution.cancellable ? 'cancellable' : 'not cancellable'}</dd></div>
+            <div><dt>Minimum profile</dt><dd>{entry.minProgramProfile ?? 'none'}</dd></div>
+            <div>
+              <dt>Required capabilities</dt>
+              <dd>
+                {entry.requiredCapabilities.length === 0
+                  ? 'none'
+                  : entry.requiredCapabilities.map((requirement) => (
+                    <span key={`${requirement.capabilityId}:${requirement.scope}`} className="node-capability-requirement">
+                      <code>{requirement.capabilityId}</code> · {requirement.scope}
+                      {requirement.targetParameter ? ` · target ${requirement.targetParameter}` : ''}
+                      {requirement.componentParameter ? ` · component ${requirement.componentParameter}` : ''}
+                    </span>
+                  ))}
+              </dd>
+            </div>
+            <div><dt>Tags</dt><dd>{entry.tags.join(', ') || 'none'}</dd></div>
+          </dl>
+          <h3>Parameters ({entry.parameters.length})</h3>
+          {entry.parameters.length === 0 ? <p className="muted">No authored parameters.</p> : (
+            <div className="node-schema-list">
+              {entry.parameters.map((parameter) => (
+                <section key={parameter.id}>
+                  <strong>{parameter.id}</strong>
+                  <span>{parameter.required ? 'required' : 'optional'} · <code>{parameter.schemaHash}</code></span>
+                  <pre>{JSON.stringify(parameter.schema, null, 2)}</pre>
+                </section>
+              ))}
+            </div>
+          )}
+        </div>
+      </OverlayPanel>}
     </div>
   );
-}
+});

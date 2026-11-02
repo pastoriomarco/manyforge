@@ -9,7 +9,8 @@ namespace manyforge::core {
 namespace {
 
 CollisionPairId test_pair() {
-  return {"robot/gripper", "object/part"};
+  return {"component/arm/model/arm_model/body/gripper/collision/0",
+          "scene/part/shape/0"};
 }
 
 CollisionPolicySnapshot release_policy() {
@@ -234,7 +235,9 @@ TEST(OrderedContactValidationTest,
 TEST(OrderedContactValidationTest,
      BinaryContactRejectsSameCountIdentityReplacement) {
   auto policy = binary_release_policy();
-  const CollisionPairId second_pair{"robot/gripper", "object/other"};
+  const CollisionPairId second_pair{
+      "component/arm/model/arm_model/body/gripper/collision/0",
+      "scene/other/shape/0"};
   auto second_entry = policy.support_contacts.front();
   second_entry.pair = second_pair;
   policy.support_contacts.push_back(second_entry);

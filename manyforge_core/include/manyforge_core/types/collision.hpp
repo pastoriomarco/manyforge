@@ -4,34 +4,34 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/geometry.hpp>
+#include <manyforge_core/types/robot_defaults.generated.hpp>
 #include <manyforge_core/types/robot_state.hpp>
 
 namespace manyforge::core {
 
 // Normalized collision DTOs (spec §3.8.1).
 //
-// These DTOs ship the ManyForge-owned collision contract introduced by the
-// collision-ownership plan. They are populated alongside the existing
-// CollisionCheckRequestDTO / CollisionCheckResultDTO during Chunks 1-4 of
-// that plan. The kernel migrates to consuming them in Chunk 5; see
-// docs/plans/COLLISION_CHECKING_OWNERSHIP_PLAN.md for chunk semantics.
+// These DTOs shipped the ManyForge-owned collision contract. They were
+// populated alongside CollisionCheckRequestDTO / CollisionCheckResultDTO
+// during the rollout, before the kernel migrated to consuming them.
 
 /// Stable, engine-independent collision body id (spec §3.8.1).
 ///
 /// Normative formats (one of):
-///   robot/<robot_id>/link/<link_name>/collision/<index>
-///   robot/<robot_id>/attached/<object_id>/shape/<index>
-///   object/<object_id>/shape/<index>
-///   fixture/<fixture_id>/shape/<index>
+///   component/<component>/model/<model>/body/<role>/collision/<index>
+///   scene/<scene_resource>/shape/<index>
+///   runtime_object/<runtime_object>/shape/<index>
 ///
 /// Ids MUST be stable across process restarts for the same artifacts.
-/// Ids MUST NOT depend on backend-native geometry object names. Multi-robot
-/// scenes MUST include <robot_id> even while only one robot is supported.
+/// Ids MUST NOT depend on backend-native geometry object or generated link
+/// names. Multi-component scenes carry exact component and model identity.
 using CollisionBodyId = std::string;
 
 /// Collision-world revision (spec §3.8.1).
@@ -46,55 +46,6 @@ struct CollisionWorldRevision {
   /// Content digest covering the body inventory and any policy overlays
   /// affecting collision decisions. Stable for identical world content.
   std::string content_hash;
-};
-
-/// Mutation source for a CollisionWorldLedgerEntry (spec §3.8.1).
-///
-/// Names which subsystem caused the revision bump. Audit consumers use
-/// this to reconstruct the chain of changes that produced a given world
-/// state.
-enum class CollisionWorldMutationSource {
-  kProgramLoad,
-  kSceneEdit,
-  kAttach,
-  kDetach,
-  kPoseSourceApply,
-  kDeploymentLoad,
-  kPolicyUpdate,
-  kProjectionRebuild,
-};
-
-/// Bounded-ledger entry recording a single collision-world revision
-/// transition (spec §3.8.1).
-///
-/// The publisher appends one entry per successful mutation, in trajectory
-/// order. The ledger is read-only to consumers; failure archives and audit
-/// tools use it to explain how the world state evolved.
-struct CollisionWorldLedgerEntry {
-  CollisionWorldRevision revision;
-
-  /// Revision id immediately before this entry. Zero for the program-load
-  /// entry that establishes the initial revision.
-  std::uint64_t previous_revision_id = 0;
-
-  CollisionWorldMutationSource mutation_source =
-      CollisionWorldMutationSource::kProgramLoad;
-
-  /// Body ids whose identity or presence in the collision world is changed
-  /// by this mutation. MAY be empty for program-load / deployment-reload
-  /// entries that affect the whole inventory.
-  std::vector<std::string> affected_body_ids;
-
-  /// Wall-clock timestamp for forensic ordering. Steady-clock equivalents
-  /// MAY be used for tests with FakeClock.
-  std::int64_t timestamp_ns = 0;
-
-  /// Caller identifier, e.g. "scene_edit_route", "pose_source_apply",
-  /// "kernel_factory".
-  std::string authority_source;
-
-  /// Operator session id when available.
-  std::optional<std::string> session_id;
 };
 
 /// Canonical unordered pair of collision body ids (spec §3.8.1).
@@ -160,10 +111,9 @@ struct CollisionPairClearance {
 
 /// Logical owner of a collision body (spec §3.8.1).
 enum class CollisionOwnerKind {
-  kRobotLink,
-  kAttachedObject,
-  kDetachedObject,
-  kFixture,
+  kComponentModelBody,
+  kSceneResource,
+  kRuntimeObject,
 };
 
 /// Geometry kind for a collision body (spec §3.8.1).
@@ -180,7 +130,7 @@ enum class CollisionGeometryKind {
 /// Normalized descriptor for one geometry element (spec §3.8.1).
 struct CollisionGeometryDescriptor {
   CollisionBodyId body_id;
-  CollisionOwnerKind owner_kind = CollisionOwnerKind::kFixture;
+  CollisionOwnerKind owner_kind = CollisionOwnerKind::kSceneResource;
   CollisionGeometryKind geometry_kind = CollisionGeometryKind::kBox;
   Pose3DTO local_pose;
   /// Full box dimensions in meters. Required when `geometry_kind == kBox`.
@@ -255,6 +205,61 @@ enum class CollisionDistanceRequestMode {
   return "unknown";
 }
 
+/// Collision settings (Deployment `collision_clearance_m` and
+/// `collision_check_step_rad`; their defaults kDefaultCollisionClearanceM and
+/// kDefaultCollisionCheckStepRad are in manyforge_core/resources/robot_defaults.tsv).
+/// - Clearance: a validated or planned move keeps at least this from every
+///   body its collision policy does not allow it to touch; 1 mm by default
+///   (it also covers the executed spline's deviation from the planned chords).
+///   0 disables it: contact-only checks. A motion's own `clearance_m` replaces
+///   it for that move, within [0, kMaxCollisionClearanceM].
+/// - Check step: the joint-space distance (Euclidean, as RoboPlan's
+///   `collision_check_step_size`) between two collision-checked
+///   configurations of the planner's first attempt. Pre-dispatch validation
+///   checks the trajectory's own waypoints only.
+inline constexpr double kMaxCollisionClearanceM = 0.05;
+inline constexpr double kCollisionRetryCheckStepRad = 0.01;
+
+/// The planner's collision-check step for one planning attempt: the
+/// configured step on the first attempt, the finer of it and
+/// kCollisionRetryCheckStepRad on a retry (requested only after validation
+/// rejected a candidate; the same resolution could reproduce the same missed
+/// narrow contact).
+[[nodiscard]] inline constexpr double collision_check_step_for_attempt(
+    const double configured_step_rad, const std::uint32_t planning_attempt_index) noexcept {
+  return planning_attempt_index == 0U || configured_step_rad < kCollisionRetryCheckStepRad
+             ? configured_step_rad
+             : kCollisionRetryCheckStepRad;
+}
+
+/// Collision clearance (coal security margin) of one canonical logical pair.
+struct CollisionPairMargin {
+  CollisionPairId pair;
+  double margin_m = 0.0;
+
+  friend bool operator==(const CollisionPairMargin&,
+                         const CollisionPairMargin&) = default;
+};
+
+/// Collision clearance for one move: two bodies of a listed pair closer than
+/// its margin collide. Pairs not listed keep margin 0. `margin_m` is the
+/// move's clearance the list was derived from (reported with a clearance
+/// refusal). Immutable once built and shared by every query of the move.
+struct CollisionClearanceMargins {
+  double margin_m = 0.0;
+  /// Sorted by pair, unique, every margin in (0, margin_m].
+  std::vector<CollisionPairMargin> pairs;
+
+  [[nodiscard]] double margin_for(const CollisionPairId& pair) const noexcept {
+    const auto found = std::lower_bound(
+        pairs.begin(), pairs.end(), pair,
+        [](const CollisionPairMargin& entry, const CollisionPairId& selected) {
+          return entry.pair < selected;
+        });
+    return found != pairs.end() && found->pair == pair ? found->margin_m : 0.0;
+  }
+};
+
 /// Normalized collision query (spec §3.8.1).
 ///
 /// Superset of CollisionCheckRequestDTO. Chunk 1 mirrors the existing
@@ -286,6 +291,9 @@ struct CollisionQuery {
   /// kSelectedCollidingPairs. Other modes require this list to be empty.
   std::vector<CollisionPairId> selected_distance_pairs;
   std::optional<std::int64_t> max_contacts;
+  /// Clearance margins for this query. Null means margin 0 for every pair,
+  /// as on the runtime surfaces.
+  std::shared_ptr<const CollisionClearanceMargins> clearance_margins;
 };
 
 /// Engine result status (spec §3.8.1).
@@ -353,6 +361,11 @@ struct CollisionResult {
   /// active policy requested signed release evidence or bounded penetration
   /// for that pair.
   std::vector<CollisionPairClearance> pair_clearances;
+
+  /// Colliding pairs reported only because of their clearance margin: the
+  /// engine's signed clearance is positive but below the pair's margin.
+  /// Sorted by pair; a subset of `normalized_pairs`.
+  std::vector<CollisionPairClearance> clearance_violations;
 
   /// Per-pair classification produced by the Chunk 3 policy evaluator.
   /// Includes observed-pair classifications and may include policy-state
@@ -440,6 +453,9 @@ struct SupportContactPolicyEntry {
   /// this false.
   bool require_strictly_decreasing_penetration = true;
   bool allow_recontact = false;
+
+  friend bool operator==(const SupportContactPolicyEntry&,
+                         const SupportContactPolicyEntry&) = default;
 };
 
 /// Geometry-only grasp-contact policy for detached pick approaches.
@@ -454,6 +470,9 @@ struct ContactGraspPolicyEntry {
   std::vector<std::string> allowed_robot_links;
   double max_penetration_m = 0.0;
   double terminal_window_start_fraction = 0.8;
+
+  friend bool operator==(const ContactGraspPolicyEntry&,
+                         const ContactGraspPolicyEntry&) = default;
 };
 
 /// Policy-revision twin of CollisionWorldRevision (spec §3.8.1, added in
@@ -461,6 +480,9 @@ struct ContactGraspPolicyEntry {
 struct CollisionPolicyRevision {
   std::uint64_t revision_id = 0;
   std::string content_hash;
+
+  friend bool operator==(const CollisionPolicyRevision&,
+                         const CollisionPolicyRevision&) = default;
 };
 
 /// Immutable policy configuration consumed by the policy evaluator for one
@@ -496,6 +518,9 @@ struct CollisionPolicySnapshot {
   /// when false, the evaluator classifies opportunistically with the
   /// available data.
   bool require_full_diagnostics = true;
+
+  friend bool operator==(const CollisionPolicySnapshot&,
+                         const CollisionPolicySnapshot&) = default;
 };
 
 /// Severity grade of a CollisionDecision (spec §3.8.1).

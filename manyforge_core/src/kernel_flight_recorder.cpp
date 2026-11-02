@@ -32,19 +32,17 @@ const char* kernel_event_type_name(KernelEventType type) {
     case kPlanCompleted: return "plan_completed";
     case kCacheHit: return "cache_hit";
     case kCacheMiss: return "cache_miss";
-    case kCacheRevalidationCandidate: return "cache_revalidation_candidate";
-    case kCacheRevalidated: return "cache_revalidated";
     case kCacheRevalidationFailed: return "cache_revalidation_failed";
     case kCacheInvalidated: return "cache_invalidated";
     case kValidationStarted: return "validation_started";
     case kValidationPassed: return "validation_passed";
     case kValidationFailed: return "validation_failed";
+    case kParticipantPrepared: return "participant_prepared";
+    case kParticipantSettled: return "participant_settled";
     case kExecuteStarted: return "execute_started";
     case kExecuteCompleted: return "execute_completed";
     case kStopRequested: return "stop_requested";
     case kStopIssued: return "stop_issued";
-    case kPauseRequested: return "pause_requested";
-    case kResumeRequested: return "resume_requested";
     case kRuntimeVelocityScaleChanged: return "runtime_velocity_scale_changed";
     case kCompletedAcknowledged: return "completed_acknowledged";
     case kFailedValidationAcknowledged:
@@ -52,27 +50,6 @@ const char* kernel_event_type_name(KernelEventType type) {
     case kInterventionAcknowledged: return "intervention_acknowledged";
     case kErrorRaised: return "error_raised";
     case kCollisionDetected: return "collision_detected";
-    case kInterruptSignalIngested: return "interrupt_signal_ingested";
-    case kInterruptSignalRejectedStale: return "interrupt_signal_rejected_stale";
-    case kInterruptSignalRejectedClassViolation:
-      return "interrupt_signal_rejected_class_violation";
-    case kInterruptSignalRejected: return "interrupt_signal_rejected";
-    case kInterruptLatched: return "interrupt_latched";
-    case kInterruptSuppressedByActiveMask:
-      return "interrupt_suppressed_by_active_mask";
-    case kInterruptQueued: return "interrupt_queued";
-    case kInterruptDroppedQueueOverflow:
-      return "interrupt_dropped_queue_overflow";
-    case kInterruptPreemptApplied: return "interrupt_preempt_applied";
-    case kInterruptDispositionApplied: return "interrupt_disposition_applied";
-    case kInterruptCleared: return "interrupt_cleared";
-    case kInterruptIngestOverflow: return "interrupt_ingest_overflow";
-    case kInterruptSourceClassViolation:
-      return "interrupt_source_class_violation";
-    case kInterruptRecoveryHandlerStarted:
-      return "interrupt_recovery_handler_started";
-    case kInterruptRecoveryHandlerCompleted:
-      return "interrupt_recovery_handler_completed";
     case kMotionInterruptScopeArmed: return "motion_interrupt_scope_armed";
     case kMotionInterruptScopeReaped: return "motion_interrupt_scope_reaped";
     case kMotionInterruptArmFailed: return "motion_interrupt_arm_failed";

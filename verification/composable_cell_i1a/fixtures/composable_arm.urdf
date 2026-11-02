@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<robot name="composable_arm">
+  <link name="arm_base"/>
+  <link name="tool_mount"/>
+  <joint name="arm_joint" type="revolute">
+    <parent link="arm_base"/>
+    <child link="tool_mount"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="10" velocity="1"/>
+  </joint>
+</robot>

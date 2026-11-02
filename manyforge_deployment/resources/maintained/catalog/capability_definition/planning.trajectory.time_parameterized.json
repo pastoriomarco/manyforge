@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
+  "capability_id": "planning.trajectory.time_parameterized",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "target_binding"
+}

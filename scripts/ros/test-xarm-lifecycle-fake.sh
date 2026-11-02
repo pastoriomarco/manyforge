@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run the deterministic fake xArm lifecycle and sole-owner plugin lane.
+# Run the xArm adapter's tests (fault catalogue, action sequences, I/O, launch
+# contribution) against their fake driver.
 
 set -euo pipefail
 
@@ -14,15 +15,8 @@ set +u
 source "${BUILD_ROOT}/install/setup.bash"
 set -u
 
-FIXTURE_ROOT=$(mktemp -d /tmp/manyforge-xarm-binding-fixture.XXXXXX)
-trap 'rm -r -- "${FIXTURE_ROOT}"' EXIT
-"${WORKSPACE}/scripts/ros/prepare-xarm-production-binding-fixture.sh" \
-    "${FIXTURE_ROOT}"
-export MANYFORGE_XARM_EXACT_FAKE_URDF="${FIXTURE_ROOT}/model/lite6_fixed_pneumatic.supervised_fake.runtime.urdf"
-export MANYFORGE_XARM_EXACT_CONTROLLER_YAML="${FIXTURE_ROOT}/model/ros2_controllers.yaml"
-
 ctest \
     --test-dir "${BUILD_ROOT}/build/manyforge_xarm_control" \
     --output-on-failure
 
-echo "Fake xArm lifecycle ownership lane passed."
+echo "xArm adapter tests passed."

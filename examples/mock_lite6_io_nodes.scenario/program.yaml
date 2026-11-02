@@ -1,0 +1,284 @@
+{
+  "api_version": "manyforge.program.v2",
+  "blackboard": {
+    "keys": [
+      {
+        "access": "read_write",
+        "initial": false,
+        "key": "trial.ack_timed_out",
+        "persistence": "run",
+        "type": "bool"
+      },
+      {
+        "access": "read_write",
+        "key": "trial.part_initial",
+        "persistence": "run",
+        "type": "bool"
+      }
+    ],
+    "namespaces": [
+      {
+        "namespace_id": "trial",
+        "owner": "program"
+      }
+    ]
+  },
+  "catalog": {
+    "api_version": "manyforge.node_catalog.v2",
+    "content_version": "2.9.0"
+  },
+  "compatibility": {
+    "assistant": "forbidden",
+    "lanes": [
+      "manyforge-only"
+    ],
+    "requires": [],
+    "tags": [
+      "lite6",
+      "r5-live-trial"
+    ]
+  },
+  "component_roles": {
+    "plc": {},
+    "station": {}
+  },
+  "description": "Mock Lite6 I/O nodes. Mock: read_part_initial scripts part_present false and reads it; wait_part scripts part_present false then true after 250 ms (timeout 2 s); check_part reads the value left true; set clamp and lamp. ROS: set plc_start (SetBool ack, 500 ms), wait for plc_ready (Bool topic, timeout 5 s). wait_operator_ack scripts operator_ack false with no change, so it times out after 5 s into a Fallback unless operator_ack is set true in the Tool & I/O panel during the wait.",
+  "forest": [
+    {
+      "children": [
+        {
+          "children": [],
+          "instance_id": "read_part_initial",
+          "node_id": "io.get_input",
+          "parameters": {
+            "mock_simulation": [
+              {
+                "signal": {
+                  "resource_role": "part_present",
+                  "target_role": "station"
+                },
+                "start_value": false
+              }
+            ],
+            "output_key": "trial.part_initial",
+            "resource_role": "part_present",
+            "target_role": "station"
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "wait_part",
+          "node_id": "io.wait_for_input",
+          "parameters": {
+            "expected_value": true,
+            "mock_simulation": [
+              {
+                "change": {
+                  "after_ms": 250,
+                  "value": true
+                },
+                "signal": {
+                  "resource_role": "part_present",
+                  "target_role": "station"
+                },
+                "start_value": false
+              }
+            ],
+            "resource_role": "part_present",
+            "target_role": "station",
+            "timeout_s": 2.0
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "check_part",
+          "node_id": "io.check_input",
+          "parameters": {
+            "expected_value": true,
+            "resource_role": "part_present",
+            "target_role": "station"
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "clamp_on",
+          "node_id": "io.set_output",
+          "parameters": {
+            "resource_role": "clamp",
+            "target_role": "station",
+            "value": true
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "plc_start_on",
+          "node_id": "io.set_output",
+          "parameters": {
+            "resource_role": "plc_start",
+            "target_role": "plc",
+            "value": true
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "wait_plc_ready",
+          "node_id": "io.wait_for_input",
+          "parameters": {
+            "expected_value": true,
+            "resource_role": "plc_ready",
+            "target_role": "plc",
+            "timeout_s": 5.0
+          }
+        },
+        {
+          "children": [
+            {
+              "children": [],
+              "instance_id": "wait_operator_ack",
+              "node_id": "io.wait_for_input",
+              "parameters": {
+                "expected_value": true,
+                "mock_simulation": [
+                  {
+                    "signal": {
+                      "resource_role": "operator_ack",
+                      "target_role": "station"
+                    },
+                    "start_value": false
+                  }
+                ],
+                "resource_role": "operator_ack",
+                "target_role": "station",
+                "timeout_s": 5.0
+              }
+            },
+            {
+              "children": [],
+              "instance_id": "record_ack_timeout",
+              "node_id": "logic.set_value",
+              "parameters": {
+                "key": "trial.ack_timed_out",
+                "value": true
+              }
+            }
+          ],
+          "instance_id": "ack_or_timeout",
+          "node_id": "fallback",
+          "parameters": {}
+        },
+        {
+          "children": [],
+          "instance_id": "lamp_on",
+          "node_id": "io.set_output",
+          "parameters": {
+            "resource_role": "lamp",
+            "target_role": "station",
+            "value": true
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "clamp_off",
+          "node_id": "io.set_output",
+          "parameters": {
+            "resource_role": "clamp",
+            "target_role": "station",
+            "value": false
+          }
+        }
+      ],
+      "instance_id": "trial_d",
+      "node_id": "sequence",
+      "parameters": {}
+    }
+  ],
+  "name": "mock_lite6_io_nodes",
+  "parameters": [],
+  "positions": {},
+  "program_id": "mock_lite6_io_nodes",
+  "program_profile": "composable-cell-v1",
+  "scene": [
+    {
+      "pose": {
+        "frame_ref": {
+          "kind": "cell_frame"
+        },
+        "orientation": {
+          "rpy_deg": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "position_m": [
+          0.0,
+          0.0,
+          -0.051
+        ]
+      },
+      "scene_resource_id": "ground",
+      "shape": {
+        "box_dimensions_m": [
+          1.0,
+          1.0,
+          0.1
+        ],
+        "type": "box"
+      }
+    }
+  ],
+  "schema_version": "manyforge.composer_authoring_forest.v1",
+  "target_roles": {
+    "plc": {
+      "component_role": "plc",
+      "required_capabilities": [
+        {
+          "capability_id": "io.gpio.set_output",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "io.gpio.wait_for_input",
+          "disposition": "required",
+          "parameters": {}
+        }
+      ],
+      "required_collision_body_roles": [],
+      "required_frame_roles": [],
+      "required_model_roles": [],
+      "required_resource_roles": [
+        "plc_ready",
+        "plc_start"
+      ]
+    },
+    "station": {
+      "component_role": "station",
+      "required_capabilities": [
+        {
+          "capability_id": "io.gpio.get_input",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "io.gpio.set_output",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "io.gpio.wait_for_input",
+          "disposition": "required",
+          "parameters": {}
+        }
+      ],
+      "required_collision_body_roles": [],
+      "required_frame_roles": [],
+      "required_model_roles": [],
+      "required_resource_roles": [
+        "clamp",
+        "lamp",
+        "operator_ack",
+        "part_present"
+      ]
+    }
+  }
+}

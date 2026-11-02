@@ -17,19 +17,27 @@
 # Usage:
 #   docker compose run --rm dev bash
 #   # Inside container:
-#   cd /workspace && ./scripts/test-all.sh all
+#   cd /workspace && ./scripts/test-all.sh retained
 
 # --- Stage 1: Build React frontend ---
 FROM node:22-slim AS frontend-builder
-WORKDIR /build
+WORKDIR /workspace/manyforge_composer/frontend
 COPY manyforge_composer/frontend/package.json manyforge_composer/frontend/package-lock.json* ./
 RUN npm ci --ignore-scripts
 COPY manyforge_composer/frontend/ ./
+# Frontend contract tests are compiled by `tsc -b` and intentionally consume
+# the owner-issued fixtures rather than maintaining browser-local copies. Keep
+# their repository-relative paths intact in this isolated build stage.
+COPY manyforge_deployment/resources/program_binding_lite6_native.fixture.json \
+     /workspace/manyforge_deployment/resources/program_binding_lite6_native.fixture.json
+COPY manyforge_headless_api/tests/fixtures/control-v2-local-delta.json \
+     /workspace/manyforge_headless_api/tests/fixtures/control-v2-local-delta.json
 RUN npm run build
 
 # --- Stage 2: Python/C++ runtime ---
 FROM python:3.12-slim-bookworm
 
+ARG ROBOPLAN_SOURCE_MODE=qualified
 ENV DEBIAN_FRONTEND=noninteractive
 # Pinocchio (cmeel package) installs shared libs under a Python-managed prefix.
 # The cmeel lib dir is added to the dynamic linker cache below; keep LD_LIBRARY_PATH
@@ -42,8 +50,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgtest-dev libgmock-dev \
         libboost-filesystem-dev libboost-serialization-dev libboost-system-dev \
         libboost-python-dev libboost-chrono-dev libboost-thread-dev libboost-date-time-dev \
-        libeigen3-dev libyaml-cpp-dev liburdfdom-dev \
-        liboctomap-dev \
+        libeigen3-dev libyaml-cpp-dev libyaml-dev liburdfdom-dev \
+        libdouble-conversion-dev libexpat1-dev libssl-dev libutf8proc-dev \
+        liboctomap-dev libsqlite3-dev \
         git curl ca-certificates \
     && cd /usr/src/googletest && cmake . && make \
     && cp lib/*.a /usr/lib/ \
@@ -85,66 +94,107 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
         py_trees==2.4.0 \
         pybind11==3.0.3 \
         pyyaml==6.0.3 \
+        rfc8785==0.1.4 \
         pillow==10.2.0 \
         trimesh==4.11.5 \
         yourdfpy==0.0.60 \
         nanobind==2.12.0 \
         scikit-build-core==0.12.2 \
+        wheel==0.48.0 \
         pin==4.1.0 \
         fastapi==0.135.3 \
         "uvicorn[standard]==0.44.0" \
         httpx==0.28.1 \
+        httpx2==2.12.0 \
         websockets==16.0 \
         mcp==1.27.0 \
     && pip check \
     && CMEEL_LIB=$(python3 -c "import site; print(site.getsitepackages()[0])")/cmeel.prefix/lib \
     && if [ -d "$CMEEL_LIB" ]; then echo "$CMEEL_LIB" > /etc/ld.so.conf.d/cmeel.conf && ldconfig; fi
 
-# RoboPlan: C++ planning library with Python bindings (nanobind)
-# Pre-cloned on host — see scripts/setup-docker.sh
+# Exact RoboPlan 0.8 source closure with source-built ProxSuite (configured by
+# exact jrl-cmakemodules, no serialization) and TOPPRA, and exact nanoflann.
+# Prepared on the host by scripts/setup-docker.sh.
 COPY .docker/roboplan/ /tmp/roboplan/
+COPY .docker/proxsuite/ /tmp/proxsuite/
+COPY .docker/jrl-cmakemodules/ /tmp/jrl-cmakemodules/
+COPY .docker/toppra/ /tmp/toppra/
+COPY .docker/nanoflann/ /tmp/nanoflann/
 COPY third_party/roboplan/ /tmp/roboplan-manifest/
-COPY scripts/ci/check-roboplan-dependency-stack.py /tmp/check-roboplan-dependency-stack.py
+COPY scripts/ci/build-roboplan-source-stack.sh /tmp/build-roboplan-source-stack.sh
+COPY scripts/ci/build-roboplan-source-closure.sh /tmp/build-roboplan-source-closure.sh
+COPY scripts/ci/verify-external-source-closure.py /tmp/verify-external-source-closure.py
+COPY verification/composable_cell_e1/external_delta_ledger.v1.json /tmp/external-delta-ledger.v1.json
 RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n' 2>/dev/null | head -1) \
     && PINOCCHIO_PREFIX=$(dirname $(dirname $(dirname $PINOCCHIO_CMAKE_DIR))) \
     && echo "Pinocchio prefix: ${PINOCCHIO_PREFIX}" \
+    && if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then \
+         python3 /tmp/verify-external-source-closure.py \
+           --ledger /tmp/external-delta-ledger.v1.json \
+           --source-id roboplan_0_8_0_foundation --root /tmp/roboplan \
+           --content-kind source --allow-stripped-git; \
+       elif [ "$ROBOPLAN_SOURCE_MODE" = development_override ]; then \
+         echo "RoboPlan development override: exact-source qualification disabled" >&2; \
+       else \
+         echo "Invalid ROBOPLAN_SOURCE_MODE: $ROBOPLAN_SOURCE_MODE" >&2; exit 2; \
+       fi \
     && cd /tmp/roboplan-manifest \
     && sha256sum -c patches.sha256 \
+    && umask 0002 \
     && while read -r digest patch; do \
          case "$patch" in patches/*.patch) ;; *) echo "Invalid RoboPlan patch path: $patch" >&2; exit 1;; esac; \
          git -C /tmp/roboplan apply --check "/tmp/roboplan-manifest/$patch"; \
          git -C /tmp/roboplan apply "/tmp/roboplan-manifest/$patch"; \
        done < patches.sha256 \
-    && cd /tmp/roboplan \
-    && export CMAKE_PREFIX_PATH="${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH}" \
+    && umask 0022 \
+    && export CMAKE_PREFIX_PATH="${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}" \
     && export LD_LIBRARY_PATH="${PINOCCHIO_PREFIX}/lib:${LD_LIBRARY_PATH}" \
-    && ROBOPLAN_CMAKE_ARGS=-DBUILD_TESTING=OFF ./scripts/build_cmake.bash \
-    && ROBOPLAN_INSTALL=/tmp/roboplan/install \
-    && mkdir -p /usr/local/lib/cmake /usr/local/include /usr/local/share \
-    && for pkg in roboplan roboplan_rrt roboplan_simple_ik roboplan_toppra roboplan_oink roboplan_cartesian_planning roboplan_example_models toppra; do \
-         if [ -d "${ROBOPLAN_INSTALL}/${pkg}/lib" ]; then \
-           cp -a ${ROBOPLAN_INSTALL}/${pkg}/lib/*.so* /usr/local/lib/ 2>/dev/null || true; \
-           cp -a ${ROBOPLAN_INSTALL}/${pkg}/lib/*.a /usr/local/lib/ 2>/dev/null || true; \
-         fi; \
-         if [ -d "${ROBOPLAN_INSTALL}/${pkg}/include" ]; then \
-           cp -a ${ROBOPLAN_INSTALL}/${pkg}/include/* /usr/local/include/; \
-         fi; \
-         if [ -d "${ROBOPLAN_INSTALL}/${pkg}/lib/cmake" ]; then \
-           cp -a ${ROBOPLAN_INSTALL}/${pkg}/lib/cmake/* /usr/local/lib/cmake/; \
-         fi; \
-         if [ -d "${ROBOPLAN_INSTALL}/${pkg}/share" ]; then \
-           cp -a ${ROBOPLAN_INSTALL}/${pkg}/share/* /usr/local/share/; \
-         fi; \
+    && if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then DEVELOPMENT_SOURCE=0; else DEVELOPMENT_SOURCE=1; fi \
+    && ROBOPLAN_SOURCE_LEDGER=/tmp/external-delta-ledger.v1.json \
+       ROBOPLAN_SOURCE_VERIFIER=/tmp/verify-external-source-closure.py \
+       ROBOPLAN_SOURCE_ID=roboplan_0_8_0_foundation \
+       ROBOPLAN_ALLOW_STRIPPED_GIT=1 \
+       ROBOPLAN_ALLOW_DEVELOPMENT_SOURCE="$DEVELOPMENT_SOURCE" \
+       bash /tmp/build-roboplan-source-closure.sh \
+         /tmp/proxsuite /tmp/jrl-cmakemodules /tmp/toppra /tmp/nanoflann /tmp/roboplan \
+         -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+         -DBUILD_PYTHON_BINDINGS=OFF \
+    && CLOSURE_INSTALL=/tmp/roboplan-install-closure \
+    && for prefix in \
+         "${CLOSURE_INSTALL}/proxsuite" \
+         "${CLOSURE_INSTALL}/toppra"; do \
+         test -d "$prefix" || { echo "Missing exact install prefix: $prefix" >&2; exit 1; }; \
+         cp -a "$prefix/." /usr/local/; \
        done \
     && ldconfig \
-    && export CMAKE_PREFIX_PATH="/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH}" \
-    && for py_pkg in roboplan roboplan_example_models roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt roboplan_cartesian_planning; do \
+    && ROBOPLAN_SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])") \
+    && export CMAKE_PREFIX_PATH="${ROBOPLAN_SITE_PACKAGES}:/usr/local:${PINOCCHIO_PREFIX}" \
+    && export LD_LIBRARY_PATH="${ROBOPLAN_SITE_PACKAGES}/lib:/usr/local/lib:${PINOCCHIO_PREFIX}/lib" \
+    && export CMAKE_ARGS="-DFETCHCONTENT_FULLY_DISCONNECTED=ON -DFETCHCONTENT_UPDATES_DISCONNECTED=ON -DFETCHCONTENT_SOURCE_DIR_NANOFLANN=/tmp/nanoflann -DCMAKE_DISABLE_FIND_PACKAGE_nanoflann=ON -DCMAKE_DISABLE_FIND_PACKAGE_tl-expected=ON" \
+    && for py_pkg in roboplan_common roboplan_example_models roboplan_core roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt roboplan_cartesian_planning roboplan; do \
          cd "/tmp/roboplan/${py_pkg}"; \
-         pip install --no-build-isolation --no-deps --no-cache-dir -v .; \
+         pip install --no-build-isolation --no-deps --no-cache-dir -v . || exit 1; \
        done \
+    && printf '%s\n' "${ROBOPLAN_SITE_PACKAGES}/lib" > /etc/ld.so.conf.d/manyforge-roboplan.conf \
+    && ldconfig \
     && pip check \
-    && python3 /tmp/check-roboplan-dependency-stack.py \
-    && rm -rf /tmp/roboplan /tmp/check-roboplan-dependency-stack.py
+    && rm -rf /tmp/roboplan /tmp/proxsuite /tmp/jrl-cmakemodules /tmp/toppra /tmp/nanoflann \
+         /tmp/roboplan-manifest \
+         /tmp/roboplan-build-closure /tmp/roboplan-install-closure \
+         /tmp/build-roboplan-source-stack.sh /tmp/build-roboplan-source-closure.sh \
+         /tmp/verify-external-source-closure.py /tmp/external-delta-ledger.v1.json
+
+# Keep the inexpensive installed-stack check separate so corrections to the
+# verifier do not invalidate the exact, source-built dependency layer.
+COPY scripts/ci/check-roboplan-dependency-stack.py /tmp/check-roboplan-dependency-stack.py
+RUN python3 /tmp/check-roboplan-dependency-stack.py \
+    && rm -f /tmp/check-roboplan-dependency-stack.py
+
+# The installed Python distributions are the sole RoboPlan runtime/CMake
+# prefix. The disconnected C++ closure above is qualification/build input and
+# is removed in the same layer; it does not leave a second ABI generation.
+ENV CMAKE_PREFIX_PATH=/usr/local/lib/python3.12/site-packages:/usr/local/lib/python3.12/site-packages/cmeel.prefix:/usr/local
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/lib:/usr/local/lib
 
 WORKDIR /workspace
 
@@ -164,7 +214,8 @@ RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
 # Copy built frontend from Stage 1
-COPY --from=frontend-builder --chown=manyforge:manyforge /build/dist/ /opt/manyforge-frontend/dist/
+COPY --from=frontend-builder --chown=manyforge:manyforge \
+     /workspace/manyforge_composer/frontend/dist/ /opt/manyforge-frontend/dist/
 
 # The source-mounted behavior package is exposed through PYTHONPATH by the
 # entrypoint; /workspace/scripts/manyforge is its container CLI shim.

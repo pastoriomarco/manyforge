@@ -1,0 +1,34 @@
+diff --git a/roboplan_cartesian_planning/include/roboplan_cartesian_planning/cartesian_path_planner.hpp b/roboplan_cartesian_planning/include/roboplan_cartesian_planning/cartesian_path_planner.hpp
+--- a/roboplan_cartesian_planning/include/roboplan_cartesian_planning/cartesian_path_planner.hpp
++++ b/roboplan_cartesian_planning/include/roboplan_cartesian_planning/cartesian_path_planner.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <functional>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -115,6 +116,12 @@ struct CartesianPlannerOptions {
+   /// Only used in Bounded speed mode.
+   double corner_tolerance = 0.175;
+ 
++  /// @brief Optional per-grid-point bound on the TOPP-RA path speed, forwarded to
++  /// TOPPRAOptions::max_path_velocity (e.g. to cap the tool's Cartesian speed).
++  /// @details Only used in TimeOptimal speed mode.
++  std::function<double(const Eigen::VectorXd& q, const Eigen::VectorXd& dq_ds)>
++      toppra_max_path_velocity;
++
+   /// @brief Validates the mode-independent option values (dt, tolerances, scales).
+   /// @details Mode-specific options (e.g. the Bounded mode's commanded speeds/accelerations) are
+   /// validated where they are used.
+diff --git a/roboplan_cartesian_planning/src/cartesian_path_planner.cpp b/roboplan_cartesian_planning/src/cartesian_path_planner.cpp
+--- a/roboplan_cartesian_planning/src/cartesian_path_planner.cpp
++++ b/roboplan_cartesian_planning/src/cartesian_path_planner.cpp
+@@ -548,6 +548,7 @@ CartesianPathPlanner::timeOptimal(const ResolvedPath& resolved) {
+   toppra_options.mode = SplineFittingMode::LinearBlend;
+   toppra_options.velocity_scale = options_.velocity_scale;
+   toppra_options.acceleration_scale = options_.acceleration_scale;
++  toppra_options.max_path_velocity = options_.toppra_max_path_velocity;
+ 
+   // A hard cap still bounds the time-parameterization problem size for very long paths.
+   JointPath joint_path;

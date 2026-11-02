@@ -1,20 +1,32 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import tailwindcss from '@tailwindcss/vite';
 
-export default defineConfig({
-  plugins: [react(), tailwindcss()],
-  server: {
-    port: 3000,
-    proxy: {
-      '/api': 'http://localhost:9000',
-      '/ws': {
-        target: 'ws://localhost:9000',
-        ws: true,
+export default defineConfig(() => {
+  const backend = process.env.MANYFORGE_COMPOSER_PROXY_TARGET
+    ?? 'http://localhost:9000';
+  return {
+    plugins: [react()],
+    server: {
+      port: 3000,
+      proxy: {
+        '/api': backend,
+        '/ws': { target: backend, ws: true },
       },
     },
-  },
-  build: {
-    outDir: 'dist',
-  },
+    build: {
+      outDir: 'dist',
+      rolldownOptions: {
+        output: {
+          codeSplitting: {
+            groups: [{
+              name: 'vendor',
+              test: /node_modules[\\/]/,
+              maxSize: 450_000,
+              entriesAware: true,
+            }],
+          },
+        },
+      },
+    },
+  };
 });

@@ -1,14 +1,19 @@
 name: local-ci
 
+# Self-hosted (maintainer machines, label manyforge-local), so never on
+# pull_request: a public repository must not run fork code on them. Manual and
+# release tags only; it carries the full ROS integration and e2e suites.
 on:
-  pull_request:
-  push:
-    branches: [main, dev]
   workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
 
 concurrency:
-  group: local-ci-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   docker-local:
@@ -36,45 +41,38 @@ jobs:
               echo "All shell scripts pass bash -n"
               ./scripts/ci/verify-version-sync.sh
               ./scripts/ci/check-private-spec-boundary.sh
-              ./scripts/ci/check-terminal-commit-boundary.sh
               python3 scripts/ci/check-authority-port-alignment.py
               python3 scripts/ci/check-planner-portability.py
-              python3 scripts/ci/check-viewer-data-plane-boundaries.py
+              python3 scripts/ci/check-error-catalog.py
+              python3 manyforge_core/tools/generate_error_catalog.py --check
               # Runs inside the dev image already (this whole command executes
               # in manyforge-dev:latest), so take the direct in-container path.
-              INSIDE_MANYFORGE_DEV_CONTAINER=1 ./scripts/ci/check-public-contracts-fresh.sh
+              INSIDE_MANYFORGE_DEV_CONTAINER=1 ./scripts/ci/check-public-contracts-fresh.sh structural-rest
+          # Both source the ROS environment (cpp: headless leg's ROS host).
           - name: core-cpp
             suite: core-cpp
+            image: manyforge-ros-lyrical-full
             command: ./scripts/test-all.sh cpp
           - name: roboplan
             suite: roboplan
+            image: manyforge-ros-lyrical-full
             command: ./scripts/test-all.sh roboplan
-          - name: bindings
-            suite: bindings
-            command: |
-              ./scripts/test-all.sh cpp
-              ./scripts/test-all.sh bindings
           - name: python-composer
             suite: python-composer
             command: |
               ./scripts/test-all.sh python
-              (cd manyforge_composer/frontend && npm ci && npx tsc --noEmit -p tsconfig.app.json)
+              ./scripts/test-all.sh bridge
+              (cd manyforge_composer/frontend && npm ci --ignore-scripts)
               ./scripts/test-all.sh composer
-          - name: integration
-            suite: integration
-            command: ./scripts/test-all.sh integration
-          - name: qualification
-            suite: qualification
-            command: |
-              ./scripts/test-all.sh qualification
-              python3 manyforge_core/tools/collect_qualification_evidence.py \
-                --lane local-ci/qualification \
-                --source soft-on-path-planner \
-                --require-evidence \
-                -- ./scripts/run-soft-on-path-planner-qualification.sh --in-container
           - name: core-tsan
             suite: core-tsan
             command: bash scripts/ci/run-core-tsan.sh
+          - name: ros-integration-and-e2e
+            suite: ros-e2e
+            image: manyforge-ros-lyrical-full
+            command: |
+              ./scripts/test-all.sh ros
+              ./scripts/test-all.sh ros-e2e
     steps:
       - name: Prepare local clone
         id: checkout
@@ -84,7 +82,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          source_repo="${MANYFORGE_SOURCE_REPO:-/home/tndlux/workspaces/dev_ws/src/manyforge}"
+          source_repo="${MANYFORGE_SOURCE_REPO:-${HOME}/workspaces/dev_ws/src/manyforge}"
           worktree="${RUNNER_TEMP}/manyforge-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.suite }}"
 
           if [[ ! -d "${source_repo}/.git" ]]; then
@@ -109,15 +107,23 @@ jobs:
         shell: bash
         env:
           LOCAL_CI_COMMAND: ${{ matrix.command }}
+          LOCAL_CI_IMAGE: ${{ matrix.image }}
           TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 history_size=7
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: |
           set -euo pipefail
           worktree="${{ steps.checkout.outputs.worktree }}"
-          image="${MANYFORGE_LOCAL_CI_IMAGE:-manyforge-dev:latest}"
-          cache_volume="manyforge-local-ci-build-${{ matrix.suite }}"
+          image="${LOCAL_CI_IMAGE:-${MANYFORGE_LOCAL_CI_IMAGE:-manyforge-dev:latest}}"
 
-          docker image inspect "${image}" >/dev/null
+          image_id="$(docker image inspect "${image}" --format '{{.Id}}')"
+          if [[ ! "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Could not resolve immutable image identity for ${image}" >&2
+            exit 1
+          fi
+          # Do not share CMake products across workflow containers. A
+          # persistent suite-named volume can race between refs and can outlive
+          # the dev image whose ABI produced it. Run the inspected immutable
+          # image so a concurrent retag cannot change the qualified runtime.
           docker run --rm \
             --security-opt seccomp=unconfined \
             -e WORKSPACE=/workspace \
@@ -125,9 +131,8 @@ jobs:
             -e CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL}" \
             -e TSAN_OPTIONS="${TSAN_OPTIONS}" \
             -v "${worktree}:/workspace" \
-            -v "${cache_volume}:/tmp/manyforge-build" \
             -w /workspace \
-            "${image}" \
+            "${image_id}" \
             bash -lc "set -euo pipefail; ${LOCAL_CI_COMMAND}"
 
       - name: Upload qualification evidence

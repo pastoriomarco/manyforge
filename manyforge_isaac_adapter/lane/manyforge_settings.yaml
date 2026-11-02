@@ -1,0 +1,57 @@
+# ManyForge's Isaac lane settings (CONTRACTS §12, §14). Every value carries its
+# reason. Per-robot values are the models' `lanes.isaac` rows; per-scene pose
+# mappings are Scenario data (the pose source component and
+# `scene_pose_sources`).
+
+# Topic-based hardware: Isaac Sim's articulation subscribes to joint commands
+# and publishes joint states on plain ROS topics (the ROS2 Joint State /
+# Articulation Controller action graph of the scenes in examples/).
+hardware:
+  plugin: topic_based_ros2_control/TopicBasedSystem
+  parameters:
+    joint_commands_topic: /isaac_joint_commands   # the scenes' articulation command topic
+    joint_states_topic: /isaac_joint_states       # the scenes' joint state topic
+    # -1: publish the command every controller cycle, never skip an
+    # "unchanged" one (the value the Isaac lane ran with before v2; the
+    # reset-position writer's acknowledgement relies on it).
+    trigger_joint_command_threshold: "-1"
+    # Joint states are taken as Isaac reports them, without wrap summing
+    # (the value the Isaac lane ran with before v2).
+    sum_wrapped_joint_states: "false"
+  # Isaac's articulation takes position targets only.
+  joint_command_interfaces: [position]
+
+# The controller manager's process settings (the values the Isaac lane ran
+# with before v2): no memory locking (a simulator host isn't a real-time
+# machine, and locking fails without the container's memlock limit) and the
+# stock real-time thread priority.
+controller_manager:
+  lock_memory: "false"
+  thread_priority: "50"
+
+# `reset_position` (RP-1b; the Mock lane's writer): a stock
+# ForwardCommandController loaded inactive next to the arm's JTC. Reset
+# switches JTC off and the writer on, publishes the Deployment's initial pose
+# once, waits for the hardware to send it on `joint_commands_topic` (one
+# exact sample, within the switch step's 1 s), then switches back; JTC takes
+# that command as its hold position (`set_last_command_interface_value_as_state_on_activation`).
+# Refused with `simulation_not_playing` while the simulation isn't playing.
+reset_position_writer:
+  type: forward_command_controller/ForwardCommandController
+  interface_name: position
+  acknowledged_on: joint_commands_topic
+
+# The Isaac scenes place every robot in the cell frame `universe`; the
+# component's `<frame_prefix>world` hangs from it at identity (a static
+# transform the launch publishes, as before v2).
+world_parent_frame: universe
+
+# Gripper transports (the tools' `lanes.isaac` rows pick one):
+# - isaac_joint_state_effort: effort on the row's command topic, no bridge
+#   (the Lite gripper's finger is driven by effort in the scene);
+# - ros_gripper_command: a GripperCommand bridge node in the tool's namespace,
+#   with the row's `gripper_bridge` file from gripper_bridges/ (the Robotiq
+#   linkage needs mimic completion checks the bridge does).
+gripper:
+  # How long a gripper command waits for its action server to appear.
+  wait_for_action_server_timeout_s: 2.0

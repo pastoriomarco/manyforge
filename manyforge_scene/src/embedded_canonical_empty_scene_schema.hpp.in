@@ -1,0 +1,25 @@
+#pragma once
+
+#include <string_view>
+
+namespace manyforge::scene::detail {
+
+inline constexpr std::string_view kEmbeddedCanonicalEmptySceneSchema =
+    R"mf_sces(@MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA_SQL@)mf_sces";
+
+inline constexpr std::string_view kEmbeddedLogicalSceneTransactionMigration =
+    R"mf_sctm(@MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION_SQL@)mf_sctm";
+
+inline constexpr std::string_view kEmbeddedNativeProjectionHandoffMigration =
+    R"mf_nphm(@MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION_SQL@)mf_nphm";
+
+inline constexpr std::string_view kEmbeddedBoundedHistoryMigration =
+    R"mf_bhm(@MANYFORGE_BOUNDED_HISTORY_MIGRATION_SQL@)mf_bhm";
+
+inline constexpr std::string_view kEmbeddedMaintenanceInitializationMigration =
+    R"mf_mim(@MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION_SQL@)mf_mim";
+
+inline constexpr std::string_view kEmbeddedInitialSceneBaselineMigration =
+    R"mf_isbm(@MANYFORGE_INITIAL_SCENE_BASELINE_MIGRATION_SQL@)mf_isbm";
+
+}  // namespace manyforge::scene::detail

@@ -9,6 +9,7 @@ struct SpeedProfileDTO {
     double velocity_scale = 1.0;              // (0, 1]
     double acceleration_scale = 1.0;          // (0, 1]
     std::optional<double> max_tcp_linear_speed_mps;  // > 0, optional
+    friend bool operator==(const SpeedProfileDTO&, const SpeedProfileDTO&) = default;
 };
 
 }  // namespace manyforge::core

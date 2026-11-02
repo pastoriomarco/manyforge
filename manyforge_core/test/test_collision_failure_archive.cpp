@@ -131,8 +131,10 @@ TEST(CollisionFailureArchive, ConcurrentPushesRemainBoundedAndCounted) {
   for (int t = 0; t < kThreads; ++t) {
     threads.emplace_back([&archive, t]() {
       for (int i = 0; i < kPerThread; ++i) {
-        const std::string entry_id =
-            std::string("t") + std::to_string(t) + "-" + std::to_string(i);
+        std::string entry_id{"t"};
+        entry_id.append(std::to_string(t));
+        entry_id.push_back('-');
+        entry_id.append(std::to_string(i));
         archive.push(make_entry(entry_id, t * kPerThread + i));
       }
     });

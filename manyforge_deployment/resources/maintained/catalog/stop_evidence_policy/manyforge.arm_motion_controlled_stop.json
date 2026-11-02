@@ -1,0 +1,134 @@
+{
+  "api_version": "manyforge.stop_evidence_policy.v2",
+  "containment_granularity": "resource",
+  "disposition": "stoppable",
+  "escalation_stages": [
+    {
+      "containment_command": {
+        "command": {
+          "command_kind": "motion_controlled_stop",
+          "provider_contract_ref": {
+            "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
+            "contract_schema_revision": "sha256:65e6f4462981225916834490d4e3cb4d42b70611a2287e1b76fdb1cbcabcb113",
+            "provider_contract_role_id": "stop_contract"
+          }
+        }
+      },
+      "containment_granularity": "resource",
+      "evidence_conjunction": "all_of",
+      "evidence_requirements": [
+        {
+          "evidence": {
+            "evidence_kind": "motion_rest",
+            "provider_contract_ref": {
+              "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
+              "contract_schema_revision": "sha256:65e6f4462981225916834490d4e3cb4d42b70611a2287e1b76fdb1cbcabcb113",
+              "provider_contract_role_id": "stop_contract"
+            }
+          },
+          "evidence_item_id": "controlled_rest",
+          "observation_semantics": {
+            "minimum_dwell_ns": 10000000,
+            "observation_kind": "post_command_dwell"
+          },
+          "source_requirement": {
+            "allowed_authority_classes": [
+              "commanded",
+              "measured",
+              "predicted"
+            ],
+            "freshness_budget_ns": 100000000,
+            "source_kind": "binding_state_authority",
+            "state_endpoint_role_id": "state"
+          }
+        }
+      ],
+      "stage_kind": "nominal",
+      "stop_escalation_stage_id": "motion_controlled_stop"
+    },
+    {
+      "containment_command": {
+        "command": {
+          "command_kind": "controller_goal_cancel"
+        }
+      },
+      "containment_granularity": "resource",
+      "evidence_conjunction": "all_of",
+      "evidence_requirements": [
+        {
+          "evidence": {
+            "evidence_kind": "motion_rest",
+            "provider_contract_ref": {
+              "contract_schema_id": "manyforge.value_schema.provider_contract.empty.v1",
+              "contract_schema_revision": "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
+              "provider_contract_role_id": "software_hard_stop"
+            }
+          },
+          "evidence_item_id": "runtime_collision_cancel_rest",
+          "observation_semantics": {
+            "minimum_dwell_ns": 10000000,
+            "observation_kind": "post_command_dwell"
+          },
+          "source_requirement": {
+            "allowed_authority_classes": [
+              "commanded",
+              "measured",
+              "predicted"
+            ],
+            "freshness_budget_ns": 100000000,
+            "source_kind": "binding_state_authority",
+            "state_endpoint_role_id": "state"
+          }
+        }
+      ],
+      "stage_kind": "controlled_fallback",
+      "stop_escalation_stage_id": "runtime_collision_controller_goal_cancel"
+    },
+    {
+      "containment_command": {
+        "command": {
+          "command_kind": "registered",
+          "provider_contract_ref": {
+            "contract_schema_id": "manyforge.value_schema.provider_contract.empty.v1",
+            "contract_schema_revision": "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
+            "provider_contract_role_id": "software_hard_stop"
+          },
+          "registered_command_kind_id": "manyforge.stop.software_hard"
+        }
+      },
+      "containment_granularity": "resource",
+      "evidence_conjunction": "all_of",
+      "evidence_requirements": [
+        {
+          "evidence": {
+            "evidence_kind": "motion_rest",
+            "provider_contract_ref": {
+              "contract_schema_id": "manyforge.value_schema.provider_contract.empty.v1",
+              "contract_schema_revision": "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
+              "provider_contract_role_id": "software_hard_stop"
+            }
+          },
+          "evidence_item_id": "hard_rest",
+          "observation_semantics": {
+            "minimum_dwell_ns": 10000000,
+            "observation_kind": "post_command_dwell"
+          },
+          "source_requirement": {
+            "allowed_authority_classes": [
+              "commanded",
+              "measured",
+              "predicted"
+            ],
+            "freshness_budget_ns": 100000000,
+            "source_kind": "binding_state_authority",
+            "state_endpoint_role_id": "state"
+          }
+        }
+      ],
+      "stage_kind": "software_hard",
+      "stop_escalation_stage_id": "software_hard"
+    }
+  ],
+  "stop_evidence_policy_id": "manyforge.arm_motion_controlled_stop",
+  "stop_evidence_policy_revision": "sha256:9570715a3b82955ee0cf0b4b7d74e91bba1364df9ab598103941047158f7e71a"
+}

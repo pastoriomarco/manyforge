@@ -281,8 +281,7 @@ class FixedRuntimeEngine final : public ICollisionQueryEngine {
   bool return_oversized_clearance_observations_ = false;
 };
 
-RuntimeCollisionQueryBundlePtr make_bundle(CollisionPolicySnapshot policy,
-                                           std::uint64_t epoch = 1) {
+RuntimeCollisionQueryBundlePtr make_bundle(CollisionPolicySnapshot policy) {
   auto world = std::make_shared<CollisionWorldSnapshot>();
   world->revision = {1, "runtime-world"};
   world->snapshot_format_version = 1;
@@ -292,13 +291,13 @@ RuntimeCollisionQueryBundlePtr make_bundle(CollisionPolicySnapshot policy,
     return body;
   };
   world->bodies = {
-      make_body("object/part/shape/0"),
-      make_body("robot/robot1/link/finger_left/collision/0"),
-      make_body("robot/robot1/link/finger_right/collision/0"),
+      make_body("component/robot1/model/robot1_model/body/finger_left/collision/0"),
+      make_body("component/robot1/model/robot1_model/body/finger_right/collision/0"),
+      make_body("scene/part/shape/0"),
   };
   world->body_count = static_cast<std::int64_t>(world->bodies.size());
   return build_runtime_collision_query_bundle(
-      CollisionWorldPolicySnapshotBundle{world, std::move(policy)}, epoch);
+      CollisionWorldPolicySnapshotBundle{world, std::move(policy)});
 }
 
 RuntimeCollisionStateProjection make_projection() {
@@ -310,10 +309,30 @@ RuntimeCollisionStateProjection make_projection() {
   return projection;
 }
 
+ProjectionRevisionDTO make_projection_revision(std::uint64_t revision,
+                                                char content_digit) {
+  return ProjectionRevisionDTO{
+      RetainedBundleId(
+          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+      GraphRevision(
+          "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+      SceneRevision{
+          SceneId(
+              "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+          revision,
+          ContentDigest("sha256:" + std::string(64U, content_digit))}};
+}
+
+RuntimeCollisionQueryBundlePtr with_projection_revision(
+    RuntimeCollisionQueryBundlePtr source, ProjectionRevisionDTO revision) {
+  auto bundle = std::make_shared<RuntimeCollisionQueryBundle>(*source);
+  bundle->projection_revision = std::move(revision);
+  return bundle;
+}
+
 TEST(RuntimeCollisionQueryBundleTest,
      PreservesAuthoredContactReleaseTerminalAndProgressFlags) {
-  const CollisionPairId pair{"object/part/shape/0",
-                             "robot/robot1/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {7, "preserved-release-policy"};
   SupportContactPolicyEntry release;
@@ -369,9 +388,31 @@ TEST(RuntimeCollisionQuerySessionTest,
 }
 
 TEST(RuntimeCollisionQuerySessionTest,
+     RuntimeTickKeepsNonArmFingerFromPreparedCollisionTrajectory) {
+  const TrajectoryDTO arm{{}, {"j1"}, {{0.0, {0.0}, {}, {}}}};
+  const TrajectoryDTO expanded{
+      {}, {"j1", "j2"}, {{0.0, {0.0, 0.004}, {}, {}}}};
+  auto projection = build_runtime_collision_state_projection(arm, expanded);
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+  CollisionPolicySnapshot policy;
+  policy.revision = {1, "runtime-policy"};
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  RuntimeCollisionQuerySession session(std::move(projection.value()), publisher,
+                                       engine, {}, 10'000'000);
+  ASSERT_FALSE(session.prepare(publisher.bundle).has_value());
+
+  const std::array<double, 1> arm_position{0.25};
+  EXPECT_EQ(session.tick(publisher.bundle, arm_position, 1).status,
+            RuntimeCollisionTickStatus::kClear);
+  EXPECT_DOUBLE_EQ(engine->last_positions_[0], 0.25);
+  EXPECT_DOUBLE_EQ(engine->last_positions_[1], 0.004);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
      WarmSignedReleaseTickHasZeroFrameworkAllocations) {
-  const CollisionPairId pair{"object/part/shape/0",
-                             "robot/robot1/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {2, "runtime-signed-release-policy"};
   SupportContactPolicyEntry release;
@@ -405,8 +446,7 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      WarmBinaryReleaseTickHasZeroFrameworkAllocations) {
-  const CollisionPairId pair{"object/part/shape/0",
-                             "robot/robot1/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {3, "runtime-binary-release-policy"};
   SupportContactPolicyEntry release;
@@ -445,8 +485,7 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      WarmBoundedPenetrationTickHasZeroFrameworkAllocations) {
-  const CollisionPairId pair{"object/part/shape/0",
-                             "robot/robot1/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {4, "runtime-bounded-contact-policy"};
   SupportContactPolicyEntry contact;
@@ -481,8 +520,7 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      ImmutablePolicyIndexAllowsOnlyThePublishedPair) {
-  const CollisionPairId allowed{"object/fixture/shape/0",
-                                "robot/r/link/tool/collision/0"};
+  const CollisionPairId allowed{"component/r/model/r_model/body/tool/collision/0", "scene/fixture/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {2, "touch-policy"};
   policy.allowed_touch_link_pairs = {allowed};
@@ -497,8 +535,8 @@ TEST(RuntimeCollisionQuerySessionTest,
   EXPECT_EQ(session.tick(publisher.bundle, positions, 1).status,
             RuntimeCollisionTickStatus::kClear);
 
-  engine->collide({"object/unexpected/shape/0",
-                   "robot/r/link/tool/collision/0"},
+  engine->collide({"scene/unexpected/shape/0",
+                   "component/r/model/r_model/body/tool/collision/0"},
                   -0.001);
   const auto blocked = session.tick(publisher.bundle, positions, 2);
   EXPECT_EQ(blocked.status, RuntimeCollisionTickStatus::kCollision);
@@ -574,8 +612,7 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      SignedPolicyRejectsAllActiveOnlyEngineWithoutScopeFallback) {
-  const CollisionPairId pair{"object/part/shape/0",
-                             "robot/robot1/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {2, "runtime-signed-release-policy"};
   SupportContactPolicyEntry release;
@@ -602,8 +639,7 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      SignedPolicyReportsMissingPenetrationCapabilityPrecisely) {
-  const CollisionPairId pair{"object/part/shape/0",
-                             "robot/robot1/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {3, "runtime-signed-release-missing-depth-policy"};
   SupportContactPolicyEntry release;
@@ -630,8 +666,7 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      BinaryPolicyAdmitsExplicitCollisionOnlyNoneScope) {
-  const CollisionPairId pair{"object/part/shape/0",
-                             "robot/robot1/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {3, "runtime-binary-release-policy"};
   SupportContactPolicyEntry release;
@@ -663,8 +698,7 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      BoundedPolicyWithReleaseFieldMixtureFailsBeforeMonitorArm) {
-  const CollisionPairId pair{"object/part/shape/0",
-                             "robot/robot1/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {4, "runtime-invalid-bounded-policy"};
   SupportContactPolicyEntry bounded;
@@ -832,7 +866,8 @@ TEST(RuntimeCollisionQuerySessionTest,
       std::make_shared<CollisionPolicyIndex>(*coherent->policy_index);
   for (std::size_t i = 0; i <= 64; ++i) {
     oversized_index->touch_link_index[
-        {"object/part_" + std::to_string(i), "robot/link"}] = true;
+        {"component/arm/model/arm_model/body/link/collision/0",
+         "scene/part_" + std::to_string(i) + "/shape/0"}] = true;
   }
   auto oversized_bundle =
       std::make_shared<RuntimeCollisionQueryBundle>(*coherent);
@@ -853,7 +888,7 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      DuplicatePolicyEntriesFailIndexCoherenceBeforeMonitorArm) {
-  const CollisionPairId pair{"object/part", "robot/link"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/link/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {15, "runtime-policy"};
   policy.allowed_touch_link_pairs = {pair, pair};
@@ -894,34 +929,6 @@ TEST(RuntimeCollisionQuerySessionTest,
   ASSERT_TRUE(error.has_value());
   EXPECT_EQ(error->details.at("reason"),
             "runtime_collision_policy_capacity_exceeded");
-  EXPECT_EQ(engine->prepared_joint_count_, 0u);
-  EXPECT_EQ(engine->query_count_, 0u);
-}
-
-TEST(RuntimeCollisionQuerySessionTest,
-     OversizedFreshnessSidecarFailsBeforeMonitorArm) {
-  CollisionPolicySnapshot policy;
-  policy.revision = {11, "runtime-policy"};
-  const auto coherent = make_bundle(std::move(policy));
-  auto oversized_bundle =
-      std::make_shared<RuntimeCollisionQueryBundle>(*coherent);
-  for (std::size_t i = 0; i <= 32; ++i) {
-    oversized_bundle->body_freshness.push_back(
-        {"object/part_" + std::to_string(i), std::nullopt, std::nullopt,
-         std::nullopt});
-  }
-  oversized_bundle->lookup_order_valid = true;
-  StaticRuntimePublisher publisher;
-  publisher.bundle = std::move(oversized_bundle);
-  auto engine = std::make_shared<FixedRuntimeEngine>();
-  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
-                                       10'000'000);
-
-  const auto error = session.prepare(publisher.bundle);
-
-  ASSERT_TRUE(error.has_value());
-  EXPECT_EQ(error->details.at("reason"),
-            "runtime_collision_bundle_capacity_exceeded");
   EXPECT_EQ(engine->prepared_joint_count_, 0u);
   EXPECT_EQ(engine->query_count_, 0u);
 }
@@ -1003,10 +1010,9 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      RuntimeBundlePreselectsMetricPairsAndExcludesBinaryPairs) {
-  const CollisionPairId bounded_pair{"object/fixture/shape/0",
-                                     "object/insert/shape/0"};
-  const CollisionPairId binary_pair{"fixture/table/shape/0",
-                                    "object/binary/shape/0"};
+  const CollisionPairId bounded_pair{"scene/fixture/shape/0",
+                                     "scene/insert/shape/0"};
+  const CollisionPairId binary_pair{"scene/binary/shape/0", "scene/table/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {2, "mixed-runtime-distance-selection"};
 
@@ -1048,8 +1054,7 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      ActiveContactGraspAllowsOnlyMatchingBoundedContact) {
-  const CollisionPairId pair{"object/part/shape/0",
-                             "robot/robot1/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {2, "contact-grasp-policy"};
   ContactGraspPolicyEntry grasp;
@@ -1083,8 +1088,7 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      ActiveContactGraspRejectsContradictoryPositiveClearance) {
-  const CollisionPairId pair{"object/part/shape/0",
-                             "robot/robot1/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {2, "contact-grasp-positive-clearance"};
   ContactGraspPolicyEntry grasp;
@@ -1117,8 +1121,7 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      ContactReleaseStateRejectsIncreasingPenetration) {
-  const CollisionPairId pair{"object/part/shape/0",
-                             "robot/robot1/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {3, "contact-release-policy"};
   SupportContactPolicyEntry release;
@@ -1166,9 +1169,105 @@ TEST(RuntimeCollisionQuerySessionTest,
 }
 
 TEST(RuntimeCollisionQuerySessionTest,
+     CommandCapableSessionFollowsRuleChangesAndCarriesContactReleaseHistory) {
+  const CollisionPairId released_pair{
+      "component/robot1/model/robot1_model/body/finger_left/collision/0",
+      "scene/part/shape/0"};
+  const CollisionPairId added_pair{
+      "component/robot1/model/robot1_model/body/finger_right/collision/0",
+      "scene/part/shape/0"};
+  SupportContactPolicyEntry release;
+  release.pair = released_pair;
+  release.max_start_penetration_m = 0.01;
+  SupportContactPolicyEntry added = release;
+  added.pair = added_pair;
+  const auto entry_for = [](const RuntimeContactReleaseStateSnapshot& snapshot,
+                            const CollisionPairId& pair) {
+    for (std::size_t i = 0; i < snapshot.count; ++i) {
+      if (snapshot.entries[i].pair != nullptr && *snapshot.entries[i].pair == pair) {
+        return &snapshot.entries[i];
+      }
+    }
+    return static_cast<const RuntimeContactReleaseStateEntry*>(nullptr);
+  };
+
+  CollisionPolicySnapshot admission_policy;
+  admission_policy.revision = {5, "admission-contact-release-policy"};
+  admission_policy.support_contacts.push_back(release);
+  const auto admission_revision = make_projection_revision(1U, 'd');
+  const auto admission_bundle = with_projection_revision(
+      make_bundle(std::move(admission_policy)), admission_revision);
+  StaticRuntimePublisher publisher;
+  publisher.bundle = admission_bundle;
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       10'000'000);
+  ASSERT_FALSE(session.prepare(admission_bundle).has_value());
+  const std::array<double, 2> positions{0.0, 0.0};
+
+  engine->collide(released_pair, -0.002);
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 1).status,
+            RuntimeCollisionTickStatus::kClear);
+  engine->clear();
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 2).status,
+            RuntimeCollisionTickStatus::kClear);
+
+  // New rules mid-motion: the unchanged pair keeps its released history, the
+  // new pair starts fresh (it may start in contact), and the start-of-motion
+  // baseline is not re-counted.
+  CollisionPolicySnapshot extended_policy;
+  extended_policy.revision = {6, "attach-adds-support-contact"};
+  extended_policy.support_contacts = {release, added};
+  publisher.bundle = with_projection_revision(
+      make_bundle(std::move(extended_policy)),
+      make_projection_revision(2U, 'e'));
+  engine->collide(added_pair, -0.002);
+  const auto rebound = session.tick(publisher.bundle, positions, 3);
+  EXPECT_EQ(rebound.status, RuntimeCollisionTickStatus::kClear);
+  EXPECT_EQ(rebound.initial_contact_pair_count, 1U);
+  EXPECT_EQ(rebound.current_contact_pair_count, 1U);
+  const auto extended = session.contact_release_state_snapshot();
+  ASSERT_TRUE(extended.valid);
+  EXPECT_EQ(extended.binding_owner, publisher.bundle);
+  ASSERT_EQ(extended.count, 2U);
+  const auto* carried = entry_for(extended, released_pair);
+  const auto* fresh = entry_for(extended, added_pair);
+  ASSERT_NE(carried, nullptr);
+  ASSERT_NE(fresh, nullptr);
+  EXPECT_TRUE(carried->release_state.separated);
+  EXPECT_EQ(carried->support_state, SupportContactEvaluationState::kSeparated);
+  EXPECT_TRUE(fresh->release_state.started_in_contact);
+  EXPECT_FALSE(fresh->release_state.separated);
+
+  engine->collide(released_pair, -0.001);
+  const auto recontact = session.tick(publisher.bundle, positions, 4);
+  EXPECT_EQ(recontact.status, RuntimeCollisionTickStatus::kCollision);
+  EXPECT_EQ(recontact.reason, RuntimeCollisionTickReason::kContactReleaseRecontact);
+
+  // A changed rule starts fresh and a removed pair drops out.
+  CollisionPolicySnapshot changed_policy;
+  changed_policy.revision = {7, "changed-support-contact"};
+  SupportContactPolicyEntry changed = release;
+  changed.max_start_penetration_m = 0.02;
+  changed_policy.support_contacts = {changed};
+  publisher.bundle = with_projection_revision(
+      make_bundle(std::move(changed_policy)),
+      make_projection_revision(3U, 'f'));
+  engine->collide(released_pair, -0.001);
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 5).status,
+            RuntimeCollisionTickStatus::kClear);
+  const auto changed_state = session.contact_release_state_snapshot();
+  ASSERT_EQ(changed_state.count, 1U);
+  const auto* restarted = entry_for(changed_state, released_pair);
+  ASSERT_NE(restarted, nullptr);
+  EXPECT_TRUE(restarted->release_state.started_in_contact);
+  EXPECT_FALSE(restarted->release_state.separated);
+  EXPECT_EQ(entry_for(changed_state, added_pair), nullptr);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
      SignedReleaseTreatsAbsentPairAsSeparatedWithoutDistance) {
-  const CollisionPairId pair{"object/part/shape/0",
-                             "robot/robot1/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {4, "signed-release-policy"};
   SupportContactPolicyEntry release;
@@ -1201,8 +1300,7 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      BinaryReleaseRequestsNoDistanceAndRejectsRecontact) {
-  const CollisionPairId pair{"object/part/shape/0",
-                             "robot/robot1/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {5, "binary-release-policy"};
   SupportContactPolicyEntry release;
@@ -1243,8 +1341,7 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      BinaryReleaseRejectsContactThatWasAbsentAtRuntimeBaseline) {
-  const CollisionPairId pair{"object/part/shape/0",
-                             "robot/robot1/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {6, "binary-new-contact-policy"};
   SupportContactPolicyEntry release;
@@ -1275,8 +1372,7 @@ TEST(RuntimeCollisionQuerySessionTest,
 
 TEST(RuntimeCollisionQuerySessionTest,
      BoundedPenetrationAllowsAppearanceRecontactAndFinalContactWithinBound) {
-  const CollisionPairId pair{"object/insert/shape/0",
-                             "object/fixture/shape/0"};
+  const CollisionPairId pair{"scene/fixture/shape/0", "scene/insert/shape/0"};
   CollisionPolicySnapshot policy;
   policy.revision = {7, "bounded-contact-policy"};
   SupportContactPolicyEntry contact;

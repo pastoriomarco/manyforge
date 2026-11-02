@@ -21,3 +21,5 @@ __pycache__/
 # Frontend build artifacts (npm ci runs inside Docker)
 manyforge_composer/frontend/node_modules/
 manyforge_composer/frontend/dist/
+.manyforge-dev/
+.manyforge-diagnostic/

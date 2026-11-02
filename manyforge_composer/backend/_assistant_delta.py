@@ -1,38 +1,12 @@
-"""Assistant tool-call delta computation.
+"""Pure authoring-document tree/scene delta reduction.
 
-Computes per-conversation tree+scene state diffs returned in every
-``/api/assistant/bridge/tools/{toolId}`` response. The MCP wrapper
-running in the sandbox can't fetch state on its own — the OpenShell
-SSRF policy denies arbitrary GETs — so the only native way to
-deliver fresh state confirmation to the model is to attach the delta
-to the bridge tool response itself. The wrapper passes that response
-through to the model verbatim.
-
-State is sourced from ``state.program.to_dict()`` so we never read
-anything the bridge endpoint doesn't already have. Two diffs are
-produced per call:
-
-  * ``sinceCallStart``  : changes vs the snapshot from the previous
-    tool call. Tells the model what *this* call did.
-  * ``sinceConversationStart`` : cumulative changes vs the first call
-    in this conversation. Tells the model how the world has drifted
-    from the program-as-loaded.
-
-Plus ``rootName`` / ``rootKind`` for cheap goal-completion checks
-(rule 9 in the bridge prompt).
-
-Baselines and last-snapshots are kept per ``conversation_id`` in a
-module-level dict; eviction happens on Composer restart and on
-explicit ``forget_conversation`` (intended to be called when a
-program reload makes the prior baseline meaningless).
+This module owns no conversations, caches, Composer state, callback response,
+or assistant wire. H0/I6 session owners may feed explicit snapshots into this
+bounded reducer after the new Program and scene contracts are qualified.
 """
 from __future__ import annotations
 
 from typing import Any
-
-
-_BASELINES: dict[str, dict[str, Any]] = {}
-_LAST_SNAPSHOTS: dict[str, dict[str, Any]] = {}
 
 
 def _index_tree(tree_doc: Any) -> dict[str, dict[str, Any]]:
@@ -184,116 +158,61 @@ def _diff_indices(
             "added": added_entries,
             "removed": removed_keys,
             "moved": moved,
-            "kindChanged": kind_changed,
-            "paramsChanged": params_changed,
+            "kind_changed": kind_changed,
+            "params_changed": params_changed,
         }
     return {
         "added": added_entries,
         "removed": removed_keys,
-        "kindChanged": kind_changed,
-        "poseChanged": pose_changed,
-        "dimChanged": dim_changed,
+        "kind_changed": kind_changed,
+        "pose_changed": pose_changed,
+        "dimensions_changed": dim_changed,
     }
 
 
 def _is_empty_diff(diff: dict[str, Any]) -> bool:
     return not any(diff.get(k) for k in (
-        "added", "removed", "moved", "kindChanged",
-        "paramsChanged", "poseChanged", "dimChanged",
+        "added", "removed", "moved", "kind_changed",
+        "params_changed", "pose_changed", "dimensions_changed",
     ))
 
 
-def snapshot_from_program(program_dict: dict[str, Any] | None) -> dict[str, Any]:
-    """Build a comparable snapshot {tree, scene} from program.to_dict()."""
-    if not isinstance(program_dict, dict):
-        return {"tree": {}, "scene": []}
-    tree = program_dict.get("tree") if isinstance(program_dict.get("tree"), dict) else {}
-    scene = (
-        program_dict.get("sceneResources")
-        or program_dict.get("scene_resources")
-        or program_dict.get("scene")
-        or []
-    )
-    return {"tree": tree, "scene": scene}
-
-
-def compute_delta(
+def compute_document_delta(
     *,
-    conversation_id: str,
-    current_program_dict: dict[str, Any] | None,
+    before_tree: dict[str, Any] | None,
+    before_scene: list[Any] | dict[str, Any] | None,
+    after_tree: dict[str, Any] | None,
+    after_scene: list[Any] | dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Compute the delta block to attach to a tool-call response.
-
-    On the first call for ``conversation_id`` the current snapshot
-    becomes the conversation baseline; both diffs come back empty
-    (``noop``). On subsequent calls the diffs report changes since
-    the previous call (``sinceCallStart``) and since the first call
-    (``sinceConversationStart``).
-    """
-    if not isinstance(conversation_id, str) or not conversation_id:
-        conversation_id = "(default)"
-
-    current = snapshot_from_program(current_program_dict)
-
-    baseline = _BASELINES.get(conversation_id)
-    if baseline is None:
-        _BASELINES[conversation_id] = current
-        _LAST_SNAPSHOTS[conversation_id] = current
-        baseline = current
-        last = current
-    else:
-        last = _LAST_SNAPSHOTS.get(conversation_id, baseline)
-
-    base_tree_idx = _index_tree(baseline.get("tree"))
-    base_scene_idx = _index_scene(baseline.get("scene"))
-    last_tree_idx = _index_tree(last.get("tree"))
-    last_scene_idx = _index_scene(last.get("scene"))
-    cur_tree_idx = _index_tree(current.get("tree"))
-    cur_scene_idx = _index_scene(current.get("scene"))
-
-    cumulative_tree = _diff_indices(base_tree_idx, cur_tree_idx, domain="tree")
-    cumulative_scene = _diff_indices(base_scene_idx, cur_scene_idx, domain="scene")
-    call_tree = _diff_indices(last_tree_idx, cur_tree_idx, domain="tree")
-    call_scene = _diff_indices(last_scene_idx, cur_scene_idx, domain="scene")
-
+    """Compare explicit documents without retaining them or inferring effects."""
+    before_tree_index = _index_tree(before_tree or {})
+    before_scene_index = _index_scene(before_scene or [])
+    after_tree_index = _index_tree(after_tree or {})
+    after_scene_index = _index_scene(after_scene or [])
+    tree_delta = _diff_indices(
+        before_tree_index,
+        after_tree_index,
+        domain="tree",
+    )
+    scene_delta = _diff_indices(
+        before_scene_index,
+        after_scene_index,
+        domain="scene",
+    )
     root_name: str | None = None
     root_kind: str | None = None
-    cur_tree = current.get("tree")
-    if isinstance(cur_tree, dict):
-        n = cur_tree.get("name")
-        i = cur_tree.get("id")
-        if isinstance(n, str): root_name = n
-        if isinstance(i, str): root_kind = i
-
-    _LAST_SNAPSHOTS[conversation_id] = current
-
+    if isinstance(after_tree, dict):
+        raw_name = after_tree.get("name")
+        raw_kind = after_tree.get("id")
+        root_name = raw_name if isinstance(raw_name, str) else None
+        root_kind = raw_kind if isinstance(raw_kind, str) else None
     return {
-        "rootName": root_name,
-        "rootKind": root_kind,
-        "sinceCallStart": {
-            "tree": call_tree,
-            "scene": call_scene,
-            "noop": _is_empty_diff(call_tree) and _is_empty_diff(call_scene),
-        },
-        "sinceConversationStart": {
-            "tree": cumulative_tree,
-            "scene": cumulative_scene,
-            "noop": _is_empty_diff(cumulative_tree) and _is_empty_diff(cumulative_scene),
-        },
+        "root_name": root_name,
+        "root_kind": root_kind,
+        "tree": tree_delta,
+        "scene": scene_delta,
+        "unchanged": _is_empty_diff(tree_delta) and _is_empty_diff(scene_delta),
     }
 
 
-def forget_conversation(conversation_id: str) -> None:
-    """Drop cached baseline + last snapshot for a conversation.
-
-    Called when a program is reloaded so the next tool call
-    re-baselines against the freshly loaded program.
-    """
-    _BASELINES.pop(conversation_id, None)
-    _LAST_SNAPSHOTS.pop(conversation_id, None)
-
-
-def reset_all() -> None:
-    """Clear every cached baseline. Used on program/load."""
-    _BASELINES.clear()
-    _LAST_SNAPSHOTS.clear()
+__all__ = ["compute_document_delta"]

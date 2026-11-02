@@ -8,7 +8,7 @@
 #include <mutex>
 #include <vector>
 
-#include <manyforge_roboplan/roboplan_planner_backend.hpp>
+#include <manyforge_roboplan/roboplan_planning_performance_contract.hpp>
 
 namespace manyforge::roboplan_backend {
 
@@ -27,10 +27,10 @@ struct RoboPlanPlanningQualificationBatch {
 
 /// Bounded, opt-in recorder for version-transition qualification.
 ///
-/// Production factories do not enable it. Once attached to the planner, each
-/// record preserves the exact resolved request and retained scene binding that
-/// the planner consumed; capture tools must not reconstruct those facts from
-/// UI state or authored YAML.
+/// Production composition does not enable it. A future planning adapter can
+/// preserve the exact resolved request and retained scene binding it consumed;
+/// capture tools must not reconstruct those facts from UI state or authored
+/// YAML.
 class RoboPlanPlanningQualificationRecorder final
     : public IRoboPlanPlanningPerformanceObserver {
  public:

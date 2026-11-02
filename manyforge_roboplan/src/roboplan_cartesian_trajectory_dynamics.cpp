@@ -1,11 +1,15 @@
 #include <manyforge_roboplan/detail/cartesian_trajectory_contract.hpp>
 
+// Extracted unchanged from c4b075fa6dfb69e463c61f3efa8cfce8de681e8a; contains no planner or scene owner.
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -21,7 +25,8 @@ namespace {
 constexpr std::size_t kMaxDynamicsIntervalChecks = 500000;
 constexpr std::size_t kMaxDynamicsSubdivisionDepth = 40;
 constexpr std::size_t kPlanningControlCheckStride = 64;
-constexpr long double kFloatingPointBoundHeadroom = 1.0L + 1e-12L;
+// Covers double rounding in the interval bounds (a few ulps per term).
+constexpr double kFloatingPointBoundHeadroom = 1.0 + 1e-9;
 // The accepted envelope remains fully conservative. This value only controls
 // how tightly branch-and-bound resolves the global conservative peak. The
 // interval residual remains part of the accepted envelope, so this affects
@@ -30,7 +35,7 @@ constexpr long double kFloatingPointBoundHeadroom = 1.0L + 1e-12L;
 // caps avoidable speed retiming at two percent (about one percent for an
 // acceleration-bound trajectory) without turning certification into the
 // dominant Cartesian-planning cost.
-constexpr long double kResidualBudgetFraction = 0.02L;
+constexpr double kResidualBudgetFraction = 0.02;
 
 bool finite_positive(double value) {
   return std::isfinite(value) &&
@@ -72,27 +77,27 @@ core::ErrorDTO dynamics_resource_error(std::size_t segment_index,
 }
 
 template <std::size_t N>
-long double evaluate_polynomial(const std::array<double, N>& coefficients,
-                                long double value) {
-  long double result = 0.0L;
+double evaluate_polynomial(const std::array<double, N>& coefficients,
+                                double value) {
+  double result = 0.0;
   for (auto coefficient = coefficients.rbegin();
        coefficient != coefficients.rend(); ++coefficient) {
-    result = result * value + static_cast<long double>(*coefficient);
+    result = result * value + *coefficient;
   }
   return result;
 }
 
-constexpr long double binomial(std::size_t n, std::size_t k) {
+constexpr double binomial(std::size_t n, std::size_t k) {
   if (k > n) {
-    return 0.0L;
+    return 0.0;
   }
   if (k > n - k) {
     k = n - k;
   }
-  long double result = 1.0L;
+  double result = 1.0;
   for (std::size_t index = 1; index <= k; ++index) {
-    result *= static_cast<long double>(n - (k - index));
-    result /= static_cast<long double>(index);
+    result *= static_cast<double>(n - (k - index));
+    result /= static_cast<double>(index);
   }
   return result;
 }
@@ -101,19 +106,18 @@ constexpr long double binomial(std::size_t n, std::size_t k) {
 // inequality for s in [0, 1]. Unlike point sampling, this is a true interval
 // upper bound and converges as adaptive subdivision narrows the interval.
 template <std::size_t N>
-long double polynomial_absolute_interval_bound(
-    const std::array<double, N>& coefficients, long double lower,
-    long double upper) {
-  const long double width = upper - lower;
-  long double result = 0.0L;
-  long double width_power = 1.0L;
+double polynomial_absolute_interval_bound(
+    const std::array<double, N>& coefficients, double lower,
+    double upper) {
+  const double width = upper - lower;
+  double result = 0.0;
+  double width_power = 1.0;
   for (std::size_t local_power = 0; local_power < N; ++local_power) {
-    long double local_coefficient = 0.0L;
+    double local_coefficient = 0.0;
     for (std::size_t source_power = local_power; source_power < N;
          ++source_power) {
       local_coefficient +=
-          static_cast<long double>(coefficients[source_power]) *
-          binomial(source_power, local_power) *
+          coefficients[source_power] * binomial(source_power, local_power) *
           std::pow(lower, static_cast<int>(source_power - local_power));
     }
     result += std::abs(local_coefficient * width_power);
@@ -306,10 +310,10 @@ struct FrameDynamicsSample {
 };
 
 struct KinematicDerivativeBounds {
-  long double linear_acceleration_mps2 = 0.0L;
-  long double angular_acceleration_rad_s2 = 0.0L;
-  long double linear_jerk_mps3 = 0.0L;
-  long double angular_jerk_rad_s3 = 0.0L;
+  double linear_acceleration_mps2 = 0.0;
+  double angular_acceleration_rad_s2 = 0.0;
+  double linear_jerk_mps3 = 0.0;
+  double angular_jerk_rad_s3 = 0.0;
 };
 
 struct SegmentPolynomial {
@@ -366,12 +370,17 @@ resolve_cartesian_kinematic_motion_bounds(
       std::move(*resolved));
 }
 
+namespace {
+
+// One tip frame relative to the base, against the Cartesian path's limits.
 core::Result<CartesianFrameDynamicsEnvelope>
-measure_cartesian_frame_dynamics_envelope(
-    const core::PlanRequestDTO& request, const core::CartesianPathDTO& path,
-    const std::shared_ptr<roboplan::Scene>& scene,
-    const roboplan::JointTrajectory& trajectory,
-    const CartesianPlanningControl& control) {
+measure_one_frame_dynamics_envelope(
+    const CartesianTrajectoryContractInput &request,
+    const std::string &tip_frame,
+    const core::CartesianPathDTO &path,
+    const std::shared_ptr<roboplan::Scene> &scene,
+    const roboplan::JointTrajectory &trajectory,
+    const CartesianPlanningControl &control) {
   CartesianFrameDynamicsEnvelope envelope;
   const std::size_t joint_count = trajectory.joint_names.size();
   const std::size_t sample_count = trajectory.positions.size();
@@ -383,35 +392,37 @@ measure_cartesian_frame_dynamics_envelope(
     return core::Result<CartesianFrameDynamicsEnvelope>::Ok(
         std::move(envelope));
   }
-  const auto group_info = scene->getJointGroupInfo(request.group_id);
-  const auto tip_frame_id = scene->getFrameId(request.tcp_frame);
-  const auto base_frame_id = scene->getFrameId(request.base_frame);
+  const auto group_info = scene->getJointGroupInfo(request.compiled_group_name);
+  const auto tip_frame_id = scene->getFrameId(tip_frame);
+  const auto base_frame_id = scene->getFrameId(request.compiled_base_frame);
   if (!group_info.has_value() || !tip_frame_id.has_value() ||
       !base_frame_id.has_value() ||
       group_info->joint_names != trajectory.joint_names ||
-      group_info->q_indices.size() !=
-          static_cast<Eigen::Index>(joint_count) ||
-      group_info->v_indices.size() !=
-          static_cast<Eigen::Index>(joint_count)) {
+      group_info->q_indices.size() != static_cast<Eigen::Index>(joint_count) ||
+      group_info->v_indices.size() != static_cast<Eigen::Index>(joint_count)) {
     envelope.complete = false;
     return core::Result<CartesianFrameDynamicsEnvelope>::Ok(
         std::move(envelope));
   }
   auto amplification = resolve_cartesian_kinematic_motion_bounds(
-      scene, request.group_id, trajectory.joint_names);
+      scene, request.compiled_group_name, trajectory.joint_names);
   if (!amplification.ok()) {
     return core::Result<CartesianFrameDynamicsEnvelope>::Err(
         amplification.error());
   }
-  const auto& motion_bounds = amplification.value();
+  const auto &motion_bounds = amplification.value();
+  // The interval checks below run in double: long double is software
+  // binary128 on aarch64 and made this check dominate Cartesian planning.
+  const std::vector<double> angular_amplification(
+      motion_bounds.angular_amplification.begin(),
+      motion_bounds.angular_amplification.end());
+  const std::vector<double> prismatic_amplification(
+      motion_bounds.prismatic_amplification.begin(),
+      motion_bounds.prismatic_amplification.end());
 
-  double linear_speed_limit = path.max_linear_speed_mps;
-  if (request.speed_profile.max_tcp_linear_speed_mps.has_value()) {
-    linear_speed_limit = std::min(
-        linear_speed_limit,
-        *request.speed_profile.max_tcp_linear_speed_mps);
-  }
-  linear_speed_limit *= request.speed_profile.velocity_scale;
+  const double linear_speed_limit =
+      request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0) *
+      request.speed_profile.velocity_scale;
   const double angular_speed_limit =
       path.max_angular_speed_rad_s * request.speed_profile.velocity_scale;
   const double linear_acceleration_limit =
@@ -429,7 +440,7 @@ measure_cartesian_frame_dynamics_envelope(
         std::move(envelope));
   }
 
-  const auto& model = scene->getModel();
+  const auto &model = scene->getModel();
   pinocchio::Data data(model);
   Eigen::VectorXd group_positions(static_cast<Eigen::Index>(joint_count));
   Eigen::VectorXd group_velocities(static_cast<Eigen::Index>(joint_count));
@@ -450,6 +461,188 @@ measure_cartesian_frame_dynamics_envelope(
     observed_peak.angular_acceleration_rad_s2 =
         std::max(observed_peak.angular_acceleration_rad_s2,
                  sample.angular_acceleration_rad_s2);
+  };
+
+  // Seed every piece first so refinement starts from the trajectory-wide
+  // observed peak. Pieces below that peak resolve within the residual budget
+  // without bisecting against an artificially low early peak.
+  struct SeededSegment {
+    SegmentPolynomial polynomial;
+    std::array<FrameDynamicsSample, 5> seeds;
+  };
+  std::vector<SeededSegment> segments;
+  segments.reserve(sample_count - 1);
+  const auto evaluate_sample = [&](const SegmentPolynomial& segment,
+                                   double progress)
+      -> std::optional<FrameDynamicsSample> {
+    if (sample_evaluations++ >= kMaxDynamicsIntervalChecks) {
+      return std::nullopt;
+    }
+    const double normalized_time = progress;
+    const double duration = segment.duration_s;
+    const double duration_squared = duration * duration;
+    for (std::size_t joint = 0; joint < joint_count; ++joint) {
+      const auto& coefficients = segment.positions[joint];
+      const std::array<double, 5> velocity_coefficients{
+          coefficients[1], 2.0 * coefficients[2],
+          3.0 * coefficients[3], 4.0 * coefficients[4],
+          5.0 * coefficients[5]};
+      const std::array<double, 4> acceleration_coefficients{
+          2.0 * coefficients[2], 6.0 * coefficients[3],
+          12.0 * coefficients[4], 20.0 * coefficients[5]};
+      group_positions[static_cast<Eigen::Index>(joint)] = static_cast<double>(
+          evaluate_polynomial(coefficients, normalized_time));
+      group_velocities[static_cast<Eigen::Index>(joint)] =
+          static_cast<double>(
+              evaluate_polynomial(velocity_coefficients, normalized_time) /
+              duration);
+      group_accelerations[static_cast<Eigen::Index>(joint)] =
+          static_cast<double>(evaluate_polynomial(
+                                  acceleration_coefficients,
+                                  normalized_time) /
+                              duration_squared);
+    }
+    if (!group_positions.allFinite() || !group_velocities.allFinite() ||
+        !group_accelerations.allFinite()) {
+      return std::nullopt;
+    }
+    const auto full_positions =
+        scene->toFullJointPositions(request.compiled_group_name,
+                                    group_positions);
+    full_velocities.setZero();
+    full_accelerations.setZero();
+    for (Eigen::Index joint = 0;
+         joint < static_cast<Eigen::Index>(joint_count); ++joint) {
+      const Eigen::Index velocity_index = group_info->v_indices[joint];
+      if (velocity_index < 0 || velocity_index >= model.nv) {
+        return std::nullopt;
+      }
+      full_velocities[velocity_index] = group_velocities[joint];
+      full_accelerations[velocity_index] = group_accelerations[joint];
+    }
+    pinocchio::forwardKinematics(model, data, full_positions,
+                                 full_velocities, full_accelerations);
+    pinocchio::updateFramePlacements(model, data);
+    const auto tip_velocity = pinocchio::getFrameVelocity(
+        model, data, tip_frame_id.value(),
+        pinocchio::LOCAL_WORLD_ALIGNED);
+    const auto base_velocity = pinocchio::getFrameVelocity(
+        model, data, base_frame_id.value(),
+        pinocchio::LOCAL_WORLD_ALIGNED);
+    const auto tip_acceleration = pinocchio::getFrameClassicalAcceleration(
+        model, data, tip_frame_id.value(),
+        pinocchio::LOCAL_WORLD_ALIGNED);
+    const auto base_acceleration =
+        pinocchio::getFrameClassicalAcceleration(
+            model, data, base_frame_id.value(),
+            pinocchio::LOCAL_WORLD_ALIGNED);
+
+    const Eigen::Vector3d displacement =
+        data.oMf[tip_frame_id.value()].translation() -
+        data.oMf[base_frame_id.value()].translation();
+    const Eigen::Vector3d velocity_difference =
+        tip_velocity.linear() - base_velocity.linear();
+    const Eigen::Vector3d relative_linear_velocity =
+        velocity_difference -
+        base_velocity.angular().cross(displacement);
+    const Eigen::Vector3d relative_angular_velocity =
+        tip_velocity.angular() - base_velocity.angular();
+    // Differentiate T_base^-1*T_tip in a world-aligned basis. Norms are
+    // rotation invariant, while these transport terms are required when the
+    // requested base frame itself moves.
+    const Eigen::Vector3d relative_linear_acceleration =
+        tip_acceleration.linear() - base_acceleration.linear() -
+        base_acceleration.angular().cross(displacement) -
+        2.0 * base_velocity.angular().cross(velocity_difference) +
+        base_velocity.angular().cross(
+            base_velocity.angular().cross(displacement));
+    const Eigen::Vector3d relative_angular_acceleration =
+        tip_acceleration.angular() - base_acceleration.angular() -
+        base_velocity.angular().cross(relative_angular_velocity);
+    FrameDynamicsSample result{
+        relative_linear_velocity.norm(),
+        relative_angular_velocity.norm(),
+        relative_linear_acceleration.norm(),
+        relative_angular_acceleration.norm()};
+    if (!finite_sample(result)) {
+      return std::nullopt;
+    }
+    return result;
+  };
+
+  const auto derivative_bounds =
+      [&](const SegmentPolynomial& segment, double lower, double upper)
+      -> std::optional<KinematicDerivativeBounds> {
+    double angular_speed = 0.0;
+    double angular_acceleration = 0.0;
+    double angular_jerk = 0.0;
+    double prismatic_speed = 0.0;
+    double prismatic_acceleration = 0.0;
+    double prismatic_jerk = 0.0;
+    const double duration = segment.duration_s;
+    const double duration_squared = duration * duration;
+    const double duration_cubed = duration_squared * duration;
+    for (std::size_t joint = 0; joint < joint_count; ++joint) {
+      const auto& coefficients = segment.positions[joint];
+      const std::array<double, 5> velocity_coefficients{
+          coefficients[1], 2.0 * coefficients[2],
+          3.0 * coefficients[3], 4.0 * coefficients[4],
+          5.0 * coefficients[5]};
+      const std::array<double, 4> acceleration_coefficients{
+          2.0 * coefficients[2], 6.0 * coefficients[3],
+          12.0 * coefficients[4], 20.0 * coefficients[5]};
+      const std::array<double, 3> jerk_coefficients{
+          6.0 * coefficients[3], 24.0 * coefficients[4],
+          60.0 * coefficients[5]};
+      const double speed = polynomial_absolute_interval_bound(
+                                    velocity_coefficients, lower, upper) /
+                                duration;
+      const double acceleration =
+          polynomial_absolute_interval_bound(acceleration_coefficients,
+                                             lower, upper) /
+          duration_squared;
+      const double jerk = polynomial_absolute_interval_bound(
+                                   jerk_coefficients, lower, upper) /
+                               duration_cubed;
+      angular_speed +=
+          speed * angular_amplification[joint];
+      angular_acceleration +=
+          acceleration * angular_amplification[joint];
+      angular_jerk +=
+          jerk * angular_amplification[joint];
+      prismatic_speed +=
+          speed * prismatic_amplification[joint];
+      prismatic_acceleration +=
+          acceleration * prismatic_amplification[joint];
+      prismatic_jerk +=
+          jerk * prismatic_amplification[joint];
+    }
+    const double angular_acceleration_bound =
+        angular_acceleration + angular_speed * angular_speed;
+    const double angular_jerk_bound =
+        angular_jerk +
+        3.0 * angular_speed * angular_acceleration +
+        angular_speed * angular_speed * angular_speed;
+    const double radius = motion_bounds.model_radius_m;
+    KinematicDerivativeBounds result;
+    result.angular_acceleration_rad_s2 = angular_acceleration_bound;
+    result.angular_jerk_rad_s3 = angular_jerk_bound;
+    result.linear_acceleration_mps2 =
+        prismatic_acceleration +
+        2.0 * angular_speed * prismatic_speed +
+        radius * angular_acceleration_bound;
+    result.linear_jerk_mps3 =
+        prismatic_jerk +
+        6.0 * angular_speed * prismatic_acceleration +
+        6.0 * angular_acceleration_bound * prismatic_speed +
+        radius * angular_jerk_bound;
+    if (!std::isfinite(result.linear_acceleration_mps2) ||
+        !std::isfinite(result.angular_acceleration_rad_s2) ||
+        !std::isfinite(result.linear_jerk_mps3) ||
+        !std::isfinite(result.angular_jerk_rad_s3)) {
+      return std::nullopt;
+    }
+    return result;
   };
 
   for (std::size_t segment_index = 0; segment_index + 1 < sample_count;
@@ -501,185 +694,10 @@ measure_cartesian_frame_dynamics_envelope(
       segment.positions.push_back(*coefficients);
     }
 
-    const auto evaluate_sample = [&](double progress)
-        -> std::optional<FrameDynamicsSample> {
-      if (sample_evaluations++ >= kMaxDynamicsIntervalChecks) {
-        return std::nullopt;
-      }
-      const long double normalized_time =
-          static_cast<long double>(progress);
-      const long double duration =
-          static_cast<long double>(segment.duration_s);
-      const long double duration_squared = duration * duration;
-      for (std::size_t joint = 0; joint < joint_count; ++joint) {
-        const auto& coefficients = segment.positions[joint];
-        const std::array<double, 5> velocity_coefficients{
-            coefficients[1], 2.0 * coefficients[2],
-            3.0 * coefficients[3], 4.0 * coefficients[4],
-            5.0 * coefficients[5]};
-        const std::array<double, 4> acceleration_coefficients{
-            2.0 * coefficients[2], 6.0 * coefficients[3],
-            12.0 * coefficients[4], 20.0 * coefficients[5]};
-        group_positions[static_cast<Eigen::Index>(joint)] =
-            static_cast<double>(
-                evaluate_polynomial(coefficients, normalized_time));
-        group_velocities[static_cast<Eigen::Index>(joint)] =
-            static_cast<double>(evaluate_polynomial(
-                                    velocity_coefficients, normalized_time) /
-                                duration);
-        group_accelerations[static_cast<Eigen::Index>(joint)] =
-            static_cast<double>(evaluate_polynomial(
-                                    acceleration_coefficients,
-                                    normalized_time) /
-                                duration_squared);
-      }
-      if (!group_positions.allFinite() || !group_velocities.allFinite() ||
-          !group_accelerations.allFinite()) {
-        return std::nullopt;
-      }
-      const auto full_positions =
-          scene->toFullJointPositions(request.group_id, group_positions);
-      full_velocities.setZero();
-      full_accelerations.setZero();
-      for (Eigen::Index joint = 0;
-           joint < static_cast<Eigen::Index>(joint_count); ++joint) {
-        const Eigen::Index velocity_index = group_info->v_indices[joint];
-        if (velocity_index < 0 || velocity_index >= model.nv) {
-          return std::nullopt;
-        }
-        full_velocities[velocity_index] = group_velocities[joint];
-        full_accelerations[velocity_index] = group_accelerations[joint];
-      }
-      pinocchio::forwardKinematics(model, data, full_positions,
-                                   full_velocities, full_accelerations);
-      pinocchio::updateFramePlacements(model, data);
-      const auto tip_velocity = pinocchio::getFrameVelocity(
-          model, data, tip_frame_id.value(),
-          pinocchio::LOCAL_WORLD_ALIGNED);
-      const auto base_velocity = pinocchio::getFrameVelocity(
-          model, data, base_frame_id.value(),
-          pinocchio::LOCAL_WORLD_ALIGNED);
-      const auto tip_acceleration = pinocchio::getFrameClassicalAcceleration(
-          model, data, tip_frame_id.value(),
-          pinocchio::LOCAL_WORLD_ALIGNED);
-      const auto base_acceleration =
-          pinocchio::getFrameClassicalAcceleration(
-              model, data, base_frame_id.value(),
-              pinocchio::LOCAL_WORLD_ALIGNED);
-
-      const Eigen::Vector3d displacement =
-          data.oMf[tip_frame_id.value()].translation() -
-          data.oMf[base_frame_id.value()].translation();
-      const Eigen::Vector3d velocity_difference =
-          tip_velocity.linear() - base_velocity.linear();
-      const Eigen::Vector3d relative_linear_velocity =
-          velocity_difference -
-          base_velocity.angular().cross(displacement);
-      const Eigen::Vector3d relative_angular_velocity =
-          tip_velocity.angular() - base_velocity.angular();
-      // Differentiate T_base^-1*T_tip in a world-aligned basis. Norms are
-      // rotation invariant, while these transport terms are required when the
-      // requested base frame itself moves.
-      const Eigen::Vector3d relative_linear_acceleration =
-          tip_acceleration.linear() - base_acceleration.linear() -
-          base_acceleration.angular().cross(displacement) -
-          2.0 * base_velocity.angular().cross(velocity_difference) +
-          base_velocity.angular().cross(
-              base_velocity.angular().cross(displacement));
-      const Eigen::Vector3d relative_angular_acceleration =
-          tip_acceleration.angular() - base_acceleration.angular() -
-          base_velocity.angular().cross(relative_angular_velocity);
-      FrameDynamicsSample result{
-          relative_linear_velocity.norm(),
-          relative_angular_velocity.norm(),
-          relative_linear_acceleration.norm(),
-          relative_angular_acceleration.norm()};
-      if (!finite_sample(result)) {
-        return std::nullopt;
-      }
-      return result;
-    };
-
-    const auto derivative_bounds =
-        [&](double lower, double upper)
-        -> std::optional<KinematicDerivativeBounds> {
-      long double angular_speed = 0.0L;
-      long double angular_acceleration = 0.0L;
-      long double angular_jerk = 0.0L;
-      long double prismatic_speed = 0.0L;
-      long double prismatic_acceleration = 0.0L;
-      long double prismatic_jerk = 0.0L;
-      const long double duration =
-          static_cast<long double>(segment.duration_s);
-      const long double duration_squared = duration * duration;
-      const long double duration_cubed = duration_squared * duration;
-      for (std::size_t joint = 0; joint < joint_count; ++joint) {
-        const auto& coefficients = segment.positions[joint];
-        const std::array<double, 5> velocity_coefficients{
-            coefficients[1], 2.0 * coefficients[2],
-            3.0 * coefficients[3], 4.0 * coefficients[4],
-            5.0 * coefficients[5]};
-        const std::array<double, 4> acceleration_coefficients{
-            2.0 * coefficients[2], 6.0 * coefficients[3],
-            12.0 * coefficients[4], 20.0 * coefficients[5]};
-        const std::array<double, 3> jerk_coefficients{
-            6.0 * coefficients[3], 24.0 * coefficients[4],
-            60.0 * coefficients[5]};
-        const long double speed = polynomial_absolute_interval_bound(
-                                      velocity_coefficients, lower, upper) /
-                                  duration;
-        const long double acceleration =
-            polynomial_absolute_interval_bound(acceleration_coefficients,
-                                               lower, upper) /
-            duration_squared;
-        const long double jerk = polynomial_absolute_interval_bound(
-                                     jerk_coefficients, lower, upper) /
-                                 duration_cubed;
-        angular_speed +=
-            speed * motion_bounds.angular_amplification[joint];
-        angular_acceleration +=
-            acceleration * motion_bounds.angular_amplification[joint];
-        angular_jerk +=
-            jerk * motion_bounds.angular_amplification[joint];
-        prismatic_speed +=
-            speed * motion_bounds.prismatic_amplification[joint];
-        prismatic_acceleration +=
-            acceleration * motion_bounds.prismatic_amplification[joint];
-        prismatic_jerk +=
-            jerk * motion_bounds.prismatic_amplification[joint];
-      }
-      const long double angular_acceleration_bound =
-          angular_acceleration + angular_speed * angular_speed;
-      const long double angular_jerk_bound =
-          angular_jerk +
-          3.0L * angular_speed * angular_acceleration +
-          angular_speed * angular_speed * angular_speed;
-      const long double radius =
-          static_cast<long double>(motion_bounds.model_radius_m);
-      KinematicDerivativeBounds result;
-      result.angular_acceleration_rad_s2 = angular_acceleration_bound;
-      result.angular_jerk_rad_s3 = angular_jerk_bound;
-      result.linear_acceleration_mps2 =
-          prismatic_acceleration +
-          2.0L * angular_speed * prismatic_speed +
-          radius * angular_acceleration_bound;
-      result.linear_jerk_mps3 =
-          prismatic_jerk +
-          6.0L * angular_speed * prismatic_acceleration +
-          6.0L * angular_acceleration_bound * prismatic_speed +
-          radius * angular_jerk_bound;
-      if (!std::isfinite(result.linear_acceleration_mps2) ||
-          !std::isfinite(result.angular_acceleration_rad_s2) ||
-          !std::isfinite(result.linear_jerk_mps3) ||
-          !std::isfinite(result.angular_jerk_rad_s3)) {
-        return std::nullopt;
-      }
-      return result;
-    };
-
     std::array<std::optional<FrameDynamicsSample>, 5> seed_samples{
-        evaluate_sample(0.0), evaluate_sample(0.25), evaluate_sample(0.5),
-        evaluate_sample(0.75), evaluate_sample(1.0)};
+        evaluate_sample(segment, 0.0), evaluate_sample(segment, 0.25),
+        evaluate_sample(segment, 0.5), evaluate_sample(segment, 0.75),
+        evaluate_sample(segment, 1.0)};
     if (!std::all_of(seed_samples.begin(), seed_samples.end(),
                      [](const auto& sample) { return sample.has_value(); })) {
       if (sample_evaluations > kMaxDynamicsIntervalChecks) {
@@ -694,6 +712,16 @@ measure_cartesian_frame_dynamics_envelope(
     for (const auto& sample : seed_samples) {
       record_observed(*sample);
     }
+    segments.push_back(SeededSegment{
+        std::move(segment),
+        {*seed_samples[0], *seed_samples[1], *seed_samples[2],
+         *seed_samples[3], *seed_samples[4]}});
+  }
+
+  for (std::size_t segment_index = 0; segment_index < segments.size();
+       ++segment_index) {
+    const SegmentPolynomial& segment = segments[segment_index].polynomial;
+    const auto& seed_samples = segments[segment_index].seeds;
 
     struct Interval {
       double lower = 0.0;
@@ -709,8 +737,8 @@ measure_cartesian_frame_dynamics_envelope(
     for (std::size_t seed = 1; seed < kSeedProgress.size(); ++seed) {
       pending.push_back(Interval{kSeedProgress[seed - 1],
                                  kSeedProgress[seed],
-                                 *seed_samples[seed - 1],
-                                 *seed_samples[seed], 0});
+                                 seed_samples[seed - 1],
+                                 seed_samples[seed], 0});
     }
     while (!pending.empty()) {
       Interval interval = std::move(pending.back());
@@ -726,36 +754,36 @@ measure_cartesian_frame_dynamics_envelope(
               std::move(*error));
         }
       }
-      const auto bounds = derivative_bounds(interval.lower, interval.upper);
+      const auto bounds =
+          derivative_bounds(segment, interval.lower, interval.upper);
       if (!bounds.has_value()) {
         envelope.complete = false;
         return core::Result<CartesianFrameDynamicsEnvelope>::Ok(
             std::move(envelope));
       }
-      const long double half_interval_s =
-          0.5L * static_cast<long double>(segment.duration_s) *
-          static_cast<long double>(interval.upper - interval.lower);
-      const long double linear_speed_residual =
+      const double half_interval_s =
+          0.5 * segment.duration_s * (interval.upper - interval.lower);
+      const double linear_speed_residual =
           bounds->linear_acceleration_mps2 * half_interval_s;
-      const long double angular_speed_residual =
+      const double angular_speed_residual =
           bounds->angular_acceleration_rad_s2 * half_interval_s;
-      const long double linear_acceleration_residual =
+      const double linear_acceleration_residual =
           bounds->linear_jerk_mps3 * half_interval_s;
-      const long double angular_acceleration_residual =
+      const double angular_acceleration_residual =
           bounds->angular_jerk_rad_s3 * half_interval_s;
-      const long double linear_speed_upper =
+      const double linear_speed_upper =
           std::max(interval.lower_sample.linear_speed_mps,
                    interval.upper_sample.linear_speed_mps) +
           linear_speed_residual;
-      const long double angular_speed_upper =
+      const double angular_speed_upper =
           std::max(interval.lower_sample.angular_speed_rad_s,
                    interval.upper_sample.angular_speed_rad_s) +
           angular_speed_residual;
-      const long double linear_acceleration_upper =
+      const double linear_acceleration_upper =
           std::max(interval.lower_sample.linear_acceleration_mps2,
                    interval.upper_sample.linear_acceleration_mps2) +
           linear_acceleration_residual;
-      const long double angular_acceleration_upper =
+      const double angular_acceleration_upper =
           std::max(interval.lower_sample.angular_acceleration_rad_s2,
                    interval.upper_sample.angular_acceleration_rad_s2) +
           angular_acceleration_residual;
@@ -778,10 +806,9 @@ measure_cartesian_frame_dynamics_envelope(
         if (interval.depth >= kMaxDynamicsSubdivisionDepth ||
             midpoint <= interval.lower || midpoint >= interval.upper) {
           return core::Result<CartesianFrameDynamicsEnvelope>::Err(
-              dynamics_resource_error(segment_index,
-                                      envelope.interval_checks));
+              dynamics_resource_error(segment_index, envelope.interval_checks));
         }
-        const auto midpoint_sample = evaluate_sample(midpoint);
+        const auto midpoint_sample = evaluate_sample(segment, midpoint);
         if (!midpoint_sample.has_value()) {
           if (sample_evaluations > kMaxDynamicsIntervalChecks) {
             return core::Result<CartesianFrameDynamicsEnvelope>::Err(
@@ -793,9 +820,8 @@ measure_cartesian_frame_dynamics_envelope(
               std::move(envelope));
         }
         record_observed(*midpoint_sample);
-        pending.push_back(Interval{midpoint, interval.upper,
-                                   *midpoint_sample, interval.upper_sample,
-                                   interval.depth + 1});
+        pending.push_back(Interval{midpoint, interval.upper, *midpoint_sample,
+                                   interval.upper_sample, interval.depth + 1});
         pending.push_back(Interval{interval.lower, midpoint,
                                    interval.lower_sample, *midpoint_sample,
                                    interval.depth + 1});
@@ -808,18 +834,149 @@ measure_cartesian_frame_dynamics_envelope(
       envelope.angular_speed_ratio = std::max(
           envelope.angular_speed_ratio,
           static_cast<double>(angular_speed_upper / angular_speed_limit));
-      envelope.linear_acceleration_ratio = std::max(
-          envelope.linear_acceleration_ratio,
-          static_cast<double>(linear_acceleration_upper /
-                              linear_acceleration_limit));
-      envelope.angular_acceleration_ratio = std::max(
-          envelope.angular_acceleration_ratio,
-          static_cast<double>(angular_acceleration_upper /
-                              angular_acceleration_limit));
+      envelope.linear_acceleration_ratio =
+          std::max(envelope.linear_acceleration_ratio,
+                   static_cast<double>(linear_acceleration_upper /
+                                       linear_acceleration_limit));
+      envelope.angular_acceleration_ratio =
+          std::max(envelope.angular_acceleration_ratio,
+                   static_cast<double>(angular_acceleration_upper /
+                                       angular_acceleration_limit));
     }
   }
-  return core::Result<CartesianFrameDynamicsEnvelope>::Ok(
-      std::move(envelope));
+  return core::Result<CartesianFrameDynamicsEnvelope>::Ok(std::move(envelope));
 }
 
-}  // namespace manyforge::roboplan_backend::detail
+// RP-3: active TCP relative to the requested base frame.
+struct TcpVelocityModel final {
+  std::shared_ptr<roboplan::Scene> scene;
+  std::string group_name;
+  Eigen::VectorXi v_indices;
+  pinocchio::FrameIndex tcp_frame{};
+  pinocchio::FrameIndex base_frame{};
+};
+
+std::optional<TcpVelocityModel>
+resolve_tcp_velocity_model(const CartesianTrajectoryContractInput &request,
+                           const std::shared_ptr<roboplan::Scene> &scene) {
+  if (!scene)
+    return std::nullopt;
+  const auto group_info = scene->getJointGroupInfo(request.compiled_group_name);
+  const auto tcp_frame = scene->getFrameId(request.compiled_tcp_frame);
+  const auto base_frame = scene->getFrameId(request.compiled_base_frame);
+  if (!group_info.has_value() || !tcp_frame.has_value() ||
+      !base_frame.has_value() ||
+      group_info->v_indices.size() !=
+          static_cast<Eigen::Index>(group_info->joint_names.size()))
+    return std::nullopt;
+  return TcpVelocityModel{scene, request.compiled_group_name,
+                          group_info->v_indices, *tcp_frame, *base_frame};
+}
+
+// Linear and angular TCP velocity relative to the base frame for group
+// positions and velocities (or a path tangent), in a world-aligned basis.
+std::pair<Eigen::Vector3d, Eigen::Vector3d>
+relative_tcp_velocity(const TcpVelocityModel &tcp, pinocchio::Data &data,
+                      const Eigen::VectorXd &group_positions,
+                      const Eigen::VectorXd &group_velocities) {
+  const auto &model = tcp.scene->getModel();
+  Eigen::VectorXd velocities = Eigen::VectorXd::Zero(model.nv);
+  for (Eigen::Index joint = 0; joint < tcp.v_indices.size(); ++joint)
+    velocities[tcp.v_indices[joint]] = group_velocities[joint];
+  pinocchio::forwardKinematics(
+      model, data,
+      tcp.scene->toFullJointPositions(tcp.group_name, group_positions),
+      velocities);
+  pinocchio::updateFramePlacements(model, data);
+  const auto tip = pinocchio::getFrameVelocity(model, data, tcp.tcp_frame,
+                                               pinocchio::LOCAL_WORLD_ALIGNED);
+  const auto base = pinocchio::getFrameVelocity(
+      model, data, tcp.base_frame, pinocchio::LOCAL_WORLD_ALIGNED);
+  const Eigen::Vector3d displacement =
+      data.oMf[tcp.tcp_frame].translation() -
+      data.oMf[tcp.base_frame].translation();
+  return {Eigen::Vector3d(tip.linear() - base.linear() -
+                          base.angular().cross(displacement)),
+          Eigen::Vector3d(tip.angular() - base.angular())};
+}
+
+}  // namespace
+
+std::optional<TcpPathVelocityBound>
+make_tcp_speed_path_velocity_bound(
+    const CartesianTrajectoryContractInput &request,
+    const core::CartesianPathDTO *path,
+    const std::shared_ptr<roboplan::Scene> &scene) {
+  auto tcp = resolve_tcp_velocity_model(request, scene);
+  const double linear_limit =
+      kTcpSpeedTargetFraction *
+      request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0) *
+      request.speed_profile.velocity_scale;
+  const double angular_limit =
+      path ? kTcpSpeedTargetFraction * path->max_angular_speed_rad_s *
+                 request.speed_profile.velocity_scale
+           : 0.0;
+  if (!tcp.has_value() || !finite_positive(linear_limit) ||
+      (path && !finite_positive(angular_limit)))
+    return std::nullopt;
+  auto data = std::make_shared<pinocchio::Data>(scene->getModel());
+  return TcpPathVelocityBound(
+      [tcp = std::move(*tcp), data = std::move(data), linear_limit,
+       angular_limit](const Eigen::VectorXd &q, const Eigen::VectorXd &dq_ds) {
+        const auto velocity = relative_tcp_velocity(tcp, *data, q, dq_ds);
+        double bound = std::numeric_limits<double>::infinity();
+        if (const double rate = velocity.first.norm(); rate > 0.0)
+          bound = linear_limit / rate;
+        if (const double rate = velocity.second.norm();
+            angular_limit > 0.0 && rate > 0.0)
+          bound = std::min(bound, angular_limit / rate);
+        return bound;
+      });
+}
+
+std::optional<double>
+measure_tcp_sample_speed_ratio(const CartesianTrajectoryContractInput &request,
+                               const core::CartesianPathDTO *path,
+                               const std::shared_ptr<roboplan::Scene> &scene,
+                               const roboplan::JointTrajectory &trajectory) {
+  const auto tcp = resolve_tcp_velocity_model(request, scene);
+  const double linear_limit =
+      request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0) *
+      request.speed_profile.velocity_scale;
+  const double angular_limit =
+      path ? path->max_angular_speed_rad_s * request.speed_profile.velocity_scale
+           : 0.0;
+  if (!tcp.has_value() || !finite_positive(linear_limit) ||
+      (path && !finite_positive(angular_limit)) ||
+      tcp->v_indices.size() !=
+          static_cast<Eigen::Index>(trajectory.joint_names.size()) ||
+      trajectory.velocities.size() != trajectory.positions.size())
+    return std::nullopt;
+  pinocchio::Data data(scene->getModel());
+  double ratio = 0.0;
+  for (std::size_t sample = 0; sample < trajectory.positions.size(); ++sample) {
+    const auto velocity =
+        relative_tcp_velocity(*tcp, data, trajectory.positions[sample],
+                              trajectory.velocities[sample]);
+    ratio = std::max(ratio, velocity.first.norm() / linear_limit);
+    if (path)
+      ratio = std::max(ratio, velocity.second.norm() / angular_limit);
+  }
+  if (!std::isfinite(ratio))
+    return std::nullopt;
+  return ratio;
+}
+
+core::Result<CartesianFrameDynamicsEnvelope>
+measure_cartesian_frame_dynamics_envelope(
+    const CartesianTrajectoryContractInput &request,
+    const core::CartesianPathDTO &path,
+    const std::shared_ptr<roboplan::Scene> &scene,
+    const roboplan::JointTrajectory &trajectory,
+    const CartesianPlanningControl &control) {
+  // The TCP linear-speed limit holds at the active TCP.
+  return measure_one_frame_dynamics_envelope(
+      request, request.compiled_tcp_frame, path, scene, trajectory, control);
+}
+
+} // namespace manyforge::roboplan_backend::detail

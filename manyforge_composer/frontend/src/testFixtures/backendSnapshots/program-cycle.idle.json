@@ -1,0 +1,219 @@
+{
+  "allowed_commands": [
+    {
+      "allowed": true,
+      "command_kind": "cell_full_stop",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "execution_recovery",
+      "disabled_reason": "program_cycle_state_idle_after_reset",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "operation_acknowledge_completed",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "operation_reset",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "operation_start",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "operation_stop",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "program_discard_full_stop",
+      "disabled_reason": "program_run_state_unavailable",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "program_full_stop",
+      "disabled_reason": "program_run_state_unavailable",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "program_manual_handover",
+      "disabled_reason": "program_run_state_unavailable",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "program_manual_result_stage",
+      "disabled_reason": "program_run_state_unavailable",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "program_motion_resume",
+      "disabled_reason": "program_run_state_unavailable",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "program_motion_start",
+      "disabled_reason": "program_run_state_unavailable",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "program_motion_stop",
+      "disabled_reason": "program_run_state_unavailable",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "program_reset",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "program_resume_full_stop",
+      "disabled_reason": "program_run_state_unavailable",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "program_run",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "program_runtime_blackboard_write",
+      "disabled_reason": "program_run_state_unavailable",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": false,
+      "command_kind": "program_stop",
+      "disabled_reason": "program_run_state_unavailable",
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "runtime_scale",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null,
+        "program_runner_owner_epoch": "program-runner.epoch.1"
+      }
+    }
+  ],
+  "causal_client_sequence": null,
+  "causal_correlation_id": null,
+  "causal_session_id": null,
+  "current_command_kind": null,
+  "cycle_claim_generation": null,
+  "cycle_generation": 1,
+  "execution_control_revision": 1,
+  "failure": null,
+  "node_status_revision": null,
+  "program_run_id": null,
+  "program_runner_owner_epoch": "program-runner.epoch.1",
+  "recovery_offer": null,
+  "reset_options": null,
+  "reset_phase": null,
+  "reset_robot_position": {
+    "available": false,
+    "reason": "The active Deployment has no qualified simulator position-reset capability"
+  },
+  "run": null,
+  "run_end": null,
+  "run_revision": null,
+  "runtime_control_revision": null,
+  "runtime_controls": null,
+  "state": "idle_after_reset",
+  "terminal_or_settlement_reference": null
+}

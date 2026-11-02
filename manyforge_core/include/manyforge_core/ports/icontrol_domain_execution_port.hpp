@@ -1,0 +1,42 @@
+#pragma once
+
+#include <manyforge_core/types/participant_stop_stage.hpp>
+#include <manyforge_core/types/spring_back_return_point.hpp>
+#include <stop_token>
+
+namespace manyforge::core {
+
+/// Focused binding-owned Stop-stage realization. Kernel alone selects the
+/// stage and advances/terminalizes the aggregate Stop transaction.
+///
+/// Implementations are admitted only when every provider/transport operation
+/// is independently cancellable or has a retained finite timeout. The call
+/// must return no later than the robot's own Stop-time bound (its supplied
+/// controlled deadline, extended once a Stop trajectory is sent by a normal
+/// motion's no-report bound for it within `controlled_stage_watchdog_ns`, or
+/// its lane's stop-completion timeout for a hard stage, Q51/Q57, M6) and must
+/// not rely on caller thread abandonment to make progress. A provider
+/// that cannot satisfy that property requires a supervised runtime-unit
+/// process with bounded IPC; an ordinary finite worker pool is not sufficient
+/// isolation because hung calls can exhaust it.
+class IControlDomainExecutionPort {
+ public:
+  virtual ~IControlDomainExecutionPort() = default;
+
+  [[nodiscard]] virtual ParticipantStopStageResultDTO TranslateStopStage(
+      const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
+      std::stop_token cancellation) = 0;
+
+  /// Private takeover selection. The selected immutable plan must already
+  /// authorize spring return. Providers without the progress seam retain
+  /// ordinary Stop containment and cannot authorize a successor from it.
+  [[nodiscard]] virtual ParticipantStopStageResultDTO TranslateStopStageForTakeover(
+      const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
+      std::stop_token cancellation, IStopStageSpringReturnObserver& observer) {
+    static_cast<void>(observer);
+    return TranslateStopStage(stage, budget, cancellation);
+  }
+
+};
+
+}  // namespace manyforge::core

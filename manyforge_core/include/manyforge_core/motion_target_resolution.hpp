@@ -9,10 +9,8 @@ namespace manyforge::core {
 /// Resolve one portable motion target against an immutable scene binding.
 /// This is the only policy implementation shared by kernel admission and
 /// non-dispatching preview/plan surfaces.
-Result<MotionSpecDTO> resolve_motion_target(
-    const ExecuteRequestDTO& request,
-    const SceneRevisionBindingDTO& scene_binding,
-    const RobotStateDTO* observed_start_state,
+Result<ResolvedMotionSpecDTO> resolve_motion_target(
+    const ExecuteRequestDTO& request, const ProgramFrameResolutionContextDTO* resolution_context,
     const IReferencePoseResolver& reference_resolver);
 
 }  // namespace manyforge::core

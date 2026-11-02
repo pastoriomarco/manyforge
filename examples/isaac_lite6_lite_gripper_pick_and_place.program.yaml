@@ -1,221 +1,508 @@
-api_version: manyforge.program.v0
-program_profile: v0.1
+api_version: manyforge.program.v2
+program_id: isaac_lite6_lite_gripper_pick_and_place
+program_revision: sha256:949627e589146e217114bc56db7378b83277924278d47f20b241436d13feb619
+program_profile: composable-cell-v1
 name: isaac_lite6_lite_gripper_pick_and_place
-description: >-
-  Isaac-compatible Lite6 pick-and-place program. It uses the same static scene
-  and behavior sequence as the native Lite6 pick-and-place example while
-  targeting the ros2_control / Isaac execution deployment.
+description: Retained Isaac-compatible Lite6 pick-and-place Program. It preserves the scan poses, exact
+  scene and rest coordinates, linear lite-gripper commands, carried-object transitions, and typed simulator
+  lifecycle. Manager-owned observed-scene latching replaces the retired trajectory-reset node.
+catalog:
+  api_version: manyforge.node_catalog.v2
+  content_version: 2.9.0
 compatibility:
-  lanes: [isaac-sim]
+  lanes:
+  - isaac-sim
   assistant: forbidden
-  requires: [ros2_control, lite_gripper]
-  tags: [pick-and-place, isaac-sim, lite6]
-catalog_version: "0.5.0"
-robot:
-  robot_id: lite6
-  group_id: lite6
-  base_frame: link_base
-  tcp_frame: link_tcp
+  requires:
+  - lite_gripper
+  - ros2_control
+  tags:
+  - isaac-sim
+  - lite6
+  - pick-and-place
+component_roles:
+  robot:
+    required_component_type_tags:
+    - articulated-arm
+    required_model_roles:
+    - arm_model
+  tool:
+    required_component_type_tags:
+    - gripper
+target_roles:
+  arm:
+    component_role: robot
+    required_capabilities:
+    - capability_id: execution.feedback.phase_events
+      parameters: {}
+      disposition: required
+    - capability_id: execution.trajectory.execute
+      parameters: {}
+      disposition: required
+    - capability_id: planning.motion.joint_goal
+      parameters: {}
+      disposition: required
+    - capability_id: planning.motion.pose_goal
+      parameters: {}
+      disposition: required
+    - capability_id: planning.trajectory.time_parameterized
+      parameters: {}
+      disposition: required
+    - capability_id: state.observed.current
+      parameters: {}
+      disposition: required
+    - capability_id: validation.trajectory.non_collision
+      parameters: {}
+      disposition: required
+    required_frame_roles:
+    - base
+    required_resource_roles:
+    - arm_joints
+    required_collision_body_roles:
+    - arm_collision
+    required_model_roles:
+    - arm_model
+  gripper:
+    component_role: tool
+    required_capabilities:
+    - capability_id: model.kinematics.fk
+      parameters: {}
+      disposition: required
+    - capability_id: tool.gripper.command
+      parameters: {}
+      disposition: required
+    - capability_id: tool.gripper.feedback
+      parameters: {}
+      disposition: required
+    required_frame_roles:
+    - tcp
+    required_resource_roles:
+    - fingers
+    required_collision_body_roles:
+    - gripper_collision
 scene:
-- object_id: ground
+- scene_resource_id: graspable
   shape:
     type: box
-    box_dimensions_m: [1.0, 1.0, 0.1]
+    box_dimensions_m:
+    - 0.06
+    - 0.015
+    - 0.015
   pose:
-    frame_id: universe
-    position_m: [0.0, 0.0, -0.051]
-    orientation_rpy_deg: [0.0, 0.0, 0.0]
-- object_id: wall
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - 0.18
+    - -0.2
+    - 0.08
+    orientation:
+      rpy_deg:
+      - 0.0
+      - 0.0
+      - 0.0
+  resource_roles:
+  - pick_object
+- scene_resource_id: ground
   shape:
     type: box
-    box_dimensions_m: [1.0, 0.02, 0.2]
+    box_dimensions_m:
+    - 1.0
+    - 1.0
+    - 0.1
   pose:
-    frame_id: universe
-    position_m: [0.0, -0.15, 0.1]
-    orientation_rpy_deg: [0.0, 0.0, 0.0]
-- object_id: graspable
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - 0.0
+    - 0.0
+    - -0.051
+    orientation:
+      rpy_deg:
+      - 0.0
+      - 0.0
+      - 0.0
+- scene_resource_id: wall
   shape:
     type: box
-    box_dimensions_m: [0.06, 0.015, 0.015]
+    box_dimensions_m:
+    - 1.0
+    - 0.02
+    - 0.2
   pose:
-    frame_id: universe
-    position_m: [0.18, -0.20, 0.08]
-    orientation_rpy_deg: [0.0, 0.0, 0.0]
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - 0.0
+    - -0.15
+    - 0.1
+    orientation:
+      rpy_deg:
+      - 0.0
+      - 0.0
+      - 0.0
 parameters:
-- name: velocity_scale
-  type: float
+- parameter_id: velocity_scale
+  type: float64
   default: 0.4
   constraints:
     min_exclusive: 0.0
     max_inclusive: 1.0
-  description: Velocity scale for all Lite6 pick-and-place moves.
+  description: Velocity scale for all Lite6 moves.
 tree:
-  id: sequence
-  name: isaac_lite6_pick_and_place
+  node_id: sequence
+  instance_id: isaac_lite6_pick_and_place
+  parameters: {}
   children:
-  - id: command_gripper
-    name: open_gripper_start
-    params:
-      gripper_id: primary
-      position: 0.0081
-      max_effort: 10.0
-      duration_s: 0.8
-      timeout_s: 0.0
-  - id: move_manipulator_action
-    name: move_to_rest
-    params:
-      move_id: lite6_rest
-      motion_type: joint
-      joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
-      joint_goal_positions_rad: [0.0, -0.785, 0.785, 0.0, 1.57, 0.0]
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: move_manipulator_action
-    name: scan_left
-    params:
-      move_id: lite6_scan_left
-      motion_type: joint
-      joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
-      joint_goal_positions_rad: [-0.175, -0.419, 1.378, 0.349, 1.535, -0.977]
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: move_manipulator_action
-    name: scan_right
-    params:
-      move_id: lite6_scan_right
-      motion_type: joint
-      joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
-      joint_goal_positions_rad: [0.733, -0.297, 1.378, -0.576, 1.692, 1.291]
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: move_manipulator_action
-    name: move_to_pick_approach
-    params:
-      move_id: lite6_pick_approach
-      motion_type: pose
+  - node_id: simulation.set_state
+    instance_id: play_simulation
+    parameters:
+      state: play
+    children: []
+  - node_id: gripper.command_position
+    instance_id: open_gripper_start
+    parameters:
+      target_role: gripper
+      position:
+        kind: linear_m
+        value_m: 0.0081
+      max_effort:
+        kind: linear_newton
+        value_n: 10.0
+      command_duration_s: 0.8
+    children: []
+  - node_id: motion.move_to_joint_target
+    instance_id: move_to_rest
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
+      goal:
+      - joint_name: joint1
+        position_rad: 0.0
+      - joint_name: joint2
+        position_rad: -0.785
+      - joint_name: joint3
+        position_rad: 0.785
+      - joint_name: joint4
+        position_rad: 0.0
+      - joint_name: joint5
+        position_rad: 1.57
+      - joint_name: joint6
+        position_rad: 0.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: motion.move_to_joint_target
+    instance_id: scan_left
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
+      goal:
+      - joint_name: joint1
+        position_rad: -0.175
+      - joint_name: joint2
+        position_rad: -0.419
+      - joint_name: joint3
+        position_rad: 1.378
+      - joint_name: joint4
+        position_rad: 0.349
+      - joint_name: joint5
+        position_rad: 1.535
+      - joint_name: joint6
+        position_rad: -0.977
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: motion.move_to_joint_target
+    instance_id: scan_right
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
+      goal:
+      - joint_name: joint1
+        position_rad: 0.733
+      - joint_name: joint2
+        position_rad: -0.297
+      - joint_name: joint3
+        position_rad: 1.378
+      - joint_name: joint4
+        position_rad: -0.576
+      - joint_name: joint5
+        position_rad: 1.692
+      - joint_name: joint6
+        position_rad: 1.291
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: motion.move_to_pose
+    instance_id: move_to_pick_approach
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
       target_mode: relative
       target_reference:
-        type: object
-        id: graspable
+        type: scene_resource
+        scene_resource_id: graspable
       offset_reference:
-        type: frame
-        id: link_base
-      pose_goal:
-        position_m: [0.0, 0.0, 0.08]
-        orientation_rpy_deg: [180.0, 0.0, 0.0]
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: move_manipulator_action
-    name: move_to_pick
-    params:
-      move_id: lite6_pick_down
-      motion_type: pose
+        type: frame_role
+        frame_role_id: base
+      goal:
+        position_m:
+        - 0.0
+        - 0.0
+        - 0.08
+        orientation:
+          rpy_deg:
+          - 180.0
+          - 0.0
+          - 0.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: motion.move_to_pose
+    instance_id: move_to_pick
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
       target_mode: relative
       target_reference:
-        type: object
-        id: graspable
+        type: scene_resource
+        scene_resource_id: graspable
       offset_reference:
-        type: frame
-        id: link_base
-      pose_goal:
-        position_m: [0.0, 0.0, 0.035]
-        orientation_rpy_deg: [180.0, 0.0, 0.0]
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: command_gripper
-    name: close_gripper
-    params:
-      gripper_id: primary
-      position: 0.0
-      max_effort: 10.0
-      duration_s: 0.8
-      timeout_s: 0.0
-  - id: attach_object_to_link
-    name: attach_graspable
-    params:
-      object_id: graspable
-      link_frame: link_tcp
-      gripper_id: primary
-  - id: move_manipulator_action
-    name: pick_retreat
-    params:
-      move_id: lite6_pick_retreat
-      motion_type: pose
+        type: frame_role
+        frame_role_id: base
+      goal:
+        position_m:
+        - 0.0
+        - 0.0
+        - 0.035
+        orientation:
+          rpy_deg:
+          - 180.0
+          - 0.0
+          - 0.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: gripper.command_position
+    instance_id: close_gripper
+    parameters:
+      target_role: gripper
+      position:
+        kind: linear_m
+        value_m: 0.0
+      max_effort:
+        kind: linear_newton
+        value_n: 10.0
+      command_duration_s: 0.8
+    children: []
+  - node_id: scene.attach_carried_object
+    instance_id: attach_graspable
+    parameters:
+      scene_resource_id: graspable
+      target_role: gripper
+      carrier_frame_role: tcp
+      touch_body_roles:
+      - gripper_collision
+    children: []
+  - node_id: motion.move_to_pose
+    instance_id: pick_retreat
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
       target_mode: relative
       target_reference:
-        type: robot_link
-        id: link_tcp
-      pose_goal:
-        position_m: [0.0, 0.0, -0.08]
-        orientation_rpy_deg: [0.0, 0.0, 0.0]
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: reset_trajectories
-    name: invalidate_after_pick
-  - id: move_manipulator_action
-    name: move_to_drop_approach
-    params:
-      move_id: lite6_drop_approach
-      motion_type: pose
-      pose_goal:
-        frame_id: link_base
-        position_m: [0.16, 0.08, 0.20]
-        orientation_rpy_deg: [180.0, 0.0, 0.0]
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: move_manipulator_action
-    name: move_to_drop
-    params:
-      move_id: lite6_drop_down
-      motion_type: pose
-      pose_goal:
-        frame_id: link_base
-        position_m: [0.16, 0.08, 0.17]
-        orientation_rpy_deg: [180.0, 0.0, 0.0]
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: command_gripper
-    name: open_gripper_release
-    params:
-      gripper_id: primary
-      position: 0.0081
-      max_effort: 10.0
-      duration_s: 0.8
-      timeout_s: 0.0
-  - id: detach_object_from_link
-    name: detach_graspable
-    params:
-      object_id: graspable
-      link_frame: link_tcp
-  - id: move_manipulator_action
-    name: drop_retreat
-    params:
-      move_id: lite6_drop_retreat
-      motion_type: pose
-      pose_goal:
-        frame_id: link_base
-        position_m: [0.16, 0.08, 0.22]
-        orientation_rpy_deg: [180.0, 0.0, 0.0]
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: reset_trajectories
-    name: invalidate_after_drop
-  - id: move_manipulator_action
-    name: return_rest
-    params:
-      move_id: lite6_return_rest
-      motion_type: joint
-      joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
-      joint_goal_positions_rad: [0.0, -0.785, 0.785, 0.0, 1.57, 0.0]
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
+        type: frame_role
+        frame_role_id: tcp
+        target_role: gripper
+      goal:
+        position_m:
+        - 0.0
+        - 0.0
+        - -0.08
+        orientation:
+          rpy_deg:
+          - 0.0
+          - 0.0
+          - 0.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: motion.move_to_pose
+    instance_id: move_to_drop_approach
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
+      goal:
+        frame_ref:
+          kind: target_frame
+          target_role: arm
+          frame_role: base
+        position_m:
+        - 0.16
+        - 0.08
+        - 0.2
+        orientation:
+          rpy_deg:
+          - 180.0
+          - 0.0
+          - 0.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: motion.move_to_pose
+    instance_id: move_to_drop
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
+      goal:
+        frame_ref:
+          kind: target_frame
+          target_role: arm
+          frame_role: base
+        position_m:
+        - 0.16
+        - 0.08
+        - 0.17
+        orientation:
+          rpy_deg:
+          - 180.0
+          - 0.0
+          - 0.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: gripper.command_position
+    instance_id: open_gripper_release
+    parameters:
+      target_role: gripper
+      position:
+        kind: linear_m
+        value_m: 0.0081
+      max_effort:
+        kind: linear_newton
+        value_n: 10.0
+      command_duration_s: 0.8
+    children: []
+  - node_id: scene.detach_carried_object
+    instance_id: detach_graspable
+    parameters:
+      scene_resource_id: graspable
+      target_role: gripper
+    children: []
+  - node_id: motion.move_to_pose
+    instance_id: drop_retreat
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
+      goal:
+        frame_ref:
+          kind: target_frame
+          target_role: arm
+          frame_role: base
+        position_m:
+        - 0.16
+        - 0.08
+        - 0.22
+        orientation:
+          rpy_deg:
+          - 180.0
+          - 0.0
+          - 0.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: motion.move_to_joint_target
+    instance_id: return_rest
+    parameters:
+      target_role: arm
+      base_frame_role: base
+      tcp_endpoint:
+        kind: current
+      goal:
+      - joint_name: joint1
+        position_rad: 0.0
+      - joint_name: joint2
+        position_rad: -0.785
+      - joint_name: joint3
+        position_rad: 0.785
+      - joint_name: joint4
+        position_rad: 0.0
+      - joint_name: joint5
+        position_rad: 1.57
+      - joint_name: joint6
+        position_rad: 0.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    children: []
+    value_sources:
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+  - node_id: simulation.reset
+    instance_id: reset_simulation
+    parameters: {}
+    children: []
+  - node_id: timer
+    instance_id: wait_after_reset
+    parameters:
+      duration_s: 1.0
+    children: []
+  - node_id: simulation.set_state
+    instance_id: pause_simulation
+    parameters:
+      state: pause
+    children: []

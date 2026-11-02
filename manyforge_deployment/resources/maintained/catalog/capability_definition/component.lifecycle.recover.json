@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:7303e9db6f3c6d94b00ed8c448bb98abe156775f562e122cb8046799a7d41e9a",
+  "capability_id": "component.lifecycle.recover",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "control_domain"
+}

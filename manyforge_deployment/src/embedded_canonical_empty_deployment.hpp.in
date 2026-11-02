@@ -1,0 +1,10 @@
+#pragma once
+
+#include <string_view>
+
+namespace manyforge::deployment::detail {
+
+inline constexpr std::string_view kEmbeddedCanonicalEmptyDeployment =
+    R"mf_canon(@MANYFORGE_EMBEDDED_CANONICAL_EMPTY_DEPLOYMENT@)mf_canon";
+
+}  // namespace manyforge::deployment::detail

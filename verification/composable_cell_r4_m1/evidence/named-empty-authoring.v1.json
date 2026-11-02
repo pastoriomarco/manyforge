@@ -1,0 +1,124 @@
+{
+  "schema": "manyforge.composable_cell.r4_m1.named_empty_authoring.v1",
+  "status": "PASS_PRIVATE_FULL_FIX_USER_FRONTEND_ACTIVE_BACKEND_RESTART_PENDING",
+  "date": "2026-10-15",
+  "preceding_result": {
+    "file": "gui-scenario-handoff.v1.json",
+    "sha256": "53e5158d4a71b25e08fbc436087f39b0660ea1cc9a1e9a80f607d99ca48cb51d",
+    "relationship": "This follow-up resolves its distinct New zero-component presentation failure. The earlier failure/churn receipt remains unchanged."
+  },
+  "source": {
+    "base_commit": "d3920e13f0f9560a6b83fd8329570a6bb64d17c2",
+    "patch_sha256": "219bac376d14daa3be8ee5d99cd15c1d7111b53ddd1cbe6804212a76af930b63",
+    "files": {
+      "manyforge_composer/frontend/src/state/viewerModelReadiness.ts": "bb78dbddd08f5d00c2429b7549385eb146cd9627c758c4dbc6046c9e4a31814c",
+      "manyforge_composer/frontend/src/hooks/useHeadlessState.ts": "5c6e06dd392f42c9da557d1f596f278ab3fbeb098602a0eae937e24f54113a34",
+      "manyforge_headless_api/component_overview.py": "58d40aed16244e5e2dd495a6029f54b52aeaa087779941f51a3e5c570d9e43d2",
+      "manyforge_composer/frontend/src/state/viewerModelReadiness.test.ts": "5a3eef6a9af1b64e47c69fff4e0a4387675fadace88860c767c8703477e0aff8",
+      "manyforge_composer/frontend/src/hooks/useHeadlessState.test.ts": "5eedbc03d1e7ea5d73c337b9ce19ab901bf3bcf5121b4e0d76ee3134d0ccc199",
+      "manyforge_headless_api/tests/test_component_overview.py": "7e31e9205fdbfeca7ba1aeab3d15b5170b00f97b61aa9d0d947ebf1b5cb57070"
+    },
+    "scope": "Physical observation/overview applicability uses current exact identity/publication joins, explicit zero physical graph arrays and a typed canonical flag, independent of canonical or named-empty origin. Close, command admission, capability/observation reality, loaded faults and backend wire unchanged.",
+    "source_readback_entries": 2885,
+    "user_and_private_mismatches": 0,
+    "native_binaries_unchanged": true
+  },
+  "owner_checks": {
+    "frontend_passed": 83,
+    "backend_overview_passed": 87,
+    "typescript": "PASS",
+    "scope": "Focused owner gates. No broad rebuild or combined release claim."
+  },
+  "actual_private_browser": {
+    "operation": "After standard private restart, actual GUI New created a second unique saved empty Scenario. Named predecessor required the existing popup; explicit Close and continue acknowledged once. No API substitution or Run.",
+    "new_document_posts": 1,
+    "http_status": 200,
+    "new_request_duration_ms": 744,
+    "canonical_empty": false,
+    "model_instances": 0,
+    "controllable_components": 0,
+    "runtime_units": 1,
+    "graph_revision": "sha256:30f6a38c13a38271e80e2166bc2b28d07c6512afb51da561a984b0774c46a74b",
+    "retained_bundle_id": "sha256:3aa6a7d7f9001ac1c79082a69f566210d9482b3dc3428f40e0acfa682f76be40",
+    "publication_generation": 12,
+    "composer_workspace_applied": {
+      "available": true,
+      "matchesDraft": true,
+      "programRevision": null,
+      "unavailableReason": null
+    },
+    "native_applied_program": {
+      "http_status": 409,
+      "code": "program_not_selected",
+      "meaning": "Saved empty Program Draft exists; no executable Program is selected. Backend expected-absence branch is measured on actual post-New state."
+    },
+    "overview": {
+      "readiness": "ready",
+      "summary_label": "No components"
+    },
+    "viewer_label": "No robot loaded",
+    "errors_badge_present": false,
+    "qualification_errors": [],
+    "idle": {
+      "duration_s": 65.97668,
+      "historian_accepted_before": 0,
+      "historian_accepted_after": 0,
+      "viewer_active_sockets_before": 0,
+      "viewer_active_sockets_after": 0,
+      "viewer_socket_creations_before": 5,
+      "viewer_socket_creations_after": 5
+    },
+    "initial_transition_limit": "Five observation connections/errors occurred before the accepted zero-physical fact during New/Close transitions. There were no durable history rows in this restarted API epoch; after acceptance, socket creations stayed 5 and active sockets stayed 0 during the bounded idle window.",
+    "browser": "Firefox 156; Mesa llvmpipe software rendering; no graphics performance claim."
+  },
+  "user_deployment": {
+    "source_synced_utc": "2026-10-15T21:12:14.897418+00:00",
+    "six_file_preimage_posthash_checks": true,
+    "frontend_hot_reload": "ACTIVE: both product modules served by current Vite. Four frontend paths synced including tests.",
+    "python_backend": "PENDING: both Python files copied to source, but existing user Headless API interpreter has not reloaded the overview change. Explicit user-approved restart required.",
+    "user_workbench_restart_performed": false,
+    "user_scenario_or_runtime_mutation_by_this_gate": false,
+    "history_purged": false
+  },
+  "restart_findings": {
+    "private_standard_restart": "Loaded Python correction without compilation; Manager named-empty bundle/graph/publication survived unchanged.",
+    "composer_authoring_state": "In-memory authoring workspace reset to a new epoch with no loaded Draft on restart; saved project files remained. Actual GUI New was then performed to qualify the intended post-New state.",
+    "user_implication": "A full Workbench restart interrupts providers and resets the current authoring session. Save work first; read current state again after explicit restart approval. No API-only reload is supported by the current supervisor."
+  },
+  "limits": [
+    "No additional Load/Run, real robot, Isaac or manual motion was performed in this follow-up. Loaded guards are covered by focused owning tests and preceding GUI evidence; this receipt adds actual New/idle proof.",
+    "Historical rows were not purged or acknowledged. Process counters reset on private restart and are compared only within that restarted epoch.",
+    "The user backend remains pending; private success does not imply the running user reducer is already updated."
+  ],
+  "provenance": [
+    {
+      "receipt": "named-empty-source-sync.json",
+      "sha256": "b3e61586ab0b99681082f9b4f2d3312a792fdec32b545d92141c0b9b5764c98c"
+    },
+    {
+      "receipt": "named-empty-private-postrestart.json",
+      "sha256": "4b7785987d258ef7a047a9a0bf24adcf00e9c6bf21a2e03a86f5a59a9bca02f2"
+    },
+    {
+      "receipt": "named-empty-after-actual-new-api.json",
+      "sha256": "caed857b7162589c4620783369b3b27b40c0cada8b0fbcbe566048b230a7dfff"
+    },
+    {
+      "receipt": "named-empty-after-actual-new-browser.json",
+      "sha256": "f897ec91ab233bf221da0643c766aa6dcfcd7dd246a9793fee562edb4d86f085"
+    },
+    {
+      "receipt": "named-empty-idle-after-api.json",
+      "sha256": "77043382f02e03fdbfe5083a08012c356bbf5bbc3ba66f60568f73de9b21a0d0"
+    },
+    {
+      "receipt": "named-empty-idle-after-browser.json",
+      "sha256": "f897ec91ab233bf221da0643c766aa6dcfcd7dd246a9793fee562edb4d86f085"
+    },
+    {
+      "receipt": "named-empty-final-source-readback.json",
+      "sha256": "6928dbbfa8488db875fcf3a2dfc2f9784582b79dc3aac3ced96a6f41667e424d"
+    }
+  ],
+  "retention_note": "Self-contained portable results. Receipt basenames/hashes identify local provenance without promising raw artifacts remain available. Machine addresses, user names and home paths are excluded."
+}

@@ -1,0 +1,139 @@
+diff --git a/roboplan_cartesian_planning/src/cartesian_path_planner.cpp b/roboplan_cartesian_planning/src/cartesian_path_planner.cpp
+--- a/roboplan_cartesian_planning/src/cartesian_path_planner.cpp
++++ b/roboplan_cartesian_planning/src/cartesian_path_planner.cpp
+@@ -647,6 +647,36 @@ CartesianPathPlanner::timeBounded(const ResolvedPath& resolved) const {
+       return tl::make_unexpected("The Cartesian path has a span with no tool motion.");
+     }
+ 
++    // The tool's lateral acceleration on a curve of radius r is v^2 / r. Each waypoint inside the
++    // run gets the radius of the circle through it and its neighbors, and each sample whose span
++    // reaches into the waypoint's neighboring spans takes that curve. As a rate of the path
++    // parameter, the lateral acceleration is then curvatures[j] * s_dot^2.
++    std::vector<double> curvatures(count, 0.0);
++    const auto run_begin = s.begin() + first;
++    const auto run_end = s.begin() + last + 1;
++    for (const auto& reference : resolved.references) {
++      const auto& c = reference.cumulative;
++      for (size_t w = 1; w + 1 < c.size(); ++w) {
++        const Eigen::Vector3d p0 = reference.waypoints.at(w - 1).topRightCorner<3, 1>();
++        const Eigen::Vector3d p1 = reference.waypoints.at(w).topRightCorner<3, 1>();
++        const Eigen::Vector3d p2 = reference.waypoints.at(w + 1).topRightCorner<3, 1>();
++        const double chords = (p1 - p0).norm() * (p2 - p1).norm() * (p2 - p0).norm();
++        // A stop is passed at rest, so its turn takes no lateral acceleration.
++        if (c.at(w) <= s.at(first) + kEps || c.at(w) >= s.at(last) - kEps || chords <= 0.0) {
++          continue;
++        }
++        const double curvature =
++            2.0 * (p1 - p0).cross(p2 - p1).norm() / chords * linear_rate * linear_rate;
++        auto from = std::upper_bound(run_begin, run_end, c.at(w - 1));
++        from = from == run_begin ? from : from - 1;
++        const auto to = std::min(std::lower_bound(from, run_end, c.at(w + 1)), run_end - 1);
++        for (auto it = from; it <= to; ++it) {
++          auto& sample_curvature = curvatures.at(static_cast<size_t>(it - run_begin));
++          sample_curvature = std::max(sample_curvature, curvature);
++        }
++      }
++    }
++
+     // The fastest allowed path speed and acceleration at each sample. Along the path, the joint
+     // velocity is q' * s_dot and the joint acceleration is q' * s_ddot + q'' * s_dot^2. The speed
+     // is capped so that the q'' term takes at most half of each joint's acceleration limit, and the
+@@ -662,10 +692,14 @@ CartesianPathPlanner::timeBounded(const ResolvedPath& resolved) const {
+                                     .cwiseAbs()
+                                     .cwiseMax(ddq.at(j).cwiseAbs())
+                                     .cwiseMax(ddq.at(after).cwiseAbs());
++      // The tool's lateral acceleration on curves is held the same way, against the linear limit.
+       speeds.at(j) = std::min(
+-          {speed, (v_max.array() / d1).minCoeff(), (0.5 * a_max.array() / d2).sqrt().minCoeff()});
++          {speed, (v_max.array() / d1).minCoeff(), (0.5 * a_max.array() / d2).sqrt().minCoeff(),
++           std::sqrt(0.5 * options_.max_linear_acceleration / curvatures.at(j))});
+       accelerations.at(j) = std::min(
+-          acceleration, ((a_max.array() - d2 * speeds.at(j) * speeds.at(j)) / d1).minCoeff());
++          {acceleration, ((a_max.array() - d2 * speeds.at(j) * speeds.at(j)) / d1).minCoeff(),
++           (options_.max_linear_acceleration - curvatures.at(j) * speeds.at(j) * speeds.at(j)) /
++               linear_rate});
+     }
+ 
+     // Start and end at rest, changing speed no faster than the path acceleration allows. Over a
+diff --git a/roboplan_cartesian_planning/test/test_cartesian_path_planner.cpp b/roboplan_cartesian_planning/test/test_cartesian_path_planner.cpp
+--- a/roboplan_cartesian_planning/test/test_cartesian_path_planner.cpp
++++ b/roboplan_cartesian_planning/test/test_cartesian_path_planner.cpp
+@@ -1,6 +1,8 @@
+ #include <gtest/gtest.h>
+ #include <stdexcept>
+ 
++#include <cmath>
++#include <limits>
+ #include <memory>
+ #include <vector>
+ 
+@@ -517,6 +519,69 @@ TEST_F(CartesianPlannerTest, BoundedModeSlowsOnlyWhereJointLimitsBind) {
+   EXPECT_LE(peak_acceleration_ratio, options.acceleration_scale + 1e-3);
+ }
+ 
++// On a rounded corner, Bounded mode slows the tool down only along the arc, so that its lateral
++// acceleration v^2 / r stays within the linear acceleration limit, and runs through it without a
++// stop.
++TEST_F(CartesianPlannerTest, BoundedModeSlowsOnlyOnCurves) {
++  JointConfiguration q_start;
++  q_start.positions = scene_->getCurrentJointPositions();
++  q_start.positions.head(6) << 0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0;
++  scene_->setJointPositions(q_start.positions);
++
++  CartesianPlannerOptions options;
++  options.group_name = kGroup;
++  options.speed_mode = CartesianSpeedMode::Bounded;
++  options.max_linear_speed = 0.15;
++  options.max_linear_acceleration = 0.4;
++  // Resolve the arc finely enough that the sampled tool positions follow its curve.
++  options.position_tolerance = 0.001;
++  CartesianPathPlanner planner(scene_, options);
++
++  // Along base y, a quarter circle of radius 10 mm in 0.05 rad steps, then along base z.
++  constexpr double kRadius = 0.01;
++  const Eigen::Matrix4d start = scene_->forwardKinematics(q_start.positions, kTipFrame, kBaseFrame);
++  std::vector<Eigen::Matrix4d> waypoints{start};
++  for (int k = 0; k <= 32; ++k) {
++    const double angle = 0.5 * M_PI * k / 32;
++    Eigen::Matrix4d pose = start;
++    pose(1, 3) += 0.1 + kRadius * std::sin(angle);
++    pose(2, 3) += kRadius * (1.0 - std::cos(angle));
++    waypoints.push_back(pose);
++  }
++  Eigen::Matrix4d end = waypoints.back();
++  end(2, 3) += 0.1;
++  waypoints.push_back(end);
++  const auto result =
++      planner.plan(CartesianPath({kBaseFrame}, {kTipFrame}, {waypoints}), q_start);
++  ASSERT_TRUE(result.has_value()) << result.error();
++
++  std::vector<Eigen::Vector3d> positions;
++  for (const auto& q : result->positions) {
++    const Eigen::VectorXd q_full = scene_->toFullJointPositions(kGroup, q);
++    positions.push_back(scene_->forwardKinematics(q_full, kTipFrame, kBaseFrame).block<3, 1>(0, 3));
++  }
++  const double arc_speed = std::sqrt(options.max_linear_acceleration * kRadius);
++  double peak_speed = 0.0;
++  double min_speed = std::numeric_limits<double>::infinity();
++  for (size_t i = 1; i + 1 < positions.size(); ++i) {
++    const double speed = (positions.at(i + 1) - positions.at(i - 1)).norm() / (2.0 * options.dt);
++    peak_speed = std::max(peak_speed, speed);
++    // On the arc: slow enough for its curvature, but still moving.
++    const Eigen::Vector3d offset = positions.at(i) - start.block<3, 1>(0, 3);
++    if (offset.y() > 0.1 + 1e-3 && offset.z() < kRadius - 1e-3) {
++      EXPECT_LE(speed, 1.05 * arc_speed);
++      min_speed = std::min(min_speed, speed);
++    }
++    // The tool's whole acceleration stays within the linear limit.
++    const Eigen::Vector3d acceleration =
++        (positions.at(i + 1) - 2.0 * positions.at(i) + positions.at(i - 1)) /
++        (options.dt * options.dt);
++    EXPECT_LE(acceleration.norm(), 1.1 * options.max_linear_acceleration);
++  }
++  EXPECT_GT(min_speed, 0.5 * arc_speed);
++  EXPECT_NEAR(peak_speed, options.max_linear_speed, 0.002);
++}
++
+ TEST_F(CartesianPlannerTest, PeakLimitRatiosSkipUnlimitedJoints) {
+   // Without the YAML config the URDF provides no acceleration limits.
+   const auto model_prefix = example_models::get_package_models_dir();

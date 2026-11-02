@@ -1,0 +1,196 @@
+{
+  "schema_version": "manyforge.reset_observation_live_readback.v1",
+  "status": "CURRENT_FIX_SERVED_CURRENT_RUNTIME_HEALTHY_SCREENSHOT_TIME_UNPROVEN",
+  "captured_utc": "2026-10-16T09:42:25.462599+00:00",
+  "source_readback_utc": "2026-10-16T09:42:58.615828+00:00",
+  "source_sha256": {
+    "App.tsx": "d43dd53d0953361691a9368bd3f0cdb7ed630247764eb44611278aa30fdb97ff",
+    "state/scenarioClose.ts": "e4b67f4a1e585cda3132d84b877f45d26e26d3ae0e541a321196fb782bd73ad4",
+    "components/ProgramNodePalette.tsx": "17aa9c5bdb4c46889556af513a553f1c888bcdd0ff9cb78b599026a612c701ae",
+    "styles/surfaces/program-canvas.css": "849ab4f81afab22dfcf72190f051049224f1e1ef08320b0ec8c59c83167010be"
+  },
+  "served_modules": {
+    "App.tsx": {
+      "status": 200,
+      "sha256": "8615a7846f3137ce9dd2afdaf420e7431e5c4b3bf38313fd6e34418d103883d3",
+      "markers": {
+        "readResetSnapshot": true,
+        "resetCloseSnapshot": true,
+        "documentMotionActive": true
+      }
+    },
+    "state/scenarioClose.ts": {
+      "status": 200,
+      "sha256": "a134a7bc6b48cad80ab5ed7287d78dcf56ec6751d88b934d808e761b5c6f9ed4",
+      "markers": {
+        "resetCloseSnapshot": true,
+        "readResetSnapshot": true,
+        "synchronizing": true
+      }
+    }
+  },
+  "cycle": {
+    "state": "idle_after_reset",
+    "cycle_generation": 8,
+    "cycle_claim_generation": null,
+    "program_run_id": null,
+    "failure": null,
+    "reset_phase": null,
+    "causal_correlation_id": "program-cycle-reset.1792141803998-7c38f3c4c9ac88",
+    "execution_control_revision": 55
+  },
+  "control": {
+    "cycle_state": "idle_after_reset",
+    "cycle_generation": 8,
+    "causal_correlation_id": "program-cycle-reset.1792141803998-7c38f3c4c9ac88",
+    "causal_session_id": "control-session.7071c10ff73541d1ade47b119260fe1d",
+    "causal_client_sequence": "6240",
+    "execution_control_revision": 55,
+    "current_failure": null,
+    "recovery_required": false
+  },
+  "authoring_admission": {
+    "admission_generation": 275,
+    "authoring_allowed": true
+  },
+  "health": "ready",
+  "durable_current_reset_result": {
+    "admission": {
+      "admission_generation": 245,
+      "authoring_allowed": false
+    },
+    "idle_cycle_generation": 8,
+    "program_run_id": "program-cycle.7",
+    "reset_cycle_generation": 7,
+    "runtime_controls": {
+      "audit": [
+        {
+          "action_id": "reset_cycle",
+          "correlation_id": "program-cycle-reset.1792141803998-7c38f3c4c9ac88",
+          "event_revision": 1,
+          "kind": "program_runtime_controls_reset",
+          "request_id": "program-cycle-reset.1792141803998-7c38f3c4c9ac88",
+          "source_label": "operator_ui"
+        }
+      ],
+      "program_run_id": "program-cycle.7",
+      "recovery_fences": {
+        "deployment_generation": 13,
+        "pose_source_apply_generation": 0,
+        "program_generation": 1,
+        "scene_admission_epoch": 242
+      },
+      "retry_counts": {},
+      "runtime_control_revision": 2,
+      "schema_version": "manyforge.program_runtime_controls.v3"
+    },
+    "schema_version": "manyforge.program_cycle_reset_result.v1",
+    "settlement_reference": "sha256:0f799c49874b63cd0343037241f97a12314f50afa1448687c3ae5b91ce5fe0e1"
+  },
+  "inflight_commands": 0,
+  "successful_http_loads_after_observation_fix": [
+    {
+      "timestamp": "2026-10-16T09:06:05.998988179Z",
+      "status": 200,
+      "request_id": "7d8f4eb44b504618"
+    },
+    {
+      "timestamp": "2026-10-16T09:09:30.351160029Z",
+      "status": 200,
+      "request_id": "37767e90873e4491"
+    },
+    {
+      "timestamp": "2026-10-16T09:13:34.869705879Z",
+      "status": 200,
+      "request_id": "7da92baa7cae4f0a"
+    }
+  ],
+  "new_close_correlation": "No newer composer-close correlation observable in current facts or available logs. Current causal ID is a later ordinary manual Reset. Historical overwritten Close correlations are not fully retained by this journal.",
+  "limits": [
+    "Screenshot timestamp and exact browser semantic state at failure remain unknown.",
+    "Current readiness does not establish the cause or timing of an earlier screenshot.",
+    "Program journal stores current causal ID; matching Historian query returned no composer-close event, so absence is not proof no earlier Close Reset occurred.",
+    "No client-side WebSocket frame ring is available from this readback."
+  ],
+  "preservation": {
+    "palette_r2_source_read_only": true,
+    "source_writes": [],
+    "runtime_commands": [],
+    "restart": false,
+    "probes_stopped": true
+  },
+  "raw_evidence_identifier": "dx1073-close-observation-current-20261016",
+  "raw_sha256": {
+    "api.json": "3acb4edf35d3f330f9492b7b45e1f04619072a66eb681ffbd354aa1a74028dd5",
+    "source-readback.json": "131c40213ba0d29766522b4a0f7f67fd501bf8e5f1cc18bb52e552c8c7fefb8f",
+    "durable-correlations.json": "5f760e9537b2af596329ec5fe6a46c52636b8f19746d95577df5d73a08c1c5a5",
+    "since-fix.log": "f176743c4cdc6c331ace76783ff5a8c1a8a00ea1358db6a39f8022fdd14091be"
+  },
+  "follow_up_checks": [
+    {
+      "captured_utc": "2026-10-16T10:33:29.219725+00:00",
+      "source_readback_utc": "2026-10-16T10:33:51.229140+00:00",
+      "cycle": {
+        "state": "idle_after_reset",
+        "cycle_generation": 8,
+        "program_run_id": null,
+        "cycle_claim_generation": null,
+        "causal_correlation_id": "program-cycle-reset.1792141803998-7c38f3c4c9ac88",
+        "execution_control_revision": 55,
+        "failure": null,
+        "reset_phase": null
+      },
+      "admission": {
+        "admission_generation": 275,
+        "authoring_allowed": true
+      },
+      "source_sha256": {
+        "App.tsx": "d43dd53d0953361691a9368bd3f0cdb7ed630247764eb44611278aa30fdb97ff",
+        "state/scenarioClose.ts": "e4b67f4a1e585cda3132d84b877f45d26e26d3ae0e541a321196fb782bd73ad4",
+        "components/ProgramNodePalette.tsx": "17aa9c5bdb4c46889556af513a553f1c888bcdd0ff9cb78b599026a612c701ae",
+        "styles/surfaces/program-canvas.css": "849ab4f81afab22dfcf72190f051049224f1e1ef08320b0ec8c59c83167010be"
+      },
+      "served_modules": {
+        "App.tsx": {
+          "status": 200,
+          "sha256": "8615a7846f3137ce9dd2afdaf420e7431e5c4b3bf38313fd6e34418d103883d3",
+          "markers": {
+            "readResetSnapshot": true,
+            "resetCloseSnapshot": true,
+            "documentMotionActive": true
+          }
+        },
+        "state/scenarioClose.ts": {
+          "status": 200,
+          "sha256": "a134a7bc6b48cad80ab5ed7287d78dcf56ec6751d88b934d808e761b5c6f9ed4",
+          "markers": {
+            "resetCloseSnapshot": true,
+            "readResetSnapshot": true,
+            "synchronizing": true
+          }
+        }
+      },
+      "same_cycle_revision_and_correlation_as_prior_check": true,
+      "http_post_warning_error_since_prior_check": 0,
+      "control_diagnostics": {
+        "active_clients": 1,
+        "source_failures": 0,
+        "stale_transitions": 0,
+        "heartbeat_challenges": 39627,
+        "heartbeat_echoes": 39627
+      },
+      "interpretation": "No fresh server-side Reset/Close is observable since prior check. A browser-local failure before reaching the server remains possible; screenshot age is not established. Current failed dialog can be cancelled and reopened by the user to clear that attempt; idle path should not submit another Reset.",
+      "runtime_commands": [],
+      "restart": false,
+      "source_writes": [],
+      "palette_r2_preserved": true,
+      "probes_stopped": true,
+      "raw_evidence_identifier": "dx1086-close-observation-current-20261016",
+      "raw_sha256": {
+        "api.json": "3040f54cab2dc48a9ece7146d35815b90ba7cfb7a136c006613dbdf7d0e5fe90",
+        "source-readback.json": "928c4a3e7c250b80f33005da35db339062ab96a6e986252ec5d7d49ed9ed5bd2",
+        "docker.log": "a6715d6db1cb6d5e876a7454b472b9afccc6dd3639e266dbdb44b5236dbbb13c"
+      }
+    }
+  ]
+}

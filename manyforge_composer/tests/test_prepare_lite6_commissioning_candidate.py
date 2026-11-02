@@ -1,9 +1,19 @@
+"""Tests for retained Lite6 commissioning safety logic and the I10 gate.
+
+The historical implementation blob
+``1bb14aa35ed0b1c2ab7909dff8be86f016179754`` and test blob
+``0248ca9da10b5a883126e43ea91b71c4cdf96541`` assigned their removed case
+families as follows: old Composer status/candidate wire behavior to I6-I8,
+preview/evidence client integration to I10/R, and the one-degree/freshness
+safety checks retained below in effect-free form.
+"""
+
 from __future__ import annotations
 
 import importlib.util
 import math
 from pathlib import Path
-from typing import Any, Mapping
+import sys
 
 import pytest
 
@@ -20,145 +30,82 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
-
-def _responses() -> dict[str, dict[str, Any]]:
-    joints = [f"joint{index}" for index in range(1, 7)]
-    positions = [0.1, -0.2, 0.3, -0.4, 0.5, -0.6]
-    return {
-        "/api/robot-lifecycle/status": {
-            "configured": True,
-            "providerHealthy": True,
-            "fresh": True,
-            "canExecute": True,
-            "motionAdmitted": True,
-            "positionValid": "true",
-            "robotEnabled": "true",
-            "vendorControlReady": "true",
-            "hardwareComponentActive": "true",
-            "trajectoryControllerActive": "true",
-            "reconciliationRequired": False,
-        },
-        "/api/runtime/status": {
-            "profileKind": "real_robot",
-            "canExecute": True,
-        },
-        "/api/cycle/status": {
-            "state": "idle",
-            "motionStopState": "idle",
-            "error": None,
-        },
-        "/api/scene/state": {
-            "robot": {
-                "robot_id": "lite6-a",
-                "state_source": "observed_ros2",
-                "source_age_ns": 10_000_000,
-                "joint_names": joints,
-                "joint_positions": dict(zip(joints, positions)),
-            },
-        },
-    }
+HISTORICAL_TEST_BLOB = "0248ca9da10b5a883126e43ea91b71c4cdf96541"
+HISTORICAL_CASE_DISPOSITION = {
+    "preview_without_execute": ("I6", "I7", "I8", "I10", "R"),
+    "closed_lifecycle_before_candidate": ("I7", "I8", "I10", "R"),
+    "stale_observation_before_candidate": ("I5", "H0", "I10", "R"),
+    "zero_out_of_bounds_or_nonfinite_delta": ("I10", "R"),
+}
 
 
-class FakeTransport:
-    def __init__(self, responses: dict[str, dict[str, Any]]) -> None:
-        self.responses = responses
-        self.calls: list[tuple[str, str, Mapping[str, Any] | None]] = []
-
-    def __call__(
-        self,
-        method: str,
-        path: str,
-        payload: Mapping[str, Any] | None,
-    ) -> dict[str, Any]:
-        self.calls.append((method, path, payload))
-        if path == "/api/robot-control/candidates":
-            assert payload is not None
-            joint = payload["jointTarget"]["jointNames"][0]
-            requested = payload["jointTarget"]["positionsRad"][0]
-            joints = [f"joint{index}" for index in range(1, 7)]
-            positions = [0.1, -0.2, 0.3, -0.4, 0.5, -0.6]
-            positions[joints.index(joint)] = requested
-            return {
-                "candidateId": "candidate-1",
-                "status": "ready",
-                "commitEligible": True,
-                "normalizedJointTarget": {
-                    "jointNames": joints,
-                    "positionsRad": positions,
-                },
-            }
-        return self.responses[path]
+def _names() -> tuple[str, ...]:
+    return tuple(f"cell-a/lite6/joint{index}" for index in range(1, 7))
 
 
-def test_prepares_bounded_candidate_without_execute_request() -> None:
-    transport = FakeTransport(_responses())
+def test_previews_only_one_bounded_caller_addressed_joint() -> None:
+    names = _names()
+    starts = (0.1, -0.2, 0.3, -0.4, 0.5, -0.6)
 
-    result = _MODULE.prepare_candidate(
-        base_url="http://unused",
-        joint="joint2",
+    preview = _MODULE.preview_bounded_joint_delta(
+        joint_names=names,
+        start_positions_rad=starts,
+        target_joint=names[1],
         delta_deg=-0.5,
-        request_json=transport,
     )
 
-    assert result["motionDispatched"] is False
-    assert result["operatorApprovalRequired"] is True
-    assert result["candidate"]["candidateId"] == "candidate-1"
-    post = transport.calls[-1]
-    assert post[0:2] == ("POST", "/api/robot-control/candidates")
+    assert preview.joint_names == names
+    assert preview.start_positions_rad == starts
     assert math.isclose(
-        post[2]["jointTarget"]["positionsRad"][0],
-        -0.2 + math.radians(-0.5),
+        preview.target_positions_rad[1],
+        starts[1] + math.radians(-0.5),
     )
-    assert not any(path.endswith("/execute") for _, path, _ in transport.calls)
-
-
-def test_refuses_closed_lifecycle_before_candidate_creation() -> None:
-    responses = _responses()
-    responses["/api/robot-lifecycle/status"]["canExecute"] = False
-    transport = FakeTransport(responses)
-
-    with pytest.raises(
-        _MODULE.CommissioningRefusal,
-        match="canExecute=true",
-    ):
-        _MODULE.prepare_candidate(
-            base_url="http://unused",
-            joint="joint1",
-            delta_deg=0.5,
-            request_json=transport,
+    assert all(
+        target == start
+        for index, (start, target) in enumerate(
+            zip(starts, preview.target_positions_rad)
         )
-
-    assert not any(method == "POST" for method, _, _ in transport.calls)
-
-
-def test_refuses_stale_observed_state_before_candidate_creation() -> None:
-    responses = _responses()
-    responses["/api/scene/state"]["robot"]["source_age_ns"] = 251_000_000
-    transport = FakeTransport(responses)
-
-    with pytest.raises(_MODULE.CommissioningRefusal, match="state is stale"):
-        _MODULE.prepare_candidate(
-            base_url="http://unused",
-            joint="joint1",
-            delta_deg=0.5,
-            request_json=transport,
-        )
-
-    assert not any(method == "POST" for method, _, _ in transport.calls)
+        if index != 1
+    )
 
 
-@pytest.mark.parametrize("delta", [0.0, -1.001, 1.001, math.inf])
-def test_refuses_unbounded_or_invalid_delta(delta: float) -> None:
-    transport = FakeTransport(_responses())
-
+@pytest.mark.parametrize("delta", [0.0, -1.001, 1.001, math.inf, True])
+def test_refuses_unbounded_or_invalid_delta(delta: object) -> None:
     with pytest.raises(_MODULE.CommissioningRefusal):
-        _MODULE.prepare_candidate(
-            base_url="http://unused",
-            joint="joint1",
+        _MODULE.preview_bounded_joint_delta(
+            joint_names=_names(),
+            start_positions_rad=(0.0,) * 6,
+            target_joint=_names()[0],
             delta_deg=delta,
-            request_json=transport,
         )
 
-    assert transport.calls == []
+
+def test_refuses_stale_or_malformed_observation_before_preview() -> None:
+    with pytest.raises(_MODULE.CommissioningRefusal, match="stale"):
+        _MODULE.require_fresh_source_age(251_000_000)
+    with pytest.raises(_MODULE.CommissioningRefusal, match="six joints"):
+        _MODULE.preview_bounded_joint_delta(
+            joint_names=_names()[:-1],
+            start_positions_rad=(0.0,) * 5,
+            target_joint=_names()[0],
+            delta_deg=0.5,
+        )
+
+
+def test_direct_client_fails_with_stable_gate_before_effects(capsys) -> None:
+    assert _MODULE.main() == 78
+    assert (
+        _MODULE.LITE6_COMMISSIONING_UNAVAILABLE_REASON_CODE
+        in capsys.readouterr().err
+    )
+
+
+def test_all_historical_candidate_case_families_remain_assigned() -> None:
+    assert HISTORICAL_TEST_BLOB == (
+        "0248ca9da10b5a883126e43ea91b71c4cdf96541"
+    )
+    assert len(HISTORICAL_CASE_DISPOSITION) == 4
+    assert all("R" in gates for gates in HISTORICAL_CASE_DISPOSITION.values())

@@ -1,1121 +1,363 @@
-"""Tests for the orchestrator runner."""
+"""First Program-Binding Behavior caller remains transport-only."""
 
-from pathlib import Path
-from manyforge_behavior.node_environment import build_node_environment
-from unittest.mock import patch
+from __future__ import annotations
+
+from typing import Any, Mapping
 
 import pytest
-import py_trees
-import yaml
 
-from manyforge_behavior.catalog import NodeCatalog
-from manyforge_behavior.deployment import Deployment
-from manyforge_behavior.kernel_client import ExecutionState, MockKernelClient
-from manyforge_behavior.program import Program, ProgramValidationError, SceneResource
+from manyforge_behavior.kernel_client import (
+    KernelClient,
+    KernelClientResponseError,
+)
 from manyforge_behavior.runner import OrchestratorRunner
 
-CATALOG_PATH = str(Path(__file__).parent.parent / "resources" / "node_catalog.yaml")
-NODE_ENVIRONMENT = build_node_environment(CATALOG_PATH)
-FIXTURE_PATH = str(
-    Path(__file__).parent / "fixtures" / "pick_and_place.program.yaml"
-)
-DEPLOYMENT_FIXTURE = str(
-    Path(__file__).parent / "fixtures" / "test.deployment.yaml"
-)
-VISION_PROGRAM_EXAMPLE = str(
-    Path(__file__).parent.parent.parent / "examples" / "vision_guided_bin_pick.program.yaml"
-)
-VISION_DEPLOYMENT_EXAMPLE = str(
-    Path(__file__).parent.parent.parent / "examples" / "vision_guided_bin_pick.deployment.yaml"
-)
-VISION_POSE_PROGRAM_EXAMPLE = str(
-    Path(__file__).parent.parent.parent / "examples" / "vision_guided_pose_pick.program.yaml"
-)
-VISION_POSE_DEPLOYMENT_EXAMPLE = str(
-    Path(__file__).parent.parent.parent / "examples" / "vision_guided_pose_pick.deployment.yaml"
-)
-SEMANTIC_SHAPE_PROGRAM_EXAMPLE = str(
-    Path(__file__).parent.parent.parent / "examples" / "semantic_shape_pick.program.yaml"
-)
-SEMANTIC_SHAPE_DEPLOYMENT_EXAMPLE = str(
-    Path(__file__).parent.parent.parent / "examples" / "semantic_shape_pick.deployment.yaml"
-)
+
+class RecordingTransport:
+    def __init__(self) -> None:
+        self.submitted: Mapping[str, Any] | None = None
+        self.controls: list[tuple[str, str, Mapping[str, Any]]] = []
+
+    def identity(self) -> dict[str, Any]:
+        # execution_identity.v2: runtime identity only (H1a-IF.2).
+        return {
+            "ok": True,
+            "identity": {
+                "schema_version": "manyforge.execution_identity.v2",
+                "owner_epoch": "owner-epoch-7",
+                "cell_id": "cell-1",
+                "active_publication_generation": 1,
+                "control_management_mode": "component_lifecycle",
+                "graph_revision": "sha256:" + "2" * 64,
+                "retained_bundle_id": "sha256:" + "3" * 64,
+            },
+        }
+
+    def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        self.submitted = body
+        return {
+            "ok": True,
+            "accepted": {"operation_id": "operation-1"},
+        }
+
+    def read(self, operation_id: str) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "operation": {"operation_id": operation_id, "state": "completed"},
+        }
+
+    def _control(
+        self, kind: str, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        self.controls.append((kind, operation_id, body))
+        return {
+            "ok": True,
+            "accepted": {
+                "operation_id": operation_id,
+                "operations": [operation_id],
+                "stop_id": "stop-1",
+            },
+        }
+
+    def reset(self, operation_id, body):
+        return self._control("reset", operation_id, body)
+
+    def acknowledge_completed(self, operation_id, body):
+        return self._control("acknowledge_completed", operation_id, body)
+
+    def stop(self, body):
+        operation_id = body["operations"][0]["operation_id"]
+        return self._control("stop", operation_id, body)
 
 
-def _v0_0_adapter_configs() -> dict:
+def _capability(capability_id: str, command_schema: dict[str, str] | None) -> dict:
     return {
-        "planning": {
-            "adapter_id": "planning.test",
-            "adapter_version": "0.1.0",
-            "supported_profiles": ["v0.0"],
-            "capability_keys": [
-                "planning.motion.joint_goal",
-                "planning.motion.pose_goal",
-                "planning.profile.first_feasible",
-                "planning.profile.balanced",
-                "planning.profile.quality_bounded",
-                "planning.trajectory.time_parameterized",
-            ],
-            "config": {},
+        "capability_id": capability_id,
+        "capability_definition_revision": "sha256:" + "6" * 64,
+        "control_binding": {
+            "control_binding_id": f"{capability_id}.binding",
+            "control_binding_revision": "sha256:" + "7" * 64,
         },
-        "context": {
-            "adapter_id": "context.test",
-            "adapter_version": "0.1.0",
-            "supported_profiles": ["v0.0"],
-            "capability_keys": [
-                "context.state.current",
-                "context.validation.trajectory",
-                "context.collision.check",
-                "context.kinematics.fk",
-                "context.limits.joint",
-                "scene.shape.box",
-                "scene.shape.sphere",
-                "scene.edit.add",
-                "scene.edit.remove",
-                "scene.edit.update_pose",
-            ],
-            "config": {},
-        },
-        "execution": {
-            "adapter_id": "execution.test",
-            "adapter_version": "0.1.0",
-            "supported_profiles": ["v0.0"],
-            "capability_keys": [
-                "execution.trajectory.execute",
-                "execution.feedback.phase_events",
-                "execution.feedback.state_snapshots",
-                "execution.stop.soft",
-                "execution.pause",
-                "execution.resume",
-                "execution.reset",
-            ],
-            "config": {},
-        },
+        "capability_provider_binding": None,
+        "command_schema": command_schema,
     }
 
 
-@pytest.fixture(autouse=True)
-def reset_blackboard():
-    py_trees.blackboard.Blackboard.enable_activity_stream()
-    yield
-    py_trees.blackboard.Blackboard.clear()
+def _applied_binding() -> dict[str, Any]:
+    """The Applied Program binding a run was admitted with (subset)."""
 
-
-@pytest.fixture
-def kernel():
-    return MockKernelClient()
-
-
-class TestRunnerLoading:
-    def test_load_succeeds(self, kernel):
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
-        runner.load()
-        assert runner.catalog is not None
-        assert runner.program is not None
-        assert runner.program.name == "test_pick_and_place"
-
-    def test_build_tree(self, kernel):
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
-        runner.load()
-        tree = runner.build_tree()
-        assert tree is not None
-        assert tree.root.name == "main_sequence"
-
-    @staticmethod
-    def _parallel_program(*, params: dict | None = None) -> Program:
-        catalog = NodeCatalog(CATALOG_PATH)
-        return Program.from_dict(
+    return {
+        "program_id": "program-1",
+        "program_revision": "sha256:" + "1" * 64,
+        "program_binding_id": "binding-1",
+        "graph_revision": "sha256:" + "2" * 64,
+        "retained_bundle_id": "sha256:" + "3" * 64,
+        "target_role_bindings": [
             {
-                "api_version": "manyforge.program.v0",
-                "program_profile": "v0.1",
-                "name": "parallel_policy_program",
-                "catalog_version": "0.5.0",
-                "robot": {
-                    "robot_id": "ur5",
-                    "group_id": "arm",
-                    "base_frame": "base_link",
-                    "tcp_frame": "tool0",
-                },
-                "tree": {
-                    "id": "parallel",
-                    "name": "parallel_root",
-                    "params": dict(params or {}),
-                    "children": [
+                "target_role_id": "arm",
+                "component_role_id": "robot",
+                "controllable_component_id": "lite6_arm",
+                "command_target_id": "arm",
+                "robot_tcps": [{"entry": {"component_id": "mounted_tool",
+                                           "target_id": "gripper", "frame_role_id": "tip"},
+                                "end_effector": True}],
+                "capability_bindings": [
+                    _capability("execution.trajectory.execute", None)
+                ],
+            },
+            {
+                "target_role_id": "gripper",
+                "component_role_id": "robot",
+                "controllable_component_id": "lite6_gripper",
+                "command_target_id": "gripper",
+                "capability_bindings": [
+                    _capability(
+                        "tool.gripper.command",
                         {
-                            "id": "timer",
-                            "name": "timer_a",
-                            "params": {"duration_s": 0.001},
+                            "command_schema_id": "gripper.command_position",
+                            "command_schema_revision": "sha256:" + "5" * 64,
                         },
-                        {
-                            "id": "timer",
-                            "name": "timer_b",
-                            "params": {"duration_s": 0.001},
-                        },
-                    ],
-                },
+                    )
+                ],
             },
-            catalog,
+        ],
+    }
+
+
+def test_runner_submits_source_joint_names_against_exact_owner_selection() -> None:
+    transport = RecordingTransport()
+    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
+
+    accepted = runner.submit_joint_goal(
+        request_id="request-1",
+        program_run_id="run-1",
+        component_role_id="robot",
+        target_role_id="arm",
+        node_instance_id="root/move[0]",
+        node_attempt_id="run-1/move[0]/attempt-1",
+        move_id="move-1",
+        joint_names=("joint2", "joint1"),
+        positions_rad=(0.2, -0.1),
+    )
+
+    assert accepted["accepted"]["operation_id"] == "operation-1"
+    assert transport.submitted is not None
+    request = transport.submitted
+    assert request["request_context"]["request_owner_epoch"] == "owner-epoch-7"
+    assert request["program_binding_id"] == "binding-1"
+    assert request["expected_retained_bundle_id"] == "sha256:" + "3" * 64
+    participant = request["participants"][0]
+    assert participant["component_role_id"] == "robot"
+    assert participant["target_role_id"] == "arm"
+    assert participant["payload"]["tcp_endpoint"] == {
+        "kind": "entry", "entry": {
+            "component_id": "mounted_tool", "target_id": "gripper", "frame_role_id": "tip",
+        },
+    }
+    assert participant["payload"]["motion"] == {
+        "kind": "joint_goal",
+        "joint_names": ["joint2", "joint1"],
+        "positions_rad": [0.2, -0.1],
+    }
+    assert "robot_id" not in repr(request)
+    assert "group_id" not in repr(request)
+
+
+def test_runner_refuses_joint_goal_without_end_effector_tcp() -> None:
+    transport = RecordingTransport()
+    binding = _applied_binding()
+    binding["target_role_bindings"][0]["robot_tcps"] = []
+    runner = OrchestratorRunner(KernelClient(transport), binding)
+    with pytest.raises(ValueError, match="no unique end-effector TCP"):
+        runner.submit_joint_goal(
+            request_id="request-1", program_run_id="run-1", component_role_id="robot",
+            target_role_id="arm", node_instance_id="move", node_attempt_id="attempt",
+            move_id="move-1", joint_names=("joint1",), positions_rad=(0.1,),
         )
-
-    def test_parallel_default_policy_is_success_on_all(self, kernel):
-        program = self._parallel_program()
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel, program=program)
-        runner.load()
-        tree = runner.build_tree()
-
-        assert isinstance(
-            tree.root.policy,
-            py_trees.common.ParallelPolicy.SuccessOnAll,
-        )
-
-    def test_parallel_success_on_one_policy_is_honored(self, kernel):
-        program = self._parallel_program(params={"success_policy": "success_on_one"})
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel, program=program)
-        runner.load()
-        tree = runner.build_tree()
-
-        assert isinstance(
-            tree.root.policy,
-            py_trees.common.ParallelPolicy.SuccessOnOne,
-        )
+    assert transport.submitted is None
 
 
-class TestRunnerSceneApplication:
-    def test_apply_scene(self, kernel):
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
-        runner.load()
-        runner.apply_scene()
-        assert len(kernel.scene_edits) == 1
-        assert kernel.scene_edits[0].operation == "add"
-        assert kernel.scene_edits[0].object_id == "table"
-
-    def test_apply_scene_sets_robot_base_pose_before_objects(self, kernel):
-        catalog = NodeCatalog(CATALOG_PATH)
-        program = Program(FIXTURE_PATH, catalog)
-        program.robot.base_pose = {
-            "frame_id": "universe",
-            "position_m": [0.1, 0.2, 0.3],
-            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-        }
-        runner = OrchestratorRunner(
-            NODE_ENVIRONMENT, FIXTURE_PATH, kernel, program=program
-        )
-        runner.load()
-        runner.apply_scene()
-        assert kernel.robot_base_pose == program.robot.base_pose
-        assert kernel.scene_edits[0].object_id == "table"
-
-    def test_apply_scene_forwards_cylinder_shape_dimensions(self, kernel):
-        catalog = NodeCatalog(CATALOG_PATH)
-        program = Program(FIXTURE_PATH, catalog)
-        program.scene = [
-            SceneResource(
-                object_id="graspable",
-                shape={
-                    "type": "cylinder",
-                    "cylinder_radius_m": 0.014,
-                    "cylinder_height_m": 0.089,
-                },
-                pose={
-                    "frame_id": "link_base",
-                    "position_m": [0.18, -0.2, 0.08],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-            )
-        ]
-        runner = OrchestratorRunner(
-            NODE_ENVIRONMENT, FIXTURE_PATH, kernel, program=program
-        )
-        runner.load()
-        runner.apply_scene()
-
-        assert len(kernel.scene_edits) == 1
-        request = kernel.scene_edits[0]
-        assert request.operation == "add"
-        assert request.object_id == "graspable"
-        assert request.shape_type == "cylinder"
-        assert request.cylinder_radius_m == pytest.approx(0.014)
-        assert request.cylinder_height_m == pytest.approx(0.089)
-
-    def test_apply_scene_failure(self, kernel):
-        kernel.fail_next_scene_edit = True
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
-        runner.load()
-        with pytest.raises(RuntimeError, match="Failed to add scene"):
-            runner.apply_scene()
+def test_runner_reads_owner_projection_without_reducing_it() -> None:
+    runner = OrchestratorRunner(KernelClient(RecordingTransport()), _applied_binding())
+    assert runner.operation("operation-1")["operation"] == {
+        "operation_id": "operation-1",
+        "state": "completed",
+    }
 
 
-class TestRunnerExecution:
-    def test_full_run(self, kernel):
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
-        runner.load()
-        runner.build_tree()
-        runner.apply_scene()
-        result = runner.run(max_ticks=100)
-        assert result is True
-        # apply_scene() adds the static table, and the tree removes it after the move.
-        assert len(kernel.scene_edits) >= 2
-        assert kernel.execute_count >= 1  # move_to_pick
+def test_runner_submits_unit_tagged_gripper_command_to_selected_target() -> None:
+    transport = RecordingTransport()
+    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
 
-    def test_run_with_override(self, kernel):
-        runner = OrchestratorRunner(
-            NODE_ENVIRONMENT,
-            FIXTURE_PATH,
-            kernel,
-            overrides={"pick_velocity_scale": 0.8},
-        )
-        runner.load()
-        runner.build_tree()
-        runner.apply_scene()
-        result = runner.run(max_ticks=100)
-        assert result is True
+    accepted = runner.submit_gripper_position(
+        request_id="request-gripper-1",
+        program_run_id="run-1",
+        component_role_id="robot",
+        target_role_id="gripper",
+        node_instance_id="root/gripper[0]",
+        node_attempt_id="run-1/gripper[0]/attempt-1",
+        position_kind="linear_m",
+        position=0.004,
+        max_effort=5.0,
+        command_duration_s=0.25,
+        completion_timeout_s=2.0,
+    )
 
-    def test_run_fails_on_execute_failure(self, kernel):
-        kernel.fail_next_execute = True
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
-        runner.load()
-        runner.build_tree()
-        runner.apply_scene()
-        result = runner.run(max_ticks=100)
-        assert result is False
-
-    def test_run_without_load_raises(self, kernel):
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
-        with pytest.raises(RuntimeError):
-            runner.build_tree()
-
-    def test_run_without_build_raises(self, kernel):
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
-        runner.load()
-        with pytest.raises(RuntimeError):
-            runner.run()
-
-    def test_max_ticks_returns_false(self, kernel):
-        """If tree doesn't complete within max_ticks, return False."""
-        # Normal run completes quickly, so use max_ticks=0
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
-        runner.load()
-        runner.build_tree()
-        result = runner.run(max_ticks=0)
-        assert result is False
-
-    def test_run_with_skill_authored_program(self, kernel, tmp_path):
-        """Runner expands shipped skills into executable runtime nodes."""
-        program_path = tmp_path / "skill.program.yaml"
-        program_path.write_text(
-            yaml.safe_dump(
-                {
-                    "api_version": "manyforge.program.v0",
-                    "program_profile": "v0.0",
-                    "name": "skill_program",
-                    "catalog_version": "0.5.0",
-                    "description": "skill-authored test program",
-                    "robot": {
-                        "robot_id": "ur5",
-                        "group_id": "arm",
-                        "base_frame": "base_link",
-                        "tcp_frame": "tool0",
-                    },
-                    "scene": [],
-                    "parameters": [],
-                    "tree": {
-                        "id": "move_to_named_config",
-                        "name": "go_home",
-                        "params": {
-                            "config_name": "home",
-                            "joint_names": [
-                                "shoulder_pan_joint",
-                                "shoulder_lift_joint",
-                                "elbow_joint",
-                                "wrist_1_joint",
-                                "wrist_2_joint",
-                                "wrist_3_joint",
-                            ],
-                            "joint_positions_rad": [0.0, -1.0, 1.0, -1.0, -1.0, 0.0],
-                            "velocity_scale": 0.25,
-                        },
-                    },
-                },
-                sort_keys=False,
-            ),
-            encoding="utf-8",
-        )
-
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, str(program_path), kernel)
-        runner.load()
-        tree = runner.build_tree()
-
-        assert tree.root.name == "go_home"
-        result = runner.run(max_ticks=10)
-        assert result is True
-        assert kernel.execute_count == 1
-        assert kernel.last_execute_request is not None
-        assert kernel.last_execute_request.move_id == "move_to_home"
+    assert accepted["accepted"]["operation_id"] == "operation-1"
+    assert transport.submitted is not None
+    participant = transport.submitted["participants"][0]
+    assert participant["target_role_id"] == "gripper"
+    assert participant["required_capability_id"] == "tool.gripper.command"
+    assert participant["payload"] == {
+        "kind": "capability_command",
+        "command_schema_id": "gripper.command_position",
+        "command_schema_revision": "sha256:" + "5" * 64,
+        "command_value": {
+            "kind": "gripper_position",
+            "position": {"kind": "linear_m", "value_m": 0.004},
+            "max_effort": {"kind": "linear_newton", "value_n": 5.0},
+        },
+        "completion_timeout_s": 2.0,
+        "caller_options": [
+            {"option_id": "command_duration_s", "value_s": 0.25}
+        ],
+    }
+    assert "robot_id" not in repr(transport.submitted)
+    assert "group_id" not in repr(transport.submitted)
 
 
-class TestRunnerChildCardinality:
-    def test_runner_rejects_leaf_with_children(self, kernel):
-        catalog = NodeCatalog(CATALOG_PATH)
-        program = Program.from_dict(
+def test_runner_passes_wait_for_duration_as_a_bool_caller_option() -> None:
+    transport = RecordingTransport()
+    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
+
+    runner.submit_gripper_position(
+        request_id="request-gripper-1",
+        program_run_id="run-1",
+        component_role_id="robot",
+        target_role_id="gripper",
+        node_instance_id="root/gripper[0]",
+        node_attempt_id="run-1/gripper[0]/attempt-1",
+        position_kind="linear_m",
+        position=0.004,
+        command_duration_s=0.25,
+        wait_for_duration=True,
+        completion_timeout_s=2.0,
+    )
+
+    assert transport.submitted is not None
+    assert transport.submitted["participants"][0]["payload"]["caller_options"] == [
+        {"option_id": "command_duration_s", "value_s": 0.25},
+        {"option_id": "wait_for_duration", "value_bool": True},
+    ]
+
+
+def test_runner_stop_is_attributed_fenced_and_exactly_replayable() -> None:
+    transport = RecordingTransport()
+    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
+
+    first = runner.stop_operation(
+        request_id="request-stop-1",
+        operation_id="operation-1",
+        expected_operation_revision=4,
+        expected_stop_generation=0,
+        reason="operator requested Stop",
+        correlation_id="cycle-1",
+    )
+    replay = runner.stop_operation(
+        request_id="request-stop-1",
+        operation_id="operation-1",
+        expected_operation_revision=4,
+        expected_stop_generation=0,
+        reason="operator requested Stop",
+        correlation_id="cycle-1",
+    )
+
+    assert first["accepted"]["stop_id"] == "stop-1"
+    assert replay["accepted"]["stop_id"] == "stop-1"
+    assert transport.controls[0] == transport.controls[1]
+    kind, operation_id, request = transport.controls[0]
+    assert kind == "stop"
+    assert operation_id == "operation-1"
+    assert request == {
+        "request_context": {
+            "request_id": "request-stop-1",
+            "request_owner_epoch": "owner-epoch-7",
+            "source_label": "manyforge_behavior",
+            "correlation_id": "cycle-1",
+        },
+        "operations": [
             {
-                "api_version": "manyforge.program.v0",
-                "program_profile": "v0.0",
-                "name": "invalid_leaf_children",
-                "catalog_version": "0.5.0",
-                "robot": {
-                    "robot_id": "ur5",
-                    "group_id": "arm",
-                    "base_frame": "base_link",
-                    "tcp_frame": "tool0",
-                },
-                "tree": {
-                    "id": "timer",
-                    "name": "timer_leaf",
-                    "params": {"duration_s": 0.1},
-                },
-            },
-            catalog,
-        )
-        program.tree.children.append(
-            Program.from_dict(
-                {
-                    "api_version": "manyforge.program.v0",
-                    "program_profile": "v0.0",
-                    "name": "single_wait",
-                    "catalog_version": "0.5.0",
-                    "robot": {
-                        "robot_id": "ur5",
-                        "group_id": "arm",
-                        "base_frame": "base_link",
-                        "tcp_frame": "tool0",
-                    },
-                    "tree": {
-                        "id": "timer",
-                        "name": "unexpected_child",
-                        "params": {"duration_s": 0.1},
-                    },
-                },
-                catalog,
-            ).tree
-        )
-
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel, program=program)
-        runner.load()
-
-        with pytest.raises(ValueError, match="allows at most 0 children"):
-            runner.build_tree()
-
-    def test_runner_rejects_decorator_with_multiple_children(self, kernel):
-        catalog = NodeCatalog(CATALOG_PATH)
-        program = Program.from_dict(
-            {
-                "api_version": "manyforge.program.v0",
-                "program_profile": "v0.0",
-                "name": "invalid_decorator_children",
-                "catalog_version": "0.5.0",
-                "robot": {
-                    "robot_id": "ur5",
-                    "group_id": "arm",
-                    "base_frame": "base_link",
-                    "tcp_frame": "tool0",
-                },
-                "tree": {
-                    "id": "inverter",
-                    "name": "invert_once",
-                    "children": [
-                        {"id": "timer", "name": "first", "params": {"duration_s": 0.1}},
-                    ],
-                },
-            },
-            catalog,
-        )
-        program.tree.children.append(
-            Program.from_dict(
-                {
-                    "api_version": "manyforge.program.v0",
-                    "program_profile": "v0.0",
-                    "name": "second_wait",
-                    "catalog_version": "0.5.0",
-                    "robot": {
-                        "robot_id": "ur5",
-                        "group_id": "arm",
-                        "base_frame": "base_link",
-                        "tcp_frame": "tool0",
-                    },
-                    "tree": {
-                        "id": "timer",
-                        "name": "second",
-                        "params": {"duration_s": 0.2},
-                    },
-                },
-                catalog,
-            ).tree
-        )
-
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel, program=program)
-        runner.load()
-
-        with pytest.raises(ValueError, match="allows at most 1 child"):
-            runner.build_tree()
-
-
-class TestRelativeTargetValidation:
-    @staticmethod
-    def _base_program_dict(
-        target_reference: dict,
-        pose_goal: dict | None = None,
-    ) -> dict:
-        return {
-            "api_version": "manyforge.program.v0",
-            "program_profile": "v0.1",
-            "name": "relative_target_validation",
-            "catalog_version": "0.5.0",
-            "robot": {
-                "robot_id": "ur5",
-                "group_id": "arm",
-                "base_frame": "base_link",
-                "tcp_frame": "tool0",
-            },
-            "tree": {
-                "id": "move_manipulator_action",
-                "name": "relative_pose_step",
-                "params": {
-                    "move_id": "move_1",
-                    "motion_type": "pose",
-                    "target_mode": "relative",
-                    "target_reference": target_reference,
-                    "pose_goal": pose_goal
-                    or {
-                        "position_m": [0.0, 0.0, 0.08],
-                        "orientation_rpy_deg": [180.0, 0.0, 0.0],
-                    },
-                },
-            },
-        }
-
-    def test_program_rejects_pose_reference_without_pose(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-
-        with pytest.raises(
-            ProgramValidationError,
-            match="target_reference.pose is required when target_reference.type='pose'",
-        ):
-            Program.from_dict(
-                self._base_program_dict(
-                    {"type": "pose"}
-                ),
-                catalog,
-            )
-
-    def test_program_rejects_frame_reference_without_id(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-
-        with pytest.raises(
-            ProgramValidationError,
-            match="target_reference.id is required when target_reference.type='frame'",
-        ):
-            Program.from_dict(
-                self._base_program_dict(
-                    {"type": "frame"}
-                ),
-                catalog,
-            )
-
-    def test_program_rejects_relative_pose_without_pose_goal(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-
-        program = self._base_program_dict(
-            {"type": "object", "id": "target_object"}
-        )
-        del program["tree"]["params"]["pose_goal"]
-        with pytest.raises(
-            ProgramValidationError,
-            match="pose_goal is required when motion_type=pose",
-        ):
-            Program.from_dict(
-                program,
-                catalog,
-            )
-
-
-class TestRunnerDeployment:
-    def test_load_with_deployment(self, kernel):
-        """Runner loads deployment and validates against program."""
-        runner = OrchestratorRunner(
-            NODE_ENVIRONMENT, FIXTURE_PATH, kernel,
-            deployment_path=DEPLOYMENT_FIXTURE)
-        runner.load()
-        assert runner.deployment is not None
-        assert runner.deployment.robot_config.global_max_tcp_linear_speed_mps == 0.25
-
-    def test_deployment_profile_mismatch_raises(self, kernel):
-        """Deployment with wrong profile raises during load."""
-        import tempfile
-        import yaml
-        data = {
-            "api_version": "manyforge.deployment.v0",
-            "schema_version": "0.1.0",
-            "name": "bad",
-            "program_profile": "v0.1",  # mismatch
-            "robot_config": {
-                "robot_id": "ur5", "group_id": "arm",
-                "urdf_path": "test.urdf",
-                "global_max_tcp_linear_speed_mps": 0.25,
-            },
-            "adapters": {
-                "planning": {"adapter_id": "p", "adapter_version": "0.1.0", "config": {}},
-                "context": {"adapter_id": "c", "adapter_version": "0.1.0", "config": {}},
-                "execution": {"adapter_id": "e", "adapter_version": "0.1.0", "config": {}},
-            },
-            "orchestrator": {"engine": "py_trees", "config": {}},
-            "launch": {"runner": {"module": "m", "args": []}},
-        }
-        f = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
-        yaml.dump(data, f)
-        f.close()
-        runner = OrchestratorRunner(
-            NODE_ENVIRONMENT, FIXTURE_PATH, kernel,
-            deployment_path=f.name)
-        from manyforge_behavior.deployment import DeploymentValidationError
-        with pytest.raises(DeploymentValidationError):
-            runner.load()
-        import os
-        os.unlink(f.name)
-
-    def test_global_tcp_speed_on_blackboard(self, kernel):
-        """After build_tree with deployment, global TCP speed is on blackboard."""
-        runner = OrchestratorRunner(
-            NODE_ENVIRONMENT, FIXTURE_PATH, kernel,
-            deployment_path=DEPLOYMENT_FIXTURE)
-        runner.load()
-        runner.build_tree()
-        bb = py_trees.blackboard.Client(name="test_tcp")
-        bb.register_key(key="global_max_tcp_linear_speed_mps",
-                        access=py_trees.common.Access.READ)
-        assert bb.global_max_tcp_linear_speed_mps == 0.25
-
-    def test_gripper_configs_on_blackboard(self, kernel, tmp_path):
-        deployment_path = tmp_path / "with_gripper.deployment.yaml"
-        deployment_path.write_text(
-            yaml.safe_dump(
-                {
-                    "api_version": "manyforge.deployment.v0",
-                    "schema_version": "0.1.0",
-                    "name": "with_gripper",
-                    "program_profile": "v0.0",
-                    "robot_config": {
-                        "robot_id": "ur5",
-                        "group_id": "arm",
-                        "urdf_path": "package://roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf",
-                        "srdf_path": "package://roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf",
-                        "global_max_tcp_linear_speed_mps": 0.25,
-                    },
-                    "grasp_risk_policy": {
-                        "open_loop_grasp": {
-                            "allowed": True,
-                            "scope": "simulation",
-                            "rationale": "runner fixture uses legacy simulated gripper semantics",
-                        }
-                    },
-                    "grippers": {
-                        "primary": {
-                            "command_mode": "simulated_joint",
-                            "group_id": "gripper",
-                            "joint_name": "finger_joint",
-                            "motion_time_s": 0.8,
-                            "touch_links": ["left_inner_finger_pad", "right_inner_finger_pad"],
-                        }
-                    },
-                    "adapters": _v0_0_adapter_configs(),
-                    "orchestrator": {"engine": "py_trees", "config": {}},
-                    "launch": {"runner": {"module": "manyforge_behavior.runner", "args": []}},
-                }
-            )
-        )
-        runner = OrchestratorRunner(
-            NODE_ENVIRONMENT,
-            FIXTURE_PATH,
-            kernel,
-            deployment_path=str(deployment_path),
-        )
-        runner.load()
-        runner.build_tree()
-        bb = py_trees.blackboard.Client(name="test_gripper_configs")
-        bb.register_key(key="gripper_configs", access=py_trees.common.Access.READ)
-        assert bb.gripper_configs["primary"]["group_id"] == "gripper"
-        assert bb.gripper_configs["primary"]["joint_name"] == "finger_joint"
-        assert bb.gripper_configs["primary"]["touch_links"] == [
-            "left_inner_finger_pad",
-            "right_inner_finger_pad",
-        ]
-
-    def test_runner_without_deployment_still_works(self, kernel):
-        """Existing behavior unchanged when no deployment_path."""
-        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
-        runner.load()
-        assert runner.deployment is None
-        runner.build_tree()  # Should not raise
-
-    def test_query_model_receives_scene_snapshot_provider(self, kernel):
-        """Runner threads the configured native viewer render callback into query_model nodes."""
-        catalog = NodeCatalog(CATALOG_PATH)
-        program = Program.from_dict(
-            {
-                "api_version": "manyforge.program.v0",
-                "program_profile": "v0.0",
-                "name": "query_model_program",
-                "catalog_version": "0.5.0",
-                "robot": {
-                    "robot_id": "ur5",
-                    "group_id": "arm",
-                    "base_frame": "base_link",
-                    "tcp_frame": "tool0",
-                },
-                "blackboard": {
-                    "namespaces": [
-                        {
-                            "id": "vlm_target",
-                            "contract": "query_model_output_v1",
-                            "prefix": "vlm/target",
-                            "fields": [
-                                {"name": "pick_left_bin", "type": "bool"},
-                            ],
-                        },
-                    ],
-                },
-                "tree": {
-                    "id": "query_model",
-                    "name": "pick_target",
-                    "params": {
-                        "model_endpoint_alias": "local_vlm",
-                        "prompt_template_id": "pick_target_v1",
-                        "output_key_prefix": {"namespace_ref": "vlm_target"},
-                        "include_scene_snapshot": True,
-                    },
-                },
-            },
-            catalog,
-        )
-        deployment = Deployment.from_dict(
-            {
-                "api_version": "manyforge.deployment.v0",
-                "schema_version": "0.1.0",
-                "name": "query_model_deployment",
-                "program_profile": "v0.0",
-                "robot_config": {
-                    "robot_id": "ur5",
-                    "group_id": "arm",
-                    "urdf_path": "package://test.urdf",
-                    "global_max_tcp_linear_speed_mps": 0.25,
-                },
-                "adapters": _v0_0_adapter_configs(),
-                "orchestrator": {"engine": "py_trees", "config": {}},
-                "launch": {"runner": {"module": "manyforge_behavior.runner", "args": []}},
-                "model_endpoints": {
-                    "local_vlm": {
-                        "provider": "openai",
-                        "model_id": "gemma-test",
-                        "base_url": "http://localhost:8000/v1",
-                    }
-                },
-                "prompt_templates": {
-                    "pick_target_v1": {
-                        "version": "1",
-                        "template_text": "Pick a target",
-                        "output_schema": {
-                            "type": "object",
-                            "required": ["pick_left_bin"],
-                            "properties": {"pick_left_bin": {"type": "boolean"}},
-                        },
-                    }
-                },
+                "operation_id": "operation-1",
+                "expected_operation_revision": 4,
+                "expected_stop_generation": 0,
             }
+        ],
+        "reason": "operator requested Stop",
+    }
+
+
+def test_runner_rejects_an_incomplete_owner_projection_before_submission() -> None:
+    class IncompleteIdentityTransport(RecordingTransport):
+        def identity(self) -> dict[str, Any]:
+            return {"ok": True, "identity": {"owner_epoch": "owner-epoch-7"}}
+
+    transport = IncompleteIdentityTransport()
+    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
+
+    with pytest.raises(KernelClientResponseError, match="incomplete"):
+        runner.submit_joint_goal(
+            request_id="request-1",
+            program_run_id="run-1",
+            component_role_id="robot",
+            target_role_id="arm",
+            node_instance_id="root/move[0]",
+            node_attempt_id="run-1/move[0]/attempt-1",
+            move_id="move-1",
+            joint_names=("joint1",),
+            positions_rad=(0.1,),
         )
 
-        def render_scene(width: int, height: int, format: str):
-            return b"fake-image"
+    assert transport.submitted is None
 
-        runner = OrchestratorRunner(
-            NODE_ENVIRONMENT,
-            FIXTURE_PATH,
-            kernel,
-            program=program,
-            deployment=deployment,
-            scene_snapshot_provider=render_scene,
+
+def test_runner_takes_program_identity_from_the_applied_binding_only() -> None:
+    transport = RecordingTransport()
+    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
+    arguments = {
+        "request_id": "request-1",
+        "program_run_id": "run-1",
+        "node_instance_id": "root/move[0]",
+        "node_attempt_id": "run-1/move[0]/attempt-1",
+        "move_id": "move-1",
+        "joint_names": ("joint1",),
+        "positions_rad": (0.1,),
+    }
+
+    # A role the applied Program does not bind to motion is refused.
+    with pytest.raises(ValueError, match="not bound"):
+        runner.submit_joint_goal(
+            component_role_id="robot", target_role_id="gripper", **arguments
         )
-        runner.load()
-        tree = runner.build_tree()
-
-        assert tree.root.name == "pick_target"
-        assert getattr(tree.root, "_include_scene_snapshot") is True
-        assert getattr(tree.root, "_scene_snapshot_provider") is render_scene
-
-    @patch("manyforge_behavior.nodes.model._call_model")
-    def test_vision_guided_example_runs_on_mock_kernel(self, mock_call, kernel):
-        """The shipped vision-guided example validates and executes one branch."""
-        mock_call.return_value = {
-            "text": '{"pick_left_bin": true, "selected_object_id": "left_part", "confidence": 0.91, "reason": "left object is clearer"}',
-            "parsed": {
-                "pick_left_bin": True,
-                "selected_object_id": "left_part",
-                "confidence": 0.91,
-                "reason": "left object is clearer",
-            },
-            "model_version": "gemma-test",
-            "usage": {"input_tokens": 12, "output_tokens": 8},
-        }
-
-        runner = OrchestratorRunner(
-            NODE_ENVIRONMENT,
-            VISION_PROGRAM_EXAMPLE,
-            kernel,
-            deployment_path=VISION_DEPLOYMENT_EXAMPLE,
-            scene_snapshot_provider=lambda width, height, format: b"fake-image",
+    with pytest.raises(ValueError, match="not bound"):
+        runner.submit_joint_goal(
+            component_role_id="other", target_role_id="arm", **arguments
         )
-        runner.load()
-        runner.build_tree()
-        runner.apply_scene()
+    assert transport.submitted is None
 
-        result = runner.run(max_ticks=200)
-
-        assert result is True
-        assert kernel.execute_count >= 1
-
-    @patch("manyforge_behavior.nodes.model._call_model")
-    def test_vision_guided_pose_example_runs_on_mock_kernel(self, mock_call, kernel):
-        """The shipped pose-injection example executes motion from VLM pose output."""
-        mock_call.return_value = {
-            "text": (
-                '{"selected_object_id": "left_part", '
-                '"approach_pose": {"position_m": [0.40, -0.14, 0.34], '
-                '"orientation_rpy_deg": [180.0, 0.0, -90.0]}, '
-                '"grasp_pose": {"position_m": [0.40, -0.14, 0.26], '
-                '"orientation_rpy_deg": [180.0, 0.0, -90.0]}, '
-                '"confidence": 0.92, "reason": "left part is isolated"}'
-            ),
-            "parsed": {
-                "selected_object_id": "left_part",
-                "approach_pose": {
-                    "position_m": [0.40, -0.14, 0.34],
-                    "orientation_rpy_deg": [180.0, 0.0, -90.0],
-                },
-                "grasp_pose": {
-                    "position_m": [0.40, -0.14, 0.26],
-                    "orientation_rpy_deg": [180.0, 0.0, -90.0],
-                },
-                "confidence": 0.92,
-                "reason": "left part is isolated",
-            },
-            "model_version": "gemma-test",
-            "usage": {"input_tokens": 24, "output_tokens": 16},
-        }
-
-        runner = OrchestratorRunner(
-            NODE_ENVIRONMENT,
-            VISION_POSE_PROGRAM_EXAMPLE,
-            kernel,
-            deployment_path=VISION_POSE_DEPLOYMENT_EXAMPLE,
-            scene_snapshot_provider=lambda width, height, format: b"fake-image",
+    # The binding runs only against the publication it was compiled for.
+    stale = _applied_binding()
+    stale["retained_bundle_id"] = "sha256:" + "9" * 64
+    stale_runner = OrchestratorRunner(KernelClient(transport), stale)
+    with pytest.raises(KernelClientResponseError, match="differs"):
+        stale_runner.submit_joint_goal(
+            component_role_id="robot", target_role_id="arm", **arguments
         )
-        runner.load()
-        runner.build_tree()
-        runner.apply_scene()
+    assert transport.submitted is None
 
-        result = runner.run(max_ticks=200)
-
-        assert result is True
-        assert kernel.execute_count >= 4
-        assert kernel.last_execute_request is not None
-        assert kernel.last_execute_request.move_id == "vlm_place_pose"
-        assert kernel.last_execute_request.pose_goal is not None
-        assert kernel.last_execute_request.pose_goal["position_m"] == [0.22, 0.0, 0.30]
-
-    @patch("manyforge_behavior.nodes.model._call_model")
-    def test_semantic_shape_pick_example_runs_on_mock_kernel(self, mock_call, kernel):
-        """The semantic shape-pick example uses deterministic planning after model selection."""
-        mock_call.return_value = {
-            "text": "",
-            "parsed": {
-                "outcome": "selected",
-                "selected_object_id": "sphere_part",
-                "matched_attributes": ["shape=sphere"],
-                "confidence": 0.95,
-                "reason": "sphere requested",
-            },
-            "tool_call": {
-                "name": "select_scene_object",
-                "arguments_text": (
-                    '{"outcome": "selected", "selected_object_id": "sphere_part", '
-                    '"matched_attributes": ["shape=sphere"], '
-                    '"confidence": 0.95, "reason": "sphere requested"}'
-                ),
-                "id": "call_1",
-                "raw": {},
-            },
-            "model_version": "gemma-test",
-            "usage": {"input_tokens": 20, "output_tokens": 10},
-        }
-
-        runner = OrchestratorRunner(
-            NODE_ENVIRONMENT,
-            SEMANTIC_SHAPE_PROGRAM_EXAMPLE,
-            kernel,
-            deployment_path=SEMANTIC_SHAPE_DEPLOYMENT_EXAMPLE,
-            scene_snapshot_provider=lambda width, height, format: b"fake-image",
-        )
-        runner.load()
-        runner.build_tree()
-        runner.apply_scene()
-
-        result = runner.run(max_ticks=300)
-
-        assert result is True
-        assert kernel.execute_count >= 6
-        assert kernel.last_execute_request is not None
-        assert kernel.last_execute_request.move_id == "planned_place_retreat"
-        assert kernel.get_metrics()["plans_succeeded"] >= 2
-
-    @patch("manyforge_behavior.nodes.model._call_model")
-    def test_query_model_can_drive_motion_pose_goal_via_blackboard(self, mock_call, kernel):
-        """Structured VLM output can feed a downstream move_manipulator pose goal."""
-        mock_call.return_value = {
-            "text": (
-                '{"grasp_pose": {"position_m": [0.42, -0.05, 0.31], '
-                '"orientation_rpy_deg": [180.0, 0.0, -90.0]}, "confidence": 0.94}'
-            ),
-            "parsed": {
-                "grasp_pose": {
-                    "position_m": [0.42, -0.05, 0.31],
-                    "orientation_rpy_deg": [180.0, 0.0, -90.0],
-                },
-                "confidence": 0.94,
-            },
-            "model_version": "gemma-test",
-            "usage": {"input_tokens": 18, "output_tokens": 12},
-        }
-
-        program = Program.from_dict(
-            {
-                "api_version": "manyforge.program.v0",
-                "program_profile": "v0.0",
-                "name": "vlm_pose_goal_program",
-                "catalog_version": "0.5.0",
-                "robot": {
-                    "robot_id": "ur5",
-                    "group_id": "arm",
-                    "base_frame": "base_link",
-                    "tcp_frame": "tool0",
-                },
-                "blackboard": {
-                    "namespaces": [
-                        {
-                            "id": "vlm_grasp",
-                            "contract": "query_model_output_v1",
-                            "prefix": "vlm/grasp",
-                            "fields": [
-                                {"name": "grasp_pose", "type": "pose"},
-                                {"name": "confidence", "type": "float"},
-                            ],
-                        },
-                    ],
-                },
-                "tree": {
-                    "id": "sequence",
-                    "name": "root",
-                    "children": [
-                        {
-                            "id": "query_model",
-                            "name": "infer_grasp_pose",
-                            "params": {
-                                "model_endpoint_alias": "local_vlm",
-                                "prompt_template_id": "grasp_pose_v1",
-                                "output_key_prefix": {"namespace_ref": "vlm_grasp"},
-                                "min_confidence": 0.80,
-                            },
-                        },
-                        {
-                            "id": "move_manipulator_action",
-                            "name": "execute_grasp_pose",
-                            "params": {
-                                "move_id": "vlm_pose_goal",
-                                "motion_type": "pose",
-                                "pose_goal": {
-                                    "field_ref": {
-                                        "namespace": "vlm_grasp",
-                                        "field": "grasp_pose",
-                                    }
-                                },
-                            },
-                        },
-                    ],
-                },
-            },
-            NodeCatalog(CATALOG_PATH),
-        )
-        deployment = Deployment.from_dict(
-            {
-                "api_version": "manyforge.deployment.v0",
-                "schema_version": "0.1.0",
-                "name": "vlm_pose_goal_deployment",
-                "program_profile": "v0.0",
-                "robot_config": {
-                    "robot_id": "ur5",
-                    "group_id": "arm",
-                    "urdf_path": "package://test.urdf",
-                    "global_max_tcp_linear_speed_mps": 0.25,
-                },
-                "adapters": _v0_0_adapter_configs(),
-                "orchestrator": {"engine": "py_trees", "config": {}},
-                "launch": {"runner": {"module": "manyforge_behavior.runner", "args": []}},
-                "model_endpoints": {
-                    "local_vlm": {
-                        "provider": "openai",
-                        "model_id": "gemma-test",
-                        "base_url": "http://localhost:8000/v1",
-                    }
-                },
-                "prompt_templates": {
-                    "grasp_pose_v1": {
-                        "version": "1",
-                        "template_text": "Return a grasp pose",
-                        "output_schema": {
-                            "type": "object",
-                            "required": ["grasp_pose", "confidence"],
-                            "properties": {
-                                "grasp_pose": {
-                                    "type": "object",
-                                    "required": ["position_m"],
-                                    "properties": {
-                                        "position_m": {
-                                            "type": "array",
-                                            "minItems": 3,
-                                            "maxItems": 3,
-                                            "items": {"type": "number"},
-                                        },
-                                        "orientation_rpy_deg": {
-                                            "type": "array",
-                                            "minItems": 3,
-                                            "maxItems": 3,
-                                            "items": {"type": "number"},
-                                        },
-                                        "orientation_xyzw": {
-                                            "type": "array",
-                                            "minItems": 4,
-                                            "maxItems": 4,
-                                            "items": {"type": "number"},
-                                        },
-                                    },
-                                },
-                                "confidence": {"type": "number"},
-                            },
-                        },
-                    }
-                },
-            }
-        )
-
-        runner = OrchestratorRunner(
-            NODE_ENVIRONMENT,
-            FIXTURE_PATH,
-            kernel,
-            program=program,
-            deployment=deployment,
-        )
-        runner.load()
-        runner.build_tree()
-
-        result = runner.run(max_ticks=200)
-
-        assert result is True
-        assert kernel.last_execute_request is not None
-        assert kernel.last_execute_request.pose_goal is not None
-        assert kernel.last_execute_request.pose_goal["position_m"] == [0.42, -0.05, 0.31]
-        assert kernel.last_execute_request.pose_goal["orientation_xyzw"] == pytest.approx(
-            [0.70710678, -0.70710678, -4.32978028e-17, 4.32978028e-17],
-            abs=1e-6,
-        )
-
-
-class TestRunnerCapabilities:
-    def test_runner_validates_capabilities_on_load(self, kernel):
-        """Deployment with capability keys → load succeeds."""
-        runner = OrchestratorRunner(
-            NODE_ENVIRONMENT, FIXTURE_PATH, kernel,
-            deployment_path=DEPLOYMENT_FIXTURE)
-        runner.load()  # Should not raise
-        assert runner.deployment is not None
-
-    def test_runner_rejects_missing_capabilities(self, kernel):
-        """Deployment missing a key → load raises error."""
-        import tempfile
-        import yaml
-        data = {
-            "api_version": "manyforge.deployment.v0",
-            "schema_version": "0.1.0",
-            "name": "test",
-            "program_profile": "v0.0",
-            "robot_config": {
-                "robot_id": "ur5", "group_id": "arm",
-                "urdf_path": "test.urdf",
-                "global_max_tcp_linear_speed_mps": 0.25,
-            },
-            "adapters": {
-                "planning": {
-                    "adapter_id": "p",
-                    "adapter_version": "0.1.0",
-                    "supported_profiles": ["v0.0"],
-                    "capability_keys": [
-                        "planning.motion.joint_goal",
-                        "planning.motion.pose_goal",
-                        # Missing: planning.trajectory.time_parameterized
-                    ],
-                    "config": {},
-                },
-                "context": {
-                    "adapter_id": "c",
-                    "adapter_version": "0.1.0",
-                    "supported_profiles": ["v0.0"],
-                    "capability_keys": [
-                        "context.state.current",
-                        "context.validation.trajectory",
-                        "context.collision.check",
-                        "context.kinematics.fk",
-                        "context.limits.joint",
-                        "scene.shape.box",
-                        "scene.shape.sphere",
-                        "scene.edit.add",
-                        "scene.edit.remove",
-                        "scene.edit.update_pose",
-                    ],
-                    "config": {},
-                },
-                "execution": {
-                    "adapter_id": "e",
-                    "adapter_version": "0.1.0",
-                    "supported_profiles": ["v0.0"],
-                    "capability_keys": [
-                        "execution.trajectory.execute",
-                        "execution.feedback.phase_events",
-                        "execution.feedback.state_snapshots",
-                        "execution.stop.soft",
-                        "execution.pause",
-                        "execution.resume",
-                        "execution.reset",
-                    ],
-                    "config": {},
-                },
-            },
-            "orchestrator": {"engine": "py_trees", "config": {}},
-            "launch": {"runner": {"module": "m", "args": []}},
-        }
-        f = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
-        yaml.dump(data, f)
-        f.close()
-        runner = OrchestratorRunner(
-            NODE_ENVIRONMENT, FIXTURE_PATH, kernel,
-            deployment_path=f.name)
-        from manyforge_behavior.deployment import DeploymentValidationError
-        with pytest.raises(DeploymentValidationError, match="Missing capability keys"):
-            runner.load()
-        import os
-        os.unlink(f.name)
+    runner.submit_joint_goal(
+        component_role_id="robot", target_role_id="arm", **arguments
+    )
+    assert transport.submitted is not None
+    assert transport.submitted["program_id"] == "program-1"
+    assert transport.submitted["program_revision"] == "sha256:" + "1" * 64
+    assert "motion_target_role_id" not in repr(transport.submitted)

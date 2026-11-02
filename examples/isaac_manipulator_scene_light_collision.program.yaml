@@ -1,380 +1,376 @@
-api_version: manyforge.program.v0
-program_profile: v0.1
+api_version: manyforge.program.v2
+program_id: isaac_manipulator_scene_light_collision
+program_revision: sha256:2ac7519878a608f72a21387efe72b8c9ab1612e772c2841a8c5ff41223a2318e
+program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light_collision
-description: 'Isaac Sim light-scene reproduction for UR10e + Robotiq 2F-140: robot
-  base pose and selected table/object meshes are authored from the live Isaac scene.
-  The pick-and-place behavior tree is adapted from the known-good Robotiq demo and
-  targets the Isaac cheese box instead of the legacy graspable.'
-catalog_version: 0.5.0
+description: Retained Isaac UR10e runtime-collision scenario. It starts from the exact light-scene geometry,
+  removes the declared probe wall before planning, then re-inserts that wall concurrently with command
+  execution so the Manager-owned collision and Stop path can be observed without a supervisor fallback.
+catalog:
+  api_version: manyforge.node_catalog.v2
+  content_version: 2.9.0
 compatibility:
   lanes:
   - isaac-sim
   assistant: forbidden
   requires:
-  - ros2_control
   - robotiq_2f_140_gripper
+  - ros2_control
   tags:
-  - runtime-collision
   - isaac-sim
-  - ur10e
   - robotiq
-robot:
-  robot_id: ur10e
-  group_id: arm
-  base_frame: base_link
-  tcp_frame: grasp_frame
-  base_pose:
-    frame_id: universe
-    position_m:
-    - -0.21814000606536865
-    - -0.571590006351471
-    - 0.12999999523162842
-    orientation_rpy_deg:
-    - 0.0
-    - 0.0
-    - -89.99999803880428
+  - runtime-collision
+  - ur10e
+component_roles:
+  robot:
+    required_component_type_tags:
+    - articulated-arm
+    required_model_roles:
+    - arm_model
+  tool:
+    required_component_type_tags:
+    - gripper
+target_roles:
+  arm:
+    component_role: robot
+    required_capabilities:
+    - capability_id: execution.feedback.phase_events
+      parameters: {}
+      disposition: required
+    - capability_id: execution.trajectory.execute
+      parameters: {}
+      disposition: required
+    - capability_id: planning.motion.joint_goal
+      parameters: {}
+      disposition: required
+    - capability_id: planning.motion.pose_goal
+      parameters: {}
+      disposition: required
+    - capability_id: planning.trajectory.time_parameterized
+      parameters: {}
+      disposition: required
+    - capability_id: state.observed.current
+      parameters: {}
+      disposition: required
+    - capability_id: validation.trajectory.non_collision
+      parameters: {}
+      disposition: required
+    required_frame_roles:
+    - base
+    required_resource_roles:
+    - arm_joints
+    required_collision_body_roles:
+    - arm_collision
+    required_model_roles:
+    - arm_model
+  gripper:
+    component_role: tool
+    required_capabilities:
+    - capability_id: model.kinematics.fk
+      parameters: {}
+      disposition: required
+    - capability_id: tool.gripper.command
+      parameters: {}
+      disposition: required
+    - capability_id: tool.gripper.feedback
+      parameters: {}
+      disposition: required
+    required_frame_roles: []
+    required_resource_roles:
+    - fingers
+    required_collision_body_roles:
+    - gripper_collision
 scene:
-- object_id: isaac_table_low_327
-  shape:
-    type: mesh
-    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/background__table_low_327_collider_cooked.obj
-    mesh_scale:
-    - 1
-    - 1.5
-    - 1.149999976
-  pose:
-    frame_id: universe
-    position_m:
-    - 0
-    - 0
-    - -0.7695999827980996
-    orientation_rpy_deg:
-    - 0
-    - 0
-    - 0
-- object_id: isaac_cheese_box
+- scene_resource_id: isaac_cheese_box
   shape:
     type: mesh
     mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/mac_n_cheese_centered_collider_cooked.obj
     mesh_scale:
-    - 1
-    - 1
-    - 1
+    - 1.0
+    - 1.0
+    - 1.0
   pose:
-    frame_id: universe
+    frame_ref:
+      kind: cell_frame
     position_m:
     - -0.455038
     - 0.076595
     - 0.087827
-    orientation_rpy_deg:
-    - 92.340746
-    - -1.76826
-    - -90.093258
-- object_id: isaac_soup_can
-  shape:
-    type: mesh
-    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__soup_can_collider_cooked.obj
-    mesh_scale:
-    - 1
-    - 1
-    - 1
-  pose:
-    frame_id: universe
-    position_m:
-    - 0.085370734333992
-    - -0.004780956543982029
-    - 0.05248536914587021
-    orientation_rpy_deg:
-    - 89.988004
-    - 0.106372
-    - 173.509839
-- object_id: isaac_small_KLT
+    orientation:
+      rpy_deg:
+      - 92.340746
+      - -1.76826
+      - -90.093258
+  resource_roles:
+  - pick_object
+- scene_resource_id: isaac_small_klt
   shape:
     type: mesh
     mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__small_KLT_collider_primitives.obj
     mesh_scale:
-    - 1
-    - 1
-    - 1
+    - 1.0
+    - 1.0
+    - 1.0
   pose:
-    frame_id: universe
+    frame_ref:
+      kind: cell_frame
     position_m:
     - -0.561839
     - -0.367252
     - 0.073459
-    orientation_rpy_deg:
-    - -7.6e-05
-    - 0.162992
-    - 0.006698
-- object_id: isaac_small_KLT_01
+    orientation:
+      rpy_deg:
+      - -7.6e-05
+      - 0.162992
+      - 0.006698
+- scene_resource_id: isaac_small_klt_01
   shape:
     type: mesh
     mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__small_KLT_01_collider_primitives.obj
     mesh_scale:
-    - 1
-    - 1
-    - 1
+    - 1.0
+    - 1.0
+    - 1.0
   pose:
-    frame_id: universe
+    frame_ref:
+      kind: cell_frame
     position_m:
     - 0.27161648869514465
     - -0.35853588581085205
     - 0.07468909025192261
-    orientation_rpy_deg:
-    - -2.1e-05
-    - -0.104678
-    - -4.0e-05
+    orientation:
+      rpy_deg:
+      - -2.1e-05
+      - -0.104678
+      - -4.0e-05
+- scene_resource_id: isaac_soup_can
+  shape:
+    type: mesh
+    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__soup_can_collider_cooked.obj
+    mesh_scale:
+    - 1.0
+    - 1.0
+    - 1.0
+  pose:
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - 0.085370734333992
+    - -0.004780956543982029
+    - 0.05248536914587021
+    orientation:
+      rpy_deg:
+      - 89.988004
+      - 0.106372
+      - 173.509839
+- scene_resource_id: isaac_table_low_327
+  shape:
+    type: mesh
+    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/background__table_low_327_collider_cooked.obj
+    mesh_scale:
+    - 1.0
+    - 1.5
+    - 1.149999976
+  pose:
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - 0.0
+    - 0.0
+    - -0.7695999827980996
+    orientation:
+      rpy_deg:
+      - 0.0
+      - 0.0
+      - 0.0
+- scene_resource_id: runtime_collision_wall
+  shape:
+    type: box
+    box_dimensions_m:
+    - 0.02
+    - 0.2
+    - 0.2
+  pose:
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - -0.4
+    - 0.0
+    - 0.4
+    orientation:
+      rpy_deg:
+      - 0.0
+      - 0.0
+      - 0.0
 parameters:
-- name: velocity_scale
-  type: float
+- parameter_id: velocity_scale
+  type: float64
   default: 0.2
   constraints:
-    min_exclusive: 0
-    max_inclusive: 1
-  description: Velocity scale for all moves.
-saved_with_deployment:
-  name: isaac_manipulator_scene_light_ros2_control_collision
-  source_path: /workspace/examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml
-  content_sha256: 560d3e99eefb044e1b2df4943e0c3e5ddb11ee1e3759b981a294e9618fe8ff7a
+    min_exclusive: 0.0
+    max_inclusive: 1.0
+  description: Velocity scale for the collision-bearing move.
 tree:
-  id: parallel
-  name: parallel
+  node_id: sequence
+  instance_id: isaac_collision_cycle
+  parameters: {}
   children:
-  - id: sequence
-    name: sequence
-    operator_stop_policy: continue
+  - node_id: simulation.set_entity_pose
+    instance_id: set_cheese_initial_pose
+    parameters:
+      scene_resource_id: isaac_cheese_box
+      pose:
+        frame_ref:
+          kind: cell_frame
+        position_m:
+        - -0.455038
+        - 0.076595
+        - 0.087827
+        orientation:
+          rpy_deg:
+          - 92.340746
+          - -1.76826
+          - -90.093258
+    children: []
+  - node_id: simulation.set_state
+    instance_id: play_simulation
+    parameters:
+      state: play
+    children: []
+  - node_id: scene.remove_object
+    instance_id: clear_collision_wall
+    parameters:
+      scene_resource_id: runtime_collision_wall
+    children: []
+  - node_id: parallel
+    instance_id: insert_wall_during_motion
+    parameters:
+      success_policy: all
     children:
-    - id: timer
-      name: timer
-      params:
-        duration_s: 1
-    - id: add_collision_object
-      name: add_collision_object
-      params:
-        shape:
-          type: box
-          box_dimensions_m:
-          - 0.02
-          - 0.2
-          - 0.2
-        pose:
-          frame_id: universe
-          position_m:
-          - -0.4
-          - 0
-          - 0.4
-          orientation_rpy_deg:
-          - 0
-          - 0
-          - 0
-        object_id: wall
-    - id: timer
-      name: timer2
-      params:
-        duration_s: 2
-    - id: remove_collision_object
-      name: remove_collision_object
-      params:
-        object_id: wall
-  - id: sequence
-    name: pick_and_place
-    children:
-    - id: command_gripper
-      name: command_gripper
-      params:
-        gripper_id: primary
-        position: 0
-        max_effort: 40
-        duration_s: 1
-        timeout_s: 0
-    - id: move_manipulator_action
-      name: move_to_pick_approach
-      params:
-        move_id: pick_approach
-        motion_type: pose
-        target_mode: relative
-        target_reference:
-          type: object
-          id: isaac_cheese_box
-        pose_goal:
-          position_m:
-          - 0
-          - 0
-          - 0.2
-          orientation_rpy_deg:
-          - 180
-          - 0
-          - 180
-        offset_reference:
-          type: frame
-          id: base_link
-        velocity_scale: ${param:velocity_scale}
-        planning_timeout_s: 10
-        execution_timeout_s: 30
-    - id: move_manipulator_action
-      name: move_to_pick
-      params:
-        move_id: pick_down
-        motion_type: pose
-        target_mode: relative
-        target_reference:
-          type: object
-          id: isaac_cheese_box
-        pose_goal:
-          position_m:
-          - 0
-          - 0
-          - 0.08
-          orientation_rpy_deg:
-          - 180
-          - 0
-          - 180
-        offset_reference:
-          type: frame
-          id: base_link
-        velocity_scale: ${param:velocity_scale}
-        planning_timeout_s: 10
-        execution_timeout_s: 30
-    - id: command_gripper
-      name: close_gripper
-      params:
-        gripper_id: primary
-        position: 0.55
-        max_effort: 40
-        duration_s: 1
-        timeout_s: 0
-    - id: attach_object_to_link
-      name: attach_cheese_box
-      params:
-        object_id: isaac_cheese_box
-        link_frame: grasp_frame
-        gripper_id: primary
-    - id: move_manipulator_action
-      name: pick_retreat
-      params:
-        move_id: pick_retreat
-        motion_type: pose
-        target_mode: relative
-        target_reference:
-          type: robot_link
-          id: grasp_frame
-        pose_goal:
-          position_m:
-          - 0
-          - 0
-          - -0.2
-          orientation_rpy_deg:
-          - 0
-          - 0
-          - 0
-        velocity_scale: ${param:velocity_scale}
-        planning_timeout_s: 10
-        execution_timeout_s: 30
-    - id: move_manipulator_action
-      name: move_to_drop_approach
-      params:
-        move_id: drop_approach
-        motion_type: pose
-        target_mode: relative
-        target_reference:
-          type: object
-          id: isaac_small_KLT
-        pose_goal:
-          position_m:
-          - 0
-          - 0
-          - 0.4
-          orientation_rpy_deg:
-          - 180
-          - 0
-          - 180
-        offset_reference:
-          type: frame
-          id: base_link
-        velocity_scale: ${param:velocity_scale}
-        planning_timeout_s: 10
-        execution_timeout_s: 30
-    - id: move_manipulator_action
-      name: move_to_drop
-      params:
-        move_id: drop_down
-        motion_type: pose
-        target_mode: relative
-        velocity_scale: ${param:velocity_scale}
-        planning_timeout_s: 10
-        execution_timeout_s: 30
-        joint_position_tol_rad: 0.05
-        target_reference:
-          type: object
-          id: isaac_small_KLT
-        pose_goal:
-          position_m:
-          - 0
-          - 0
-          - 0.35
-          orientation_rpy_deg:
-          - 180
-          - 0
-          - 180
-        offset_reference:
-          type: frame
-          id: base_link
-    - id: command_gripper
-      name: open_gripper
-      params:
-        gripper_id: primary
-        position: 0
-        max_effort: 40
-        duration_s: 1
-        timeout_s: 0
-    - id: detach_object_from_link
-      name: detach_cheese_box
-      params:
-        object_id: isaac_cheese_box
-        link_frame: grasp_frame
-    - id: move_manipulator_action
-      name: drop_retreat
-      params:
-        move_id: drop_retreat
-        motion_type: pose
-        target_mode: relative
-        target_reference:
-          type: object
-          id: isaac_small_KLT
-        pose_goal:
-          position_m:
-          - 0
-          - 0
-          - 0.4
-          orientation_rpy_deg:
-          - 180
-          - 0
-          - 180
-        offset_reference:
-          type: frame
-          id: base_link
-        velocity_scale: ${param:velocity_scale}
-        planning_timeout_s: 10
-        execution_timeout_s: 30
-    - id: move_manipulator_action
-      name: return_rest
-      params:
-        move_id: return_rest
-        motion_type: joint
-        joint_goal_names:
-        - shoulder_pan_joint
-        - shoulder_lift_joint
-        - elbow_joint
-        - wrist_1_joint
-        - wrist_2_joint
-        - wrist_3_joint
-        joint_goal_positions_rad:
-        - 2.63422544
-        - -0.875980752
-        - 1.551074106
-        - -2.29231544
-        - -1.560498884
-        - -2.038544566
-        velocity_scale: ${param:velocity_scale}
-        planning_timeout_s: 10
-        execution_timeout_s: 30
+    - node_id: sequence
+      instance_id: collision_wall_lifecycle
+      parameters: {}
+      children:
+      - node_id: timer
+        instance_id: wait_before_collision
+        parameters:
+          duration_s: 1.0
+        children: []
+      - node_id: scene.add_object
+        instance_id: insert_collision_wall
+        parameters:
+          scene_resource_id: runtime_collision_wall
+          shape:
+            type: box
+            box_dimensions_m:
+            - 0.02
+            - 0.2
+            - 0.2
+          pose:
+            frame_ref:
+              kind: cell_frame
+            position_m:
+            - -0.4
+            - 0.0
+            - 0.4
+            orientation:
+              rpy_deg:
+              - 0.0
+              - 0.0
+              - 0.0
+        children: []
+      - node_id: timer
+        instance_id: hold_collision_wall
+        parameters:
+          duration_s: 2.0
+        children: []
+      - node_id: scene.remove_object
+        instance_id: remove_collision_wall
+        parameters:
+          scene_resource_id: runtime_collision_wall
+        children: []
+    - node_id: sequence
+      instance_id: collision_motion
+      parameters: {}
+      children:
+      - node_id: gripper.command_position
+        instance_id: open_gripper_start
+        parameters:
+          target_role: gripper
+          position:
+            kind: angular_rad
+            value_rad: 0.0
+          max_effort:
+            kind: angular_newton_meter
+            value_nm: 40.0
+          command_duration_s: 1.0
+        children: []
+      - node_id: motion.move_to_pose
+        instance_id: move_to_pick_approach
+        parameters:
+          target_role: arm
+          base_frame_role: base
+          tcp_endpoint:
+            kind: current
+          target_mode: relative
+          target_reference:
+            type: scene_resource
+            scene_resource_id: isaac_cheese_box
+          offset_reference:
+            type: frame_role
+            frame_role_id: base
+          goal:
+            position_m:
+            - 0.0
+            - 0.0
+            - 0.2
+            orientation:
+              rpy_deg:
+              - 180.0
+              - 0.0
+              - -180.0
+          planning_timeout_s: 10.0
+          execution_timeout_s: 30.0
+          acceleration_scale: 0.8
+        children: []
+        value_sources:
+          velocity_scale:
+            kind: program_parameter
+            reference: velocity_scale
+      - node_id: motion.move_to_pose
+        instance_id: move_to_pick
+        parameters:
+          target_role: arm
+          base_frame_role: base
+          tcp_endpoint:
+            kind: current
+          target_mode: relative
+          target_reference:
+            type: scene_resource
+            scene_resource_id: isaac_cheese_box
+          offset_reference:
+            type: frame_role
+            frame_role_id: base
+          goal:
+            position_m:
+            - 0.0
+            - 0.0
+            - 0.08
+            orientation:
+              rpy_deg:
+              - 180.0
+              - 0.0
+              - -180.0
+          planning_timeout_s: 10.0
+          execution_timeout_s: 30.0
+          acceleration_scale: 0.8
+        children: []
+        value_sources:
+          velocity_scale:
+            kind: program_parameter
+            reference: velocity_scale
+  - node_id: simulation.set_state
+    instance_id: pause_if_no_collision
+    parameters:
+      state: pause
+    children: []

@@ -1,1005 +1,940 @@
-"""Bounded ROS object-pose source sidecars.
+"""Owner-neutral ROS pose-observation adapter mechanics.
 
-This module implements runtime slices for the deployment ``pose_sources``
-contract: read-only polling of explicitly configured simulator entities via
-ROS 2 ``simulation_interfaces`` and callback-driven normalization of selected
-ROS perception topics.  It does not mutate Composer or kernel scene state.
-Later slices consume the same latest-wins snapshots for observe-only UI status
-and safe planning-scene apply policies.
+This module deliberately does **not** own pose-source identity, freshness,
+latest-state caching, scene-apply policy, status reduction, or a Composer wire
+payload.  It only normalizes bounded ROS/simulator observations and offers a
+depth-one callback adapter.  The I5/H0 headless owner now supplies the retained
+pose-source lifetime/state boundary; concrete producer identity,
+receiver-local ordering/freshness, and Isaac/ROS wiring remain I9/I work.
+
+Relocation traceability
+-----------------------
+The former mixed implementation is pinned at Git blob
+``582fe0b822726e063c4793926ce6f969144af6bf``.  Its exact 14-case test source
+is blob ``453edb0ba3aee414bbe44d26a310465350d0c8f4``.  The current file retains
+the pose/quaternion/covariance/message/TF transforms, simulator read-only
+capture mapping, and bounded ROS subscription mechanics from those sources.
+The old ``PoseSourceLatestState`` family, status constants, deployment-v0
+``apply_policy`` bindings, duck-typed deployment constructors, polling loop,
+frame relabeling, and Composer-shaped ``to_dict`` payload are intentionally
+absent.  The H0 lifetime cases are carried by the current C++ owner; the
+historical producer/adapter cases remain acceptance input at I and are not a
+runnable legacy fallback.
 """
 
 from __future__ import annotations
 
-import threading
-import time
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
-from math import isfinite, sqrt
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
+from itertools import islice
+from math import hypot, isfinite
+from numbers import Real
 from typing import Any
 
-from manyforge_ros.scene_mirror_probe import PoseSnapshot, SimulationSceneMirrorClient
+from manyforge_ros.scene_mirror_probe import PoseSnapshot
 
 
-POSE_SOURCE_STATUS_DISABLED = "disabled"
-POSE_SOURCE_STATUS_FRESH = "fresh"
-POSE_SOURCE_STATUS_STALE = "stale"
-POSE_SOURCE_STATUS_REJECTED = "rejected"
+_MAX_DETAIL_CHARS = 512
+_MAX_SOURCE_TEXT_CHARS = 1024
+_MAX_BATCH_ITEMS = 4096
+
+
+class ObservationNormalizationError(ValueError):
+    """One bounded, adapter-local normalization failure.
+
+    The code describes translation failure only.  A future semantic owner
+    decides whether it means stale, rejected, faulted, or any other runtime
+    status.
+    """
+
+    def __init__(self, code: str, detail: str) -> None:
+        self.code = _bounded_source_text(code, label="error code", limit=128)
+        self.detail = _bounded_detail(detail)
+        super().__init__(f"{self.code}: {self.detail}")
 
 
 @dataclass(frozen=True)
-class PoseSourceBinding:
-    """Binding from one ManyForge scene object to one source-local entity."""
+class AdapterFailure:
+    """Failure to normalize one source-local item."""
 
-    object_id: str
-    entity: str
-    apply_policy: str = "observe_only"
-    frame_id: str = ""
+    source_key: str
+    code: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class NormalizedJointState:
+    """ROS JointState values without assuming all coordinates are angular."""
+
+    topic: str
+    names: tuple[str, ...]
+    positions: tuple[float, ...]
+    source_stamp_ns: int | None
+
+
+@dataclass(frozen=True)
+class DetectionSelector:
+    """Source-local Detection3D association and quality filter."""
+
+    detection_id: str = ""
+    class_id: str = ""
+    selection: str = ""
     confidence_min: float | None = None
+    max_position_variance_m2: float | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("detection_id", "class_id", "selection"):
+            raw_value = getattr(self, field_name)
+            if not isinstance(raw_value, str):
+                raise ValueError(f"{field_name} must be a string")
+            if len(raw_value) > _MAX_SOURCE_TEXT_CHARS:
+                raise ValueError(f"{field_name} exceeds the adapter bound")
+            value = raw_value.strip()
+            if len(value) > _MAX_SOURCE_TEXT_CHARS:
+                raise ValueError(f"{field_name} exceeds the adapter bound")
+            object.__setattr__(self, field_name, value)
+        association_count = sum(
+            bool(value) for value in (self.detection_id, self.class_id, self.selection)
+        )
+        if association_count != 1:
+            raise ValueError(
+                "selector requires exactly one detection_id, class_id, or selection"
+            )
+        if self.selection and self.selection not in ("first", "best_score"):
+            raise ValueError("selection must be 'first' or 'best_score'")
+        if self.confidence_min is not None:
+            try:
+                confidence_min = _finite_number(
+                    self.confidence_min,
+                    label="confidence_min",
+                )
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+            object.__setattr__(self, "confidence_min", confidence_min)
+        if self.max_position_variance_m2 is not None:
+            try:
+                max_position_variance_m2 = _finite_number(
+                    self.max_position_variance_m2,
+                    label="max_position_variance_m2",
+                )
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+            if max_position_variance_m2 < 0.0:
+                raise ValueError("max_position_variance_m2 must be finite and >= 0")
+            object.__setattr__(
+                self,
+                "max_position_variance_m2",
+                max_position_variance_m2,
+            )
 
 
 @dataclass(frozen=True)
-class PoseSourceMeasuredTcpBinding:
-    """Optional source-level measured TCP entity."""
+class NormalizedDetectionPose:
+    """One selected, quality-checked Detection3D pose."""
+
+    detection_id: str
+    class_id: str
+    confidence: float
+    max_position_variance_m2: float
+    pose: PoseSnapshot
+
+
+@dataclass(frozen=True)
+class SimulationEntityPoseRequest:
+    """Read-only request for one simulator entity pose.
+
+    ``target_frame_id`` requests a real TF transform.  It never relabels a
+    pose whose source frame differs.  A producer with a known nonconforming
+    header may instead declare both ``source_header_frame_id`` and
+    ``source_coordinate_frame_id``.  The adapter then requires the exact
+    reported header before assigning the explicitly declared coordinate frame
+    and performing the normal target-frame transform.
+    """
 
     entity: str
-    tcp_frame_id: str
-    frame_id: str = ""
-    entity_to_tcp_position_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    entity_to_tcp_orientation_xyzw: tuple[float, float, float, float] = (
+    target_frame_id: str = ""
+    source_header_frame_id: str = ""
+    source_coordinate_frame_id: str = ""
+    local_position_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    local_orientation_xyzw: tuple[float, float, float, float] = (
         0.0,
         0.0,
         0.0,
         1.0,
     )
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "entity",
+            _bounded_source_text(self.entity, label="entity"),
+        )
+        object.__setattr__(
+            self,
+            "target_frame_id",
+            _bounded_optional_source_text(
+                self.target_frame_id,
+                label="target_frame_id",
+            ),
+        )
+        for field_name in (
+            "source_header_frame_id",
+            "source_coordinate_frame_id",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _bounded_optional_source_text(
+                    getattr(self, field_name),
+                    label=field_name,
+                ),
+            )
+        if bool(self.source_header_frame_id) != bool(
+            self.source_coordinate_frame_id
+        ):
+            raise ValueError(
+                "source_header_frame_id and source_coordinate_frame_id "
+                "must be declared together"
+            )
+        object.__setattr__(
+            self,
+            "local_position_xyz",
+            _finite_numeric_sequence(
+                self.local_position_xyz,
+                length=3,
+                label="local_position_xyz",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "local_orientation_xyzw",
+            _normalize_quaternion(
+                _finite_numeric_sequence(
+                    self.local_orientation_xyzw,
+                    length=4,
+                    label="local_orientation_xyzw",
+                ),
+                label="local_orientation_xyzw quaternion",
+            ),
+        )
+
 
 @dataclass(frozen=True)
-class PoseSourceUpdate:
-    """Accepted pose update for a bound object."""
+class SimulationEntityPoseObservation:
+    """One source-local simulator observation."""
 
-    pose_source_id: str
-    object_id: str
     entity: str
     pose: PoseSnapshot
-    monotonic_s: float
-    apply_policy: str
-    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
-class PoseSourceRejection:
-    """Rejected pose update for a bound object."""
+class SimulationEntityPoseBatch:
+    """One read-only capture result with no status or retained latest state."""
 
-    pose_source_id: str
-    object_id: str
-    entity: str
-    reason: str
-    monotonic_s: float
-    detail: str = ""
+    observations: tuple[SimulationEntityPoseObservation, ...]
+    failures: tuple[AdapterFailure, ...]
 
 
 @dataclass(frozen=True)
-class PoseSourceMeasuredTcpUpdate:
-    """Accepted measured TCP update sampled with source object poses."""
+class TfPoseRequest:
+    """One exact target/source TF lookup pair."""
 
-    pose_source_id: str
-    entity: str
-    tcp_frame_id: str
-    frame_id: str
+    target_frame_id: str
+    source_frame_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "target_frame_id",
+            _bounded_source_text(self.target_frame_id, label="target_frame_id"),
+        )
+        object.__setattr__(
+            self,
+            "source_frame_id",
+            _bounded_source_text(self.source_frame_id, label="source_frame_id"),
+        )
+
+
+@dataclass(frozen=True)
+class TfPoseObservation:
+    """One normalized TF lookup result."""
+
+    request: TfPoseRequest
     pose: PoseSnapshot
-    monotonic_s: float
 
 
 @dataclass(frozen=True)
-class PoseSourceMeasuredRobotUpdate:
-    """Accepted measured robot joint-state sample."""
+class TfPoseBatch:
+    """One stateless group of TF lookup results."""
 
-    pose_source_id: str
-    joint_state_topic: str
-    joint_names: tuple[str, ...]
-    joint_positions_rad: tuple[float, ...]
-    monotonic_s: float
-    stamp_sec: float | None = None
+    observations: tuple[TfPoseObservation, ...]
+    failures: tuple[AdapterFailure, ...]
 
 
-@dataclass(frozen=True)
-class PoseSourceObjectState:
-    """Latest object state exposed by the sidecar."""
+class DepthOneSubscriptionAdapter:
+    """Normalize ROS messages and synchronously hand them to another owner.
 
-    object_id: str
-    status: str
-    update: PoseSourceUpdate | None = None
-    rejection: PoseSourceRejection | None = None
-    age_s: float | None = None
-
-
-@dataclass(frozen=True)
-class PoseSourceSnapshot:
-    """Latest-wins state snapshot for all objects from one source."""
-
-    pose_source_id: str
-    status: str
-    monotonic_s: float
-    objects: tuple[PoseSourceObjectState, ...]
-    measured_tcp: PoseSourceMeasuredTcpUpdate | None = None
-    measured_tcp_age_s: float | None = None
-    measured_robot: PoseSourceMeasuredRobotUpdate | None = None
-    measured_robot_age_s: float | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        payload = {
-            "poseSourceId": self.pose_source_id,
-            "status": self.status,
-            "monotonicS": self.monotonic_s,
-            "objects": [
-                {
-                    "objectId": obj.object_id,
-                    "status": obj.status,
-                    "ageS": obj.age_s,
-                    "update": _update_to_dict(obj.update),
-                    "rejection": _rejection_to_dict(obj.rejection),
-                }
-                for obj in self.objects
-            ],
-        }
-        if self.measured_tcp is not None:
-            payload["measuredTcp"] = _measured_tcp_to_dict(
-                self.measured_tcp,
-                age_s=self.measured_tcp_age_s,
-            )
-        if self.measured_robot is not None:
-            payload["measuredRobot"] = _measured_robot_to_dict(
-                self.measured_robot,
-                age_s=self.measured_robot_age_s,
-            )
-        return payload
-
-
-@dataclass(frozen=True)
-class PoseSourcePollResult:
-    """Result of one bounded sidecar poll."""
-
-    pose_source_id: str
-    status: str
-    monotonic_s: float
-    updates: tuple[PoseSourceUpdate, ...] = ()
-    rejections: tuple[PoseSourceRejection, ...] = ()
-    measured_tcp_update: PoseSourceMeasuredTcpUpdate | None = None
-    source_errors: tuple[str, ...] = ()
-
-
-class PoseSourceLatestState:
-    """Thread-safe latest-wins pose-source state.
-
-    The state intentionally stores at most one accepted update and one latest
-    rejection per object.  There is no frame queue and therefore no stale backlog
-    for downstream Composer/UI consumers to drain.
+    The ROS subscription depth is one, but the adapter has no semantic cache,
+    latest-value accessor, clock, freshness rule, or status.  The callback
+    recipient owns receive timestamps, sequencing, retention, and policy.
     """
 
     def __init__(
         self,
         *,
-        pose_source_id: str,
-        object_ids: Iterable[str],
-        stale_after_s: float,
-        measured_tcp_enabled: bool = False,
-    ) -> None:
-        if stale_after_s <= 0.0:
-            raise ValueError("stale_after_s must be > 0")
-        self.pose_source_id = pose_source_id
-        self.object_ids = tuple(object_ids)
-        self.stale_after_s = float(stale_after_s)
-        self.measured_tcp_enabled = bool(measured_tcp_enabled)
-        self._updates: dict[str, PoseSourceUpdate] = {}
-        self._rejections: dict[str, PoseSourceRejection] = {}
-        self._measured_tcp: PoseSourceMeasuredTcpUpdate | None = None
-        self._measured_robot: PoseSourceMeasuredRobotUpdate | None = None
-        self._lock = threading.Lock()
-
-    def apply_poll_result(self, result: PoseSourcePollResult) -> None:
-        if result.pose_source_id != self.pose_source_id:
-            raise ValueError(
-                f"poll result source '{result.pose_source_id}' does not match "
-                f"state source '{self.pose_source_id}'"
-            )
-        with self._lock:
-            for update in result.updates:
-                self._updates[update.object_id] = update
-                self._rejections.pop(update.object_id, None)
-            for rejection in result.rejections:
-                self._updates.pop(rejection.object_id, None)
-                self._rejections[rejection.object_id] = rejection
-            if result.measured_tcp_update is not None:
-                self._measured_tcp = result.measured_tcp_update
-
-    def apply_measured_robot_update(
-        self,
-        update: PoseSourceMeasuredRobotUpdate,
-    ) -> None:
-        if update.pose_source_id != self.pose_source_id:
-            raise ValueError(
-                f"measured robot source '{update.pose_source_id}' does not match "
-                f"state source '{self.pose_source_id}'"
-            )
-        with self._lock:
-            self._measured_robot = update
-
-    def snapshot(self, *, monotonic_s: float | None = None) -> PoseSourceSnapshot:
-        now = time.monotonic() if monotonic_s is None else float(monotonic_s)
-        objects: list[PoseSourceObjectState] = []
-        with self._lock:
-            updates = dict(self._updates)
-            rejections = dict(self._rejections)
-            measured_tcp = self._measured_tcp
-            measured_robot = self._measured_robot
-
-        any_fresh = False
-        any_rejected = False
-        any_stale = False
-        for object_id in self.object_ids:
-            update = updates.get(object_id)
-            rejection = rejections.get(object_id)
-            if update is not None:
-                age_s = max(0.0, now - update.monotonic_s)
-                if age_s <= self.stale_after_s:
-                    status = POSE_SOURCE_STATUS_FRESH
-                    any_fresh = True
-                else:
-                    status = POSE_SOURCE_STATUS_STALE
-                    any_stale = True
-                objects.append(
-                    PoseSourceObjectState(
-                        object_id=object_id,
-                        status=status,
-                        update=update,
-                        rejection=rejection,
-                        age_s=age_s,
-                    )
-                )
-            elif rejection is not None:
-                any_rejected = True
-                objects.append(
-                    PoseSourceObjectState(
-                        object_id=object_id,
-                        status=POSE_SOURCE_STATUS_REJECTED,
-                        rejection=rejection,
-                    )
-                )
-            else:
-                any_stale = True
-                objects.append(
-                    PoseSourceObjectState(
-                        object_id=object_id,
-                        status=POSE_SOURCE_STATUS_STALE,
-                    )
-                )
-
-        if any_fresh:
-            status = POSE_SOURCE_STATUS_FRESH
-        elif any_rejected:
-            status = POSE_SOURCE_STATUS_REJECTED
-        elif any_stale:
-            status = POSE_SOURCE_STATUS_STALE
-        else:
-            status = POSE_SOURCE_STATUS_DISABLED
-        return PoseSourceSnapshot(
-            pose_source_id=self.pose_source_id,
-            status=status,
-            monotonic_s=now,
-            objects=tuple(objects),
-            measured_tcp=measured_tcp,
-            measured_tcp_age_s=(
-                max(0.0, now - measured_tcp.monotonic_s)
-                if measured_tcp is not None
-                else None
-            ),
-            measured_robot=measured_robot,
-            measured_robot_age_s=(
-                max(0.0, now - measured_robot.monotonic_s)
-                if measured_robot is not None
-                else None
-            ),
-        )
-
-
-class MeasuredRobotJointStateTracker:
-    """Latest-wins measured robot joint-state subscriber."""
-
-    def __init__(
-        self,
-        *,
         node: Any,
-        pose_source_id: str,
-        joint_state_topic: str,
-        now_fn: Callable[[], float] | None = None,
+        message_type: Any,
+        topic: str,
+        normalize: Callable[[Any], Any],
+        on_observation: Callable[[Any], None],
+        on_error: Callable[[ObservationNormalizationError], None] | None = None,
+        qos_profile_factory: Callable[[int], Any] | None = None,
     ) -> None:
-        topic = str(joint_state_topic or "").strip()
-        if not topic:
-            raise ValueError("joint_state_topic must be non-empty")
-        self.pose_source_id = pose_source_id
-        self.joint_state_topic = topic
-        self.now_fn = now_fn or time.monotonic
-        self._latest: PoseSourceMeasuredRobotUpdate | None = None
-        self._lock = threading.Lock()
-        try:
-            from sensor_msgs.msg import JointState
-        except Exception as exc:  # pragma: no cover - exercised only without ROS.
-            raise RuntimeError("sensor_msgs.msg.JointState is required") from exc
+        self._node = node
+        self._normalize = normalize
+        self._on_observation = on_observation
+        self._on_error = on_error
+        normalized_topic = _bounded_source_text(topic, label="topic")
+        if qos_profile_factory is None:
+            from rclpy.qos import QoSProfile
+
+            qos_profile = QoSProfile(depth=1)
+        else:
+            qos_profile = qos_profile_factory(1)
         self._subscription = node.create_subscription(
-            JointState,
-            self.joint_state_topic,
-            self._on_joint_state,
-            10,
+            message_type,
+            normalized_topic,
+            self._on_message,
+            qos_profile,
         )
 
-    def _on_joint_state(self, msg: Any) -> None:
-        names = tuple(str(name).strip() for name in getattr(msg, "name", ()))
-        positions = tuple(float(value) for value in getattr(msg, "position", ()))
-        if not names or len(names) != len(positions):
-            return
-        if any(not name for name in names) or any(not isfinite(value) for value in positions):
-            return
-        stamp_sec: float | None = None
-        header = getattr(msg, "header", None)
-        stamp = getattr(header, "stamp", None)
-        if stamp is not None:
-            sec = getattr(stamp, "sec", None)
-            nanosec = getattr(stamp, "nanosec", None)
-            try:
-                stamp_sec = float(sec) + float(nanosec) * 1e-9
-            except (TypeError, ValueError):
-                stamp_sec = None
-        update = PoseSourceMeasuredRobotUpdate(
-            pose_source_id=self.pose_source_id,
-            joint_state_topic=self.joint_state_topic,
-            joint_names=names,
-            joint_positions_rad=positions,
-            monotonic_s=self.now_fn(),
-            stamp_sec=stamp_sec,
-        )
-        with self._lock:
-            self._latest = update
+    def close(self) -> None:
+        """Destroy only this adapter's transport subscription."""
 
-    def latest_update(self) -> PoseSourceMeasuredRobotUpdate | None:
-        with self._lock:
-            return self._latest
+        self._node.destroy_subscription(self._subscription)
 
-
-class SimulationInterfacesPoseSource:
-    """Bounded latest-wins pose source backed by ``simulation_interfaces``."""
-
-    def __init__(
-        self,
-        *,
-        client: SimulationSceneMirrorClient,
-        pose_source_id: str,
-        bindings: Iterable[PoseSourceBinding],
-        measured_tcp: PoseSourceMeasuredTcpBinding | None = None,
-        max_update_hz: float = 4.0,
-        stale_after_s: float = 1.0,
-        now_fn: Callable[[], float] | None = None,
-    ) -> None:
-        if max_update_hz <= 0.0:
-            raise ValueError("max_update_hz must be > 0")
-        self.client = client
-        self.pose_source_id = pose_source_id
-        self.bindings = tuple(bindings)
-        self.measured_tcp = measured_tcp
-        if not self.bindings:
-            raise ValueError("bindings must not be empty")
-        for binding in self.bindings:
-            if not binding.object_id:
-                raise ValueError("binding.object_id must be non-empty")
-            if not binding.entity:
-                raise ValueError("binding.entity must be non-empty")
-        self.max_update_hz = float(max_update_hz)
-        self.stale_after_s = float(stale_after_s)
-        self.now_fn = now_fn or time.monotonic
-        self.state = PoseSourceLatestState(
-            pose_source_id=pose_source_id,
-            object_ids=[binding.object_id for binding in self.bindings],
-            stale_after_s=stale_after_s,
-            measured_tcp_enabled=measured_tcp is not None,
-        )
-
-    @classmethod
-    def from_deployment_config(
-        cls,
-        *,
-        client: SimulationSceneMirrorClient,
-        source_config: object,
-        now_fn: Callable[[], float] | None = None,
-    ) -> "SimulationInterfacesPoseSource":
-        """Build from a deployment ``PoseSourceConfig``-like object.
-
-        The method is intentionally duck-typed so ``manyforge_ros`` does not
-        depend on ``manyforge_behavior`` at package-install time.
-        """
-
-        bindings = []
-        source_frame_id = getattr(source_config, "frame_id", "")
-        objects = getattr(source_config, "objects")
-        for object_id, binding in objects.items():
-            bindings.append(
-                PoseSourceBinding(
-                    object_id=getattr(binding, "object_id", object_id),
-                    entity=getattr(binding, "entity"),
-                    apply_policy=getattr(binding, "apply_policy", "observe_only"),
-                    frame_id=getattr(binding, "frame_id", "") or source_frame_id,
-                    confidence_min=getattr(binding, "confidence_min", None),
-                )
-            )
-        measured_tcp_raw = getattr(source_config, "measured_tcp", None)
-        measured_tcp = None
-        if measured_tcp_raw is not None:
-            measured_tcp = PoseSourceMeasuredTcpBinding(
-                entity=getattr(measured_tcp_raw, "entity"),
-                tcp_frame_id=getattr(measured_tcp_raw, "tcp_frame_id"),
-                frame_id=getattr(measured_tcp_raw, "frame_id", ""),
-                entity_to_tcp_position_xyz=tuple(
-                    getattr(
-                        measured_tcp_raw,
-                        "entity_to_tcp_position_xyz",
-                        (0.0, 0.0, 0.0),
-                    )
-                ),
-                entity_to_tcp_orientation_xyzw=tuple(
-                    getattr(
-                        measured_tcp_raw,
-                        "entity_to_tcp_orientation_xyzw",
-                        (0.0, 0.0, 0.0, 1.0),
-                    )
-                ),
-            )
-        return cls(
-            client=client,
-            pose_source_id=getattr(source_config, "source_id"),
-            bindings=bindings,
-            measured_tcp=measured_tcp,
-            max_update_hz=getattr(source_config, "max_update_hz", 4.0),
-            stale_after_s=getattr(source_config, "stale_after_s", 1.0),
-            now_fn=now_fn,
-        )
-
-    @property
-    def period_s(self) -> float:
-        return 1.0 / self.max_update_hz
-
-    def poll_once(self) -> PoseSourcePollResult:
-        now = self.now_fn()
-        entity_names = [binding.entity for binding in self.bindings]
-        if self.measured_tcp is not None:
-            entity_names.append(self.measured_tcp.entity)
-        entity_names = list(dict.fromkeys(entity_names))
-        updates: list[PoseSourceUpdate] = []
-        rejections: list[PoseSourceRejection] = []
-        measured_tcp_update: PoseSourceMeasuredTcpUpdate | None = None
-        source_errors: tuple[str, ...] = ()
+    def _on_message(self, message: Any) -> None:
         try:
-            snapshot = self.client.capture(
-                entity_names=entity_names,
+            observation = self._normalize(message)
+        except ObservationNormalizationError as exc:
+            if self._on_error is not None:
+                self._on_error(exc)
+            return
+        except ValueError as exc:
+            if self._on_error is not None:
+                self._on_error(
+                    ObservationNormalizationError("invalid_message", str(exc))
+                )
+            return
+        self._on_observation(observation)
+
+
+def normalize_joint_state_message(message: Any, *, topic: str) -> NormalizedJointState:
+    """Translate one ROS JointState without inventing coordinate units."""
+
+    normalized_topic = _bounded_source_text(topic, label="topic")
+    raw_names = _bounded_rows(
+        getattr(message, "name", ()),
+        label="joint names",
+        error_code="invalid_joint_state",
+    )
+    raw_positions = _bounded_rows(
+        getattr(message, "position", ()),
+        label="joint positions",
+        error_code="invalid_joint_state",
+    )
+    try:
+        names = tuple(
+            _bounded_source_text(name, label="joint name") for name in raw_names
+        )
+    except ValueError as exc:
+        raise ObservationNormalizationError(
+            "invalid_joint_state", str(exc)
+        ) from exc
+    try:
+        positions = tuple(
+            _finite_number(value, label="joint position") for value in raw_positions
+        )
+    except ValueError as exc:
+        raise ObservationNormalizationError(
+            "invalid_joint_state", str(exc)
+        ) from exc
+    if not names or len(names) != len(positions):
+        raise ObservationNormalizationError(
+            "invalid_joint_state",
+            "joint names and positions must be non-empty and equal in length",
+        )
+    if len(set(names)) != len(names):
+        raise ObservationNormalizationError(
+            "invalid_joint_state", "joint names must be unique"
+        )
+    return NormalizedJointState(
+        topic=normalized_topic,
+        names=names,
+        positions=positions,
+        source_stamp_ns=_stamp_to_ns(
+            getattr(getattr(message, "header", None), "stamp", None)
+        ),
+    )
+
+
+def normalize_pose_stamped_message(
+    message: Any,
+    *,
+    fallback_frame_id: str = "",
+) -> PoseSnapshot:
+    """Translate one ROS PoseStamped and normalize its quaternion."""
+
+    return _pose_msg_to_snapshot(
+        getattr(message, "pose", None),
+        header=getattr(message, "header", None),
+        fallback_frame_id=fallback_frame_id,
+    )
+
+
+def normalize_pose_array_message(
+    message: Any,
+    *,
+    fallback_frame_id: str = "",
+) -> tuple[PoseSnapshot, ...]:
+    """Translate a PoseArray in source order without assigning object identity."""
+
+    header = getattr(message, "header", None)
+    poses = _bounded_rows(
+        getattr(message, "poses", ()) or (),
+        label="pose array",
+        error_code="invalid_pose_array",
+    )
+    return tuple(
+        _pose_msg_to_snapshot(
+            pose,
+            header=header,
+            fallback_frame_id=fallback_frame_id,
+        )
+        for pose in poses
+    )
+
+
+def normalize_detection3d_array_message(
+    message: Any,
+    *,
+    selector: DetectionSelector,
+    fallback_frame_id: str = "",
+    target_frame_id: str = "",
+    tf_buffer: Any | None = None,
+    lookup_time: Any | None = None,
+) -> NormalizedDetectionPose:
+    """Select and normalize one Detection3D observation.
+
+    Association and quality checks stay source-local.  No scene object,
+    capability, apply policy, or runtime status is assigned here.
+    """
+
+    detections = _bounded_rows(
+        getattr(message, "detections", ()) or (),
+        label="detection array",
+        error_code="invalid_detection_array",
+    )
+    match = _select_detection3d_match(detections, selector)
+    if match is None:
+        raise ObservationNormalizationError(
+            "detection_not_found", "no detection matched the configured selector"
+        )
+    if selector.confidence_min is not None and match.score < selector.confidence_min:
+        raise ObservationNormalizationError(
+            "confidence_below_min",
+            f"score {match.score:.6g} < confidence_min {selector.confidence_min:.6g}",
+        )
+    covariance_max = _pose_position_covariance_max(match.pose_with_covariance)
+    if (
+        selector.max_position_variance_m2 is not None
+        and covariance_max > selector.max_position_variance_m2
+    ):
+        raise ObservationNormalizationError(
+            "covariance_exceeded",
+            f"position covariance {covariance_max:.6g} > "
+            f"max_position_variance_m2 {selector.max_position_variance_m2:.6g}",
+        )
+    pose = _pose_msg_to_snapshot(
+        getattr(match.pose_with_covariance, "pose", None),
+        header=_preferred_header(match.header, getattr(message, "header", None)),
+        fallback_frame_id=fallback_frame_id,
+    )
+    pose = transform_pose_snapshot(
+        pose,
+        target_frame_id=target_frame_id,
+        buffer=tf_buffer,
+        lookup_time=lookup_time,
+    )
+    return NormalizedDetectionPose(
+        detection_id=match.detection_id,
+        class_id=match.class_id,
+        confidence=match.score,
+        max_position_variance_m2=covariance_max,
+        pose=pose,
+    )
+
+
+def read_simulation_entity_states(
+    client: Any,
+    entity_names: Sequence[str],
+    *,
+    coherent: bool,
+) -> tuple[Any, bool]:
+    """Read the named entities once; the flag is true for one-instant reads.
+
+    With ``coherent`` the client's single batch read is used when the
+    simulator offers one. Otherwise the per-entity capture is used, whose
+    states may straddle simulator steps, and the flag is false.
+    """
+
+    batch_read = getattr(client, "capture_entity_states", None)
+    if coherent and callable(batch_read):
+        snapshot = batch_read(entity_names=tuple(entity_names))
+        if snapshot is not None:
+            return snapshot, True
+    return (
+        client.capture(
+            entity_names=tuple(entity_names),
+            include_info=False,
+            include_state=True,
+            include_bounds=False,
+        ),
+        False,
+    )
+
+
+def capture_simulation_entity_poses(
+    client: Any,
+    requests: Sequence[SimulationEntityPoseRequest],
+    *,
+    tf_buffer: Any | None = None,
+    lookup_time: Any | None = None,
+    snapshot: Any | None = None,
+) -> SimulationEntityPoseBatch:
+    """Perform one explicit read-only simulator capture with no local state.
+
+    ``snapshot`` normalizes an already read result for these entities instead
+    of reading the client again.
+    """
+
+    request_tuple = _bounded_rows(
+        requests,
+        label="simulation entity requests",
+    )
+    if not request_tuple:
+        raise ValueError("requests must not be empty")
+    if not all(
+        isinstance(request, SimulationEntityPoseRequest) for request in request_tuple
+    ):
+        raise ValueError("simulation entity requests contain an invalid row")
+    entities = tuple(request.entity for request in request_tuple)
+    if len(set(entities)) != len(entities):
+        raise ValueError("simulation entity requests must be unique")
+    try:
+        if snapshot is None:
+            snapshot = client.capture(
+                entity_names=entities,
                 include_info=False,
                 include_state=True,
                 include_bounds=False,
             )
-            source_errors = snapshot.errors
-            by_entity = {entity.name: entity for entity in snapshot.entities}
-            for binding in self.bindings:
-                entity = by_entity.get(binding.entity)
-                if entity is None:
-                    rejections.append(
-                        self._reject(
-                            binding,
-                            reason="missing_entity",
-                            detail="entity missing from simulation snapshot",
-                            monotonic_s=now,
-                        )
-                    )
-                    continue
-                if entity.errors:
-                    rejections.append(
-                        self._reject(
-                            binding,
-                            reason="source_error",
-                            detail="; ".join(entity.errors),
-                            monotonic_s=now,
-                        )
-                    )
-                    continue
-                if entity.pose is None:
-                    rejections.append(
-                        self._reject(
-                            binding,
-                            reason="pose_missing",
-                            detail="entity state did not include pose",
-                            monotonic_s=now,
-                        )
-                    )
-                    continue
-                updates.append(
-                    PoseSourceUpdate(
-                        pose_source_id=self.pose_source_id,
-                        object_id=binding.object_id,
-                        entity=binding.entity,
-                        pose=_pose_with_frame(entity.pose, binding.frame_id),
-                        monotonic_s=now,
-                        apply_policy=binding.apply_policy,
-                    )
-                )
-            if self.measured_tcp is not None:
-                entity = by_entity.get(self.measured_tcp.entity)
-                if entity is None:
-                    source_errors = source_errors + (
-                        "measured_tcp missing from simulation snapshot",
-                    )
-                elif entity.errors:
-                    source_errors = source_errors + (
-                        f"measured_tcp source error: {'; '.join(entity.errors)}",
-                    )
-                elif entity.pose is None:
-                    source_errors = source_errors + (
-                        "measured_tcp entity state did not include pose",
-                    )
-                else:
-                    measured_pose = _compose_pose_with_local_offset(
-                        _pose_with_frame(entity.pose, self.measured_tcp.frame_id),
-                        self.measured_tcp.entity_to_tcp_position_xyz,
-                        self.measured_tcp.entity_to_tcp_orientation_xyzw,
-                    )
-                    measured_tcp_update = PoseSourceMeasuredTcpUpdate(
-                        pose_source_id=self.pose_source_id,
-                        entity=self.measured_tcp.entity,
-                        tcp_frame_id=self.measured_tcp.tcp_frame_id,
-                        frame_id=self.measured_tcp.frame_id or entity.pose.frame_id,
-                        pose=measured_pose,
-                        monotonic_s=now,
-                    )
-        except Exception as exc:  # pragma: no cover - exercised through ROS errors.
-            source_errors = (str(exc),)
-            for binding in self.bindings:
-                rejections.append(
-                    self._reject(
-                        binding,
-                        reason="source_error",
-                        detail=str(exc),
-                        monotonic_s=now,
-                    )
-                )
-
-        if updates:
-            status = POSE_SOURCE_STATUS_FRESH
-        elif rejections:
-            status = POSE_SOURCE_STATUS_REJECTED
-        else:
-            status = POSE_SOURCE_STATUS_STALE
-        result = PoseSourcePollResult(
-            pose_source_id=self.pose_source_id,
-            status=status,
-            monotonic_s=now,
-            updates=tuple(updates),
-            rejections=tuple(rejections),
-            measured_tcp_update=measured_tcp_update,
-            source_errors=source_errors,
-        )
-        self.state.apply_poll_result(result)
-        return result
-
-    def poll_forever(
-        self,
-        *,
-        on_result: Callable[[PoseSourcePollResult], None] | None = None,
-        stop_event: threading.Event | None = None,
-        max_iterations: int | None = None,
-    ) -> None:
-        """Run a bounded polling loop.
-
-        The callback is invoked synchronously.  If it is slow, the loop skips
-        sleep and continues with the latest simulator state; it never queues
-        stale poll results behind the callback.
-        """
-
-        iterations = 0
-        next_deadline = self.now_fn()
-        while stop_event is None or not stop_event.is_set():
-            if max_iterations is not None and iterations >= max_iterations:
-                return
-            result = self.poll_once()
-            if on_result is not None:
-                on_result(result)
-            iterations += 1
-            next_deadline += self.period_s
-            delay_s = max(0.0, next_deadline - self.now_fn())
-            if delay_s > 0.0:
-                if stop_event is not None:
-                    stop_event.wait(delay_s)
-                else:
-                    time.sleep(delay_s)
-
-    def _reject(
-        self,
-        binding: PoseSourceBinding,
-        *,
-        reason: str,
-        detail: str,
-        monotonic_s: float,
-    ) -> PoseSourceRejection:
-        return PoseSourceRejection(
-            pose_source_id=self.pose_source_id,
-            object_id=binding.object_id,
-            entity=binding.entity,
-            reason=reason,
-            detail=detail,
-            monotonic_s=monotonic_s,
-        )
-
-
-class PoseStampedTopicPoseSource:
-    """Latest-wins source backed by one ``geometry_msgs/PoseStamped`` topic.
-
-    A plain ``PoseStamped`` message does not carry an object identifier, so this
-    source intentionally supports exactly one configured object binding.  Multi-
-    object topic shapes should use a message type with explicit association,
-    such as ``Detection3DArray`` or a ManyForge-specific pose update message.
-    """
-
-    def __init__(
-        self,
-        *,
-        node: Any,
-        pose_source_id: str,
-        binding: PoseSourceBinding,
-        topic: str,
-        max_update_hz: float = 30.0,
-        stale_after_s: float = 1.0,
-        now_fn: Callable[[], float] | None = None,
-    ) -> None:
-        if not pose_source_id:
-            raise ValueError("pose_source_id must be non-empty")
-        if not topic:
-            raise ValueError("topic must be non-empty")
-        if max_update_hz <= 0.0:
-            raise ValueError("max_update_hz must be > 0")
-        if not binding.object_id:
-            raise ValueError("binding.object_id must be non-empty")
-        self.node = node
-        self.pose_source_id = pose_source_id
-        self.binding = binding
-        self.topic = topic
-        self.max_update_hz = float(max_update_hz)
-        self.stale_after_s = float(stale_after_s)
-        self.now_fn = now_fn or time.monotonic
-        self._last_emit_monotonic_s: float | None = None
-        self.state = PoseSourceLatestState(
-            pose_source_id=pose_source_id,
-            object_ids=[binding.object_id],
-            stale_after_s=stale_after_s,
-        )
-
-        from geometry_msgs.msg import PoseStamped
-        from rclpy.qos import QoSProfile
-
-        # Depth one keeps the sidecar bounded even if the downstream Composer
-        # snapshot consumer is temporarily slower than the publisher.
-        self._subscription = node.create_subscription(
-            PoseStamped,
-            topic,
-            self._on_pose_stamped,
-            QoSProfile(depth=1),
-        )
-
-    @property
-    def period_s(self) -> float:
-        return 1.0 / self.max_update_hz
-
-    @classmethod
-    def from_deployment_config(
-        cls,
-        *,
-        node: Any,
-        source_config: object,
-        now_fn: Callable[[], float] | None = None,
-    ) -> "PoseStampedTopicPoseSource":
-        """Build from a deployment ``PoseSourceConfig``-like object."""
-
-        if getattr(source_config, "kind") != "pose_stamped_topic":
-            raise ValueError("source_config.kind must be pose_stamped_topic")
-        topic = getattr(source_config, "topic")
-        objects = getattr(source_config, "objects")
-        if len(objects) != 1:
-            raise ValueError("pose_stamped_topic sources require exactly one object")
-        object_id, binding_raw = next(iter(objects.items()))
-        fallback_frame_id = getattr(binding_raw, "frame_id", "") or getattr(
-            source_config,
-            "frame_id",
-            "",
-        )
-        binding = PoseSourceBinding(
-            object_id=getattr(binding_raw, "object_id", object_id),
-            entity=topic,
-            apply_policy=getattr(binding_raw, "apply_policy", "observe_only"),
-            frame_id=fallback_frame_id,
-            confidence_min=getattr(binding_raw, "confidence_min", None),
-        )
-        return cls(
-            node=node,
-            pose_source_id=getattr(source_config, "source_id"),
-            binding=binding,
-            topic=topic,
-            max_update_hz=getattr(source_config, "max_update_hz", 30.0),
-            stale_after_s=getattr(source_config, "stale_after_s", 1.0),
-            now_fn=now_fn,
-        )
-
-    def snapshot(self, *, monotonic_s: float | None = None) -> PoseSourceSnapshot:
-        return self.state.snapshot(monotonic_s=monotonic_s)
-
-    def close(self) -> None:
-        self.node.destroy_subscription(self._subscription)
-
-    def _on_pose_stamped(self, msg: Any) -> None:
-        now = self.now_fn()
-        if (
-            self._last_emit_monotonic_s is not None
-            and now - self._last_emit_monotonic_s < self.period_s
-        ):
-            return
-        self._last_emit_monotonic_s = now
-        try:
-            pose = _pose_stamped_msg_to_snapshot(
-                msg,
-                fallback_frame_id=self.binding.frame_id,
-            )
-        except ValueError as exc:
-            result = PoseSourcePollResult(
-                pose_source_id=self.pose_source_id,
-                status=POSE_SOURCE_STATUS_REJECTED,
-                monotonic_s=now,
-                rejections=(
-                    PoseSourceRejection(
-                        pose_source_id=self.pose_source_id,
-                        object_id=self.binding.object_id,
-                        entity=self.topic,
-                        reason="invalid_pose",
-                        detail=str(exc),
-                        monotonic_s=now,
-                    ),
-                ),
-            )
-            self.state.apply_poll_result(result)
-            return
-        result = PoseSourcePollResult(
-            pose_source_id=self.pose_source_id,
-            status=POSE_SOURCE_STATUS_FRESH,
-            monotonic_s=now,
-            updates=(
-                PoseSourceUpdate(
-                    pose_source_id=self.pose_source_id,
-                    object_id=self.binding.object_id,
-                    entity=self.topic,
-                    pose=pose,
-                    monotonic_s=now,
-                    apply_policy=self.binding.apply_policy,
-                ),
+    except Exception as exc:
+        detail = _bounded_detail(exc)
+        return SimulationEntityPoseBatch(
+            observations=(),
+            failures=tuple(
+                AdapterFailure(request.entity, "source_error", detail)
+                for request in request_tuple
             ),
         )
-        self.state.apply_poll_result(result)
 
-
-@dataclass(frozen=True)
-class _PoseArrayObjectBinding:
-    binding: PoseSourceBinding
-    pose_index: int
-
-
-class PoseArrayTopicPoseSource:
-    """Latest-wins source backed by one ``geometry_msgs/PoseArray`` topic.
-
-    ``PoseArray`` has no object identifiers or confidences, so object
-    association is exclusively deployment-owned: each object binding must carry
-    a unique ``metadata.pose_index`` value.  Missing indexes or malformed poses
-    reject only the affected object while fresh indexes can still update.
-    """
-
-    def __init__(
-        self,
-        *,
-        node: Any,
-        pose_source_id: str,
-        bindings: Iterable[_PoseArrayObjectBinding],
-        topic: str,
-        frame_id: str = "",
-        max_update_hz: float = 30.0,
-        stale_after_s: float = 1.0,
-        now_fn: Callable[[], float] | None = None,
-    ) -> None:
-        if not pose_source_id:
-            raise ValueError("pose_source_id must be non-empty")
-        if not topic:
-            raise ValueError("topic must be non-empty")
-        if max_update_hz <= 0.0:
-            raise ValueError("max_update_hz must be > 0")
-        self.node = node
-        self.pose_source_id = pose_source_id
-        self.bindings = tuple(bindings)
-        self.topic = topic
-        self.frame_id = frame_id
-        self.max_update_hz = float(max_update_hz)
-        self.stale_after_s = float(stale_after_s)
-        self.now_fn = now_fn or time.monotonic
-        self._last_emit_monotonic_s: float | None = None
-        if not self.bindings:
-            raise ValueError("bindings must not be empty")
-        seen: dict[int, str] = {}
-        for entry in self.bindings:
-            if not entry.binding.object_id:
-                raise ValueError("binding.object_id must be non-empty")
-            if entry.pose_index < 0:
-                raise ValueError("pose_index must be non-negative")
-            previous = seen.get(entry.pose_index)
-            if previous is not None:
+    try:
+        snapshot_entities = _bounded_rows(
+            getattr(snapshot, "entities", ()),
+            label="simulation snapshot entities",
+        )
+        snapshot_errors = _bounded_rows(
+            getattr(snapshot, "errors", ()),
+            label="simulation snapshot errors",
+        )
+        by_entity: dict[str, Any] = {}
+        for entity in snapshot_entities:
+            name = _bounded_source_text(
+                getattr(entity, "name", None),
+                label="simulation snapshot entity name",
+            )
+            if name in by_entity:
                 raise ValueError(
-                    f"pose_index {entry.pose_index} is used by both "
-                    f"'{previous}' and '{entry.binding.object_id}'"
+                    f"simulation snapshot contains duplicate entity {name}"
                 )
-            seen[entry.pose_index] = entry.binding.object_id
-        self.state = PoseSourceLatestState(
-            pose_source_id=pose_source_id,
-            object_ids=[entry.binding.object_id for entry in self.bindings],
-            stale_after_s=stale_after_s,
+            by_entity[name] = entity
+        if len(snapshot_errors) + len(request_tuple) > _MAX_BATCH_ITEMS:
+            raise ValueError(
+                "simulation snapshot plus requested results exceed the adapter bound"
+            )
+    except (AttributeError, TypeError, ValueError) as exc:
+        return _simulation_capture_failure_batch(
+            request_tuple,
+            code="invalid_source_snapshot",
+            detail=exc,
         )
 
-        from geometry_msgs.msg import PoseArray
-        from rclpy.qos import QoSProfile
-
-        self._subscription = node.create_subscription(
-            PoseArray,
-            topic,
-            self._on_pose_array,
-            QoSProfile(depth=1),
-        )
-
-    @property
-    def period_s(self) -> float:
-        return 1.0 / self.max_update_hz
-
-    @classmethod
-    def from_deployment_config(
-        cls,
-        *,
-        node: Any,
-        source_config: object,
-        now_fn: Callable[[], float] | None = None,
-    ) -> "PoseArrayTopicPoseSource":
-        """Build from a deployment ``PoseSourceConfig``-like object."""
-
-        if getattr(source_config, "kind") != "pose_array_topic":
-            raise ValueError("source_config.kind must be pose_array_topic")
-        topic = getattr(source_config, "topic")
-        source_frame_id = getattr(source_config, "frame_id", "")
-        entries: list[_PoseArrayObjectBinding] = []
-        for object_id, binding_raw in getattr(source_config, "objects").items():
-            metadata = getattr(binding_raw, "metadata", {}) or {}
-            pose_index = metadata.get("pose_index")
-            if not isinstance(pose_index, int) or isinstance(pose_index, bool):
-                raise ValueError(
-                    f"pose_array_topic object '{object_id}' requires integer metadata.pose_index"
+    observations: list[SimulationEntityPoseObservation] = []
+    failures: list[AdapterFailure] = [
+        AdapterFailure("", "source_error", _bounded_detail(error))
+        for error in snapshot_errors
+    ]
+    for request in request_tuple:
+        entity = by_entity.get(request.entity)
+        if entity is None:
+            if len(failures) >= _MAX_BATCH_ITEMS:
+                return _simulation_capture_failure_batch(
+                    request_tuple,
+                    code="invalid_source_snapshot",
+                    detail="simulation snapshot produced too many failure rows",
                 )
-            fallback_frame_id = getattr(binding_raw, "frame_id", "") or source_frame_id
-            entries.append(
-                _PoseArrayObjectBinding(
-                    binding=PoseSourceBinding(
-                        object_id=getattr(binding_raw, "object_id", object_id),
-                        entity=f"{topic}[{pose_index}]",
-                        apply_policy=getattr(
-                            binding_raw,
-                            "apply_policy",
-                            "observe_only",
-                        ),
-                        frame_id=fallback_frame_id,
-                        confidence_min=getattr(binding_raw, "confidence_min", None),
-                    ),
-                    pose_index=pose_index,
+            failures.append(
+                AdapterFailure(
+                    request.entity,
+                    "missing_entity",
+                    "entity missing from simulation snapshot",
                 )
             )
-        return cls(
-            node=node,
-            pose_source_id=getattr(source_config, "source_id"),
-            bindings=entries,
-            topic=topic,
-            frame_id=source_frame_id,
-            max_update_hz=getattr(source_config, "max_update_hz", 30.0),
-            stale_after_s=getattr(source_config, "stale_after_s", 1.0),
-            now_fn=now_fn,
-        )
-
-    def snapshot(self, *, monotonic_s: float | None = None) -> PoseSourceSnapshot:
-        return self.state.snapshot(monotonic_s=monotonic_s)
-
-    def close(self) -> None:
-        self.node.destroy_subscription(self._subscription)
-
-    def _on_pose_array(self, msg: Any) -> None:
-        now = self.now_fn()
-        if (
-            self._last_emit_monotonic_s is not None
-            and now - self._last_emit_monotonic_s < self.period_s
-        ):
-            return
-        self._last_emit_monotonic_s = now
-        poses = list(getattr(msg, "poses", []) or [])
-        header = getattr(msg, "header", None)
-        updates: list[PoseSourceUpdate] = []
-        rejections: list[PoseSourceRejection] = []
-        for entry in self.bindings:
-            binding = entry.binding
-            if entry.pose_index >= len(poses):
-                rejections.append(
-                    PoseSourceRejection(
-                        pose_source_id=self.pose_source_id,
-                        object_id=binding.object_id,
-                        entity=binding.entity,
-                        reason="pose_index_missing",
-                        detail=(
-                            f"PoseArray has {len(poses)} pose(s); "
-                            f"index {entry.pose_index} is unavailable"
-                        ),
-                        monotonic_s=now,
+            continue
+        try:
+            entity_errors = _bounded_rows(
+                getattr(entity, "errors", ()),
+                label=f"errors for simulation entity {request.entity}",
+            )
+        except ValueError as exc:
+            return _simulation_capture_failure_batch(
+                request_tuple,
+                code="invalid_source_snapshot",
+                detail=exc,
+            )
+        if entity_errors:
+            if len(failures) >= _MAX_BATCH_ITEMS:
+                return _simulation_capture_failure_batch(
+                    request_tuple,
+                    code="invalid_source_snapshot",
+                    detail="simulation snapshot produced too many failure rows",
+                )
+            failures.append(
+                AdapterFailure(
+                    request.entity,
+                    "source_error",
+                    _bounded_error_summary(entity_errors),
+                )
+            )
+            continue
+        entity_pose = getattr(entity, "pose", None)
+        if entity_pose is None:
+            if len(failures) >= _MAX_BATCH_ITEMS:
+                return _simulation_capture_failure_batch(
+                    request_tuple,
+                    code="invalid_source_snapshot",
+                    detail="simulation snapshot produced too many failure rows",
+                )
+            failures.append(
+                AdapterFailure(
+                    request.entity,
+                    "pose_missing",
+                    "entity state did not include pose",
+                )
+            )
+            continue
+        if not isinstance(entity_pose, PoseSnapshot):
+            if len(failures) >= _MAX_BATCH_ITEMS:
+                return _simulation_capture_failure_batch(
+                    request_tuple,
+                    code="invalid_source_snapshot",
+                    detail="simulation snapshot produced too many failure rows",
+                )
+            failures.append(
+                AdapterFailure(
+                    request.entity,
+                    "frame_or_pose_invalid",
+                    "entity pose is not a normalized PoseSnapshot",
+                )
+            )
+            continue
+        try:
+            pose = compose_pose_with_local_offset(
+                entity_pose,
+                request.local_position_xyz,
+                request.local_orientation_xyzw,
+            )
+            if request.source_header_frame_id:
+                if pose.frame_id != request.source_header_frame_id:
+                    raise ObservationNormalizationError(
+                        "source_frame_mismatch",
+                        "simulation entity header changed: expected "
+                        f"{request.source_header_frame_id}, observed "
+                        f"{pose.frame_id}",
                     )
+                pose = PoseSnapshot(
+                    frame_id=request.source_coordinate_frame_id,
+                    stamp_ns=pose.stamp_ns,
+                    position_xyz=pose.position_xyz,
+                    orientation_xyzw=pose.orientation_xyzw,
                 )
-                continue
-            try:
-                pose = _pose_msg_to_snapshot(
-                    poses[entry.pose_index],
-                    header=header,
-                    fallback_frame_id=binding.frame_id or self.frame_id,
+            pose = transform_pose_snapshot(
+                pose,
+                target_frame_id=request.target_frame_id,
+                buffer=tf_buffer,
+                lookup_time=lookup_time,
+            )
+        except ValueError as exc:
+            if len(failures) >= _MAX_BATCH_ITEMS:
+                return _simulation_capture_failure_batch(
+                    request_tuple,
+                    code="invalid_source_snapshot",
+                    detail="simulation snapshot produced too many failure rows",
                 )
-            except ValueError as exc:
-                rejections.append(
-                    PoseSourceRejection(
-                        pose_source_id=self.pose_source_id,
-                        object_id=binding.object_id,
-                        entity=binding.entity,
-                        reason="invalid_pose",
-                        detail=str(exc),
-                        monotonic_s=now,
-                    )
-                )
-                continue
-            updates.append(
-                PoseSourceUpdate(
-                    pose_source_id=self.pose_source_id,
-                    object_id=binding.object_id,
-                    entity=binding.entity,
-                    pose=pose,
-                    monotonic_s=now,
-                    apply_policy=binding.apply_policy,
+            failures.append(
+                AdapterFailure(
+                    request.entity,
+                    "frame_or_pose_invalid",
+                    _bounded_detail(exc),
                 )
             )
-        status = (
-            POSE_SOURCE_STATUS_FRESH
-            if updates
-            else POSE_SOURCE_STATUS_REJECTED
-            if rejections
-            else POSE_SOURCE_STATUS_STALE
+            continue
+        observations.append(
+            SimulationEntityPoseObservation(entity=request.entity, pose=pose)
         )
-        self.state.apply_poll_result(
-            PoseSourcePollResult(
-                pose_source_id=self.pose_source_id,
-                status=status,
-                monotonic_s=now,
-                updates=tuple(updates),
-                rejections=tuple(rejections),
+    return SimulationEntityPoseBatch(tuple(observations), tuple(failures))
+
+
+def capture_tf_poses(
+    buffer: Any,
+    requests: Sequence[TfPoseRequest],
+    *,
+    lookup_time: Any | None = None,
+) -> TfPoseBatch:
+    """Perform exact TF lookups without retaining a latest-state cache."""
+
+    request_tuple = _bounded_rows(requests, label="TF requests")
+    if not request_tuple:
+        raise ValueError("requests must not be empty")
+    if not all(isinstance(request, TfPoseRequest) for request in request_tuple):
+        raise ValueError("TF requests contain an invalid row")
+    if len(set(request_tuple)) != len(request_tuple):
+        raise ValueError("TF requests must be unique")
+    resolved_lookup_time = _tf_lookup_time() if lookup_time is None else lookup_time
+    observations: list[TfPoseObservation] = []
+    failures: list[AdapterFailure] = []
+    for request in request_tuple:
+        source_key = f"{request.target_frame_id}<-{request.source_frame_id}"
+        try:
+            transform = buffer.lookup_transform(
+                request.target_frame_id,
+                request.source_frame_id,
+                resolved_lookup_time,
             )
+            pose = normalize_transform_stamped(transform)
+        except Exception as exc:
+            failures.append(
+                AdapterFailure(source_key, "tf_lookup_failed", _bounded_detail(exc))
+            )
+            continue
+        observations.append(TfPoseObservation(request=request, pose=pose))
+    return TfPoseBatch(tuple(observations), tuple(failures))
+
+
+def transform_pose_snapshot(
+    pose: PoseSnapshot,
+    *,
+    target_frame_id: str,
+    buffer: Any | None,
+    lookup_time: Any | None = None,
+) -> PoseSnapshot:
+    """Transform a pose through TF; never relabel a different source frame."""
+
+    try:
+        target_frame = _bounded_optional_source_text(
+            target_frame_id,
+            label="target frame",
         )
+    except ValueError as exc:
+        raise ObservationNormalizationError(
+            "frame_unresolved", str(exc)
+        ) from exc
+    normalized_pose = _validated_pose_snapshot(pose, label="source pose")
+    if not target_frame or normalized_pose.frame_id == target_frame:
+        return normalized_pose
+    if buffer is None:
+        raise ObservationNormalizationError(
+            "frame_unresolved",
+            f"no TF buffer available for {target_frame} <- "
+            f"{normalized_pose.frame_id}",
+        )
+    try:
+        transform = buffer.lookup_transform(
+            target_frame,
+            normalized_pose.frame_id,
+            _tf_lookup_time() if lookup_time is None else lookup_time,
+        )
+    except Exception as exc:
+        raise ObservationNormalizationError(
+            "frame_unresolved",
+            f"TF lookup failed for {target_frame} <- "
+            f"{normalized_pose.frame_id}: {exc}",
+        ) from exc
+
+    tf = getattr(transform, "transform", None)
+    translation = getattr(tf, "translation", None)
+    rotation = getattr(tf, "rotation", None)
+    if translation is None or rotation is None:
+        raise ObservationNormalizationError(
+            "invalid_transform", "TransformStamped transform is incomplete"
+        )
+    transform_translation = _finite_vector3(
+        translation,
+        label="TransformStamped translation",
+    )
+    transform_orientation = _normalize_quaternion(
+        _quaternion_from_message(rotation),
+        label="TransformStamped orientation quaternion",
+    )
+    transformed_position = _vector_add(
+        transform_translation,
+        _rotate_vector(transform_orientation, normalized_pose.position_xyz),
+    )
+    transformed_position = _finite_numeric_sequence(
+        transformed_position,
+        length=3,
+        label="transformed pose position_xyz",
+    )
+    transformed_orientation = _normalize_quaternion(
+        _quaternion_multiply(
+            transform_orientation,
+            normalized_pose.orientation_xyzw,
+        ),
+        label="transformed pose orientation quaternion",
+    )
+    return PoseSnapshot(
+        frame_id=target_frame,
+        stamp_ns=normalized_pose.stamp_ns,
+        position_xyz=transformed_position,
+        orientation_xyzw=transformed_orientation,
+    )
 
 
-@dataclass(frozen=True)
-class _Detection3DObjectBinding:
-    binding: PoseSourceBinding
-    detection_id: str = ""
-    class_id: str = ""
-    selection: str = ""
-    max_position_variance_m2: float | None = None
+def compose_pose_with_local_offset(
+    pose: PoseSnapshot,
+    position_xyz: tuple[float, float, float],
+    orientation_xyzw: tuple[float, float, float, float],
+) -> PoseSnapshot:
+    """Compose a source pose with a fixed source-local offset."""
+
+    normalized_pose = _validated_pose_snapshot(pose, label="source pose")
+    normalized_position = _finite_numeric_sequence(
+        position_xyz,
+        length=3,
+        label="fixed-offset position_xyz",
+    )
+    offset_orientation = _normalize_quaternion(
+        _finite_numeric_sequence(
+            orientation_xyzw,
+            length=4,
+            label="fixed-offset orientation_xyzw",
+        ),
+        label="fixed-offset orientation quaternion",
+    )
+    composed_position = _vector_add(
+        normalized_pose.position_xyz,
+        _rotate_vector(
+            normalized_pose.orientation_xyzw,
+            normalized_position,
+        ),
+    )
+    composed_position = _finite_numeric_sequence(
+        composed_position,
+        length=3,
+        label="composed position_xyz",
+    )
+    return PoseSnapshot(
+        frame_id=normalized_pose.frame_id,
+        stamp_ns=normalized_pose.stamp_ns,
+        position_xyz=composed_position,
+        orientation_xyzw=_normalize_quaternion(
+            _quaternion_multiply(
+                normalized_pose.orientation_xyzw,
+                offset_orientation,
+            ),
+            label="composed orientation quaternion",
+        ),
+    )
+
+
+def relative_pose(reference: PoseSnapshot, pose: PoseSnapshot) -> PoseSnapshot:
+    """Express ``pose`` in the frame of ``reference``; both share one frame."""
+
+    normalized_reference = _validated_pose_snapshot(
+        reference, label="reference pose"
+    )
+    normalized_pose = _validated_pose_snapshot(pose, label="source pose")
+    if normalized_reference.frame_id != normalized_pose.frame_id:
+        raise ObservationNormalizationError(
+            "frame_or_pose_invalid",
+            "reference and source poses use different frames",
+        )
+    inverse = _quaternion_conjugate(normalized_reference.orientation_xyzw)
+    offset = normalized_pose.position_xyz
+    origin = normalized_reference.position_xyz
+    return PoseSnapshot(
+        frame_id=normalized_reference.frame_id,
+        stamp_ns=normalized_pose.stamp_ns,
+        position_xyz=_finite_numeric_sequence(
+            _rotate_vector(
+                inverse,
+                (offset[0] - origin[0], offset[1] - origin[1], offset[2] - origin[2]),
+            ),
+            length=3,
+            label="relative position_xyz",
+        ),
+        orientation_xyzw=_normalize_quaternion(
+            _quaternion_multiply(inverse, normalized_pose.orientation_xyzw),
+            label="relative orientation quaternion",
+        ),
+    )
+
+
+def normalize_transform_stamped(transform: Any) -> PoseSnapshot:
+    """Translate one ROS TransformStamped into a finite PoseSnapshot."""
+
+    header = getattr(transform, "header", None)
+    tf = getattr(transform, "transform", None)
+    translation = getattr(tf, "translation", None)
+    rotation = getattr(tf, "rotation", None)
+    if translation is None or rotation is None:
+        raise ObservationNormalizationError(
+            "invalid_transform", "TransformStamped transform is incomplete"
+        )
+    position_xyz = _finite_vector3(
+        translation,
+        label="TransformStamped translation",
+    )
+    orientation_xyzw = _normalize_quaternion(
+        _quaternion_from_message(rotation),
+        label="TransformStamped orientation quaternion",
+    )
+    try:
+        frame_id = _bounded_source_text(
+            getattr(header, "frame_id", None),
+            label="TransformStamped header.frame_id",
+        )
+    except ValueError as exc:
+        raise ObservationNormalizationError(
+            "invalid_transform", str(exc)
+        ) from exc
+    return PoseSnapshot(
+        frame_id=frame_id,
+        stamp_ns=_stamp_to_ns(getattr(header, "stamp", None)),
+        position_xyz=position_xyz,
+        orientation_xyzw=orientation_xyzw,
+    )
 
 
 @dataclass(frozen=True)
@@ -1011,606 +946,193 @@ class _Detection3DMatch:
     header: Any
 
 
-class Detection3DArrayTopicPoseSource:
-    """Latest-wins source backed by ``vision_msgs/Detection3DArray``.
-
-    Object association is deployment-owned.  Each object binding must name
-    exactly one detection id, class id, or selection policy.  Confidence gates
-    use ``ObjectHypothesis.score``; covariance gates use the selected
-    ``PoseWithCovariance`` position diagonal.
-    """
-
-    def __init__(
-        self,
-        *,
-        node: Any,
-        pose_source_id: str,
-        bindings: Iterable[_Detection3DObjectBinding],
-        topic: str,
-        frame_id: str = "",
-        max_update_hz: float = 30.0,
-        stale_after_s: float = 1.0,
-        buffer: Any | None = None,
-        listener: Any | None = None,
-        now_fn: Callable[[], float] | None = None,
-    ) -> None:
-        if not pose_source_id:
-            raise ValueError("pose_source_id must be non-empty")
-        if not topic:
-            raise ValueError("topic must be non-empty")
-        if max_update_hz <= 0.0:
-            raise ValueError("max_update_hz must be > 0")
-        self.node = node
-        self.pose_source_id = pose_source_id
-        self.bindings = tuple(bindings)
-        self.topic = topic
-        self.frame_id = frame_id
-        self.max_update_hz = float(max_update_hz)
-        self.stale_after_s = float(stale_after_s)
-        self.buffer = buffer
-        self.listener = listener
-        self.now_fn = now_fn or time.monotonic
-        self._last_emit_monotonic_s: float | None = None
-        if not self.bindings:
-            raise ValueError("bindings must not be empty")
-        for entry in self.bindings:
-            if not entry.binding.object_id:
-                raise ValueError("binding.object_id must be non-empty")
-            association_count = sum(
-                bool(value)
-                for value in (entry.detection_id, entry.class_id, entry.selection)
+def _select_detection3d_match(
+    detections: Iterable[Any],
+    selector: DetectionSelector,
+) -> _Detection3DMatch | None:
+    best: _Detection3DMatch | None = None
+    result_row_count = 0
+    for detection in detections:
+        raw_detection_id = getattr(detection, "id", "") or ""
+        try:
+            detection_id = _bounded_optional_source_text(
+                raw_detection_id,
+                label="detection id",
             )
-            if association_count != 1:
-                raise ValueError(
-                    "detection bindings require exactly one detection_id, class_id, or selection"
-                )
-            if entry.selection and entry.selection not in ("first", "best_score"):
-                raise ValueError("detection selection must be 'first' or 'best_score'")
-        self.state = PoseSourceLatestState(
-            pose_source_id=pose_source_id,
-            object_ids=[entry.binding.object_id for entry in self.bindings],
-            stale_after_s=stale_after_s,
-        )
-
-        from rclpy.qos import QoSProfile
-        from vision_msgs.msg import Detection3DArray
-
-        self._subscription = node.create_subscription(
-            Detection3DArray,
-            topic,
-            self._on_detection_array,
-            QoSProfile(depth=1),
-        )
-
-    @property
-    def period_s(self) -> float:
-        return 1.0 / self.max_update_hz
-
-    @classmethod
-    def from_deployment_config(
-        cls,
-        *,
-        node: Any,
-        source_config: object,
-        buffer: Any | None = None,
-        listener: Any | None = None,
-        now_fn: Callable[[], float] | None = None,
-    ) -> "Detection3DArrayTopicPoseSource":
-        """Build from a deployment ``PoseSourceConfig``-like object."""
-
-        if getattr(source_config, "kind") != "detection3d_array_topic":
-            raise ValueError("source_config.kind must be detection3d_array_topic")
-        topic = getattr(source_config, "topic")
-        source_frame_id = getattr(source_config, "frame_id", "")
-        entries: list[_Detection3DObjectBinding] = []
-        for object_id, binding_raw in getattr(source_config, "objects").items():
-            metadata = getattr(binding_raw, "metadata", {}) or {}
-            detection_id = str(metadata.get("detection_id") or "").strip()
-            class_id = str(metadata.get("class_id") or "").strip()
-            selection = str(metadata.get("selection") or "").strip()
-            max_position_variance_raw = metadata.get("max_position_variance_m2")
-            max_position_variance_m2 = (
-                float(max_position_variance_raw)
-                if max_position_variance_raw is not None
-                else None
-            )
-            fallback_frame_id = getattr(binding_raw, "frame_id", "") or source_frame_id
-            entries.append(
-                _Detection3DObjectBinding(
-                    binding=PoseSourceBinding(
-                        object_id=getattr(binding_raw, "object_id", object_id),
-                        entity=detection_id or class_id or selection,
-                        apply_policy=getattr(
-                            binding_raw,
-                            "apply_policy",
-                            "observe_only",
-                        ),
-                        frame_id=fallback_frame_id,
-                        confidence_min=getattr(binding_raw, "confidence_min", None),
-                    ),
-                    detection_id=detection_id,
-                    class_id=class_id,
-                    selection=selection,
-                    max_position_variance_m2=max_position_variance_m2,
-                )
-            )
-        return cls(
-            node=node,
-            pose_source_id=getattr(source_config, "source_id"),
-            bindings=entries,
-            topic=topic,
-            frame_id=source_frame_id,
-            max_update_hz=getattr(source_config, "max_update_hz", 30.0),
-            stale_after_s=getattr(source_config, "stale_after_s", 1.0),
-            buffer=buffer,
-            listener=listener,
-            now_fn=now_fn,
-        )
-
-    def snapshot(self, *, monotonic_s: float | None = None) -> PoseSourceSnapshot:
-        return self.state.snapshot(monotonic_s=monotonic_s)
-
-    def close(self) -> None:
-        self.node.destroy_subscription(self._subscription)
-
-    def _on_detection_array(self, msg: Any) -> None:
-        now = self.now_fn()
+        except ValueError as exc:
+            raise ObservationNormalizationError(
+                "invalid_detection_array", str(exc)
+            ) from exc
         if (
-            self._last_emit_monotonic_s is not None
-            and now - self._last_emit_monotonic_s < self.period_s
+            not selector.selection
+            and selector.detection_id
+            and detection_id != selector.detection_id
         ):
-            return
-        self._last_emit_monotonic_s = now
-        detections = list(getattr(msg, "detections", []) or [])
-        array_header = getattr(msg, "header", None)
-        updates: list[PoseSourceUpdate] = []
-        rejections: list[PoseSourceRejection] = []
-        for entry in self.bindings:
-            binding = entry.binding
-            match = _select_detection3d_match(detections, entry)
-            if match is None:
-                rejections.append(
-                    PoseSourceRejection(
-                        pose_source_id=self.pose_source_id,
-                        object_id=binding.object_id,
-                        entity=binding.entity,
-                        reason="detection_not_found",
-                        detail="no detection matched configured association",
-                        monotonic_s=now,
-                    )
-                )
-                continue
-            if binding.confidence_min is not None and match.score < binding.confidence_min:
-                rejections.append(
-                    PoseSourceRejection(
-                        pose_source_id=self.pose_source_id,
-                        object_id=binding.object_id,
-                        entity=binding.entity,
-                        reason="confidence_below_min",
-                        detail=(
-                            f"score {match.score:.6g} < "
-                            f"confidence_min {binding.confidence_min:.6g}"
-                        ),
-                        monotonic_s=now,
-                    )
-                )
-                continue
+            continue
+        results = _bounded_rows(
+            getattr(detection, "results", ()) or (),
+            label="detection result rows",
+            error_code="invalid_detection_array",
+        )
+        result_row_count += len(results)
+        if result_row_count > _MAX_BATCH_ITEMS:
+            raise ObservationNormalizationError(
+                "invalid_detection_array",
+                "aggregate detection result rows exceed the adapter bound",
+            )
+        for result in results:
+            hypothesis = getattr(result, "hypothesis", None)
+            raw_class_id = getattr(hypothesis, "class_id", "") or ""
             try:
-                covariance_max = _pose_position_covariance_max(
-                    match.pose_with_covariance,
+                class_id = _bounded_optional_source_text(
+                    raw_class_id,
+                    label="detection class_id",
                 )
             except ValueError as exc:
-                rejections.append(
-                    PoseSourceRejection(
-                        pose_source_id=self.pose_source_id,
-                        object_id=binding.object_id,
-                        entity=binding.entity,
-                        reason="invalid_covariance",
-                        detail=str(exc),
-                        monotonic_s=now,
-                    )
-                )
-                continue
+                raise ObservationNormalizationError(
+                    "invalid_detection_array", str(exc)
+                ) from exc
             if (
-                entry.max_position_variance_m2 is not None
-                and covariance_max > entry.max_position_variance_m2
+                not selector.selection
+                and selector.class_id
+                and class_id != selector.class_id
             ):
-                rejections.append(
-                    PoseSourceRejection(
-                        pose_source_id=self.pose_source_id,
-                        object_id=binding.object_id,
-                        entity=binding.entity,
-                        reason="covariance_exceeded",
-                        detail=(
-                            f"position covariance {covariance_max:.6g} > "
-                            f"max_position_variance_m2 "
-                            f"{entry.max_position_variance_m2:.6g}"
-                        ),
-                        monotonic_s=now,
-                    )
-                )
                 continue
             try:
-                pose = _pose_msg_to_snapshot(
-                    getattr(match.pose_with_covariance, "pose", None),
-                    header=_preferred_header(match.header, array_header),
-                    fallback_frame_id=binding.frame_id or self.frame_id,
+                score = _finite_number(
+                    getattr(hypothesis, "score"),
+                    label="detection score",
                 )
-            except ValueError as exc:
-                rejections.append(
-                    PoseSourceRejection(
-                        pose_source_id=self.pose_source_id,
-                        object_id=binding.object_id,
-                        entity=binding.entity,
-                        reason="invalid_pose",
-                        detail=str(exc),
-                        monotonic_s=now,
-                    )
-                )
-                continue
-            try:
-                pose = _transform_pose_snapshot(
-                    pose,
-                    target_frame_id=binding.frame_id or self.frame_id,
-                    buffer=self.buffer,
-                )
-            except ValueError as exc:
-                rejections.append(
-                    PoseSourceRejection(
-                        pose_source_id=self.pose_source_id,
-                        object_id=binding.object_id,
-                        entity=binding.entity,
-                        reason="tf_lookup_failed",
-                        detail=str(exc),
-                        monotonic_s=now,
-                    )
-                )
-                continue
-            updates.append(
-                PoseSourceUpdate(
-                    pose_source_id=self.pose_source_id,
-                    object_id=binding.object_id,
-                    entity=binding.entity,
-                    pose=pose,
-                    monotonic_s=now,
-                    apply_policy=binding.apply_policy,
-                    metadata={
-                        "detectionId": match.detection_id,
-                        "classId": match.class_id,
-                        "confidence": match.score,
-                        "maxPositionVarianceM2": covariance_max,
-                    },
-                )
+            except (AttributeError, ValueError) as exc:
+                raise ObservationNormalizationError(
+                    "invalid_detection_array", str(exc)
+                ) from exc
+            candidate = _Detection3DMatch(
+                detection_id=detection_id,
+                class_id=class_id,
+                score=score,
+                pose_with_covariance=getattr(result, "pose", None),
+                header=getattr(detection, "header", None),
             )
-        status = (
-            POSE_SOURCE_STATUS_FRESH
-            if updates
-            else POSE_SOURCE_STATUS_REJECTED
-            if rejections
-            else POSE_SOURCE_STATUS_STALE
+            if selector.selection == "first":
+                return candidate
+            if best is None or candidate.score > best.score:
+                best = candidate
+    return best
+
+
+def _pose_position_covariance_max(pose_with_covariance: Any) -> float:
+    covariance_raw = getattr(pose_with_covariance, "covariance", None)
+    if covariance_raw is None:
+        covariance: tuple[Any, ...] = ()
+    else:
+        covariance = _bounded_rows(
+            covariance_raw,
+            label="pose covariance",
+            limit=36,
+            error_code="invalid_covariance",
         )
-        self.state.apply_poll_result(
-            PoseSourcePollResult(
-                pose_source_id=self.pose_source_id,
-                status=status,
-                monotonic_s=now,
-                updates=tuple(updates),
-                rejections=tuple(rejections),
-            )
-        )
-
-
-class TfPoseSource:
-    """Latest-wins source backed by ROS TF frame pairs.
-
-    Each object binding maps one target frame to one source frame: the source
-    frame is stored in ``binding.entity`` and the target frame is stored in
-    ``binding.frame_id``.  Deployment validation requires a target frame either
-    per object or at the source level.
-    """
-
-    def __init__(
-        self,
-        *,
-        node: Any,
-        pose_source_id: str,
-        bindings: Iterable[PoseSourceBinding],
-        max_update_hz: float = 30.0,
-        stale_after_s: float = 1.0,
-        buffer: Any | None = None,
-        listener: Any | None = None,
-        now_fn: Callable[[], float] | None = None,
-    ) -> None:
-        if not pose_source_id:
-            raise ValueError("pose_source_id must be non-empty")
-        if max_update_hz <= 0.0:
-            raise ValueError("max_update_hz must be > 0")
-        self.node = node
-        self.pose_source_id = pose_source_id
-        self.bindings = tuple(bindings)
-        self.max_update_hz = float(max_update_hz)
-        self.stale_after_s = float(stale_after_s)
-        self.now_fn = now_fn or time.monotonic
-        if not self.bindings:
-            raise ValueError("bindings must not be empty")
-        for binding in self.bindings:
-            if not binding.object_id:
-                raise ValueError("binding.object_id must be non-empty")
-            if not binding.entity:
-                raise ValueError("binding.entity must be non-empty")
-            if not binding.frame_id:
-                raise ValueError("binding.frame_id must be non-empty")
-
-        if buffer is None:
-            from tf2_ros import Buffer, TransformListener
-
-            buffer = Buffer()
-            listener = TransformListener(buffer, node)
-        self.buffer = buffer
-        self.listener = listener
-        self.state = PoseSourceLatestState(
-            pose_source_id=pose_source_id,
-            object_ids=[binding.object_id for binding in self.bindings],
-            stale_after_s=stale_after_s,
-        )
-
-    @property
-    def period_s(self) -> float:
-        return 1.0 / self.max_update_hz
-
-    @classmethod
-    def from_deployment_config(
-        cls,
-        *,
-        node: Any,
-        source_config: object,
-        buffer: Any | None = None,
-        listener: Any | None = None,
-        now_fn: Callable[[], float] | None = None,
-    ) -> "TfPoseSource":
-        """Build from a deployment ``PoseSourceConfig``-like object."""
-
-        if getattr(source_config, "kind") != "tf":
-            raise ValueError("source_config.kind must be tf")
-        source_frame_id = getattr(source_config, "frame_id", "")
-        bindings = []
-        for object_id, binding_raw in getattr(source_config, "objects").items():
-            target_frame = getattr(binding_raw, "frame_id", "") or source_frame_id
-            bindings.append(
-                PoseSourceBinding(
-                    object_id=getattr(binding_raw, "object_id", object_id),
-                    entity=getattr(binding_raw, "entity"),
-                    apply_policy=getattr(binding_raw, "apply_policy", "observe_only"),
-                    frame_id=target_frame,
-                )
-            )
-        return cls(
-            node=node,
-            pose_source_id=getattr(source_config, "source_id"),
-            bindings=bindings,
-            max_update_hz=getattr(source_config, "max_update_hz", 30.0),
-            stale_after_s=getattr(source_config, "stale_after_s", 1.0),
-            buffer=buffer,
-            listener=listener,
-            now_fn=now_fn,
-        )
-
-    def poll_once(self) -> PoseSourcePollResult:
-        now = self.now_fn()
-        updates: list[PoseSourceUpdate] = []
-        rejections: list[PoseSourceRejection] = []
-        for binding in self.bindings:
-            try:
-                transform = self.buffer.lookup_transform(
-                    binding.frame_id,
-                    binding.entity,
-                    _tf_lookup_time(),
-                )
-                pose = _transform_stamped_to_snapshot(transform)
-            except Exception as exc:
-                rejections.append(
-                    PoseSourceRejection(
-                        pose_source_id=self.pose_source_id,
-                        object_id=binding.object_id,
-                        entity=binding.entity,
-                        reason="tf_lookup_failed",
-                        detail=str(exc),
-                        monotonic_s=now,
-                    )
-                )
-                continue
-            updates.append(
-                PoseSourceUpdate(
-                    pose_source_id=self.pose_source_id,
-                    object_id=binding.object_id,
-                    entity=binding.entity,
-                    pose=pose,
-                    monotonic_s=now,
-                    apply_policy=binding.apply_policy,
-                )
-            )
-        status = (
-            POSE_SOURCE_STATUS_FRESH
-            if updates
-            else POSE_SOURCE_STATUS_REJECTED
-            if rejections
-            else POSE_SOURCE_STATUS_STALE
-        )
-        result = PoseSourcePollResult(
-            pose_source_id=self.pose_source_id,
-            status=status,
-            monotonic_s=now,
-            updates=tuple(updates),
-            rejections=tuple(rejections),
-        )
-        self.state.apply_poll_result(result)
-        return result
-
-
-def _update_to_dict(update: PoseSourceUpdate | None) -> dict[str, Any] | None:
-    if update is None:
-        return None
-    return {
-        "poseSourceId": update.pose_source_id,
-        "objectId": update.object_id,
-        "entity": update.entity,
-        "monotonicS": update.monotonic_s,
-        "applyPolicy": update.apply_policy,
-        "metadata": dict(update.metadata),
-        "pose": {
-            "frameId": update.pose.frame_id,
-            "stampSec": update.pose.stamp_sec,
-            "positionXYZ": list(update.pose.position_xyz),
-            "orientationXYZW": list(update.pose.orientation_xyzw),
-        },
-    }
-
-
-def _measured_tcp_to_dict(
-    update: PoseSourceMeasuredTcpUpdate,
-    *,
-    age_s: float | None,
-) -> dict[str, Any]:
-    return {
-        "frameId": update.frame_id or update.pose.frame_id,
-        "tcpFrameId": update.tcp_frame_id,
-        "monotonicS": update.monotonic_s,
-        "ageS": age_s,
-        "pose": {
-            "frameId": update.frame_id or update.pose.frame_id,
-            "stampSec": update.pose.stamp_sec,
-            "positionXYZ": list(update.pose.position_xyz),
-            "orientationXYZW": list(update.pose.orientation_xyzw),
-        },
-    }
-
-
-def _measured_robot_to_dict(
-    update: PoseSourceMeasuredRobotUpdate,
-    *,
-    age_s: float | None,
-) -> dict[str, Any]:
-    return {
-        "jointStateTopic": update.joint_state_topic,
-        "jointNames": list(update.joint_names),
-        "jointPositionsRad": list(update.joint_positions_rad),
-        "monotonicS": update.monotonic_s,
-        "ageS": age_s,
-        "stampSec": update.stamp_sec,
-    }
-
-
-def _pose_with_frame(pose: PoseSnapshot, frame_id: str) -> PoseSnapshot:
-    normalized_frame_id = str(frame_id or "").strip()
-    if not normalized_frame_id or pose.frame_id == normalized_frame_id:
-        return pose
-    return PoseSnapshot(
-        frame_id=normalized_frame_id,
-        stamp_sec=pose.stamp_sec,
-        position_xyz=pose.position_xyz,
-        orientation_xyzw=pose.orientation_xyzw,
-    )
-
-
-def _transform_pose_snapshot(
-    pose: PoseSnapshot,
-    *,
-    target_frame_id: str,
-    buffer: Any | None,
-) -> PoseSnapshot:
-    target_frame = str(target_frame_id or "").strip()
-    if not target_frame or pose.frame_id == target_frame:
-        return pose
-    if buffer is None:
-        raise ValueError(
-            f"no TF buffer available to transform pose from '{pose.frame_id}' "
-            f"to '{target_frame}'"
+    if len(covariance) != 36:
+        raise ObservationNormalizationError(
+            "invalid_covariance", "pose covariance must contain 36 values"
         )
     try:
-        transform = buffer.lookup_transform(target_frame, pose.frame_id, _tf_lookup_time())
-    except Exception as exc:
-        raise ValueError(
-            f"TF lookup failed for {target_frame} <- {pose.frame_id}: {exc}"
+        diagonal = [
+            _finite_number(
+                covariance[index],
+                label=f"pose covariance[{index}]",
+            )
+            for index in (0, 7, 14)
+        ]
+    except ValueError as exc:
+        raise ObservationNormalizationError(
+            "invalid_covariance",
+            str(exc),
         ) from exc
-
-    tf = getattr(transform, "transform", None)
-    translation = getattr(tf, "translation", None)
-    rotation = getattr(tf, "rotation", None)
-    if translation is None or rotation is None:
-        raise ValueError("TransformStamped transform is incomplete")
-    transform_translation = (
-        float(getattr(translation, "x", float("nan"))),
-        float(getattr(translation, "y", float("nan"))),
-        float(getattr(translation, "z", float("nan"))),
-    )
-    transform_orientation = _normalize_quaternion(
-        (
-            float(getattr(rotation, "x", float("nan"))),
-            float(getattr(rotation, "y", float("nan"))),
-            float(getattr(rotation, "z", float("nan"))),
-            float(getattr(rotation, "w", float("nan"))),
-        ),
-        label="TransformStamped orientation quaternion",
-    )
-    transformed_position = _vector_add(
-        transform_translation,
-        _rotate_vector(transform_orientation, pose.position_xyz),
-    )
-    transformed_orientation = _normalize_quaternion(
-        _quaternion_multiply(transform_orientation, pose.orientation_xyzw),
-        label="transformed pose orientation quaternion",
-    )
-    return PoseSnapshot(
-        frame_id=target_frame,
-        stamp_sec=pose.stamp_sec,
-        position_xyz=transformed_position,
-        orientation_xyzw=transformed_orientation,
-    )
+    if any(value < 0.0 for value in diagonal):
+        raise ObservationNormalizationError(
+            "invalid_covariance",
+            "pose covariance position diagonal contains negative values",
+        )
+    return max(diagonal)
 
 
-def _compose_pose_with_local_offset(
-    pose: PoseSnapshot,
-    position_xyz: tuple[float, float, float],
-    orientation_xyzw: tuple[float, float, float, float],
+def _pose_msg_to_snapshot(
+    pose: Any,
+    *,
+    header: Any,
+    fallback_frame_id: str,
 ) -> PoseSnapshot:
-    """Compose a source-entity world pose with its fixed entity-to-TCP pose."""
-
-    entity_orientation = _normalize_quaternion(
-        pose.orientation_xyzw,
-        label="measured TCP entity orientation quaternion",
+    raw_frame_id = getattr(header, "frame_id", "") or fallback_frame_id
+    try:
+        frame_id = _bounded_source_text(raw_frame_id, label="pose header.frame_id")
+    except ValueError as exc:
+        raise ObservationNormalizationError(
+            "invalid_pose", str(exc)
+        ) from exc
+    position = getattr(pose, "position", None)
+    orientation = getattr(pose, "orientation", None)
+    if position is None or orientation is None:
+        raise ObservationNormalizationError("invalid_pose", "pose is incomplete")
+    position_xyz = _finite_vector3(position, label="pose position")
+    orientation_xyzw = _normalize_quaternion(
+        _quaternion_from_message(orientation),
+        label="pose orientation quaternion",
     )
-    offset_orientation = _normalize_quaternion(
-        orientation_xyzw,
-        label="measured TCP fixed-offset orientation quaternion",
-    )
-    if not all(isfinite(component) for component in pose.position_xyz):
-        raise ValueError("measured TCP entity position contains non-finite values")
-    if not all(isfinite(component) for component in position_xyz):
-        raise ValueError("measured TCP fixed-offset position contains non-finite values")
     return PoseSnapshot(
-        frame_id=pose.frame_id,
-        stamp_sec=pose.stamp_sec,
-        position_xyz=_vector_add(
-            pose.position_xyz,
-            _rotate_vector(entity_orientation, position_xyz),
-        ),
-        orientation_xyzw=_normalize_quaternion(
-            _quaternion_multiply(entity_orientation, offset_orientation),
-            label="measured TCP composed orientation quaternion",
-        ),
+        frame_id=frame_id,
+        stamp_ns=_stamp_to_ns(getattr(header, "stamp", None)),
+        position_xyz=position_xyz,
+        orientation_xyzw=orientation_xyzw,
     )
+
+
+def _finite_vector3(value: Any, *, label: str) -> tuple[float, float, float]:
+    try:
+        vector = (
+            _finite_number(getattr(value, "x", None), label=f"{label}.x"),
+            _finite_number(getattr(value, "y", None), label=f"{label}.y"),
+            _finite_number(getattr(value, "z", None), label=f"{label}.z"),
+        )
+    except ValueError as exc:
+        raise ObservationNormalizationError(
+            "invalid_pose", str(exc)
+        ) from exc
+    return vector
+
+
+def _quaternion_from_message(value: Any) -> tuple[float, float, float, float]:
+    try:
+        return (
+            _finite_number(getattr(value, "x", None), label="quaternion.x"),
+            _finite_number(getattr(value, "y", None), label="quaternion.y"),
+            _finite_number(getattr(value, "z", None), label="quaternion.z"),
+            _finite_number(getattr(value, "w", None), label="quaternion.w"),
+        )
+    except ValueError as exc:
+        raise ObservationNormalizationError(
+            "invalid_quaternion", str(exc)
+        ) from exc
 
 
 def _normalize_quaternion(
-    quaternion: tuple[float, float, float, float],
+    quaternion: tuple[float, ...],
     *,
     label: str,
 ) -> tuple[float, float, float, float]:
+    if len(quaternion) != 4:
+        raise ObservationNormalizationError(
+            "invalid_quaternion", f"{label} must contain four values"
+        )
     if not all(isfinite(value) for value in quaternion):
-        raise ValueError(f"{label} contains non-finite values")
-    norm = sqrt(sum(value * value for value in quaternion))
-    if norm <= 1e-9:
-        raise ValueError(f"{label} has zero norm")
+        raise ObservationNormalizationError(
+            "invalid_quaternion", f"{label} contains non-finite values"
+        )
+    norm = hypot(*quaternion)
+    if not isfinite(norm) or norm <= 1e-9:
+        raise ObservationNormalizationError(
+            "invalid_quaternion", f"{label} has invalid norm"
+        )
     return tuple(value / norm for value in quaternion)  # type: ignore[return-value]
 
 
@@ -1654,135 +1176,41 @@ def _vector_add(
     return (lhs[0] + rhs[0], lhs[1] + rhs[1], lhs[2] + rhs[2])
 
 
-def _rejection_to_dict(
-    rejection: PoseSourceRejection | None,
-) -> dict[str, Any] | None:
-    if rejection is None:
-        return None
-    return {
-        "poseSourceId": rejection.pose_source_id,
-        "objectId": rejection.object_id,
-        "entity": rejection.entity,
-        "reason": rejection.reason,
-        "detail": rejection.detail,
-        "monotonicS": rejection.monotonic_s,
-    }
-
-
-def _pose_stamped_msg_to_snapshot(
-    msg: Any,
-    *,
-    fallback_frame_id: str,
-) -> PoseSnapshot:
-    header = getattr(msg, "header", None)
-    return _pose_msg_to_snapshot(
-        getattr(msg, "pose", None),
-        header=header,
-        fallback_frame_id=fallback_frame_id,
-    )
-
-
-def _pose_msg_to_snapshot(
-    pose: Any,
-    *,
-    header: Any,
-    fallback_frame_id: str,
-) -> PoseSnapshot:
-    frame_id = str(getattr(header, "frame_id", "") or fallback_frame_id)
-    if not frame_id:
-        raise ValueError("pose header.frame_id is empty")
-    position = getattr(pose, "position", None)
-    orientation = getattr(pose, "orientation", None)
-    if position is None or orientation is None:
-        raise ValueError("pose is incomplete")
-    position_xyz = (
-        float(getattr(position, "x", float("nan"))),
-        float(getattr(position, "y", float("nan"))),
-        float(getattr(position, "z", float("nan"))),
-    )
-    orientation_xyzw_raw = (
-        float(getattr(orientation, "x", float("nan"))),
-        float(getattr(orientation, "y", float("nan"))),
-        float(getattr(orientation, "z", float("nan"))),
-        float(getattr(orientation, "w", float("nan"))),
-    )
-    if not all(isfinite(value) for value in position_xyz + orientation_xyzw_raw):
-        raise ValueError("pose contains non-finite pose values")
-    norm = sqrt(sum(value * value for value in orientation_xyzw_raw))
-    if norm <= 1e-9:
-        raise ValueError("pose orientation quaternion has zero norm")
-    orientation_xyzw = tuple(value / norm for value in orientation_xyzw_raw)
-    return PoseSnapshot(
-        frame_id=frame_id,
-        stamp_sec=_stamp_to_float(getattr(header, "stamp", None)),
-        position_xyz=position_xyz,
-        orientation_xyzw=orientation_xyzw,  # type: ignore[arg-type]
-    )
-
-
-def _stamp_to_float(stamp: Any) -> float | None:
+def _stamp_to_ns(stamp: Any) -> int | None:
     if stamp is None:
         return None
     sec = getattr(stamp, "sec", None)
     nanosec = getattr(stamp, "nanosec", None)
-    if sec is None or nanosec is None:
-        return None
-    return float(sec) + float(nanosec) * 1e-9
-
-
-def _select_detection3d_match(
-    detections: Iterable[Any],
-    entry: _Detection3DObjectBinding,
-) -> _Detection3DMatch | None:
-    best: _Detection3DMatch | None = None
-    for detection in detections:
-        detection_id = str(getattr(detection, "id", "") or "")
-        if not entry.selection and entry.detection_id and detection_id != entry.detection_id:
-            continue
-        for result in getattr(detection, "results", []) or []:
-            hypothesis = getattr(result, "hypothesis", None)
-            class_id = str(getattr(hypothesis, "class_id", "") or "")
-            if not entry.selection and entry.class_id and class_id != entry.class_id:
-                continue
-            try:
-                score = float(getattr(hypothesis, "score"))
-            except (TypeError, ValueError):
-                continue
-            if not isfinite(score):
-                continue
-            candidate = _Detection3DMatch(
-                detection_id=detection_id,
-                class_id=class_id,
-                score=score,
-                pose_with_covariance=getattr(result, "pose", None),
-                header=getattr(detection, "header", None),
-            )
-            if entry.selection == "first":
-                return candidate
-            if best is None or candidate.score > best.score:
-                best = candidate
-    return best
-
-
-def _pose_position_covariance_max(pose_with_covariance: Any) -> float:
-    covariance_raw = getattr(pose_with_covariance, "covariance", None)
-    covariance = [] if covariance_raw is None else list(covariance_raw)
-    if len(covariance) != 36:
-        raise ValueError("pose covariance must contain 36 values")
-    diagonal = [float(covariance[index]) for index in (0, 7, 14)]
-    if not all(isfinite(value) for value in diagonal):
-        raise ValueError("pose covariance position diagonal contains non-finite values")
-    if any(value < 0.0 for value in diagonal):
-        raise ValueError("pose covariance position diagonal contains negative values")
-    return max(diagonal)
+    if type(sec) is not int or type(nanosec) is not int:
+        raise ObservationNormalizationError(
+            "invalid_timestamp",
+            "timestamp sec and nanosec must be exact integers",
+        )
+    if not 0 <= nanosec < 1_000_000_000:
+        raise ObservationNormalizationError(
+            "invalid_timestamp",
+            "timestamp nanosec must be in [0, 1000000000)",
+        )
+    value = sec * 1_000_000_000 + nanosec
+    if not 0 <= value <= (1 << 63) - 1:
+        raise ObservationNormalizationError(
+            "invalid_timestamp", "timestamp must be a nonnegative signed int64"
+        )
+    return value
 
 
 def _preferred_header(primary: Any, fallback: Any) -> Any:
     primary_stamp = getattr(primary, "stamp", None)
-    has_primary_stamp = bool(
-        getattr(primary_stamp, "sec", 0) or getattr(primary_stamp, "nanosec", 0)
+    primary_sec = getattr(primary_stamp, "sec", None)
+    primary_nanosec = getattr(primary_stamp, "nanosec", None)
+    has_primary_stamp = primary_stamp is not None and not (
+        type(primary_sec) is int
+        and type(primary_nanosec) is int
+        and primary_sec == 0
+        and primary_nanosec == 0
     )
-    if str(getattr(primary, "frame_id", "") or "") or has_primary_stamp:
+    primary_frame = getattr(primary, "frame_id", "")
+    if primary_frame not in (None, "") or has_primary_stamp:
         return primary
     return fallback
 
@@ -1793,36 +1221,151 @@ def _tf_lookup_time() -> Any:
     return Time()
 
 
-def _transform_stamped_to_snapshot(transform: Any) -> PoseSnapshot:
-    header = getattr(transform, "header", None)
-    tf = getattr(transform, "transform", None)
-    translation = getattr(tf, "translation", None)
-    rotation = getattr(tf, "rotation", None)
-    if translation is None or rotation is None:
-        raise ValueError("TransformStamped transform is incomplete")
-    position_xyz = (
-        float(getattr(translation, "x", float("nan"))),
-        float(getattr(translation, "y", float("nan"))),
-        float(getattr(translation, "z", float("nan"))),
+def _bounded_rows(
+    value: Any,
+    *,
+    label: str,
+    limit: int = _MAX_BATCH_ITEMS,
+    error_code: str | None = None,
+) -> tuple[Any, ...]:
+    detail: str | None = None
+    if isinstance(value, (str, bytes, bytearray)):
+        detail = f"{label} must be a row sequence"
+        rows: tuple[Any, ...] = ()
+    else:
+        try:
+            rows = tuple(islice(iter(value), limit + 1))
+        except TypeError:
+            rows = ()
+            detail = f"{label} must be a row sequence"
+    if detail is None and len(rows) > limit:
+        detail = f"{label} exceed the adapter bound of {limit}"
+    if detail is not None:
+        if error_code is not None:
+            raise ObservationNormalizationError(error_code, detail)
+        raise ValueError(detail)
+    return rows
+
+
+def _bounded_optional_source_text(value: object, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    if len(value) > _MAX_SOURCE_TEXT_CHARS:
+        raise ValueError(f"{label} exceeds the adapter bound")
+    text = value.strip()
+    if len(text) > _MAX_SOURCE_TEXT_CHARS:
+        raise ValueError(f"{label} exceeds the adapter bound")
+    return text
+
+
+def _finite_number(value: object, *, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{label} must be a numeric value, not text or boolean")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} must be numeric") from exc
+    if not isfinite(number):
+        raise ValueError(f"{label} must be finite")
+    return number
+
+
+def _finite_numeric_sequence(
+    value: object,
+    *,
+    length: int,
+    label: str,
+) -> tuple[float, ...]:
+    rows = _bounded_rows(value, label=label, limit=length)
+    if len(rows) != length:
+        raise ValueError(f"{label} must contain {length} values")
+    return tuple(
+        _finite_number(item, label=f"{label}[{index}]")
+        for index, item in enumerate(rows)
     )
-    orientation_xyzw_raw = (
-        float(getattr(rotation, "x", float("nan"))),
-        float(getattr(rotation, "y", float("nan"))),
-        float(getattr(rotation, "z", float("nan"))),
-        float(getattr(rotation, "w", float("nan"))),
+
+
+def _validated_pose_snapshot(pose: PoseSnapshot, *, label: str) -> PoseSnapshot:
+    if not isinstance(pose, PoseSnapshot):
+        raise ObservationNormalizationError(
+            "invalid_pose", f"{label} must be a PoseSnapshot"
+        )
+    try:
+        frame_id = _bounded_source_text(pose.frame_id, label=f"{label} frame_id")
+        position_xyz = _finite_numeric_sequence(
+            pose.position_xyz,
+            length=3,
+            label=f"{label} position_xyz",
+        )
+        stamp_ns = pose.stamp_ns
+        if stamp_ns is not None and (
+            type(stamp_ns) is not int or not 0 <= stamp_ns <= (1 << 63) - 1
+        ):
+            raise ValueError(f"{label} stamp_ns must be a nonnegative signed int64")
+        orientation_values = _finite_numeric_sequence(
+            pose.orientation_xyzw,
+            length=4,
+            label=f"{label} orientation_xyzw",
+        )
+    except ValueError as exc:
+        raise ObservationNormalizationError("invalid_pose", str(exc)) from exc
+    orientation_xyzw = _normalize_quaternion(
+        orientation_values,
+        label=f"{label} orientation quaternion",
     )
-    if not all(isfinite(value) for value in position_xyz + orientation_xyzw_raw):
-        raise ValueError("TransformStamped contains non-finite pose values")
-    norm = sqrt(sum(value * value for value in orientation_xyzw_raw))
-    if norm <= 1e-9:
-        raise ValueError("TransformStamped orientation quaternion has zero norm")
-    orientation_xyzw = tuple(value / norm for value in orientation_xyzw_raw)
-    frame_id = str(getattr(header, "frame_id", "") or "")
-    if not frame_id:
-        raise ValueError("TransformStamped header.frame_id is empty")
     return PoseSnapshot(
         frame_id=frame_id,
-        stamp_sec=_stamp_to_float(getattr(header, "stamp", None)),
-        position_xyz=position_xyz,
-        orientation_xyzw=orientation_xyzw,  # type: ignore[arg-type]
+        stamp_ns=stamp_ns,
+        position_xyz=position_xyz,  # type: ignore[arg-type]
+        orientation_xyzw=orientation_xyzw,
     )
+
+
+def _simulation_capture_failure_batch(
+    requests: tuple[Any, ...],
+    *,
+    code: str,
+    detail: object,
+) -> SimulationEntityPoseBatch:
+    bounded_detail = _bounded_detail(detail)
+    return SimulationEntityPoseBatch(
+        observations=(),
+        failures=tuple(
+            AdapterFailure(request.entity, code, bounded_detail)
+            for request in requests
+        ),
+    )
+
+
+def _bounded_error_summary(errors: tuple[Any, ...]) -> str:
+    summary = ""
+    for error in errors:
+        text = _bounded_detail(error)
+        separator = "; " if summary else ""
+        remaining = _MAX_DETAIL_CHARS - len(summary) - len(separator)
+        if remaining <= 0:
+            break
+        summary += separator + text[:remaining]
+        if len(text) > remaining:
+            break
+    return summary
+
+
+def _bounded_source_text(value: object, *, label: str, limit: int = 1024) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    if len(value) > limit:
+        raise ValueError(f"{label} exceeds {limit} characters")
+    text = value.strip()
+    if not text:
+        raise ValueError(f"{label} must be non-empty")
+    if len(text) > limit:
+        raise ValueError(f"{label} exceeds {limit} characters")
+    return text
+
+
+def _bounded_detail(value: object) -> str:
+    text = str(value)
+    if len(text) <= _MAX_DETAIL_CHARS:
+        return text
+    return text[: _MAX_DETAIL_CHARS - 3] + "..."

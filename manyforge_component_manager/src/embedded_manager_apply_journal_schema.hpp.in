@@ -1,0 +1,10 @@
+#pragma once
+
+#include <string_view>
+
+namespace manyforge::component_manager::detail {
+
+inline constexpr std::string_view kEmbeddedManagerApplyJournalSchema =
+    R"mf_majs(@MANYFORGE_MANAGER_APPLY_JOURNAL_SCHEMA_SQL@)mf_majs";
+
+}  // namespace manyforge::component_manager::detail

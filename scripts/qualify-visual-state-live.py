@@ -1,28 +1,80 @@
 #!/usr/bin/env python3
-"""Live qualification probe for Composer visual-state snapshot routing.
+"""Pure historical visual-evidence scoring; retired live-collection CLI.
 
-The probe is intentionally read-only. Run it while an operator or another
-qualification harness drives a real Composer/Isaac cycle. It samples
-`/api/scene/state`, records route diagnostics, and fails if the viewer path
-falls back to live planner reads or exceeds latency/staleness budgets.
+The complete historical probe is preserved at
+``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`` (blob
+``e14ef71ce3e4c1416cb7b29cb0d7bf541ebadc3f``):
+
+* lines 25-68 and 189-330 supplied the sample value, scalar normalization,
+  percentile, summary, and budget checks retained here with explicit bounds;
+* lines 70-187 translated the old snake/camel ``/api/scene/state`` response
+  and performed HTTP sampling. That route was superseded by the native
+  execution-observation stream and is intentionally absent; and
+* lines 332-440 parsed the old CLI, sampled its route on a clock, and wrote
+  JSON/JSONL evidence. Current live collection is owned by
+  scripts/qualification/current_workbench_browser_collector.py.
+
+``Sample`` now means an already-normalized, source-owned observer record.  No
+function in this module discovers a route, fetches Composer state, reads a
+clock, or writes evidence.  Value scoring alone is not live qualification.
 """
+
 from __future__ import annotations
 
-import argparse
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-import json
 import math
-from pathlib import Path
-import time
-from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
-from urllib.request import Request, urlopen
+import sys
+from typing import Any, Final, NoReturn
+
+
+RUNTIME_UNAVAILABLE_REASON_CODE: Final = "composable_cell_runtime_unavailable"
+MAX_VISUAL_PROBE_SAMPLES: Final = 1_000_000
+MAX_SAMPLE_TEXT_CHARS: Final = 4_096
+
+DEFAULT_SNAPSHOT_MODES: Final = frozenset({"visual_snapshot", "visual_snapshot_pending"})
+DEFAULT_PENDING_MODES: Final = frozenset({"visual_snapshot_pending"})
+DEFAULT_LEGACY_MODES: Final = frozenset({"legacy_live"})
+
+
+class VisualProbeUnavailableError(RuntimeError):
+    """Raised before a route, runtime, clock, or evidence file is touched."""
+
+
+class VisualProbeBoundsError(ValueError):
+    """Raised when value-only probe evidence is not finitely bounded."""
+
+
+def _raise_visual_probe_unavailable() -> NoReturn:
+    raise VisualProbeUnavailableError(
+        f"{RUNTIME_UNAVAILABLE_REASON_CODE}: historical visual collection is retired; "
+        "use scripts/qualification/current_workbench_browser_collector.py"
+    )
+
+
+def _required_nonnegative_float(value: object, *, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{field_name} must be a finite number")
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise ValueError(f"{field_name} must be finite and non-negative")
+    return parsed
+
+
+def _validate_optional_nonnegative_float(
+    value: object,
+    *,
+    field_name: str,
+) -> None:
+    if value is not None:
+        _required_nonnegative_float(value, field_name=field_name)
 
 
 @dataclass(slots=True)
 class Sample:
+    """One already-normalized observer sample; never a route response DTO."""
+
     index: int
     ok: bool
     latency_ms: float
@@ -43,7 +95,64 @@ class Sample:
     fresh_pose_source_count: int | None = None
     error: str | None = None
 
+    def __post_init__(self) -> None:
+        if isinstance(self.index, bool) or not isinstance(self.index, int):
+            raise TypeError("index must be an integer")
+        if self.index < 0:
+            raise ValueError("index must be non-negative")
+        if not isinstance(self.ok, bool):
+            raise TypeError("ok must be a boolean")
+        _required_nonnegative_float(self.latency_ms, field_name="latency_ms")
+        if not isinstance(self.mode, str):
+            raise TypeError("mode must be a string")
+        if not self.mode or len(self.mode) > MAX_SAMPLE_TEXT_CHARS:
+            raise ValueError(f"mode must contain 1..{MAX_SAMPLE_TEXT_CHARS} characters")
+        for field_name in (
+            "served_from_visual_snapshot",
+            "snapshot_stale",
+            "snapshot_publisher_running",
+        ):
+            if not isinstance(getattr(self, field_name), bool):
+                raise TypeError(f"{field_name} must be a boolean")
+        for field_name in (
+            "total_ms",
+            "snapshot_age_ms",
+            "snapshot_build_ms",
+        ):
+            _validate_optional_nonnegative_float(
+                getattr(self, field_name),
+                field_name=field_name,
+            )
+        for field_name in (
+            "snapshot_sequence_number",
+            "object_count",
+            "gripper_count",
+            "pose_source_count",
+            "fresh_pose_source_count",
+        ):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{field_name} must be an integer or None")
+            if value < 0:
+                raise ValueError(f"{field_name} must be non-negative")
+        for field_name in (
+            "fallback_reason",
+            "snapshot_publisher_error",
+            "objects_source",
+            "error",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                if not isinstance(value, str):
+                    raise TypeError(f"{field_name} must be a string or None")
+                if len(value) > MAX_SAMPLE_TEXT_CHARS:
+                    raise ValueError(f"{field_name} exceeds {MAX_SAMPLE_TEXT_CHARS} characters")
+
     def to_json(self) -> dict[str, Any]:
+        """Project the normalized sample into an artifact-ready mapping."""
+
         return {
             "index": self.index,
             "ok": self.ok,
@@ -67,125 +176,6 @@ class Sample:
         }
 
 
-def _snake_or_camel(mapping: dict[str, Any], snake: str, camel: str, default: Any = None) -> Any:
-    if snake in mapping:
-        return mapping[snake]
-    return mapping.get(camel, default)
-
-
-def _get_json(base_url: str, path: str, *, timeout_s: float) -> dict[str, Any]:
-    url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
-    request = Request(url, headers={"Accept": "application/json"})
-    with urlopen(request, timeout=timeout_s) as response:
-        body = response.read()
-    return json.loads(body.decode("utf-8"))
-
-
-def _fresh_pose_source_count(pose_sources: list[Any]) -> int:
-    fresh_count = 0
-    for item in pose_sources:
-        if not isinstance(item, dict):
-            continue
-        fresh = item.get("fresh")
-        if fresh is None:
-            fresh = item.get("is_fresh")
-        if fresh is None:
-            fresh = item.get("isFresh")
-        if bool(fresh):
-            fresh_count += 1
-    return fresh_count
-
-
-def _sample_scene_state(
-    *,
-    base_url: str,
-    index: int,
-    timeout_s: float,
-) -> Sample:
-    started = time.perf_counter()
-    try:
-        payload = _get_json(base_url, "/api/scene/state", timeout_s=timeout_s)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
-    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
-        return Sample(
-            index=index,
-            ok=False,
-            latency_ms=elapsed_ms,
-            error=f"{exc.__class__.__name__}: {exc}",
-        )
-
-    diagnostics = _snake_or_camel(
-        payload,
-        "visual_state_diagnostics",
-        "visualStateDiagnostics",
-        {},
-    )
-    if not isinstance(diagnostics, dict):
-        diagnostics = {}
-    pose_sources = _snake_or_camel(payload, "pose_sources", "poseSources", [])
-    if not isinstance(pose_sources, list):
-        pose_sources = []
-
-    return Sample(
-        index=index,
-        ok=True,
-        latency_ms=elapsed_ms,
-        mode=str(diagnostics.get("mode") or "unknown"),
-        served_from_visual_snapshot=bool(
-            _snake_or_camel(
-                diagnostics,
-                "served_from_visual_snapshot",
-                "servedFromVisualSnapshot",
-                False,
-            )
-        ),
-        fallback_reason=_snake_or_camel(
-            diagnostics,
-            "fallback_reason",
-            "fallbackReason",
-            None,
-        ),
-        total_ms=_optional_float(diagnostics.get("total_ms")),
-        snapshot_age_ms=_optional_float(
-            _snake_or_camel(diagnostics, "snapshot_age_ms", "snapshotAgeMs", None)
-        ),
-        snapshot_sequence_number=_optional_int(
-            _snake_or_camel(
-                diagnostics,
-                "snapshot_sequence_number",
-                "snapshotSequenceNumber",
-                None,
-            )
-        ),
-        snapshot_build_ms=_optional_float(
-            _snake_or_camel(diagnostics, "snapshot_build_ms", "snapshotBuildMs", None)
-        ),
-        snapshot_stale=bool(
-            _snake_or_camel(diagnostics, "snapshot_stale", "snapshotStale", False)
-        ),
-        snapshot_publisher_running=bool(
-            _snake_or_camel(
-                diagnostics,
-                "snapshot_publisher_running",
-                "snapshotPublisherRunning",
-                False,
-            )
-        ),
-        snapshot_publisher_error=_snake_or_camel(
-            diagnostics,
-            "snapshot_publisher_error",
-            "snapshotPublisherError",
-            None,
-        ),
-        objects_source=_snake_or_camel(diagnostics, "objects_source", "objectsSource", None),
-        object_count=len(payload.get("objects") or []),
-        gripper_count=len(payload.get("grippers") or []),
-        pose_source_count=len(pose_sources),
-        fresh_pose_source_count=_fresh_pose_source_count(pose_sources),
-    )
-
-
 def _optional_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -207,13 +197,23 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
-def _percentile(values: list[float], percentile: float) -> float | None:
+def _percentile(values: Sequence[float], percentile: float) -> float | None:
+    if len(values) > MAX_VISUAL_PROBE_SAMPLES:
+        raise VisualProbeBoundsError(f"values exceeds {MAX_VISUAL_PROBE_SAMPLES} entries")
+    percentile_value = _required_nonnegative_float(
+        percentile,
+        field_name="percentile",
+    )
+    if percentile_value > 1.0:
+        raise ValueError("percentile must be in [0, 1]")
     if not values:
         return None
-    ordered = sorted(values)
+    ordered = sorted(
+        _required_nonnegative_float(value, field_name="values entry") for value in values
+    )
     if len(ordered) == 1:
         return ordered[0]
-    rank = (len(ordered) - 1) * percentile
+    rank = (len(ordered) - 1) * percentile_value
     lower = math.floor(rank)
     upper = math.ceil(rank)
     if lower == upper:
@@ -222,26 +222,33 @@ def _percentile(values: list[float], percentile: float) -> float | None:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
-def _build_summary(samples: list[Sample]) -> dict[str, Any]:
+def _build_summary(
+    samples: Sequence[Sample],
+    *,
+    snapshot_modes: frozenset[str] = DEFAULT_SNAPSHOT_MODES,
+    pending_modes: frozenset[str] = DEFAULT_PENDING_MODES,
+    legacy_modes: frozenset[str] = DEFAULT_LEGACY_MODES,
+) -> dict[str, Any]:
+    """Aggregate normalized samples without translating a live wire payload."""
+
+    if isinstance(samples, (str, bytes)):
+        raise TypeError("samples must be a sequence of Sample values")
+    if len(samples) > MAX_VISUAL_PROBE_SAMPLES:
+        raise VisualProbeBoundsError(f"samples exceeds {MAX_VISUAL_PROBE_SAMPLES} entries")
+    if not all(isinstance(sample, Sample) for sample in samples):
+        raise TypeError("samples must contain only Sample values")
     ok_samples = [sample for sample in samples if sample.ok]
     latencies = [sample.latency_ms for sample in ok_samples]
     mode_counts = Counter(sample.mode for sample in ok_samples)
-    fallback_counts = Counter(
-        sample.fallback_reason or "none" for sample in ok_samples
-    )
+    fallback_counts = Counter(sample.fallback_reason or "none" for sample in ok_samples)
     publisher_errors = Counter(
-        sample.snapshot_publisher_error
-        for sample in ok_samples
-        if sample.snapshot_publisher_error
+        sample.snapshot_publisher_error for sample in ok_samples if sample.snapshot_publisher_error
     )
     stale_count = sum(1 for sample in ok_samples if sample.snapshot_stale)
-    pending_count = sum(1 for sample in ok_samples if sample.mode == "visual_snapshot_pending")
-    legacy_count = sum(1 for sample in ok_samples if sample.mode == "legacy_live")
-    non_snapshot_count = sum(
-        1
-        for sample in ok_samples
-        if sample.mode not in {"visual_snapshot", "visual_snapshot_pending"}
-    )
+    pending_count = sum(1 for sample in ok_samples if sample.mode in pending_modes)
+    legacy_count = sum(1 for sample in ok_samples if sample.mode in legacy_modes)
+    non_snapshot_count = sum(1 for sample in ok_samples if sample.mode not in snapshot_modes)
+    ages = [sample.snapshot_age_ms for sample in ok_samples if sample.snapshot_age_ms is not None]
     return {
         "sample_count": len(samples),
         "ok_count": len(ok_samples),
@@ -256,35 +263,21 @@ def _build_summary(samples: list[Sample]) -> dict[str, Any]:
         "stale_ratio": (stale_count / len(ok_samples)) if ok_samples else None,
         "pending_ratio": (pending_count / len(ok_samples)) if ok_samples else None,
         "latency_ms": {
-            "min": min(latencies) if latencies else None,
+            "min": min(latencies, default=None),
             "p50": _percentile(latencies, 0.50),
             "p95": _percentile(latencies, 0.95),
             "p99": _percentile(latencies, 0.99),
-            "max": max(latencies) if latencies else None,
+            "max": max(latencies, default=None),
         },
         "snapshot_age_ms": {
-            "p95": _percentile(
-                [
-                    sample.snapshot_age_ms
-                    for sample in ok_samples
-                    if sample.snapshot_age_ms is not None
-                ],
-                0.95,
-            ),
-            "max": max(
-                [
-                    sample.snapshot_age_ms
-                    for sample in ok_samples
-                    if sample.snapshot_age_ms is not None
-                ],
-                default=None,
-            ),
+            "p95": _percentile(ages, 0.95),
+            "max": max(ages, default=None),
         },
     }
 
 
 def _evaluate(
-    summary: dict[str, Any],
+    summary: Mapping[str, Any],
     *,
     max_error_count: int,
     max_legacy_count: int,
@@ -293,35 +286,34 @@ def _evaluate(
     max_stale_ratio: float,
     max_pending_ratio: float,
 ) -> list[str]:
+    """Apply latency, staleness, fallback, and publisher-health budgets."""
+
     failures: list[str] = []
-    if summary["ok_count"] <= 0:
-        failures.append("no successful /api/scene/state samples")
+    if int(summary.get("ok_count", 0)) <= 0:
+        failures.append("no successful visual-observer samples")
         return failures
-    if summary["error_count"] > max_error_count:
+    error_count = int(summary.get("error_count", 0))
+    if error_count > max_error_count:
+        failures.append(f"observer errors {error_count} > budget {max_error_count}")
+    legacy_count = int(summary.get("legacy_count", 0))
+    if legacy_count > max_legacy_count:
+        failures.append(f"legacy-mode samples {legacy_count} > budget {max_legacy_count}")
+    non_snapshot_count = int(summary.get("non_snapshot_count", 0))
+    if non_snapshot_count > max_non_snapshot_count:
         failures.append(
-            f"route errors {summary['error_count']} > budget {max_error_count}"
+            "non-snapshot samples " f"{non_snapshot_count} > budget {max_non_snapshot_count}"
         )
-    if summary["legacy_count"] > max_legacy_count:
-        failures.append(
-            f"legacy_live samples {summary['legacy_count']} > budget {max_legacy_count}"
-        )
-    if summary["non_snapshot_count"] > max_non_snapshot_count:
-        failures.append(
-            "non-snapshot samples "
-            f"{summary['non_snapshot_count']} > budget {max_non_snapshot_count}"
-        )
-    publisher_errors = summary["publisher_errors"]
+    publisher_errors = summary.get("publisher_errors", {})
     if publisher_errors:
         failures.append(f"publisher errors observed: {publisher_errors}")
-    p95 = summary["latency_ms"]["p95"]
+    latency = summary.get("latency_ms", {})
+    p95 = latency.get("p95") if isinstance(latency, Mapping) else None
     if p95 is not None and p95 > max_p95_ms:
-        failures.append(f"scene-state p95 latency {p95:.1f} ms > budget {max_p95_ms:.1f} ms")
-    stale_ratio = summary["stale_ratio"]
+        failures.append(f"visual-observer p95 latency {p95:.1f} ms > budget {max_p95_ms:.1f} ms")
+    stale_ratio = summary.get("stale_ratio")
     if stale_ratio is not None and stale_ratio > max_stale_ratio:
-        failures.append(
-            f"snapshot stale ratio {stale_ratio:.3f} > budget {max_stale_ratio:.3f}"
-        )
-    pending_ratio = summary["pending_ratio"]
+        failures.append(f"snapshot stale ratio {stale_ratio:.3f} > budget {max_stale_ratio:.3f}")
+    pending_ratio = summary.get("pending_ratio")
     if pending_ratio is not None and pending_ratio > max_pending_ratio:
         failures.append(
             f"snapshot pending ratio {pending_ratio:.3f} > budget {max_pending_ratio:.3f}"
@@ -329,112 +321,36 @@ def _evaluate(
     return failures
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", default="http://127.0.0.1:9000")
-    parser.add_argument("--duration-s", type=float, default=90.0)
-    parser.add_argument("--hz", type=float, default=10.0)
-    parser.add_argument("--timeout-s", type=float, default=2.0)
-    parser.add_argument("--warmup-s", type=float, default=2.0)
-    parser.add_argument("--max-error-count", type=int, default=0)
-    parser.add_argument("--max-legacy-count", type=int, default=0)
-    parser.add_argument("--max-non-snapshot-count", type=int, default=0)
-    parser.add_argument("--max-p95-ms", type=float, default=100.0)
-    parser.add_argument("--max-stale-ratio", type=float, default=0.05)
-    parser.add_argument("--max-pending-ratio", type=float, default=0.10)
-    parser.add_argument(
-        "--samples-jsonl",
-        default=None,
-        help="Optional path for per-sample JSONL output",
-    )
-    parser.add_argument(
-        "--summary-json",
-        default=None,
-        help="Optional path for the final summary JSON",
-    )
-    parser.add_argument(
-        "--print-samples",
-        action="store_true",
-        help="Print every sample as JSONL to stdout",
-    )
-    return parser.parse_args()
+def require_visual_probe(
+    *_args: object,
+    **_kwargs: object,
+) -> NoReturn:
+    """Typed gate for callers that would perform live visual observation."""
+
+    _raise_visual_probe_unavailable()
 
 
-def main() -> int:
-    args = _parse_args()
-    if args.duration_s <= 0:
-        raise SystemExit("--duration-s must be positive")
-    if args.hz <= 0:
-        raise SystemExit("--hz must be positive")
-    period_s = 1.0 / args.hz
-    deadline = time.monotonic() + args.duration_s
-    next_sample_at = time.monotonic() + max(0.0, args.warmup_s)
-    samples: list[Sample] = []
-    samples_handle = None
-    try:
-        if args.samples_jsonl:
-            samples_path = Path(args.samples_jsonl)
-            samples_path.parent.mkdir(parents=True, exist_ok=True)
-            samples_handle = samples_path.open("w", encoding="utf-8")
-        sample_index = 0
-        while time.monotonic() < deadline:
-            now = time.monotonic()
-            if now < next_sample_at:
-                time.sleep(min(0.05, next_sample_at - now))
-                continue
-            sample = _sample_scene_state(
-                base_url=args.base_url,
-                index=sample_index,
-                timeout_s=args.timeout_s,
-            )
-            samples.append(sample)
-            sample_json = sample.to_json()
-            if samples_handle is not None:
-                samples_handle.write(json.dumps(sample_json, sort_keys=True) + "\n")
-                samples_handle.flush()
-            if args.print_samples:
-                print(json.dumps(sample_json, sort_keys=True), flush=True)
-            sample_index += 1
-            next_sample_at += period_s
-            if next_sample_at < time.monotonic() - period_s:
-                next_sample_at = time.monotonic() + period_s
-    finally:
-        if samples_handle is not None:
-            samples_handle.close()
-
-    summary = _build_summary(samples)
-    failures = _evaluate(
-        summary,
-        max_error_count=args.max_error_count,
-        max_legacy_count=args.max_legacy_count,
-        max_non_snapshot_count=args.max_non_snapshot_count,
-        max_p95_ms=args.max_p95_ms,
-        max_stale_ratio=args.max_stale_ratio,
-        max_pending_ratio=args.max_pending_ratio,
+def main(_argv: list[str] | None = None) -> int:
+    print(
+        f"{RUNTIME_UNAVAILABLE_REASON_CODE}: historical live visual-state "
+        "collection is retired; use scripts/qualification/current_workbench_browser_collector.py",
+        file=sys.stderr,
     )
-    result = {
-        "success": not failures,
-        "base_url": args.base_url,
-        "duration_s": args.duration_s,
-        "hz": args.hz,
-        "budgets": {
-            "max_error_count": args.max_error_count,
-            "max_legacy_count": args.max_legacy_count,
-            "max_non_snapshot_count": args.max_non_snapshot_count,
-            "max_p95_ms": args.max_p95_ms,
-            "max_stale_ratio": args.max_stale_ratio,
-            "max_pending_ratio": args.max_pending_ratio,
-        },
-        "summary": summary,
-        "failures": failures,
-    }
-    if args.summary_json:
-        summary_path = Path(args.summary_json)
-        summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
-    print(json.dumps(result, indent=2, sort_keys=True))
-    return 0 if not failures else 1
+    return 78
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+__all__ = [
+    "DEFAULT_LEGACY_MODES",
+    "DEFAULT_PENDING_MODES",
+    "DEFAULT_SNAPSHOT_MODES",
+    "RUNTIME_UNAVAILABLE_REASON_CODE",
+    "Sample",
+    "VISUAL_PROBE_RESTORATION_GATES",
+    "VisualProbeBoundsError",
+    "VisualProbeUnavailableError",
+    "require_visual_probe",
+]

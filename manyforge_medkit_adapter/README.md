@@ -1,24 +1,23 @@
 # manyforge_medkit_adapter
 
-Forwards ManyForge core faults to a [ros2_medkit](https://github.com/selfpatch/ros2_medkit)
-fault manager: FAILED on fault latch, PASSED healing stream on clear,
-severities from the ManyForge fault taxonomy (CRITICAL bypasses medkit
-debounce), SOVD entity presence via a `MedkitDiscoveryHint` beacon.
-Fail-closed startup: exits 2 when `ros2_medkit_msgs` is not importable,
-3 when the `report_fault` service is unreachable.
+This package currently retains the transport-neutral fault latch, healing,
+archive-reference, and medkit-report mapping in `forwarder.py`. The effectful
+adapter entrypoint is intentionally unavailable until I6/N provides an
+addressed runtime diagnostics source; it exits 78 before parsing arguments,
+accessing a network, importing ROS, or publishing a fault.
 
 ManyForge core stays medkit-free — this package owns the coupling, one-way.
 
-**Full runbook (install, test, operate, gotchas):**
+The previous Composer-polling adapter is a behavior reference, not a runnable
+fallback. Its complete source is pinned at
+`manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`, blob
+`ef1b592fac2c99ebb10c4683b86c654704e7d3aa`. At N, the restored adapter must
+consume addressed owner-issued diagnostics while preserving FAILED-on-latch,
+PASSED healing, severity, archive-reference, discovery, and fail-closed
+behavior.
+
+**Status and medkit notes:**
 [`docs/operations/ROS2_MEDKIT.md`](../docs/operations/ROS2_MEDKIT.md)
 
-Quick start (medkit built and sourced, fault_manager running):
-
-```bash
-export PYTHONPATH="$PWD/manyforge_medkit_adapter:$PWD/manyforge_ros:$PWD/manyforge_behavior:${PYTHONPATH}"
-python3 -m manyforge_medkit_adapter.adapter --composer-url http://127.0.0.1:9000
-```
-
-Tests: hermetic forwarder tests run in the ros lane (`./scripts/test-ros.sh`);
-the real-lifecycle integration test requires a built medkit and a running
-fault_manager, and skips with a clear reason otherwise.
+Hermetic reducer and mapping tests remain part of the ROS lane. No current
+real-lifecycle or operator command is claimed until N qualification.

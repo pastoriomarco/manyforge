@@ -1,297 +1,571 @@
-// Chunk 4 unit tests for ManyForgeCollisionEngine: independent
-// per-instance scenes, concurrent queries on separate instances,
-// agreement with the RoboPlan path on a primitive fixture, and
-// no-scene-lock-contention against the planner projection.
+// Owner-neutral manyforge_collision integration and relocation acceptance map.
+//
+// The historical source at manyforge@08222188293df8e12f90dc72e204c21f22f92ea1
+// contained 35 tests. It constructed NativeKernelBundle for scene snapshots,
+// observed state, planner comparison, and runtime composition. That factory is
+// intentionally gone. Nine responsibilities below remain testable directly
+// through ManyForgeCollisionEngine; both the retained/adapted cases and every
+// unavailable historical case are named exactly once below instead of being
+// hidden in a skipped legacy body.
 
-#include <manyforge_collision/manyforge_collision_engine.hpp>
-#include <manyforge_core/collision/collision_policy_evaluator.hpp>
-#include <manyforge_core/collision/collision_validation_coordinator.hpp>
-#include <roboplan_example_models/resources.hpp>
-#include <manyforge_roboplan/native_kernel_factory.hpp>
-
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
+#include <array>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
-#include <map>
+#include <manyforge_collision/manyforge_collision_engine.hpp>
+#include <manyforge_collision/scene_asset_root.hpp>
+#include <manyforge_core/types/collision.hpp>
+#include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <memory>
-#include <stdexcept>
+#include <optional>
+#include <pinocchio/algorithm/geometry.hpp>
+#include <pinocchio/algorithm/joint-configuration.hpp>
+#include <pinocchio/collision/collision.hpp>
+#include <pinocchio/parsers/srdf.hpp>
+#include <pinocchio/parsers/urdf.hpp>
+#include <random>
+#include <set>
 #include <string>
-#include <thread>
+#include <utility>
 #include <vector>
+
+#include "collision_qualification_support.hpp"
 
 namespace {
 
-using manyforge::core::AddObjectRequestDTO;
-using manyforge::core::AttachObjectRequestDTO;
-using manyforge::core::BoxShapeDTO;
+using manyforge::collision::ManyForgeCollisionEngine;
 using manyforge::core::CollisionCancellationToken;
 using manyforge::core::CollisionDecisionResult;
-using manyforge::core::CollisionDistanceRequestMode;
 using manyforge::core::CollisionEngineStatus;
 using manyforge::core::CollisionPolicySnapshot;
 using manyforge::core::CollisionQuery;
 using manyforge::core::CollisionResult;
-using manyforge::core::CollisionShapeDTO;
-using manyforge::core::CollisionSurface;
-using manyforge::core::CollisionValidationCoordinator;
-using manyforge::core::CollisionValidationPassConfig;
 using manyforge::core::CollisionWorldSnapshot;
-using manyforge::core::ICollisionQueryEngine;
-using manyforge::core::MeshShapeDTO;
-using manyforge::core::Pose3DTO;
-using manyforge::core::TrajectoryDTO;
-using manyforge::core::TrajectoryWaypointDTO;
-using manyforge::core::Vector3DTO;
-using manyforge::collision::ManyForgeCollisionEngine;
-using manyforge::roboplan_backend::NativeKernelBundle;
-using manyforge::roboplan_backend::create_native_kernel;
-
-std::shared_ptr<ManyForgeCollisionEngine> make_engine(
-    const std::string& model_name = "ur5_gripper",
-    const std::string& group_name = "arm") {
-  struct Config {
-    std::string urdf_rel;
-    std::string srdf_rel;
-    std::string default_group;
-  };
-  const std::map<std::string, Config> configs = {
-      {"ur5_gripper",
-       {"ur_robot_model/ur5_gripper.urdf", "ur_robot_model/ur5_gripper.srdf",
-        "arm"}},
-      {"fr3",
-       {"franka_robot_model/fr3.urdf", "franka_robot_model/fr3.srdf",
-        "fr3_arm"}},
-      {"kinova",
-       {"kinova_robot_model/kinova_robotiq.urdf",
-        "kinova_robot_model/kinova_robotiq.srdf", "kinova_arm"}},
-      {"so101",
-       {"so101_robot_model/so101.urdf", "so101_robot_model/so101.srdf",
-        "arm"}},
-  };
-  auto it = configs.find(model_name);
-  if (it == configs.end()) {
-    throw std::runtime_error("unknown example model: " + model_name);
-  }
-  const auto models_dir = roboplan::example_models::get_package_models_dir();
-  const auto pkg_share = roboplan::example_models::get_package_share_dir();
-  const std::string actual_group =
-      group_name.empty() ? it->second.default_group : group_name;
-  return std::make_shared<ManyForgeCollisionEngine>(
-      model_name,
-      models_dir / it->second.urdf_rel,
-      models_dir / it->second.srdf_rel,
-      std::vector<std::filesystem::path>{pkg_share},
-      actual_group);
-}
+using manyforge::qualification::AcceptanceDisposition;
 
 std::filesystem::path repo_root() {
   return std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
 }
 
-std::shared_ptr<NativeKernelBundle> make_ur10e_bundle() {
-  const auto root = repo_root();
-  const auto model_dir = root / "manyforge_example_models" / "models" /
-                         "ur10e_robotiq_2f_140";
-  manyforge::core::ExecutionKernelConfig config;
-  return manyforge::roboplan_backend::create_native_kernel(
-      "ur10e_robotiq_2f_140",
-      "arm",
-      (model_dir / "ur10e_robotiq_2f_140.urdf").string(),
-      (model_dir / "ur10e_robotiq_2f_140.srdf").string(),
-      {root.string()},
-      config);
-}
-
-std::shared_ptr<ManyForgeCollisionEngine> make_ur10e_engine() {
-  const auto root = repo_root();
-  const auto model_dir = root / "manyforge_example_models" / "models" /
-                         "ur10e_robotiq_2f_140";
-  return std::make_shared<ManyForgeCollisionEngine>(
-      "ur10e_robotiq_2f_140",
-      model_dir / "ur10e_robotiq_2f_140.urdf",
-      model_dir / "ur10e_robotiq_2f_140.srdf",
-      std::vector<std::filesystem::path>{root},
-      "arm");
-}
-
-manyforge::core::RobotStateDTO observed_state(
-    const NativeKernelBundle& bundle) {
-  auto state = bundle.observed_state_provider->current_state(
-      bundle.clock->now());
-  if (!state.ok()) {
-    throw std::runtime_error("observed state unavailable in test fixture: " +
-                             state.error().message);
-  }
-  return std::move(state.value());
-}
-
-CollisionQuery make_query(const std::vector<double>& positions) {
-  CollisionQuery q;
-  q.query_id = "manyforge-collision-engine-test";
-  q.robot_state.joint_names = {};
-  q.robot_state.positions_rad = positions;
-  return q;
-}
-
-CollisionResult check_snapshot(ManyForgeCollisionEngine& engine,
-                               const CollisionWorldSnapshot& snapshot,
-                               CollisionQuery q) {
-  q.collision_world_revision = snapshot.revision;
-  CollisionPolicySnapshot policy;
-  CollisionCancellationToken cancel;
-  return engine.check(snapshot, q, policy, cancel);
-}
-
-class AlwaysIncompleteCompareEngine final : public ICollisionQueryEngine {
- public:
-  CollisionResult check(const CollisionWorldSnapshot& snapshot,
-                        const CollisionQuery& query,
-                        const CollisionPolicySnapshot& policy,
-                        const CollisionCancellationToken& cancel) override {
-    (void)snapshot;
-    (void)policy;
-    (void)cancel;
-    CollisionResult result;
-    result.query_id = query.query_id;
-    result.surface = query.surface;
-    result.engine_id = engine_id();
-    result.engine_version = engine_version();
-    result.engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
-    result.decision = CollisionDecisionResult::kInconclusiveFail;
-    return result;
-  }
-
-  const manyforge::core::CollisionEngineCapabilityDescriptor& capability()
-      const override {
-    return capability_;
-  }
-
-  std::string engine_id() const override { return "test/incomplete_compare"; }
-  std::string engine_version() const override { return "0.0.0-test"; }
-
- private:
-  manyforge::core::CollisionEngineCapabilityDescriptor capability_;
+struct ModelPaths {
+  std::filesystem::path urdf;
+  std::filesystem::path srdf;
 };
 
-AddObjectRequestDTO make_box_object(const std::string& object_id,
-                                    double x = 0.7) {
-  AddObjectRequestDTO req;
-  req.object_id = object_id;
-  req.shape = CollisionShapeDTO{BoxShapeDTO{Vector3DTO{0.05, 0.05, 0.05}}};
-  req.pose.position_m = Vector3DTO{x, 0.0, 0.25};
-  req.pose.orientation.w = 1.0;
-  req.frame_id = "universe";
-  return req;
+ModelPaths ur10e_model_paths() {
+  const auto model_dir = repo_root() / "manyforge_example_models" / "models" /
+                         "ur10e_robotiq_2f_140";
+  return {
+      model_dir / "ur10e_robotiq_2f_140.urdf",
+      model_dir / "ur10e_robotiq_2f_140.srdf",
+  };
 }
 
-AddObjectRequestDTO make_large_collision_box(const std::string& object_id) {
-  AddObjectRequestDTO req;
-  req.object_id = object_id;
-  req.shape = CollisionShapeDTO{BoxShapeDTO{Vector3DTO{10.0, 10.0, 10.0}}};
-  req.pose.position_m = Vector3DTO{0.0, 0.0, 0.5};
-  req.pose.orientation.w = 1.0;
-  req.frame_id = "universe";
-  return req;
+// The maintained Lite 6 with its lite gripper: mesh links and mesh fingers
+// (the F-1 pair is a finger mesh against a wall).
+ModelPaths lite6_model_paths() {
+  const auto model_dir = repo_root() / "manyforge_example_models" / "models" /
+                         "lite6_lite_gripper";
+  return {
+      model_dir / "lite6_lite_gripper.urdf",
+      model_dir / "lite6_lite_gripper.srdf",
+  };
 }
 
-AddObjectRequestDTO make_mesh_object(const std::string& object_id) {
-  const auto mesh_path =
-      std::filesystem::temp_directory_path() /
-      ("manyforge_collision_engine_" + object_id + ".obj");
-  std::ofstream mesh_file(mesh_path);
-  mesh_file << "v 0 0 0\n";
-  mesh_file << "v 0.01 0 0\n";
-  mesh_file << "v 0 0.01 0\n";
-  mesh_file << "f 1 2 3\n";
-  mesh_file.close();
-
-  MeshShapeDTO mesh;
-  mesh.resource_uri = mesh_path.string();
-  mesh.scale = Vector3DTO{1.0, 1.0, 1.0};
-
-  AddObjectRequestDTO req;
-  req.object_id = object_id;
-  req.shape = CollisionShapeDTO{mesh};
-  req.pose.position_m = Vector3DTO{0.7, 0.0, 0.25};
-  req.pose.orientation.w = 1.0;
-  req.frame_id = "universe";
-  return req;
+ManyForgeCollisionEngine::SharedModelPtr load_lite6_shared_model() {
+  const auto paths = lite6_model_paths();
+  return ManyForgeCollisionEngine::load_shared_model(
+      "lite6_lite_gripper", paths.urdf, paths.srdf, {repo_root()}, "lite6");
 }
 
-AddObjectRequestDTO make_isaac_mesh_object(const std::string& object_id,
-                                           const std::string& rel_mesh_path,
-                                           Vector3DTO scale,
-                                           Vector3DTO position,
-                                           manyforge::core::QuaternionDTO orientation =
-                                               {0.0, 0.0, 0.0, 1.0}) {
-  MeshShapeDTO mesh;
-  mesh.resource_uri = (repo_root() / rel_mesh_path).string();
-  mesh.scale = scale;
+const std::vector<std::string> kLite6ArmJoints{"joint1", "joint2", "joint3",
+                                               "joint4", "joint5", "joint6"};
 
-  AddObjectRequestDTO req;
-  req.object_id = object_id;
-  req.shape = CollisionShapeDTO{mesh};
-  req.pose.position_m = position;
-  req.pose.orientation = orientation;
-  req.frame_id = "universe";
-  return req;
+ManyForgeCollisionEngine::SharedModelPtr load_shared_model() {
+  const auto paths = ur10e_model_paths();
+  return ManyForgeCollisionEngine::load_shared_model(
+      "ur10e_robotiq_2f_140", paths.urdf, paths.srdf, {repo_root()}, "arm");
 }
 
-Pose3DTO make_pose(Vector3DTO position,
-                   manyforge::core::QuaternionDTO orientation) {
-  Pose3DTO pose;
-  pose.position_m = position;
-  pose.orientation = orientation;
-  return pose;
+std::unique_ptr<ManyForgeCollisionEngine> make_engine(
+    const std::string& group = "arm") {
+  const auto paths = ur10e_model_paths();
+  return std::make_unique<ManyForgeCollisionEngine>(
+      "ur10e_robotiq_2f_140", paths.urdf, paths.srdf,
+      std::vector<std::filesystem::path>{repo_root()}, group);
 }
 
-std::string diagnostics_text(
-    const std::map<std::string, std::string>& diagnostics) {
-  std::string out;
-  for (const auto& [key, value] : diagnostics) {
-    if (!out.empty()) {
-      out += "; ";
+CollisionWorldSnapshot minimal_snapshot() {
+  CollisionWorldSnapshot snapshot;
+  snapshot.publisher_id = "owner-neutral-collision-test";
+  snapshot.revision.revision_id = 1;
+  snapshot.revision.content_hash = "sha256:owner-neutral-collision-test";
+  snapshot.all_bodies_have_geometry = true;
+  return snapshot;
+}
+
+CollisionQuery one_joint_query() {
+  CollisionQuery query;
+  query.robot_state.joint_names = {"joint"};
+  query.robot_state.positions_rad = {0.0};
+  return query;
+}
+
+CollisionResult check(ManyForgeCollisionEngine& engine,
+                      const CollisionWorldSnapshot& snapshot,
+                      CollisionQuery query,
+                      const CollisionCancellationToken* cancel = nullptr) {
+  query.collision_world_revision = snapshot.revision;
+  CollisionCancellationToken default_cancel;
+  return engine.check(snapshot, query, CollisionPolicySnapshot{},
+                      cancel == nullptr ? default_cancel : *cancel);
+}
+
+struct TemporaryModel {
+  std::filesystem::path root;
+  TemporaryModel() {
+    auto pattern = (std::filesystem::temp_directory_path() / "collision-bound-XXXXXX").string();
+    if (!::mkdtemp(pattern.data())) throw std::runtime_error("cannot create test model directory");
+    root = pattern;
+  }
+  ~TemporaryModel() { std::filesystem::remove_all(root); }
+};
+
+ManyForgeCollisionEngine::SharedModelPtr load_empty_collision_model(
+    const TemporaryModel& temporary) {
+  const auto urdf = temporary.root / "empty.urdf";
+  const auto srdf = temporary.root / "empty.srdf";
+  {
+    std::ofstream model(urdf);
+    model << R"(<robot name="empty"><link name="base"/><link name="tip"/>
+      <joint name="joint" type="revolute"><parent link="base"/><child link="tip"/>
+      <axis xyz="0 0 1"/><limit lower="-1" upper="1" effort="1" velocity="1"/>
+      </joint></robot>)";
+    std::ofstream semantic(srdf);
+    semantic << R"(<robot name="empty"><group name="arm"><joint name="joint"/></group></robot>)";
+  }
+  return ManyForgeCollisionEngine::load_shared_model(
+      "empty", urdf, srdf, {}, "arm");
+}
+
+TEST(CollisionEngineSelfCoverage, BoundsColdGeometryBeforeQuadraticAllocationOrMeshIo) {
+  TemporaryModel temporary;
+  const auto path = temporary.root / "model.urdf";
+  const auto write_model = [&](std::size_t count, bool missing_mesh) {
+    std::ofstream output(path);
+    output << "<robot name='bounded'><link name='base'>";
+    for (std::size_t index = 0; index < count; ++index) {
+      output << "<collision><geometry>"
+             << (missing_mesh ? "<mesh filename='/nonexistent-collision-bound-mesh.stl'/>"
+                              : "<box size='0.1 0.1 0.1'/>")
+             << "</geometry></collision>";
     }
-    out += key + "=" + value;
+    output << "</link></robot>";
+    ASSERT_TRUE(output.good());
+  };
+  write_model(ManyForgeCollisionEngine::kMaximumRetainedCollisionGeometries, false);
+  EXPECT_NO_THROW(ManyForgeCollisionEngine::load_shared_model("bounded", path, {}, {}, {}));
+  write_model(ManyForgeCollisionEngine::kMaximumRetainedCollisionGeometries + 1, true);
+  try {
+    (void)ManyForgeCollisionEngine::load_shared_model("bounded", path, {}, {}, {});
+    FAIL() << "oversized collision model was accepted";
+  } catch (const std::invalid_argument& error) {
+    EXPECT_STREQ(error.what(),
+                 "retained collision geometry count exceeds qualified cold-model bound");
   }
-  return out;
 }
 
-std::int64_t diagnostic_int64(
-    const std::map<std::string, std::string>& diagnostics,
-    const std::string& key) {
-  auto it = diagnostics.find(key);
-  if (it == diagnostics.end()) {
-    throw std::runtime_error("missing diagnostic key: " + key);
+TEST(CollisionEngineSelfCoverage, MasterOnlyGroupIncludesItsCrossBranchMimic) {
+  namespace core = manyforge::core;
+  namespace collision = manyforge::collision;
+  TemporaryModel temporary;
+  const auto urdf = temporary.root / "model.urdf";
+  const auto srdf = temporary.root / "model.srdf";
+  {
+    std::ofstream model(urdf);
+    model << R"(<robot name="mimic">
+      <link name="base"><collision><geometry><sphere radius="0.05"/></geometry></collision></link>
+      <link name="source"><collision><geometry><sphere radius="0.05"/></geometry></collision></link>
+      <link name="follower"><collision><geometry><sphere radius="0.05"/></geometry></collision></link>
+      <joint name="a_source" type="prismatic"><parent link="base"/><child link="source"/>
+        <origin xyz="1 0 0"/><axis xyz="0 1 0"/><limit lower="0" upper="1" effort="10" velocity="1"/></joint>
+      <joint name="b_follower" type="prismatic"><parent link="base"/><child link="follower"/>
+        <origin xyz="-1 0 0"/><axis xyz="0 1 0"/><limit lower="0" upper="1" effort="10" velocity="1"/>
+        <mimic joint="a_source" multiplier="1" offset="0"/></joint></robot>)";
+    std::ofstream semantic(srdf);
+    semantic
+        << R"(<robot name="mimic"><group name="hand"><joint name="a_source"/></group></robot>)";
   }
-  return std::stoll(it->second);
-}
-
-std::string classified_pairs_text(const CollisionResult& result) {
-  std::string out;
-  for (const auto& classified : result.normalized_pairs_classified) {
-    if (!out.empty()) {
-      out += "; ";
+  const auto shared = ManyForgeCollisionEngine::load_shared_model("mimic", urdf, srdf, {}, "hand");
+  ManyForgeCollisionEngine engine(shared,
+                                  ManyForgeCollisionEngine::make_shared_scene_cache(shared));
+  std::vector<collision::RetainedComponentCollisionBodyProjectionInput> bodies;
+  for (const auto* frame : {"base", "source", "follower"})
+    bodies.push_back({core::ControllableComponentId("hand"), core::ModelInstanceId("model"),
+                      core::ModelRevision("r1"), core::CollisionBodyRoleId(frame), 0, frame});
+  const std::vector<collision::RetainedComponentModelFrameProjectionInput> frames{
+      {core::ControllableComponentId("hand"), core::ModelInstanceId("model"),
+       core::ModelRevision("r1"), core::FrameRoleId("base"), "base"}};
+  const auto projection = ManyForgeCollisionEngine::project_retained_component_collision(
+      shared, "base", bodies, frames);
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+  auto snapshot = minimal_snapshot();
+  snapshot.bodies = projection.value().component_bodies;
+  snapshot.component_model_frames = projection.value().component_model_frames;
+  const auto follower = std::find_if(snapshot.bodies.begin(), snapshot.bodies.end(),
+                                     [](const auto& body) { return body.frame_id == "follower"; });
+  ASSERT_NE(follower, snapshot.bodies.end());
+  const auto follower_id = follower->body_id;
+  core::CollisionWorldBody obstacle;
+  obstacle.body_id = "scene/obstacle/shape/0";
+  obstacle.owner_kind = core::CollisionOwnerKind::kSceneResource;
+  obstacle.frame_id = "world";
+  obstacle.pose.position_m = {-1, .4, 0};
+  core::CollisionGeometryDescriptor shape;
+  shape.body_id = obstacle.body_id;
+  shape.owner_kind = obstacle.owner_kind;
+  shape.geometry_kind = core::CollisionGeometryKind::kBox;
+  shape.box_dimensions_m = core::Vector3DTO{.04, .04, .04};
+  obstacle.geometries.push_back(shape);
+  snapshot.bodies.push_back(obstacle);
+  snapshot.body_count = snapshot.bodies.size();
+  snapshot.geometry_count = 4;
+  const core::CollisionPairId expected{std::min(follower_id, obstacle.body_id),
+                                       std::max(follower_id, obstacle.body_id)};
+  const std::vector<std::string> names{"a_source"};
+  ASSERT_EQ(engine.prepare_runtime_query(names), core::RuntimeCollisionQueryPrepareStatus::kReady);
+  EXPECT_TRUE(engine.runtime_query_covers_full_configuration());
+  const auto base = std::find_if(snapshot.bodies.begin(), snapshot.bodies.end(),
+                                 [](const auto& body) { return body.frame_id == "base"; });
+  ASSERT_NE(base, snapshot.bodies.end());
+  EXPECT_FALSE(engine.IsBodyStaticWrtGroup(snapshot, base->body_id).has_value());
+  ASSERT_EQ(engine.prepare_runtime_snapshot(snapshot),
+            core::RuntimeCollisionQueryPrepareStatus::kReady);
+  EXPECT_EQ(engine.IsBodyStaticWrtGroup(snapshot, base->body_id), std::optional<bool>(true));
+  EXPECT_EQ(engine.IsBodyStaticWrtGroup(snapshot, follower_id), std::optional<bool>(false));
+  EXPECT_EQ(engine.IsBodyStaticWrtGroup(snapshot, obstacle.body_id), std::optional<bool>(true));
+  EXPECT_FALSE(engine.IsBodyStaticWrtGroup(snapshot, "missing").has_value());
+  auto stale = snapshot;
+  ++stale.revision.revision_id;
+  EXPECT_FALSE(engine.IsBodyStaticWrtGroup(stale, base->body_id).has_value());
+  stale = snapshot;
+  stale.revision.content_hash = "sha256:other";
+  EXPECT_FALSE(engine.IsBodyStaticWrtGroup(stale, base->body_id).has_value());
+  auto same_content = snapshot;
+  same_content.publisher_id = "other-publisher";
+  ++same_content.revision.revision_id;
+  EXPECT_EQ(engine.IsBodyStaticWrtGroup(same_content, base->body_id), std::optional<bool>(true));
+  for (const double position : {.1, .4}) {
+    CollisionQuery query;
+    query.query_id = "master-only";
+    query.robot_state.joint_names = names;
+    query.robot_state.positions_rad = {position};
+    const auto ordinary = check(engine, snapshot, query);
+    ASSERT_EQ(ordinary.engine_status, CollisionEngineStatus::kOk);
+    const auto runtime = engine.check_runtime(snapshot, {query.robot_state.positions_rad,
+                                                         0,
+                                                         50'000'000,
+                                                         core::CollisionDistanceRequestMode::kNone,
+                                                         {}});
+    ASSERT_EQ(runtime.engine_status, CollisionEngineStatus::kOk);
+    EXPECT_EQ(engine.internal_last_query_mechanism_counters().active_collision_pair_count, 5U);
+    if (position == .4) {
+      EXPECT_EQ(ordinary.normalized_pairs, std::vector<core::CollisionPairId>{expected});
+      ASSERT_EQ(runtime.collision_pairs.size(), 1U);
+      ASSERT_NE(runtime.collision_pairs.front().pair, nullptr);
+      EXPECT_EQ(*runtime.collision_pairs.front().pair, expected);
+    } else {
+      EXPECT_FALSE(ordinary.in_collision);
+      EXPECT_EQ(runtime.status, core::RuntimeCollisionQueryStatus::kClear);
     }
-    out += classified.pair.body_a + " <-> " + classified.pair.body_b +
-           " class=" +
-           std::to_string(static_cast<int>(classified.classification));
   }
-  return out;
 }
 
-// --- Independence ---------------------------------------------------------
+// Coordinates are identified by joint name against the engine's current
+// model. A named state whose length equals model.nq is still mapped by name,
+// so a reordered (or foreign) state can never be read positionally.
+TEST(CollisionEngineSelfCoverage, NamedStateMapsByNameEvenWhenItsCountEqualsTheModel) {
+  namespace core = manyforge::core;
+  namespace collision = manyforge::collision;
+  TemporaryModel temporary;
+  const auto urdf = temporary.root / "model.urdf";
+  const auto srdf = temporary.root / "model.srdf";
+  {
+    std::ofstream model(urdf);
+    model << R"(<robot name="pair">
+      <link name="base"/>
+      <link name="near"><collision><geometry><sphere radius="0.05"/></geometry></collision></link>
+      <link name="far"><collision><geometry><sphere radius="0.05"/></geometry></collision></link>
+      <joint name="a_near" type="prismatic"><parent link="base"/><child link="near"/>
+        <origin xyz="1 0 0"/><axis xyz="0 1 0"/><limit lower="0" upper="1" effort="10" velocity="1"/></joint>
+      <joint name="b_far" type="prismatic"><parent link="base"/><child link="far"/>
+        <origin xyz="-1 0 0"/><axis xyz="0 1 0"/><limit lower="0" upper="1" effort="10" velocity="1"/></joint>
+      <link name="idle"/>
+      <joint name="c_idle" type="prismatic"><parent link="base"/><child link="idle"/>
+        <axis xyz="0 0 1"/><limit lower="0" upper="1" effort="10" velocity="1"/></joint>
+      </robot>)";
+    std::ofstream semantic(srdf);
+    semantic << R"(<robot name="pair"><group name="arm"><joint name="a_near"/><joint name="b_far"/></group></robot>)";
+  }
+  const auto shared = ManyForgeCollisionEngine::load_shared_model("pair", urdf, srdf, {}, "arm");
+  ManyForgeCollisionEngine engine(shared,
+                                  ManyForgeCollisionEngine::make_shared_scene_cache(shared));
+  std::vector<collision::RetainedComponentCollisionBodyProjectionInput> bodies;
+  for (const auto* frame : {"near", "far"})
+    bodies.push_back({core::ControllableComponentId("pair"), core::ModelInstanceId("model"),
+                      core::ModelRevision("r1"), core::CollisionBodyRoleId(frame), 0, frame});
+  const std::vector<collision::RetainedComponentModelFrameProjectionInput> frames{
+      {core::ControllableComponentId("pair"), core::ModelInstanceId("model"),
+       core::ModelRevision("r1"), core::FrameRoleId("base"), "base"}};
+  const auto projection = ManyForgeCollisionEngine::project_retained_component_collision(
+      shared, "base", bodies, frames);
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+  auto snapshot = minimal_snapshot();
+  snapshot.bodies = projection.value().component_bodies;
+  snapshot.component_model_frames = projection.value().component_model_frames;
+  core::CollisionWorldBody obstacle;
+  obstacle.body_id = "scene/obstacle/shape/0";
+  obstacle.owner_kind = core::CollisionOwnerKind::kSceneResource;
+  obstacle.frame_id = "world";
+  obstacle.pose.position_m = {-1, .4, 0};
+  core::CollisionGeometryDescriptor shape;
+  shape.body_id = obstacle.body_id;
+  shape.owner_kind = obstacle.owner_kind;
+  shape.geometry_kind = core::CollisionGeometryKind::kBox;
+  shape.box_dimensions_m = core::Vector3DTO{.04, .04, .04};
+  obstacle.geometries.push_back(shape);
+  snapshot.bodies.push_back(obstacle);
+  snapshot.body_count = snapshot.bodies.size();
+  snapshot.geometry_count = 3;
+
+  const auto query = [](std::vector<std::string> names, std::vector<double> positions) {
+    CollisionQuery result;
+    result.query_id = "named-coordinates";
+    result.robot_state.joint_names = std::move(names);
+    result.robot_state.positions_rad = std::move(positions);
+    return result;
+  };
+  // Reordered names whose count equals model.nq: only b_far reaches the
+  // obstacle. Read positionally, the same vector would move a_near instead
+  // and report no collision.
+  const auto reordered =
+      check(engine, snapshot, query({"b_far", "c_idle", "a_near"}, {.4, 0., .1}));
+  ASSERT_EQ(reordered.engine_status, CollisionEngineStatus::kOk);
+  EXPECT_TRUE(reordered.in_collision);
+  const auto canonical =
+      check(engine, snapshot, query({"a_near", "c_idle", "b_far"}, {.4, 0., .1}));
+  ASSERT_EQ(canonical.engine_status, CollisionEngineStatus::kOk);
+  EXPECT_FALSE(canonical.in_collision);
+
+  const std::vector<std::string> reordered_runtime_names{
+      "b_far", "c_idle", "a_near"};
+  ASSERT_EQ(engine.prepare_runtime_query(reordered_runtime_names),
+            core::RuntimeCollisionQueryPrepareStatus::kReady);
+  EXPECT_TRUE(engine.runtime_query_covers_full_configuration());
+  const std::vector<std::string> partial_runtime_names{"a_near", "b_far"};
+  ASSERT_EQ(engine.prepare_runtime_query(partial_runtime_names),
+            core::RuntimeCollisionQueryPrepareStatus::kReady);
+  EXPECT_FALSE(engine.runtime_query_covers_full_configuration());
+
+  const auto refused = [&](CollisionQuery refused_query, const std::string& reason) {
+    const auto result = check(engine, snapshot, std::move(refused_query));
+    EXPECT_EQ(result.engine_status, CollisionEngineStatus::kDiagnosticIncomplete) << reason;
+    EXPECT_EQ(result.decision, CollisionDecisionResult::kInconclusiveFail) << reason;
+    EXPECT_EQ(result.raw_diagnostics.at("robot_state_error_reason"), reason);
+  };
+  // Equal counts never establish identity: a foreign name, a repeated name, a
+  // name/position count mismatch, or an unnamed full vector are refused.
+  refused(query({"b_far", "c_foreign", "a_near"}, {.4, 0., .1}), "robot_state_joint_unknown");
+  refused(query({"b_far", "b_far", "a_near"}, {.4, 0., .1}), "robot_state_joint_duplicate");
+  refused(query({"b_far", "a_near"}, {.4, 0., .1}), "robot_state_joint_name_count_mismatch");
+  refused(query({}, {.4, 0., .1}), "robot_state_joint_names_required");
+  // An unnamed state is accepted only in the model's own SRDF group order.
+  const auto group = check(engine, snapshot, query({}, {.1, .4}));
+  EXPECT_EQ(group.engine_status, CollisionEngineStatus::kOk);
+  EXPECT_TRUE(group.in_collision);
+}
+
+TEST(CollisionEngineSelfCoverage, RetainsEverySrdfEnabledSelfPairAndMatchesIndependentQueries) {
+  namespace core = manyforge::core;
+  namespace collision = manyforge::collision;
+  const auto paths = ur10e_model_paths();
+  const auto shared = load_shared_model();
+  ManyForgeCollisionEngine engine(shared,
+                                  ManyForgeCollisionEngine::make_shared_scene_cache(shared));
+  pinocchio::Model model;
+  pinocchio::GeometryModel geometry;
+  pinocchio::urdf::buildModel(paths.urdf.string(), model, false, true);
+  pinocchio::urdf::buildGeom(model, paths.urdf.string(), pinocchio::COLLISION, geometry,
+                             std::vector<std::string>{repo_root().string()});
+  // Independent expected inventory: first enumerate, then apply SRDF
+  // exclusions.
+  geometry.addAllCollisionPairs();
+  pinocchio::srdf::removeCollisionPairs(model, geometry, paths.srdf.string());
+  ASSERT_GT(geometry.collisionPairs.size(), 0U);
+  std::set<std::string> frames;
+  std::vector<collision::RetainedComponentCollisionBodyProjectionInput> bodies;
+  for (const auto& object : geometry.geometryObjects) {
+    const auto& frame = model.frames[object.parentFrame].name;
+    if (frames.insert(frame).second) {
+      bodies.push_back({core::ControllableComponentId("self-test"), core::ModelInstanceId("robot"),
+                        core::ModelRevision("model-1"), core::CollisionBodyRoleId(frame), 0,
+                        frame});
+    }
+  }
+  const std::vector<collision::RetainedComponentModelFrameProjectionInput> model_frames{
+      {core::ControllableComponentId("self-test"), core::ModelInstanceId("robot"),
+       core::ModelRevision("model-1"), core::FrameRoleId("base"), "base_link"}};
+  const auto projection = ManyForgeCollisionEngine::project_retained_component_collision(
+      shared, "base_link", bodies, model_frames);
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+  auto snapshot = minimal_snapshot();
+  snapshot.bodies = projection.value().component_bodies;
+  snapshot.component_model_frames = projection.value().component_model_frames;
+  snapshot.body_count = snapshot.bodies.size();
+  snapshot.geometry_count = geometry.geometryObjects.size();
+  snapshot.contains_mesh_geometry = true;
+  const std::vector<std::string> names{"shoulder_pan_joint", "shoulder_lift_joint",
+                                       "elbow_joint",        "wrist_1_joint",
+                                       "wrist_2_joint",      "wrist_3_joint"};
+  ASSERT_EQ(engine.prepare_runtime_query(names), core::RuntimeCollisionQueryPrepareStatus::kReady);
+  // The integrated Robotiq coordinates are outside this arm-only view.
+  EXPECT_FALSE(engine.runtime_query_covers_full_configuration());
+  ASSERT_EQ(engine.prepare_runtime_snapshot(snapshot),
+            core::RuntimeCollisionQueryPrepareStatus::kReady);
+  pinocchio::Data data(model);
+  pinocchio::GeometryData geometry_data(geometry);
+  std::minstd_rand generator(2718);
+  std::uniform_real_distribution<double> angle(-2.5, 2.5);
+  unsigned collision_count = 0, clear_count = 0;
+  for (unsigned sample = 0; sample < 64; ++sample) {
+    if (sample == 32) {
+      ++snapshot.revision.revision_id;
+      snapshot.revision.content_hash = "same-geometry-next-revision";
+      ASSERT_EQ(engine.prepare_runtime_snapshot(snapshot),
+                core::RuntimeCollisionQueryPrepareStatus::kReady);
+    }
+    auto q = pinocchio::neutral(model).eval();
+    std::vector<double> values(names.size());
+    for (std::size_t index = 0; index < names.size(); ++index) {
+      values[index] = sample == 0 ? 0 : angle(generator);
+      q[model.idx_qs[model.getJointId(names[index])]] = values[index];
+    }
+    const bool expected =
+        pinocchio::computeCollisions(model, data, geometry, geometry_data, q, false);
+    CollisionQuery ordinary;
+    ordinary.query_id = "self-pose-" + std::to_string(sample);
+    ordinary.robot_state.joint_names = names;
+    ordinary.robot_state.positions_rad = values;
+    const auto ordinary_result = check(engine, snapshot, ordinary);
+    ASSERT_EQ(ordinary_result.engine_status, CollisionEngineStatus::kOk);
+    EXPECT_EQ(ordinary_result.in_collision, expected) << "ordinary sample " << sample;
+    const auto actual = engine.check_runtime(
+        snapshot, {values, 0, 50'000'000, core::CollisionDistanceRequestMode::kNone, {}});
+    ASSERT_EQ(actual.engine_status, CollisionEngineStatus::kOk);
+    ASSERT_EQ(engine.internal_last_query_mechanism_counters().active_collision_pair_count,
+              geometry.collisionPairs.size())
+        << "self-collision coverage differs from SRDF";
+    EXPECT_EQ(actual.status, expected ? core::RuntimeCollisionQueryStatus::kCollision
+                                      : core::RuntimeCollisionQueryStatus::kClear)
+        << "sample " << sample;
+    if (expected)
+      ++collision_count;
+    else
+      ++clear_count;
+  }
+  EXPECT_GT(collision_count, 0U);
+  EXPECT_GT(clear_count, 0U);
+}
+
+constexpr std::array<AcceptanceDisposition, 26>
+    kFactoryCoupledAcceptance{{
+        {"FactoryValidationAndLookaheadReuseOnePreparedRevision", "I6/N",
+         "addressed validation/lookahead contexts reuse one owner-issued revision"},
+        {"ConcurrentColdContextsPublishOnePreparedRevision", "I6/N",
+         "concurrent consumers publish one immutable prepared revision"},
+        {"DedicatedRuntimeSurfacePreparesAndTracksPublishedRevisions", "I6/N+I8/P5",
+         "runtime preparation, distance modes, counters, and revision tracking"},
+        {"DedicatedRuntimeSurfaceRejectsDuplicateFullConfigurationNames", "I6/N",
+         "resource-addressed state rejects duplicate canonical coordinates"},
+        {"ConcurrentQueriesOnDifferentInstancesComplete", "I6/N",
+         "independent owner-issued query contexts make concurrent progress"},
+        {"ConcurrentCollidingSnapshotQueriesDoNotRaceDiagnosticCapture", "I6/N",
+         "colliding diagnostics remain isolated across concurrent contexts"},
+        {"AgreesWithDiagnosticComparatorOnFreeJointStateAgainstSameModel", "I6/N",
+         "new diagnostic observer parity without the removed comparator owner"},
+        {"SnapshotPortAcceptsPrimitiveSceneSnapshotWithBodyPairCapability", "I6/N",
+         "headless scene publishes exact primitive body/resource identities"},
+        {"SnapshotPortAppliesTimeoutBudgetToFullCall", "I6/N+I8/P5",
+         "owner-issued query deadline covers preparation and collision work"},
+        {"ObservedRuntimeMonitorReportsSnapshotSyncSeparately", "I8/P5",
+         "immediate monitor reports changed-snapshot cost separately"},
+        {"ObservedRuntimeLookaheadExcludesSnapshotSyncFromPerQueryBudget", "I8/P5",
+         "lookahead charges preparation outside each warm query budget"},
+        {"SnapshotPortLoadsTriangleMeshSceneObject", "I6/N",
+         "retained mesh identity and bytes load through the headless snapshot"},
+        {"PassiveMeshSceneContactDoesNotEnterMotionEnginePairGraph", "I6/N+I8/P5",
+         "passive contacts cannot acquire motion-policy authority"},
+        {"IsaacMeshTableCheeseStartContactDoesNotEnterMotionEnginePairGraph", "I9/I+I8/P5",
+         "Isaac observed mesh contacts preserve exact policy classification"},
+        {"AttachedObjectTouchLinksHonorExplicitGripperCollisionEnvelope", "I6/N+I8/P5",
+         "attachments and touch links use owner-issued resource identities"},
+        {"RequiredUnsupportedDiagnosticCapabilityFailsClosed", "I6/N",
+         "typed required capabilities fail closed when unavailable"},
+        {"RequiredDistanceCapabilityPopulatesSignedClearance", "I6/N+I8/P5",
+         "signed-clearance evidence is emitted for an explicit distance scope"},
+        {"RequiredDistanceCapabilityWithoutTypedScopeFailsClosed", "I6/N",
+         "distance requests require an exact typed scope"},
+        {"SelectedCollidingDistancePreservesFullCollisionCoverage", "I6/N+I8/P5",
+         "selected distance never narrows collision enumeration"},
+        {"SelectedPenetrationIsExactAcrossIndependentWorkerHistories", "I8/P5",
+         "worker history cannot alter selected penetration evidence"},
+        {"UnrelatedSelectedPairEvaluatesNoDistance", "I6/N",
+         "unknown selected resources perform no distance work"},
+        {"SelectedCollidingDistanceRequiresANonemptySelection", "I6/N",
+         "empty selected-distance scope fails closed"},
+        {"AllCollidingDistanceEvaluatesOnlyCollidingGeometryPairs", "I6/N+I8/P5",
+         "all-colliding mode excludes unrelated distance work"},
+        {"MultipleGeometryPairsReduceToDeepestLogicalPairDistance", "I6/N+I8/P5",
+         "logical-pair reduction retains the deepest complete finite evidence"},
+        {"QueryProceedsEvenWhilePlannerProjectionIsHeavilyBusy", "I6/N",
+         "authoritative collision queries are independent of planner projection"},
+        {"CompareModeEmitsMismatchEventWhenEnginesDisagree", "I6/N+I5/H0",
+         "source-owned mismatch facts replace the deleted comparator emitter"},
+    }};
+
+constexpr std::array<AcceptanceDisposition, 9> kRetainedAcceptance{{
+    {"ConvenienceInstancesOwnDistinctInternalAssets", "retained/current",
+     "direct engine instances own distinct model, cache, and mutable contexts"},
+    {"FactoryContextsShareImmutableAssetsButIsolateRuntimePreparation",
+     "adapted/current",
+     "explicit contexts share immutable model assets and choose cache domains"},
+    {"EngineExposesStableIdAndVersion", "retained/current",
+     "the direct engine exposes stable identity, version, and capability"},
+    {"MixedFiniteAndNonFiniteComponentsRemainIncomplete", "retained/current",
+     "owner-neutral distance evidence remains incomplete around non-finite data"},
+    {"SnapshotPortRejectsStaleRevision", "retained/current",
+     "the direct engine rejects a query for a different snapshot revision"},
+    {"SnapshotPortRejectsUnknownSnapshotFormatWithDiagnostic", "retained/current",
+     "the direct engine rejects an unknown snapshot format with diagnostics"},
+    {"SnapshotPortHonorsCancellation", "retained/current",
+     "the direct engine fails closed on a pre-requested cancellation"},
+    {"ZeroTimeoutFailsClosedWithoutQueryPass", "retained/current",
+     "the direct engine fails closed before work when no deadline remains"},
+    {"MalformedQueryFailsClosedWithoutThrowing", "retained/current",
+     "the direct engine reports malformed robot state without throwing"},
+}};
 
 TEST(ManyForgeCollisionEngineTest,
      ConvenienceInstancesOwnDistinctInternalAssets) {
-  auto engine_a = make_engine();
-  auto engine_b = make_engine();
+  const auto engine_a = make_engine();
+  const auto engine_b = make_engine();
   EXPECT_NE(engine_a->internal_model_identity(),
             engine_b->internal_model_identity());
   EXPECT_NE(engine_a->internal_scene_cache_identity(),
@@ -301,1360 +575,588 @@ TEST(ManyForgeCollisionEngineTest,
 }
 
 TEST(ManyForgeCollisionEngineTest,
-     FactoryContextsShareImmutableAssetsButIsolateRuntimePreparation) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_FALSE(bundle->collision_validation_engines.empty());
-  ASSERT_FALSE(bundle->collision_runtime_lookahead_engines.empty());
+     ExplicitContextsShareImmutableAssetsAndChooseCacheDomains) {
+  const auto model = load_shared_model();
+  const auto shared_cache = ManyForgeCollisionEngine::make_shared_scene_cache(model);
+  const auto isolated_cache = ManyForgeCollisionEngine::make_shared_scene_cache(model);
+  ManyForgeCollisionEngine validation(model, shared_cache);
+  ManyForgeCollisionEngine lookahead(model, shared_cache);
+  ManyForgeCollisionEngine immediate(model, isolated_cache);
 
-  auto runtime = std::dynamic_pointer_cast<ManyForgeCollisionEngine>(
-      bundle->collision_runtime_monitor_engine);
-  auto validation = std::dynamic_pointer_cast<ManyForgeCollisionEngine>(
-      bundle->collision_validation_engines.front());
-  auto lookahead = std::dynamic_pointer_cast<ManyForgeCollisionEngine>(
-      bundle->collision_runtime_lookahead_engines.front());
-  ASSERT_TRUE(runtime);
-  ASSERT_TRUE(validation);
-  ASSERT_TRUE(lookahead);
-
-  EXPECT_EQ(runtime->internal_model_identity(),
-            validation->internal_model_identity());
-  EXPECT_EQ(validation->internal_model_identity(),
-            lookahead->internal_model_identity());
-  EXPECT_NE(runtime->internal_scene_cache_identity(),
-            validation->internal_scene_cache_identity());
-  EXPECT_EQ(validation->internal_scene_cache_identity(),
-            lookahead->internal_scene_cache_identity());
-  EXPECT_NE(runtime->capability().mutable_context_id,
-            validation->capability().mutable_context_id);
-  EXPECT_NE(validation->capability().mutable_context_id,
-            lookahead->capability().mutable_context_id);
+  EXPECT_EQ(validation.internal_model_identity(), lookahead.internal_model_identity());
+  EXPECT_EQ(lookahead.internal_model_identity(), immediate.internal_model_identity());
+  EXPECT_EQ(validation.internal_scene_cache_identity(),
+            lookahead.internal_scene_cache_identity());
+  EXPECT_NE(validation.internal_scene_cache_identity(),
+            immediate.internal_scene_cache_identity());
+  EXPECT_NE(validation.capability().mutable_context_id,
+            lookahead.capability().mutable_context_id);
 }
 
 TEST(ManyForgeCollisionEngineTest,
-     FactoryValidationAndLookaheadReuseOnePreparedRevision) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  ASSERT_FALSE(bundle->collision_validation_engines.empty());
-  ASSERT_FALSE(bundle->collision_runtime_lookahead_engines.empty());
-  auto validation = std::dynamic_pointer_cast<ManyForgeCollisionEngine>(
-      bundle->collision_validation_engines.front());
-  auto lookahead = std::dynamic_pointer_cast<ManyForgeCollisionEngine>(
-      bundle->collision_runtime_lookahead_engines.front());
-  ASSERT_TRUE(validation);
-  ASSERT_TRUE(lookahead);
+     SharedCacheTreatsRevisionNumbersAsPublisherLocal) {
+  TemporaryModel temporary;
+  const auto model = load_empty_collision_model(temporary);
+  const auto cache = ManyForgeCollisionEngine::make_shared_scene_cache(model);
+  ManyForgeCollisionEngine first(model, cache);
+  ManyForgeCollisionEngine replacement(model, cache);
+  auto original = minimal_snapshot();
+  auto next_incarnation = original;
+  next_incarnation.publisher_id = "replacement-collision-publisher";
+  next_incarnation.revision.content_hash = "sha256:replacement-world";
 
-  CollisionQuery query;
-  query.query_id = "shared-prepared-revision";
-  query.robot_state = observed_state(*bundle);
-  auto first = check_snapshot(*validation, *snapshot, query);
-  ASSERT_EQ(first.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(first.raw_diagnostics);
-  auto second = check_snapshot(*lookahead, *snapshot, query);
-  ASSERT_EQ(second.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(second.raw_diagnostics);
+  (void)check(first, original, one_joint_query());
+  const auto result = check(replacement, next_incarnation, one_joint_query());
 
-  EXPECT_EQ(validation->internal_prepared_scene_identity(),
-            lookahead->internal_prepared_scene_identity());
-  EXPECT_EQ(validation->internal_prepared_scene_build_count(), 1u);
-  EXPECT_EQ(lookahead->internal_prepared_scene_build_count(), 1u);
+  EXPECT_EQ(replacement.internal_prepared_scene_build_count(), 2U);
+  EXPECT_EQ(result.raw_diagnostics.count("snapshot_sync_error"), 0U);
 }
 
 TEST(ManyForgeCollisionEngineTest,
-     ConcurrentColdContextsPublishOnePreparedRevision) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_FALSE(bundle->collision_validation_engines.empty());
-  ASSERT_FALSE(bundle->collision_runtime_lookahead_engines.empty());
-  auto validation = std::dynamic_pointer_cast<ManyForgeCollisionEngine>(
-      bundle->collision_validation_engines.front());
-  auto lookahead = std::dynamic_pointer_cast<ManyForgeCollisionEngine>(
-      bundle->collision_runtime_lookahead_engines.front());
-  ASSERT_TRUE(validation);
-  ASSERT_TRUE(lookahead);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
+     SharedCacheRejectsRevisionReuseWithinOnePublisher) {
+  TemporaryModel temporary;
+  const auto model = load_empty_collision_model(temporary);
+  const auto cache = ManyForgeCollisionEngine::make_shared_scene_cache(model);
+  ManyForgeCollisionEngine first(model, cache);
+  ManyForgeCollisionEngine replacement(model, cache);
+  auto original = minimal_snapshot();
+  auto invalid_reuse = original;
+  invalid_reuse.revision.content_hash = "sha256:changed-without-revision";
 
-  CollisionQuery query;
-  query.query_id = "shared-prepared-concurrent-cold-revision";
-  query.robot_state = observed_state(*bundle);
-  std::atomic<int> ready{0};
-  std::atomic<bool> release{false};
-  CollisionResult validation_result;
-  CollisionResult lookahead_result;
-  auto run = [&](ManyForgeCollisionEngine& engine, CollisionResult& result) {
-    ready.fetch_add(1, std::memory_order_release);
-    while (!release.load(std::memory_order_acquire)) {
-      std::this_thread::yield();
-    }
-    result = check_snapshot(engine, *snapshot, query);
-  };
-  std::thread validation_thread(run, std::ref(*validation),
-                                std::ref(validation_result));
-  std::thread lookahead_thread(run, std::ref(*lookahead),
-                               std::ref(lookahead_result));
-  while (ready.load(std::memory_order_acquire) != 2) {
-    std::this_thread::yield();
-  }
-  release.store(true, std::memory_order_release);
-  validation_thread.join();
-  lookahead_thread.join();
+  (void)check(first, original, one_joint_query());
+  const auto result = check(replacement, invalid_reuse, one_joint_query());
 
-  ASSERT_EQ(validation_result.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(validation_result.raw_diagnostics);
-  ASSERT_EQ(lookahead_result.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(lookahead_result.raw_diagnostics);
-  EXPECT_EQ(validation->internal_prepared_scene_identity(),
-            lookahead->internal_prepared_scene_identity());
-  EXPECT_EQ(validation->internal_prepared_scene_build_count(), 1u);
+  EXPECT_EQ(result.raw_diagnostics.at("snapshot_sync_error"),
+            "collision snapshot revision reused with different content hash");
 }
 
 TEST(ManyForgeCollisionEngineTest, EngineExposesStableIdAndVersion) {
-  auto engine = make_engine();
+  const auto engine = make_engine();
   EXPECT_FALSE(engine->engine_id().empty());
   EXPECT_FALSE(engine->engine_version().empty());
+  EXPECT_FALSE(engine->capability().mutable_context_id.empty());
 }
 
 TEST(ManyForgeCollisionDistanceEvidenceTest,
      MixedFiniteAndNonFiniteComponentsRemainIncomplete) {
   manyforge::collision::detail::SelectedCollidingDistanceEvidence evidence;
-
   evidence.observe(-0.001);
   evidence.observe(-0.003);
   evidence.observe(std::numeric_limits<double>::quiet_NaN());
   evidence.observe(-0.002);
-
   EXPECT_FALSE(evidence.complete);
   ASSERT_TRUE(evidence.deepest_finite_m.has_value());
   EXPECT_DOUBLE_EQ(*evidence.deepest_finite_m, -0.003);
 
-  manyforge::collision::detail::SelectedCollidingDistanceEvidence
-      infinite_only;
+  manyforge::collision::detail::SelectedCollidingDistanceEvidence infinite_only;
   infinite_only.observe(std::numeric_limits<double>::infinity());
   EXPECT_FALSE(infinite_only.complete);
   EXPECT_FALSE(infinite_only.deepest_finite_m.has_value());
 }
 
-TEST(ManyForgeCollisionEngineTest,
-     DedicatedRuntimeSurfacePreparesAndTracksPublishedRevisions) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  const auto state = observed_state(*bundle);
-  auto engine = make_engine();
-
-  const auto& capability = engine->capability();
-  EXPECT_TRUE(
-      manyforge::core::collision_distance_request_modes_valid(capability));
-  EXPECT_EQ(capability.supported_distance_request_modes,
-            (std::vector<manyforge::core::CollisionDistanceRequestMode>{
-                manyforge::core::CollisionDistanceRequestMode::kNone,
-                manyforge::core::CollisionDistanceRequestMode::
-                    kSelectedCollidingPairs,
-                manyforge::core::CollisionDistanceRequestMode::
-                    kAllCollidingPairs,
-                manyforge::core::CollisionDistanceRequestMode::
-                    kAllActivePairs}));
-  EXPECT_EQ(capability.runtime_query_memory_model,
-            manyforge::core::RuntimeCollisionQueryMemoryModel::kMeasuredBounded);
-  EXPECT_GT(capability.runtime_query_clean_allocation_upper_bound, 0u);
-  EXPECT_GT(capability.runtime_query_qualified_wcet_ns, 0u);
-  EXPECT_TRUE(capability.runtime_query_snapshot_change_may_allocate);
-  EXPECT_GT(
-      capability.runtime_query_snapshot_change_allocation_upper_bound, 0u);
-  EXPECT_GT(capability.runtime_query_snapshot_change_qualified_wcet_ns, 0u);
-  ASSERT_EQ(engine->prepare_runtime_query(state.joint_names),
-            manyforge::core::RuntimeCollisionQueryPrepareStatus::kReady);
-  ASSERT_EQ(engine->prepare_runtime_snapshot(*snapshot),
-            manyforge::core::RuntimeCollisionQueryPrepareStatus::kReady);
-
-  manyforge::core::RuntimeCollisionQueryRequest request;
-  request.positions_rad = state.positions_rad;
-  request.state_time_ns = 1;
-  request.timeout_budget_ns = 100'000'000;
-  auto clear = engine->check_runtime(*snapshot, request);
-  EXPECT_NE(clear.status,
-            manyforge::core::RuntimeCollisionQueryStatus::kInconclusive);
-
-  ASSERT_TRUE(bundle->scene_authority->add_object(
-                         make_large_collision_box("runtime_collision_box"))
-                  .success);
-  auto collision_snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(collision_snapshot, nullptr);
-  auto collision = engine->check_runtime(*collision_snapshot, request);
-  EXPECT_EQ(collision.status,
-            manyforge::core::RuntimeCollisionQueryStatus::kCollision);
-  EXPECT_FALSE(collision.collision_pairs.empty());
-  for (const auto& observation : collision.collision_pairs) {
-    ASSERT_NE(observation.pair, nullptr);
-    EXPECT_LE(observation.pair->body_a, observation.pair->body_b);
-  }
-
-  const std::vector<manyforge::core::CollisionPairId> selected_pairs{
-      *collision.collision_pairs.front().pair};
-  request.distance_request_mode =
-      CollisionDistanceRequestMode::kSelectedCollidingPairs;
-  request.selected_distance_pairs = selected_pairs;
-  auto precise = engine->check_runtime(*collision_snapshot, request);
-  ASSERT_EQ(precise.status,
-            manyforge::core::RuntimeCollisionQueryStatus::kCollision);
-  ASSERT_EQ(precise.clearance_pairs.size(), 1u);
-  ASSERT_NE(precise.clearance_pairs.front().pair, nullptr);
-  EXPECT_EQ(*precise.clearance_pairs.front().pair, selected_pairs.front());
-  EXPECT_TRUE(precise.clearance_pairs.front().signed_clearance_m.has_value());
-  auto counters = engine->internal_last_query_mechanism_counters();
-  EXPECT_EQ(counters.collision_api_call_count, 1u);
-  EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
-  EXPECT_EQ(counters.first_distance_evaluation_ordinal, 2u);
-  EXPECT_EQ(counters.distance_evaluated_logical_pair_count, 1u);
-  EXPECT_GT(counters.distance_evaluated_geometry_pair_count, 0u);
-  EXPECT_EQ(counters.distance_api_call_count,
-            counters.distance_evaluated_geometry_pair_count);
-  EXPECT_EQ(counters.fk_placement_invocation_count, 1u);
-
-  const std::vector<manyforge::core::CollisionPairId>
-      selected_noncolliding_pairs{{"fixture/not_present/shape/0",
-                                   "object/not_present/shape/0"}};
-  request.selected_distance_pairs = selected_noncolliding_pairs;
-  auto selected_noncolliding =
-      engine->check_runtime(*collision_snapshot, request);
-  ASSERT_EQ(selected_noncolliding.status,
-            manyforge::core::RuntimeCollisionQueryStatus::kCollision);
-  ASSERT_EQ(selected_noncolliding.collision_pairs.size(),
-            collision.collision_pairs.size());
-  for (std::size_t i = 0; i < collision.collision_pairs.size(); ++i) {
-    ASSERT_NE(selected_noncolliding.collision_pairs[i].pair, nullptr);
-    ASSERT_NE(collision.collision_pairs[i].pair, nullptr);
-    EXPECT_EQ(*selected_noncolliding.collision_pairs[i].pair,
-              *collision.collision_pairs[i].pair);
-  }
-  EXPECT_TRUE(selected_noncolliding.clearance_pairs.empty());
-  counters = engine->internal_last_query_mechanism_counters();
-  EXPECT_EQ(counters.distance_request_mode,
-            CollisionDistanceRequestMode::kSelectedCollidingPairs);
-  EXPECT_EQ(counters.collision_api_call_count, 1u);
-  EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
-  EXPECT_EQ(counters.first_distance_evaluation_ordinal, 0u);
-  EXPECT_GT(counters.colliding_geometry_pair_count, 0u);
-  EXPECT_EQ(counters.distance_api_call_count, 0u);
-  EXPECT_EQ(counters.distance_evaluated_geometry_pair_count, 0u);
-  EXPECT_EQ(counters.distance_evaluated_logical_pair_count, 0u);
-  EXPECT_EQ(counters.fk_placement_invocation_count, 1u);
-
-  request.distance_request_mode = CollisionDistanceRequestMode::kNone;
-  request.selected_distance_pairs = {};
-  auto lightweight = engine->check_runtime(*collision_snapshot, request);
-  ASSERT_EQ(lightweight.status,
-            manyforge::core::RuntimeCollisionQueryStatus::kCollision);
-  EXPECT_TRUE(lightweight.clearance_pairs.empty());
-  counters = engine->internal_last_query_mechanism_counters();
-  EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
-  EXPECT_EQ(counters.first_distance_evaluation_ordinal, 0u);
-  EXPECT_EQ(counters.distance_api_call_count, 0u);
-  EXPECT_EQ(counters.distance_evaluated_geometry_pair_count, 0u);
-  EXPECT_EQ(counters.distance_evaluated_logical_pair_count, 0u);
-  EXPECT_EQ(counters.fk_placement_invocation_count, 1u);
-
-  request.distance_request_mode =
-      CollisionDistanceRequestMode::kSelectedCollidingPairs;
-  request.selected_distance_pairs = {};
-  const auto missing_selection =
-      engine->check_runtime(*collision_snapshot, request);
-  EXPECT_EQ(missing_selection.status,
-            manyforge::core::RuntimeCollisionQueryStatus::kInconclusive);
-  EXPECT_EQ(
-      missing_selection.failure_reason,
-      manyforge::core::RuntimeCollisionQueryFailureReason::
-          kPairDiagnosticsIncomplete);
-  EXPECT_EQ(missing_selection.engine_status,
-            manyforge::core::CollisionEngineStatus::kDiagnosticIncomplete);
-  counters = engine->internal_last_query_mechanism_counters();
-  EXPECT_EQ(counters.collision_api_call_count, 0u);
-  EXPECT_EQ(counters.distance_api_call_count, 0u);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     DedicatedRuntimeSurfaceRejectsDuplicateFullConfigurationNames) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  auto state = observed_state(*bundle);
-  ASSERT_GE(state.joint_names.size(), 2u);
-  ASSERT_EQ(state.joint_names.size(), state.positions_rad.size());
-  state.joint_names.back() = state.joint_names.front();
-  auto engine = make_engine();
-
-  EXPECT_EQ(engine->prepare_runtime_query(state.joint_names),
-            manyforge::core::RuntimeCollisionQueryPrepareStatus::
-                kInvalidJointOrder);
-}
-
-// --- Concurrent queries on separate instances -----------------------------
-
-TEST(ManyForgeCollisionEngineTest,
-     ConcurrentQueriesOnDifferentInstancesComplete) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-
-  auto engine_a = make_engine();
-  auto engine_b = make_engine();
-  CollisionQuery q;
-  q.query_id = "concurrent-non-colliding-snapshot";
-  q.robot_state = observed_state(*bundle);
-
-  std::atomic<int> done{0};
-  std::atomic<bool> any_failed{false};
-
-  auto worker = [&done, &any_failed, &snapshot, &q](ManyForgeCollisionEngine& eng) {
-    try {
-      for (int i = 0; i < 10; ++i) {
-        auto result = check_snapshot(eng, *snapshot, q);
-        (void)result;
-      }
-    } catch (...) {
-      any_failed.store(true);
-    }
-    done.fetch_add(1);
-  };
-
-  std::thread t_a(worker, std::ref(*engine_a));
-  std::thread t_b(worker, std::ref(*engine_b));
-  t_a.join();
-  t_b.join();
-
-  EXPECT_EQ(done.load(), 2);
-  EXPECT_FALSE(any_failed.load());
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     ConcurrentCollidingSnapshotQueriesDoNotRaceDiagnosticCapture) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_large_collision_box("collision_box"))
-                  .success);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-
-  auto engine_a = make_engine("ur5_gripper", "arm");
-  auto engine_b = make_engine("ur5_gripper", "arm");
-
-  CollisionQuery q;
-  q.query_id = "concurrent-colliding-snapshot";
-  q.robot_state = observed_state(*bundle);
-  q.collision_world_revision = snapshot->revision;
-  q.required_capabilities = {"binary_collision", "body_pair_only"};
-  CollisionPolicySnapshot policy;
-  CollisionCancellationToken cancel;
-
-  auto serial = engine_a->check(*snapshot, q, policy, cancel);
-  ASSERT_EQ(serial.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(serial.raw_diagnostics);
-  ASSERT_TRUE(serial.in_collision);
-  ASSERT_FALSE(serial.normalized_pairs.empty());
-
-  std::atomic<int> done{0};
-  std::atomic<bool> any_failed{false};
-  auto worker = [&](ManyForgeCollisionEngine& eng) {
-    try {
-      for (int i = 0; i < 50; ++i) {
-        auto result = eng.check(*snapshot, q, policy, cancel);
-        if (result.engine_status != serial.engine_status ||
-            result.in_collision != serial.in_collision ||
-            result.normalized_pairs != serial.normalized_pairs) {
-          any_failed.store(true);
-          break;
-        }
-      }
-    } catch (...) {
-      any_failed.store(true);
-    }
-    done.fetch_add(1);
-  };
-
-  std::thread t_a(worker, std::ref(*engine_a));
-  std::thread t_b(worker, std::ref(*engine_b));
-  t_a.join();
-  t_b.join();
-
-  EXPECT_EQ(done.load(), 2);
-  EXPECT_FALSE(any_failed.load());
-}
-
-// --- Compare-mode parity on a primitive fixture ---------------------------
-
-TEST(ManyForgeCollisionEngineTest,
-     AgreesWithDiagnosticComparatorOnFreeJointStateAgainstSameModel) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-
-  auto engine = make_engine("ur5_gripper", "arm");
-
-  // Use the current robot state from the kernel bundle as the input.
-  auto current = observed_state(*bundle);
-  CollisionQuery q;
-  q.query_id = "parity";
-  q.robot_state = current;
-
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  auto direct = check_snapshot(*engine, *snapshot, q);
-  auto diagnostic = bundle->collision_diagnostic_comparator->compare(q);
-  EXPECT_EQ(direct.in_collision, diagnostic.in_collision);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     SnapshotPortAcceptsPrimitiveSceneSnapshotWithBodyPairCapability) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_box_object("box_a")).success);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-
-  auto engine = make_engine("ur5_gripper", "arm");
-  CollisionQuery q;
-  q.query_id = "snapshot-primitive";
-  q.robot_state = observed_state(*bundle);
-  q.collision_world_revision = snapshot->revision;
-  q.required_capabilities = {"binary_collision", "body_pair_only"};
-  CollisionPolicySnapshot policy;
-  CollisionCancellationToken cancel;
-
-  auto result = engine->check(*snapshot, q, policy, cancel);
-  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(result.raw_diagnostics);
-  EXPECT_EQ(result.decision, result.in_collision
-                                 ? CollisionDecisionResult::kFail
-                                 : CollisionDecisionResult::kPass);
-  ASSERT_TRUE(result.collision_world_revision.has_value());
-  EXPECT_EQ(result.collision_world_revision->revision_id,
-            snapshot->revision.revision_id);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     SnapshotPortAppliesTimeoutBudgetToFullCall) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_box_object("box_a")).success);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-
-  auto engine = make_engine("ur5_gripper", "arm");
-  CollisionQuery q;
-  q.query_id = "snapshot-timeout";
-  q.robot_state = observed_state(*bundle);
-  q.collision_world_revision = snapshot->revision;
-  q.timeout_budget_ns = 1;
-  CollisionPolicySnapshot policy;
-  CollisionCancellationToken cancel;
-
-  auto result = engine->check(*snapshot, q, policy, cancel);
-  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kTimeout);
-  EXPECT_EQ(result.decision, CollisionDecisionResult::kInconclusiveFail);
-  ASSERT_TRUE(result.query_duration_ns.has_value());
-  EXPECT_GT(*result.query_duration_ns, *q.timeout_budget_ns);
-  EXPECT_EQ(diagnostic_int64(result.raw_diagnostics, "timeout_budget_ns"),
-            *q.timeout_budget_ns);
-  EXPECT_EQ(diagnostic_int64(result.raw_diagnostics,
-                             "timeout_observed_duration_ns"),
-            *result.query_duration_ns);
-  EXPECT_EQ(result.raw_diagnostics.at("timeout_includes_snapshot_sync"),
-            "true");
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     ObservedRuntimeMonitorReportsSnapshotSyncSeparately) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_mesh_object("mesh_a")).success);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  ASSERT_TRUE(snapshot->contains_mesh_geometry);
-
-  auto engine = make_engine("ur5_gripper", "arm");
-  CollisionQuery q;
-  q.query_id = "observed-runtime-sync-separate";
-  q.surface = CollisionSurface::kObservedRuntimeMonitor;
-  q.robot_state = observed_state(*bundle);
-  q.collision_world_revision = snapshot->revision;
-  CollisionPolicySnapshot policy;
-  CollisionCancellationToken cancel;
-
-  auto result = engine->check(*snapshot, q, policy, cancel);
-  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(result.raw_diagnostics);
-  ASSERT_TRUE(result.query_duration_ns.has_value());
-  const auto sync_duration_ns =
-      diagnostic_int64(result.raw_diagnostics, "snapshot_sync_duration_ns");
-  const auto total_duration_ns =
-      diagnostic_int64(result.raw_diagnostics, "total_call_duration_ns");
-  EXPECT_GE(sync_duration_ns, 0);
-  EXPECT_GE(total_duration_ns, sync_duration_ns);
-  EXPECT_GE(total_duration_ns, *result.query_duration_ns);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     ObservedRuntimeLookaheadExcludesSnapshotSyncFromPerQueryBudget) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_mesh_object("mesh_a")).success);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  ASSERT_TRUE(snapshot->contains_mesh_geometry);
-
-  auto engine = make_engine("ur5_gripper", "arm");
-  CollisionQuery q;
-  q.query_id = "observed-runtime-lookahead-sync-separate";
-  q.surface = CollisionSurface::kObservedRuntimeLookahead;
-  q.robot_state = observed_state(*bundle);
-  q.collision_world_revision = snapshot->revision;
-  // One nanosecond deterministically forces the post-sync collision query over
-  // budget without relying on machine-specific mesh ingestion timing.
-  q.timeout_budget_ns = 1;
-  CollisionPolicySnapshot policy;
-  CollisionCancellationToken cancel;
-
-  auto result = engine->check(*snapshot, q, policy, cancel);
-  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kTimeout);
-  EXPECT_EQ(result.decision, CollisionDecisionResult::kInconclusiveFail);
-  ASSERT_TRUE(result.query_duration_ns.has_value());
-  EXPECT_EQ(result.raw_diagnostics.at("timeout_includes_snapshot_sync"),
-            "false");
-  const auto sync_duration_ns =
-      diagnostic_int64(result.raw_diagnostics, "snapshot_sync_duration_ns");
-  const auto total_duration_ns =
-      diagnostic_int64(result.raw_diagnostics, "total_call_duration_ns");
-  EXPECT_GE(sync_duration_ns, 0);
-  EXPECT_GE(total_duration_ns, sync_duration_ns);
-  EXPECT_GE(total_duration_ns, *result.query_duration_ns);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     SnapshotPortLoadsTriangleMeshSceneObject) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_mesh_object("mesh_a")).success);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  ASSERT_TRUE(snapshot->contains_mesh_geometry);
-
-  auto engine = make_engine("ur5_gripper", "arm");
-  CollisionQuery q;
-  q.query_id = "snapshot-mesh";
-  q.robot_state = observed_state(*bundle);
-  q.collision_world_revision = snapshot->revision;
-  CollisionPolicySnapshot policy;
-  CollisionCancellationToken cancel;
-
-  auto result = engine->check(*snapshot, q, policy, cancel);
-  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(result.raw_diagnostics);
-  EXPECT_EQ(result.decision, result.in_collision
-                                 ? CollisionDecisionResult::kFail
-                                 : CollisionDecisionResult::kPass);
-  EXPECT_EQ(result.raw_diagnostics.count("snapshot_sync_error"), 0u)
-      << diagnostics_text(result.raw_diagnostics);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     PassiveMeshSceneContactDoesNotEnterMotionEnginePairGraph) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_mesh_object("mesh_a")).success);
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_box_object("box_a", 0.7)).success);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  ASSERT_TRUE(snapshot->contains_mesh_geometry);
-  auto policy = bundle->scene_authority->collision_policy_snapshot();
-  ASSERT_TRUE(policy.has_value());
-  ASSERT_FALSE(policy->allowed_static_static_pairs.empty());
-
-  auto engine = make_engine("ur5_gripper", "arm");
-  CollisionQuery q;
-  q.query_id = "snapshot-mesh-static-contact";
-  q.robot_state = observed_state(*bundle);
-  q.collision_world_revision = snapshot->revision;
-  CollisionCancellationToken cancel;
-
-  auto direct = engine->check(*snapshot, q, *policy, cancel);
-  ASSERT_EQ(direct.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(direct.raw_diagnostics);
-  ASSERT_FALSE(direct.in_collision)
-      << "Passive world-object contacts must remain scene-health data, not "
-         "motion-validation contacts.";
-
-  TrajectoryDTO trajectory;
-  trajectory.joint_names = q.robot_state.joint_names;
-  TrajectoryWaypointDTO waypoint;
-  waypoint.positions_rad = q.robot_state.positions_rad;
-  waypoint.time_from_start_s = 0.0;
-  trajectory.waypoints.push_back(std::move(waypoint));
-
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = *policy;
-  CollisionValidationCoordinator coordinator(std::move(cfg));
-  const auto bundle_result =
-      coordinator.validate_trajectory(*snapshot, *engine, trajectory, cancel);
-  EXPECT_TRUE(bundle_result.decision.accepted);
-  ASSERT_FALSE(bundle_result.waypoint_records.empty());
-  EXPECT_EQ(bundle_result.waypoint_records.front().result.engine_status,
-            CollisionEngineStatus::kOk);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     IsaacMeshTableCheeseStartContactDoesNotEnterMotionEnginePairGraph) {
-  auto bundle = make_ur10e_bundle();
-  ASSERT_TRUE(bundle);
-  manyforge::core::SetRobotBasePoseRequestDTO placement;
-  placement.robot_id = bundle->robot_id;
-  placement.pose_in_world = make_pose(
-      Vector3DTO{-0.21814000606536865, -0.571590006351471,
-                 0.12999999523162842},
-      manyforge::core::QuaternionDTO{0.0, 0.0, -0.7071067690849304,
-                                     0.7071067932881648});
-  ASSERT_TRUE(bundle->scene_authority->set_robot_base_pose(placement).success);
-
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_isaac_mesh_object(
-                  "isaac_table_low_327",
-                  "examples/isaac_manipulator_scene_light/meshes/"
-                  "background__table_low_327_collider_cooked.obj",
-                  Vector3DTO{1.0, 1.5, 1.149999976},
-                  Vector3DTO{0.0, 0.0, -0.7695999827980996}))
-                  .success);
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_isaac_mesh_object(
-                  "isaac_cheese_box",
-                  "examples/isaac_manipulator_scene_light/meshes/"
-                  "mac_n_cheese_centered_collider_cooked.obj",
-                  Vector3DTO{1.0, 1.0, 1.0},
-                  Vector3DTO{-0.4550379514694214, 0.0765950009226799,
-                             0.087826669216156},
-                  manyforge::core::QuaternionDTO{
-                      0.5020703673362732, -0.518012523651123,
-                      -0.4821583032608032, 0.49710360169410706}))
-                  .success);
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_isaac_mesh_object(
-                  "isaac_soup_can",
-                  "examples/isaac_manipulator_scene_light/meshes/"
-                  "World__soup_can_collider_cooked.obj",
-                  Vector3DTO{1.0, 1.0, 1.0},
-                  Vector3DTO{0.085370734333992, -0.004780956543982029,
-                             0.05248536914587021},
-                  manyforge::core::QuaternionDTO{
-                      0.03936762849031647, 0.705935907260489,
-                      0.706009404317132, 0.04068667697327009}))
-                  .success);
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_isaac_mesh_object(
-                  "isaac_small_KLT",
-                  "examples/isaac_manipulator_scene_light/meshes/"
-                  "World__small_KLT_collider_primitives.obj",
-                  Vector3DTO{1.0, 1.0, 1.0},
-                  Vector3DTO{-0.561839, -0.367252, 0.073459},
-                  manyforge::core::QuaternionDTO{
-                      -7.463636797056011e-07, 0.0014223730063974037,
-                      5.845196084198735e-05, 0.9999989867184076}))
-                  .success);
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_isaac_mesh_object(
-                  "isaac_small_KLT_01",
-                  "examples/isaac_manipulator_scene_light/meshes/"
-                  "World__small_KLT_01_collider_primitives.obj",
-                  Vector3DTO{1.0, 1.0, 1.0},
-                  Vector3DTO{0.27161648869514465, -0.35853588581085205,
-                             0.07468909025192261},
-                  manyforge::core::QuaternionDTO{
-                      -1.835783623763347e-07, -0.0009134877500924122,
-                      -3.4923311013172767e-07, 0.9999995827699003}))
-                  .success);
-
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  auto policy = bundle->scene_authority->collision_policy_snapshot();
-  ASSERT_TRUE(policy.has_value());
-  ASSERT_FALSE(policy->allowed_static_static_pairs.empty());
-
-  CollisionQuery q;
-  q.query_id = "isaac-mesh-contact-start";
-  q.robot_state.positions_rad = {2.63422544, -0.875980752, 1.551074106,
-                                 -2.29231544, -1.560498884, -2.038544566};
-  q.collision_world_revision = snapshot->revision;
-  CollisionCancellationToken cancel;
-  auto engine = make_ur10e_engine();
-
-  auto direct = engine->check(*snapshot, q, *policy, cancel);
-  ASSERT_EQ(direct.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(direct.raw_diagnostics);
-  ASSERT_FALSE(direct.in_collision)
-      << "The cheese box resting on the Isaac table is passive scene state; "
-         "it must not consume the robot motion engine's runtime-monitor budget.";
-
-  TrajectoryDTO trajectory;
-  trajectory.joint_names = {};
-  TrajectoryWaypointDTO waypoint;
-  waypoint.positions_rad = q.robot_state.positions_rad;
-  waypoint.time_from_start_s = 0.0;
-  trajectory.waypoints.push_back(std::move(waypoint));
-
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = *policy;
-  CollisionValidationCoordinator coordinator(std::move(cfg));
-  const auto bundle_result =
-      coordinator.validate_trajectory(*snapshot, *engine, trajectory, cancel);
-  ASSERT_FALSE(bundle_result.waypoint_records.empty());
-  EXPECT_TRUE(bundle_result.decision.accepted)
-      << classified_pairs_text(bundle_result.waypoint_records.front().result);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     AttachedObjectTouchLinksHonorExplicitGripperCollisionEnvelope) {
-  auto bundle = make_ur10e_bundle();
-  ASSERT_TRUE(bundle);
-
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_box_object("grasped_box")).success);
-  AttachObjectRequestDTO attach;
-  attach.object_id = "grasped_box";
-  attach.frame_id = "grasp_frame";
-  attach.touch_links = {"robotiq_base_link",
-                        "left_outer_knuckle",
-                        "left_outer_finger",
-                        "left_inner_knuckle",
-                        "left_inner_finger",
-                        "right_inner_finger",
-                        "left_inner_finger_pad",
-                        "right_outer_knuckle",
-                        "right_outer_finger",
-                        "right_inner_knuckle",
-                        "right_inner_finger_pad"};
-  const auto attach_result = bundle->scene_authority->attach_object(attach);
-  ASSERT_TRUE(attach_result.success)
-      << (attach_result.error ? attach_result.error->message : "");
-
-  auto policy = bundle->scene_authority->collision_policy_snapshot();
-  ASSERT_TRUE(policy.has_value());
-  const std::string object_body =
-      "robot/ur10e_robotiq_2f_140/attached/grasped_box/shape/0";
-  const std::string left_knuckle_body =
-      "robot/ur10e_robotiq_2f_140/link/left_inner_knuckle/collision/0";
-  const std::string right_knuckle_body =
-      "robot/ur10e_robotiq_2f_140/link/right_inner_knuckle/collision/0";
-  const std::string gripper_base_body =
-      "robot/ur10e_robotiq_2f_140/link/robotiq_base_link/collision/0";
-  const auto has_pair = [&](const std::string& a, const std::string& b) {
-    manyforge::core::CollisionPairId expected{a, b};
-    if (expected.body_b < expected.body_a) {
-      std::swap(expected.body_a, expected.body_b);
-    }
-    return std::find(policy->allowed_touch_link_pairs.begin(),
-                     policy->allowed_touch_link_pairs.end(),
-                     expected) != policy->allowed_touch_link_pairs.end();
-  };
-  EXPECT_TRUE(has_pair(object_body, left_knuckle_body));
-  EXPECT_TRUE(has_pair(object_body, right_knuckle_body));
-  EXPECT_TRUE(has_pair(object_body, gripper_base_body));
-}
-
 TEST(ManyForgeCollisionEngineTest, SnapshotPortRejectsStaleRevision) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-
-  auto engine = make_engine("ur5_gripper", "arm");
-  CollisionQuery q;
-  q.query_id = "snapshot-stale";
-  q.robot_state = observed_state(*bundle);
-  q.collision_world_revision = snapshot->revision;
-  q.collision_world_revision.revision_id += 1;
-  CollisionPolicySnapshot policy;
-  CollisionCancellationToken cancel;
-
-  auto result = engine->check(*snapshot, q, policy, cancel);
-  EXPECT_EQ(result.engine_status,
-            CollisionEngineStatus::kDiagnosticIncomplete);
+  const auto engine = make_engine();
+  const auto snapshot = minimal_snapshot();
+  CollisionQuery query;
+  query.query_id = "stale-revision";
+  query.collision_world_revision = snapshot.revision;
+  ++query.collision_world_revision.revision_id;
+  const auto result = engine->check(
+      snapshot, query, CollisionPolicySnapshot{}, CollisionCancellationToken{});
+  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kDiagnosticIncomplete);
   EXPECT_EQ(result.decision, CollisionDecisionResult::kInconclusiveFail);
-  EXPECT_EQ(result.raw_diagnostics["query_revision_id"],
-            std::to_string(snapshot->revision.revision_id + 1));
-  EXPECT_EQ(result.raw_diagnostics["snapshot_revision_id"],
-            std::to_string(snapshot->revision.revision_id));
+  EXPECT_EQ(result.raw_diagnostics.at("query_revision_id"), "2");
+  EXPECT_EQ(result.raw_diagnostics.at("snapshot_revision_id"), "1");
 }
 
 TEST(ManyForgeCollisionEngineTest,
      SnapshotPortRejectsUnknownSnapshotFormatWithDiagnostic) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  auto unsupported_snapshot = *snapshot;
-  unsupported_snapshot.snapshot_format_version = 99;
-
-  auto engine = make_engine("ur5_gripper", "arm");
-  CollisionQuery q;
-  q.query_id = "snapshot-format";
-  q.robot_state = observed_state(*bundle);
-  q.collision_world_revision = unsupported_snapshot.revision;
-  CollisionPolicySnapshot policy;
-  CollisionCancellationToken cancel;
-
-  auto result = engine->check(unsupported_snapshot, q, policy, cancel);
-  EXPECT_EQ(result.engine_status,
-            CollisionEngineStatus::kDiagnosticIncomplete);
+  const auto engine = make_engine();
+  auto snapshot = minimal_snapshot();
+  snapshot.snapshot_format_version = 99;
+  CollisionQuery query;
+  query.query_id = "unknown-format";
+  const auto result = check(*engine, snapshot, query);
+  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kDiagnosticIncomplete);
   EXPECT_EQ(result.decision, CollisionDecisionResult::kInconclusiveFail);
-  EXPECT_EQ(result.raw_diagnostics["snapshot_format_version"], "99");
+  EXPECT_EQ(result.raw_diagnostics.at("snapshot_format_version"), "99");
 }
 
 TEST(ManyForgeCollisionEngineTest, SnapshotPortHonorsCancellation) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-
-  auto engine = make_engine("ur5_gripper", "arm");
-  CollisionQuery q;
-  q.query_id = "snapshot-cancel";
-  q.robot_state = observed_state(*bundle);
-  q.collision_world_revision = snapshot->revision;
-  CollisionPolicySnapshot policy;
+  const auto engine = make_engine();
+  const auto snapshot = minimal_snapshot();
   CollisionCancellationToken cancel;
-  cancel.request_cancel("test");
-
-  auto result = engine->check(*snapshot, q, policy, cancel);
+  cancel.request_cancel("owner-neutral-test");
+  const auto result = check(*engine, snapshot, CollisionQuery{}, &cancel);
   EXPECT_EQ(result.engine_status, CollisionEngineStatus::kCancelled);
   EXPECT_EQ(result.decision, CollisionDecisionResult::kInconclusiveFail);
-  EXPECT_EQ(result.raw_diagnostics["cancel_reason"], "test");
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     RequiredUnsupportedDiagnosticCapabilityFailsClosed) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  auto engine = make_engine("ur5_gripper", "arm");
-
-  CollisionQuery q;
-  q.robot_state = observed_state(*bundle);
-  q.required_capabilities = {"contact_points"};
-  auto result = check_snapshot(*engine, *snapshot, q);
-
-  EXPECT_EQ(result.engine_status,
-            manyforge::core::CollisionEngineStatus::kDiagnosticIncomplete);
-  EXPECT_EQ(result.decision,
-            manyforge::core::CollisionDecisionResult::kInconclusiveFail);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     RequiredDistanceCapabilityPopulatesSignedClearance) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_TRUE(bundle->scene_authority->add_object(make_box_object("distance_box")).success);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  auto engine = make_engine("ur5_gripper", "arm");
-
-  CollisionQuery q;
-  q.robot_state = observed_state(*bundle);
-  // The all-active diagnostic/baseline path is explicit. Production contact-
-  // policy queries use selected/all-colliding scopes instead.
-  q.required_capabilities = {"distance", "penetration_depth"};
-  q.distance_request_mode = CollisionDistanceRequestMode::kAllActivePairs;
-  auto result = check_snapshot(*engine, *snapshot, q);
-
-  EXPECT_EQ(result.engine_status,
-            manyforge::core::CollisionEngineStatus::kOk);
-  ASSERT_TRUE(result.min_clearance_m.has_value());
-  ASSERT_TRUE(result.min_clearance_pair.has_value());
-  EXPECT_FALSE(result.pair_clearances.empty());
-  EXPECT_TRUE(std::isfinite(*result.min_clearance_m));
-
-  const auto counters = engine->internal_last_query_mechanism_counters();
-  EXPECT_EQ(counters.distance_request_mode,
-            CollisionDistanceRequestMode::kAllActivePairs);
-  EXPECT_EQ(counters.distance_api_call_count, 1u);
-  EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
-  EXPECT_EQ(counters.first_distance_evaluation_ordinal, 2u);
-  EXPECT_EQ(counters.distance_evaluated_geometry_pair_count,
-            counters.active_collision_pair_count);
-  EXPECT_EQ(counters.fk_placement_invocation_count, 2u);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     RequiredDistanceCapabilityWithoutTypedScopeFailsClosed) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  auto engine = make_engine("ur5_gripper", "arm");
-
-  CollisionQuery q;
-  q.robot_state = observed_state(*bundle);
-  q.required_capabilities = {"distance", "penetration_depth"};
-  auto result = check_snapshot(*engine, *snapshot, q);
-
-  EXPECT_EQ(result.engine_status,
-            manyforge::core::CollisionEngineStatus::kDiagnosticIncomplete);
-  EXPECT_EQ(result.decision,
-            manyforge::core::CollisionDecisionResult::kInconclusiveFail);
-  EXPECT_EQ(result.raw_diagnostics.at("distance_scope_error"),
-            "distance or penetration_depth capability requires an explicit "
-            "typed distance request scope");
-  const auto counters = engine->internal_last_query_mechanism_counters();
-  EXPECT_EQ(counters.collision_api_call_count, 0u);
-  EXPECT_EQ(counters.distance_api_call_count, 0u);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     SelectedCollidingDistancePreservesFullCollisionCoverage) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_TRUE(bundle->scene_authority
-                  ->add_object(make_large_collision_box("selective_box"))
-                  .success);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  auto engine = make_engine("ur5_gripper", "arm");
-
-  CollisionQuery collision_only;
-  collision_only.robot_state = observed_state(*bundle);
-  collision_only.distance_request_mode = CollisionDistanceRequestMode::kNone;
-  const auto complete = check_snapshot(*engine, *snapshot, collision_only);
-  ASSERT_EQ(complete.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(complete.raw_diagnostics);
-  ASSERT_TRUE(complete.in_collision);
-  ASSERT_GT(complete.normalized_pairs.size(), 1u);
-  EXPECT_TRUE(complete.pair_clearances.empty());
-  auto counters = engine->internal_last_query_mechanism_counters();
-  EXPECT_EQ(counters.collision_api_call_count, 1u);
-  EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
-  EXPECT_EQ(counters.first_distance_evaluation_ordinal, 0u);
-  EXPECT_EQ(counters.colliding_logical_pair_count,
-            complete.normalized_pairs.size());
-  EXPECT_EQ(counters.distance_api_call_count, 0u);
-  EXPECT_EQ(counters.distance_evaluated_geometry_pair_count, 0u);
-
-  CollisionQuery selective = collision_only;
-  // Signed-release and bounded-penetration policy modes share this engine
-  // scope; the policy evaluator, not the engine, interprets the metric.
-  selective.distance_request_mode =
-      CollisionDistanceRequestMode::kSelectedCollidingPairs;
-  selective.selected_distance_pairs = {complete.normalized_pairs.front()};
-  for (const std::string evidence_mode : {"signed_penetration",
-                                          "bounded_penetration"}) {
-    selective.query_id = evidence_mode;
-    const auto selected = check_snapshot(*engine, *snapshot, selective);
-    ASSERT_EQ(selected.engine_status, CollisionEngineStatus::kOk)
-        << evidence_mode << ": "
-        << diagnostics_text(selected.raw_diagnostics);
-    EXPECT_EQ(selected.normalized_pairs, complete.normalized_pairs);
-    ASSERT_EQ(selected.pair_clearances.size(), 1u);
-    EXPECT_EQ(selected.pair_clearances.front().pair,
-              complete.normalized_pairs.front());
-    EXPECT_TRUE(std::isfinite(
-        selected.pair_clearances.front().signed_clearance_m));
-    counters = engine->internal_last_query_mechanism_counters();
-    EXPECT_EQ(counters.distance_request_mode,
-              CollisionDistanceRequestMode::kSelectedCollidingPairs);
-    EXPECT_EQ(counters.collision_api_call_count, 1u);
-    EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
-    EXPECT_EQ(counters.first_distance_evaluation_ordinal, 2u);
-    EXPECT_EQ(counters.distance_evaluated_logical_pair_count, 1u);
-    EXPECT_GT(counters.distance_evaluated_geometry_pair_count, 0u);
-    EXPECT_LT(counters.distance_evaluated_geometry_pair_count,
-              counters.active_collision_pair_count);
-    EXPECT_EQ(counters.distance_api_call_count,
-              counters.distance_evaluated_geometry_pair_count);
-    EXPECT_EQ(counters.fk_placement_invocation_count, 1u);
-  }
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     SelectedPenetrationIsExactAcrossIndependentWorkerHistories) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_TRUE(bundle->scene_authority
-                  ->add_object(make_large_collision_box("deterministic_box"))
-                  .success);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-
-  CollisionQuery collision_only;
-  collision_only.robot_state = observed_state(*bundle);
-  auto discovery_engine = make_engine("ur5_gripper", "arm");
-  const auto complete =
-      check_snapshot(*discovery_engine, *snapshot, collision_only);
-  ASSERT_EQ(complete.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(complete.raw_diagnostics);
-  ASSERT_FALSE(complete.normalized_pairs.empty());
-
-  CollisionQuery selected = collision_only;
-  selected.distance_request_mode =
-      CollisionDistanceRequestMode::kSelectedCollidingPairs;
-  selected.selected_distance_pairs = {complete.normalized_pairs.front()};
-
-  auto fresh_engine = make_engine("ur5_gripper", "arm");
-  const auto fresh = check_snapshot(*fresh_engine, *snapshot, selected);
-  ASSERT_EQ(fresh.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(fresh.raw_diagnostics);
-  ASSERT_EQ(fresh.pair_clearances.size(), 1u);
-
-  auto history_engine = make_engine("ur5_gripper", "arm");
-  CollisionResult after_history;
-  for (int sample = 0; sample < 37; ++sample) {
-    after_history = check_snapshot(*history_engine, *snapshot, selected);
-    ASSERT_EQ(after_history.engine_status, CollisionEngineStatus::kOk)
-        << diagnostics_text(after_history.raw_diagnostics);
-  }
-  ASSERT_EQ(after_history.pair_clearances.size(), 1u);
-  EXPECT_EQ(after_history.pair_clearances.front().pair,
-            fresh.pair_clearances.front().pair);
-  EXPECT_EQ(after_history.pair_clearances.front().signed_clearance_m,
-            fresh.pair_clearances.front().signed_clearance_m);
-
-  const double penetration_m =
-      -fresh.pair_clearances.front().signed_clearance_m;
-  ASSERT_GT(penetration_m, 0.0);
-  manyforge::core::SupportContactPolicyEntry bounded;
-  bounded.pair = fresh.pair_clearances.front().pair;
-  bounded.mode =
-      manyforge::core::CollisionContactPolicyMode::kBoundedPenetration;
-  bounded.max_contact_penetration_m = penetration_m;
-  manyforge::core::ContactReleaseEvaluationState at_boundary_state;
-  const auto at_boundary = manyforge::core::advance_contact_release_sample(
-      bounded,
-      manyforge::core::ContactReleaseSampleEvidence{
-          .in_contact = true,
-          .signed_clearance_m =
-              fresh.pair_clearances.front().signed_clearance_m},
-      at_boundary_state);
-  EXPECT_TRUE(at_boundary.accepted());
-
-  bounded.max_contact_penetration_m = std::nextafter(penetration_m, 0.0);
-  manyforge::core::ContactReleaseEvaluationState over_boundary_state;
-  const auto over_boundary = manyforge::core::advance_contact_release_sample(
-      bounded,
-      manyforge::core::ContactReleaseSampleEvidence{
-          .in_contact = true,
-          .signed_clearance_m =
-              fresh.pair_clearances.front().signed_clearance_m},
-      over_boundary_state);
-  EXPECT_EQ(over_boundary.failure,
-            manyforge::core::ContactReleaseTransitionFailure::
-                kContactPenetrationExceedsPolicy);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     UnrelatedSelectedPairEvaluatesNoDistance) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_TRUE(bundle->scene_authority
-                  ->add_object(make_large_collision_box("unrelated_box"))
-                  .success);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  auto engine = make_engine("ur5_gripper", "arm");
-
-  CollisionQuery query;
-  query.robot_state = observed_state(*bundle);
-  query.distance_request_mode =
-      CollisionDistanceRequestMode::kSelectedCollidingPairs;
-  query.selected_distance_pairs = {{"fixture/not_present/shape/0",
-                                    "object/not_present/shape/0"}};
-  std::sort(query.selected_distance_pairs.begin(),
-            query.selected_distance_pairs.end());
-  auto& unrelated_pair = query.selected_distance_pairs.front();
-  if (unrelated_pair.body_b < unrelated_pair.body_a) {
-    std::swap(unrelated_pair.body_a, unrelated_pair.body_b);
-  }
-
-  const auto result = check_snapshot(*engine, *snapshot, query);
-  ASSERT_EQ(result.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(result.raw_diagnostics);
-  ASSERT_TRUE(result.in_collision);
-  EXPECT_FALSE(result.normalized_pairs.empty());
-  EXPECT_TRUE(result.pair_clearances.empty());
-  const auto counters = engine->internal_last_query_mechanism_counters();
-  EXPECT_EQ(counters.collision_api_call_count, 1u);
-  EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
-  EXPECT_EQ(counters.first_distance_evaluation_ordinal, 0u);
-  EXPECT_GT(counters.colliding_geometry_pair_count, 0u);
-  EXPECT_EQ(counters.distance_api_call_count, 0u);
-  EXPECT_EQ(counters.distance_evaluated_geometry_pair_count, 0u);
-  EXPECT_EQ(counters.distance_evaluated_logical_pair_count, 0u);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     SelectedCollidingDistanceRequiresANonemptySelection) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  auto engine = make_engine("ur5_gripper", "arm");
-
-  CollisionQuery query;
-  query.robot_state = observed_state(*bundle);
-  query.distance_request_mode =
-      CollisionDistanceRequestMode::kSelectedCollidingPairs;
-
-  const auto result = check_snapshot(*engine, *snapshot, query);
-  EXPECT_EQ(result.engine_status,
-            manyforge::core::CollisionEngineStatus::kDiagnosticIncomplete);
-  EXPECT_EQ(result.decision,
-            manyforge::core::CollisionDecisionResult::kInconclusiveFail);
-  EXPECT_EQ(
-      result.raw_diagnostics.at("distance_scope_error"),
-      "selected_distance_pairs_missing");
-  const auto counters = engine->internal_last_query_mechanism_counters();
-  EXPECT_EQ(counters.collision_api_call_count, 0u);
-  EXPECT_EQ(counters.distance_api_call_count, 0u);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     AllCollidingDistanceEvaluatesOnlyCollidingGeometryPairs) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_TRUE(bundle->scene_authority
-                  ->add_object(make_large_collision_box("all_colliding_box"))
-                  .success);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  auto engine = make_engine("ur5_gripper", "arm");
-
-  CollisionQuery query;
-  query.robot_state = observed_state(*bundle);
-  query.distance_request_mode =
-      CollisionDistanceRequestMode::kAllCollidingPairs;
-  const auto result = check_snapshot(*engine, *snapshot, query);
-  ASSERT_EQ(result.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(result.raw_diagnostics);
-  ASSERT_TRUE(result.in_collision);
-  ASSERT_EQ(result.pair_clearances.size(), result.normalized_pairs.size());
-
-  const auto counters = engine->internal_last_query_mechanism_counters();
-  EXPECT_EQ(counters.distance_request_mode,
-            CollisionDistanceRequestMode::kAllCollidingPairs);
-  EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
-  EXPECT_EQ(counters.first_distance_evaluation_ordinal, 2u);
-  EXPECT_EQ(counters.distance_evaluated_geometry_pair_count,
-            counters.colliding_geometry_pair_count);
-  EXPECT_EQ(counters.distance_evaluated_logical_pair_count,
-            counters.colliding_logical_pair_count);
-  EXPECT_EQ(counters.distance_api_call_count,
-            counters.colliding_geometry_pair_count);
-  EXPECT_EQ(counters.fk_placement_invocation_count, 1u);
-}
-
-TEST(ManyForgeCollisionEngineTest,
-     MultipleGeometryPairsReduceToDeepestLogicalPairDistance) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  ASSERT_TRUE(bundle->scene_authority
-                  ->add_object(make_large_collision_box("multi_geometry_box"))
-                  .success);
-  const auto published = bundle->scene_authority->snapshot();
-  ASSERT_NE(published, nullptr);
-
-  auto make_variant = [&](std::uint64_t revision_offset,
-                          const std::string& hash_suffix,
-                          bool shifted_first,
-                          bool add_second) {
-    auto variant = *published;
-    auto body = std::find_if(
-        variant.bodies.begin(), variant.bodies.end(), [](const auto& candidate) {
-          return candidate.body_id ==
-                 "object/multi_geometry_box/shape/0";
-        });
-    if (body == variant.bodies.end() || body->geometries.empty()) {
-      throw std::runtime_error("multi-geometry fixture body is missing");
-    }
-    auto shifted = body->geometries.front();
-    shifted.local_pose.position_m.x_m = 0.75;
-    if (shifted_first) {
-      body->geometries.front() = shifted;
-    }
-    if (add_second) {
-      body->geometries.push_back(std::move(shifted));
-      ++variant.geometry_count;
-    }
-    variant.revision.revision_id =
-        published->revision.revision_id + revision_offset;
-    variant.revision.content_hash =
-        published->revision.content_hash + hash_suffix;
-    return variant;
-  };
-
-  const auto first_snapshot = make_variant(1, "-first", false, false);
-  const auto second_snapshot = make_variant(2, "-second", true, false);
-  const auto combined_snapshot = make_variant(3, "-combined", false, true);
-  auto engine = make_engine("ur5_gripper", "arm");
-
-  CollisionQuery discover;
-  discover.robot_state = observed_state(*bundle);
-  const auto discovery =
-      check_snapshot(*engine, first_snapshot, discover);
-  ASSERT_EQ(discovery.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(discovery.raw_diagnostics);
-  ASSERT_FALSE(discovery.normalized_pairs.empty());
-  const auto selected_pair = discovery.normalized_pairs.front();
-
-  CollisionQuery query = discover;
-  query.distance_request_mode =
-      CollisionDistanceRequestMode::kSelectedCollidingPairs;
-  query.selected_distance_pairs = {selected_pair};
-  const auto first = check_snapshot(*engine, first_snapshot, query);
-  ASSERT_EQ(first.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(first.raw_diagnostics);
-  ASSERT_EQ(first.pair_clearances.size(), 1u);
-  const auto first_counters =
-      engine->internal_last_query_mechanism_counters();
-
-  const auto second = check_snapshot(*engine, second_snapshot, query);
-  ASSERT_EQ(second.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(second.raw_diagnostics);
-  ASSERT_EQ(second.pair_clearances.size(), 1u);
-  const auto second_counters =
-      engine->internal_last_query_mechanism_counters();
-
-  const auto combined =
-      check_snapshot(*engine, combined_snapshot, query);
-  ASSERT_EQ(combined.engine_status, CollisionEngineStatus::kOk)
-      << diagnostics_text(combined.raw_diagnostics);
-  ASSERT_EQ(combined.pair_clearances.size(), 1u);
-  const auto combined_counters =
-      engine->internal_last_query_mechanism_counters();
-
-  const double expected_deepest =
-      std::min(first.pair_clearances.front().signed_clearance_m,
-               second.pair_clearances.front().signed_clearance_m);
-  EXPECT_NEAR(combined.pair_clearances.front().signed_clearance_m,
-              expected_deepest, 1e-9);
-  EXPECT_EQ(combined.pair_clearances.front().pair, selected_pair);
-  EXPECT_EQ(combined_counters.distance_evaluated_logical_pair_count, 1u);
-  EXPECT_EQ(combined_counters.distance_evaluated_geometry_pair_count,
-            first_counters.distance_evaluated_geometry_pair_count +
-                second_counters.distance_evaluated_geometry_pair_count);
-  EXPECT_GT(combined_counters.distance_evaluated_geometry_pair_count, 1u);
+  EXPECT_EQ(result.raw_diagnostics.at("cancel_reason"), "owner-neutral-test");
 }
 
 TEST(ManyForgeCollisionEngineTest, ZeroTimeoutFailsClosedWithoutQueryPass) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  auto engine = make_engine("ur5_gripper", "arm");
-
-  CollisionQuery q;
-  q.robot_state = observed_state(*bundle);
-  q.timeout_budget_ns = 0;
-  auto result = check_snapshot(*engine, *snapshot, q);
-
-  EXPECT_EQ(result.engine_status,
-            manyforge::core::CollisionEngineStatus::kTimeout);
-  EXPECT_EQ(result.decision,
-            manyforge::core::CollisionDecisionResult::kInconclusiveFail);
-  EXPECT_EQ(diagnostic_int64(result.raw_diagnostics, "timeout_budget_ns"), 0);
+  const auto engine = make_engine();
+  const auto snapshot = minimal_snapshot();
+  CollisionQuery query;
+  query.timeout_budget_ns = 0;
+  const auto result = check(*engine, snapshot, query);
+  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kTimeout);
+  EXPECT_EQ(result.decision, CollisionDecisionResult::kInconclusiveFail);
+  EXPECT_EQ(result.raw_diagnostics.at("timeout_budget_ns"), "0");
 }
 
 TEST(ManyForgeCollisionEngineTest, MalformedQueryFailsClosedWithoutThrowing) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  auto engine = make_engine("ur5_gripper", "definitely_not_a_group");
-
-  CollisionQuery q = make_query({0.0});
-  auto result = check_snapshot(*engine, *snapshot, q);
-
-  EXPECT_EQ(result.engine_status,
-            manyforge::core::CollisionEngineStatus::kDiagnosticIncomplete);
-  EXPECT_EQ(result.decision,
-            manyforge::core::CollisionDecisionResult::kInconclusiveFail);
-  EXPECT_NE(result.raw_diagnostics["robot_state_error"].find(
-                "does not match"),
-            std::string::npos);
+  const auto engine = make_engine();
+  const auto snapshot = minimal_snapshot();
+  CollisionQuery query;
+  query.robot_state.positions_rad = {0.0};
+  const auto result = check(*engine, snapshot, query);
+  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kDiagnosticIncomplete);
+  EXPECT_EQ(result.decision, CollisionDecisionResult::kInconclusiveFail);
+  EXPECT_FALSE(result.raw_diagnostics.at("robot_state_error").empty());
 }
 
-// --- No scene-lock contention --------------------------------------------
+TEST(CollisionQualificationPrimitivesTest,
+     RetainedDistributionsAndBudgetsRemainExact) {
+  const std::array<std::uint64_t, 4> samples{10, 20, 30, 40};
+  const auto distribution =
+      manyforge::qualification::summarize_distribution(samples);
+  EXPECT_DOUBLE_EQ(distribution.p50, 25.0);
+  EXPECT_DOUBLE_EQ(distribution.p95, 38.5);
+  EXPECT_DOUBLE_EQ(distribution.p99, 39.7);
+  EXPECT_DOUBLE_EQ(distribution.maximum, 40.0);
+  EXPECT_DOUBLE_EQ(manyforge::qualification::median_absolute_deviation(samples),
+                   10.0);
 
-TEST(ManyForgeCollisionEngineTest,
-     QueryProceedsEvenWhilePlannerProjectionIsHeavilyBusy) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
+  using Schedule = manyforge::qualification::RuntimeScheduleContract;
+  EXPECT_EQ(Schedule::kMonitorPeriodNs, 50'000'000);
+  EXPECT_EQ(Schedule::kImmediateQueryBudgetNs, 50'000'000);
+  EXPECT_EQ(Schedule::kLookaheadCycleBudgetNs, 200'000'000);
+  EXPECT_EQ(Schedule::kLookaheadHorizonNs, 2'000'000'000);
+  EXPECT_EQ(Schedule::kLookaheadQueryBudgetNs, 75'000'000);
+  EXPECT_EQ(Schedule::kLookaheadSamples, 32U);
+  EXPECT_EQ(Schedule::kTrajectoryWaypointCount, 201U);
+}
 
-  auto engine = make_engine("ur5_gripper", "arm");
-
-  auto snapshot = bundle->scene_authority->snapshot();
-  ASSERT_NE(snapshot, nullptr);
-  CollisionQuery direct_query;
-  direct_query.robot_state = observed_state(*bundle);
-
-  // Background thread hammers the planner projection's scene mutex through
-  // observation copies and non-authoritative diagnostic comparisons.
-  // The ManyForge-owned collision engine should not be blocked by that load.
-  std::atomic<bool> stop{false};
-  auto thrasher = std::thread([&] {
-    while (!stop.load()) {
-      CollisionQuery q;
-      q.robot_state = observed_state(*bundle);
-      auto r = bundle->collision_diagnostic_comparator->compare(q);
-      (void)r;
-    }
-  });
-
-  // Run neutral-engine queries; measure that they all complete in bounded time.
-  const auto start = std::chrono::steady_clock::now();
-  for (int i = 0; i < 20; ++i) {
-    auto r = check_snapshot(*engine, *snapshot, direct_query);
-    (void)r;
+TEST(CollisionQualificationPrimitivesTest,
+     HistoricalFactoryCasesHaveExactRestorationAssignments) {
+  EXPECT_EQ(kRetainedAcceptance.size(), 9U);
+  EXPECT_EQ(kFactoryCoupledAcceptance.size(), 26U);
+  EXPECT_EQ(kRetainedAcceptance.size() + kFactoryCoupledAcceptance.size(), 35U);
+  for (const auto& disposition : kRetainedAcceptance) {
+    EXPECT_FALSE(disposition.historical_case.empty());
+    EXPECT_FALSE(disposition.restoration_gate.empty());
+    EXPECT_FALSE(disposition.required_behavior.empty());
   }
-  const auto elapsed = std::chrono::steady_clock::now() - start;
-  stop.store(true);
-  thrasher.join();
-
-  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
-            5);
+  for (const auto& disposition : kFactoryCoupledAcceptance) {
+    EXPECT_FALSE(disposition.historical_case.empty());
+    EXPECT_FALSE(disposition.restoration_gate.empty());
+    EXPECT_FALSE(disposition.required_behavior.empty());
+  }
 }
 
-// --- Compare-mode mismatch emission --------------------------------------
+void write_mesh(const std::filesystem::path& path, const std::string& bytes) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output << bytes;
+}
+
+CollisionWorldSnapshot relative_mesh_snapshot(const std::string& uri,
+                                              const std::uint64_t revision) {
+  auto snapshot = minimal_snapshot();
+  snapshot.revision.revision_id = revision;
+  snapshot.revision.content_hash =
+      "sha256:relative-scene-mesh-" + std::to_string(revision);
+  snapshot.component_model_frames.push_back(
+      manyforge::core::CollisionComponentModelFrame{
+          manyforge::core::ControllableComponentId{"arm"},
+          manyforge::core::ModelInstanceId{"arm_model"},
+          manyforge::core::FrameRoleId{"base"},
+          "base",
+          manyforge::core::ModelRevision{"model-revision-1"},
+          {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}});
+  manyforge::core::CollisionWorldBody body;
+  body.body_id = manyforge::core::CollisionBodyId("scene/relative-mesh/shape/0");
+  body.owner_kind = manyforge::core::CollisionOwnerKind::kSceneResource;
+  body.frame_id = "world";
+  body.pose = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
+  manyforge::core::CollisionGeometryDescriptor geometry;
+  geometry.body_id = body.body_id;
+  geometry.owner_kind = body.owner_kind;
+  geometry.geometry_kind = manyforge::core::CollisionGeometryKind::kTriangleMesh;
+  geometry.local_pose = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
+  geometry.source_uri = uri;
+  geometry.mesh_scale = manyforge::core::Vector3DTO{1.0, 1.0, 1.0};
+  body.geometries.push_back(geometry);
+  snapshot.bodies.push_back(body);
+  return snapshot;
+}
+
+std::string sync_error(const CollisionResult& result) {
+  const auto found = result.raw_diagnostics.find("snapshot_sync_error");
+  return found == result.raw_diagnostics.end() ? std::string{} : found->second;
+}
 
 TEST(ManyForgeCollisionEngineTest,
-     CompareModeEmitsMismatchEventWhenEnginesDisagree) {
-  auto bundle = create_native_kernel("ur5_gripper", "arm");
-  ASSERT_TRUE(bundle);
+     RelativeSceneMeshResolvesOnlyBelowTheApprovedSceneAssetRoot) {
+  TemporaryModel temporary;
+  const std::string triangle = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+  const auto outside = temporary.root / "outside";
+  const auto approved = temporary.root / "approved";
+  write_mesh(outside / "examples/x/meshes/outside.obj", triangle);
+  write_mesh(approved / "examples/x/meshes/a.obj", triangle);
+  // A repository-relative example mesh: the removed fallbacks would have
+  // found it through the current directory or the development /workspace.
+  const std::string repository_mesh =
+      "examples/isaac_manipulator_scene_light/meshes/"
+      "World__soup_can_collider_cooked.obj";
 
-  // Compare mode is generic: the RoboPlan adapter sees only an
-  // ICollisionQueryEngine, not the concrete manyforge_collision type.
-  auto secondary = std::make_shared<AlwaysIncompleteCompareEngine>();
-  bundle->collision_diagnostic_comparator->set_compare_engine(secondary);
+  const auto previous_directory = std::filesystem::current_path();
+  struct RestoreDirectory final {
+    std::filesystem::path path;
+    ~RestoreDirectory() {
+      std::error_code ignored;
+      std::filesystem::current_path(path, ignored);
+    }
+  } restore{previous_directory};
+  std::filesystem::current_path(outside);
 
-  std::atomic<int> mismatch_count{0};
-  std::atomic<bool> saw_secondary_incomplete{false};
-  std::atomic<bool> saw_timestamp{false};
-  bundle->collision_diagnostic_comparator->set_mismatch_record_emitter(
-      [&mismatch_count, &saw_secondary_incomplete, &saw_timestamp](
-          manyforge::core::CollisionEngineMismatchRecord record) {
-        auto status_it = record.raw_diagnostics.find("secondary_engine_status");
-        if (status_it != record.raw_diagnostics.end() &&
-            status_it->second == "diagnostic_incomplete") {
-          saw_secondary_incomplete.store(true);
-        }
-        if (record.emitted_at_ns > 0) {
-          saw_timestamp.store(true);
-        }
-        mismatch_count.fetch_add(1);
-      });
+  const auto urdf = temporary.root / "empty.urdf";
+  const auto srdf = temporary.root / "empty.srdf";
+  static_cast<void>(load_empty_collision_model(temporary));
 
-  CollisionQuery q;
-  q.robot_state = observed_state(*bundle);
-  q.required_capabilities = {"body_pair_only"};
-  bundle->collision_diagnostic_comparator->compare(q);
+  {
+    // No approved root: relative scene meshes fail closed even when the
+    // file exists below the current directory.
+    const auto model = ManyForgeCollisionEngine::load_shared_model(
+        "unrooted", urdf, srdf, {temporary.root}, "arm");
+    ManyForgeCollisionEngine engine(model, nullptr);
+    const auto result = check(
+        engine, relative_mesh_snapshot("examples/x/meshes/outside.obj", 1U),
+        one_joint_query());
+    EXPECT_NE(sync_error(result).find("no approved scene-asset root"),
+              std::string::npos)
+        << sync_error(result);
+  }
 
-  EXPECT_GT(mismatch_count.load(), 0);
-  EXPECT_TRUE(saw_secondary_incomplete.load());
-  EXPECT_TRUE(saw_timestamp.load());
+  const int root_fd =
+      ::open(approved.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  ASSERT_GE(root_fd, 0);
+  const auto model = ManyForgeCollisionEngine::load_shared_model(
+      "rooted", urdf, srdf, {temporary.root, repo_root()}, "arm", root_fd);
+  static_cast<void>(::close(root_fd));  // The model keeps its own duplicate.
+  {
+    ManyForgeCollisionEngine engine(model, nullptr);
+    for (const auto& [uri, revision] :
+         std::vector<std::pair<std::string, std::uint64_t>>{
+             {"examples/x/meshes/outside.obj", 2U},
+             {repository_mesh, 3U},
+             {"../outside/examples/x/meshes/outside.obj", 4U}}) {
+      const auto result =
+          check(engine, relative_mesh_snapshot(uri, revision), one_joint_query());
+      EXPECT_FALSE(sync_error(result).empty()) << uri;
+    }
+    const auto loaded = check(
+        engine, relative_mesh_snapshot("examples/x/meshes/a.obj", 5U),
+        one_joint_query());
+    EXPECT_TRUE(sync_error(loaded).empty()) << sync_error(loaded);
+  }
+  const auto pinned = ManyForgeCollisionEngine::scene_mesh_content_digest(
+      model, "examples/x/meshes/a.obj");
+  ASSERT_TRUE(pinned.ok()) << pinned.error().message;
+  EXPECT_EQ(pinned.value().rfind("sha256:", 0), 0U);
 
-  // Reset to disabled.
-  bundle->collision_diagnostic_comparator->set_compare_engine(nullptr);
-  bundle->collision_diagnostic_comparator->set_mismatch_record_emitter({});
+  // Renaming the approved root does not change what the model reads.
+  std::filesystem::rename(approved, temporary.root / "approved-displaced");
+  ASSERT_TRUE(ManyForgeCollisionEngine::scene_mesh_content_digest(
+                  model, "examples/x/meshes/a.obj")
+                  .ok());
+
+  // Changed bytes after the first load: a fresh cache must refuse them.
+  write_mesh(temporary.root / "approved-displaced/examples/x/meshes/a.obj",
+             "v 0 0 0\nv 2 0 0\nv 0 2 0\nf 1 2 3\n");
+  ManyForgeCollisionEngine fresh(
+      model, ManyForgeCollisionEngine::make_shared_scene_cache(model));
+  const auto changed = check(
+      fresh, relative_mesh_snapshot("examples/x/meshes/a.obj", 6U),
+      one_joint_query());
+  EXPECT_NE(sync_error(changed).find("scene_mesh_content_changed"),
+            std::string::npos)
+      << sync_error(changed);
+  const auto still_pinned = ManyForgeCollisionEngine::scene_mesh_content_digest(
+      model, "examples/x/meshes/a.obj");
+  ASSERT_TRUE(still_pinned.ok());
+  EXPECT_EQ(still_pinned.value(), pinned.value());
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     ClearanceMarginsApplyPerPairToTheQueriesThatCarryThem) {
+  namespace core = manyforge::core;
+  namespace collision = manyforge::collision;
+  const auto paths = ur10e_model_paths();
+  const auto shared = load_shared_model();
+  ManyForgeCollisionEngine engine(shared,
+                                  ManyForgeCollisionEngine::make_shared_scene_cache(shared));
+  pinocchio::Model model;
+  pinocchio::GeometryModel geometry;
+  pinocchio::urdf::buildModel(paths.urdf.string(), model, false, true);
+  pinocchio::urdf::buildGeom(model, paths.urdf.string(), pinocchio::COLLISION, geometry,
+                             std::vector<std::string>{repo_root().string()});
+  std::set<std::string> frames;
+  std::vector<collision::RetainedComponentCollisionBodyProjectionInput> bodies;
+  for (const auto& object : geometry.geometryObjects) {
+    const auto& frame = model.frames[object.parentFrame].name;
+    if (frames.insert(frame).second) {
+      bodies.push_back({core::ControllableComponentId("clearance-test"),
+                        core::ModelInstanceId("robot"), core::ModelRevision("model-1"),
+                        core::CollisionBodyRoleId(frame), 0, frame});
+    }
+  }
+  const std::vector<collision::RetainedComponentModelFrameProjectionInput> model_frames{
+      {core::ControllableComponentId("clearance-test"), core::ModelInstanceId("robot"),
+       core::ModelRevision("model-1"), core::FrameRoleId("base"), "base_link"}};
+  const auto projection = ManyForgeCollisionEngine::project_retained_component_collision(
+      shared, "base_link", bodies, model_frames);
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+
+  // A box 4 m from the robot base: clear at margin 0, inside a 10 m margin.
+  auto snapshot = minimal_snapshot();
+  snapshot.bodies = projection.value().component_bodies;
+  snapshot.component_model_frames = projection.value().component_model_frames;
+  core::CollisionWorldBody box;
+  box.body_id = "scene/far_box/shape/0";
+  box.owner_kind = core::CollisionOwnerKind::kSceneResource;
+  box.frame_id = "world";
+  box.pose = {{4.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
+  core::CollisionGeometryDescriptor box_geometry;
+  box_geometry.body_id = box.body_id;
+  box_geometry.owner_kind = box.owner_kind;
+  box_geometry.geometry_kind = core::CollisionGeometryKind::kBox;
+  box_geometry.local_pose = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
+  box_geometry.box_dimensions_m = core::Vector3DTO{0.1, 0.1, 0.1};
+  box.geometries.push_back(box_geometry);
+  auto margins = std::make_shared<core::CollisionClearanceMargins>();
+  margins->margin_m = 10.0;
+  for (const auto& body : snapshot.bodies) {
+    margins->pairs.push_back({core::CollisionPairId{body.body_id, box.body_id}, 10.0});
+  }
+  std::sort(margins->pairs.begin(), margins->pairs.end(),
+            [](const auto& left, const auto& right) { return left.pair < right.pair; });
+  snapshot.bodies.push_back(box);
+  std::sort(snapshot.bodies.begin(), snapshot.bodies.end(),
+            [](const auto& left, const auto& right) { return left.body_id < right.body_id; });
+  snapshot.body_count = snapshot.bodies.size();
+  snapshot.geometry_count = geometry.geometryObjects.size() + 1U;
+  snapshot.scene_resource_count = 1;
+  snapshot.contains_mesh_geometry = true;
+
+  const std::vector<std::string> names{"shoulder_pan_joint", "shoulder_lift_joint",
+                                       "elbow_joint",        "wrist_1_joint",
+                                       "wrist_2_joint",      "wrist_3_joint"};
+  const std::vector<double> positions{0.0, -1.2, 1.4, -1.8, -1.57, 0.0};
+  const auto touches_box = [&](const core::CollisionPairId& pair) {
+    return pair.body_a == box.body_id || pair.body_b == box.body_id;
+  };
+  CollisionQuery query;
+  query.query_id = "clearance-none";
+  query.robot_state.joint_names = names;
+  query.robot_state.positions_rad = positions;
+  const auto plain = check(engine, snapshot, query);
+  ASSERT_EQ(plain.engine_status, CollisionEngineStatus::kOk);
+  EXPECT_TRUE(std::none_of(plain.normalized_pairs.begin(), plain.normalized_pairs.end(),
+                           touches_box));
+  EXPECT_TRUE(plain.clearance_violations.empty());
+
+  query.query_id = "clearance-10m";
+  query.clearance_margins = margins;
+  const auto with_margin = check(engine, snapshot, query);
+  ASSERT_EQ(with_margin.engine_status, CollisionEngineStatus::kOk);
+  EXPECT_TRUE(with_margin.in_collision);
+  ASSERT_FALSE(with_margin.clearance_violations.empty());
+  for (const auto& violation : with_margin.clearance_violations) {
+    EXPECT_TRUE(touches_box(violation.pair));
+    EXPECT_GT(violation.signed_clearance_m, 0.0);
+    EXPECT_LT(violation.signed_clearance_m, 10.0);
+    EXPECT_NE(std::find(with_margin.normalized_pairs.begin(), with_margin.normalized_pairs.end(),
+                        violation.pair),
+              with_margin.normalized_pairs.end());
+  }
+  EXPECT_TRUE(std::is_sorted(with_margin.clearance_violations.begin(),
+                             with_margin.clearance_violations.end(),
+                             [](const auto& left, const auto& right) {
+                               return left.pair < right.pair;
+                             }));
+
+  // The runtime surface on the same context keeps margin 0.
+  ASSERT_EQ(engine.prepare_runtime_query(names), core::RuntimeCollisionQueryPrepareStatus::kReady);
+  ASSERT_EQ(engine.prepare_runtime_snapshot(snapshot),
+            core::RuntimeCollisionQueryPrepareStatus::kReady);
+  const auto runtime = engine.check_runtime(
+      snapshot, {positions, 0, 50'000'000, core::CollisionDistanceRequestMode::kNone, {}});
+  ASSERT_EQ(runtime.engine_status, CollisionEngineStatus::kOk);
+  EXPECT_EQ(runtime.status, plain.in_collision ? core::RuntimeCollisionQueryStatus::kCollision
+                                               : core::RuntimeCollisionQueryStatus::kClear);
+  for (const auto& observation : runtime.collision_pairs) {
+    ASSERT_NE(observation.pair, nullptr);
+    EXPECT_FALSE(touches_box(*observation.pair));
+  }
+
+  // A later query without margins is back at margin 0.
+  query.query_id = "clearance-reset";
+  query.clearance_margins.reset();
+  const auto reset = check(engine, snapshot, query);
+  EXPECT_EQ(reset.in_collision, plain.in_collision);
+  EXPECT_TRUE(reset.clearance_violations.empty());
+}
+
+// S11 (CLR): the clearance margin also classifies a MESH body (coal's BVH
+// distance path), not only primitives. A small box is placed just beyond
+// every Lite 6 geometry's bounding sphere along one horizontal direction,
+// next to the left finger: no contact (at least 2 cm away from every robot
+// geometry), but within a 0.5 m margin of the finger mesh.
+TEST(ManyForgeCollisionEngineTest, ClearanceMarginClassifiesAFingerMeshNearAnObstacle) {
+  namespace core = manyforge::core;
+  namespace collision = manyforge::collision;
+  const auto paths = lite6_model_paths();
+  const auto shared = load_lite6_shared_model();
+  ManyForgeCollisionEngine engine(shared,
+                                  ManyForgeCollisionEngine::make_shared_scene_cache(shared));
+  pinocchio::Model model;
+  pinocchio::GeometryModel geometry;
+  pinocchio::urdf::buildModel(paths.urdf.string(), model, false, true);
+  pinocchio::urdf::buildGeom(model, paths.urdf.string(), pinocchio::COLLISION, geometry,
+                             std::vector<std::string>{repo_root().string()});
+  std::set<std::string> frames;
+  std::vector<collision::RetainedComponentCollisionBodyProjectionInput> bodies;
+  for (const auto& object : geometry.geometryObjects) {
+    const auto& frame = model.frames[object.parentFrame].name;
+    if (frames.insert(frame).second) {
+      bodies.push_back({core::ControllableComponentId("clearance-mesh-test"),
+                        core::ModelInstanceId("robot"), core::ModelRevision("model-1"),
+                        core::CollisionBodyRoleId(frame), 0, frame});
+    }
+  }
+  const std::string finger_frame = "lite_gripper_left_finger";
+  ASSERT_TRUE(frames.contains(finger_frame));
+  const std::vector<collision::RetainedComponentModelFrameProjectionInput> model_frames{
+      {core::ControllableComponentId("clearance-mesh-test"), core::ModelInstanceId("robot"),
+       core::ModelRevision("model-1"), core::FrameRoleId("base"), "link_base"}};
+  const auto projection = ManyForgeCollisionEngine::project_retained_component_collision(
+      shared, "link_base", bodies, model_frames);
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+
+  // The arm pose, and every geometry's world bounding sphere at it (the
+  // fingers stay at their neutral position, as the engine keeps them).
+  const std::vector<double> positions{0.0, 0.3, 0.8, 0.0, 0.5, 0.0};
+  Eigen::VectorXd q = pinocchio::neutral(model);
+  for (std::size_t index = 0; index < kLite6ArmJoints.size(); ++index) {
+    ASSERT_TRUE(model.existJointName(kLite6ArmJoints[index]));
+    q[model.joints[model.getJointId(kLite6ArmJoints[index])].idx_q()] = positions[index];
+  }
+  pinocchio::Data data(model);
+  pinocchio::GeometryData geometry_data(geometry);
+  pinocchio::updateGeometryPlacements(model, data, geometry, geometry_data, q);
+  std::vector<std::pair<Eigen::Vector3d, double>> spheres;
+  std::optional<Eigen::Vector3d> finger_center;
+  for (std::size_t index = 0; index < geometry.geometryObjects.size(); ++index) {
+    auto& object = geometry.geometryObjects[index];
+    ASSERT_TRUE(object.geometry);
+    if (!(object.geometry->aabb_radius > 0.0)) object.geometry->computeLocalAABB();
+    const Eigen::Vector3d center = geometry_data.oMg[index].act(
+        Eigen::Vector3d(object.geometry->aabb_center.cast<double>()));
+    spheres.emplace_back(center, static_cast<double>(object.geometry->aabb_radius));
+    if (model.frames[object.parentFrame].name == finger_frame) finger_center = center;
+  }
+  ASSERT_TRUE(finger_center.has_value());
+  // Outward (horizontal, away from the base) through the finger.
+  Eigen::Vector3d outward(finger_center->x(), finger_center->y(), 0.0);
+  outward = outward.norm() > 1e-6 ? Eigen::Vector3d(outward.normalized())
+                                  : Eigen::Vector3d::UnitX();
+  double farthest = -std::numeric_limits<double>::infinity();
+  for (const auto& [center, radius] : spheres)
+    farthest = std::max(farthest, outward.dot(center) + radius);
+  // A 1 cm box whose near face is 2 cm beyond every robot geometry.
+  constexpr double kGapLowerBoundM = 0.02;
+  constexpr double kBoxSideM = 0.01;
+  const Eigen::Vector3d box_center =
+      *finger_center +
+      (farthest + kGapLowerBoundM + kBoxSideM / 2.0 - outward.dot(*finger_center)) * outward;
+
+  auto snapshot = minimal_snapshot();
+  snapshot.bodies = projection.value().component_bodies;
+  snapshot.component_model_frames = projection.value().component_model_frames;
+  core::CollisionWorldBody box;
+  box.body_id = "scene/finger_box/shape/0";
+  box.owner_kind = core::CollisionOwnerKind::kSceneResource;
+  box.frame_id = "world";
+  box.pose = {{box_center.x(), box_center.y(), box_center.z()}, {0.0, 0.0, 0.0, 1.0}};
+  core::CollisionGeometryDescriptor box_geometry;
+  box_geometry.body_id = box.body_id;
+  box_geometry.owner_kind = box.owner_kind;
+  box_geometry.geometry_kind = core::CollisionGeometryKind::kBox;
+  box_geometry.local_pose = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
+  box_geometry.box_dimensions_m = core::Vector3DTO{kBoxSideM, kBoxSideM, kBoxSideM};
+  box.geometries.push_back(box_geometry);
+  constexpr double kMarginM = 0.5;
+  auto margins = std::make_shared<core::CollisionClearanceMargins>();
+  margins->margin_m = kMarginM;
+  for (const auto& body : snapshot.bodies) {
+    margins->pairs.push_back({core::CollisionPairId{body.body_id, box.body_id}, kMarginM});
+  }
+  std::sort(margins->pairs.begin(), margins->pairs.end(),
+            [](const auto& left, const auto& right) { return left.pair < right.pair; });
+  snapshot.bodies.push_back(box);
+  std::sort(snapshot.bodies.begin(), snapshot.bodies.end(),
+            [](const auto& left, const auto& right) { return left.body_id < right.body_id; });
+  snapshot.body_count = snapshot.bodies.size();
+  snapshot.geometry_count = geometry.geometryObjects.size() + 1U;
+  snapshot.scene_resource_count = 1;
+  snapshot.contains_mesh_geometry = true;
+
+  const auto touches_box = [&](const core::CollisionPairId& pair) {
+    return pair.body_a == box.body_id || pair.body_b == box.body_id;
+  };
+  const auto is_finger_pair = [&](const core::CollisionPairId& pair) {
+    const auto finger = "/body/" + finger_frame + "/";
+    return touches_box(pair) && (pair.body_a.find(finger) != std::string::npos ||
+                                 pair.body_b.find(finger) != std::string::npos);
+  };
+  CollisionQuery query;
+  query.query_id = "mesh-clearance-none";
+  query.robot_state.joint_names = kLite6ArmJoints;
+  query.robot_state.positions_rad = positions;
+  const auto plain = check(engine, snapshot, query);
+  ASSERT_EQ(plain.engine_status, CollisionEngineStatus::kOk);
+  EXPECT_TRUE(std::none_of(plain.normalized_pairs.begin(), plain.normalized_pairs.end(),
+                           touches_box));
+  EXPECT_TRUE(plain.clearance_violations.empty());
+
+  query.query_id = "mesh-clearance-margin";
+  query.clearance_margins = margins;
+  const auto with_margin = check(engine, snapshot, query);
+  ASSERT_EQ(with_margin.engine_status, CollisionEngineStatus::kOk);
+  EXPECT_TRUE(with_margin.in_collision);
+  const auto finger = std::find_if(with_margin.clearance_violations.begin(),
+                                   with_margin.clearance_violations.end(),
+                                   [&](const auto& violation) {
+                                     return is_finger_pair(violation.pair);
+                                   });
+  ASSERT_NE(finger, with_margin.clearance_violations.end());
+  // The mesh distance, not a bounding volume: at least the 2 cm gap, and
+  // inside the margin.
+  EXPECT_GE(finger->signed_clearance_m, kGapLowerBoundM - 1e-6);
+  EXPECT_LT(finger->signed_clearance_m, kMarginM);
+  for (const auto& violation : with_margin.clearance_violations) {
+    EXPECT_TRUE(touches_box(violation.pair));
+    EXPECT_GT(violation.signed_clearance_m, 0.0);
+  }
+
+  // Without margins the same scene is clear of the box again.
+  query.query_id = "mesh-clearance-reset";
+  query.clearance_margins.reset();
+  const auto reset = check(engine, snapshot, query);
+  EXPECT_TRUE(std::none_of(reset.normalized_pairs.begin(), reset.normalized_pairs.end(),
+                           touches_box));
+  EXPECT_TRUE(reset.clearance_violations.empty());
 }
 
 }  // namespace

@@ -1,0 +1,114 @@
+{
+  "api_version": "manyforge.scenario.project.v2",
+  "content": {
+    "assignment_present": true,
+    "deployment_present": true,
+    "program_present": true
+  },
+  "description": "Mock Lite6 signal moves: search_trip scripts probe_contact false then true after 1000 ms -> signal_trip/success; search_no_trip scripts edge_sensor false with no change and completes without trip -> no_signal_trip (default success); probe_no_trip descends slowly (TCP up to 10 mm/s, endpoint gripper/tcp) to a requested goal 1 mm past the probe_block top, so the fingertips touch the block; probe_contact_policy allows contact only for the endpoint bodies against probe_block in the last 20% of the motion (up to 2 mm); it scripts edge_sensor false with no change and completes without a trip (on_no_signal success) -> no_signal_trip. end_rest withdraws from the probe_block contact under withdrawal_contact_policy (same endpoint/block pair, 2 mm initial cap, decreasing penetration, separation required, no recontact). The node_outcome keys are checked.",
+  "members": {
+    "assignment.yaml": "sha256:de588e86970c3ca6ab42824aa3916549c34064dbf1c4c97ba3fe06984a28d6a0",
+    "deployment.yaml": "sha256:cc8b34714357931af21fe57d1b4cef628c30435cd85cd47b841b51a3dbac28ae",
+    "program.yaml": "sha256:f8ef49a816561eb15f2c6b888c364164f49da3afa79865499da3d94ad92f7a20"
+  },
+  "name": "mock_lite6_signal_moves",
+  "saved_status": {
+    "checked_content_digest": "sha256:3b9f46223d50a9c7d87271c57f0392fe901e29dedef12487eb792f8338f23b2c",
+    "last_known_status": "unknown",
+    "manyforge_version": "0.2.0"
+  },
+  "scenario_id": "mock_lite6_signal_moves",
+  "source_snapshot": {
+    "entries": [
+      {
+        "content_digest": "sha256:ac91231b9338ecc99dc4f318854f3288d427dbf7d36d5f1a916b7cdb00e0ee8b",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link1.stl"
+      },
+      {
+        "content_digest": "sha256:2945b39ecc4154da30d1ebe5a9b380e742a379fb0902148f2e286672f46ee1db",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link2.stl"
+      },
+      {
+        "content_digest": "sha256:9af8b412d1f9bc5714be78f4473f28f4ffa91caa0455f215e24e132c8ef433cd",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link3.stl"
+      },
+      {
+        "content_digest": "sha256:17ff580ba7a4477c120374b2e6396940bab2cdc8fad07a34af9ae44b08ee1515",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link4.stl"
+      },
+      {
+        "content_digest": "sha256:f69ec2478819438078db12412597d51bb815acb66d0e1aaa57d4d0f93630fc9c",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link5.stl"
+      },
+      {
+        "content_digest": "sha256:6c2492bd20f3b7216626f00f7e8b63cda12e3faec9b64c6216d1d53022f2ee18",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link6.stl"
+      },
+      {
+        "content_digest": "sha256:728a2e960227fe8b781e7220e0c9a171e2f746524c5db7875bb15b3a2ce2ff92",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link_base.stl"
+      },
+      {
+        "content_digest": "sha256:41d28af66c2fbd6a93b9fb5f9cfceb3c1de1f021928006871ae4e9d813f8459a",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link1.stl"
+      },
+      {
+        "content_digest": "sha256:d082d23629f1fe619bfc664208039e177cf774a6f953c2c1722aec20edd73ca4",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link2.stl"
+      },
+      {
+        "content_digest": "sha256:ff11c8164bb932cfdfedf27f875e5d5bd3ae13df128c44809da1bf15b712d759",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link3.stl"
+      },
+      {
+        "content_digest": "sha256:902ef2e6c6f66f0fa72b8b7e242ea75ea85af7dfd35581997ceaf475e25a4954",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link4.stl"
+      },
+      {
+        "content_digest": "sha256:3e0c201146a4444a08493d83a273f81b0298a723186a2bb27ede21c574237a41",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link5.stl"
+      },
+      {
+        "content_digest": "sha256:36a7bad22997a0938884485997f026b602bd952674a22d3a8e47cc160cde70d8",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link6.stl"
+      },
+      {
+        "content_digest": "sha256:84f69488a1de60c76c23f83b1759ed76e9235bd56b4b98b4c997c24c18ba7b42",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link_base.stl"
+      },
+      {
+        "content_digest": "sha256:a4be77f1dc363ff0dfd0102f7921a81e09c838ca2d0e2581a829e081ee2f4f9e",
+        "source_id": "component:lite6_robot:srdf"
+      },
+      {
+        "content_digest": "sha256:71ab0f5c34f27aebd8dd84ef7da1fb80e6bd250bff0926d801d1dc5578b91349",
+        "source_id": "component:lite6_robot:urdf"
+      },
+      {
+        "content_digest": "sha256:2a153d0e80df1f94240904daa83bed8e95e35a4b23aa81936828c49b57b13dbc",
+        "source_id": "component:lite_gripper:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_body.stl"
+      },
+      {
+        "content_digest": "sha256:dde70561a6ad271f8482971079a0df3624c03e66b53a957a3b38fb27aaf1a9ff",
+        "source_id": "component:lite_gripper:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_finger.stl"
+      },
+      {
+        "content_digest": "sha256:8a5d093619ff306ba55453158e76b2fc0c15c895f1f175da0bf9d434c6f2aabc",
+        "source_id": "component:lite_gripper:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_body.stl"
+      },
+      {
+        "content_digest": "sha256:5ef3546569f512f8c39b7b2b8d9c5f3bb1a61feb64ad50f3603c7676a001c66e",
+        "source_id": "component:lite_gripper:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_finger.stl"
+      },
+      {
+        "content_digest": "sha256:8f8b5daf8860c6a63f6806bab50772f914ba3503c322ffc96a8af303da41ab90",
+        "source_id": "component:lite_gripper:srdf"
+      },
+      {
+        "content_digest": "sha256:7b1d335778d48bf01e24c96a6ef1281f24f4efd105eb27b49bb9c29e6a3e573b",
+        "source_id": "component:lite_gripper:urdf"
+      }
+    ],
+    "schema_version": "manyforge.scenario.source_snapshot.v1"
+  }
+}

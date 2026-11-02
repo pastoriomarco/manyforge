@@ -1,13 +1,29 @@
 #pragma once
 
-#include <manyforge_core/types/error_code.hpp>
-
 #include <cstdint>
+#include <functional>
+#include <manyforge_core/time/iclock.hpp>
+#include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/capability_command_receipt.hpp>
+#include <manyforge_core/types/addressed_command_identity.hpp>
+#include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace manyforge::core {
+
+/// Authored target actuation, separate from angular/linear command coordinates.
+enum class GripperActuationKind {
+  kPositionCommanded,
+  kPneumatic,
+};
+
+/// Strict authored output choice. Absence is not a no-output command.
+enum class GripperOutputMode {
+  kCommanded,
+  kNone,
+};
 
 enum class GripperCommandState {
   kIdle,
@@ -16,8 +32,7 @@ enum class GripperCommandState {
   kFailed,
 };
 
-inline constexpr const char* gripper_command_state_name(
-    GripperCommandState state) noexcept {
+inline constexpr const char* gripper_command_state_name(GripperCommandState state) noexcept {
   switch (state) {
     case GripperCommandState::kIdle:
       return "idle";
@@ -38,8 +53,7 @@ enum class GripperProjectionState {
   kFailed,
 };
 
-inline constexpr const char* gripper_projection_state_name(
-    GripperProjectionState state) noexcept {
+inline constexpr const char* gripper_projection_state_name(GripperProjectionState state) noexcept {
   switch (state) {
     case GripperProjectionState::kNotRequired:
       return "not_required";
@@ -56,11 +70,15 @@ inline constexpr const char* gripper_projection_state_name(
 enum class GripperInvalidationReason {
   kReset,
   kStop,
-  kPause,
   kReplacement,
   kDeploymentSwap,
   kShutdown,
 };
+
+/// Exact addressed-operation identity stamped only when a prepared command is
+/// released. Direct/manual gripper commands leave this absent. A Stop adapter
+/// uses it to reject a stale goal before cancelling a newer command.
+using AddressedGripperCommandIdentityDTO = AddressedCommandIdentityDTO;
 
 struct GripperCommandRequestDTO {
   std::string gripper_id;
@@ -68,6 +86,9 @@ struct GripperCommandRequestDTO {
   std::string joint_name;
   double target_position = 0.0;
   double duration_s = 0.0;
+  /// GRP-2: complete only when the controller reports done and duration_s has
+  /// elapsed since the command started (else on the controller's report).
+  bool wait_for_duration = false;
   std::optional<double> max_effort;
 
   std::string commanded_state;
@@ -78,14 +99,65 @@ struct GripperCommandRequestDTO {
   std::string transport_kind;
   std::vector<std::string> evidence;
   std::string evidence_state;
+  /// Owner-resolved terminal deadline for this private command. The native
+  /// fixed-duration mechanism rejects a duration that cannot fit this bound.
+  double completion_timeout_s = 1.0;
+  std::optional<AddressedGripperCommandIdentityDTO> addressed_identity = std::nullopt;
+  /// PRIVATE process-local proof supplied only by the genuine prepared owner.
+  /// Never serialized or retained by a provider. It checks the same resident
+  /// committed session without locks or a second admission handshake.
+  std::function<bool(const AddressedGripperCommandIdentityDTO&)> committed_owner_is_current;
+  std::optional<std::uint64_t> owner_lifecycle_generation;
 };
 
-struct GripperCommandResultDTO {
-  bool accepted = false;
-  std::uint64_t command_id = 0;
-  std::uint64_t generation = 0;
-  std::optional<ErrorDTO> error;
+using GripperCommandResultDTO = CapabilityCommandDispatchReceiptDTO;
+
+enum class GraspConfirmationSourceKind {
+  kDiscreteInput = 1,
+  kPerception = 2,
+  kForceCurrent = 3,
 };
+
+/// A source adapter's observation, not a Program's assertion that a command
+/// succeeded. observed_at_ns is in the receiving owner's clock domain.
+struct GripperGraspObservationDTO final {
+  std::string gripper_id;
+  std::uint64_t command_id{};
+  std::uint64_t generation{};
+  std::uint64_t expected_status_revision{};
+  std::string observation_id;
+  bool confirmed{};
+  TimePoint observed_at_ns{};
+  std::string attribution;
+
+  friend bool operator==(const GripperGraspObservationDTO&,
+                         const GripperGraspObservationDTO&) = default;
+};
+
+/// One bounded, immutable evidence record for the current gripper command.
+/// Its source/time are independent of commanded position and joint samples.
+struct GripperGraspEvidenceDTO final {
+  // Zero is deliberately not a source kind. Empty evidence is never a
+  // discrete-input observation; the actual source adapter supplies its kind.
+  GraspConfirmationSourceKind source_kind{};
+  ControlBindingId source_id;
+  ControlBindingRevision source_revision;
+  RuntimeEpoch source_epoch;
+  GripperGraspObservationDTO observation;
+  TimePoint expires_at_ns{};
+
+  friend bool operator==(const GripperGraspEvidenceDTO&, const GripperGraspEvidenceDTO&) = default;
+};
+
+[[nodiscard]] inline bool gripper_grasp_evidence_is_fresh(const GripperGraspEvidenceDTO& evidence,
+                                                          TimePoint now_ns) noexcept {
+  const bool source_kind_valid =
+      evidence.source_kind == GraspConfirmationSourceKind::kDiscreteInput ||
+      evidence.source_kind == GraspConfirmationSourceKind::kPerception ||
+      evidence.source_kind == GraspConfirmationSourceKind::kForceCurrent;
+  return source_kind_valid && now_ns >= evidence.observation.observed_at_ns &&
+         now_ns < evidence.expires_at_ns;
+}
 
 /// Immutable observer snapshot published by the owning gripper adapter.
 /// Reading this DTO must never advance a deadline, mutate command state, or
@@ -109,10 +181,19 @@ struct GripperCommandStatusDTO {
   std::string transport_kind;
   std::vector<std::string> evidence;
   std::string evidence_state;
-  GripperProjectionState projection_state =
-      GripperProjectionState::kNotRequired;
+  GripperProjectionState projection_state = GripperProjectionState::kNotRequired;
   std::string projection_reason;
   std::optional<ErrorDTO> error;
+  std::optional<GripperGraspEvidenceDTO> grasp_evidence;
+  /// Local admission fence, independent of an admitted transaction generation.
+  std::uint64_t admission_generation{};
+  bool admission_closed{};
+  /// Destructive lifecycle generation; pneumatic Stop's admission-only fence
+  /// does not retire it. Reset/replacement/shutdown still do.
+  std::uint64_t lifecycle_generation{};
+  /// A Stop/Reset cancel was sent and the controller has not yet reported
+  /// that goal's terminal (Q58: the Stop does not wait for it).
+  bool cancellation_pending{};
 };
 
 }  // namespace manyforge::core

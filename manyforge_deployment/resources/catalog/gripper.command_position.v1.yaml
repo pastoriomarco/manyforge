@@ -1,0 +1,24 @@
+api_version: manyforge.command_schema.v1
+command_schema_id: gripper.command_position
+command_schema_revision: sha256:b8e74c2c32f4bf438905efe148b7fbf6f452bb91c1bf83a30b0404a1c2533f08
+compatible_capabilities:
+  - capability_id: tool.gripper.command
+    capability_definition_revision: sha256:a24b841e7c0323815a3576869d5819340bc6a98f1c2ffd5b47131e26698e9392
+command_value:
+  value_kind: gripper_position
+  accepted_position_kinds: [angular, linear]
+  minimum_resource_count: 1
+  maximum_resource_count: 4096
+  max_effort_contract: optional_nonnegative_matching_coordinate
+resource_role_selectors: []
+channel_role_selectors: []
+caller_options:
+  - option_id: command_duration_s
+    value_kind: nonnegative_duration_seconds
+    required: false
+  - option_id: wait_for_duration
+    value_kind: bool
+    required: false
+completion_rule: goal_fenced_target_reached
+confirmation_rule: binding_feedback_required
+stop_evidence_requirements: [command_terminal]

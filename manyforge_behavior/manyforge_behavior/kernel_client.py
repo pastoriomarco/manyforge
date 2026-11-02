@@ -1,3042 +1,740 @@
-"""Abstract kernel interface and mock implementation for testing."""
+"""Thin Behavior client for the resource-addressed native execution owner."""
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from collections import deque
-import copy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from enum import Enum
-import math
-import threading
-import time
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, Callable, Mapping, Protocol
 
 
-MAX_CONTROLLED_STOP_DECELERATION_TIME_S = 2.0
-_STOP_MODES = {"spring_back_hold", "soft_on_path", "hard_deceleration"}
+class ExecutionTransport(Protocol):
+    """Bounded operation-addressed calls to the execution owner."""
 
+    def identity(self) -> dict[str, Any]: ...
 
-def _unavailable_recovery_assessment(reason_code: str) -> dict:
-    """Complete fail-closed RT-8B DTO for clients without recovery support."""
-    return {
-        "schema_version": "manyforge.kernel_recovery_assessment.v1",
-        "assessment_revision": 0,
-        "assessed_at_ns": 0,
-        "control_command_epoch": 0,
-        "execution_id": 0,
-        "execution_state": "idle",
-        "recovery_class": "none",
-        "status": "unavailable",
-        "latch_id": "",
-        "source_id": "",
-        "policy_id": "",
-        "preemption_result": "none_required",
-        "stop_owner_active": False,
-        "stop_owner_generation": 0,
-        "backend_stop_confirmed": False,
-        "stop_certificate_id": "",
-        "observed_state_available": False,
-        "observed_state_sequence": 0,
-        "observed_state_source_id": "",
-        "observed_state_authority_profile": "",
-        "observed_state_measured": False,
-        "observed_state_valid_until_ns": 0,
-        "observed_state_fresh": False,
-        "observed_state_at_rest": False,
-        "stronger_authority_active": False,
-        "queued_latch_present": False,
-        "retry_admissible": False,
-        "allowed_actions": [],
-        "reason_code": reason_code,
-        "evidence_refs": [],
-    }
+    def targets(self) -> dict[str, Any]: ...
 
+    def control_state(self) -> dict[str, Any]: ...
 
-def _max_controlled_stop_deceleration_time_label() -> str:
-    label = f"{MAX_CONTROLLED_STOP_DECELERATION_TIME_S:.15g}"
-    return f"{label}.0" if "." not in label and "e" not in label.lower() else label
+    def observation(self) -> dict[str, Any]: ...
 
+    def query_target(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-class ExecutionState(Enum):
-    IDLE = "idle"
-    PLANNING = "planning"
-    VALIDATING = "validating"
-    EXECUTING = "executing"
-    INTERRUPTED = "interrupted"
-    PAUSED = "paused"
-    STOPPING = "stopping"
-    STOPPED = "stopped"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    INTERVENTION_REQUIRED = "intervention_required"
+    def query_operation(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
+    def register_io_watch(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-class GripperCommandState(Enum):
-    IDLE = "idle"
-    EXECUTING = "executing"
-    COMPLETED = "completed"
-    FAILED = "failed"
+    def read_io_watch(self, registration: Mapping[str, Any]) -> dict[str, Any]: ...
 
+    def release_io_watch(self, registration: Mapping[str, Any]) -> None: ...
 
-@dataclass
-class MotionInterruptStopProfile:
-    """Controlled-stop profile carried by a motion-scoped
-    interrupt scope (mirrors `MotionInterruptStopProfileDTO` in
-    spec/210 §3.11). `stop_mode` is one of "spring_back_hold",
-    "soft_on_path", or "hard_deceleration"."""
+    def release_io_watch_scope(self, scope_request: Mapping[str, Any]) -> None: ...
 
-    profile_id: str
-    stop_mode: str
-    deceleration_time_s: Optional[float] = None
-    max_stop_time_s: Optional[float] = None
-    joint_deceleration_profile_id: Optional[str] = None
-    per_joint_max_deceleration_rad_s2: Dict[str, float] = field(default_factory=dict)
-    allowed_fallback_modes: List[str] = field(default_factory=list)
-    allow_natural_completion_on_short_path: bool = True
-    require_backend_confirmation: bool = True
-    # Measured-velocity threshold (rad/s) for the at-rest settle verdict. When
-    # None the kernel uses its default. Drives the measured-stop confirmation.
-    settle_velocity_threshold_rad_s: Optional[float] = None
+    def start_mock_io_node_simulation(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def __post_init__(self) -> None:
-        if not self.profile_id:
-            raise ValueError("stop_profile.profile_id must be non-empty")
-        if self.stop_mode not in _STOP_MODES:
-            raise ValueError(
-                "stop_profile.stop_mode must be one of "
-                "'spring_back_hold', 'soft_on_path', or 'hard_deceleration'"
-            )
-        for mode in self.allowed_fallback_modes:
-            if mode not in _STOP_MODES:
-                raise ValueError(
-                    "stop_profile.allowed_fallback_modes contains unknown "
-                    f"mode '{mode}'"
-                )
-        if self.deceleration_time_s is not None:
-            decel = float(self.deceleration_time_s)
-            if not math.isfinite(decel) or decel <= 0.0:
-                raise ValueError(
-                    "stop_profile.deceleration_time_s must be finite and > 0"
-                )
-            if decel > MAX_CONTROLLED_STOP_DECELERATION_TIME_S:
-                raise ValueError(
-                    "stop_profile.deceleration_time_s must be <= "
-                    f"{_max_controlled_stop_deceleration_time_label()}"
-                )
-            self.deceleration_time_s = decel
-        if self.max_stop_time_s is not None:
-            max_stop = float(self.max_stop_time_s)
-            if not math.isfinite(max_stop) or max_stop <= 0.0:
-                raise ValueError(
-                    "stop_profile.max_stop_time_s must be finite and > 0"
-                )
-            self.max_stop_time_s = max_stop
-        if self.settle_velocity_threshold_rad_s is not None:
-            settle = float(self.settle_velocity_threshold_rad_s)
-            if not math.isfinite(settle) or settle <= 0.0:
-                raise ValueError(
-                    "stop_profile.settle_velocity_threshold_rad_s must be "
-                    "finite and > 0"
-                )
-            self.settle_velocity_threshold_rad_s = settle
-        for joint, limit in self.per_joint_max_deceleration_rad_s2.items():
-            if not joint:
-                raise ValueError(
-                    "stop_profile.per_joint_max_deceleration_rad_s2 "
-                    "joint names must be non-empty"
-                )
-            if not math.isfinite(float(limit)) or float(limit) <= 0.0:
-                raise ValueError(
-                    "stop_profile.per_joint_max_deceleration_rad_s2 "
-                    "limits must be finite and > 0"
-                )
+    def end_mock_io_node_simulation(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
+    def set_mock_io_run_paused(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-@dataclass
-class MotionInterruptScope:
-    """Per-move binding that arms a `kMove`-scoped
-    interrupt policy for exactly one execute request (spec/260 §2.6).
-    `node_category` is one of "generic" (default; MoveUntilSignal) or
-    "precision_contact" (ProbeSearchMove). `activation_mode` is one of
-    "require_inactive_at_arm", "fresh_edge_after_arm",
-    "trip_if_already_active", or "maintain_level_with_hysteresis".
-    `complete_move_on_signal` scopes MUST carry a `stop_profile`."""
+    def full_stop(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    scope_id: str
-    policy_id: str
-    activation_mode: str = "require_inactive_at_arm"
-    arm_timeout_ns: Optional[int] = None
-    result_binding_key: Optional[str] = None
-    required: bool = True
-    stop_profile: Optional[MotionInterruptStopProfile] = None
-    node_category: str = "generic"
+    def set_operation_runtime_scale(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
 
+    def submit(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-@dataclass
-class MotionTripOutcome:
-    """Successful signal_trip outcome carried inside a
-    `MotionExecutionOutcome`. Mirrors `MotionTripOutcomeDTO`."""
+    def register_program_run_capture(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
 
-    latch_id: str = ""
-    source_id: str = ""
-    policy_id: str = ""
-    scope_id: str = ""
-    executed_stop_mode: str = ""
-    stop_command_source: str = ""
-    backend_stop_confirmed: bool = False
-    stop_distance_rad: Optional[float] = None
-    initial_path_deviation_rad: Optional[float] = None
-    path_deviation_max_rad: Optional[float] = None
-    fallback_reason: Optional[str] = None
-    signal_to_latch_ns: int = 0
-    latch_to_backend_stop_call_ns: int = 0
-    latch_to_stop_confirmed_ns: int = 0
-    result_binding_key: Optional[str] = None
+    def read_program_execution_scope(self, program_run_id: str) -> dict[str, Any]: ...
 
+    def read_manual_handover(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-@dataclass
-class MotionExecutionOutcome:
-    """Immutable terminal outcome for one motion execution
-    (mirrors `MotionExecutionOutcomeDTO`, spec/210 §3.11). The kernel
-    emits one per terminal execution; behavior-tree nodes consume it
-    via `KernelClient.get_execution_outcome(execution_id)`."""
+    def stop_program_selection(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    execution_id: int = 0
-    move_id: str = ""
-    # One of "completed_normally" | "signal_trip" | "no_signal_trip" |
-    # "stopped" | "failed" | "interrupted_fault".
-    terminal_cause: str = "completed_normally"
-    action_span: Optional["ActionSpan"] = None
-    contact_policy_id: Optional[str] = None
-    trip: Optional[MotionTripOutcome] = None
-    error_code: Optional[str] = None
-    error_message: Optional[str] = None
-    error_reason: Optional[str] = None
+    def release_program_selection(
+        self, body: Mapping[str, Any], expected_selection_revision: int
+    ) -> dict[str, Any]: ...
 
+    def start_program_selection(
+        self, body: Mapping[str, Any], expected_selection_revision: int
+    ) -> dict[str, Any]: ...
 
-@dataclass
-class ActionSpan:
-    """Causal action-span envelope for kernel/planner/execution events."""
+    def check_program_node_motion_attention(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
 
-    action_source: str = "system"
-    action_span_id: str = ""
-    program_run_id: Optional[str] = None
-    node_instance_id: Optional[str] = None
-    node_attempt_id: Optional[str] = None
-    parent_node_attempt_id: Optional[str] = None
+    def read(self, operation_id: str) -> dict[str, Any]: ...
 
+    def operation_recovery(self, operation_id: str) -> dict[str, Any]: ...
 
-@dataclass
-class JointDynamicsLimit:
-    """Per-joint dynamics cap for one joint (Phase 4-P5.1K).
+    def apply_operation_recovery(
+        self,
+        operation_id: str,
+        expected_operation_revision: int,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]: ...
 
-    Each field is an ABSOLUTE cap in SI units, or None meaning "no cap from
-    this source for this dimension". The kernel resolves the effective cap as
-    the conservative minimum across model/backend/controller/deployment sources
-    and enforces velocity/acceleration in TOPP-RA time-parameterization. Jerk is
-    carried but only enforceable where the active predictor constrains jerk; the
-    discrete TOPP-RA path rejects a jerk cap as `unsupported_joint_dynamics_limit`
-    rather than claiming enforcement."""
+    def reset(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    max_velocity_rad_s: Optional[float] = None
-    max_acceleration_rad_s2: Optional[float] = None
-    max_jerk_rad_s3: Optional[float] = None
-
-
-@dataclass
-class ExecuteRequest:
-    robot_id: str
-    group_id: str
-    move_id: str
-    base_frame: str
-    tcp_frame: str
-    motion_type: str  # joint | pose | cartesian
-    target_mode: str = "absolute"  # absolute | relative
-    target_reference: Optional[Dict[str, Any]] = None
-    offset_reference: Optional[Dict[str, Any]] = None
-    planning_profile: str = "first_feasible"
-    joint_goal_names: List[str] = field(default_factory=list)
-    joint_goal_positions_rad: List[float] = field(default_factory=list)
-    pose_goal: Optional[Dict[str, Any]] = None
-    cartesian_path: Optional[Dict[str, Any]] = None
-    velocity_scale: float = 1.0
-    acceleration_scale: float = 1.0
-    max_tcp_linear_speed_mps: Optional[float] = None
-    # Per-joint absolute dynamics caps keyed by canonical drivable joint name
-    # (Phase 4-P5.1K). Empty preserves prior behavior. Carried through the
-    # native request channel into TOPP-RA; velocity_scale is applied AFTER the
-    # absolute per-joint velocity cap is resolved.
-    per_joint_dynamics_limits: Dict[str, JointDynamicsLimit] = field(
-        default_factory=dict
-    )
-    joint_position_tol_rad: float = 0.05
-    translation_tol_m: float = 0.005
-    rotation_tol_rad: float = 0.05
-    planning_timeout_s: float = 2.0
-    execution_timeout_s: float = 10.0
-    cache_mode: str = "default"
-    # Per-move bindings that arm move-scoped interrupt
-    # policies (spec/210 §3.10 + spec/260 §2.6). Empty list preserves
-    # free-move semantics; non-empty arms each scope atomically with
-    # dispatch and reaps on every terminal execution state.
-    motion_interrupt_scopes: List[MotionInterruptScope] = field(default_factory=list)
-    # Program-run correlation id (spec/500 §2.2): minted once by the
-    # orchestrator runner at program start, optional at the kernel
-    # boundary. When present the kernel stamps it on every kernel
-    # event for the execution so durable history can be joined across
-    # Composer -> kernel -> backend without timestamp guesswork.
-    program_run_id: Optional[str] = None
-    action_span: Optional[ActionSpan] = None
-    contact_policy_id: Optional[str] = None
-
-
-@dataclass
-class ExecutionStatus:
-    state: ExecutionState = ExecutionState.IDLE
-    execution_id: int = 0
-    progress: float = 0.0
-    active_move_id: str = ""
-
-
-@dataclass
-class ExecutionSnapshot:
-    timestamp_ns: int = 0
-    sequence_number: int = 0
-    execution_id: int = 0
-    move_id: str = ""
-    state: ExecutionState = ExecutionState.IDLE
-    progress: float = 0.0
-    joint_positions_rad: List[float] = field(default_factory=list)
-    state_source: str = ""
-    source_timestamp_ns: int = 0
-    source_age_ns: int = 0
-    error: Optional[str] = None
-    error_code: Optional[str] = None
-    error_details: Dict[str, str] = field(default_factory=dict)
-    action_span: Optional[ActionSpan] = None
-    contact_policy_id: Optional[str] = None
-
-
-@dataclass
-class ObjectState:
-    object_id: str = ""
-    exists: bool = False
-    attached: bool = False
-    frame_id: Optional[str] = None
-
-
-@dataclass
-class CommandResult:
-    accepted: bool = False
-    error: Optional[str] = None
-    # Stable fault token from the backend fault taxonomy; None when accepted
-    # or when the rejecting surface has no classified cause.
-    reason_code: Optional[str] = None
-    # Preserve authority-owned structured evidence across Python adapters.
-    # Callers must use explicit fields (for example `retryable`) rather than
-    # parsing the human-readable error string.
-    details: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ExecuteResult:
-    ok: bool = False
-    execution_id: int = 0
-    error: Optional[str] = None
-    trajectory_duration_s: Optional[float] = None
-    trajectory_waypoint_count: Optional[int] = None
-    final_state: Optional[str] = None
-    final_error: Optional[str] = None
-
-
-@dataclass
-class TrajectoryWaypoint:
-    time_from_start_s: float = 0.0
-    positions_rad: List[float] = field(default_factory=list)
-
-
-@dataclass
-class Trajectory:
-    joint_names: List[str] = field(default_factory=list)
-    waypoints: List[TrajectoryWaypoint] = field(default_factory=list)
-
-
-@dataclass
-class SceneEditRequest:
-    operation: str  # "add", "upsert", "remove", "update_pose", "attach", "detach"
-    object_id: str
-    shape_type: Optional[str] = None
-    box_dimensions_m: Optional[List[float]] = None
-    sphere_radius_m: Optional[float] = None
-    cylinder_radius_m: Optional[float] = None
-    cylinder_height_m: Optional[float] = None
-    mesh_resource_uri: Optional[str] = None
-    mesh_scale: Optional[List[float]] = None
-    pose_position_m: Optional[List[float]] = None
-    pose_orientation_xyzw: Optional[List[float]] = None
-    frame_id: Optional[str] = None
-    touch_links: Optional[List[str]] = None
-    support_contacts: Optional[List[Dict[str, Any]]] = None
-    source_id: Optional[str] = None
-    source_timestamp_ns: Optional[int] = None
-    source_freshness_budget_ns: Optional[int] = None
-    scene_admission_role: Optional[str] = None
-    scene_admission_lease_max_age_ns: Optional[int] = None
-    scene_admission_target_drift_tolerance_m: Optional[float] = None
-    scene_admission_target_angular_tolerance_rad: Optional[float] = None
-    scene_admission_obstacle_drift_tolerance_m: Optional[float] = None
-    scene_admission_obstacle_angular_tolerance_rad: Optional[float] = None
-    scene_admission_allow_runtime_dynamic_obstacle: bool = False
-    expected_attached: Optional[bool] = None
-    action_span: Optional[ActionSpan] = None
-
-
-@dataclass
-class SceneEditResult:
-    success: bool = False
-    error: Optional[str] = None
-    error_code: Optional[str] = None
-    error_details: Dict[str, str] = field(default_factory=dict)
-    update_status: Optional[str] = None
-    collision_world_revision_changed: bool = False
-    collision_world_freshness_changed: bool = False
-
-
-@dataclass
-class SceneShape:
-    type: str
-    box_dimensions_m: Optional[List[float]] = None
-    sphere_radius_m: Optional[float] = None
-    cylinder_radius_m: Optional[float] = None
-    cylinder_height_m: Optional[float] = None
-    mesh_resource_uri: Optional[str] = None
-    mesh_scale: Optional[List[float]] = None
-
-
-@dataclass
-class SceneObjectSnapshot:
-    object_id: str
-    shape: Optional[SceneShape] = None
-    pose_in_frame: Optional[Dict[str, Any]] = None
-    pose_in_universe: Optional[Dict[str, Any]] = None
-    attached: bool = False
-    frame_id: Optional[str] = None
-    support_contacts: List[Dict[str, Any]] = field(default_factory=list)
-
-
-@dataclass
-class RobotStateSnapshot:
-    joint_names: List[str] = field(default_factory=list)
-    positions_rad: List[float] = field(default_factory=list)
-    velocities_rad_s: List[float] = field(default_factory=list)
-
-
-@dataclass
-class MotionPreviewResult:
-    ok: bool = False
-    error: Optional[str] = None
-    error_details: Optional[Dict[str, Any]] = None
-    trajectory_duration_s: Optional[float] = None
-    trajectory_waypoint_count: Optional[int] = None
-    final_state: Optional[RobotStateSnapshot] = None
-    final_tcp_pose: Optional[Dict[str, Any]] = None
-
-
-@dataclass
-class GripperCommandRequest:
-    gripper_id: str
-    group_id: str
-    joint_name: str
-    target_position: float
-    duration_s: float
-    max_effort: Optional[float] = None
-    actuation_kind: str = ""
-    state_authority: str = ""
-    completion_policy: str = ""
-    grasp_confirmation_policy: str = ""
-    transport_kind: str = ""
-    open_state_ref: str = ""
-    closed_state_ref: str = ""
-    srdf_presets: Dict[str, float] = field(default_factory=dict)
-    commanded_state: str = ""
-    action_span: Optional[ActionSpan] = None
-
-
-@dataclass
-class GripperCommandStatus:
-    state: GripperCommandState = GripperCommandState.IDLE
-    gripper_id: str = ""
-    command_id: int = 0
-    generation: int = 0
-    revision: int = 0
-    progress: float = 0.0
-    current_position: Optional[float] = None
-    target_position: Optional[float] = None
-    commanded_position: Optional[float] = None
-    observed_position: Optional[float] = None
-    commanded_state: str = ""
-    actuation_kind: str = ""
-    state_authority: str = ""
-    completion_policy: str = ""
-    grasp_confirmation_policy: str = ""
-    transport_kind: str = ""
-    evidence: List[str] = field(default_factory=list)
-    evidence_state: str = ""
-    projection_state: str = "not_required"
-    projection_reason: str = ""
-    error: Optional[str] = None
-    # Stable fault token from the backend fault taxonomy; None unless FAILED.
-    reason_code: Optional[str] = None
-
-
-def resolve_gripper_commanded_state(
-    *,
-    target_position: float,
-    srdf_presets: Optional[Dict[str, float]] = None,
-    open_state_ref: str = "",
-    closed_state_ref: str = "",
-    tolerance: float = 1e-6,
-) -> str:
-    """Resolve an internal gripper target label from RMA/SRDF presets.
-
-    Deployment YAML owns the symbolic open/closed references. Runtime requests
-    still carry the numeric target for compatibility, but status should report
-    when that numeric target corresponds to the configured semantic open/close
-    state instead of treating every gripper as position-commanded.
-    """
-
-    presets = srdf_presets or {}
-    target = float(target_position)
-    for state_name, ref in (("open", open_state_ref), ("closed", closed_state_ref)):
-        if not ref:
-            continue
-        raw_position = presets.get(str(ref))
-        if raw_position is None:
-            continue
-        try:
-            preset_position = float(raw_position)
-        except (TypeError, ValueError):
-            continue
-        if abs(target - preset_position) <= tolerance:
-            return state_name
-    return "numeric"
-
-
-def gripper_completion_evidence(
-    completion_policy: str,
-    state_authority: str,
-) -> List[str]:
-    """Map semantic gripper policy to compact diagnostic evidence labels."""
-
-    policy = str(completion_policy or "").strip()
-    authority = str(state_authority or "").strip()
-    if policy == "dwell_elapsed":
-        return ["dwell_elapsed"]
-    if policy == "request_ack_then_dwell":
-        return ["request_ack", "dwell_elapsed"]
-    if policy == "driver_result":
-        return ["driver_result"]
-    if policy == "position_reached":
-        if authority == "sim_observed":
-            return ["sim_observed_joint_state"]
-        if authority == "real_observed":
-            return ["real_observed_joint_state"]
-        if authority == "native_backend":
-            return ["native_backend_state"]
-        return ["position_reached"]
-    if policy == "open_loop_immediate":
-        return ["open_loop_immediate"]
-    return []
-
-
-def normalize_gripper_evidence(raw_evidence: Any) -> List[str]:
-    """Return evidence as a list of non-empty string labels."""
-
-    if raw_evidence is None:
-        return []
-    if isinstance(raw_evidence, str):
-        evidence = [raw_evidence]
-    elif isinstance(raw_evidence, (list, tuple, set)):
-        evidence = list(raw_evidence)
-    else:
-        evidence = [raw_evidence]
-    return [str(item) for item in evidence if str(item)]
-
-
-def gripper_observed_position(
-    state_authority: str,
-    current_position: Optional[float],
-) -> Optional[float]:
-    """Expose a position as observed only for explicit state authorities."""
-
-    if state_authority not in {
-        "native_backend",
-        "sim_observed",
-        "real_observed",
-    }:
-        return None
-    return None if current_position is None else float(current_position)
-
-
-def gripper_evidence_state(
-    *,
-    state_authority: str,
-    grasp_confirmation_policy: str,
-    failed: bool = False,
-) -> str:
-    """Return the grasp-evidence qualifier carried beside command status."""
-
-    if failed:
-        return "faulted_unverified"
-    if (
-        str(state_authority or "").strip() == "commanded_estimate"
-        or str(grasp_confirmation_policy or "").strip() == "none_open_loop"
-    ):
-        return "unverified"
-    return ""
-
-
-def gripper_request_status_metadata(
-    request: GripperCommandRequest,
-    *,
-    current_position: Optional[float] = None,
-    failed: bool = False,
-) -> Dict[str, Any]:
-    """Normalize request semantic fields into status/cache metadata."""
-
-    commanded_state = request.commanded_state or resolve_gripper_commanded_state(
-        target_position=request.target_position,
-        srdf_presets=request.srdf_presets,
-        open_state_ref=request.open_state_ref,
-        closed_state_ref=request.closed_state_ref,
-    )
-    return {
-        "actuation_kind": request.actuation_kind,
-        "state_authority": request.state_authority,
-        "completion_policy": request.completion_policy,
-        "grasp_confirmation_policy": request.grasp_confirmation_policy,
-        "transport_kind": request.transport_kind,
-        "commanded_position": float(request.target_position),
-        "observed_position": gripper_observed_position(
-            request.state_authority,
-            current_position,
-        ),
-        "commanded_state": commanded_state,
-        "evidence": gripper_completion_evidence(
-            request.completion_policy,
-            request.state_authority,
-        ),
-        "evidence_state": gripper_evidence_state(
-            state_authority=request.state_authority,
-            grasp_confirmation_policy=request.grasp_confirmation_policy,
-            failed=failed,
-        ),
-    }
-
-
-def gripper_effective_command_request(
-    request: GripperCommandRequest,
-) -> tuple[Optional[GripperCommandRequest], Optional[str]]:
-    """Resolve semantic pneumatic targets to RMA/SRDF-owned positions."""
-
-    actuation_kind = str(request.actuation_kind or "").strip()
-    if actuation_kind in {"", "position_commanded"}:
-        return request, None
-    if actuation_kind != "pneumatic":
-        return (
-            None,
-            f"Unsupported gripper actuation_kind '{request.actuation_kind}'",
-        )
-
-    commanded_state = request.commanded_state or resolve_gripper_commanded_state(
-        target_position=request.target_position,
-        srdf_presets=request.srdf_presets,
-        open_state_ref=request.open_state_ref,
-        closed_state_ref=request.closed_state_ref,
-    )
-    if commanded_state not in {"open", "closed"}:
-        return (
-            None,
-            "pneumatic gripper target must match open_state_ref or "
-            "closed_state_ref",
-        )
-    ref_name = (
-        request.open_state_ref
-        if commanded_state == "open"
-        else request.closed_state_ref
-    )
-    if not ref_name:
-        return (
-            None,
-            f"pneumatic gripper {commanded_state} command requires "
-            f"{commanded_state}_state_ref",
-        )
-    if ref_name not in request.srdf_presets:
-        return (
-            None,
-            f"pneumatic gripper state ref '{ref_name}' is missing from "
-            "srdf_presets",
-        )
-    try:
-        target_position = float(request.srdf_presets[ref_name])
-    except (TypeError, ValueError):
-        return (
-            None,
-            f"pneumatic gripper state ref '{ref_name}' has a non-numeric "
-            "srdf preset",
-        )
-    return (
-        replace(
-            request,
-            target_position=target_position,
-            commanded_state=commanded_state,
-        ),
-        None,
-    )
-
-
-def _pose_to_matrix(pos: List[float], orient_xyzw: List[float]) -> List[List[float]]:
-    """Build 4x4 matrix from position + quaternion (xyzw)."""
-    x, y, z, w = orient_xyzw
-    return [
-        [1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * z * w, 2 * x * z + 2 * y * w, pos[0]],
-        [2 * x * y + 2 * z * w, 1 - 2 * x * x - 2 * z * z, 2 * y * z - 2 * x * w, pos[1]],
-        [2 * x * z - 2 * y * w, 2 * y * z + 2 * x * w, 1 - 2 * x * x - 2 * y * y, pos[2]],
-        [0, 0, 0, 1],
-    ]
-
-
-def _matrix_to_pose(m: List[List[float]]) -> tuple[List[float], List[float]]:
-    """Extract position + quaternion (xyzw) from 4x4 matrix."""
-    pos = [m[0][3], m[1][3], m[2][3]]
-    trace = m[0][0] + m[1][1] + m[2][2]
-    if trace > 0:
-        s = math.sqrt(trace + 1.0) * 2
-        w = 0.25 * s
-        x = (m[2][1] - m[1][2]) / s
-        y = (m[0][2] - m[2][0]) / s
-        z = (m[1][0] - m[0][1]) / s
-    elif m[0][0] > m[1][1] and m[0][0] > m[2][2]:
-        s = math.sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2
-        w = (m[2][1] - m[1][2]) / s
-        x = 0.25 * s
-        y = (m[0][1] + m[1][0]) / s
-        z = (m[0][2] + m[2][0]) / s
-    elif m[1][1] > m[2][2]:
-        s = math.sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2
-        w = (m[0][2] - m[2][0]) / s
-        x = (m[0][1] + m[1][0]) / s
-        y = 0.25 * s
-        z = (m[1][2] + m[2][1]) / s
-    else:
-        s = math.sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2
-        w = (m[1][0] - m[0][1]) / s
-        x = (m[0][2] + m[2][0]) / s
-        y = (m[1][2] + m[2][1]) / s
-        z = 0.25 * s
-    return pos, [x, y, z, w]
-
-
-def _multiply_matrices(a: List[List[float]], b: List[List[float]]) -> List[List[float]]:
-    """Multiply two 4x4 matrices."""
-    return [
-        [sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)]
-        for i in range(4)
-    ]
-
-
-def _invert_matrix(m: List[List[float]]) -> List[List[float]]:
-    """Invert a rigid 4x4 transform."""
-    rt = [[m[j][i] for j in range(3)] for i in range(3)]
-    t = [m[0][3], m[1][3], m[2][3]]
-    nt = [-(rt[i][0] * t[0] + rt[i][1] * t[1] + rt[i][2] * t[2]) for i in range(3)]
-    return [
-        [rt[0][0], rt[0][1], rt[0][2], nt[0]],
-        [rt[1][0], rt[1][1], rt[1][2], nt[1]],
-        [rt[2][0], rt[2][1], rt[2][2], nt[2]],
-        [0, 0, 0, 1],
-    ]
-
-
-def _is_vector(values: Optional[List[float]], length: int) -> bool:
-    return values is not None and len(values) == length
-
-
-def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
-    if not request.object_id:
-        return "object_id must not be empty"
-
-    if request.operation not in {"add", "upsert", "remove", "update_pose", "attach", "detach"}:
-        return f"Unsupported scene edit operation: {request.operation}"
-    if request.expected_attached is not None:
-        if request.operation != "update_pose":
-            return "expected_attached is only valid for update_pose"
-        if not isinstance(request.expected_attached, bool):
-            return "expected_attached must be boolean when provided"
-
-    if request.operation in {"add", "upsert"}:
-        if request.shape_type not in {"box", "sphere", "cylinder", "mesh"}:
-            return f"{request.operation} requires shape_type to be one of: box, sphere, cylinder, mesh"
-        if request.shape_type == "box":
-            if not _is_vector(request.box_dimensions_m, 3):
-                return f"{request.operation} with shape_type=box requires box_dimensions_m=[x, y, z]"
-            if any(v <= 0.0 for v in request.box_dimensions_m):
-                return "box_dimensions_m values must be > 0"
-        if request.shape_type == "sphere":
-            if request.sphere_radius_m is None or request.sphere_radius_m <= 0.0:
-                return f"{request.operation} with shape_type=sphere requires sphere_radius_m > 0"
-        if request.shape_type == "cylinder":
-            if request.cylinder_radius_m is None or request.cylinder_radius_m <= 0.0:
-                return f"{request.operation} with shape_type=cylinder requires cylinder_radius_m > 0"
-            if request.cylinder_height_m is None or request.cylinder_height_m <= 0.0:
-                return f"{request.operation} with shape_type=cylinder requires cylinder_height_m > 0"
-        if request.shape_type == "mesh":
-            if not request.mesh_resource_uri:
-                return f"{request.operation} with shape_type=mesh requires mesh_resource_uri"
-            if request.mesh_scale is not None:
-                if not _is_vector(request.mesh_scale, 3):
-                    return "mesh_scale must have exactly 3 elements"
-                if any(v <= 0.0 for v in request.mesh_scale):
-                    return "mesh_scale values must be > 0"
-        # Authored creation always carries a full pose (spec 420 §4A.2,
-        # create-exception revoked): the sink never invents position or
-        # orientation.
-        if request.pose_position_m is None:
-            return f"{request.operation} requires pose_position_m"
-        if not _is_vector(request.pose_position_m, 3):
-            return "pose_position_m must have exactly 3 elements"
-        if request.pose_orientation_xyzw is None:
-            return (
-                f"{request.operation} requires pose_orientation_xyzw — the "
-                "scene-edit sink never defaults an orientation"
-            )
-        if not _is_vector(request.pose_orientation_xyzw, 4):
-            return "pose_orientation_xyzw must have exactly 4 elements"
-        if request.support_contacts is not None:
-            if not isinstance(request.support_contacts, list):
-                return "support_contacts must be a list"
-            for index, contact in enumerate(request.support_contacts):
-                if not isinstance(contact, dict):
-                    return f"support_contacts[{index}] must be a mapping"
-                allowed_fields = {
-                    "support_object_id",
-                    "mode",
-                    "release_evidence_mode",
-                    "max_contact_penetration_m",
-                    "enforce_max_start_penetration",
-                    "max_start_penetration_m",
-                    "release_tolerance_m",
-                    "min_release_progress_m",
-                    "require_separation_by_end",
-                    "require_strictly_decreasing_penetration",
-                    "allow_recontact",
-                }
-                unknown_fields = sorted(
-                    str(field) for field in set(contact) - allowed_fields
-                )
-                if unknown_fields:
-                    return (
-                        f"support_contacts[{index}] contains unknown fields: "
-                        f"{', '.join(unknown_fields)}"
-                    )
-                support_object_id = contact.get("support_object_id")
-                if not isinstance(support_object_id, str) or not support_object_id:
-                    return f"support_contacts[{index}].support_object_id is required"
-                mode = contact.get("mode", "contact_release")
-                if mode not in {
-                    "contact_release",
-                    "bounded_penetration",
-                    "contact_process",
-                }:
-                    return (
-                        f"support_contacts[{index}].mode must be contact_release, "
-                        "bounded_penetration, or contact_process"
-                    )
-                release_only_fields = {
-                    "release_evidence_mode",
-                    "enforce_max_start_penetration",
-                    "max_start_penetration_m",
-                    "release_tolerance_m",
-                    "min_release_progress_m",
-                    "require_separation_by_end",
-                    "require_strictly_decreasing_penetration",
-                    "allow_recontact",
-                }
-                if mode == "bounded_penetration":
-                    invalid_fields = sorted(set(contact) & release_only_fields)
-                    if invalid_fields:
-                        return (
-                            f"support_contacts[{index}] fields are valid only for "
-                            f"contact_release: {', '.join(invalid_fields)}"
-                        )
-                    max_contact_penetration_m = contact.get(
-                        "max_contact_penetration_m"
-                    )
-                    if (
-                        isinstance(max_contact_penetration_m, bool)
-                        or not isinstance(max_contact_penetration_m, (int, float))
-                        or not math.isfinite(float(max_contact_penetration_m))
-                        or max_contact_penetration_m < 0.0
-                    ):
-                        return (
-                            f"support_contacts[{index}].max_contact_penetration_m "
-                            "is required and must be finite and >= 0"
-                        )
-                    continue
-                if "max_contact_penetration_m" in contact:
-                    return (
-                        f"support_contacts[{index}].max_contact_penetration_m is "
-                        "valid only for bounded_penetration"
-                    )
-                if mode == "contact_process":
-                    invalid_fields = sorted(set(contact) & release_only_fields)
-                    if invalid_fields:
-                        return (
-                            f"support_contacts[{index}] fields are valid only for "
-                            f"contact_release: {', '.join(invalid_fields)}"
-                        )
-                    continue
-                release_evidence_mode = contact.get(
-                    "release_evidence_mode", "signed_penetration"
-                )
-                if release_evidence_mode not in {
-                    "signed_penetration",
-                    "binary_contact",
-                }:
-                    return (
-                        f"support_contacts[{index}].release_evidence_mode must be "
-                        "signed_penetration or binary_contact"
-                    )
-                max_start_penetration_m = contact.get("max_start_penetration_m", 0.0)
-                if (
-                    isinstance(max_start_penetration_m, bool)
-                    or not isinstance(max_start_penetration_m, (int, float))
-                    or not math.isfinite(float(max_start_penetration_m))
-                    or max_start_penetration_m < 0.0
-                ):
-                    return (
-                        f"support_contacts[{index}].max_start_penetration_m must be "
-                        "finite and >= 0"
-                    )
-                for field_name in (
-                    "release_tolerance_m",
-                    "min_release_progress_m",
-                ):
-                    value = contact.get(field_name, 0.0)
-                    if (
-                        isinstance(value, bool)
-                        or not isinstance(value, (int, float))
-                        or not math.isfinite(float(value))
-                        or value < 0.0
-                    ):
-                        return (
-                            f"support_contacts[{index}].{field_name} must be "
-                            "finite and >= 0"
-                        )
-                for field_name in (
-                    "enforce_max_start_penetration",
-                    "require_separation_by_end",
-                    "require_strictly_decreasing_penetration",
-                    "allow_recontact",
-                ):
-                    if field_name in contact and not isinstance(contact[field_name], bool):
-                        return f"support_contacts[{index}].{field_name} must be boolean"
-                if release_evidence_mode == "binary_contact":
-                    if contact.get("enforce_max_start_penetration", False):
-                        return (
-                            f"support_contacts[{index}]."
-                            "enforce_max_start_penetration must be false for "
-                            "binary_contact"
-                        )
-                    for field_name in (
-                        "max_start_penetration_m",
-                        "release_tolerance_m",
-                        "min_release_progress_m",
-                    ):
-                        if float(contact.get(field_name, 0.0)) != 0.0:
-                            return (
-                                f"support_contacts[{index}].{field_name} must be 0 "
-                                "for binary_contact"
-                            )
-                    if contact.get("require_strictly_decreasing_penetration", False):
-                        return (
-                            f"support_contacts[{index}]."
-                            "require_strictly_decreasing_penetration must be false "
-                            "for binary_contact"
-                        )
-
-    if request.operation == "update_pose":
-        if request.pose_position_m is None:
-            return "update_pose requires pose_position_m"
-        if not _is_vector(request.pose_position_m, 3):
-            return "pose_position_m must have exactly 3 elements"
-        # AUTHORED update_pose (no source timing) must carry an orientation —
-        # spec 420 §4A.2. A pose-SOURCE update (live mirroring; identified by
-        # source_timestamp_ns) may be position-only: the sink then keeps the
-        # object's last known orientation, never identity.
-        if request.pose_orientation_xyzw is None and request.source_timestamp_ns is None:
-            return (
-                "update_pose requires pose_orientation_xyzw for authored edits; "
-                "only pose-source updates (with source_timestamp_ns) may omit it "
-                "to keep the last known orientation"
-            )
-        if request.pose_orientation_xyzw is not None and not _is_vector(request.pose_orientation_xyzw, 4):
-            return "pose_orientation_xyzw must have exactly 4 elements"
-        source_timestamp = request.source_timestamp_ns
-        source_budget = request.source_freshness_budget_ns
-        if request.source_id is not None and not str(request.source_id).strip():
-            return "source_id must be non-empty when provided"
-        if (source_timestamp is None) != (source_budget is None):
-            return (
-                "update_pose source_timestamp_ns and "
-                "source_freshness_budget_ns must be provided together"
-            )
-        if source_timestamp is not None:
-            if not isinstance(source_timestamp, int) or source_timestamp < 0:
-                return "source_timestamp_ns must be a non-negative integer"
-            if not isinstance(source_budget, int) or source_budget <= 0:
-                return "source_freshness_budget_ns must be a positive integer"
-        scene_admission_present = any(
-            value is not None
-            for value in (
-                request.scene_admission_role,
-                request.scene_admission_lease_max_age_ns,
-                request.scene_admission_target_drift_tolerance_m,
-                request.scene_admission_target_angular_tolerance_rad,
-                request.scene_admission_obstacle_drift_tolerance_m,
-                request.scene_admission_obstacle_angular_tolerance_rad,
-            )
-        ) or bool(request.scene_admission_allow_runtime_dynamic_obstacle)
-        if scene_admission_present:
-            if request.scene_admission_role is None:
-                return (
-                    "scene_admission_role is required when scene admission "
-                    "metadata is provided"
-                )
-            if not str(request.scene_admission_role).strip():
-                return "scene_admission_role must be non-empty when provided"
-            if (
-                request.scene_admission_lease_max_age_ns is not None
-                and (
-                    not isinstance(request.scene_admission_lease_max_age_ns, int)
-                    or request.scene_admission_lease_max_age_ns <= 0
-                )
-            ):
-                return "scene_admission_lease_max_age_ns must be a positive integer"
-            role = str(request.scene_admission_role).strip()
-            target_fields_present = (
-                request.scene_admission_target_drift_tolerance_m is not None
-                or request.scene_admission_target_angular_tolerance_rad is not None
-            )
-            obstacle_fields_present = (
-                request.scene_admission_obstacle_drift_tolerance_m is not None
-                or request.scene_admission_obstacle_angular_tolerance_rad is not None
-            )
-            if role != "observed_target" and target_fields_present:
-                return (
-                    "scene_admission target drift tolerances are only valid "
-                    "for observed_target"
-                )
-            if role != "observed_dynamic_obstacle" and obstacle_fields_present:
-                return (
-                    "scene_admission obstacle drift tolerances are only valid "
-                    "for observed_dynamic_obstacle"
-                )
-            if (
-                role != "observed_dynamic_obstacle"
-                and request.scene_admission_allow_runtime_dynamic_obstacle
-            ):
-                return (
-                    "scene_admission_allow_runtime_dynamic_obstacle is only "
-                    "valid for observed_dynamic_obstacle"
-                )
-            for field_name in (
-                "scene_admission_target_drift_tolerance_m",
-                "scene_admission_target_angular_tolerance_rad",
-                "scene_admission_obstacle_drift_tolerance_m",
-                "scene_admission_obstacle_angular_tolerance_rad",
-            ):
-                value = getattr(request, field_name)
-                if value is None:
-                    continue
-                if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0.0:
-                    return f"{field_name} must be a finite number >= 0"
-
-    if request.operation == "attach" and not request.frame_id:
-        return "attach requires frame_id"
-    if request.touch_links is not None:
-        if not isinstance(request.touch_links, list):
-            return "touch_links must be a list of strings"
-        if any(not isinstance(link, str) or not link for link in request.touch_links):
-            return "touch_links must contain only non-empty strings"
-
-    return None
-
-
-class KernelClient(ABC):
-    @abstractmethod
-    def execute(self, request: ExecuteRequest) -> ExecuteResult: ...
-
-    @abstractmethod
-    def stop(self) -> CommandResult: ...
-
-    def close(self) -> None:
-        """Deterministically release the client's execution resources.
-
-        Optional lifecycle hook called once at process shutdown, after the
-        cycle layer has quiesced. Implementations that own native resources
-        (command gate, backend threads) must make their safety-relevant
-        teardown happen HERE rather than relying on interpreter-exit garbage
-        collection, whose ordering is not guaranteed. Must be idempotent;
-        the client is unusable afterwards. Default: no-op.
-        """
-
-    @abstractmethod
-    def pause(self) -> CommandResult: ...
-
-    @abstractmethod
-    def resume(self, *, expected_epoch: Optional[int] = None) -> CommandResult: ...
-
-    @abstractmethod
-    def reset(self, *, expected_epoch: Optional[int] = None) -> CommandResult: ...
-
-    def control_command_epoch(self) -> int:
-        """Return the kernel lifecycle/recovery command epoch.
-
-        Implementations that do not support epoch-guarded commands fail closed
-        by exposing epoch 0 and no-op bumping; production native clients
-        override this with the C++ kernel authority.
-        """
-        return 0
-
-    def bump_control_command_epoch(self) -> int:
-        return 0
-
-    def clock_anchor(self) -> dict:
-        """Return a monotonic<->wall clock anchor pair.
-
-        The pair is sampled back-to-back so downstream recorders can convert
-        kernel-monotonic event timestamps to wall time without drain-latency
-        skew. Non-native implementations sample the process clocks; the
-        native client overrides this with the kernel's IClock instance.
-        """
-        return {
-            "monotonic_ns": time.monotonic_ns(),
-            "wall_time_ns": time.time_ns(),
-        }
-
-    def set_flight_recorder_dir(self, directory: str) -> None:
-        """Configure the kernel flight-ring dump directory (no-op default)."""
-
-    def dump_flight_record(self, reason: str) -> str:
-        """Best-effort kernel flight-ring dump; returns the written path.
-
-        Non-native implementations have no flight ring and return "".
-        """
-        return ""
-
-    def drain_kernel_events_with_stats(self) -> dict:
-        """Drain buffered kernel events plus loss counters.
-
-        Loss anywhere in the event pipeline must be countable, never silent.
-        Implementations without an overflow-counting buffer report a zero
-        monotonic drop total alongside the plain drain.
-        """
-        return {"events": self.drain_kernel_events(), "dropped_total": 0}
-
-    def wait_for_kernel_events(self, timeout_s: float) -> bool:
-        """Block an NRT consumer until an event is buffered or timeout expires.
-
-        Native clients override this with a condition-backed wait that releases
-        the GIL. The compatibility default sleeps, so clients without event
-        notification remain bounded without creating a busy loop.
-        """
-        timeout = float(timeout_s)
-        if not math.isfinite(timeout) or timeout < 0.0 or timeout > 1.0:
-            raise ValueError("timeout_s must be finite and in [0, 1]")
-        time.sleep(timeout)
-        return False
-
-    @abstractmethod
     def acknowledge_completed(
-        self, execution_id: int, *, expected_epoch: Optional[int] = None
-    ) -> CommandResult: ...
+        self, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
 
-    def get_recovery_assessment(self) -> dict:
-        """RT-8B kernel recovery assessment. Unsupported clients fail closed
-        with an empty none-assessment (no allowed actions)."""
-        return _unavailable_recovery_assessment(
-            "recovery_assessment_unsupported"
-        )
+    def stop(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def apply_recovery_action(self, request: dict) -> dict:
-        """RT-8B recovery command. Unsupported clients fail closed."""
-        return {
-            "request_id": str(request.get("request_id", "")),
-            "action": str(request.get("action", "")),
-            "accepted": False,
-            "error": {
-                "code": "unsupported_capability",
-                "message": "apply_recovery_action unsupported by this client",
-                "details": {"reason": "recovery_action_unsupported"},
-            },
-            "resulting_assessment": self.get_recovery_assessment(),
-        }
+    def stop_program_run(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def set_runtime_velocity_scale(
-        self, scale: float, principal_id: str | None = None
-    ) -> None:
-        """Forward the viewer runtime velocity-scale control to the kernel.
+    def release_program_run_stop_fence(
+        self, program_run_id: str, stop_id: str, stop_generation: int
+    ) -> dict[str, Any]: ...
 
-        ADR-0018: this is a live execution control, not a behavior-tree
-        parameter override. Implementations clamp finite values to [0, 1] and
-        apply them to discrete execution without stopping the active action.
-        `principal_id` is optional because not every direct kernel caller has
-        supervisory actor context.
-        """
-        # Default implementation: no-op. Native/mocked clients that support
-        # runtime scaling override.
-        return None
+    def stop_status(self, stop_id: str) -> dict[str, Any]: ...
 
-    def get_motion_interrupt_stop_capability(self) -> Dict[str, Any]:
-        """Report the execution backend's controlled-stop capability.
+    def set_rule_active(self, rule_id: str, active: bool) -> dict[str, Any]: ...
 
-        Clients without a qualified stop implementation fail closed. Composer
-        uses this report to admit deployment stop profiles; returning an empty
-        or invented capability would be less safe than making absence loud.
-        """
-        raise RuntimeError("controlled-stop capability is unavailable")
+    def reset_rule_activation(self) -> dict[str, Any]: ...
 
-    def set_command_gate(self, enabled: bool) -> bool:
-        """Request the backend command-enable gate (single gate authority).
+    def clear_outside_change(
+        self, controllable_component_id: str, signal_name: str
+    ) -> dict[str, Any]: ...
 
-        The execution backend is the only publisher of the gate topic;
-        flows that need command suppression (simulator reset) must request
-        it through the kernel client instead of publishing the topic
-        themselves. Returns False (fail-closed) when the backend has no
-        gate surface.
-        """
-        return False
-
-    def command_gate_enabled(self) -> bool:
-        """Last gate value requested from the backend gate authority."""
-        return False
-
-    @abstractmethod
-    def get_status(self) -> ExecutionStatus: ...
-
-    @abstractmethod
-    def get_execution_snapshot(self) -> ExecutionSnapshot: ...
-
-    def get_execution_outcome(
-        self, execution_id: int
-    ) -> Optional[MotionExecutionOutcome]:
-        """Return the immutable terminal MotionExecutionOutcome
-        for `execution_id`, or None when no outcome has been recorded.
-
-        Default returns None so kernel clients that do not yet implement
-        the outcome surface (legacy mocks) keep building. Production
-        kernel clients (NativeKernelClient, ROS bridges) MUST override.
-        """
-        return None
-
-    @abstractmethod
-    def invalidate_trajectories(
-        self, action_span: Optional[ActionSpan] = None
-    ) -> None: ...
-
-    @abstractmethod
-    def preview_motion(
-        self,
-        request: ExecuteRequest,
-        start_state: Optional[RobotStateSnapshot] = None,
-    ) -> MotionPreviewResult:
-        """Plan + validate a motion without executing it."""
-        ...
-
-    @abstractmethod
-    def scene_edit(self, request: SceneEditRequest) -> SceneEditResult: ...
-
-    def set_robot_base_pose(self, pose: Optional[Dict[str, Any]]) -> None:
-        """Set the semantic robot base pose for backends that support it.
-
-        Backends that do not model a movable robot base may ignore this. Runner
-        calls it before applying program scene resources so adapter backends can
-        project world-frame objects into their internal planning frame.
-        """
-
-    @abstractmethod
-    def get_link_pose(
-        self, target_frame: str, base_frame: str
-    ) -> Optional[Dict[str, Any]]: ...
-
-    @abstractmethod
-    def compute_target_link_poses(
-        self, request: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Compute link poses for the exact joint state carried by ``request``.
-
-        Candidate planning uses this authority boundary to bind waypoint zero
-        to the same immutable start vector passed to preview. Implementations
-        must fail closed when that vector or any requested frame cannot be
-        resolved; substituting a separately sampled current pose is invalid.
-        """
-        ...
-
-    def get_link_poses(
-        self, target_frames: List[str], base_frame: str
-    ) -> Dict[str, Dict[str, Any]]:
-        """Return poses for multiple frames.
-
-        Backends with native batch FK should override this method. The default
-        loop preserves compatibility for simple mocks and non-native clients,
-        but observer routes should still call this surface so native backends
-        can avoid one scene-lock acquisition per visual frame.
-        """
-        poses: Dict[str, Dict[str, Any]] = {}
-        for target_frame in target_frames:
-            pose = self.get_link_pose(target_frame, base_frame)
-            if pose is not None:
-                poses[target_frame] = pose
-        return poses
-
-    @abstractmethod
-    def get_object_pose(
-        self, object_id: str, base_frame: str
-    ) -> Optional[Dict[str, Any]]: ...
-
-    @abstractmethod
-    def get_object_state(self, object_id: str) -> ObjectState: ...
-
-    @abstractmethod
-    def get_scene_objects(self) -> list[SceneObjectSnapshot]:
-        """Return backend-authoritative scene objects with current shape and pose."""
-        ...
-
-    def get_scene_trace(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Return recent backend scene trace events, newest last."""
-        return []
-
-    def clear_scene_trace(self) -> None:
-        """Clear any retained backend scene trace events."""
-
-    def drain_kernel_events(self) -> List[Dict[str, Any]]:
-        """Drain buffered native kernel events (returns and clears buffer).
-
-        Returns a list of event dicts with keys: type, execution_id,
-        timestamp_ns, and optionally from_state/to_state, error, details.
-        """
-        return []
-
-    def get_cached_trajectory(self, move_id: str) -> Optional[Trajectory]:
-        """Get cached trajectory for a move. Returns None if not available."""
-        return None
-
-    @abstractmethod
-    def get_scene_object_ids(self) -> list[str]:
-        """Return IDs of all collision objects currently in the scene."""
-        ...
-
-    def get_scene_authority_status(self) -> dict[str, Any]:
-        """Return immutable logical-scene authority tokens.
-
-        Unsupported clients fail closed with zero-valued tokens. Recovery
-        coordination must never substitute the high-rate world revision for
-        the structural admission epoch.
-        """
-        return {
-            "revision_id": 0,
-            "content_hash": "",
-            "transaction_sequence": 0,
-            "scene_admission_epoch": 0,
-            "topology_epoch": 0,
-            "policy_epoch": 0,
-        }
-
-    def get_scene_authority_snapshot(self) -> dict[str, Any]:
-        """Return one coherent immutable logical-scene publication."""
-        raise NotImplementedError("logical scene snapshot capture is unavailable")
-
-    def start_planning_qualification_capture(self, capacity: int = 128) -> int:
-        """Enable bounded NRT planner evidence capture for qualification."""
-        raise NotImplementedError("planning qualification capture is unavailable")
-
-    def drain_planning_qualification_capture(
-        self, generation: int
-    ) -> dict[str, Any]:
-        raise NotImplementedError("planning qualification capture is unavailable")
-
-    def stop_planning_qualification_capture(
-        self, generation: int, idle_timeout_ms: int = 10_000
-    ) -> dict[str, Any]:
-        raise NotImplementedError("planning qualification capture is unavailable")
-
-    def planning_qualification_capture_status(self) -> dict[str, int]:
-        return {"generation": 0, "dropped_total": 0, "in_flight": 0}
-
-    def record_planning_qualification_behavior_boundary(
-        self,
-        *,
-        action_span: ActionSpan,
-        move_id: str,
-        phase: str,
-    ) -> None:
-        """Record an opt-in NRT behavior-node qualification boundary.
-
-        Backends without the qualification recorder intentionally do nothing.
-        This surface is evidence-only and must never become execution authority.
-        """
-
-        _ = action_span, move_id, phase
-
-    @abstractmethod
-    def get_joint_names(self) -> list[str]:
-        """Return ordered joint names for the active robot group."""
-        ...
-
-    @abstractmethod
-    def get_metrics(self) -> dict[str, int]:
-        """Return performance/diagnostic counters."""
-        ...
-
-    @abstractmethod
-    def command_gripper(self, request: GripperCommandRequest) -> CommandResult: ...
-
-    @abstractmethod
-    def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus: ...
-
-    def confirm_gripper_grasp(
-        self,
-        *,
-        gripper_id: str,
-        grasp_confirmation_policy: str,
-        evidence_label: str,
-        evidence_state: str = "confirmed",
-    ) -> CommandResult:
-        """Record positive grasp evidence for an existing gripper command.
-
-        Backends that do not implement this fail closed; behavior nodes using
-        evidence-backed attach policies must not silently degrade to open-loop.
-        """
-
-        return CommandResult(
-            accepted=False,
-            error="Gripper grasp confirmation is not supported by this backend",
-            reason_code="invalid_gripper_semantics",
-        )
-
-    def mark_gripper_grasp_lost(
-        self,
-        *,
-        gripper_id: str,
-        expected_command_id: int,
-        expected_generation: int,
-        evidence_label: str,
-        message: str,
-        reason_code: str = "grasp_confirmation_lost",
-    ) -> CommandResult:
-        """Invalidate grasp evidence for an existing gripper command.
-
-        This is the negative counterpart to confirm_gripper_grasp(). Backends
-        that cannot persist gripper evidence fail closed; the caller should
-        still raise its primary runtime fault rather than relying on this sink.
-        """
-
-        return CommandResult(
-            accepted=False,
-            error="Gripper grasp-loss evidence is not supported by this backend",
-            reason_code="invalid_gripper_semantics",
-        )
+    def set_io_output(
+        self, signal_id: str, value: bool | float, *, origin: str
+    ) -> dict[str, Any]: ...
 
 
-class MockKernelClient(KernelClient):
-    """Mock kernel for testing. Simulates state transitions and records calls.
+# Transport loss and malformed replies: they cannot prove what
+# the owner did, so they are never an owner refusal (or a teardown).
+EXECUTION_TRANSPORT_FAILURE_CODES = frozenset(
+    {
+        "execution_owner_unavailable",
+        "execution_command_transport_failure",
+        "execution_command_response_invalid",
+    }
+)
 
-    Args:
-        execute_duration_s: Simulated execution time per move. When > 0, execute()
-            transitions to EXECUTING and get_status() returns COMPLETED only after
-            the duration elapses. Set to 0 (default) for instant completion in tests.
-    """
+
+class KernelClientResponseError(RuntimeError):
+    """Raised when a transport returns a successful but malformed projection."""
+
+
+class KernelOperationAdmissionRejectedError(RuntimeError):
+    """The execution owner explicitly rejected an operation before acceptance."""
 
     def __init__(
         self,
-        execute_duration_s: float = 0.0,
-        joint_names: Optional[List[str]] = None,
-        *,
-        gripper_clock: Optional[Callable[[], float]] = None,
-        motion_interrupt_stop_capability: Optional[Dict[str, Any]] = None,
+        code: str,
+        message: str,
+        details: Mapping[str, Any] | None = None,
     ) -> None:
-        self._state = ExecutionState.IDLE
-        self._execution_id = 0
-        self._active_move_id = ""
-        self._active_program_run_id = ""
-        self._active_action_span: Optional[ActionSpan] = None
-        self._active_contact_policy_id = ""
-        self._next_id = 1
-        self._snapshot_sequence = 0
-        self._execute_duration_s = execute_duration_s
-        self._execute_start: Optional[float] = None
-        self._active_goal_positions_rad: List[float] = []
-        self._last_joint_positions_rad: List[float] = []
-        # Mock command-gate authority state (see set_command_gate).
-        self.command_gate_requests: List[bool] = []
-        self._command_gate_enabled = False
-        self.last_execute_request: Optional[ExecuteRequest] = None
-        self.preview_requests: List[ExecuteRequest] = []
-        self.execute_count = 0
-        self.stop_count = 0
-        self.pause_count = 0
-        self.resume_count = 0
-        self.reset_count = 0
-        self._control_command_epoch = 0
-        self.invalidate_count = 0
-        self.last_invalidate_action_span: Optional[ActionSpan] = None
-        self.runtime_velocity_scale = 1.0
-        self.runtime_velocity_scale_updates: List[float] = []
-        self.runtime_velocity_scale_principal_ids: List[Optional[str]] = []
-        self.scene_edits: List[SceneEditRequest] = []
-        self.link_pose_calls: List[tuple[str, str]] = []
-        self.target_link_pose_requests: List[Dict[str, Any]] = []
-        # Outcome store keyed by execution_id, populated
-        # automatically when execute() returns. Tests can override the
-        # default outcome shape via `next_outcome_factory`; if unset,
-        # the mock emits `completed_normally` for free moves and
-        # `no_signal_trip` for moves carrying motion_interrupt_scopes.
-        self._outcomes: Dict[int, MotionExecutionOutcome] = {}
-        self.next_outcome_factory = None  # type: ignore[assignment]
-        # Optional one-shot preview-motion result injection for tests. When
-        # set, the next preview_motion() consumes it and returns it verbatim
-        # (mirrors next_outcome_factory). Lets tests drive ready/blocked
-        # candidate planning with structured diagnostics (IK failure,
-        # joint-limit, collision) without a real planner.
-        self.next_preview_result: Optional[MotionPreviewResult] = None
-        # Allow tests to inject failures
-        self.fail_next_execute = False
-        self.fail_next_scene_edit = False
-        self._objects: Dict[str, Dict[str, Any]] = {}
-        self._scene_revision_id = 1
-        self._scene_transaction_sequence = 0
-        self._scene_admission_epoch = 1
-        self.robot_base_pose: Optional[Dict[str, Any]] = None
-        self._scene_trace: Deque[Dict[str, Any]] = deque(maxlen=4096)
-        # Metrics counters
-        self._metrics = {
-            "cache_hits": 0,
-            "cache_misses": 0,
-            "cache_revalidation_candidates": 0,
-            "cache_revalidations_succeeded": 0,
-            "cache_revalidations_failed": 0,
-            "cache_invalidations": 0,
-            "plans_succeeded": 0,
-            "plans_failed": 0,
-            "validations_passed": 0,
-            "validations_failed": 0,
-            "executions_completed": 0,
-            "executions_failed": 0,
-            "stops_issued": 0,
-            "collision_detections": 0,
-            "runtime_collision_ticks_started": 0,
-            "runtime_collision_ticks_completed": 0,
-            "runtime_collision_ticks_faulted": 0,
-            "runtime_collision_tick_max_ns": 0,
-            "runtime_collision_tick_start_jitter_max_ns": 0,
-            "runtime_collision_tick_late_periods": 0,
-            "runtime_collision_tick_missed_periods": 0,
-            "runtime_collision_tick_max_consecutive_late_periods": 0,
-            "validation_deferred_runtime_monitor_active": 0,
-            "runtime_collision_snapshot_refresh_failures": 0,
-            "snapshots_published": 0,
-            "event_subscriber_exceptions": 0,
-            "observer_lag_max_ns": 0,
-            "events_emitted": 0,
-            "flight_recorder_records": 0,
-        }
-        self._last_error_message: Optional[str] = None
-        self._last_error_code: Optional[str] = None
-        self._last_error_details: Dict[str, str] = {}
-        # Joint names (configurable for tests)
-        self._joint_names = joint_names if joint_names is not None else ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
-        self._last_joint_positions_rad = [0.0 for _ in self._joint_names]
-        self.last_gripper_command_request: Optional[GripperCommandRequest] = None
-        self.gripper_command_count = 0
-        self.fail_next_gripper_command = False
-        self._gripper_commands: Dict[str, Dict[str, Any]] = {}
-        self._gripper_positions: Dict[str, float] = {}
-        self._gripper_clock = gripper_clock or time.monotonic
-        # Tests must opt in to a synthetic controlled-stop capability. A plain
-        # mock has no physical stop implementation and therefore fails closed
-        # when a deployment asks Composer to verify stop-profile support.
-        self._motion_interrupt_stop_capability = copy.deepcopy(
-            motion_interrupt_stop_capability
-        )
-        self._next_gripper_command_id = 1
-        self._next_gripper_generation = 1
-        self._gripper_admission_blocked = False
-        # The mock derives elapsed status from an injectable clock without
-        # mutating on reads. Mutating command admission commits an elapsed
-        # predecessor before deciding whether the gripper is busy.
-        self._gripper_lock = threading.RLock()
-        # Kernel event buffer (mirrors C++ KernelEventCollector)
-        self._kernel_events_lock = threading.Lock()
-        self._kernel_events_cv = threading.Condition(self._kernel_events_lock)
-        self._kernel_events: Deque[Dict[str, Any]] = deque(maxlen=4096)
-        self._kernel_event_sequence = 0
-        self._kernel_events_dropped_total = 0
+        super().__init__(message)
+        self.code = code
+        self.details = dict(details or {})
 
-    def _emit_kernel_event(
-        self,
-        event_type: str,
-        *,
-        from_state: Optional[str] = None,
-        to_state: Optional[str] = None,
-        error: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        event: Dict[str, Any] = {
-            "type": event_type,
-            "execution_id": self._execution_id,
-            "timestamp_ns": time.monotonic_ns(),
-        }
-        if getattr(self, "_active_program_run_id", ""):
-            event["program_run_id"] = self._active_program_run_id
-        details_payload = dict(details or {})
-        active_action_span = getattr(self, "_active_action_span", None)
-        if active_action_span is not None:
-            details_payload.setdefault("action_source", active_action_span.action_source)
-            details_payload.setdefault("action_span_id", active_action_span.action_span_id)
-            if active_action_span.program_run_id:
-                details_payload.setdefault(
-                    "action_span_program_run_id", active_action_span.program_run_id
+
+class KernelImmediateStepFailedError(RuntimeError):
+    """A nonresident immediate step failed after the exact admission."""
+
+    def __init__(self, code: str, message: str, details: Mapping[str, Any],
+                 active_tcp: object) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = dict(details)
+        self.active_tcp = active_tcp
+
+
+class IoOutputWriteFailedError(RuntimeError):
+    """An output write ended `failed` or `unknown` (CONTRACTS §7), with the
+    host's typed error. It is never resent."""
+
+    def __init__(self, code: str, message: str, outcome: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.outcome = outcome
+
+
+class KernelOperationObservationUnavailableError(RuntimeError):
+    """An exact operation read could not reach the native owner temporarily."""
+
+
+class KernelOperationSettlementPendingError(RuntimeError):
+    """A terminal operation still has one accepted subordinate effect in flight."""
+
+
+class LegacyKernelMockUnavailableError(RuntimeError):
+    """The removed stateful Python mock cannot become a second Kernel owner."""
+
+
+class ExecutionState(Enum):
+    """Closed vocabulary projected by the C++ addressed execution owner."""
+
+    QUEUED = "queued"
+    RESOLVING = "resolving"
+    PLANNING = "planning"
+    VALIDATING = "validating"
+    PREPARED = "prepared"
+    DISPATCHING = "dispatching"
+    EXECUTING = "executing"
+    STOPPING = "stopping"
+    COMPLETED = "completed"
+    STOPPED = "stopped"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+    INTERVENTION_REQUIRED = "intervention_required"
+    CANCELLED_PRE_DISPATCH = "cancelled_pre_dispatch"
+
+
+_ACTION_SOURCES = frozenset(
+    {"program_node", "direct_control", "robot_control", "mcp", "system"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ActionSpan:
+    """Transport-neutral behavior-owned action correlation."""
+
+    action_source: str = "system"
+    action_span_id: str = ""
+    program_run_id: str | None = None
+    node_instance_id: str | None = None
+    node_attempt_id: str | None = None
+    parent_node_attempt_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.action_source not in _ACTION_SOURCES:
+            raise ValueError("action_source is unsupported")
+        if not self.action_span_id or len(self.action_span_id.encode("utf-8")) > 256:
+            raise ValueError("action_span_id is invalid")
+        if self.action_source == "program_node":
+            if not self.node_instance_id or not self.node_attempt_id:
+                raise ValueError(
+                    "program_node spans require node_instance_id and node_attempt_id"
                 )
-            if active_action_span.node_instance_id:
-                details_payload.setdefault(
-                    "node_instance_id", active_action_span.node_instance_id
+            if self.action_span_id != self.node_attempt_id:
+                raise ValueError(
+                    "program_node action_span_id must equal node_attempt_id"
                 )
-            if active_action_span.node_attempt_id:
-                details_payload.setdefault(
-                    "node_attempt_id", active_action_span.node_attempt_id
-                )
-            if active_action_span.parent_node_attempt_id:
-                details_payload.setdefault(
-                    "parent_node_attempt_id",
-                    active_action_span.parent_node_attempt_id,
-                )
-        active_contact_policy_id = getattr(self, "_active_contact_policy_id", "")
-        if active_contact_policy_id:
-            details_payload.setdefault("contact_policy_id", active_contact_policy_id)
-        if from_state is not None:
-            event["from_state"] = from_state
-        if to_state is not None:
-            event["to_state"] = to_state
-        if error is not None:
-            event["error"] = {"code": -1, "message": error}
-        if details_payload:
-            event["details"] = details_payload
-        with self._kernel_events_cv:
-            self._kernel_event_sequence += 1
-            event["sequence"] = self._kernel_event_sequence
-            if (
-                len(self._kernel_events) == self._kernel_events.maxlen
-            ):
-                self._kernel_events_dropped_total += 1
-            self._kernel_events.append(event)
-            self._kernel_events_cv.notify_all()
 
-    def drain_kernel_events(self) -> List[Dict[str, Any]]:
-        with self._kernel_events_lock:
-            events = list(self._kernel_events)
-            self._kernel_events.clear()
-        return events
-
-    def drain_kernel_events_with_stats(self) -> dict:
-        with self._kernel_events_lock:
-            events = list(self._kernel_events)
-            self._kernel_events.clear()
-            dropped = self._kernel_events_dropped_total
-        return {"events": events, "dropped_total": dropped}
-
-    def wait_for_kernel_events(self, timeout_s: float) -> bool:
-        timeout = float(timeout_s)
-        if not math.isfinite(timeout) or timeout < 0.0 or timeout > 1.0:
-            raise ValueError("timeout_s must be finite and in [0, 1]")
-        with self._kernel_events_cv:
-            if self._kernel_events:
-                return True
-            self._kernel_events_cv.wait_for(
-                lambda: bool(self._kernel_events),
-                timeout=timeout,
-            )
-            return bool(self._kernel_events)
-
-    def control_command_epoch(self) -> int:
-        return self._control_command_epoch
-
-    def bump_control_command_epoch(self) -> int:
-        self._control_command_epoch += 1
-        return self._control_command_epoch
-
-    def _stale_control_command(
-        self,
-        expected_epoch: Optional[int],
-    ) -> Optional[CommandResult]:
-        if expected_epoch is None:
-            return None
-        if int(expected_epoch) == self._control_command_epoch:
-            return None
-        return CommandResult(
-            accepted=False,
-            error="Control command was superseded",
-            reason_code="stale_control_command",
-        )
-
-    def _record_scene_trace(
-        self,
-        *,
-        event: str,
-        object_id: str,
-        success: bool,
-        frame_id: Optional[str] = None,
-        attached: Optional[bool] = None,
-        pose_in_frame: Optional[Dict[str, Any]] = None,
-        pose_in_universe: Optional[Dict[str, Any]] = None,
-        error: Optional[str] = None,
-    ) -> None:
-        self._scene_trace.append(
-            {
-                "timestamp_ns": time.monotonic_ns(),
-                "source": "backend",
-                "event": event,
-                "object_id": object_id,
-                "success": success,
-                "frame_id": frame_id,
-                "attached": attached,
-                "pose_in_frame": pose_in_frame,
-                "pose_in_universe": pose_in_universe,
-                "error": error,
-            }
-        )
-
-    def execute(self, request: ExecuteRequest) -> ExecuteResult:
-        import time
-        self.execute_count += 1
-        self.last_execute_request = request
-        if self._state == ExecutionState.STOPPED:
-            self._state = ExecutionState.IDLE
-            self._execution_id = 0
-            self._active_move_id = None
-            self._active_program_run_id = ""
-            self._active_action_span = None
-            self._active_contact_policy_id = ""
-            self._last_error_message = None
-            self._last_error_code = None
-            self._last_error_details = {}
-        if self._state != ExecutionState.IDLE:
-            return ExecuteResult(ok=False, error="Not in IDLE state")
-        if request.motion_type == "joint":
-            if not request.joint_goal_names:
-                return ExecuteResult(
-                    ok=False,
-                    error="Joint target must contain at least one joint",
-                )
-            if len(request.joint_goal_names) != len(
-                request.joint_goal_positions_rad
-            ):
-                return ExecuteResult(
-                    ok=False,
-                    error="Joint names and positions must have the same length",
-                )
-            if any(
-                not isinstance(name, str) or not name.strip()
-                for name in request.joint_goal_names
-            ):
-                return ExecuteResult(ok=False, error="Joint names must be non-empty")
-            if len(set(request.joint_goal_names)) != len(request.joint_goal_names):
-                return ExecuteResult(
-                    ok=False,
-                    error="Joint names must not contain duplicates",
-                )
-            try:
-                finite_positions = all(
-                    math.isfinite(float(value))
-                    for value in request.joint_goal_positions_rad
-                )
-            except (TypeError, ValueError):
-                finite_positions = False
-            if not finite_positions:
-                return ExecuteResult(
-                    ok=False,
-                    error="Joint positions must be finite",
-                )
-        if request.motion_type == "joint" and request.target_mode == "relative":
-            unknown_joints = [
-                name for name in request.joint_goal_names if name not in self._joint_names
-            ]
-            if unknown_joints:
-                return ExecuteResult(
-                    ok=False,
-                    error=(
-                        "Relative joint target names joints absent from the start state: "
-                        + ", ".join(unknown_joints)
-                    ),
-                )
-        self._authorize_mock_gripper_commands()
-        if self.fail_next_execute:
-            self.fail_next_execute = False
-            self._state = ExecutionState.FAILED
-            self._invalidate_mock_gripper_commands(block_admission=True)
-            self._last_error_message = "Execution failed (injected)"
-            self._last_error_code = "internal_error"
-            self._last_error_details = {"reason_code": "injected_failure"}
-            self._metrics["executions_failed"] += 1
-            self._emit_kernel_event("state_transition", from_state="idle", to_state="failed")
-            self._emit_kernel_event("error_raised", error="Execution failed (injected)")
-            return ExecuteResult(ok=False, error="Execution failed (injected)")
-        eid = self._next_id
-        self._next_id += 1
-        self._execution_id = eid
-        self._active_move_id = request.move_id
-        self._active_program_run_id = request.program_run_id or ""
-        self._active_action_span = request.action_span
-        self._active_contact_policy_id = request.contact_policy_id or ""
-        self._active_goal_positions_rad = self._positions_for_request(request)
-        self._emit_kernel_event("plan_started")
-        if self._execute_duration_s > 0:
-            self._state = ExecutionState.EXECUTING
-            self._execute_start = time.monotonic()
-            self._emit_kernel_event("state_transition", from_state="idle", to_state="executing")
-            self._emit_kernel_event("execute_started")
-        else:
-            self._state = ExecutionState.COMPLETED
-            self._last_joint_positions_rad = list(self._active_goal_positions_rad)
-            self._metrics["executions_completed"] += 1
-            self._emit_kernel_event("state_transition", from_state="idle", to_state="completed")
-            self._emit_kernel_event("execute_completed")
-            # Stamp an outcome for the completed execution.
-            # Tests can override via `next_outcome_factory`; default
-            # picks `no_signal_trip` for scoped moves and
-            # `completed_normally` for free moves so the natural
-            # MoveUntilSignal/ProbeSearchMove test path produces the
-            # spec-required outcome shape.
-            outcome = self._stamp_outcome(eid, request)
-            self._outcomes[eid] = outcome
-        return ExecuteResult(ok=True, execution_id=eid)
-
-    def _positions_for_request(self, request: ExecuteRequest) -> List[float]:
-        if request.motion_type == "joint" and request.joint_goal_positions_rad:
-            goals = [float(v) for v in request.joint_goal_positions_rad]
-            if request.target_mode != "relative":
-                return goals
-            current_by_name = dict(
-                zip(self._joint_names, self._last_joint_positions_rad)
-            )
-            return [
-                current_by_name[name] + delta
-                for name, delta in zip(request.joint_goal_names, goals)
-            ]
-        return list(self._last_joint_positions_rad)
-
-    def _stamp_outcome(
-        self, execution_id: int, request: ExecuteRequest
-    ) -> MotionExecutionOutcome:
-        if callable(self.next_outcome_factory):
-            outcome = self.next_outcome_factory(execution_id, request)
-            self.next_outcome_factory = None
-            return outcome
-        if request.motion_interrupt_scopes:
-            return MotionExecutionOutcome(
-                execution_id=execution_id,
-                move_id=request.move_id,
-                terminal_cause="no_signal_trip",
-                action_span=request.action_span,
-                contact_policy_id=request.contact_policy_id,
-            )
-        return MotionExecutionOutcome(
-            execution_id=execution_id,
-            move_id=request.move_id,
-            terminal_cause="completed_normally",
-            action_span=request.action_span,
-            contact_policy_id=request.contact_policy_id,
-        )
-
-    def get_execution_outcome(
-        self, execution_id: int
-    ) -> Optional[MotionExecutionOutcome]:
-        return self._outcomes.get(execution_id)
-
-    def preview_motion(
-        self,
-        request: ExecuteRequest,
-        start_state: Optional[RobotStateSnapshot] = None,
-    ) -> MotionPreviewResult:
-        """Preview a motion without mutating execution state.
-
-        The mock keeps this deliberately simple: it accepts all requests unless
-        a failure has been injected via ``fail_next_execute`` and returns the
-        requested pose as the final TCP pose for pose-goal motions. Tests that
-        need a specific structured outcome (IK failure, joint-limit, collision)
-        set ``next_preview_result`` to a prebuilt MotionPreviewResult.
-        """
-        self.preview_requests.append(request)
-        if self.next_preview_result is not None:
-            result = self.next_preview_result
-            self.next_preview_result = None
-            if result.ok:
-                self._metrics["plans_succeeded"] += 1
-                self._metrics["validations_passed"] += 1
-            else:
-                self._metrics["plans_failed"] += 1
-            return result
-        if self.fail_next_execute:
-            self.fail_next_execute = False
-            self._metrics["plans_failed"] += 1
-            return MotionPreviewResult(ok=False, error="Preview planning failed (injected)")
-
-        self._metrics["plans_succeeded"] += 1
-        self._metrics["validations_passed"] += 1
-        final_state = start_state or RobotStateSnapshot(
-            joint_names=list(self._joint_names),
-            positions_rad=[0.0 for _ in self._joint_names],
-            velocities_rad_s=[],
-        )
-        final_tcp_pose: Optional[Dict[str, Any]] = None
-        if request.motion_type == "pose" and request.pose_goal is not None:
-            final_tcp_pose = {
-                "position_m": list(request.pose_goal.get("position_m", [])),
-                "orientation_xyzw": list(request.pose_goal.get("orientation_xyzw", [])),
-            }
-        elif (
-            request.motion_type == "cartesian"
-            and request.cartesian_path is not None
-        ):
-            waypoints = request.cartesian_path.get("waypoints", [])
-            if waypoints:
-                final_tcp_pose = {
-                    "position_m": list(waypoints[-1].get("position_m", [])),
-                    "orientation_xyzw": list(
-                        waypoints[-1].get("orientation_xyzw", [])
-                    ),
-                }
-        return MotionPreviewResult(
-            ok=True,
-            trajectory_duration_s=1.0,
-            trajectory_waypoint_count=2,
-            final_state=final_state,
-            final_tcp_pose=final_tcp_pose,
-        )
-
-    def stop(self) -> CommandResult:
-        self.stop_count += 1
-        stoppable = {
-            ExecutionState.EXECUTING,
-            ExecutionState.PLANNING,
-            ExecutionState.VALIDATING,
-            ExecutionState.INTERRUPTED,
-            ExecutionState.PAUSED,
-            ExecutionState.STOPPING,
-        }
-        if self._state not in stoppable:
-            return CommandResult(accepted=False, error="Cannot stop from current state")
-        self.bump_control_command_epoch()
-        prev = self._state.value
-        self._metrics["stops_issued"] += 1
-        self._state = ExecutionState.STOPPED
-        self._invalidate_mock_gripper_commands(block_admission=True)
-        self._emit_kernel_event("stop_requested")
-        self._emit_kernel_event("state_transition", from_state=prev, to_state="stopped")
-        return CommandResult(accepted=True)
-
-    def pause(self) -> CommandResult:
-        self.pause_count += 1
-        if self._state != ExecutionState.EXECUTING:
-            return CommandResult(
-                accepted=False, error="Can only pause from EXECUTING"
-            )
-        self._state = ExecutionState.PAUSED
-        self._invalidate_mock_gripper_commands(block_admission=True)
-        self._emit_kernel_event("pause_requested")
-        self._emit_kernel_event("state_transition", from_state="executing", to_state="paused")
-        return CommandResult(accepted=True)
-
-    def resume(self, *, expected_epoch: Optional[int] = None) -> CommandResult:
-        if stale := self._stale_control_command(expected_epoch):
-            return stale
-        self.resume_count += 1
-        if self._state != ExecutionState.PAUSED:
-            return CommandResult(
-                accepted=False, error="Can only resume from PAUSED"
-            )
-        self._state = ExecutionState.EXECUTING
-        self._authorize_mock_gripper_commands()
-        self._emit_kernel_event("resume_requested")
-        self._emit_kernel_event("state_transition", from_state="paused", to_state="executing")
-        return CommandResult(accepted=True)
-
-    def reset(self, *, expected_epoch: Optional[int] = None) -> CommandResult:
-        if stale := self._stale_control_command(expected_epoch):
-            return stale
-        self.reset_count += 1
-        if self._state == ExecutionState.IDLE:
-            return CommandResult(
-                accepted=False, error="Already in IDLE"
-            )
-        prev = self._state.value
-        self._state = ExecutionState.IDLE
-        self._invalidate_mock_gripper_commands(block_admission=False)
-        self._active_move_id = ""
-        self._last_error_message = None
-        self._last_error_code = None
-        self._last_error_details = {}
-        self._emit_kernel_event("state_transition", from_state=prev, to_state="idle")
-        return CommandResult(accepted=True)
-
-    def acknowledge_completed(
-        self, execution_id: int, *, expected_epoch: Optional[int] = None
-    ) -> CommandResult:
-        if stale := self._stale_control_command(expected_epoch):
-            return stale
-        status = self.get_status()
-        if status.state != ExecutionState.COMPLETED:
-            return CommandResult(
-                accepted=False,
-                error="Can only acknowledge a COMPLETED execution",
-            )
-        if status.execution_id != int(execution_id):
-            return CommandResult(
-                accepted=False,
-                error=(
-                    "Execution acknowledgement id mismatch: "
-                    f"current={status.execution_id}, requested={execution_id}"
-                ),
-            )
-        prev = self._state.value
-        self._state = ExecutionState.IDLE
-        self._authorize_mock_gripper_commands()
-        self._active_move_id = ""
-        self._last_error_message = None
-        self._last_error_code = None
-        self._last_error_details = {}
-        self._emit_kernel_event(
-            "acknowledge_completed",
-            details={"acknowledged_execution_id": int(execution_id)},
-        )
-        self._emit_kernel_event("state_transition", from_state=prev, to_state="idle")
-        return CommandResult(accepted=True)
-
-    def script_recovery_assessment(self, assessment: dict) -> None:
-        """Tests script the next assessment verbatim; the mock never
-        re-implements the C++ admission truth table (spec/230 §3.7.1)."""
-        self._scripted_recovery_assessment = dict(assessment)
-
-    def script_recovery_action_result(self, result: dict) -> None:
-        self._scripted_recovery_action_result = dict(result)
-
-    def get_recovery_assessment(self) -> dict:
-        scripted = getattr(self, "_scripted_recovery_assessment", None)
-        if scripted is not None:
-            return dict(scripted)
-        return _unavailable_recovery_assessment("no_recovery_active")
-
-    def apply_recovery_action(self, request: dict) -> dict:
-        self.apply_recovery_action_requests = getattr(
-            self, "apply_recovery_action_requests", []
-        )
-        self.apply_recovery_action_requests.append(dict(request))
-        scripted = getattr(self, "_scripted_recovery_action_result", None)
-        if scripted is not None:
-            result = dict(scripted)
-            resulting = result.get("resulting_assessment")
-            if result.get("accepted") is True and isinstance(resulting, dict):
-                # The mock does not reproduce the kernel admission matrix. It
-                # commits only the explicitly scripted authority result so the
-                # next read observes the same post-command assessment a native
-                # client would return.
-                self._scripted_recovery_assessment = dict(resulting)
-                execution_state = str(resulting.get("execution_state") or "")
-                state_by_value = {state.value: state for state in ExecutionState}
-                if execution_state in state_by_value:
-                    self._state = state_by_value[execution_state]
-                if self._state == ExecutionState.IDLE:
-                    self._last_error_message = None
-                    self._last_error_code = None
-                    self._last_error_details = {}
-            return result
+    def as_request(self) -> dict[str, str | None]:
         return {
-            "request_id": str(request.get("request_id", "")),
-            "action": str(request.get("action", "")),
-            "accepted": False,
-            "error": {
-                "code": "recovery_action_rejected",
-                "message": "no scripted recovery action result",
-                "details": {"reason": "recovery_action_not_scripted"},
-            },
-            "resulting_assessment": self.get_recovery_assessment(),
+            "action_source": self.action_source,
+            "action_span_id": self.action_span_id,
+            "program_run_id": self.program_run_id,
+            "node_instance_id": self.node_instance_id,
+            "node_attempt_id": self.node_attempt_id,
+            "parent_node_attempt_id": self.parent_node_attempt_id,
         }
 
-    def get_status(self) -> ExecutionStatus:
-        import time
-        # Transition EXECUTING → COMPLETED when duration elapses
-        if (self._state == ExecutionState.EXECUTING
-                and self._execute_start is not None
-                and self._execute_duration_s > 0):
-            elapsed = time.monotonic() - self._execute_start
-            if elapsed >= self._execute_duration_s:
-                self._state = ExecutionState.COMPLETED
-                self._last_joint_positions_rad = list(self._active_goal_positions_rad)
-                self._execute_start = None
-                self._metrics["executions_completed"] += 1
-                self._emit_kernel_event("execute_completed")
-                self._emit_kernel_event("state_transition", from_state="executing", to_state="completed")
-                return ExecutionStatus(
-                    state=self._state,
-                    execution_id=self._execution_id,
-                    progress=1.0,
-                    active_move_id=self._active_move_id,
-                )
-            return ExecutionStatus(
-                state=self._state,
-                execution_id=self._execution_id,
-                progress=min(elapsed / self._execute_duration_s, 1.0),
-                active_move_id=self._active_move_id,
+
+class KernelClient:
+    """Stateless adapter; the C++ host remains the only execution owner."""
+
+    def __init__(self, transport: ExecutionTransport) -> None:
+        for method in (
+            "identity",
+            "submit",
+            "read",
+            "reset",
+            "acknowledge_completed",
+            "stop",
+        ):
+            if not callable(getattr(transport, method, None)):
+                raise TypeError(f"execution transport has no callable {method}")
+        self._transport = transport
+
+    @staticmethod
+    def _successful(value: object, *, label: str) -> dict[str, Any]:
+        if not isinstance(value, dict) or value.get("ok") is not True:
+            raise KernelClientResponseError(
+                f"execution owner {label} did not return a successful envelope"
             )
-        progress = 1.0 if self._state == ExecutionState.COMPLETED else 0.0
-        return ExecutionStatus(
-            state=self._state,
-            execution_id=self._execution_id,
-            progress=progress,
-            active_move_id=self._active_move_id,
+        return value
+
+    def identity(self) -> dict[str, Any]:
+        return self._successful(self._transport.identity(), label="identity")
+
+    def register_program_run_capture(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Install a claim-bound capture through the private Program transport."""
+
+        return self._successful(
+            self._transport.register_program_run_capture(body),
+            label="Program execution capture",
         )
 
-    def get_execution_snapshot(self) -> ExecutionSnapshot:
-        import time
-        status = self.get_status()
-        self._snapshot_sequence += 1
-        self._metrics["snapshots_published"] += 1
-        return ExecutionSnapshot(
-            timestamp_ns=time.monotonic_ns(),
-            sequence_number=self._snapshot_sequence,
-            execution_id=status.execution_id,
-            move_id=self._active_move_id,
-            state=status.state,
-            progress=status.progress,
-            joint_positions_rad=list(self._last_joint_positions_rad),
-            error=self._last_error_message,
-            error_code=self._last_error_code,
-            error_details=dict(self._last_error_details),
-            action_span=getattr(self, "_active_action_span", None),
-            contact_policy_id=getattr(self, "_active_contact_policy_id", None) or None,
+    def targets(self) -> dict[str, Any]:
+        return self._projection("targets")
+
+    def read_active_tcp(self, *, ordered: bool = False) -> dict[str, Any]:
+        if type(ordered) is not bool:
+            raise TypeError("ordered must be boolean")
+        method = getattr(self._transport, "read_active_tcp", None)
+        if not callable(method):
+            raise TypeError("execution transport has no callable read_active_tcp")
+        return self._successful(
+            method(ordered=True) if ordered else method(), label="read active tcp"
         )
 
-    def invalidate_trajectories(
-        self, action_span: Optional[ActionSpan] = None
-    ) -> None:
-        self.last_invalidate_action_span = action_span
-        self.invalidate_count += 1
-        self._metrics["cache_invalidations"] += 1
+    def reset_active_tcp(self) -> dict[str, Any]:
+        return self._projection("reset_active_tcp")
 
-    def set_runtime_velocity_scale(
-        self, scale: float, principal_id: str | None = None
-    ) -> None:
-        if not isinstance(scale, (int, float)) or math.isnan(scale) or math.isinf(scale):
-            return
-        clamped = max(0.0, min(1.0, float(scale)))
-        self.runtime_velocity_scale = clamped
-        self.runtime_velocity_scale_updates.append(clamped)
-        self.runtime_velocity_scale_principal_ids.append(principal_id)
+    def control_state(self) -> dict[str, Any]:
+        return self._projection("control_state")
 
-    def get_motion_interrupt_stop_capability(self) -> Dict[str, Any]:
-        if self._motion_interrupt_stop_capability is None:
-            return super().get_motion_interrupt_stop_capability()
-        return copy.deepcopy(self._motion_interrupt_stop_capability)
+    def observation(self) -> dict[str, Any]:
+        return self._projection("observation")
 
-    def set_command_gate(self, enabled: bool) -> bool:
-        # Mock gate authority: records requests so composer simulation-reset
-        # tests can assert close/reopen ordering.
-        self.command_gate_requests.append(bool(enabled))
-        self._command_gate_enabled = bool(enabled)
-        return True
-
-    def command_gate_enabled(self) -> bool:
-        return self._command_gate_enabled
-
-    def set_robot_base_pose(self, pose: Optional[Dict[str, Any]]) -> None:
-        self.robot_base_pose = None if not pose else dict(pose)
-        self._scene_revision_id += 1
-        self._scene_transaction_sequence += 1
-        self._scene_admission_epoch += 1
-        self.invalidate_trajectories()
-
-    def scene_edit(self, request: SceneEditRequest) -> SceneEditResult:
-        self.scene_edits.append(request)
-        state_before = self.get_object_state(request.object_id)
-        pose_before = self.get_object_pose(request.object_id, "universe")
-        update_status: Optional[str] = None
-        revision_changed = False
-        freshness_changed = False
-        if self.fail_next_scene_edit:
-            self.fail_next_scene_edit = False
-            error = "Scene edit failed (injected)"
-            self._record_scene_trace(
-                event=request.operation,
-                object_id=request.object_id,
-                success=False,
-                frame_id=request.frame_id,
-                attached=state_before.attached if state_before.exists else None,
-                pose_in_frame=None,
-                pose_in_universe=pose_before,
-                error=error,
-            )
-            return SceneEditResult(success=False, error=error)
-        validation_error = _validate_scene_edit_request(request)
-        if validation_error is not None:
-            self._record_scene_trace(
-                event=request.operation,
-                object_id=request.object_id,
-                success=False,
-                frame_id=request.frame_id,
-                attached=state_before.attached if state_before.exists else None,
-                pose_in_frame=None,
-                pose_in_universe=pose_before,
-                error=validation_error,
-            )
-            return SceneEditResult(success=False, error=validation_error)
-        error: Optional[str] = None
-        if request.operation == "add":
-            if request.object_id in self._objects:
-                error = "Object already exists"
-                self._record_scene_trace(
-                    event=request.operation,
-                    object_id=request.object_id,
-                    success=False,
-                    frame_id=request.frame_id,
-                    attached=state_before.attached if state_before.exists else None,
-                    pose_in_frame=None,
-                    pose_in_universe=pose_before,
-                    error=error,
-                )
-                return SceneEditResult(success=False, error=error)
-            self._objects[request.object_id] = {
-                "shape_type": request.shape_type,
-                "box_dimensions_m": list(request.box_dimensions_m or []) or None,
-                "sphere_radius_m": request.sphere_radius_m,
-                "cylinder_radius_m": request.cylinder_radius_m,
-                "cylinder_height_m": request.cylinder_height_m,
-                "mesh_resource_uri": request.mesh_resource_uri,
-                "mesh_scale": list(request.mesh_scale or [1.0, 1.0, 1.0])
-                if request.shape_type == "mesh"
-                else None,
-                "position_m": list(request.pose_position_m),
-                "orientation_xyzw": list(request.pose_orientation_xyzw),
-                "frame_id": request.frame_id or "universe",
-                "support_contacts": list(request.support_contacts or []),
-            }
-        elif request.operation == "upsert":
-            if state_before.exists and state_before.attached:
-                error = "Cannot upsert attached object"
-                self._record_scene_trace(
-                    event=request.operation,
-                    object_id=request.object_id,
-                    success=False,
-                    frame_id=request.frame_id,
-                    attached=state_before.attached,
-                    pose_in_frame=None,
-                    pose_in_universe=pose_before,
-                    error=error,
-                )
-                return SceneEditResult(success=False, error=error)
-            self._objects[request.object_id] = {
-                "shape_type": request.shape_type,
-                "box_dimensions_m": list(request.box_dimensions_m or []) or None,
-                "sphere_radius_m": request.sphere_radius_m,
-                "cylinder_radius_m": request.cylinder_radius_m,
-                "cylinder_height_m": request.cylinder_height_m,
-                "mesh_resource_uri": request.mesh_resource_uri,
-                "mesh_scale": list(request.mesh_scale or [1.0, 1.0, 1.0])
-                if request.shape_type == "mesh"
-                else None,
-                "position_m": list(request.pose_position_m),
-                "orientation_xyzw": list(request.pose_orientation_xyzw),
-                "frame_id": request.frame_id or "universe",
-                "support_contacts": list(request.support_contacts or []),
-            }
-        elif request.operation == "update_pose":
-            tracked = self._objects.get(request.object_id)
-            if tracked is None:
-                error = "Object not found"
-                self._record_scene_trace(
-                    event=request.operation,
-                    object_id=request.object_id,
-                    success=False,
-                    frame_id=request.frame_id,
-                    attached=state_before.attached if state_before.exists else None,
-                    pose_in_frame=None,
-                    pose_in_universe=pose_before,
-                    error=error,
-                )
-                return SceneEditResult(success=False, error=error)
-            current_attached = str(tracked.get("frame_id", "universe")) not in {
-                "",
-                "universe",
-                "world",
-                "World",
-                "/World",
-                "base_link",
-            }
-            if (
-                request.expected_attached is not None
-                and current_attached != request.expected_attached
-            ):
-                error = (
-                    "Scene object attachment state changed before pose update "
-                    "admission"
-                )
-                return SceneEditResult(
-                    success=False,
-                    error=error,
-                    error_code="scene_object_state_conflict",
-                    error_details={
-                        "reason": "scene_object_attachment_precondition_failed",
-                        "object_id": request.object_id,
-                        "expected_attached": str(request.expected_attached).lower(),
-                        "current_attached": str(current_attached).lower(),
-                        "current_frame_id": str(
-                            tracked.get("frame_id", "universe")
-                        ),
-                    },
-                )
-            next_orientation = (
-                list(request.pose_orientation_xyzw)
-                if request.pose_orientation_xyzw is not None
-                else list(tracked.get("orientation_xyzw", [0.0, 0.0, 0.0, 1.0]))
-            )
-            next_frame_id = request.frame_id or tracked.get("frame_id", "universe")
-            previous_geometry = (
-                tuple(tracked.get("position_m", [])),
-                tuple(tracked.get("orientation_xyzw", [])),
-                tracked.get("frame_id", "universe"),
-                tracked.get("_source_id"),
-                tracked.get("_source_freshness_budget_ns"),
-                tracked.get("_scene_admission_role"),
-                tracked.get("_scene_admission_lease_max_age_ns"),
-                tracked.get("_scene_admission_target_drift_tolerance_m"),
-                tracked.get("_scene_admission_target_angular_tolerance_rad"),
-                tracked.get("_scene_admission_obstacle_drift_tolerance_m"),
-                tracked.get("_scene_admission_obstacle_angular_tolerance_rad"),
-                bool(tracked.get("_scene_admission_allow_runtime_dynamic_obstacle")),
-            )
-            next_geometry = (
-                tuple(request.pose_position_m),
-                tuple(next_orientation),
-                next_frame_id,
-                request.source_id,
-                request.source_freshness_budget_ns,
-                request.scene_admission_role,
-                request.scene_admission_lease_max_age_ns,
-                request.scene_admission_target_drift_tolerance_m,
-                request.scene_admission_target_angular_tolerance_rad,
-                request.scene_admission_obstacle_drift_tolerance_m,
-                request.scene_admission_obstacle_angular_tolerance_rad,
-                bool(request.scene_admission_allow_runtime_dynamic_obstacle),
-            )
-            geometry_same = previous_geometry == next_geometry
-            freshness_changed = (
-                tracked.get("_source_timestamp_ns") != request.source_timestamp_ns
-            )
-            if geometry_same and freshness_changed:
-                update_status = "freshness_only"
-            elif geometry_same:
-                update_status = "no_op"
-            else:
-                update_status = "geometry_changed"
-                revision_changed = True
-            tracked["position_m"] = list(request.pose_position_m)
-            tracked["orientation_xyzw"] = next_orientation
-            # else: pose-source position-only update — keep the last known
-            # orientation (spec 420 §4A.2 mirroring semantics), never identity.
-            tracked["frame_id"] = next_frame_id
-            tracked["_source_id"] = request.source_id
-            tracked["_source_timestamp_ns"] = request.source_timestamp_ns
-            tracked["_source_freshness_budget_ns"] = (
-                request.source_freshness_budget_ns
-            )
-            tracked["_scene_admission_role"] = request.scene_admission_role
-            tracked["_scene_admission_lease_max_age_ns"] = (
-                request.scene_admission_lease_max_age_ns
-            )
-            tracked["_scene_admission_target_drift_tolerance_m"] = (
-                request.scene_admission_target_drift_tolerance_m
-            )
-            tracked["_scene_admission_target_angular_tolerance_rad"] = (
-                request.scene_admission_target_angular_tolerance_rad
-            )
-            tracked["_scene_admission_obstacle_drift_tolerance_m"] = (
-                request.scene_admission_obstacle_drift_tolerance_m
-            )
-            tracked["_scene_admission_obstacle_angular_tolerance_rad"] = (
-                request.scene_admission_obstacle_angular_tolerance_rad
-            )
-            tracked["_scene_admission_allow_runtime_dynamic_obstacle"] = bool(
-                request.scene_admission_allow_runtime_dynamic_obstacle
-            )
-        elif request.operation == "remove":
-            if request.object_id not in self._objects:
-                error = "Object not found"
-                self._record_scene_trace(
-                    event=request.operation,
-                    object_id=request.object_id,
-                    success=False,
-                    frame_id=request.frame_id,
-                    attached=state_before.attached if state_before.exists else None,
-                    pose_in_frame=None,
-                    pose_in_universe=pose_before,
-                    error=error,
-                )
-                return SceneEditResult(success=False, error=error)
-            self._objects.pop(request.object_id, None)
-        elif request.operation == "attach":
-            tracked = self._objects.get(request.object_id)
-            if tracked is None:
-                error = "Object not found"
-                self._record_scene_trace(
-                    event=request.operation,
-                    object_id=request.object_id,
-                    success=False,
-                    frame_id=request.frame_id,
-                    attached=state_before.attached if state_before.exists else None,
-                    pose_in_frame=None,
-                    pose_in_universe=pose_before,
-                    error=error,
-                )
-                return SceneEditResult(success=False, error=error)
-            target_frame = request.frame_id or "tool0"
-            world_pose = self.get_object_pose(request.object_id, "universe")
-            frame_pose = self.get_link_pose(target_frame, "universe")
-            if world_pose is None or frame_pose is None:
-                error = "Failed to resolve attach frames"
-                self._record_scene_trace(
-                    event=request.operation,
-                    object_id=request.object_id,
-                    success=False,
-                    frame_id=target_frame,
-                    attached=state_before.attached if state_before.exists else None,
-                    pose_in_frame=None,
-                    pose_in_universe=world_pose,
-                    error=error,
-                )
-                return SceneEditResult(success=False, error=error)
-            t_frame = _pose_to_matrix(
-                list(frame_pose["position_m"]),
-                list(frame_pose["orientation_xyzw"]),
-            )
-            t_world_object = _pose_to_matrix(
-                list(world_pose["position_m"]),
-                list(world_pose["orientation_xyzw"]),
-            )
-            local_pos, local_orient = _matrix_to_pose(
-                _multiply_matrices(_invert_matrix(t_frame), t_world_object)
-            )
-            tracked["position_m"] = local_pos
-            tracked["orientation_xyzw"] = local_orient
-            tracked["frame_id"] = target_frame
-        elif request.operation == "detach":
-            tracked = self._objects.get(request.object_id)
-            if tracked is None:
-                error = "Object not found"
-                self._record_scene_trace(
-                    event=request.operation,
-                    object_id=request.object_id,
-                    success=False,
-                    frame_id=request.frame_id,
-                    attached=state_before.attached if state_before.exists else None,
-                    pose_in_frame=None,
-                    pose_in_universe=pose_before,
-                    error=error,
-                )
-                return SceneEditResult(success=False, error=error)
-            target_frame = request.frame_id or "universe"
-            world_pose = self.get_object_pose(request.object_id, "universe")
-            if world_pose is None:
-                error = "Failed to resolve world pose"
-                self._record_scene_trace(
-                    event=request.operation,
-                    object_id=request.object_id,
-                    success=False,
-                    frame_id=target_frame,
-                    attached=state_before.attached if state_before.exists else None,
-                    pose_in_frame=None,
-                    pose_in_universe=None,
-                    error=error,
-                )
-                return SceneEditResult(success=False, error=error)
-            if target_frame == "universe":
-                tracked["position_m"] = list(world_pose["position_m"])
-                tracked["orientation_xyzw"] = list(world_pose["orientation_xyzw"])
-                tracked["frame_id"] = target_frame
-            else:
-                frame_pose = self.get_link_pose(target_frame, "universe")
-                if frame_pose is None:
-                    error = "Failed to resolve detach frame"
-                    self._record_scene_trace(
-                        event=request.operation,
-                        object_id=request.object_id,
-                        success=False,
-                        frame_id=target_frame,
-                        attached=state_before.attached if state_before.exists else None,
-                        pose_in_frame=None,
-                        pose_in_universe=world_pose,
-                        error=error,
-                    )
-                    return SceneEditResult(success=False, error=error)
-                t_frame = _pose_to_matrix(
-                    list(frame_pose["position_m"]),
-                    list(frame_pose["orientation_xyzw"]),
-                )
-                t_world_object = _pose_to_matrix(
-                    list(world_pose["position_m"]),
-                    list(world_pose["orientation_xyzw"]),
-                )
-                local_pos, local_orient = _matrix_to_pose(
-                    _multiply_matrices(_invert_matrix(t_frame), t_world_object)
-                )
-                tracked["position_m"] = local_pos
-                tracked["orientation_xyzw"] = local_orient
-                tracked["frame_id"] = target_frame
-        else:
-            error = f"Unsupported scene edit operation: {request.operation}"
-            self._record_scene_trace(
-                event=request.operation,
-                object_id=request.object_id,
-                success=False,
-                frame_id=request.frame_id,
-                attached=state_before.attached if state_before.exists else None,
-                pose_in_frame=None,
-                pose_in_universe=pose_before,
-                error=error,
-            )
-            return SceneEditResult(success=False, error=error)
-        if update_status is None:
-            update_status = "geometry_changed"
-            revision_changed = True
-        result = SceneEditResult(
-            success=True,
-            update_status=update_status,
-            collision_world_revision_changed=revision_changed,
-            collision_world_freshness_changed=freshness_changed,
+    def query_target(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self._successful(
+            self._transport.query_target(body), label="target observation"
         )
-        if update_status != "no_op":
-            self._scene_transaction_sequence += 1
-            if revision_changed:
-                self._scene_revision_id += 1
-            # Source-backed updates are live observations. All authored scene
-            # mutations invalidate recovery admission by default.
-            if not (
-                request.operation == "update_pose"
-                and request.source_id is not None
-            ):
-                self._scene_admission_epoch += 1
-        state_after = self.get_object_state(request.object_id)
-        pose_in_frame = None
-        pose_in_universe = None
-        frame_id = request.frame_id
-        attached = None
-        if request.operation == "remove":
-            frame_id = state_before.frame_id
-            attached = state_before.attached if state_before.exists else None
-            pose_in_universe = pose_before
-        elif state_after.exists:
-            frame_id = state_after.frame_id
-            attached = state_after.attached
-            if frame_id is not None:
-                pose_in_frame = self.get_object_pose(request.object_id, frame_id)
-            pose_in_universe = self.get_object_pose(request.object_id, "universe")
-        self._record_scene_trace(
-            event=request.operation,
-            object_id=request.object_id,
-            success=True,
-            frame_id=frame_id,
-            attached=attached,
-            pose_in_frame=pose_in_frame,
-            pose_in_universe=pose_in_universe,
-        )
+
+    def _io_watch_method(self, name: str):
+        method = getattr(self._transport, name, None)
+        if not callable(method):
+            raise TypeError(f"execution transport has no callable {name}")
+        return method
+
+    def register_io_watch(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Register one zero-claim level watch: ``{registration, result}``."""
+
+        response = self._io_watch_method("register_io_watch")(request)
+        if (
+            not isinstance(response, dict)
+            or not isinstance(response.get("registration"), dict)
+            or not isinstance(response.get("result"), dict)
+        ):
+            raise KernelClientResponseError("I/O watch registration is malformed")
+        return response
+
+    def read_io_watch(self, registration: Mapping[str, Any]) -> dict[str, Any]:
+        """The watch's current ``{state, observation, matched_sample}``."""
+
+        result = self._io_watch_method("read_io_watch")(registration)
+        if not isinstance(result, dict) or result.get("state") not in {
+            "pending", "matched", "released"
+        }:
+            raise KernelClientResponseError("I/O watch read is malformed")
         return result
 
-    def get_link_pose(
-        self, target_frame: str, base_frame: str
-    ) -> Optional[Dict[str, Any]]:
-        self.link_pose_calls.append((target_frame, base_frame))
-        if target_frame in ("", "universe", base_frame, "base_link"):
-            return {
-                "position_m": [0.0, 0.0, 0.0],
-                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-            }
-        return {
-            "position_m": [0.5, 0.0, 0.6],
-            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-        }
+    def release_io_watch(self, registration: Mapping[str, Any]) -> None:
+        self._io_watch_method("release_io_watch")(registration)
 
-    def compute_target_link_poses(
-        self, request: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Deterministic FK stand-in that records the exact requested vector."""
-        self.target_link_pose_requests.append(copy.deepcopy(request))
-        if request.get("kind") != "joint":
-            return {"reachable": False, "reason": "unsupported_target_kind"}
-        joint_names = request.get("joint_names")
-        positions = request.get("joint_positions_rad")
-        link_names = request.get("link_names")
-        base_frame = request.get("base_frame")
+    def release_io_watch_scope(self, scope_request: Mapping[str, Any]) -> None:
+        """Release one exact node attempt's watch without its token."""
+
+        self._io_watch_method("release_io_watch_scope")(scope_request)
+
+    def start_mock_io_node_simulation(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Decision 133: the host's exact accepted acknowledgement."""
+
+        ack = self._io_watch_method("start_mock_io_node_simulation")(request)
         if (
-            not isinstance(joint_names, list)
-            or not isinstance(positions, list)
-            or len(joint_names) != len(positions)
-            or not isinstance(link_names, list)
-            or not isinstance(base_frame, str)
+            not isinstance(ack, dict)
+            or ack.get("status") != "accepted"
+            or not isinstance(ack.get("signals"), list)
         ):
-            return {"reachable": False, "reason": "invalid_joint_target"}
-        link_poses: Dict[str, Dict[str, Any]] = {}
-        for link_name in link_names:
-            if not isinstance(link_name, str):
-                return {"reachable": False, "reason": "invalid_link_name"}
-            pose = self.get_link_pose(link_name, base_frame)
-            if pose is None:
-                return {"reachable": False, "reason": "frame_unresolved"}
-            link_poses[link_name] = pose
-        return {"reachable": True, "link_poses": link_poses}
+            raise KernelClientResponseError("Mock simulation acknowledgement is malformed")
+        return ack
 
-    def get_object_pose(
-        self, object_id: str, base_frame: str
-    ) -> Optional[Dict[str, Any]]:
-        tracked = self._objects.get(object_id)
-        if tracked is None:
-            return None
-        position = list(tracked.get("position_m", [0.0, 0.0, 0.0]))
-        orientation = list(tracked.get("orientation_xyzw", [0.0, 0.0, 0.0, 1.0]))
-        frame_id = tracked.get("frame_id", "universe")
-        if frame_id not in ("", "universe", base_frame):
-            frame_pose = self.get_link_pose(frame_id, base_frame)
-            if frame_pose is None:
-                return None
-            t_frame = _pose_to_matrix(
-                list(frame_pose["position_m"]),
-                list(frame_pose["orientation_xyzw"]),
+    def end_mock_io_node_simulation(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Decision 135: the host's reply to one node attempt's end."""
+
+        reply = self._io_watch_method("end_mock_io_node_simulation")(request)
+        if not isinstance(reply, dict):
+            raise KernelClientResponseError("Mock simulation end reply is malformed")
+        return reply
+
+    def set_mock_io_run_paused(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Decision 135: the host's reply to the Run's Halt state."""
+
+        reply = self._io_watch_method("set_mock_io_run_paused")(request)
+        if not isinstance(reply, dict):
+            raise KernelClientResponseError("Mock Run pause reply is malformed")
+        return reply
+
+    def _projection(self, method_name: str) -> dict[str, Any]:
+        method = getattr(self._transport, method_name, None)
+        if not callable(method):
+            raise TypeError(f"execution transport has no callable {method_name}")
+        return self._successful(method(), label=method_name.replace("_", " "))
+
+    def execute(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+        def refusal(code: str, message: str, details: object, active_tcp: object) -> None:
+            detail = dict(details) if isinstance(details, Mapping) else {}
+            participants = intent.get("participants")
+            is_set_tcp = (
+                isinstance(participants, (list, tuple)) and len(participants) == 1
+                and isinstance(participants[0], Mapping)
+                and isinstance(participants[0].get("payload"), Mapping)
+                and participants[0]["payload"].get("kind") == "set_tcp"
             )
-            t_local = _pose_to_matrix(position, orientation)
-            position, orientation = _matrix_to_pose(_multiply_matrices(t_frame, t_local))
-        return {
-            "position_m": position,
-            "orientation_xyzw": orientation,
-        }
+            if is_set_tcp and detail.get("immediate_step") == "admitted":
+                context = intent.get("request_context")
+                expected = context.get("request_id") if isinstance(context, Mapping) else None
+                if (not isinstance(expected, str) or not expected
+                    or detail.get("request_id") != expected
+                    or not isinstance(detail.get("operation_id"), str)
+                    or not detail["operation_id"]):
+                    raise KernelClientResponseError("immediate-step failure receipt is invalid")
+                raise KernelImmediateStepFailedError(code, message, detail, active_tcp)
+            raise KernelOperationAdmissionRejectedError(code, message, detail)
 
-    def get_object_state(self, object_id: str) -> ObjectState:
-        tracked = self._objects.get(object_id)
-        if tracked is None:
-            return ObjectState(object_id=object_id)
-        frame_id = tracked.get("frame_id", "universe")
-        return ObjectState(
-            object_id=object_id,
-            exists=True,
-            attached=frame_id not in ("", "universe", "base_link"),
-            frame_id=frame_id,
-        )
-
-    def get_scene_trace(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        trace = list(self._scene_trace)
-        if limit is not None and limit >= 0:
-            return trace[-limit:]
-        return trace
-
-    def clear_scene_trace(self) -> None:
-        self._scene_trace.clear()
-
-    def get_scene_objects(self) -> list[SceneObjectSnapshot]:
-        """Return authoritative object snapshots for the current mock scene."""
-        objects: list[SceneObjectSnapshot] = []
-        for object_id in sorted(self._objects):
-            tracked = self._objects[object_id]
-            shape = None
-            if tracked.get("shape_type") == "box":
-                shape = SceneShape(
-                    type="box",
-                    box_dimensions_m=list(tracked.get("box_dimensions_m") or []),
-                )
-            elif tracked.get("shape_type") == "sphere":
-                shape = SceneShape(
-                    type="sphere",
-                    sphere_radius_m=tracked.get("sphere_radius_m"),
-                )
-            elif tracked.get("shape_type") == "cylinder":
-                shape = SceneShape(
-                    type="cylinder",
-                    cylinder_radius_m=tracked.get("cylinder_radius_m"),
-                    cylinder_height_m=tracked.get("cylinder_height_m"),
-                )
-            elif tracked.get("shape_type") == "mesh":
-                shape = SceneShape(
-                    type="mesh",
-                    mesh_resource_uri=tracked.get("mesh_resource_uri"),
-                    mesh_scale=list(tracked.get("mesh_scale") or [1.0, 1.0, 1.0]),
-                )
-            objects.append(
-                SceneObjectSnapshot(
-                    object_id=object_id,
-                    shape=shape,
-                    pose_in_frame=self.get_object_pose(
-                        object_id, tracked.get("frame_id") or "universe"
-                    ),
-                    pose_in_universe=self.get_object_pose(object_id, "universe"),
-                    attached=tracked.get("frame_id") not in {None, "universe", "base_link"},
-                    frame_id=tracked.get("frame_id"),
-                    support_contacts=list(tracked.get("support_contacts") or []),
-                )
-            )
-        return objects
-
-    def get_scene_object_ids(self) -> list[str]:
-        """Return IDs of all collision objects currently in the scene."""
-        return [scene_object.object_id for scene_object in self.get_scene_objects()]
-
-    def get_scene_authority_status(self) -> dict[str, Any]:
-        return {
-            "revision_id": self._scene_revision_id,
-            "content_hash": f"mock-scene-{self._scene_revision_id}",
-            "transaction_sequence": self._scene_transaction_sequence,
-            "scene_admission_epoch": self._scene_admission_epoch,
-            "topology_epoch": self._scene_revision_id,
-            "policy_epoch": 1,
-        }
-
-    def get_joint_names(self) -> list[str]:
-        """Return ordered joint names for the active robot group."""
-        return self._joint_names
-
-    def get_metrics(self) -> dict[str, int]:
-        """Return performance/diagnostic counters."""
-        return dict(self._metrics)
-
-    def _compute_gripper_status(self, gripper_id: str) -> GripperCommandStatus:
-        command = self._gripper_commands.get(gripper_id)
-        if command is None:
-            return GripperCommandStatus(
-                state=GripperCommandState.IDLE,
-                gripper_id=gripper_id,
-                current_position=self._gripper_positions.get(gripper_id),
-            )
-
-        state = command["state"]
-        progress = float(command.get("progress", 0.0))
-        current_position = command.get("current_position")
-        target_position = command.get("target_position")
-
-        if state == GripperCommandState.EXECUTING:
-            elapsed = self._gripper_clock() - float(command["start_time"])
-            duration = float(command["duration_s"])
-            progress = min(max(elapsed / duration, 0.0), 1.0)
-            current_position = (
-                float(command["start_position"])
-                + (float(command["target_position"]) - float(command["start_position"])) * progress
-            )
-            if progress >= 1.0:
-                state = GripperCommandState.COMPLETED
-                current_position = float(command["target_position"])
-
-        return GripperCommandStatus(
-            state=state,
-            gripper_id=gripper_id,
-            command_id=int(command.get("command_id", 0)),
-            generation=int(command.get("generation", 0)),
-            revision=(
-                int(command.get("revision", 0)) + 1
-                if state != command["state"]
-                else int(command.get("revision", 0))
-            ),
-            progress=progress,
-            current_position=(
-                None if current_position is None else float(current_position)
-            ),
-            target_position=(
-                None if target_position is None else float(target_position)
-            ),
-            commanded_position=command.get("commanded_position"),
-            observed_position=gripper_observed_position(
-                str(command.get("state_authority", "")),
-                None if current_position is None else float(current_position),
-            ),
-            commanded_state=str(command.get("commanded_state", "")),
-            actuation_kind=str(command.get("actuation_kind", "")),
-            state_authority=str(command.get("state_authority", "")),
-            completion_policy=str(command.get("completion_policy", "")),
-            grasp_confirmation_policy=str(
-                command.get("grasp_confirmation_policy", "")
-            ),
-            transport_kind=str(command.get("transport_kind", "")),
-            evidence=normalize_gripper_evidence(command.get("evidence")),
-            evidence_state=str(command.get("evidence_state", "")),
-            error=command.get("error"),
-            reason_code=command.get("reason_code"),
-        )
-
-    def _invalidate_mock_gripper_commands(self, *, block_admission: bool) -> None:
-        with self._gripper_lock:
-            self._gripper_admission_blocked = block_admission
-            for command in self._gripper_commands.values():
-                command["state"] = GripperCommandState.IDLE
-                command["generation"] = self._next_gripper_generation
-                self._next_gripper_generation += 1
-                command["revision"] = int(command.get("revision", 0)) + 1
-                command["progress"] = 0.0
-                command["error"] = None
-                command["reason_code"] = None
-                command["projection_state"] = "not_required"
-                command["projection_reason"] = ""
-
-    def _authorize_mock_gripper_commands(self) -> None:
-        with self._gripper_lock:
-            self._gripper_admission_blocked = False
-
-    def _commit_elapsed_gripper_command(self, gripper_id: str) -> None:
-        """Commit clock-derived state only at a mutating authority boundary."""
-        status = self._compute_gripper_status(gripper_id)
-        command = self._gripper_commands.get(gripper_id)
-        if command is None or status.state == command["state"]:
-            return
-        command["state"] = status.state
-        command["current_position"] = status.current_position
-        command["progress"] = status.progress
-        command["observed_position"] = status.observed_position
-        command["revision"] = status.revision
-        if status.state == GripperCommandState.COMPLETED:
-            self._gripper_positions[gripper_id] = (
-                float(status.current_position)
-                if status.current_position is not None
-                else self._gripper_positions.get(gripper_id, 0.0)
-            )
-
-    def command_gripper(self, request: GripperCommandRequest) -> CommandResult:
-        with self._gripper_lock:
-            self.gripper_command_count += 1
-            if self._gripper_admission_blocked or self._state in {
-                ExecutionState.PAUSED,
-                ExecutionState.STOPPING,
-                ExecutionState.STOPPED,
-                ExecutionState.INTERRUPTED,
-                ExecutionState.FAILED,
-                ExecutionState.INTERVENTION_REQUIRED,
-            }:
-                return CommandResult(
-                    accepted=False,
-                    error="Gripper command admission is closed by the execution lifecycle",
-                    reason_code="gripper_command_not_authorized",
-                )
-            effective_request, semantic_error = gripper_effective_command_request(
-                request
-            )
-            if effective_request is None:
-                self.last_gripper_command_request = request
-                return CommandResult(
-                    accepted=False,
-                    error=semantic_error or "Invalid gripper command semantics",
-                    reason_code="invalid_gripper_semantics",
-                )
-            request = effective_request
-            self.last_gripper_command_request = request
-            if self.fail_next_gripper_command:
-                self.fail_next_gripper_command = False
-                return CommandResult(
-                    accepted=False,
-                    error="Gripper command failed (injected)",
-                    reason_code="gripper_request_failed",
-                )
-
-            self._commit_elapsed_gripper_command(request.gripper_id)
-            current_status = self.get_gripper_status(request.gripper_id)
-            if current_status.state == GripperCommandState.EXECUTING:
-                return CommandResult(
-                    accepted=False,
-                    error=f"Gripper '{request.gripper_id}' is already executing a command",
-                    reason_code="gripper_busy",
-                )
-
-            current_position = current_status.current_position
-            if current_position is None:
-                current_position = self._gripper_positions.get(request.gripper_id, 0.0)
-            if request.duration_s <= 0.0:
-                command_id = self._next_gripper_command_id
-                generation = self._next_gripper_generation
-                self._next_gripper_command_id += 1
-                self._next_gripper_generation += 1
-                self._gripper_positions[request.gripper_id] = request.target_position
-                metadata = gripper_request_status_metadata(
-                    request,
-                    current_position=float(request.target_position),
-                )
-                self._gripper_commands[request.gripper_id] = {
-                    "state": GripperCommandState.COMPLETED,
-                    "command_id": command_id,
-                    "generation": generation,
-                    "revision": 1,
-                    "current_position": request.target_position,
-                    "target_position": request.target_position,
-                    "progress": 1.0,
-                    "error": None,
-                    "reason_code": None,
-                    **metadata,
-                }
-                return CommandResult(
-                    accepted=True,
-                    details={"command_id": command_id, "generation": generation},
-                )
-
-            command_id = self._next_gripper_command_id
-            generation = self._next_gripper_generation
-            self._next_gripper_command_id += 1
-            self._next_gripper_generation += 1
-            metadata = gripper_request_status_metadata(
-                request,
-                current_position=float(current_position),
-            )
-            self._gripper_commands[request.gripper_id] = {
-                "state": GripperCommandState.EXECUTING,
-                "command_id": command_id,
-                "generation": generation,
-                "revision": 1,
-                "group_id": request.group_id,
-                "joint_name": request.joint_name,
-                "start_position": current_position,
-                "current_position": current_position,
-                "target_position": request.target_position,
-                "duration_s": request.duration_s,
-                "start_time": self._gripper_clock(),
-                "progress": 0.0,
-                "error": None,
-                "reason_code": None,
-                **metadata,
-            }
-            return CommandResult(
-                accepted=True,
-                details={"command_id": command_id, "generation": generation},
-            )
-
-    def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus:
-        with self._gripper_lock:
-            command = self._gripper_commands.get(gripper_id)
-            if command is None:
-                return GripperCommandStatus(
-                    state=GripperCommandState.IDLE,
-                    gripper_id=gripper_id,
-                    current_position=self._gripper_positions.get(gripper_id),
-                )
-
-            return self._compute_gripper_status(gripper_id)
-
-    def confirm_gripper_grasp(
-        self,
-        *,
-        gripper_id: str,
-        grasp_confirmation_policy: str,
-        evidence_label: str,
-        evidence_state: str = "confirmed",
-    ) -> CommandResult:
-        policy = str(grasp_confirmation_policy or "").strip()
-        label = str(evidence_label or "").strip()
-        state = str(evidence_state or "").strip()
-        if not policy:
-            return CommandResult(
-                accepted=False,
-                error="grasp_confirmation_policy is required",
-                reason_code="invalid_gripper_semantics",
-            )
-        if policy == "none_open_loop":
-            return CommandResult(
-                accepted=False,
-                error="none_open_loop does not accept verified grasp evidence",
-                reason_code="invalid_gripper_semantics",
-            )
-        if not label:
-            return CommandResult(
-                accepted=False,
-                error="grasp confirmation evidence_label is required",
-                reason_code="invalid_gripper_semantics",
-            )
-        if state not in {"confirmed", "verified", "grasp_confirmed"}:
-            return CommandResult(
-                accepted=False,
-                error="grasp confirmation evidence_state must be confirmed or verified",
-                reason_code="invalid_gripper_semantics",
-            )
-        with self._gripper_lock:
-            command = self._gripper_commands.get(gripper_id)
-            if command is None:
-                return CommandResult(
-                    accepted=False,
-                    error=f"Gripper '{gripper_id}' has no command status to confirm",
-                    reason_code="stale_gripper_state",
-                )
-            status_policy = str(command.get("grasp_confirmation_policy", "") or "")
-            if status_policy and status_policy != policy:
-                return CommandResult(
-                    accepted=False,
-                    error=(
-                        f"Gripper '{gripper_id}' status policy '{status_policy}' "
-                        f"does not match confirmation policy '{policy}'"
-                    ),
-                    reason_code="invalid_gripper_semantics",
-                )
-            evidence = normalize_gripper_evidence(command.get("evidence"))
-            if label not in evidence:
-                evidence.append(label)
-            command["evidence"] = evidence
-            command["evidence_state"] = state
-            command["grasp_confirmation_policy"] = policy
-            command["revision"] = int(command.get("revision", 0)) + 1
-            return CommandResult(accepted=True)
-
-    def mark_gripper_grasp_lost(
-        self,
-        *,
-        gripper_id: str,
-        expected_command_id: int,
-        expected_generation: int,
-        evidence_label: str,
-        message: str,
-        reason_code: str = "grasp_confirmation_lost",
-    ) -> CommandResult:
-        label = str(evidence_label or "").strip()
-        if not label:
-            return CommandResult(
-                accepted=False,
-                error="grasp loss evidence_label is required",
-                reason_code="invalid_gripper_semantics",
-            )
-        with self._gripper_lock:
-            command = self._gripper_commands.get(gripper_id)
-            if command is None:
-                return CommandResult(
-                    accepted=False,
-                    error=f"Gripper '{gripper_id}' has no command status to invalidate",
-                    reason_code="stale_gripper_state",
-                )
+        try:
+            response = self._transport.submit(intent)
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            if isinstance(code, str) and code not in EXECUTION_TRANSPORT_FAILURE_CODES:
+                refusal(code, str(exc) or "execution owner rejected the operation",
+                        getattr(exc, "details", None), getattr(exc, "active_tcp", None))
+            raise
+        if isinstance(response, dict) and response.get("ok") is False:
+            error = response.get("error")
             if (
-                int(command.get("command_id", 0)) != int(expected_command_id)
-                or int(command.get("generation", 0)) != int(expected_generation)
+                isinstance(error, Mapping)
+                and isinstance(error.get("code"), str)
+                and error["code"]
+                and isinstance(error.get("message"), str)
+                and isinstance(error.get("details", {}), Mapping)
             ):
-                return CommandResult(
-                    accepted=False,
-                    error=(
-                        f"Gripper '{gripper_id}' command identity changed before "
-                        "grasp-loss evidence was applied"
-                    ),
-                    reason_code="stale_gripper_state",
-                )
-            evidence = normalize_gripper_evidence(command.get("evidence"))
-            if label not in evidence:
-                evidence.append(label)
-            command["evidence"] = evidence
-            command["evidence_state"] = "pressure_or_part_lost"
-            command["state"] = GripperCommandState.FAILED
-            command["generation"] = self._next_gripper_generation
-            self._next_gripper_generation += 1
-            command["revision"] = int(command.get("revision", 0)) + 1
-            command["progress"] = float(command.get("progress", 1.0))
-            command["error"] = str(message or "gripper grasp confirmation was lost")
-            command["reason_code"] = str(reason_code or "grasp_confirmation_lost")
-            return CommandResult(accepted=True)
+                refusal(error["code"], error["message"], error.get("details"),
+                        response.get("active_tcp"))
+        return self._successful(response, label="submission")
+
+    def plan_pick(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+        method = getattr(self._transport, "plan_pick", None)
+        if not callable(method):
+            raise TypeError("execution transport has no callable plan_pick")
+        return self._successful(method(intent), label="pick planning")
+
+    def plan_place(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+        method = getattr(self._transport, "plan_place", None)
+        if not callable(method):
+            raise TypeError("execution transport has no callable plan_place")
+        return self._successful(method(intent), label="place planning")
+
+    def operation(self, operation_id: str) -> dict[str, Any]:
+        try:
+            response = self._transport.read(operation_id)
+        except Exception as exc:
+            # Headless transports expose stable machine-readable error codes.
+            # Map only owner availability on this exact read; every other
+            # transport, protocol, and owner error retains its original type.
+            if getattr(exc, "code", None) == "execution_owner_unavailable":
+                raise KernelOperationObservationUnavailableError(
+                    "native operation observation is temporarily unavailable"
+                ) from exc
+            raise
+        return self._successful(response, label="observation")
+
+    def recovery_assessment(self, operation_id: str) -> dict[str, Any]:
+        method = getattr(self._transport, "operation_recovery", None)
+        if not callable(method):
+            raise TypeError("execution transport has no callable operation_recovery")
+        response = self._successful(method(operation_id), label="recovery assessment")
+        assessment = response.get("recovery_assessment")
+        if not isinstance(assessment, dict):
+            raise KernelClientResponseError(
+                "headless recovery assessment has no owner projection"
+            )
+        revision = response.get("operation_revision")
+        participants = response.get("participants")
+        if (
+            type(revision) is not int
+            or revision < 1
+            or not isinstance(participants, list)
+            or not participants
+        ):
+            raise KernelClientResponseError(
+                "headless recovery assessment has no exact operation scope"
+            )
+        return {
+            **assessment,
+            "operation_revision": revision,
+            "participants": participants,
+            "stop_id": response.get("stop_id"),
+            "stop_generation": response.get("stop_generation"),
+        }
+
+    def recover(
+        self,
+        operation_id: str,
+        expected_operation_revision: int,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        method = getattr(self._transport, "apply_operation_recovery", None)
+        if not callable(method):
+            raise TypeError(
+                "execution transport has no callable apply_operation_recovery"
+            )
+        response = self._successful(
+            method(operation_id, expected_operation_revision, request),
+            label="recovery action",
+        )
+        result = response.get("result")
+        if (
+            not isinstance(result, dict)
+            or type(result.get("accepted")) is not bool
+            or not isinstance(result.get("resulting_assessment"), dict)
+        ):
+            raise KernelClientResponseError(
+                "headless recovery action has no exact owner result"
+            )
+        return result
+
+    def query_operation(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        return self._successful(
+            self._transport.query_operation(request), label="Program operation context"
+        )
+
+    def full_stop(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        return self._successful(self._transport.full_stop(request), label="Full Stop")
+
+    def set_operation_runtime_scale(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        return self._successful(
+            self._transport.set_operation_runtime_scale(request),
+            label="operation runtime scale",
+        )
+
+    def reset(self, operation_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
+        return self._successful(
+            self._transport.reset(operation_id, request),
+            label="Reset",
+        )
+
+    def acknowledge_completed(
+        self, operation_id: str, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            response = self._transport.acknowledge_completed(operation_id, request)
+        except Exception as error:
+            details = getattr(error, "details", None)
+            if getattr(error, "code", None) == "operation_effect_in_flight" or (
+                isinstance(details, Mapping)
+                and details.get("reason") == "operation_effect_in_flight"
+            ):
+                raise KernelOperationSettlementPendingError(
+                    "operation completion is waiting for a subordinate effect"
+                ) from error
+            raise
+        return self._successful(response, label="completion acknowledgement")
+
+    def stop(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        return self._successful(
+            self._transport.stop(request),
+            label="Stop",
+        )
+
+    def stop_program_run(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        return self._successful(
+            self._transport.stop_program_run(request),
+            label="Program-run Stop",
+        )
+
+    def read_program_execution_scope(self, program_run_id: str) -> dict[str, Any]:
+        response = self._successful(
+            self._transport.read_program_execution_scope(program_run_id),
+            label="Program execution scope",
+        )
+        scope = response.get("scope")
+        if not isinstance(scope, dict):
+            raise KernelClientResponseError("execution scope has an invalid shape")
+        return scope
+
+    def read_manual_handover(self, request: Mapping[str, Any]) -> dict[str, Any] | None:
+        response = self._successful(
+            self._transport.read_manual_handover(request), label="manual handover"
+        )
+        handover = response.get("handover")
+        if handover is not None and not isinstance(handover, dict):
+            raise KernelClientResponseError("manual handover has an invalid shape")
+        return handover
+
+    def stop_program_selection(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        response = self._successful(
+            self._transport.stop_program_selection(request),
+            label="Program selection Stop",
+        )
+        accepted = response.get("accepted")
+        if (
+            response.get("command") != "stop_program_selection"
+            or not isinstance(accepted, Mapping)
+            or not isinstance(accepted.get("group_ids"), list)
+            or not accepted["group_ids"]
+            or accepted.get("replay_status") not in {"accepted_new", "replayed_exact"}
+            or not isinstance(accepted.get("state"), Mapping)
+        ):
+            raise KernelClientResponseError("Program selection Stop omitted its scope")
+        return accepted
+
+    def release_program_selection(
+        self, request: Mapping[str, Any], expected_selection_revision: int
+    ) -> Mapping[str, Any]:
+        response = self._successful(
+            self._transport.release_program_selection(
+                request, expected_selection_revision
+            ),
+            label="Program selection Resume",
+        )
+        scope = response.get("scope")
+        if (
+            response.get("command") != "release_program_selection"
+            or not isinstance(scope, Mapping)
+            or type(scope.get("selection_revision")) is not int
+        ):
+            raise KernelClientResponseError(
+                "Program selection Resume omitted its scope"
+            )
+        return scope
+
+    def start_program_selection(
+        self, request: Mapping[str, Any], expected_selection_revision: int
+    ) -> Mapping[str, Any]:
+        response = self._successful(
+            self._transport.start_program_selection(
+                request, expected_selection_revision
+            ),
+            label="Program selection initial Run",
+        )
+        scope = response.get("scope")
+        if (
+            response.get("command") != "start_program_selection"
+            or not isinstance(scope, Mapping)
+            or type(scope.get("selection_revision")) is not int
+        ):
+            raise KernelClientResponseError(
+                "Program selection initial Run omitted its scope"
+            )
+        return scope
+
+    def check_program_node_motion_attention(
+        self, request: Mapping[str, Any]
+    ) -> None:
+        response = self._successful(
+            self._transport.check_program_node_motion_attention(request),
+            label="Program node motion attention",
+        )
+        if response.get("command") != "check_program_node_motion_attention":
+            raise KernelClientResponseError(
+                "Program node motion attention omitted its command"
+            )
+
+    def release_program_run_stop_fence(
+        self, program_run_id: str, stop_id: str, stop_generation: int
+    ) -> dict[str, Any]:
+        return self._successful(
+            self._transport.release_program_run_stop_fence(
+                program_run_id, stop_id, stop_generation
+            ),
+            label="Program-run Stop release",
+        )
+
+    def stop_status(self, stop_id: str) -> dict[str, Any]:
+        method = getattr(self._transport, "stop_status", None)
+        if not callable(method):
+            raise TypeError("execution transport has no callable stop_status")
+        response = self._successful(method(stop_id), label="Stop status")
+        status = response.get("stop_status")
+        if (
+            not isinstance(status, dict)
+            or status.get("stop_id") != stop_id
+            or status.get("state")
+            not in {
+                "accepted",
+                "stopping",
+                "certifying",
+                "succeeded",
+                "partial",
+                "failed",
+            }
+        ):
+            raise KernelClientResponseError(
+                "execution Stop status changed its aggregate identity"
+            )
+        return response
+
+    def _required(self, name: str) -> Callable[..., Any]:
+        method = getattr(self._transport, name, None)
+        if not callable(method):
+            raise TypeError(f"execution transport has no callable {name}")
+        return method
+
+    def set_rule_active(self, rule_id: str, active: bool) -> dict[str, Any]:
+        """Kernel `set_rule_active` (CONTRACTS §8); `rule_unknown` is refused."""
+
+        if not isinstance(rule_id, str) or not rule_id or type(active) is not bool:
+            raise ValueError("set_rule_active requires a rule id and a boolean")
+        return self._successful(
+            self._required("set_rule_active")(rule_id, active), label="rule activation"
+        )
+
+    def reset_rule_activation(self) -> dict[str, Any]:
+        """Every global rule returns to its `active_at_start` (run end, Reset)."""
+
+        return self._successful(
+            self._required("reset_rule_activation")(), label="rule activation reset"
+        )
+
+    def clear_outside_change(
+        self, controllable_component_id: str, signal_name: str
+    ) -> dict[str, Any]:
+        """Kernel `clear_outside_change` (CONTRACTS §7); writes nothing."""
+
+        return self._successful(
+            self._required("clear_outside_change")(controllable_component_id, signal_name),
+            label="outside change clear",
+        )
+
+    def set_io_output(
+        self, component_id: str, signal_name: str, value: bool | float
+    ) -> dict[str, Any]:
+        """One output write by signal id through the one write path (CONTRACTS
+        §7), sent once. A refusal (`cell_latched`, `rule_holds`) raises the
+        transport's typed error; a `failed` or `unknown` result raises
+        `IoOutputWriteFailedError` with the host's code."""
+
+        response = self._successful(
+            self._required("set_io_output")(
+                f"{component_id}/{signal_name}", value, origin="program"
+            ),
+            label="output write",
+        )
+        result = response["result"]
+        if result["outcome"] == "succeeded":
+            return result
+        error = result.get("error")
+        if not isinstance(error, Mapping) or not isinstance(error.get("code"), str):
+            raise KernelClientResponseError(
+                f"output write ended {result['outcome']} without a typed error"
+            )
+        raise IoOutputWriteFailedError(
+            error["code"], str(error.get("message") or error["code"]), result["outcome"]
+        )
+
+class MockKernelClient:
+    """Removed stateful semantic mock; tests fake the thin HTTP transport."""
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise LegacyKernelMockUnavailableError(
+            "stateful Python MockKernelClient was superseded by the C++ "
+            "resource-addressed owner; inject a bounded transport fake"
+        )
+
+
+__all__ = [
+    "ActionSpan",
+    "EXECUTION_TRANSPORT_FAILURE_CODES",
+    "ExecutionState",
+    "ExecutionTransport",
+    "IoOutputWriteFailedError",
+    "KernelClient",
+    "KernelOperationAdmissionRejectedError",
+    "KernelImmediateStepFailedError",
+    "KernelOperationObservationUnavailableError",
+    "KernelOperationSettlementPendingError",
+    "KernelClientResponseError",
+    "LegacyKernelMockUnavailableError",
+    "MockKernelClient",
+]

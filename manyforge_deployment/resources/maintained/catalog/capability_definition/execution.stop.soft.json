@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:3ed811803c31726c758e227fc52bd57854cc6e7fa09dff0fd117d41800d4f8b9",
+  "capability_id": "execution.stop.soft",
+  "provider_binding_kind": "control_binding",
+  "scope": "target_binding"
+}

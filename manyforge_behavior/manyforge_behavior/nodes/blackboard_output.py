@@ -1,29 +1,31 @@
-"""Shared helpers for nodes that publish bundle-based namespace outputs."""
+"""I6/N gate for behavior-node namespace output commits.
+
+The former writer is pinned at
+``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`` blob
+``d1aff04b69c5a86decad3a4ffc46613d21fc1ab5`` lines 12-29.  Atomic bundle
+commit behavior returns only after addressed Program Binding exists; this
+gate intentionally inspects neither a binding nor the proposed payload.
+"""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Final
 
-import py_trees
 
-from manyforge_behavior.blackboard_namespace import write_namespace_bundle
+BLACKBOARD_OUTPUT_UNAVAILABLE_REASON_CODE: Final = (
+    "composable_cell_blackboard_output_binding_unavailable"
+)
+
+
+class BlackboardOutputBindingUnavailableError(RuntimeError):
+    pass
 
 
 class BlackboardOutputMixin:
-    _bb: py_trees.blackboard.Client
-    _output_key_prefix: str
+    """Gate until Program Binding supplies the exact output namespace."""
 
-    def _write_namespace_output(
-        self,
-        value: Any,
-        *,
-        status: str,
-        **meta: Any,
-    ) -> None:
-        write_namespace_bundle(
-            self._bb,
-            self._output_key_prefix,
-            value=value,
-            status=status,
-            **meta,
+    def _write_namespace_output(self, *_args: object, **_kwargs: object) -> None:
+        raise BlackboardOutputBindingUnavailableError(
+            f"{BLACKBOARD_OUTPUT_UNAVAILABLE_REASON_CODE}: bound node outputs "
+            "return at I6/N"
         )

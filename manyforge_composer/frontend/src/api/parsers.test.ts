@@ -1,0 +1,5838 @@
+import { describe, expect, it } from 'vitest';
+import actualHeldRun from '../testFixtures/programRunHeld64.fixture.json';
+import isaacSceneOwnerSections from '../testFixtures/isaacSceneOwnerSections.fixture.json';
+import nativeBindingFixture from '../../../../manyforge_deployment/resources/program_binding_lite6_native.fixture.json';
+import { sceneOwnerFacts } from '../state/sceneAuthoring';
+import type { NodeEnvironmentResponse } from '../types/api';
+import {
+  StructuralContractError,
+  parsePreparedActivationInput,
+  parseAuthoringWorkspaceSnapshot,
+  parseAppliedProgramSelection,
+  parseAppliedProgramStatus,
+  parseCapabilityCommandPreviewResponse,
+  parseCatalogResponse,
+  parseCurrentScenarioResponse,
+  parseDeploymentWorkspaceResponse,
+  parseExecutionControlStatus,
+  parseExecutionIdentity,
+  parseExecutionOwnerStatus,
+  parseHealthResponse,
+  parseHeadlessRuntimeSnapshot,
+  parseHistorianPage,
+  parseHistorianDetail,
+  parseHistorianDiscovery,
+  parseManagerDiffProjection,
+  parseManagerGraphProjection,
+  parseManagerStatusProjection,
+  parseOperatorAlarmSnapshot,
+  parseOperationObservation,
+  parsePersistentKeyEdit,
+  parseExpressionCheckResult,
+  parsePersistentKeyValues,
+  parsePersistentKeyValuesCleared,
+  parseRuntimeScaleControlAccepted,
+  parseRuntimeScaleControlStatus,
+  parseMotionPreviewResponse,
+  parseNodeEnvironmentResponse,
+  parseLogicalSceneProjection,
+  parseManagerApplyResponse,
+  parseManagerApplyStatus,
+  parseManagerDeploymentCandidatePreviewResponse,
+  parseProgramWorkspaceResponse,
+  parseProgramWorkspaceTransitionResponse,
+  parseProgramRunStatus,
+  parseApiErrorDto,
+  parseKnownProgramRunOutcome,
+  parseProgramCycleStatus,
+  parseProgramRuntimeControlProjection,
+  parseScenarioDocumentIndexResponse,
+  parseScenarioDocumentExportResponse,
+  parseScenarioDocumentSaveResponse,
+  parseSceneRuntimeProjection,
+  parseSceneMeshAssetMetadata,
+  parseProgramDraftMeshAssetMetadata,
+  parseSceneTransactionResponse,
+  parseSceneUrdfManifest,
+  parseSourceModelProjection,
+} from './parsers';
+
+function authoringWorkspaceFixture(): Record<string, unknown> {
+  const program = workspaceFixture();
+  const deployment = deploymentWorkspaceFixture();
+  const programDraft = program.draft as Record<string, unknown>;
+  const programSaved = program.saved as Record<string, unknown>;
+  const deploymentDraft = deployment.draft as Record<string, unknown>;
+  return {
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2',
+    workspaceEpoch: 'workspace.epoch.1',
+    workspaceRevision: 7,
+    program: { ...programDraft, saved: programSaved },
+    deployment: {
+      draftId: deploymentDraft.id,
+      draftRevision: deploymentDraft.revision,
+      document: deploymentDraft.document,
+      savedPath: '/workspace/deployment.fixture.json',
+      savedDocument: deploymentDraft.document,
+      differsFromSaved: false,
+    },
+    project: {
+      document_path: '/workspace/cell',
+      read_only: false,
+      document_id: 'cell',
+      document_name: 'Cell',
+      document_description: '',
+      source_diagnostics: [],
+      source_document_digest: null,
+      program_role_assignment: null,
+      source_program_digest: null,
+      source_deployment_digest: null,
+    },
+  };
+}
+
+describe('shared authoring workspace transport', () => {
+  it('parses both Drafts and project facts as one closed publication', () => {
+    const parsed = parseAuthoringWorkspaceSnapshot(authoringWorkspaceFixture());
+    expect(parsed.workspaceRevision).toBe(7);
+    expect(parsed.program.draft.draftRevision).toBe(2);
+    expect(parsed.deployment.draftRevision).toBe(4);
+    expect(parsed.project.documentPath).toBe('/workspace/cell');
+  });
+
+  it('parses the edited-outside-ManyForge project warning', () => {
+    const edited = authoringWorkspaceFixture();
+    (edited.project as Record<string, unknown>).source_diagnostics = [{
+      code: 'edited_outside_manyforge',
+      source_id: 'member:program.yaml',
+      message: 'Edited outside ManyForge since the last Save',
+    }];
+    expect(parseAuthoringWorkspaceSnapshot(edited).project.sourceDiagnostics).toEqual([{
+      code: 'edited_outside_manyforge',
+      sourceId: 'member:program.yaml',
+      message: 'Edited outside ManyForge since the last Save',
+    }]);
+    (edited.project as Record<string, unknown>).source_diagnostics = [{
+      code: 'unknown_diagnostic', source_id: 'x', message: 'x',
+    }];
+    expect(() => parseAuthoringWorkspaceSnapshot(edited)).toThrow(/edited_outside_manyforge/);
+  });
+
+  it('rejects added fields and an untruthful saved comparison', () => {
+    const added = authoringWorkspaceFixture();
+    Object.assign(added, { applied: {} });
+    expect(() => parseAuthoringWorkspaceSnapshot(added)).toThrow(/exactly/);
+
+    const untruthful = authoringWorkspaceFixture();
+    const deployment = untruthful.deployment as Record<string, unknown>;
+    deployment.savedDocument = { deployment_revision: 'different' };
+    expect(() => parseAuthoringWorkspaceSnapshot(untruthful)).toThrow(
+      /truthful Draft\/Saved comparison/,
+    );
+  });
+});
+
+describe('editable Scenario document transport', () => {
+  it('parses ordinary saved documents with explicit advisory state', () => {
+    const parsed = parseScenarioDocumentIndexResponse({
+      api_version: 'manyforge.scenario_document_index.v1',
+      directory: '/workspace/examples',
+      entries: [{
+        source_kind: 'saved',
+        path: '/workspace/examples/cell',
+        scenario_id: 'cell',
+        name: 'Cell',
+        folder_name: 'cell',
+        location: 'examples',
+        description: 'Editable cell',
+        saved_manyforge_version: '1.0.0',
+        display_status: 'changed',
+        status_detail: 'Content changed since the recorded status.',
+      }],
+    });
+
+    expect(parsed.directory).toBe('/workspace/examples');
+    expect(parsed.entries.map((entry) => entry.sourceKind)).toEqual(['saved']);
+    expect(parsed.entries[0]?.displayStatus).toBe('changed');
+    expect(parsed.entries[0]?.folderName).toBe('cell');
+    expect(parsed.entries[0]?.location).toBe('examples');
+  });
+
+  it('parses a Scenario Save response', () => {
+    const saved = parseScenarioDocumentSaveResponse({
+      status: 'saved',
+      path: '/workspace/cell',
+      scenario_id: 'cell',
+      last_known_status: 'unknown',
+      workspace: workspaceFixture(),
+    });
+    expect(saved.lastKnownStatus).toBe('unknown');
+  });
+
+  it('parses an explicit portable project export', () => {
+    expect(parseScenarioDocumentExportResponse({
+      status: 'exported',
+      path: '/workspace/exports/cell',
+    })).toEqual({
+      status: 'exported',
+      path: '/workspace/exports/cell',
+    });
+  });
+});
+
+it('bounds discovery by encoded bytes and requires the exact continuation', () => {
+  const page = { schema_version: 'manyforge.historian_discovery.v1', kind: 'channel',
+    values: ['manyforge.composer'], truncated: true, next_after: 'manyforge.composer' };
+  expect(parseHistorianDiscovery(page).nextAfter).toBe('manyforge.composer');
+  for (const patch of [{ next_after: 'other' }, { values: [] },
+    { values: ['é'.repeat(513)], next_after: 'é'.repeat(513) },
+    { values: ['e\u0301'], next_after: 'e\u0301' }]) {
+    expect(() => parseHistorianDiscovery({ ...page, ...patch })).toThrow(StructuralContractError);
+  }
+});
+
+function programFixture(): Record<string, unknown> {
+  return {
+    api_version: 'manyforge.program.v2',
+    program_id: 'fixture',
+    program_revision: `sha256:${'a'.repeat(64)}`,
+    program_profile: 'composable-cell-v1',
+    name: 'Fixture',
+    catalog: {
+      api_version: 'manyforge.node_catalog.v2',
+      content_version: '2.4.0',
+    },
+    component_roles: {},
+    target_roles: {},
+    parameters: [{
+      parameter_id: 'duration',
+      type: 'float64',
+      default: 0.5,
+    }],
+    blackboard: { namespaces: [], keys: [] },
+    tree: {
+      node_id: 'timer',
+      instance_id: 'wait',
+      parameters: {},
+      value_sources: {
+        duration_s: { kind: 'program_parameter', reference: 'duration' },
+      },
+      children: [],
+    },
+  };
+}
+
+function workspaceFixture(): Record<string, unknown> {
+  const program = programFixture();
+  const programFields = { ...program };
+  const tree = programFields.tree;
+  delete programFields.program_revision;
+  delete programFields.tree;
+  return {
+    schemaVersion: 'manyforge.composer_program_workspace.v2',
+    authoringWorkspace: {
+      workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
+      programDraftId: 'draft-1', programDraftRevision: 2,
+      deploymentDraftId: 'deployment-draft-1', deploymentDraftRevision: 4,
+    },
+    draft: {
+      draftId: 'draft-1',
+      draftRevision: 2,
+      programLoaded: true,
+      authoring: {
+        schema_version: 'manyforge.composer_authoring_forest.v1',
+        ...programFields,
+        forest: [tree],
+        positions: {},
+      },
+      candidateAvailable: true,
+      programRevision: program.program_revision,
+      program,
+      diagnostics: [],
+      formulaReferences: { computedKeys: {}, nodes: {} },
+    },
+    applicability: {
+      applyReady: true,
+      unavailableReason: null,
+    },
+    saved: {
+      available: true,
+      matchesDraft: false,
+      path: '/workspace/fixture.program.yaml',
+      programRevision: `sha256:${'b'.repeat(64)}`,
+    },
+    applied: {
+      available: false,
+      matchesDraft: null,
+      programRevision: null,
+      unavailableReason: {
+        code: 'program_apply_unavailable',
+        message: 'Apply waits for N7.',
+        restorationGates: ['N7'],
+      },
+    },
+    hasUnsavedChanges: true,
+    hasUnappliedChanges: null,
+  };
+}
+
+function deploymentWorkspaceFixture(): Record<string, unknown> {
+  const digestA = `sha256:${'a'.repeat(64)}`;
+  const digestB = `sha256:${'b'.repeat(64)}`;
+  const digestC = `sha256:${'c'.repeat(64)}`;
+  return {
+    schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+    authoringWorkspace: {
+      workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
+      programDraftId: 'draft-1', programDraftRevision: 2,
+      deploymentDraftId: 'deployment-draft-1', deploymentDraftRevision: 4,
+    },
+    draft: {
+      id: 'deployment-draft-1',
+      revision: 4,
+      document: {
+        api_version: 'manyforge.deployment.v1',
+        deployment_artifact_id: 'deployment.fixture',
+        deployment_revision: digestA,
+        graph: { runtime_units: [], model_instances: [], controllable_components: [],
+          control_domains: [], control_bindings: [], component_attachments: [] },
+      },
+      deploymentArtifactId: 'deployment.fixture',
+      deploymentRevision: digestA,
+      graphRevision: digestC,
+      differsFromSaved: false,
+    },
+    saved: { path: '/workspace/deployment.fixture.json', deploymentRevision: digestA, differsFromApplied: null },
+    managerApplied: { activationOrder: null, deploymentRevision: digestA, scenarioId: 'fixture' },
+    runAdmission: { ready: true, reason: null },
+    binding: programBindingFixture('fixture-program', digestB, digestA),
+    scenarioCandidates: [{
+      scenarioId: 'fixture',
+      sourceDocumentDigest: digestB,
+      deploymentArtifactId: 'deployment.fixture',
+      deploymentRevision: digestA,
+      retainedBundleId: digestB,
+      programId: 'fixture-program',
+      programRevision: digestB,
+      programBindingId: digestA,
+      description: 'Fixture Scenario',
+    }],
+    savedScenarioCandidates: [{
+      scenarioId: 'fixture',
+      sourceDocumentDigest: digestB,
+      deploymentArtifactId: 'deployment.fixture',
+      deploymentRevision: digestA,
+      retainedBundleId: digestB,
+      programId: 'fixture-program',
+      programRevision: digestB,
+      programBindingId: digestA,
+      description: 'Fixture Scenario',
+    }],
+    unavailableReasons: [],
+  };
+}
+
+function programBindingFixture(
+  programId: string,
+  programRevision: string,
+  programBindingId: string,
+): Record<string, unknown> {
+  const binding = structuredClone(nativeBindingFixture) as Record<string, unknown>;
+  binding.program_binding_id = programBindingId;
+  binding.program_id = programId;
+  binding.program_revision = programRevision;
+  binding.retained_bundle_id = `sha256:${'b'.repeat(64)}`;
+  binding.graph_revision = `sha256:${'c'.repeat(64)}`;
+  (binding.node_environment as Record<string, unknown>).environment_digest =
+    `sha256:${'a'.repeat(64)}`;
+  return binding;
+}
+
+function sourceSectionFixture(): Record<string, unknown> {
+  return {
+    available: true,
+    freshness: 'fresh',
+    known_gaps: [],
+    payload: { schema_version: 'fixture.v1' },
+    source_generation: 1,
+    source_owner_epoch: 'source-epoch-1',
+    source_owner_id: 'source-owner',
+    receiver_age_ns: 100,
+  };
+}
+
+function runtimeSnapshotFixture(): Record<string, unknown> {
+  return {
+    schema_version: 'manyforge.headless_runtime_snapshot.v1',
+    complete: true,
+    projection_generation: 4,
+    projection_owner_epoch: 'projection-epoch-1',
+    projection_owner_id: 'headless-api',
+    reasons: [],
+    unavailable_sections: [],
+    sections: {
+      manager: sourceSectionFixture(),
+      logical_scene: sourceSectionFixture(),
+      scene_runtime: sourceSectionFixture(),
+    },
+  };
+}
+
+function alarmSnapshotFixture(): Record<string, unknown> {
+  const alarm = {
+    condition_id: 'condition-1',
+    activation_id: 'activation-1',
+    record_revision: 3,
+    activated_at_ns: 100,
+    definition_id: 'manyforge.test.condition',
+    lifecycle_state: 'active_unacknowledged',
+    active: true,
+    acknowledged: false,
+    priority: 'high',
+    alarm_class: 'runtime_health',
+    title: 'Test alarm',
+    message: 'A condition requires attention.',
+    consequence: 'Runtime state may be incomplete.',
+    operator_response: 'Inspect the source.',
+    occurrence_count: 2,
+    acknowledgement_required: true,
+    requires_motion_attention: false,
+    subject: {
+      subject_kind: 'cell',
+      subject_id: 'cell-1',
+      resource_ids: [],
+    },
+    details: { source: 'fixture' },
+  };
+  return {
+    schema_version: 'manyforge.operator_alarm_snapshot.v2',
+    owner_id: 'alarm-owner',
+    owner_epoch: 'alarm-epoch-1',
+    generation: 2,
+    state_revision: 3,
+    reconciled: true,
+    health: { state: 'available', details: {} },
+    live_count: 1,
+    unacknowledged_count: 1,
+    active_count: 1,
+    active_acknowledged_count: 0,
+    motion_attention_count: 0,
+    motion_attention_membership: [],
+    unacknowledged_membership: [{
+      condition_id: 'condition-1',
+      activation_id: 'activation-1',
+      record_revision: 3,
+    }],
+    alarms: [alarm],
+    truncated: false,
+  };
+}
+
+function structuralManifestFixture(): Record<string, unknown> {
+  return {
+    cell_id: 'fixture-cell',
+    graph_revision: 'graph-7',
+    retained_bundle_id: `sha256:${'a'.repeat(64)}`,
+    viewer_model_revision: `sha256:${'b'.repeat(64)}`,
+    model_key: 'model-key-123',
+    root_link: 'base_link',
+    projection: {
+      kind: 'retained_neutral',
+      source: 'active_retained_viewer_model',
+      root_frame: 'base_link',
+      position_unit: 'm',
+      angle_unit: 'rad',
+      quaternion_order: 'xyzw',
+      joint_coordinate_policy: 'zero_independent_with_retained_mimic',
+      operational_validity: 'not_asserted',
+      runtime_state_used: false,
+    },
+    links: [
+      {
+        name: 'base_link',
+        neutral_transform: {
+          relative_to: 'base_link',
+          position_m: [0, 0, 0],
+          orientation_xyzw: [0, 0, 0, 1],
+        },
+        visuals: [],
+        collisions: [],
+      },
+    ],
+    joints: [],
+  };
+}
+
+function sourceModelFixture(): Record<string, unknown> {
+  return {
+    schema_version: 'manyforge.source_model_projection.v3',
+    cell_id: 'cell-a',
+    retained_bundle_id: 'bundle-1',
+    graph_revision: 'graph-1',
+    model_map_contract: null,
+    model_map_product_id: null,
+    components: [
+      { component_id: 'lite6_robot', mounted_on: null },
+      { component_id: 'lite_gripper', mounted_on: { component_id: 'lite6_robot', interface_id: 'flange' } },
+    ],
+    occurrences: [],
+    targets: [],
+    source: {
+      available: true,
+      freshness: 'fresh',
+      known_gaps: [],
+      projection_generation: 1,
+      projection_owner_epoch: 'source-projection-1',
+      receiver_age_ns: 10,
+      selection_projection_generation: 2,
+      selection_source_content_digest: `sha256:${'a'.repeat(64)}`,
+      selection_source_generation: 3,
+      selection_source_owner_epoch: 'manager-epoch-1',
+      selection_source_owner_id: 'component-manager.cell-a',
+      source_content_digest: `sha256:${'b'.repeat(64)}`,
+      source_generation: 4,
+      source_owner_epoch: 'source-owner-epoch-1',
+      source_owner_id: 'headless-api.source-model',
+      source_owner_kind: 'source_model_projection',
+    },
+  };
+}
+
+function projectionRevisionFixture(revision = 1): Record<string, unknown> {
+  return {
+    retained_bundle_id: 'bundle-1',
+    graph_revision: 'graph-1',
+    scene_revision: {
+      scene_id: 'scene-1',
+      revision_id: revision,
+      content_hash: `sha256:${'c'.repeat(64)}`,
+    },
+  };
+}
+
+function managerApplyRecordFixture(): Record<string, unknown> {
+  return {
+    apply_generation: 3,
+    apply_id: 'apply-3',
+    candidate_graph_revision: 'graph-2',
+    candidate_retained_bundle_id: 'bundle-2',
+    committed: false,
+    expected_active_projection_revision: projectionRevisionFixture(),
+    fence: {
+      acceptance_digest: `sha256:${'d'.repeat(64)}`,
+      configuration_fence_generation: 2,
+      configuration_fence_id: 'fence-2',
+      fence_attempt_digest: `sha256:${'e'.repeat(64)}`,
+      scope: { configurations: ['configuration-1'], resources: ['resource-1'] },
+      state: 'held',
+    },
+    incomplete: true,
+    intent_digest: `sha256:${'f'.repeat(64)}`,
+    phase: 'fence_held',
+    scene_initialization: 'preserve',
+    prepared_activation: {
+      schema_version: 'manyforge.prepared_activation_input.v6',
+      prepared_activation_id: `sha256:${'a'.repeat(64)}`,
+      origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: `sha256:${'b'.repeat(64)}`, project_path: '/projects/fixture.scenario' },
+      captured_input_digest: `sha256:${'c'.repeat(64)}`,
+      deployment_artifact_id: 'deployment.fixture',
+      deployment_revision: `sha256:${'d'.repeat(64)}`,
+      retained_bundle_id: `sha256:${'e'.repeat(64)}`,
+      graph_revision: `sha256:${'f'.repeat(64)}`,
+      program_id: 'fixture-program',
+      program_revision: `sha256:${'a'.repeat(64)}`,
+      program_outcome: { kind: 'bound', program_binding_id: `sha256:${'b'.repeat(64)}` },
+      node_environment_digest: `sha256:${'c'.repeat(64)}`,
+      assistant_mode: 'forbidden',
+    },
+    request: {
+      correlation_id: null,
+      request_id: 'request-3',
+      request_owner_epoch: 'browser-epoch-3',
+      source_label: 'composer_ui',
+    },
+    terminal_state: null,
+  };
+}
+
+function logicalSceneFixture(): Record<string, unknown> {
+  return {
+    api_version: 'manyforge.logical_scene_source.v1',
+    access: {
+      active_projection: projectionRevisionFixture(),
+      phase: 'finalized',
+      projection_leases_open: true,
+      scene_writes_open: true,
+    },
+    snapshot: {
+      carried_object_attachments: [],
+      cell_id: 'cell-a',
+      configured_collision_policy: {},
+      objects: [{
+        collision_shapes: [{
+          type: 'box',
+          dimensions_m: { x: 0.1, y: 0.2, z: 0.3 },
+        }],
+        placement: {
+          kind: 'cell_fixed',
+          cell_id: 'cell-a',
+          pose_in_cell: {
+            position_m: { x: 0.4, y: 0, z: 0.5 },
+            orientation_xyzw: [0, 0, 0, 1],
+          },
+        },
+        provider_evidence: null,
+        scene_resource_id: 'part',
+        support_contacts: [],
+      }],
+      policy_epoch: 1,
+      revision: (projectionRevisionFixture().scene_revision as Record<string, unknown>),
+      topology_epoch: 1,
+      transaction_sequence: 1,
+    },
+  };
+}
+
+function sceneRuntimeFixture(): Record<string, unknown> {
+  return {
+    api_version: 'manyforge.scene_runtime_source.v1',
+    cell_id: 'cell-a',
+    state: {
+      active_replay_id: null,
+      api_version: 'manyforge.scene_runtime_state.v2',
+      counters: {
+        buffer_replaced: 0,
+        buffered: 0,
+        closed: 0,
+        failed: 0,
+        opened: 1,
+        replayed: 0,
+        retired: 0,
+        stale_completion_rejected: 0,
+      },
+      deferred: false,
+      error: null,
+      initialization_generation: 1,
+      initialization_token: 'token-1',
+      pose_sources: [],
+      reason: 'ready',
+      runtime_identity: {
+        deployment_generation: 1,
+        graph_revision: 'graph-1',
+        program_generation: 0,
+        retained_bundle_id: 'bundle-1',
+        runtime_generation: 1,
+      },
+      started_at_ns: 1,
+      state: 'open',
+      updated_at_ns: 2,
+    },
+  };
+}
+
+function poseSourceFixture(
+  payload: Record<string, unknown>,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    buffered: false,
+    eligible: false,
+    expires_at_ns: 2_000_000_000,
+    fresh: true,
+    object_id: 'robot-1',
+    observed_at_ns: 1_000_000_000,
+    payload,
+    policy_id: 'viewer.measured_robot',
+    payload_quality: 'good',
+    source_epoch: 'observer-epoch-1',
+    source_epoch_order: 1,
+    source_id: 'isaac-observer',
+    source_sequence: 7,
+    ...overrides,
+  };
+}
+
+describe('parseSceneUrdfManifest', () => {
+  it('accepts a complete authored-neutral projection', () => {
+    const parsed = parseSceneUrdfManifest(structuralManifestFixture());
+
+    expect(parsed.projection.runtime_state_used).toBe(false);
+    expect(parsed.projection.operational_validity).toBe('not_asserted');
+    expect(parsed.links[0]?.neutral_transform.relative_to).toBe('base_link');
+  });
+
+  it('rejects a projection that claims runtime state was used', () => {
+    const fixture = structuralManifestFixture();
+    const projection = fixture.projection as Record<string, unknown>;
+    projection.runtime_state_used = true;
+
+    expect(() => parseSceneUrdfManifest(fixture)).toThrowError(
+      StructuralContractError,
+    );
+  });
+
+  it('rejects links without explicit neutral transforms', () => {
+    const fixture = structuralManifestFixture();
+    const [link] = fixture.links as Record<string, unknown>[];
+    delete link.neutral_transform;
+
+    expect(() => parseSceneUrdfManifest(fixture)).toThrow(
+      'manifest.links[0].neutral_transform must be an object',
+    );
+  });
+
+  it('rejects historical runtime-authority fields', () => {
+    const fixture = structuralManifestFixture();
+    fixture.authority = { commandable_joint_names: ['joint1'] };
+
+    expect(() => parseSceneUrdfManifest(fixture)).toThrow(
+      'manifest must be free of runtime authority and live-state fields',
+    );
+  });
+});
+
+describe('scene mesh asset parser', () => {
+  const asset = () => ({
+    schema_version: 'manyforge.scene_mesh_asset.v2',
+    asset_hash: '0123456789abcdef',
+    mesh_asset_url: '/api/scene/object-meshes/0123456789abcdef.glb',
+    mesh_asset_status: 'pending',
+    last_error: null,
+  });
+
+  it('requires the exact content-addressed URL without owner identity', () => {
+    expect(parseSceneMeshAssetMetadata(asset()).mesh_asset_url)
+      .toBe('/api/scene/object-meshes/0123456789abcdef.glb');
+    for (const url of [
+      '/api/scene/object-meshes/0123456789abcdef.glb?owner_epoch=scene.epoch.1&generation=7',
+      '/api/scene/object-meshes/fedcba9876543210.glb',
+    ]) {
+      expect(() => parseSceneMeshAssetMetadata({ ...asset(), mesh_asset_url: url }))
+        .toThrow(/content-addressed/);
+    }
+    // The removed owner-generation fields and the v1 schema are rejected.
+    expect(() => parseSceneMeshAssetMetadata({
+      ...asset(), source_owner_epoch: 'scene.epoch.1', source_generation: 7,
+    })).toThrow();
+    expect(() => parseSceneMeshAssetMetadata({
+      ...asset(), schema_version: 'manyforge.scene_mesh_asset.v1',
+    })).toThrow(/scene_mesh_asset\.v2/);
+  });
+
+  it('requires the exact Program Draft-revision-bound URL', () => {
+    const draftAsset = {
+      schema_version: 'manyforge.program_draft_mesh_asset.v1',
+      asset_hash: '0123456789abcdef',
+      mesh_asset_url: '/api/program/draft/scene-meshes/0123456789abcdef.glb?draft_id=draft-1&draft_revision=9',
+      mesh_asset_status: 'pending',
+      draft_id: 'draft-1',
+      draft_revision: 9,
+      last_error: null,
+    };
+    expect(parseProgramDraftMeshAssetMetadata(draftAsset).draft_revision).toBe(9);
+    draftAsset.mesh_asset_url = '/api/program/draft/scene-meshes/0123456789abcdef.glb?draft_id=draft-1&draft_revision=8';
+    expect(() => parseProgramDraftMeshAssetMetadata(draftAsset)).toThrow(/Draft-revision/);
+  });
+});
+
+describe('Program product projections', () => {
+  const digestA = `sha256:${'a'.repeat(64)}`;
+  const digestB = `sha256:${'b'.repeat(64)}`;
+  const digestC = `sha256:${'c'.repeat(64)}`;
+
+  function runStatus(state = 'running'): Record<string, unknown> {
+    return {
+      schema_version: 'manyforge.program_run_status.v3',
+      owner_id: 'program-runner.cell-a',
+      owner_epoch: 'program-runner.epoch.1',
+      run_revision: 3,
+      state,
+      capture: {
+        schema_version: 'manyforge.program_run_capture.v2',
+        program_run_id: 'program-run.1',
+        applied_record_digest: digestC,
+        scenario_id: 'cell-pick',
+        source_document_digest: digestA,
+        program_id: 'pick',
+        program_revision: digestB,
+        program_binding_id: digestC,
+        retained_bundle_id: digestA,
+        graph_revision: digestB,
+        node_environment_digest: digestC,
+        node_policy_digest: digestA,
+        node_policies: [],
+        owner_identities: [{
+          owner_role: 'program_runner',
+          owner_id: 'program-runner.cell-a',
+          owner_epoch: 'program-runner.epoch.1',
+        }],
+      },
+      tree_status: 'running',
+      node_status_revision: 2,
+      node_statuses: { root: 'running' },
+      active_operation_count: 1,
+      operation_failures: [],
+      reason_code: null,
+      message: '',
+      details: null,
+      origin: null,
+    };
+  }
+
+  function failedRunStatus(
+    details: unknown,
+    origin: unknown = { kind: 'owner', node_instance_id: 'move', owner_api: 'scene.frames' },
+  ): Record<string, unknown> {
+    return {
+      ...runStatus('failed'),
+      tree_status: 'failure',
+      node_statuses: { root: 'failure', move: 'failure' },
+      reason_code: 'owner_request_failed',
+      message: 'frame role tool0 is not available',
+      details,
+      origin,
+    };
+  }
+
+  function recoveryOffer(): Record<string, unknown> {
+    return {
+      schema_version: 'manyforge.cycle_recovery_offer.v5',
+      offer_id: digestA,
+      offer_revision: 1,
+      generated_at_ns: 10,
+      kernel_assessment_revision: 0,
+      control_command_epoch: 0,
+      operation_id: null,
+      operation_revision: null,
+      program_run_id: 'program-run.1',
+      program_binding_id: digestC,
+      node_instance_id: 'move',
+      node_attempt_id: 'move.attempt.1',
+      participants: [],
+      graph_revision: digestB,
+      retained_bundle_id: digestA,
+      cycle_generation: 1,
+      program_generation: 1,
+      deployment_generation: 1,
+      scene_admission_epoch: 1,
+      pose_source_apply_generation: 0,
+      stop_id: null,
+      stop_generation: null,
+      stop_certificate_id: null,
+      stop_certificate_revision: null,
+      status: 'action_required',
+      recovery_class: 'node_failure_pause',
+      actions: [{
+        action_id: 'reset_cycle',
+        requires_confirmation: true,
+        performs_backend_reset: true,
+        enabled: true,
+        disabled_reason_code: null,
+      }],
+      reason_code: 'node_input_unavailable',
+      message: "missing input duration_s from blackboard_key 'delay'",
+      details: {
+        input_problem: 'missing',
+        path: 'duration_s',
+        source_kind: 'blackboard_key',
+        source_reference: 'delay',
+      },
+      origin: { kind: 'program_node', node_instance_id: 'move', owner_api: null },
+      evidence_refs: [],
+      manual_result: { enabled: false, disabled_reason_code: 'manual_result_not_available' },
+      policy: { allow_intervention: true, max_retries: 0 },
+      retries_used: 300,
+    };
+  }
+
+  function runtimeControlsProjection(): Record<string, unknown> {
+    return {
+      schema_version: 'manyforge.program_runtime_control_projection.v9',
+      owner_id: 'program-runner.cell-a',
+      owner_epoch: 'program-runner.epoch.1',
+      program_run_id: 'program-run.1',
+      run_revision: 3,
+      runtime_controls: {
+        schema_version: 'manyforge.program_runtime_controls.v3',
+        program_run_id: 'program-run.1',
+        runtime_control_revision: 1,
+        recovery_fences: {
+          program_generation: 1,
+          deployment_generation: 1,
+          scene_admission_epoch: 1,
+          pose_source_apply_generation: 0,
+        },
+        retry_counts: {},
+        audit: [],
+      },
+      recovery_offer: null,
+      recovery_offers: [],
+      execution_selections: {
+        selection_revision: 0,
+        motion_held: false,
+        groups: [{ group_id: 'all', node_count: 1, held_node_count: 0,
+          state: 'running', stop_allowed: true,
+          start_allowed: false, start_unavailable_reason: 'selection_not_ready',
+          resume_allowed: false,
+          resume_unavailable_reason: 'selection_not_held',
+          runtime_scale_selector: {
+            program_binding_id: digestC,
+            component_role_id: 'robot',
+            target_role_id: 'arm',
+          },
+          runtime_scale_unavailable_reason: null,
+          resource_ids: ['robot.joint_1', 'robot.joint_2'] }],
+      },
+    };
+  }
+
+  it('parses the exact Applied owner identity', () => {
+    const appliedInput = {
+      assistant_mode: 'forbidden',
+      assistant_projection: null,
+      simulation_scene: null,
+      baseline_program_binding_id: digestA,
+      deployment_artifact_id: 'cell-a',
+      deployment_revision: digestB,
+      graph_revision: digestC,
+      node_environment_digest: digestA,
+      owner_identities: [{
+        owner_role: 'headless_projection',
+        owner_id: 'headless.program-apply',
+        owner_epoch: 'headless.epoch.1',
+      }],
+      preparation_digest: digestB,
+      program: programFixture(),
+      program_binding: programBindingFixture('fixture', digestA, digestC),
+      program_binding_id: digestC,
+      program_id: 'fixture',
+      program_revision: digestA,
+      retained_bundle_id: digestB,
+      source_document_digest: digestA,
+      scenario_id: 'cell-pick',
+      project_path: '/projects/cell-pick.scenario',
+      schema_version: 'manyforge.applied_program_selection.v3',
+      source: {
+        record_digest: digestC,
+        semantic_content_digest: digestB,
+        source_generation: 1,
+        source_owner_epoch: 'headless.epoch.1',
+        source_owner_id: 'headless.program-apply',
+      },
+    };
+    const applied = parseAppliedProgramSelection(appliedInput);
+
+    const current = parseCurrentScenarioResponse({
+      schema_version: 'manyforge.current_scenario.v1',
+      ready: true,
+      current_scenario: {
+        scenario_id: 'cell-pick',
+        source_document_digest: digestA,
+        deployment_artifact_id: 'cell-a',
+        deployment_revision: digestB,
+        retained_bundle_id: digestC,
+        graph_revision: digestB,
+        program_id: 'fixture',
+        program_revision: digestA,
+        program_binding_id: digestC,
+      },
+      unavailable_reasons: [],
+    });
+    expect(current.currentScenario?.scenarioId).toBe('cell-pick');
+    expect(() => parseCurrentScenarioResponse({
+      schema_version: 'manyforge.current_scenario.v1',
+      ready: false,
+      current_scenario: null,
+      unavailable_reasons: [],
+    })).toThrow(/unavailable reasons exactly when no current Scenario exists/);
+    expect(applied.recordDigest).toBe(digestC);
+    expect(applied.sourceOwnerEpoch).toBe('headless.epoch.1');
+    expect(applied.program.program_id).toBe('fixture');
+    expect(applied.programBinding.program_binding_id).toBe(digestC);
+    expect(
+      applied.programBinding.component_role_bindings[0].component_role_id,
+    ).toBeTypeOf('string');
+    const nestedMalformed = programBindingFixture('fixture', digestA, digestC);
+    (
+      (
+        nestedMalformed.target_role_bindings as Record<string, unknown>[]
+      )[0].frame_role_bindings as Record<string, unknown>[]
+    )[0].unknown = true;
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_binding: nestedMalformed,
+    })).toThrow(/closed record/);
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_binding: programBindingFixture(
+        'another-program',
+        digestA,
+        digestC,
+      ),
+    })).toThrow(/content-identical Program and Program Binding identities/);
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_binding: {
+        ...programBindingFixture('fixture', digestA, digestC),
+        retained_bundle_id: digestA,
+      },
+    })).toThrow(/content-identical Program and Program Binding identities/);
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_binding: {
+        ...programBindingFixture('fixture', digestA, digestC),
+        graph_revision: digestA,
+      },
+    })).toThrow(/content-identical Program and Program Binding identities/);
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_binding: {
+        ...programBindingFixture('fixture', digestA, digestC),
+        node_environment: {
+          ...(programBindingFixture(
+            'fixture',
+            digestA,
+            digestC,
+          ).node_environment as Record<string, unknown>),
+          unknown: true,
+        },
+      },
+    })).toThrow(/closed record/);
+  });
+
+  // Same eight-field provenance row as the actual Runner/Headless contract.
+  function operationFailureRow() {
+    return { node_instance_id: 'retry_move', node_attempt_id: 'retry_move.attempt.1',
+      operator_facing_run_revision: 3,
+      operation: { source_owner_epoch: 'kernel.1', operation_id: 'operation.1', operation_revision: 2 },
+      resource_ids: ['lite6_robot.arm.coordinate.000000'],
+      failure: { code: 'planning_failed', message: 'original failure' },
+      recovery_class: 'failed_validation', terminal_facts: [{ kind: 'local_failure', effect: 'no_effect' }] };
+  }
+
+  it('accepts the actual held R5a Run with its required empty operation failures', () => {
+    const run = parseProgramRunStatus(actualHeldRun);
+    expect(run.capture.programRunId).toBe('program-cycle.1');
+    expect(run.state).toBe('running');
+    expect(run.nodeStatuses.start_rest).toBe('held');
+    expect(run.operationFailures).toEqual([]);
+    const missing = { ...actualHeldRun } as Record<string, unknown>;
+    delete missing.operation_failures;
+    expect(() => parseProgramRunStatus(missing)).toThrow();
+  });
+
+  it('retains exact nonempty operation failure provenance without inferring new authority', () => {
+    const run = parseProgramRunStatus({ ...actualHeldRun, operation_failures: [operationFailureRow()] });
+    expect(run.operationFailures).toEqual([{ nodeInstanceId: 'retry_move', nodeAttemptId: 'retry_move.attempt.1',
+      operatorFacingRunRevision: 3,
+      operation: { sourceOwnerEpoch: 'kernel.1', operationId: 'operation.1', operationRevision: 2 },
+      resourceIds: ['lite6_robot.arm.coordinate.000000'],
+      failure: { code: 'planning_failed', message: 'original failure' },
+      recoveryClass: 'failed_validation', terminalFacts: [{ kind: 'local_failure', effect: 'no_effect' }] }]);
+  });
+
+  it('accepts producer bounds and Unicode code-point resource ordering', () => {
+    const row = operationFailureRow();
+    row.operator_facing_run_revision = Number.MAX_SAFE_INTEGER;
+    row.operation.operation_revision = Number.MAX_SAFE_INTEGER;
+    row.node_instance_id = 'é'.repeat(64); // Exactly 128 UTF-8 bytes.
+    row.failure.message = '';
+    row.resource_ids = ['\uE000', '\u{10000}']; // Python order differs from UTF-16 sort.
+    row.terminal_facts = []; // No terminal facts are inferred.
+    expect(parseProgramRunStatus({ ...runStatus(), operation_failures: [row] }).operationFailures[0])
+      .toMatchObject({ nodeInstanceId: row.node_instance_id, resourceIds: row.resource_ids,
+        operatorFacingRunRevision: Number.MAX_SAFE_INTEGER, failure: { message: '' }, terminalFacts: [] });
+  });
+
+  it.each([null, {}, Array(4097).fill(operationFailureRow())])(
+    'rejects missing collection shape or over-bound operation failures (%#)', (rows) => {
+      expect(() => parseProgramRunStatus({ ...runStatus(), operation_failures: rows })).toThrow();
+    },
+  );
+  it.each([
+    null,
+    { ...operationFailureRow(), extra: true },
+    { ...operationFailureRow(), node_attempt_id: '' },
+    { ...operationFailureRow(), node_instance_id: 'é'.repeat(65) },
+    { ...operationFailureRow(), node_instance_id: 'e\u0301' },
+    { ...operationFailureRow(), operator_facing_run_revision: 0 },
+    { ...operationFailureRow(), operator_facing_run_revision: true },
+    { ...operationFailureRow(), operation: { ...operationFailureRow().operation, operation_revision: 2 ** 53 } },
+    { ...operationFailureRow(), operation: { ...operationFailureRow().operation, extra: true } },
+    { ...operationFailureRow(), operation: { ...operationFailureRow().operation, source_owner_epoch: 'é'.repeat(1025) } },
+    { ...operationFailureRow(), resource_ids: [] },
+    { ...operationFailureRow(), resource_ids: ['b', 'a'] },
+    { ...operationFailureRow(), resource_ids: ['a', 'a'] },
+    { ...operationFailureRow(), resource_ids: ['a'.repeat(1025)] },
+    { ...operationFailureRow(), resource_ids: Array.from({ length: 4097 }, (_, index) => String(index).padStart(4, '0')) },
+    { ...operationFailureRow(), failure: { code: '', message: '' } },
+    { ...operationFailureRow(), failure: { code: 'failed', message: 'é'.repeat(2049) } },
+    { ...operationFailureRow(), failure: { code: 'failed', message: '', extra: true } },
+    { ...operationFailureRow(), recovery_class: '' },
+    { ...operationFailureRow(), terminal_facts: [{ kind: 'failed', effect: '', extra: true }] },
+    { ...operationFailureRow(), terminal_facts: [{ kind: 'failed', effect: 1 }] },
+    { ...operationFailureRow(), terminal_facts: Array(4097).fill({ kind: 'failed', effect: 'no_effect' }) },
+  ])('rejects malformed or unbounded failure provenance row (%#)', (row) => {
+    expect(() => parseProgramRunStatus({ ...runStatus(), operation_failures: [row] })).toThrow();
+  });
+
+  it('keeps run status tied to one exact runner owner', () => {
+    const status = parseProgramRunStatus(runStatus());
+
+    expect(status.capture.programRunId).toBe('program-run.1');
+  });
+
+  it('carries the run end reason (CONTRACTS §9) once the run has ended', () => {
+    expect(parseProgramRunStatus(runStatus()).runEnd).toBeNull();
+    expect(parseProgramRunStatus({ ...runStatus(), run_end: null }).runEnd).toBeNull();
+    expect(parseProgramRunStatus({ ...runStatus(), run_end: {
+      end_reason: 'stopped', details: { stopped_by: 'rule', rule_id: 'door' },
+    } }).runEnd).toEqual({ end_reason: 'stopped', details: { stopped_by: 'rule', rule_id: 'door' } });
+    expect(parseProgramRunStatus({ ...runStatus(), run_end: {
+      end_reason: 'cell_fault',
+      details: { component_id: 'lite6_robot', error: { code: 'fault_estop', message: 'e-stop' } },
+    } }).runEnd).toEqual({ end_reason: 'cell_fault',
+      details: { component_id: 'lite6_robot', error: { code: 'fault_estop', message: 'e-stop' } } });
+    expect(() => parseProgramRunStatus({ ...runStatus(), run_end: { end_reason: 'aborted', details: {} } }))
+      .toThrow(/end_reason/);
+  });
+
+  it('carries a run failure as one structured error', () => {
+    const status = parseProgramRunStatus(failedRunStatus({
+      reason: 'frame_role_unresolved',
+      reference_type: 'frame_role',
+      reference_id: 'tool0',
+      target_role_id: 'arm',
+      retryable: false,
+    }));
+
+    expect(status.reason).toEqual({
+      code: 'owner_request_failed',
+      message: 'frame role tool0 is not available',
+      details: {
+        reason: 'frame_role_unresolved',
+        reference_type: 'frame_role',
+        reference_id: 'tool0',
+        target_role_id: 'arm',
+        retryable: false,
+      },
+      origin: { kind: 'owner', nodeInstanceId: 'move', ownerApi: 'scene.frames' },
+    });
+    expect(status.message).toBe('frame role tool0 is not available');
+    expect(parseProgramRunStatus(runStatus()).reason).toBeNull();
+    const stopped = { ...runStatus('stopped'), reason_code: 'operator_stop', message: 'Stopped' };
+    expect(parseProgramRunStatus(stopped).reason).toEqual({
+      code: 'operator_stop', message: 'Stopped', details: null, origin: null,
+    });
+  });
+
+  it('accepts a retained failed run migrated without details or origin', () => {
+    expect(parseProgramRunStatus(failedRunStatus(null, null)).reason).toEqual({
+      code: 'owner_request_failed',
+      message: 'frame role tool0 is not available',
+      details: null,
+      origin: null,
+    });
+  });
+
+  it('refuses failure details outside their registered bounds', () => {
+    expect(() => parseProgramRunStatus(failedRunStatus({ stack: 'trace' })))
+      .toThrow(/registered failure-detail key/);
+    expect(() => parseProgramRunStatus(failedRunStatus({ reason: { nested: true } })))
+      .toThrow(/scalar failure detail/);
+    expect(() => parseProgramRunStatus(failedRunStatus({ reason: ['a'] })))
+      .toThrow(/scalar failure detail/);
+    expect(() => parseProgramRunStatus(failedRunStatus({ retryable: 2 ** 53 })))
+      .toThrow(/scalar failure detail/);
+    expect(parseProgramRunStatus(failedRunStatus({ retryable: -1.5 }))
+      .reason?.details?.retryable).toBe(-1.5);
+    expect(() => parseProgramRunStatus(failedRunStatus({ reason: 'é'.repeat(129) })))
+      .toThrow(/at most 256 bytes/);
+    expect(parseProgramRunStatus(failedRunStatus({ reason: 'é'.repeat(128) }))
+      .reason?.details?.reason).toBe('é'.repeat(128));
+    expect(() => parseProgramRunStatus(failedRunStatus([]))).toThrow(/an object/);
+    const keys = [
+      'reason', 'reference_type', 'reference_id', 'target_role_id', 'input_problem',
+      'path', 'source_kind', 'source_reference', 'rule_id', 'component_id', 'retryable', 'required_action',
+    ];
+    const large = Object.fromEntries(keys.map((key) => [key, 'x'.repeat(200)]));
+    expect(() => parseProgramRunStatus(failedRunStatus(large)))
+      .toThrow(/at most 2048 bytes/);
+    expect(() => parseProgramRunStatus(failedRunStatus(
+      { retryable: true },
+      null,
+    ))).toThrow(/null unless the record names a failure origin/);
+    expect(() => parseProgramRunStatus({
+      ...runStatus(),
+      origin: { kind: 'program_runner', node_instance_id: null, owner_api: null },
+    })).toThrow(/null when the run names no reason/);
+  });
+
+  it('refuses failure origins outside their kinds', () => {
+    const origin = (value: unknown) => parseProgramRunStatus(failedRunStatus(null, value)).reason?.origin;
+    expect(origin({ kind: 'program_runner', node_instance_id: null, owner_api: null }))
+      .toEqual({ kind: 'program_runner', nodeInstanceId: null, ownerApi: null });
+    expect(origin({ kind: 'owner', node_instance_id: 'move', owner_api: null }))
+      .toEqual({ kind: 'owner', nodeInstanceId: 'move', ownerApi: null });
+    for (const invalid of [
+      { kind: 'program_node', node_instance_id: null, owner_api: null },
+      { kind: 'program_node', node_instance_id: 'move', owner_api: 'kernel.operation' },
+      { kind: 'owner', node_instance_id: null, owner_api: 'kernel.operation' },
+      { kind: 'program_runner', node_instance_id: null, owner_api: 'kernel.operation' },
+      { kind: 'operator', node_instance_id: 'move', owner_api: null },
+    ]) {
+      expect(() => origin(invalid)).toThrow(/origin must be a program_node/);
+    }
+    expect(() => origin({ kind: 'owner', node_instance_id: 'move' })).toThrow(/exactly/);
+    expect(() => origin({ kind: 'owner', node_instance_id: '', owner_api: null }))
+      .toThrow(/nonempty identity/);
+    expect(() => origin({ kind: 'owner', node_instance_id: 'm'.repeat(257), owner_api: null }))
+      .toThrow(/at most 256 bytes/);
+  });
+
+  it('parses one recovery offer per active failure hold, with Continue', () => {
+    const offer = (node: string, offerId: string) => ({
+      ...recoveryOffer(),
+      offer_id: offerId,
+      node_instance_id: node,
+      node_attempt_id: `${node}.attempt.1`,
+      actions: [{
+        action_id: 'retry_motion_from_current_state',
+        requires_confirmation: false,
+        performs_backend_reset: false,
+        enabled: true,
+        disabled_reason_code: null,
+      }, {
+        action_id: 'continue_with_failure',
+        requires_confirmation: true,
+        performs_backend_reset: false,
+        enabled: true,
+        disabled_reason_code: null,
+      }],
+    });
+    const hold = (node: string, offerId: string, groups: string[], scope = 'all') => ({
+      motion_group_ids: groups,
+      intervention_stop_scope: scope,
+      offer: offer(node, offerId),
+    });
+    const parsed = parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offers: [
+        hold('left.move', digestA, ['left']),
+        hold('right.move', digestB, ['right'], 'own_groups'),
+      ],
+    });
+    expect(parsed.recoveryHolds.map((row) => [
+      row.motionGroupIds, row.interventionStopScope, row.offer.nodeInstanceId, row.offer.offerId,
+    ])).toEqual([
+      [['left'], 'all', 'left.move', digestA],
+      [['right'], 'own_groups', 'right.move', digestB],
+    ]);
+    expect(parsed.recoveryHolds[0].offer.actions[1]).toEqual({
+      actionId: 'continue_with_failure',
+      requiresConfirmation: true,
+      performsBackendReset: false,
+      enabled: true,
+      disabledReasonCode: null,
+    });
+    expect(parseProgramRuntimeControlProjection(runtimeControlsProjection()).recoveryHolds)
+      .toEqual([]);
+
+    const refuses = (holds: unknown) => () => parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(), recovery_offers: holds,
+    });
+    const projection = runtimeControlsProjection();
+    delete projection.recovery_offers;
+    expect(() => parseProgramRuntimeControlProjection(projection)).toThrow(/exactly/);
+    expect(refuses(null)).toThrow(/recovery_offers/);
+    expect(refuses([{ ...hold('a', digestA, ['left']), extra: 1 }])).toThrow(/exactly/);
+    expect(refuses([hold('a', digestA, [])])).toThrow(/motion_group_ids/);
+    expect(refuses([hold('a', digestA, ['left', 'left'])])).toThrow(/motion_group_ids/);
+    expect(refuses([hold('a', digestA, [''])])).toThrow(/motion_group_ids/);
+    expect(refuses([hold('a', digestA, ['left'], 'some')])).toThrow(/intervention_stop_scope/);
+    expect(refuses([hold('a', digestA, ['left']), hold('b', digestA, ['right'])]))
+      .toThrow(/one offer per held node/);
+    expect(refuses([hold('a', digestA, ['left']), hold('a', digestB, ['right'])]))
+      .toThrow(/one offer per held node/);
+    expect(refuses([{ ...hold('a', digestA, ['left']),
+      offer: { ...offer('a', digestA), program_run_id: 'program-run.2' } }]))
+      .toThrow(/one exact Program-run identity/);
+    expect(refuses([{ ...hold('a', digestA, ['left']),
+      offer: { ...offer('a', digestA), actions: [{ ...offer('a', digestA).actions[1], action_id: 'continue' }] } }]))
+      .toThrow(/supported recovery action/);
+  });
+
+  it('preserves the captured recovery-offer own-group intervention scope', () => {
+    const scope = 'own_groups';
+    const offer = {
+      ...recoveryOffer(),
+      policy: { allow_intervention: true, max_retries: 0, intervention_stop_scope: scope },
+    };
+    const parsed = parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offer: offer,
+      recovery_offers: [{
+        motion_group_ids: ['robot'], intervention_stop_scope: scope, offer,
+      }],
+    });
+    const expected = { allowIntervention: true, maxRetries: 0, interventionStopScope: scope };
+    expect(parsed.recoveryOffer?.policy).toEqual(expected);
+    expect(parsed.recoveryHolds[0].offer.policy).toEqual(expected);
+  });
+
+  it.each([null, true, 1, [], {}, 'all', 'groups', undefined])(
+    'rejects malformed recovery-offer intervention scope %j',
+    (scope) => {
+      expect(() => parseProgramRuntimeControlProjection({
+        ...runtimeControlsProjection(),
+        recovery_offer: {
+          ...recoveryOffer(),
+          policy: { allow_intervention: true, max_retries: 0, intervention_stop_scope: scope },
+        },
+      })).toThrow(/intervention_stop_scope/);
+    },
+  );
+
+  it('carries the held failure details and origin on the recovery offer', () => {
+    const offer = parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offer: recoveryOffer(),
+    }).recoveryOffer;
+
+    expect(offer?.reason).toEqual({
+      code: 'node_input_unavailable',
+      message: "missing input duration_s from blackboard_key 'delay'",
+      details: {
+        input_problem: 'missing',
+        path: 'duration_s',
+        source_kind: 'blackboard_key',
+        source_reference: 'delay',
+      },
+      origin: { kind: 'program_node', nodeInstanceId: 'move', ownerApi: null },
+    });
+    const withoutMessage = recoveryOffer();
+    delete withoutMessage.message;
+    expect(() => parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offer: withoutMessage,
+    })).toThrow(/exactly/);
+    expect(() => parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offer: { ...recoveryOffer(), message: 'é'.repeat(2049) },
+    })).toThrow(/at most 4096 bytes/);
+    expect(parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offer: { ...recoveryOffer(), message: 'é'.repeat(2048) },
+    }).recoveryOffer?.reason.message).toBe('é'.repeat(2048));
+    expect(() => parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offer: { ...recoveryOffer(), schema_version: 'manyforge.cycle_recovery_offer.v4' },
+    })).toThrow(/cycle_recovery_offer.v5/);
+    // Omitted stop scope stays omitted: zero is Unlimited and the used count
+    // may exceed the finite configured range.
+    expect(offer?.policy).toEqual({ allowIntervention: true, maxRetries: 0 });
+    expect(offer?.retriesUsed).toBe(300);
+    for (const policy of [
+      {},
+      { allow_intervention: true, max_retries: 256 },
+      { allow_intervention: true, max_retries: 1, intervention_delegate: 'forbidden' },
+      { allow_intervention: true, max_retries: 1, intervention_stop_scope: 'own_groups', extra: true },
+    ]) {
+      expect(() => parseProgramRuntimeControlProjection({
+        ...runtimeControlsProjection(),
+        recovery_offer: { ...recoveryOffer(), policy },
+      })).toThrow();
+    }
+    expect(() => parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offer: { ...recoveryOffer(), details: { secret: 'x' } },
+    })).toThrow(/registered failure-detail key/);
+  });
+
+  it('exposes a Composer ErrorDTO as a structured error without an origin', () => {
+    expect(parseApiErrorDto({
+      detail: {
+        code: 'activation_preparation_failed',
+        message: 'candidate could not be prepared',
+        details: { preparer_detail: 'bad frame', attempt: 2, nested: { a: 1 } },
+      },
+    })).toEqual({
+      code: 'activation_preparation_failed',
+      message: 'candidate could not be prepared',
+      details: { preparer_detail: 'bad frame', attempt: 2 },
+      origin: null,
+    });
+    expect(parseApiErrorDto({ detail: { code: 'authoring_not_ready' } })).toEqual({
+      code: 'authoring_not_ready', message: '', details: null, origin: null,
+    });
+    expect(parseApiErrorDto({ detail: 'upstream failed' })).toBeNull();
+    expect(parseApiErrorDto({ detail: { message: 'no code' } })).toBeNull();
+    expect(parseApiErrorDto(null)).toBeNull();
+  });
+
+  it('accepts a node held until Run and refuses unknown node statuses', () => {
+    const held = runStatus();
+    held.node_statuses = { root: 'running', move: 'held' };
+    expect(parseProgramRunStatus(held).nodeStatuses.move).toBe('held');
+    const unknown = runStatus();
+    unknown.node_statuses = { root: 'paused' };
+    expect(() => parseProgramRunStatus(unknown)).toThrow(/supported presentation status/);
+  });
+
+  it('accepts exact runtime controls when no recovery action is offered', () => {
+    const projection = parseProgramRuntimeControlProjection(
+      runtimeControlsProjection(),
+    );
+
+    expect(projection.recoveryOffer).toBeNull();
+    expect(projection.programRunId).toBe('program-run.1');
+  });
+
+  it.each([true, false])('retains the owner\'s motion-held fact unchanged when %s', (motionHeld) => {
+    const input = runtimeControlsProjection();
+    (input.execution_selections as Record<string, unknown>).motion_held = motionHeld;
+    expect(parseProgramRuntimeControlProjection(input).executionSelections.motionHeld).toBe(motionHeld);
+  });
+
+  it('requires the owner\'s boolean motion-held fact', () => {
+    for (const value of [undefined, null, 'true', 0, 1]) {
+      const invalid = runtimeControlsProjection();
+      const selections = invalid.execution_selections as Record<string, unknown>;
+      if (value === undefined) delete selections.motion_held;
+      else selections.motion_held = value;
+      expect(() => parseProgramRuntimeControlProjection(invalid)).toThrow();
+    }
+  });
+
+  it('carries each selection\'s exact reserved resources, sorted and unique', () => {
+    const projection = parseProgramRuntimeControlProjection(runtimeControlsProjection());
+    expect(projection.executionSelections.groups[0].resourceIds)
+      .toEqual(['robot.joint_1', 'robot.joint_2']);
+    for (const resourceIds of [['robot.joint_2', 'robot.joint_1'], ['robot.joint_1', 'robot.joint_1'], ['']]) {
+      const input = runtimeControlsProjection();
+      const selections = input.execution_selections as { groups: Record<string, unknown>[] };
+      selections.groups[0].resource_ids = resourceIds;
+      expect(() => parseProgramRuntimeControlProjection(input)).toThrow(/sorted unique resource IDs/);
+    }
+  });
+
+  it('accepts one Run/Resume eligibility for ready, held and mixed groups', () => {
+    const withGroup = (patch: Record<string, unknown>) => {
+      const input = runtimeControlsProjection();
+      const selections = input.execution_selections as { groups: Record<string, unknown>[] };
+      selections.groups[0] = { ...selections.groups[0], ...patch };
+      return input;
+    };
+    const releasable = {
+      stop_allowed: false,
+      start_allowed: true, start_unavailable_reason: null,
+      resume_allowed: true, resume_unavailable_reason: null,
+    };
+    // After Execute: never-started work waits for Run (the live shape that
+    // the old Run-only-when-ready / Resume-only-when-held rule rejected).
+    for (const [state, held] of [['ready', 0], ['held', 1]] as const) {
+      const parsed = parseProgramRuntimeControlProjection(
+        withGroup({ ...releasable, state, held_node_count: held }),
+      );
+      expect(parsed.executionSelections.groups[0]).toMatchObject({
+        state, startAllowed: true, resumeAllowed: true,
+      });
+    }
+    const mixed = runtimeControlsProjection();
+    (mixed.execution_selections as { groups: Record<string, unknown>[] }).groups[0] = {
+      ...(mixed.execution_selections as { groups: Record<string, unknown>[] }).groups[0],
+      ...releasable, state: 'mixed', node_count: 2, held_node_count: 1,
+    };
+    expect(parseProgramRuntimeControlProjection(mixed).executionSelections.groups[0].state)
+      .toBe('mixed');
+    // Stop preserves never-started Ready nodes alongside Stopped nodes.
+    expect(parseProgramRuntimeControlProjection(withGroup({
+      ...releasable, state: 'mixed', node_count: 8, held_node_count: 8,
+    })).executionSelections.groups[0].heldNodeCount).toBe(8);
+    for (const held of [0, 9]) {
+      expect(() => parseProgramRuntimeControlProjection(withGroup({
+        ...releasable, state: 'mixed', node_count: 8, held_node_count: held,
+      }))).toThrow(/coherent bounded selection status and eligibility/);
+    }
+
+    // Run and Resume can never disagree, and nothing releases running work.
+    expect(() => parseProgramRuntimeControlProjection(withGroup({
+      ...releasable, state: 'ready',
+      resume_allowed: false, resume_unavailable_reason: 'selection_not_held',
+    }))).toThrow(/coherent bounded selection status and eligibility/);
+    expect(() => parseProgramRuntimeControlProjection(withGroup({
+      ...releasable, state: 'running',
+    }))).toThrow(/coherent bounded selection status and eligibility/);
+  });
+
+  it('accepts a bounded recent control trace after many events and rejects gaps', () => {
+    const input = runtimeControlsProjection();
+    const controls = input.runtime_controls as Record<string, unknown>;
+    controls.runtime_control_revision = 10_001;
+    controls.audit = Array.from({ length: 256 }, (_, index) => ({
+      event_revision: 9_745 + index, kind: 'runtime_blackboard_written', value: index,
+    }));
+    const parsed = parseProgramRuntimeControlProjection(input).runtimeControls;
+    expect(parsed.runtimeControlRevision).toBe(10_001);
+    expect(parsed.audit[0].eventRevision).toBe(9_745);
+    for (const length of [0, 255, 257]) {
+      controls.audit = Array.from({ length }, (_, index) => ({
+        event_revision: 10_001 - length + index, kind: 'event',
+      }));
+      expect(() => parseProgramRuntimeControlProjection(input)).toThrow();
+    }
+    controls.audit = Array.from({ length: 256 }, (_, index) => ({
+      event_revision: 9_744 + index, kind: 'event',
+    }));
+    expect(() => parseProgramRuntimeControlProjection(input)).toThrow();
+    controls.schema_version = 'manyforge.program_runtime_controls.v2';
+    expect(() => parseProgramRuntimeControlProjection(input)).toThrow();
+  });
+
+  it('parses an automatic retry audit event into typed facts, with or without its Kernel failure', () => {
+    const input = runtimeControlsProjection();
+    const controls = input.runtime_controls as Record<string, unknown>;
+    controls.runtime_control_revision = 4;
+    const retry = {
+      event_revision: 1, kind: 'program_node_automatic_retry', node_instance_id: 'move',
+      attempt: 2, max_attempts: 4, cause: 'collision_stop_nominal', delay_s: 1,
+    };
+    controls.audit = [
+      { ...retry, code: 'kernel_timeout', message: 'planner timed out' },
+      { ...retry, event_revision: 2, code: null, message: null },
+      { ...retry, event_revision: 3 },
+    ];
+    const audit = parseProgramRuntimeControlProjection(input).runtimeControls.audit;
+    expect(audit).toEqual([
+      {
+        eventRevision: 1,
+        kind: 'program_node_automatic_retry',
+        facts: {
+          nodeInstanceId: 'move', attempt: 2, maxAttempts: 4, cause: 'collision_stop_nominal', delayS: 1,
+          failure: { code: 'kernel_timeout', message: 'planner timed out', details: null, origin: null },
+        },
+      },
+      {
+        eventRevision: 2,
+        kind: 'program_node_automatic_retry',
+        facts: {
+          nodeInstanceId: 'move', attempt: 2, maxAttempts: 4, cause: 'collision_stop_nominal', delayS: 1,
+          failure: null,
+        },
+      },
+      {
+        eventRevision: 3,
+        kind: 'program_node_automatic_retry',
+        facts: {
+          nodeInstanceId: 'move', attempt: 2, maxAttempts: 4, cause: 'collision_stop_nominal', delayS: 1,
+          failure: null,
+        },
+      },
+    ]);
+  });
+
+  it('accepts the io wait source transitions the Runner records as audit events', () => {
+    const input = runtimeControlsProjection();
+    const controls = input.runtime_controls as Record<string, unknown>;
+    controls.runtime_control_revision = 3;
+    controls.audit = [
+      { event_revision: 1, kind: 'program_node_io_source_unavailable',
+        node_instance_id: 'wait_part', node_attempt_id: 'attempt.1', quality: 'stale' },
+      { event_revision: 2, kind: 'program_node_io_source_available',
+        node_instance_id: 'wait_part', node_attempt_id: 'attempt.1', quality: 'fresh' },
+    ];
+    expect(parseProgramRuntimeControlProjection(input).runtimeControls.audit).toEqual([
+      { eventRevision: 1, kind: 'program_node_io_source_unavailable',
+        facts: { node_instance_id: 'wait_part', node_attempt_id: 'attempt.1', quality: 'stale' } },
+      { eventRevision: 2, kind: 'program_node_io_source_available',
+        facts: { node_instance_id: 'wait_part', node_attempt_id: 'attempt.1', quality: 'fresh' } },
+    ]);
+  });
+
+  it('refuses a malformed automatic retry audit event', () => {
+    const valid = {
+      event_revision: 1, kind: 'program_node_automatic_retry', node_instance_id: 'move',
+      attempt: 2, max_attempts: 4, cause: 'collision_stop_nominal', delay_s: 1,
+    };
+    const refuses = (patch: Record<string, unknown>) => {
+      const input = runtimeControlsProjection();
+      const controls = input.runtime_controls as Record<string, unknown>;
+      controls.runtime_control_revision = 2;
+      controls.audit = [{ ...valid, ...patch }];
+      return () => parseProgramRuntimeControlProjection(input);
+    };
+    expect(refuses({ node_instance_id: '' })).toThrow(/node_instance_id/);
+    expect(refuses({ node_instance_id: undefined })).toThrow(/node_instance_id/);
+    expect(refuses({ attempt: 1 })).toThrow(/attempt from 2/);
+    expect(refuses({ attempt: 5 })).toThrow(/attempt from 2/);
+    expect(refuses({ max_attempts: 'four' })).toThrow(/max_attempts/);
+    expect(refuses({ cause: '' })).toThrow(/cause/);
+    expect(refuses({ delay_s: '1' })).toThrow(/delay_s/);
+    expect(refuses({ delay_s: -1 })).toThrow(/delay_s/);
+    expect(refuses({ code: 'kernel_timeout' })).toThrow(/both code and message, or neither/);
+    expect(refuses({ message: 'planner timed out' })).toThrow(/both code and message, or neither/);
+    expect(refuses({ code: 5, message: 'planner timed out' })).toThrow(/code/);
+    expect(refuses({ code: '', message: '' })).toThrow(/code/);
+  });
+
+  it('parses a takeover fallback audit event into typed facts, with or without its cause', () => {
+    const input = runtimeControlsProjection();
+    const controls = input.runtime_controls as Record<string, unknown>;
+    controls.runtime_control_revision = 4;
+    const fallback = {
+      event_revision: 1, kind: 'program_node_takeover_fallback', node_instance_id: 'move',
+      incumbent_operation_id: 'op.1', path: 'spring_back_hold',
+      code: 'takeover_preparation_late', message: 'late', preparation_ms: 40.5, budget_ms: 30,
+      planning_cap_ms: 24,
+    };
+    controls.audit = [
+      fallback,
+      { ...fallback, event_revision: 2, path: 'ordinary_containment', code: null, message: null },
+      { ...fallback, event_revision: 3, failure_stage: 'spring_back_planning' },
+    ];
+    expect(parseProgramRuntimeControlProjection(input).runtimeControls.audit).toEqual([
+      {
+        eventRevision: 1,
+        kind: 'program_node_takeover_fallback',
+        facts: {
+          nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'spring_back_hold',
+          code: 'takeover_preparation_late', message: 'late', failureStage: null,
+          preparationMs: 40.5, budgetMs: 30, planningCapMs: 24,
+        },
+      },
+      {
+        eventRevision: 2,
+        kind: 'program_node_takeover_fallback',
+        facts: {
+          nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'ordinary_containment',
+          code: null, message: null, failureStage: null, preparationMs: 40.5, budgetMs: 30,
+          planningCapMs: 24,
+        },
+      },
+      {
+        eventRevision: 3,
+        kind: 'program_node_takeover_fallback',
+        facts: {
+          nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'spring_back_hold',
+          code: 'takeover_preparation_late', message: 'late', failureStage: 'spring_back_planning',
+          preparationMs: 40.5, budgetMs: 30, planningCapMs: 24,
+        },
+      },
+    ]);
+  });
+
+  it('refuses a malformed takeover fallback audit event', () => {
+    const valid = {
+      event_revision: 1, kind: 'program_node_takeover_fallback', node_instance_id: 'move',
+      incumbent_operation_id: 'op.1', path: 'spring_back_hold',
+      code: null, message: null, preparation_ms: 40.5, budget_ms: 30, planning_cap_ms: 24,
+    };
+    const refuses = (patch: Record<string, unknown>) => {
+      const input = runtimeControlsProjection();
+      const controls = input.runtime_controls as Record<string, unknown>;
+      controls.runtime_control_revision = 2;
+      controls.audit = [{ ...valid, ...patch }];
+      return () => parseProgramRuntimeControlProjection(input);
+    };
+    expect(refuses({})).not.toThrow();
+    expect(refuses({ node_instance_id: undefined })).toThrow(/node_instance_id/);
+    expect(refuses({ incumbent_operation_id: '' })).toThrow(/incumbent_operation_id/);
+    expect(refuses({ path: 'moving_replacement' })).toThrow(/path/);
+    expect(refuses({ path: undefined })).toThrow(/path/);
+    expect(refuses({ code: undefined })).toThrow(/code/);
+    expect(refuses({ code: 'late' })).toThrow(/both code and message, or neither/);
+    expect(refuses({ message: 'late' })).toThrow(/both code and message, or neither/);
+    expect(refuses({ preparation_ms: undefined })).toThrow(/preparation_ms/);
+    expect(refuses({ preparation_ms: -1 })).toThrow(/preparation_ms/);
+    expect(refuses({ budget_ms: 0 })).toThrow(/budget_ms/);
+    expect(refuses({ budget_ms: '30' })).toThrow(/budget_ms/);
+    expect(refuses({ planning_cap_ms: undefined })).toThrow(/planning_cap_ms/);
+    expect(refuses({ planning_cap_ms: -1 })).toThrow(/planning_cap_ms/);
+    expect(refuses({ failure_stage: '' })).toThrow(/failure_stage/);
+    expect(refuses({ failure_stage: 3 })).toThrow(/failure_stage/);
+  });
+
+  it('keeps retry counts an exact wire key and refuses removed override state', () => {
+    const input = runtimeControlsProjection();
+    const controls = input.runtime_controls as Record<string, unknown>;
+    controls.retry_counts = { move: 300 };
+    expect(parseProgramRuntimeControlProjection(input).runtimeControls)
+      .not.toHaveProperty('retryCounts');
+    delete controls.retry_counts;
+    expect(() => parseProgramRuntimeControlProjection(input)).toThrow(/exactly/);
+    controls.retry_counts = {};
+    controls.overrides = [];
+    expect(() => parseProgramRuntimeControlProjection(input)).toThrow(/exactly/);
+    delete controls.overrides;
+    expect(() => parseProgramRuntimeControlProjection({
+      ...input,
+      observation_override_candidate: null,
+    })).toThrow(/exactly/);
+  });
+
+  it('parses one coherent cycle, run, and runtime-control observation', () => {
+    const input = {
+      program_runner_owner_epoch: 'program-runner.epoch.1',
+      cycle_generation: 8,
+      state: 'running',
+      program_run_id: 'program-run.1',
+      cycle_claim_generation: 2,
+      terminal_or_settlement_reference: null,
+      execution_control_revision: 4,
+      causal_correlation_id: null,
+      causal_session_id: null,
+      causal_client_sequence: null,
+      current_command_kind: null,
+      failure: null,
+      reset_phase: null, reset_options: null,
+      reset_robot_position: { available: false, reason: 'unsupported' },
+      allowed_commands: [],
+      run_revision: 3,
+      node_status_revision: 2,
+      runtime_control_revision: 1,
+      recovery_offer: null,
+      run: runStatus(),
+      runtime_controls: runtimeControlsProjection(),
+    };
+    const cycle = parseProgramCycleStatus(input);
+
+    expect(cycle.resetRobotPosition).toEqual({ available: false, reason: 'unsupported' });
+    expect(parseProgramCycleStatus({ ...input,
+      reset_robot_position: { available: true, reason: null },
+    }).resetRobotPosition).toEqual({ available: true, reason: null });
+    for (const capability of [undefined, null, {}, { available: true, reason: 'unsupported' },
+      { available: false, reason: null }, { available: false, reason: '' },
+      { available: 1, reason: null }, { available: true, reason: null, extra: false }]) {
+      expect(() => parseProgramCycleStatus({ ...input, reset_robot_position: capability })).toThrow();
+    }
+    expect(cycle.run?.runRevision).toBe(3);
+    expect(cycle.runtimeControls?.runtimeControls.runtimeControlRevision).toBe(1);
+    expect(() => parseProgramCycleStatus({
+      ...input,
+      run_revision: 4,
+    })).toThrow(/exact advertised run projection/);
+    expect(() => parseProgramCycleStatus({
+      ...input,
+      causal_client_sequence: '0',
+    })).toThrow(/canonical positive uint64/);
+    expect(parseProgramCycleStatus({
+      ...input,
+      causal_client_sequence: '18446744073709551615',
+    }).causalClientSequence).toBe('18446744073709551615');
+  });
+
+  it('retains an immutable predecessor run after terminal owner recovery', () => {
+    const run = runStatus('failed');
+    run.tree_status = 'failure';
+    run.node_statuses = { root: 'failure' };
+    const controls = runtimeControlsProjection();
+    controls.owner_epoch = 'program-runner.epoch.2';
+    const input = {
+      program_runner_owner_epoch: 'program-runner.epoch.2',
+      cycle_generation: 8,
+      state: 'terminal_awaiting_reset',
+      program_run_id: 'program-run.1',
+      cycle_claim_generation: 2,
+      terminal_or_settlement_reference: digestA,
+      execution_control_revision: 5,
+      causal_correlation_id: 'run.1',
+      causal_session_id: null,
+      causal_client_sequence: null,
+      current_command_kind: 'program_run',
+      failure: null,
+      reset_phase: null, reset_options: null,
+      reset_robot_position: { available: false, reason: 'unsupported' },
+      allowed_commands: [],
+      run_revision: 3,
+      node_status_revision: 2,
+      runtime_control_revision: 1,
+      recovery_offer: null,
+      run,
+      runtime_controls: controls,
+    };
+    const cycle = parseProgramCycleStatus(input);
+
+    expect(cycle.programRunnerOwnerEpoch).toBe('program-runner.epoch.2');
+    expect(cycle.run?.ownerEpoch).toBe('program-runner.epoch.1');
+    expect(parseProgramCycleStatus({
+      ...input,
+      state: 'resetting',
+      reset_phase: 'stopping',
+      reset_options: { reload_initial_scene: false, reset_robot_position: false },
+      current_command_kind: 'program_reset',
+    }).run?.ownerEpoch).toBe('program-runner.epoch.1');
+    expect(() => parseProgramCycleStatus({
+      ...input,
+      state: 'running',
+    })).toThrow(/exact advertised run projection/);
+  });
+
+  it('strictly retains selected no-run Reset progress and recovery', () => {
+    const input = {
+      program_runner_owner_epoch: 'runner.1', cycle_generation: 3,
+      state: 'resetting', program_run_id: null, cycle_claim_generation: null,
+      terminal_or_settlement_reference: null, run_revision: null,
+      node_status_revision: null, runtime_control_revision: null,
+      execution_control_revision: 4, causal_correlation_id: 'reset.1',
+      causal_session_id: null, causal_client_sequence: null,
+      current_command_kind: 'program_reset', failure: null,
+      reset_phase: 'restoring_scene',
+      reset_robot_position: { available: false, reason: 'unsupported' },
+      reset_options: { reload_initial_scene: true, reset_robot_position: true },
+      allowed_commands: [], recovery_offer: null, run: null, runtime_controls: null,
+    };
+    for (const phase of ['restoring_scene', 'restoring_position', 'releasing']) {
+      expect(parseProgramCycleStatus({ ...input, reset_phase: phase }).resetOptions)
+        .toEqual({ reloadInitialScene: true, resetRobotPosition: true });
+    }
+    expect(parseProgramCycleStatus({
+      ...input, state: 'recovery_required', reset_phase: 'restoring_position',
+      failure: { failed_phase: 'restoring_position', code: 'position_failed' },
+    })).toMatchObject({ state: 'recovery_required', resetPhase: 'restoring_position',
+      resetOptions: { reloadInitialScene: true, resetRobotPosition: true } });
+    for (const change of [
+      { reset_options: undefined }, { reset_options: null },
+      { reset_options: { reload_initial_scene: true } },
+      { reset_options: { reload_initial_scene: true, reset_robot_position: 1 } },
+      { reset_options: { reload_initial_scene: true, reset_robot_position: false, extra: true } },
+      { reset_options: { reload_initial_scene: true, reset_robot_position: false, keep_stop_fault: true } },
+      { reset_options: { reload_initial_scene: false, reset_robot_position: false } },
+      { state: 'idle_after_reset' }, { current_command_kind: 'program_run' },
+      { cycle_claim_generation: 2 }, { terminal_or_settlement_reference: digestA },
+      { reset_phase: 'stopping' }, { reset_phase: null },
+    ]) {
+      expect(() => parseProgramCycleStatus({ ...input, ...change })).toThrow();
+    }
+    for (const phase of ['restoring_scene', 'restoring_position']) {
+      const selected = phase === 'restoring_scene'
+        ? { reload_initial_scene: true, reset_robot_position: false }
+        : { reload_initial_scene: false, reset_robot_position: true };
+      expect(parseProgramCycleStatus({ ...input, reset_phase: phase, reset_options: selected })
+        .resetPhase).toBe(phase);
+      const unselected = { reload_initial_scene: !selected.reload_initial_scene,
+        reset_robot_position: !selected.reset_robot_position };
+      for (const state of ['resetting', 'recovery_required']) {
+        expect(() => parseProgramCycleStatus({ ...input, state, reset_phase: phase,
+          reset_options: unselected, failure: { failed_phase: phase } })).toThrow(/phase selected/);
+      }
+    }
+    for (const failure of [null, {}, { failed_phase: 'releasing' }]) {
+      expect(() => parseProgramCycleStatus({ ...input, state: 'recovery_required',
+        reset_phase: 'restoring_position', failure })).toThrow(/exact failed phase/);
+    }
+    expect(parseProgramCycleStatus({
+      ...input, state: 'recovery_required', current_command_kind: 'program_run',
+      reset_options: null, reset_phase: null,
+    }).resetOptions).toBeNull();
+  });
+
+  it('parses accepted Program Apply and rejects a mismatched Manager identity', () => {
+    const digestA = `sha256:${'a'.repeat(64)}`;
+    const digestB = `sha256:${'b'.repeat(64)}`;
+    const digestC = `sha256:${'c'.repeat(64)}`;
+    const headless = {
+      status: 'accepted',
+      confirmation_token: null,
+      prepared_activation: {
+        schema_version: 'manyforge.prepared_activation_input.v6',
+        prepared_activation_id: digestC,
+        origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA, project_path: '/projects/fixture.scenario' },
+        captured_input_digest: digestB,
+        deployment_artifact_id: 'deployment.fixture',
+        deployment_revision: digestA,
+        retained_bundle_id: digestB,
+        graph_revision: digestC,
+        program_id: 'fixture-program',
+        program_revision: digestB,
+        program_outcome: { kind: 'bound', program_binding_id: digestA },
+        node_environment_digest: digestC,
+        assistant_mode: 'forbidden',
+      },
+      candidate_preview: null,
+      manager_apply: {
+        api_version: 'manyforge.manager_command_response.v1',
+        apply_generation: 1, apply_id: 'apply-1',
+        candidate_projection_revision: null,
+        error: null, ok: true, replay_status: 'accepted_new',
+        request_id: 'request-1', request_owner_epoch: 'owner.1', state: 'pending',
+      },
+      preparation: null,
+      phases_ms: { preparation_ms: 1 },
+      apply_id: 'apply-1',
+      apply_generation: 1,
+    };
+    const response = parseProgramWorkspaceTransitionResponse({
+      status: 'accepted',
+      headless,
+      workspace: workspaceFixture(),
+    });
+
+    expect(response.status).toBe('accepted');
+    expect(response.workspace.draft.programLoaded).toBe(true);
+    expect(parseProgramWorkspaceTransitionResponse({
+      status: 'reverted',
+      headless: null,
+      workspace: workspaceFixture(),
+    }).status).toBe('reverted');
+    expect(() => parseProgramWorkspaceTransitionResponse({
+      status: 'accepted',
+      headless: null,
+      workspace: workspaceFixture(),
+    })).toThrow(/owner response/);
+    const malformed = structuredClone(headless);
+    malformed.apply_id = 'another-apply';
+    expect(() => parseProgramWorkspaceTransitionResponse({
+      status: 'accepted',
+      headless: malformed,
+      workspace: workspaceFixture(),
+    })).toThrow(/exact accepted Manager operation/);
+  });
+});
+
+describe('Applied Program status parser', () => {
+  const digest = `sha256:${'a'.repeat(64)}`;
+  const executable = {
+    deployment_artifact_id: 'deployment-a',
+    deployment_revision: digest,
+    executable: true,
+    graph_revision: digest,
+    message: null,
+    non_executable: null,
+    program: null,
+    program_binding_id: digest,
+    program_id: 'pick',
+    program_revision: digest,
+    record_digest: digest,
+    retained_bundle_id: digest,
+    origin: { kind: 'scenario', scenario_id: 'scenario-a', source_document_digest: digest, project_path: '/projects/scenario-a.scenario' },
+    schema_version: 'manyforge.applied_program_status.v2',
+  };
+
+  it('reports an executable Program with no references', () => {
+    const parsed = parseAppliedProgramStatus(executable);
+    expect(parsed.executable).toBe(true);
+    expect(parsed.unresolvedReferences).toEqual([]);
+  });
+
+  it('distinguishes no Program from broken references and rejects mixed identities', () => {
+    const absent = {
+      ...executable,
+      executable: false,
+      program_id: null,
+      program_revision: null,
+      program_binding_id: null,
+      message: 'No Program is selected',
+    };
+    expect(parseAppliedProgramStatus(absent)).toMatchObject({
+      executable: false, programId: null, programRevision: null, unresolvedReferences: [],
+    });
+    expect(() => parseAppliedProgramStatus({ ...absent, program_binding_id: digest })).toThrow();
+    expect(() => parseAppliedProgramStatus({ ...absent, program_revision: digest })).toThrow();
+    expect(() => parseAppliedProgramStatus({ ...absent, schema_version: 'manyforge.applied_program_status.v1' })).toThrow();
+  });
+
+  it('names the references of a preserved non-executable Program', () => {
+    const parsed = parseAppliedProgramStatus({
+      ...executable,
+      executable: false,
+      message: 'Applied Program is not executable in the active Deployment',
+      program: { program_id: 'pick' },
+      program_binding_id: null,
+      non_executable: {
+        affected_execution_groups: ['grasp'],
+        affected_nodes: ['close_gripper'],
+        unresolved_roles: [{
+          command_target_id: 'jaw',
+          component_role_id: 'gripper',
+          controllable_component_id: 'gripper-1',
+          detail: 'target role depends on an unresolved component role',
+          reason: 'component_role_unresolved',
+          target_role_id: 'jaw',
+        }],
+      },
+    });
+    expect(parsed.executable).toBe(false);
+    expect(parsed.unresolvedReferences[0].target_role_id).toBe('jaw');
+    expect(parsed.affectedNodes).toEqual(['close_gripper']);
+    // A binding alongside named references is contradictory.
+    expect(() => parseAppliedProgramStatus({
+      ...executable,
+      executable: false,
+      non_executable: { affected_execution_groups: [], affected_nodes: [], unresolved_roles: [] },
+    })).toThrow(/binding exactly when executable/);
+  });
+});
+
+describe('Deployment workspace parser', () => {
+  it('requires the nullable applied order and preserves authored order', () => {
+    const fixture = deploymentWorkspaceFixture();
+    const applied = fixture.managerApplied as Record<string, unknown>;
+    applied.activationOrder = { retainedBundleId: 'bundle.current', graphRevision: `sha256:${'a'.repeat(64)}`, componentIds: ['z', 'a'] };
+    expect(parseDeploymentWorkspaceResponse(fixture).managerApplied.activationOrder?.componentIds).toEqual(['z', 'a']);
+    (applied.activationOrder as Record<string, unknown>).componentIds = ['z', 'z'];
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow('unique ordered components');
+    delete applied.activationOrder;
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow();
+  });
+
+  it('requires the nullable server Saved-vs-Applied comparison', () => {
+    const fixture = deploymentWorkspaceFixture();
+    const saved = fixture.saved as Record<string, unknown>;
+    expect(parseDeploymentWorkspaceResponse(fixture).saved.differsFromApplied).toBeNull();
+    saved.differsFromApplied = false;
+    expect(parseDeploymentWorkspaceResponse(fixture).saved.differsFromApplied).toBe(false);
+    saved.differsFromApplied = 'no';
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow();
+    delete saved.differsFromApplied;
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow();
+  });
+
+  it('binds a candidate receipt to one prepared activation identity', () => {
+    const digestA = `sha256:${'a'.repeat(64)}`;
+    const digestB = `sha256:${'b'.repeat(64)}`;
+    const preview = {
+      api_version: 'manyforge.manager_command_response.v1',
+      candidate_receipt: {
+        schema_version: 'manyforge.manager_deployment_candidate_receipt.v2',
+        deployment_artifact_id: 'deployment.fixture',
+        deployment_revision: digestA,
+        prepared_activation_id: digestB,
+        candidate_retained_bundle_id: 'bundle.next',
+        candidate_graph_revision: 'graph.next',
+        expected_current: {
+          graph_revision: 'graph.current',
+          retained_bundle_id: 'bundle.current',
+        },
+        expected_admission_generation: 7,
+        manager_owner_epoch: 'manager.epoch.1',
+        impact_digest: digestB,
+        destructive_impact: true,
+        receipt_digest: digestA,
+      },
+      converged: false,
+      diff: Object.fromEntries([
+        'component_attachments',
+        'controllable_components',
+        'control_bindings',
+        'control_domains',
+        'model_instances',
+        'runtime_units',
+      ].map((kind) => [kind, { added: [], changed: [], removed: [] }])),
+      impact: {
+        attachment_changed_components: [],
+        component_delta_digest: digestA,
+        components: [
+          { controllable_component_id: 'arm', disposition: 'retain', replacement_reasons: [] },
+          { controllable_component_id: 'gripper', disposition: 'remove', replacement_reasons: [] },
+        ],
+        destructive: true,
+        detached_components: ['gripper-2'],
+        program: {
+          executable: false,
+          non_executable: {
+            affected_execution_groups: ['grasp'],
+            affected_nodes: ['close_gripper'],
+            api_version: 'manyforge.program-binding-outcome.v1',
+            graph_revision: digestA,
+            program_id: 'fixture-program',
+            program_revision: digestB,
+            retained_bundle_id: digestA,
+            role_assignment_digest: digestB,
+            unresolved_roles: [{
+              command_target_id: null,
+              component_role_id: 'gripper',
+              controllable_component_id: 'gripper',
+              detail: 'component role selects a missing or ambiguous retained component',
+              reason: 'component_missing',
+              target_role_id: null,
+            }],
+          },
+          program_id: 'fixture-program',
+          program_revision: digestB,
+        },
+        shared_scene_projection_changed: false,
+      },
+      ok: true,
+    };
+
+    const parsed = parseManagerDeploymentCandidatePreviewResponse(preview);
+    expect(parsed.candidateReceipt.prepared_activation_id).toBe(digestB);
+    expect(parsed.candidateReceipt.destructive_impact).toBe(true);
+    // The Manager's impact is carried verbatim, never re-derived locally.
+    expect(parsed.impact.components.map((row) => row.disposition))
+      .toEqual(['retain', 'remove']);
+    expect(parsed.impact.program.executable).toBe(false);
+    expect(parsed.impact.program.unresolvedReferences[0].reason)
+      .toBe('component_missing');
+    expect(parsed.impact.program.affectedExecutionGroups).toEqual(['grasp']);
+    expect(parsed.impact.detachedComponents).toEqual(['gripper-2']);
+    const executableWithReasons = structuredClone(preview);
+    (executableWithReasons.impact.program as Record<string, unknown>)
+      .executable = true;
+    expect(() => parseManagerDeploymentCandidatePreviewResponse(executableWithReasons))
+      .toThrow(/non-executable/);
+    const stale = structuredClone(preview);
+    delete (stale.candidate_receipt as Record<string, unknown>)
+      .prepared_activation_id;
+    expect(() => parseManagerDeploymentCandidatePreviewResponse(stale))
+      .toThrow(/exactly/);
+  });
+
+  it('accepts the authored graph without embedding its compiler-issued revision', () => {
+    const parsed = parseDeploymentWorkspaceResponse(deploymentWorkspaceFixture());
+    expect(parsed.draft.document?.graph).not.toHaveProperty('graph_revision');
+    expect(parsed.draft.graphRevision).toBe(`sha256:${'c'.repeat(64)}`);
+    expect(parsed.binding?.component_role_bindings.length).toBeGreaterThan(0);
+    expect(parsed.scenarioCandidates.map((row) => row.scenarioId)).toEqual(['fixture']);
+    expect(parsed.runAdmission.ready).toBe(true);
+  });
+
+  it('accepts source-referenced Deployment intent without inventing compiled identities', () => {
+    const fixture = deploymentWorkspaceFixture();
+    Object.assign(fixture.draft as Record<string, unknown>, {
+      document: {
+        api_version: 'manyforge.deployment_intent.v2',
+        deployment_artifact_id: 'deployment.fixture',
+        name: 'Fixture',
+        components: [], attachments: [], policies: {},
+      },
+      deploymentRevision: null, graphRevision: null,
+    });
+    fixture.binding = null;
+    fixture.scenarioCandidates = [];
+    fixture.savedScenarioCandidates = [];
+    fixture.saved = { path: '/workspace/deployment.yaml', deploymentRevision: null, differsFromApplied: null };
+    const parsed = parseDeploymentWorkspaceResponse(fixture);
+    expect(parsed.draft.document?.api_version).toBe('manyforge.deployment_intent.v2');
+    expect(parsed.draft.graphRevision).toBeNull();
+    expect(parsed.saved.path).toBe('/workspace/deployment.yaml');
+    expect(parsed.saved.deploymentRevision).toBeNull();
+    const intent = (fixture.draft as Record<string, unknown>).document as Record<string, unknown>;
+    for (const field of ['graph', 'graph_revision', 'deployment_revision']) {
+      intent[field] = `sha256:${'c'.repeat(64)}`;
+      expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow();
+      delete intent[field];
+    }
+    (fixture.draft as Record<string, unknown>).graphRevision = `sha256:${'c'.repeat(64)}`;
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow('complete identities');
+  });
+
+  it('rejects mismatched or duplicate candidate identities', () => {
+    const mismatched = deploymentWorkspaceFixture();
+    (mismatched.scenarioCandidates as Record<string, unknown>[])[0]
+      .deploymentRevision = `sha256:${'d'.repeat(64)}`;
+    expect(() => parseDeploymentWorkspaceResponse(mismatched)).toThrow(
+      /exact matches/,
+    );
+
+    const duplicate = deploymentWorkspaceFixture();
+    (duplicate.scenarioCandidates as unknown[]).push(
+      structuredClone((duplicate.scenarioCandidates as unknown[])[0]),
+    );
+    expect(() => parseDeploymentWorkspaceResponse(duplicate)).toThrow(
+      /unique Scenario identities/,
+    );
+  });
+
+  it('rejects a Binding for another exact graph', () => {
+    const fixture = deploymentWorkspaceFixture();
+    (fixture.binding as Record<string, unknown>).graph_revision =
+      `sha256:${'d'.repeat(64)}`;
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow(
+      /graph revision/,
+    );
+  });
+
+  it('rejects crossed document, Run-admission, or Applied identities', () => {
+    const crossedDocument = deploymentWorkspaceFixture();
+    const document = (crossedDocument.draft as Record<string, unknown>)
+      .document as Record<string, unknown>;
+    document.deployment_revision = `sha256:${'d'.repeat(64)}`;
+    expect(() => parseDeploymentWorkspaceResponse(crossedDocument)).toThrow(
+      /exact compiled Deployment identity/,
+    );
+
+    const crossedAdmission = deploymentWorkspaceFixture();
+    (crossedAdmission.runAdmission as Record<string, unknown>).ready = false;
+    (crossedAdmission.runAdmission as Record<string, unknown>).reason = 'crossed';
+    expect(() => parseDeploymentWorkspaceResponse(crossedAdmission)).toThrow(
+      /exact Deployment Draft and Manager Applied comparison/,
+    );
+
+    const crossedApplied = deploymentWorkspaceFixture();
+    (crossedApplied.managerApplied as Record<string, unknown>).deploymentRevision =
+      `sha256:${'d'.repeat(64)}`;
+    expect(() => parseDeploymentWorkspaceResponse(crossedApplied)).toThrow(
+      /exact Deployment Draft and Manager Applied comparison/,
+    );
+  });
+
+  it('accepts the truthful empty workspace where Run is blocked', () => {
+    // Backend response with no loaded Deployment and no Manager Applied.
+    const fixture = deploymentWorkspaceFixture();
+    Object.assign(fixture.draft as Record<string, unknown>, {
+      document: null,
+      deploymentArtifactId: null,
+      deploymentRevision: null,
+      graphRevision: null,
+    });
+    fixture.saved = { path: null, deploymentRevision: null, differsFromApplied: null };
+    fixture.managerApplied = { activationOrder: null, deploymentRevision: null, scenarioId: null };
+    fixture.runAdmission = {
+      ready: false, reason: 'Deployment Draft differs from Manager Applied',
+    };
+    fixture.binding = null;
+    fixture.scenarioCandidates = [];
+    fixture.savedScenarioCandidates = [];
+    const parsed = parseDeploymentWorkspaceResponse(fixture);
+    expect(parsed.runAdmission).toEqual({
+      ready: false, reason: 'Deployment Draft differs from Manager Applied',
+    });
+
+    // A ready Run must still name a Manager Applied identity.
+    fixture.runAdmission = { ready: true, reason: null };
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow(
+      /exact Deployment Draft and Manager Applied comparison/,
+    );
+  });
+
+  it('rejects a partially populated unloaded Draft identity', () => {
+    const fixture = deploymentWorkspaceFixture();
+    Object.assign(fixture.draft as Record<string, unknown>, {
+      document: null,
+      deploymentArtifactId: 'partial',
+      deploymentRevision: null,
+      graphRevision: null,
+    });
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow(
+      /complete identities/,
+    );
+  });
+});
+
+describe('parseCatalogResponse', () => {
+  it('accepts the v2 compiler-product identity and entry shape', () => {
+    const parsed = parseCatalogResponse({
+      apiVersion: 'manyforge.node_catalog.v2',
+      contentVersion: '1.0.0',
+      catalogId: 'manyforge_builtin',
+      catalogDigest: 'sha256:catalog',
+      environmentDigest: 'sha256:environment',
+      entries: [
+        {
+          id: 'sequence',
+          name: 'Sequence',
+          category: 'Control Flow',
+          description: 'Runs children in order.',
+          stability: 'stable',
+          kind: 'composite',
+          childrenMin: 1,
+          childrenMax: 64,
+          parameters: [],
+          requiredCapabilities: [],
+          execution: {
+            blocking: false,
+            cancellable: false,
+            ownerApi: 'orchestration.control_flow',
+          },
+          runners: { py_trees: 'sequence_v1' },
+          tags: ['control-flow'],
+          minProgramProfile: null,
+          blackboard: { reads: [], writes: [] },
+          ownerContext: null,
+          outcomes: { success: 'all children succeeded' },
+          eventFamily: null,
+        },
+      ],
+    });
+
+    expect(parsed.apiVersion).toBe('manyforge.node_catalog.v2');
+    expect(parsed.entries[0]?.execution.ownerApi).toBe(
+      'orchestration.control_flow',
+    );
+    expect(parsed.entries[0]?.runners).toEqual({ py_trees: 'sequence_v1' });
+  });
+
+  it('does not accept a historical catalog version', () => {
+    expect(() => parseCatalogResponse({ apiVersion: 'v1' })).toThrow(
+      'catalog.apiVersion must be the literal "manyforge.node_catalog.v2"',
+    );
+  });
+
+  it('retains the shared named-coordinate schema in command, pick and place catalog fields', () => {
+    const schema = { type: 'object', additionalProperties: false, required: ['kind'],
+      properties: {
+        kind: { type: 'string', enum: ['angular_rad', 'linear_m', 'named_preset'] },
+        name: { type: 'string', enum: ['open', 'closed'] },
+        value_m: { type: 'number' }, value_rad: { type: 'number' },
+      },
+      allOf: [['angular_rad', 'value_rad'], ['linear_m', 'value_m'], ['named_preset', 'name']]
+        .flatMap(([kind, field]) => [
+          { if: { required: ['kind'], properties: { kind: { const: kind } } }, then: { required: [field] } },
+          { if: { not: { required: ['kind'], properties: { kind: { const: kind } } } }, then: { not: { required: [field] } } },
+        ]),
+    };
+    const fields = [
+      ['gripper.command_position', 'position'],
+      ['planning.plan_pick_sequence', 'tool_position'],
+      ['planning.plan_place_sequence', 'tool_position'],
+    ];
+    const wire = { apiVersion: 'manyforge.node_catalog.v2', contentVersion: '1.0.0',
+      catalogId: 'manyforge_builtin', catalogDigest: 'sha256:catalog', environmentDigest: 'sha256:environment',
+      entries: fields.map(([id, field]) => ({
+        id, name: id, category: 'gripper', description: '', stability: 'stable', kind: 'leaf',
+        childrenMin: 0, childrenMax: 0,
+        parameters: [{ id: field, required: true, schema, schemaHash: 'sha256:coordinate-position', hasDefault: false }],
+        requiredCapabilities: [], execution: { blocking: true, cancellable: true, ownerApi: 'execution.kernel' },
+        runners: {}, tags: [], minProgramProfile: null, blackboard: { reads: [], writes: [] },
+        ownerContext: null, outcomes: {}, eventFamily: null,
+      })),
+    };
+    for (const response of [wire, JSON.parse(JSON.stringify(wire))]) {
+      const parsed = parseCatalogResponse(response);
+      expect(parsed.entries.map((entry) => [entry.id, entry.parameters[0].id])).toEqual(fields);
+      for (const entry of parsed.entries) expect(entry.parameters[0].schema).toEqual(schema);
+    }
+  });
+});
+
+describe('Program workspace parsers', () => {
+  it.each([
+    ['gripper.command_position', 'position', 'open'],
+    ['gripper.command_position', 'position', 'closed'],
+    ['planning.plan_pick_sequence', 'tool_position', 'open'],
+    ['planning.plan_pick_sequence', 'tool_position', 'closed'],
+    ['planning.plan_place_sequence', 'tool_position', 'open'],
+    ['planning.plan_place_sequence', 'tool_position', 'closed'],
+  ])('preserves the symbolic %s.%s preset %s in Program and authoring round trips', (nodeId, field, name) => {
+    const fixture = workspaceFixture();
+    const draft = fixture.draft as Record<string, unknown>;
+    const program = draft.program as Record<string, unknown>;
+    const authoring = draft.authoring as Record<string, unknown>;
+    const tree = { node_id: nodeId, instance_id: 'gripper-step',
+      parameters: { [field]: { kind: 'named_preset', name } }, children: [] };
+    program.tree = tree;
+    authoring.forest = [tree];
+    for (const wire of [fixture, JSON.parse(JSON.stringify(fixture))]) {
+      const parsed = parseProgramWorkspaceResponse(wire);
+      expect(parsed.draft.program?.tree.parameters[field])
+        .toEqual({ kind: 'named_preset', name });
+      expect(parsed.draft.authoring?.forest[0].parameters[field])
+        .toEqual({ kind: 'named_preset', name });
+    }
+  });
+
+  it('accepts and retains the backend workspace identity on both response contracts', () => {
+    for (const [fixture, parse] of [
+      [workspaceFixture(), parseProgramWorkspaceResponse],
+      [deploymentWorkspaceFixture(), parseDeploymentWorkspaceResponse],
+    ] as const) {
+      expect(parse(fixture).authoringWorkspace).toEqual(fixture.authoringWorkspace);
+      const identity = fixture.authoringWorkspace as Record<string, unknown>;
+      identity.unexpected = true;
+      expect(() => parse(fixture)).toThrow();
+      delete identity.unexpected;
+      delete fixture.authoringWorkspace;
+      expect(() => parse(fixture)).toThrow();
+    }
+  });
+
+  it('rejects a workspace identity that does not describe its returned draft', () => {
+    const program = workspaceFixture();
+    (program.authoringWorkspace as Record<string, unknown>).programDraftRevision = 3;
+    expect(() => parseProgramWorkspaceResponse(program)).toThrow('exact Program Draft identity');
+    const deployment = deploymentWorkspaceFixture();
+    (deployment.authoringWorkspace as Record<string, unknown>).deploymentDraftId = 'other';
+    expect(() => parseDeploymentWorkspaceResponse(deployment)).toThrow('exact Deployment Draft identity');
+  });
+
+  it('preserves canonical execution membership without inventing runtime group state', () => {
+    const fixture = workspaceFixture();
+    const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
+    const authoring = (fixture.draft as Record<string, unknown>).authoring as Record<string, unknown>;
+    const tree = program.tree as Record<string, unknown>;
+    tree.execution_groups = ['all_grippers', 'robot_a'];
+    expect(parseProgramWorkspaceResponse(fixture).draft.program?.tree.execution_groups)
+      .toEqual(['all_grippers', 'robot_a']);
+    tree.execution_groups = 'all';
+    expect(parseProgramWorkspaceResponse(fixture).draft.program?.tree.execution_groups).toBe('all');
+    for (const malformed of [null, 'inherit', 'robot_a', [], ['all'], ['a', 'a'], ['z', 'a'], ['UPPER']]) {
+      tree.execution_groups = malformed;
+      expect(() => parseProgramWorkspaceResponse(fixture)).toThrow();
+    }
+    delete tree.execution_groups;
+    program.execution_groups = { robot_group: { execution_policy: 'independent' } };
+    authoring.execution_groups = { robot_group: { execution_policy: 'independent' } };
+    const parsed = parseProgramWorkspaceResponse(fixture);
+    expect(parsed.draft.program?.execution_groups).toEqual({ robot_group: { execution_policy: 'independent' } });
+    expect(parsed.draft.authoring?.execution_groups).toEqual({ robot_group: { execution_policy: 'independent' } });
+    for (const malformed of [null, 'robot_group', [], { all: { execution_policy: 'independent' } }, { robot_group: {} }, { robot_group: { execution_policy: 'unknown' } }]) {
+      program.execution_groups = malformed;
+      authoring.execution_groups = malformed;
+      expect(() => parseProgramWorkspaceResponse(fixture)).toThrow();
+    }
+    delete program.execution_groups;
+    delete authoring.execution_groups;
+    program.api_version = 'manyforge.program.v1';
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('manyforge.program.v2');
+  });
+
+  it('keeps Draft, Saved, and unavailable Applied identities distinct', () => {
+    const workspace = parseProgramWorkspaceResponse(workspaceFixture());
+
+    expect(workspace.draft.program?.tree.value_sources?.duration_s).toEqual({
+      kind: 'program_parameter',
+      reference: 'duration',
+    });
+    expect(workspace.saved.matchesDraft).toBe(false);
+    expect(workspace.hasUnappliedChanges).toBeNull();
+    expect(workspace.applied.unavailableReason?.restorationGates).toEqual(['N7']);
+  });
+
+  it('parses the exact Program scene and viewer authoring contracts', () => {
+    const fixture = workspaceFixture();
+    const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
+    program.scene = [{
+      scene_resource_id: 'part',
+      shape: { type: 'sphere', sphere_radius_m: 0.02 },
+      pose: {
+        frame_ref: { kind: 'cell_frame' },
+        position_m: [0.4, 0, 0.2],
+        orientation: { xyzw: [0, 0, 0, 1] },
+      },
+    }];
+    program.viewer = {
+      frame_role_visibility: {},
+      frame_gizmo_size_m: 0.1,
+      resource_role_visibility: {},
+      scene_resource_axes_visibility: { part: true },
+      object_axes_gizmo_size_m: 0.15,
+    };
+
+    const parsed = parseProgramWorkspaceResponse(fixture);
+    expect(parsed.draft.program?.scene?.[0]?.shape.type).toBe('sphere');
+    expect(parsed.draft.program?.viewer?.object_axes_gizmo_size_m).toBe(0.15);
+    expect(parsed.draft.program?.viewer?.scene_resource_axes_visibility).toEqual({
+      part: true,
+    });
+
+    (program.viewer as Record<string, unknown>).scene_resource_axes_visibility = { absent: true };
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow(
+      'a declared Program scene resource',
+    );
+    (program.viewer as Record<string, unknown>).scene_resource_axes_visibility = { part: true };
+
+    ((program.scene as Record<string, unknown>[])[0].shape as Record<string, unknown>).radius = 1;
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow(
+      'exactly [sphere_radius_m, type]',
+    );
+  });
+
+  it('parses run-scoped declarations and refuses removed lifetimes', () => {
+    const fixture = workspaceFixture();
+    const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
+    const parameter = (program.parameters as Record<string, unknown>[])[0];
+    const key: Record<string, unknown> = {
+      key: 'count', type: 'int64', access: 'read_write', persistence: 'persistent', initial: 3,
+    };
+    program.blackboard = { namespaces: [], keys: [key] };
+    expect(parseProgramWorkspaceResponse(fixture).draft.program?.blackboard?.keys[0])
+      .toEqual({ key: 'count', type: 'int64', access: 'read_write', persistence: 'persistent', initial: 3 });
+    delete key.initial;
+    expect(parseProgramWorkspaceResponse(fixture).draft.program?.blackboard?.keys[0])
+      .not.toHaveProperty('initial');
+
+    key.initial = null;
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('omitted instead of null');
+    Object.assign(key, { type: 'model_response', initial: {} });
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('model_response has no authored value');
+    Object.assign(key, { type: 'int64', initial: 3, persistence: 'node' });
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('run or persistent');
+    key.persistence = 'run';
+    // The removed overridability field is refused, whatever its value.
+    parameter.runtime_mutability = 'before_run';
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('parameters[0]');
+  });
+
+  it('parses computed keys and refuses them with initial: or persistent', () => {
+    const fixture = workspaceFixture();
+    const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
+    const key: Record<string, unknown> = {
+      key: 'grasp_z', type: 'float64', access: 'read', persistence: 'run',
+      expression: '-param.duration / 2',
+    };
+    program.blackboard = { namespaces: [], keys: [key] };
+    expect(parseProgramWorkspaceResponse(fixture).draft.program?.blackboard?.keys[0]).toEqual(key);
+    key.initial = 1;
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('absent for a key with initial: or persistent');
+    delete key.initial;
+    key.persistence = 'persistent';
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('absent for a key with initial: or persistent');
+    Object.assign(key, { persistence: 'run', expression: '' });
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('a non-empty string');
+  });
+
+  it('parses value sources keyed by canonical paths, formulas included, and refuses overlaps', () => {
+    const fixture = workspaceFixture();
+    const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
+    const tree = program.tree as Record<string, unknown>;
+    tree.parameters = { goal: { position_m: [0.3, 0.1, 0], orientation: { rpy_deg: [0, 0, 0] } } };
+    tree.value_sources = {
+      'goal.position_m[2]': { kind: 'expression', expression: '-param.duration / 2' },
+      'goal.orientation.rpy_deg[0]': { kind: 'blackboard_key', reference: 'roll' },
+      duration_s: { kind: 'blackboard_field', reference: 'plan', field: 'wait' },
+    };
+    expect(parseProgramWorkspaceResponse(fixture).draft.program?.tree.value_sources)
+      .toEqual(tree.value_sources);
+    tree.value_sources = { goal: { kind: 'blackboard_key', reference: 'pose' }, 'goal.position_m[2]': {
+      kind: 'expression', expression: '1',
+    } };
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('absent while goal is sourced as a whole');
+    tree.value_sources = { 'goal.position_m[02]': { kind: 'expression', expression: '1' } };
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('keyed by a canonical value path');
+    tree.value_sources = { goal: { kind: 'expression', expression: '1', reference: 'x' } };
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('exactly [expression, kind]');
+    tree.value_sources = { goal: { kind: 'program_parameter', reference: 'x', field: 'y' } };
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('exactly [kind, reference]');
+  });
+
+  it('parses the names each Draft formula reads and refuses formulas the Draft lacks', () => {
+    const fixture = workspaceFixture();
+    const draft = fixture.draft as Record<string, unknown>;
+    const program = draft.program as Record<string, unknown>;
+    (program.blackboard as { keys: unknown[] }).keys.push({
+      key: 'half', type: 'float64', access: 'read', persistence: 'run',
+      expression: 'param.duration / 2',
+    });
+    (program.tree as Record<string, unknown>).value_sources = {
+      duration_s: { kind: 'expression', expression: 'key.half + param.duration' },
+    };
+    const references = {
+      computedKeys: { half: ['param.duration'] },
+      nodes: { wait: { duration_s: ['key.half', 'param.duration'] } },
+    };
+    draft.formulaReferences = references;
+    expect(parseProgramWorkspaceResponse(fixture).draft.formulaReferences).toEqual(references);
+    for (const [invalid, message] of [
+      [{ ...references, nodes: { wait: { duration_s: ['param.duration', 'key.half'] } } }, 'sorted unique'],
+      [{ ...references, nodes: { wait: { duration_s: ['duration'] } } }, 'sorted unique'],
+      [{ ...references, nodes: { wait: { goal: [] } } }, 'a formula of a Draft node'],
+      [{ ...references, nodes: { other: { duration_s: [] } } }, 'a formula of a Draft node'],
+      [{ ...references, computedKeys: { duration: [] } }, 'a computed key of the Draft'],
+      [{ computedKeys: {} }, 'exactly'],
+    ] as const) {
+      draft.formulaReferences = invalid;
+      expect(() => parseProgramWorkspaceResponse(fixture)).toThrow(message);
+    }
+  });
+
+  it('parses the two-field node policy and rejects removed or closed-shape drift', () => {
+    const fixture = workspaceFixture();
+    const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
+    const tree = program.tree as Record<string, unknown>;
+    tree.recovery_policy = { allow_intervention: true, max_retries: 0 };
+    tree.operator_stop_policy = 'hold';
+
+    const parsed = parseProgramWorkspaceResponse(fixture);
+    // Zero is Unlimited with intervention on: an authored non-default.
+    expect(parsed.draft.program?.tree.recovery_policy).toEqual({
+      allow_intervention: true,
+      max_retries: 0,
+    });
+    expect(parsed.draft.program?.tree.operator_stop_policy).toBe('hold');
+
+    // The optional stop scope is kept only in its non-default form.
+    tree.recovery_policy = { allow_intervention: true, max_retries: 2, intervention_stop_scope: 'own_groups' };
+    expect(parseProgramWorkspaceResponse(fixture).draft.program?.tree.recovery_policy).toEqual({
+      allow_intervention: true,
+      max_retries: 2,
+      intervention_stop_scope: 'own_groups',
+    });
+
+    const cases = [
+      { recovery_policy: { allow_intervention: true, max_retries: 2, intervention_stop_scope: 'all' } },
+      { recovery_policy: { allow_intervention: true, max_retries: 2, intervention_stop_scope: 'groups' } },
+      { recovery_policy: { allow_intervention: true, max_retries: 2, intervention_stop_scope: null } },
+      { recovery_policy: { allow_intervention: true, max_retries: 2, intervention_stop_scope: 'own_groups', extra: true } },
+      // Removed policy surfaces are refused, not ignored.
+      {
+        modification_policy: {
+          runtime_override: 'forbidden',
+          persistent_edit: 'forbidden',
+          intervention_delegate: 'forbidden',
+        },
+      },
+      {
+        recovery_policy: {
+          allow_intervention: true,
+          allowed_recovery_actions: ['intervention'],
+          max_retries: 2,
+          allowed_skills: [],
+          persistence_ceiling: 'session_only',
+        },
+      },
+      { recovery_policy: { allow_intervention: true } },
+      { recovery_policy: { allow_intervention: true, max_retries: 256 } },
+      { recovery_policy: { allow_intervention: true, max_retries: -1 } },
+      // The canonical default is saved by omission.
+      { recovery_policy: { allow_intervention: false, max_retries: 0 } },
+      { operator_stop_policy: 'pause' },
+      { operator_stop_policy: 'inherit' },
+    ];
+    for (const change of cases) {
+      const invalid = structuredClone(fixture);
+      const invalidProgram = (invalid.draft as Record<string, unknown>).program as Record<string, unknown>;
+      const invalidTree = invalidProgram.tree as Record<string, unknown>;
+      Object.assign(invalidTree, change);
+      expect(() => parseProgramWorkspaceResponse(invalid)).toThrow();
+    }
+  });
+
+  it('accepts an incomplete retained forest without inventing a Program candidate', () => {
+    const fixture = workspaceFixture();
+    const draft = fixture.draft as Record<string, unknown>;
+    const authoring = draft.authoring as Record<string, unknown>;
+    authoring.forest = [];
+    draft.candidateAvailable = false;
+    draft.programRevision = null;
+    draft.program = null;
+    draft.diagnostics = [{
+      code: 'authoring_forest_root_count',
+      path: 'forest',
+      message: 'Program requires exactly one root; found 0.',
+      severity: 'error',
+    }];
+    (fixture.saved as Record<string, unknown>).matchesDraft = false;
+    fixture.hasUnsavedChanges = true;
+    fixture.applicability = {
+      applyReady: false,
+      unavailableReason: {
+        code: 'composer_authoring_draft_incomplete',
+        message: 'Program requires exactly one root; found 0.',
+        restorationGates: [],
+      },
+    };
+
+    const parsed = parseProgramWorkspaceResponse(fixture);
+    expect(parsed.draft.authoring?.forest).toEqual([]);
+    expect(parsed.draft.program).toBeNull();
+    expect(parsed.draft.diagnostics[0]?.code).toBe('authoring_forest_root_count');
+  });
+
+  it('rejects inconsistent or historical Program binding shapes', () => {
+    const inconsistent = workspaceFixture();
+    (inconsistent.draft as Record<string, unknown>).programRevision = 'sha256:wrong';
+    expect(() => parseProgramWorkspaceResponse(inconsistent)).toThrow(
+      'programWorkspace.draft must be internally consistent Program identity',
+    );
+
+    const falseSavedComparison = workspaceFixture();
+    (falseSavedComparison.saved as Record<string, unknown>).matchesDraft = true;
+    expect(() => parseProgramWorkspaceResponse(falseSavedComparison)).toThrow(
+      'programWorkspace.saved must be a truthful Draft/Saved comparison',
+    );
+
+    const falseAppliedIdentity = workspaceFixture();
+    (falseAppliedIdentity.applied as Record<string, unknown>).programRevision = (
+      falseAppliedIdentity.draft as Record<string, unknown>
+    ).programRevision;
+    expect(() => parseProgramWorkspaceResponse(falseAppliedIdentity)).toThrow(
+      'programWorkspace.applied must be internally consistent Applied identity',
+    );
+
+    const historical = workspaceFixture();
+    const program = (historical.draft as Record<string, unknown>).program as Record<string, unknown>;
+    const tree = program.tree as Record<string, unknown>;
+    tree.parameters = { duration_s: '${param:duration}' };
+    delete tree.value_sources;
+    expect(() => parseProgramWorkspaceResponse(historical)).toThrow(
+      'an explicit value_sources binding',
+    );
+  });
+
+  it('projects authoring and execution availability independently', () => {
+    const payload = {
+      environmentDigest: 'sha256:environment',
+      catalog: {},
+      executableRegistry: [{
+        node_id: 'timer',
+        engine_id: 'py_trees',
+        implementation_id: 'timer_v1',
+        executable_package_id: 'manyforge_behavior',
+      }],
+      executablePackages: [],
+      sourceCoverage: [],
+      availability: {
+        binding_context: 'unselected',
+        execution_available: false,
+        implementations: [{
+          adapter_build_qualified: true,
+          authoring_available: true,
+          binding_available: false,
+          engine_id: 'py_trees',
+          executable_package_id: 'manyforge_behavior',
+          execution_available: false,
+          implementation_id: 'timer_v1',
+          implementation_identity_resolved: true,
+          node_id: 'timer',
+          owner_health_available: true,
+          reasons: [],
+          reason_codes: ['program_binding_unselected'],
+          restoration_gates: [],
+        }],
+        manager_runtime_converged: true,
+        portable_authoring_available: true,
+        reason_codes: ['program_binding_unselected'],
+        restoration_gates: ['N'],
+      },
+      active: { retainedBundleId: 'bundle-1', graphRevision: 'graph-1' },
+      source: {},
+    };
+    const environment = parseNodeEnvironmentResponse(payload);
+
+    expect(environment.implementations[0]).toMatchObject({
+      authoringAvailable: true,
+      executionAvailable: false,
+      reasons: [],
+      reasonCodes: ['program_binding_unselected'],
+    });
+    expect(environment.executionAvailable).toBe(false);
+
+    const capabilityPayload = {
+      ...payload,
+      availability: {
+        ...payload.availability,
+        implementations: payload.availability.implementations.map((row) => ({
+          ...row,
+          binding_available: false,
+          execution_available: false,
+          reason_codes: ['capability_not_offered'],
+          reasons: [{
+            code: 'capability_not_offered',
+            message: 'No component offers assistant.model.invoke',
+            details: { capability: 'assistant.model.invoke' },
+          }],
+        })),
+      },
+    };
+    expect(parseNodeEnvironmentResponse(capabilityPayload).implementations[0]?.reasons)
+      .toEqual([{
+        code: 'capability_not_offered',
+        message: 'No component offers assistant.model.invoke',
+        details: { capability: 'assistant.model.invoke' },
+      }]);
+    const modelPayload = {
+      ...capabilityPayload,
+      availability: {
+        ...capabilityPayload.availability,
+        implementations: capabilityPayload.availability.implementations.map((row) => ({
+          ...row,
+          reason_codes: ['model_not_configured'],
+          reasons: [{
+            code: 'model_not_configured',
+            message: 'No model is configured',
+            details: {},
+          }],
+        })),
+      },
+    };
+    expect(parseNodeEnvironmentResponse(modelPayload).implementations[0]?.reasons)
+      .toEqual([{
+        code: 'model_not_configured',
+        message: 'No model is configured',
+        details: {},
+      }]);
+    const malformedCapability = {
+      ...capabilityPayload,
+      availability: {
+        ...capabilityPayload.availability,
+        implementations: capabilityPayload.availability.implementations.map((row) => ({
+          ...row,
+          reasons: [{
+            code: 'capability_not_offered',
+            message: 'No component offers assistant.model.invoke',
+            details: { capability: 12 },
+          }],
+        })),
+      },
+    };
+    expect(() => parseNodeEnvironmentResponse(malformedCapability)).toThrow(
+      'nodeEnvironment.availability.implementations[0].reasons[0].details.capability must be the missing non-empty capability ID',
+    );
+
+    payload.availability.implementations[0].owner_health_available = 'yes' as never;
+    expect(() => parseNodeEnvironmentResponse(payload)).toThrow(
+      'owner_health_available must be a boolean',
+    );
+  });
+});
+
+describe('headless projection parsers', () => {
+  it('accepts exact source-model, logical-scene, and scene-runtime facts', () => {
+    expect(parseSourceModelProjection(sourceModelFixture()).cell_id).toBe('cell-a');
+    expect(parseLogicalSceneProjection(logicalSceneFixture()).snapshot?.objects[0]
+      ?.scene_resource_id).toBe('part');
+    expect(parseSceneRuntimeProjection(sceneRuntimeFixture()).state.state).toBe('open');
+  });
+
+  it('accepts an optional positive scene object mass', () => {
+    const objectOf = (fixture: Record<string, unknown>) =>
+      ((fixture.snapshot as Record<string, unknown>).objects as Array<Record<string, unknown>>)[0]!;
+    expect(parseLogicalSceneProjection(logicalSceneFixture()).snapshot?.objects[0]?.mass_kg)
+      .toBeUndefined();
+    const heavy = logicalSceneFixture();
+    objectOf(heavy).mass_kg = 1.5;
+    expect(parseLogicalSceneProjection(heavy).snapshot?.objects[0]?.mass_kg).toBe(1.5);
+    const zero = logicalSceneFixture();
+    objectOf(zero).mass_kg = 0;
+    expect(() => parseLogicalSceneProjection(zero)).toThrow();
+  });
+
+  it('accepts the closed configured_joint_states member and keeps the legacy shape valid', () => {
+    const configured = {
+      object_id: 'robot-1',
+      policy_id: 'viewer.measured_robot',
+      source_id: 'isaac-observer',
+      topic: '/isaac_joint_states',
+    };
+    const fixture = sceneRuntimeFixture();
+    fixture.configured_joint_states = [configured];
+    expect(parseSceneRuntimeProjection(fixture).configured_joint_states).toEqual([configured]);
+
+    const empty = sceneRuntimeFixture();
+    empty.configured_joint_states = [];
+    expect(parseSceneRuntimeProjection(empty).configured_joint_states).toEqual([]);
+    expect(parseSceneRuntimeProjection(sceneRuntimeFixture()).configured_joint_states)
+      .toBeUndefined();
+  });
+
+  it('rejects malformed configured_joint_states rows and the retired cell_observer member', () => {
+    const extraField = sceneRuntimeFixture();
+    extraField.configured_joint_states = [{
+      object_id: 'robot-1',
+      policy_id: 'viewer.measured_robot',
+      source_id: 'isaac-observer',
+      topic: '/isaac_joint_states',
+      unexpected: true,
+    }];
+    expect(() => parseSceneRuntimeProjection(extraField)).toThrow(/exactly/);
+
+    const emptyTopic = sceneRuntimeFixture();
+    emptyTopic.configured_joint_states = [{
+      object_id: 'robot-1', policy_id: 'viewer.measured_robot', source_id: 'isaac-observer', topic: '',
+    }];
+    expect(() => parseSceneRuntimeProjection(emptyTopic)).toThrow('must be a non-empty string');
+
+    const notArray = sceneRuntimeFixture();
+    notArray.configured_joint_states = {};
+    expect(() => parseSceneRuntimeProjection(notArray)).toThrow();
+
+    const retired = sceneRuntimeFixture();
+    retired.cell_observer = {};
+    expect(() => parseSceneRuntimeProjection(retired)).toThrow(/exactly/);
+  });
+
+  it('accepts the complete captured live owner sections and all five current objects', () => {
+    const captured = structuredClone(isaacSceneOwnerSections) as Record<string, unknown>;
+    const runtimeWire = runtimeSnapshotFixture();
+    runtimeWire.projection_generation = captured.projection_generation;
+    runtimeWire.projection_owner_epoch = captured.projection_owner_epoch;
+    runtimeWire.projection_owner_id = captured.projection_owner_id;
+    const runtimeSections = runtimeWire.sections as Record<string, unknown>;
+    const capturedSections = captured.sections as Record<string, unknown>;
+    runtimeSections.logical_scene = capturedSections.logical_scene;
+    runtimeSections.scene_runtime = capturedSections.scene_runtime;
+
+    const logicalSection = capturedSections.logical_scene as Record<string, unknown>;
+    const logicalPayload = logicalSection.payload as Record<string, unknown>;
+    const activeProjection = (logicalPayload.access as Record<string, unknown>)
+      .active_projection as Record<string, string>;
+    const sourceModel = sourceModelFixture();
+    sourceModel.cell_id = (logicalPayload.snapshot as Record<string, unknown>).cell_id;
+    sourceModel.retained_bundle_id = activeProjection.retained_bundle_id;
+    sourceModel.graph_revision = activeProjection.graph_revision;
+    const environment = {
+      active: {
+        retainedBundleId: activeProjection.retained_bundle_id,
+        graphRevision: activeProjection.graph_revision,
+      },
+    } as NodeEnvironmentResponse;
+    const facts = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(runtimeWire),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+
+    expect(facts.available, facts.available ? undefined : facts.reason).toBe(true);
+    if (facts.available) {
+      expect(facts.facts.logicalScene.snapshot?.objects.map((object) => object.scene_resource_id))
+        .toEqual([
+          'isaac_cheese_box',
+          'isaac_small_klt',
+          'isaac_small_klt_01',
+          'isaac_soup_can',
+          'isaac_table_low_327',
+        ]);
+      expect(facts.facts.sceneRuntime.configured_joint_states?.[0]?.source_id)
+        .toBe('isaac_scene_objects');
+    }
+
+    const malformedRuntime = structuredClone(runtimeWire);
+    const malformedSections = malformedRuntime.sections as Record<string, Record<string, unknown>>;
+    const sceneRuntimeSection = malformedSections.scene_runtime;
+    const sceneRuntimePayload = sceneRuntimeSection.payload as Record<string, unknown>;
+    const configuredJointStates = sceneRuntimePayload.configured_joint_states as Record<string, unknown>[];
+    configuredJointStates[0]!.unexpected = true;
+    const malformed = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(malformedRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(malformed.available).toBe(false);
+    if (!malformed.available) {
+      expect(malformed.reason).toContain(
+        'sceneRuntime.configured_joint_states[0] must be an object with exactly',
+      );
+    }
+
+    const lostRuntime = structuredClone(runtimeWire);
+    const lostState = ((lostRuntime.sections as Record<string, Record<string, unknown>>)
+      .scene_runtime.payload as Record<string, unknown>).state as Record<string, unknown>;
+    const loss = {
+      carried_object_attachment_id: 'attachment.1',
+      code: 'scene.carried_object_lost',
+      command_target_id: 'left_gripper',
+      controllable_component_id: 'robot',
+      event_id: 'scene-runtime-pose-1',
+      full_text: 'isaac_cheese_box moved 52.0 mm / 3.0° from its grasp pose (bound 30.0 mm / 14.9°); it was detached and the motion stopped.',
+      on_grasp_lost: { detach: true, raise_alarm: true, set_key: null, stop_motion: true },
+      scene_resource_id: 'isaac_cheese_box',
+    };
+    lostState.carried_object_losses = [loss];
+    const lost = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(lost.available, lost.available ? undefined : lost.reason).toBe(true);
+    if (lost.available) expect(lost.facts.sceneRuntime.state.carried_object_losses).toEqual([loss]);
+    lostState.carried_object_losses = [{ ...loss, code: 'carried_object_lost' }];
+    const wrongCode = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(wrongCode.available).toBe(false);
+    lostState.carried_object_losses = [{ ...loss, on_grasp_lost: { ...loss.on_grasp_lost, set_key: 'loss_flag' } }];
+    const keyed = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(keyed.available).toBe(true);
+    const signalError = 'carried_object_lost_signal_unavailable';
+    lostState.carried_object_losses = [{ ...loss, signal_error: signalError }];
+    const failedPublication = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(failedPublication.available).toBe(true);
+    if (failedPublication.available) {
+      expect(failedPublication.facts.sceneRuntime.state.carried_object_losses).toEqual([
+        { ...loss, signal_error: signalError },
+      ]);
+    }
+    lostState.carried_object_losses = [{ ...loss, signal_error: { code: signalError } }];
+    const errorObject = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(errorObject.available).toBe(false);
+    lostState.carried_object_losses = [{ ...loss, signal_error: '' }];
+    const emptySignalError = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(emptySignalError.available).toBe(false);
+    lostState.carried_object_losses = [{
+      ...loss,
+      on_grasp_lost: { ...loss.on_grasp_lost, raise_alarm: false, stop_motion: false },
+      signal_error: signalError,
+    }];
+    const signalErrorWithoutFailClosedPolicy = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(signalErrorWithoutFailClosedPolicy.available).toBe(false);
+    lostState.carried_object_losses = [{
+      ...loss,
+      on_grasp_lost: { ...loss.on_grasp_lost, stop_motion: false },
+    }];
+    const alarmWithoutStop = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(alarmWithoutStop.available).toBe(false);
+    lostState.carried_object_losses = [{ ...loss, on_grasp_lost: { ...loss.on_grasp_lost, unexpected: true } }];
+    const extraPolicyField = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(extraPolicyField.available).toBe(false);
+  });
+
+  it('strictly parses carried-object attachment hierarchy metadata', () => {
+    const fixture = logicalSceneFixture();
+    const snapshot = fixture.snapshot as Record<string, unknown>;
+    snapshot.carried_object_attachments = [{
+      carried_object_attachment_id: 'attachment.1',
+      carried_object_attachment_revision: `sha256:${'a'.repeat(64)}`,
+      scene_resource_id: 'part',
+      controllable_component_id: 'robot',
+      command_target_id: 'arm',
+      carrier_frame_ref: {
+        kind: 'component',
+        controllable_component_id: 'robot',
+        model_instance_id: 'robot.model',
+        frame_role_id: 'tcp',
+      },
+      pose_in_carrier_frame: {
+        position_m: { x: 0, y: 0, z: 0.1 },
+        orientation_xyzw: [0, 0, 0, 1],
+      },
+      touch_body_roles: ['tool_collision'],
+    }];
+    expect(parseLogicalSceneProjection(fixture).snapshot
+      ?.carried_object_attachments[0].carrier_frame_ref.frame_role_id).toBe('tcp');
+    (snapshot.carried_object_attachments as Record<string, unknown>[])[0]
+      .unexpected = true;
+    expect(() => parseLogicalSceneProjection(fixture)).toThrow(/exactly/);
+  });
+
+  it('parses exact good and unknown ROS observation payloads', () => {
+    const fixture = sceneRuntimeFixture();
+    const state = fixture.state as Record<string, unknown>;
+    state.pose_sources = [
+      poseSourceFixture({
+        api_version: 'manyforge.ros_pose_observation.v2',
+        joint_names: ['joint_1', 'joint_2'],
+        kind: 'joint_state',
+        positions: [0.1, -0.2],
+        source_stamp_ns: 12500000000,
+        topic: '/isaac_joint_states',
+      }),
+      poseSourceFixture({
+        api_version: 'manyforge.ros_pose_observation.v2',
+        kind: 'simulation_entity_pose',
+        pose: {
+          frame_id: 'universe',
+          frame_kind: 'cell_frame',
+          orientation_xyzw: [0, 0, 0, 1],
+          position_m: [0.4, -0.2, 0.1],
+          source_stamp_ns: 13000000000,
+        },
+        source: { entity: '/mac_n_cheese_centered' },
+      }, {
+        eligible: true,
+        object_id: 'isaac_cheese_box',
+        policy_id: 'continuous_unattached',
+        source_sequence: 8,
+      }),
+      poseSourceFixture({
+        api_version: 'manyforge.ros_pose_observation.v2',
+        kind: 'detection3d_pose',
+        source_error: {
+          code: 'detection_not_found',
+          detail: 'no detection matched',
+          source_key: '/output',
+        },
+      }, {
+        fresh: false,
+        object_id: 'graspable',
+        policy_id: 'before_planning',
+        payload_quality: 'unknown',
+        source_sequence: 9,
+      }),
+    ];
+
+    const parsed = parseSceneRuntimeProjection(fixture).state.pose_sources;
+    expect(parsed[0]?.payload.kind).toBe('joint_state');
+    expect(parsed[1]?.payload.kind).toBe('simulation_entity_pose');
+    expect(parsed[2]?.payload_quality).toBe('unknown');
+  });
+
+  it('parses the versioned gripper-referenced simulation pose payload', () => {
+    const reference = {
+      controllable_component_id: 'robot-1',
+      command_target_id: 'gripper-target',
+      gripper_link: 'tcp',
+      coherent: true,
+      entity: '/World/gripper',
+      link: 'robotiq_base_link',
+      source_header_frame_id: 'robotiq_base_link',
+      pose_in_reference: { orientation_xyzw: [0, 0, 0, 1], position_m: [0.02, 0, 0.25] },
+    };
+    const payload = {
+      api_version: 'manyforge.ros_pose_observation.v2',
+      kind: 'simulation_entity_pose_with_references.v1',
+      pose: {
+        frame_id: 'universe',
+        frame_kind: 'cell_frame',
+        orientation_xyzw: [0, 0, 0, 1],
+        position_m: [0.4, -0.2, 0.1],
+        source_stamp_ns: null,
+      },
+      references: [reference],
+      source: { entity: '/mac_n_cheese_centered' },
+    };
+    const fixture = sceneRuntimeFixture();
+    (fixture.state as Record<string, unknown>).pose_sources = [
+      poseSourceFixture(payload, { eligible: true, object_id: 'isaac_cheese_box' }),
+      poseSourceFixture(
+        {
+          ...payload,
+          references: [{ ...reference, coherent: false, pose_in_reference: null }],
+        },
+        { eligible: true, object_id: 'isaac_other_box', source_sequence: 8 },
+      ),
+    ];
+    const parsed = parseSceneRuntimeProjection(fixture).state.pose_sources;
+    expect(parsed[0]?.payload).toMatchObject({
+      kind: 'simulation_entity_pose_with_references.v1',
+      references: [{
+        controllable_component_id: 'robot-1',
+        command_target_id: 'gripper-target',
+        gripper_link: 'tcp',
+        entity: '/World/gripper',
+        link: 'robotiq_base_link',
+        source_header_frame_id: 'robotiq_base_link',
+        coherent: true,
+        pose_in_reference: { position_m: [0.02, 0, 0.25] },
+      }],
+    });
+    expect(parsed[1]?.payload).toMatchObject({ references: [{ coherent: false, pose_in_reference: null }] });
+
+    const multipleReferences = sceneRuntimeFixture();
+    (multipleReferences.state as Record<string, unknown>).pose_sources = [poseSourceFixture({
+      ...payload,
+      references: [reference, {
+        ...reference,
+        command_target_id: 'second-gripper',
+        gripper_link: 'parallel_jaw',
+      }],
+    })];
+    expect(parseSceneRuntimeProjection(multipleReferences).state.pose_sources[0]?.payload)
+      .toMatchObject({ references: [{ command_target_id: 'gripper-target' }, { command_target_id: 'second-gripper' }] });
+
+    const duplicateTarget = sceneRuntimeFixture();
+    (duplicateTarget.state as Record<string, unknown>).pose_sources = [poseSourceFixture({
+      ...payload,
+      references: [reference, { ...reference, gripper_link: 'parallel_jaw' }],
+    })];
+    expect(() => parseSceneRuntimeProjection(duplicateTarget)).toThrow(
+      /unique controllable_component_id and command_target_id pairs/,
+    );
+
+    const extra = sceneRuntimeFixture();
+    (extra.state as Record<string, unknown>).pose_sources = [
+      poseSourceFixture({ ...payload, kind: 'simulation_entity_pose' }),
+    ];
+    expect(() => parseSceneRuntimeProjection(extra)).toThrow();
+  });
+
+  it('parses complete attached-reference measurements and optional grasp baseline', () => {
+    const payload = {
+      api_version: 'manyforge.ros_pose_observation.v2',
+      kind: 'simulation_entity_pose_with_references.v1',
+      pose: {
+        frame_id: 'universe',
+        frame_kind: 'cell_frame',
+        orientation_xyzw: [0, 0, 0, 1],
+        position_m: [0.4, -0.2, 0.1],
+        source_stamp_ns: null,
+      },
+      references: [{
+        controllable_component_id: 'arm',
+        command_target_id: 'gripper',
+        gripper_link: 'tcp',
+        entity: '/World/gripper',
+        link: 'robotiq_base_link',
+        source_header_frame_id: 'robotiq_header',
+        coherent: true,
+        pose_in_reference: { orientation_xyzw: [0, 0, 0, 1], position_m: [0.02, 0, 0.25] },
+      }],
+      source: { entity: '/mac_n_cheese_centered' },
+    };
+    const holder = {
+      controllable_component_id: 'arm', command_target_id: 'gripper', gripper_link: 'tcp',
+    };
+    const measuredAgainst = { entity: '/World/gripper', link: 'robotiq_base_link' };
+    const frame = {
+      kind: 'component',
+      controllable_component_id: 'arm',
+      model_instance_id: 'arm.model',
+      frame_role_id: 'tcp',
+    };
+    const currentOffset = {
+      position_m: { x: 0.02, y: 0, z: 0.25 },
+      orientation_xyzw: [0, 0, 0, 1],
+    };
+    const baselineOffset = {
+      position_m: { x: 0.01, y: 0, z: 0.24 },
+      orientation_xyzw: [0, 0, 0, 1],
+    };
+    const full = {
+      holder,
+      measured_against: measuredAgainst,
+      source_header_frame_id: 'robotiq_header',
+      frame,
+      current_offset: currentOffset,
+      baseline_offset: baselineOffset,
+      drift: { translation_m: 0.0141, rotation_rad: 0.02 },
+    };
+    const currentOnly = { ...full };
+    delete (currentOnly as Partial<typeof full>).baseline_offset;
+    delete (currentOnly as Partial<typeof full>).drift;
+    delete (currentOnly as Partial<typeof full>).source_header_frame_id;
+
+    const fixture = sceneRuntimeFixture();
+    (fixture.state as Record<string, unknown>).pose_sources = [
+      poseSourceFixture(payload, {
+        ...full,
+        eligible: true,
+        object_id: 'isaac_cheese_box',
+        policy_id: 'continuous_relative_to_attached',
+      }),
+      poseSourceFixture(payload, {
+        ...currentOnly,
+        eligible: true,
+        object_id: 'isaac_other_box',
+        policy_id: 'continuous_relative_to_attached',
+        source_sequence: 8,
+      }),
+    ];
+    const parsed = parseSceneRuntimeProjection(fixture).state.pose_sources;
+    expect(parsed[0]).toMatchObject(full);
+    expect(parsed[1]).toMatchObject({ holder, measured_against: measuredAgainst, current_offset: currentOffset });
+    expect(parsed[1]).not.toHaveProperty('baseline_offset');
+    expect(parsed[1]).not.toHaveProperty('drift');
+
+    const partial = sceneRuntimeFixture();
+    (partial.state as Record<string, unknown>).pose_sources = [poseSourceFixture(payload, {
+      holder,
+      eligible: true,
+      object_id: 'isaac_cheese_box',
+    })];
+    expect(() => parseSceneRuntimeProjection(partial)).toThrow(
+      /measured_against must be present with the pose measurement/,
+    );
+
+    const unpairedBaseline = sceneRuntimeFixture();
+    (unpairedBaseline.state as Record<string, unknown>).pose_sources = [poseSourceFixture(payload, {
+      ...currentOnly,
+      baseline_offset: baselineOffset,
+      eligible: true,
+      object_id: 'isaac_cheese_box',
+    })];
+    expect(() => parseSceneRuntimeProjection(unpairedBaseline)).toThrow(
+      /baseline_offset and drift to be present together/,
+    );
+
+    // Night change 9: the live row carries its observer binding id ("scene").
+    const binding = sceneRuntimeFixture();
+    (binding.state as Record<string, unknown>).pose_sources = [poseSourceFixture(payload, {
+      ...full,
+      eligible: true,
+      object_id: 'isaac_cheese_box',
+      policy_id: 'scene',
+    })];
+    expect(parseSceneRuntimeProjection(binding).state.pose_sources[0])
+      .toMatchObject({ ...full, policy_id: 'scene' });
+
+    const unreferenced = sceneRuntimeFixture();
+    (unreferenced.state as Record<string, unknown>).pose_sources = [poseSourceFixture({
+      api_version: payload.api_version,
+      kind: 'simulation_entity_pose',
+      pose: payload.pose,
+      source: payload.source,
+    }, {
+      ...full,
+      eligible: true,
+      object_id: 'isaac_cheese_box',
+      policy_id: 'scene',
+    })];
+    expect(() => parseSceneRuntimeProjection(unreferenced)).toThrow(
+      /gripper-relative pose measurements only on referenced-pose rows/,
+    );
+
+    const wrongReference = sceneRuntimeFixture();
+    (wrongReference.state as Record<string, unknown>).pose_sources = [poseSourceFixture({
+      ...payload,
+      references: [{
+        controllable_component_id: 'arm',
+        command_target_id: 'gripper',
+        gripper_link: 'tcp',
+        entity: '/World/gripper',
+        link: 'robotiq_left_finger',
+        source_header_frame_id: 'robotiq_base_link',
+        coherent: true,
+        pose_in_reference: {
+          orientation_xyzw: [0, 0, 0, 1],
+          position_m: [0.02, 0, 0.25],
+        },
+      }],
+    }, {
+      ...full,
+      eligible: true,
+      object_id: 'isaac_cheese_box',
+      policy_id: 'continuous_relative_to_attached',
+    })];
+    expect(() => parseSceneRuntimeProjection(wrongReference)).toThrow(
+      /gripper-relative pose measurements to match a coherent reference in the same observation/,
+    );
+  });
+
+  it('parses a continuous grasp-loss measurement against the cell frame', () => {
+    const fixture = sceneRuntimeFixture();
+    const payload = {
+      api_version: 'manyforge.ros_pose_observation.v2',
+      kind: 'simulation_entity_pose',
+      pose: {
+        frame_id: 'cell',
+        frame_kind: 'cell_frame',
+        orientation_xyzw: [0, 0, 0, 1],
+        position_m: [0.4, -0.2, 0.1],
+        source_stamp_ns: null,
+      },
+      source: { entity: '/part' },
+    };
+    (fixture.state as Record<string, unknown>).pose_sources = [poseSourceFixture(payload, {
+      eligible: true,
+      object_id: 'part',
+      policy_id: 'continuous',
+      measured_against: 'cell frame',
+      frame: {
+        kind: 'component',
+        controllable_component_id: 'arm',
+        model_instance_id: 'arm.model',
+        frame_role_id: 'tcp',
+      },
+      current_offset: {
+        position_m: { x: 0.02, y: 0, z: 0.25 },
+        orientation_xyzw: [0, 0, 0, 1],
+      },
+      baseline_offset: {
+        position_m: { x: 0.01, y: 0, z: 0.24 },
+        orientation_xyzw: [0, 0, 0, 1],
+      },
+      drift: { translation_m: 0.0141, rotation_rad: 0.02 },
+    })];
+
+    const parsed = parseSceneRuntimeProjection(fixture).state.pose_sources[0];
+    expect(parsed).toMatchObject({
+      measured_against: 'cell frame',
+      current_offset: { position_m: { x: 0.02, y: 0, z: 0.25 } },
+      baseline_offset: { position_m: { x: 0.01, y: 0, z: 0.24 } },
+      drift: { translation_m: 0.0141, rotation_rad: 0.02 },
+    });
+    expect(parsed).not.toHaveProperty('holder');
+    expect(parsed).not.toHaveProperty('source_header_frame_id');
+
+    // Night change 9: the live row carries its observer binding id ("scene").
+    const binding = sceneRuntimeFixture();
+    (binding.state as Record<string, unknown>).pose_sources = [poseSourceFixture(payload, {
+      eligible: true,
+      object_id: 'part',
+      policy_id: 'scene',
+      measured_against: 'cell frame',
+      frame: {
+        kind: 'component',
+        controllable_component_id: 'arm',
+        model_instance_id: 'arm.model',
+        frame_role_id: 'tcp',
+      },
+      current_offset: {
+        position_m: { x: 0.02, y: 0, z: 0.25 },
+        orientation_xyzw: [0, 0, 0, 1],
+      },
+    })];
+    expect(parseSceneRuntimeProjection(binding).state.pose_sources[0]).toMatchObject({
+      policy_id: 'scene',
+      measured_against: 'cell frame',
+    });
+  });
+
+  it('rejects ambiguous or dishonest ROS observation shapes', () => {
+    const invalidFrame = sceneRuntimeFixture();
+    (invalidFrame.state as Record<string, unknown>).pose_sources = [
+      poseSourceFixture({
+        api_version: 'manyforge.ros_pose_observation.v2',
+        kind: 'simulation_entity_pose',
+        pose: {
+          frame_id: 'world',
+          frame_kind: 'unmapped_frame',
+          orientation_xyzw: [0, 0, 0, 1],
+          position_m: [0, 0, 0],
+          source_stamp_ns: null,
+        },
+        source: { entity: '/part' },
+      }),
+    ];
+    expect(() => parseSceneRuntimeProjection(invalidFrame)).toThrow(
+      'frame_kind must be the literal "cell_frame"',
+    );
+
+    const duplicateJoint = sceneRuntimeFixture();
+    (duplicateJoint.state as Record<string, unknown>).pose_sources = [
+      poseSourceFixture({
+        api_version: 'manyforge.ros_pose_observation.v2',
+        joint_names: ['joint_1', 'joint_1'],
+        kind: 'joint_state',
+        positions: [0.1, 0.2],
+        source_stamp_ns: null,
+        topic: '/isaac_joint_states',
+      }),
+    ];
+    expect(() => parseSceneRuntimeProjection(duplicateJoint)).toThrow(
+      'equal non-empty unique joint_names',
+    );
+
+    const dishonestUnknown = sceneRuntimeFixture();
+    (dishonestUnknown.state as Record<string, unknown>).pose_sources = [
+      poseSourceFixture({
+        api_version: 'manyforge.ros_pose_observation.v2',
+        kind: 'joint_state',
+        source_error: {
+          code: 'source_error',
+          detail: 'offline',
+          source_key: '/isaac_joint_states',
+        },
+      }, { payload_quality: 'unknown' }),
+    ];
+    expect(() => parseSceneRuntimeProjection(dishonestUnknown)).toThrow(
+      'unknown quality to be unbuffered, ineligible, and stale',
+    );
+
+    // Hard switch: the superseded pose-source `quality` key is refused.
+    const superseded = sceneRuntimeFixture();
+    const joint = {
+      api_version: 'manyforge.ros_pose_observation.v2', joint_names: ['joint_1'],
+      kind: 'joint_state', positions: [0.1], source_stamp_ns: null, topic: '/isaac_joint_states',
+    };
+    const { payload_quality: quality, ...rest } = poseSourceFixture(joint);
+    (superseded.state as Record<string, unknown>).pose_sources = [{ ...rest, quality }];
+    expect(() => parseSceneRuntimeProjection(superseded)).toThrow();
+    (superseded.state as Record<string, unknown>).pose_sources = [poseSourceFixture(joint)];
+    expect(parseSceneRuntimeProjection(superseded).state.pose_sources).toHaveLength(1);
+    (superseded.state as Record<string, unknown>).api_version = 'manyforge.scene_runtime_state.v1';
+    expect(() => parseSceneRuntimeProjection(superseded)).toThrow('manyforge.scene_runtime_state.v2');
+  });
+
+  it('parses the v3 component rows and refuses v2 or crossed mounts', () => {
+    expect(parseSourceModelProjection(sourceModelFixture()).components).toEqual([
+      { component_id: 'lite6_robot', mounted_on: null },
+      { component_id: 'lite_gripper', mounted_on: { component_id: 'lite6_robot', interface_id: 'flange' } },
+    ]);
+
+    const v2 = sourceModelFixture();
+    v2.schema_version = 'manyforge.source_model_projection.v2';
+    expect(() => parseSourceModelProjection(v2)).toThrow('manyforge.source_model_projection.v3');
+
+    const withoutComponents = sourceModelFixture();
+    delete withoutComponents.components;
+    expect(() => parseSourceModelProjection(withoutComponents)).toThrow();
+
+    const extraMountField = sourceModelFixture();
+    (extraMountField.components as Array<Record<string, unknown>>)[1].mounted_on = {
+      component_id: 'lite6_robot', interface_id: 'flange', primary: true,
+    };
+    expect(() => parseSourceModelProjection(extraMountField)).toThrow();
+
+    const unknownParent = sourceModelFixture();
+    (unknownParent.components as Array<Record<string, unknown>>)[1].mounted_on = {
+      component_id: 'ur10e_robot', interface_id: 'flange',
+    };
+    expect(() => parseSourceModelProjection(unknownParent)).toThrow('mounts on listed components');
+
+    const duplicate = sourceModelFixture();
+    (duplicate.components as unknown[]).push({ component_id: 'lite6_robot', mounted_on: null });
+    expect(() => parseSourceModelProjection(duplicate)).toThrow('unique component_id values');
+  });
+
+  it('rejects stale shapes and cross-owner scene revisions', () => {
+    const stale = sourceModelFixture();
+    (stale.source as Record<string, unknown>).freshness = 'stale';
+    expect(() => parseSourceModelProjection(stale)).toThrow('available and fresh');
+
+    const scene = logicalSceneFixture();
+    const snapshot = scene.snapshot as Record<string, unknown>;
+    (snapshot.revision as Record<string, unknown>).revision_id = 2;
+    expect(() => parseLogicalSceneProjection(scene)).toThrow(
+      'the active projection scene revision',
+    );
+  });
+
+  it('accepts only an exact successful scene transaction receipt', () => {
+    const parsed = parseSceneTransactionResponse({
+      api_version: 'manyforge.manager_command_response.v1',
+      committed_projection_revision: projectionRevisionFixture(2),
+      error: null,
+      ok: true,
+      projection_status: 'committed',
+      replay_status: 'accepted_new',
+      request_id: 'request-1',
+      request_owner_epoch: 'scene-owner-epoch-7',
+      transaction_sequence: 1,
+      update_status: 'pose_changed',
+    });
+    expect(parsed.committed_projection_revision.scene_revision.revision_id).toBe(2);
+  });
+
+  it('parses exact pending and succeeded Manager Apply receipts', () => {
+    const pending = parseManagerApplyResponse({
+      api_version: 'manyforge.manager_command_response.v1',
+      apply_generation: 1,
+      apply_id: 'apply-1',
+      candidate_projection_revision: null,
+      error: null,
+      ok: true,
+      replay_status: 'accepted_new',
+      request_id: 'request-1',
+      request_owner_epoch: 'manager-owner-1',
+      state: 'pending',
+    });
+    expect(pending.state).toBe('pending');
+    expect(pending.candidateProjectionRevision).toBeNull();
+
+    const succeeded = parseManagerApplyResponse({
+      api_version: 'manyforge.manager_command_response.v1',
+      apply_generation: 1,
+      apply_id: 'apply-1',
+      candidate_projection_revision: projectionRevisionFixture(2),
+      error: null,
+      ok: true,
+      replay_status: 'replayed_exact',
+      request_id: 'request-1',
+      request_owner_epoch: 'manager-owner-1',
+      state: 'succeeded',
+    });
+    expect(succeeded.state).toBe('succeeded');
+    expect(succeeded.applyId).toBe('apply-1');
+    if (succeeded.state !== 'succeeded') {
+      throw new Error('expected a succeeded Manager Apply receipt');
+    }
+    expect(succeeded.candidateProjectionRevision.scene_revision.revision_id)
+      .toBe(2);
+  });
+
+  it('rejects obsolete, extra-field, and inconsistent Manager Apply receipts', () => {
+    const obsolete = {
+      api_version: 'manyforge.manager_command_response.v1',
+      error: null,
+      ok: true,
+      request_id: 'request-1',
+      request_owner_epoch: 'manager-owner-1',
+    };
+    expect(() => parseManagerApplyResponse(obsolete)).toThrow(/exactly/);
+
+    const extra = {
+      api_version: 'manyforge.manager_command_response.v1',
+      apply_generation: 1,
+      apply_id: 'apply-1',
+      candidate_projection_revision: null,
+      error: null,
+      ok: true,
+      replay_status: 'accepted_new',
+      request_id: 'request-1',
+      request_owner_epoch: 'manager-owner-1',
+      state: 'pending',
+      projection_status: 'pending',
+    };
+    expect(() => parseManagerApplyResponse(extra)).toThrow(/exactly/);
+
+    const pendingWithCandidate = {
+      ...extra,
+      projection_status: undefined,
+      candidate_projection_revision: projectionRevisionFixture(),
+    };
+    delete pendingWithCandidate.projection_status;
+    expect(() => parseManagerApplyResponse(pendingWithCandidate)).toThrow(
+      /null unless Apply succeeded/,
+    );
+
+    const succeededWithoutCandidate = {
+      ...extra,
+      projection_status: undefined,
+      candidate_projection_revision: null,
+      state: 'succeeded',
+    };
+    delete succeededWithoutCandidate.projection_status;
+    expect(() => parseManagerApplyResponse(succeededWithoutCandidate)).toThrow(
+      /projection revision while Apply has succeeded/,
+    );
+
+    const failedReceipt = {
+      ...extra,
+      projection_status: undefined,
+      state: 'unknown_effect',
+    };
+    delete failedReceipt.projection_status;
+    const failed = parseManagerApplyResponse(failedReceipt);
+    expect(failed.state).toBe('unknown_effect');
+  });
+
+  it('parses durable Manager Apply progress and terminal failure exactly', () => {
+    const base = {
+      api_version: 'manyforge.manager_command_response.v1',
+      apply_generation: 4,
+      apply_id: 'apply-4',
+      candidate_projection_revision: null,
+      failure_acknowledgement: 'unavailable',
+      error: null,
+      failure: null,
+      last_progress: {
+        phase: 'runtime_converged',
+        record_digest: `sha256:${'1'.repeat(64)}`,
+      },
+      ok: true,
+      phase: 'runtime_converged',
+      scene_initialization: 'preserve',
+      prepared_activation: {
+        captured_input_digest: `sha256:${'2'.repeat(64)}`,
+        deployment_artifact_id: 'deployment-1',
+        deployment_revision: `sha256:${'3'.repeat(64)}`,
+        program_binding_id: `sha256:${'4'.repeat(64)}`,
+        prepared_activation_id: `sha256:${'5'.repeat(64)}`,
+      },
+      request_id: 'request-4',
+      request_owner_epoch: 'owner-4',
+      state: 'pending',
+    };
+    expect(parseManagerApplyStatus(base).phase).toBe('runtime_converged');
+    expect(parseManagerApplyStatus(base).failureAcknowledgement).toBe('unavailable');
+    expect(() => parseManagerApplyStatus({
+      ...base,
+      failure_acknowledgement: 'available',
+    })).toThrow(/before-effect failure/);
+    const failedBeforeEffectRecord = {
+      ...base,
+      failure_acknowledgement: 'available',
+      failure: {
+        cause_code: 'stale_generation',
+        cause_details: { reason: 'expected_generation_stale' },
+        code: 'apply_admission_failed',
+        effect_boundary: 'before_effect',
+        effect_disposition: 'known',
+        message: 'Apply refused before effects began.',
+        phase: 'runtime_converged',
+        producer: 'kernel',
+      },
+      state: 'failed',
+    };
+    const failedBeforeEffect = parseManagerApplyStatus(failedBeforeEffectRecord);
+    expect(failedBeforeEffect.failureAcknowledgement).toBe('available');
+    expect(parseManagerApplyStatus({
+      ...failedBeforeEffectRecord,
+      failure_acknowledgement: 'acknowledged',
+    }).failureAcknowledgement).toBe('acknowledged');
+    const missingAcknowledgementState = { ...base } as Record<string, unknown>;
+    delete missingAcknowledgementState.failure_acknowledgement;
+    expect(() => parseManagerApplyStatus(missingAcknowledgementState)).toThrow(/exactly/);
+    expect(() => parseManagerApplyStatus({
+      ...base,
+      failure_acknowledgement: 'maybe',
+    })).toThrow(/available, acknowledged, or unavailable/);
+    expect(parseManagerApplyStatus({ ...base, scene_initialization: 'initialize' }).sceneInitialization).toBe('initialize');
+    for (const purpose of [undefined, true, 'initialize_once']) {
+      expect(() => parseManagerApplyStatus({ ...base, scene_initialization: purpose })).toThrow();
+    }
+    // A non-executable Program is reported by a null binding, not a failure.
+    expect(parseManagerApplyStatus({
+      ...base,
+      prepared_activation: { ...base.prepared_activation, program_binding_id: null },
+    }).preparedActivation.programBindingId).toBeNull();
+
+    const failed = parseManagerApplyStatus({
+      ...base,
+      failure: {
+        cause_code: 'stale_generation',
+        cause_details: { reason: 'expected_generation_stale' },
+        code: 'runtime_initialization_failed',
+        effect_boundary: 'unknown',
+        effect_disposition: 'unknown',
+        message: 'replacement state could not be established',
+        phase: 'runtime_converged',
+        producer: 'kernel',
+      },
+      state: 'unknown_effect',
+    });
+    expect(failed.state).toBe('unknown_effect');
+    expect(failed.failure?.effectDisposition).toBe('unknown');
+    expect(failed.failure).toMatchObject({
+      causeCode: 'stale_generation',
+      causeDetails: { reason: 'expected_generation_stale' },
+      producer: 'kernel',
+      effectBoundary: 'unknown',
+    });
+    expect(() => parseManagerApplyStatus({
+      ...base,
+      failure_acknowledgement: 'acknowledged',
+      failure: {
+        cause_code: 'stale_generation',
+        cause_details: { reason: 'expected_generation_stale' },
+        code: 'runtime_initialization_failed',
+        effect_boundary: 'unknown',
+        effect_disposition: 'unknown',
+        message: 'replacement state could not be established',
+        phase: 'runtime_converged',
+        producer: 'kernel',
+      },
+      state: 'unknown_effect',
+    })).toThrow(/available or acknowledged only/);
+    expect(() => parseManagerApplyStatus({
+      ...base,
+      failure_acknowledgement: 'available',
+      failure: {
+        cause_code: 'runtime_convergence_failed',
+        cause_details: {},
+        code: 'runtime_convergence_failed',
+        effect_boundary: 'unknown',
+        effect_disposition: 'known',
+        message: 'Runtime convergence failed.',
+        phase: 'runtime_converged',
+        producer: 'component_manager',
+      },
+      state: 'failed',
+    })).toThrow(/available or acknowledged only/);
+    expect(() => parseManagerApplyStatus({
+      ...base,
+      failure_acknowledgement: 'acknowledged',
+      failure: {
+        cause_code: 'runtime_convergence_failed',
+        cause_details: {},
+        code: 'runtime_convergence_failed',
+        effect_boundary: 'unknown',
+        effect_disposition: 'known',
+        message: 'Runtime convergence failed.',
+        phase: 'runtime_converged',
+        producer: 'component_manager',
+      },
+      state: 'failed',
+    })).toThrow(/available or acknowledged only/);
+    // The typed cause is part of the closed failure record.
+    expect(() => parseManagerApplyStatus({
+      ...base,
+      failure: {
+        code: 'runtime_initialization_failed',
+        effect_disposition: 'unknown',
+        message: 'no typed cause',
+        phase: 'runtime_converged',
+      },
+      state: 'unknown_effect',
+    })).toThrow(/failure/);
+
+    expect(() => parseManagerApplyStatus({
+      ...base,
+      failure: {
+        cause_code: 'runtime_initialization_failed',
+        cause_details: {},
+        code: 'runtime_initialization_failed',
+        effect_boundary: 'unknown',
+        effect_disposition: 'known',
+        message: 'mismatched disposition',
+        phase: 'runtime_converged',
+        producer: 'component_manager',
+      },
+      state: 'unknown_effect',
+    })).toThrow(/unknown/);
+  });
+
+  it('keeps the maximum visible scene projection parse bounded', () => {
+    const scene = logicalSceneFixture();
+    const snapshot = scene.snapshot as Record<string, unknown>;
+    const fixture = (snapshot.objects as Record<string, unknown>[])[0];
+    snapshot.objects = Array.from({ length: 4096 }, (_, index) => ({
+      ...fixture,
+      scene_resource_id: `part-${index.toString().padStart(4, '0')}`,
+    }));
+
+    const started = performance.now();
+    const parsed = parseLogicalSceneProjection(scene);
+    const elapsedMs = performance.now() - started;
+
+    expect(parsed.snapshot?.objects).toHaveLength(4096);
+    expect(elapsedMs).toBeLessThan(1500);
+  });
+
+  it('accepts structural and headless Composer health without inventing state', () => {
+    const structural = parseHealthResponse({
+      status: 'degraded',
+      mode: 'structural_only',
+      components: { runtime: 'unavailable' },
+      runtimeAvailability: {
+        code: 'composable_cell_runtime_unavailable',
+        message: 'Runtime is unavailable.',
+        restorationGates: ['N7', 'L0', 'P5', 'I', 'R', 'T'],
+      },
+      timestamp: 1,
+    });
+    const headless = parseHealthResponse({
+      status: 'degraded',
+      mode: 'headless_client',
+      components: { runtime: 'degraded' },
+      runtimeAvailability: null,
+      headless: { schema_version: 'manyforge.headless_health.v1' },
+      timestamp: 2,
+    });
+
+    expect(structural.runtimeAvailability?.restorationGates).toEqual([
+      'N7', 'L0', 'P5', 'I', 'R', 'T',
+    ]);
+    expect(structural.headless).toBeNull();
+    expect(headless.mode).toBe('headless_client');
+    expect(headless.runtimeAvailability).toBeNull();
+    expect(structural.workbenchSessionNotice).toBeNull();
+  });
+
+  it('parses the optional projected previous-session notice without classifying it', () => {
+    const notice = {
+      schema_version: 'manyforge.workbench_previous_session.v1',
+      session_id: 'a'.repeat(32),
+      archive_relative_path: `previous-sessions/${'a'.repeat(32)}`,
+      shutdown: 'clean',
+      effects: 'unknown',
+      history_coverage: 'not_imported',
+      journal_families: ['program_cycle', 'scene', 'manager', 'kernel_operation'],
+      message: 'Previous session journals retained; effects are unknown.',
+    };
+    const health = {
+      status: 'ok', mode: 'headless_client', components: {},
+      runtimeAvailability: null, timestamp: 1,
+      workbench_session_notice: notice,
+    };
+    const parsed = parseHealthResponse(health).workbenchSessionNotice;
+    expect(parsed).toEqual({
+      schemaVersion: notice.schema_version,
+      sessionId: notice.session_id,
+      archiveRelativePath: notice.archive_relative_path,
+      shutdown: 'clean', effects: 'unknown', historyCoverage: 'not_imported',
+      journalFamilies: notice.journal_families, message: notice.message,
+    });
+    expect(parseHealthResponse({ ...health, workbench_session_notice: null })
+      .workbenchSessionNotice).toBeNull();
+
+    for (const invalid of [
+      { ...notice, schema_version: 'other' },
+      { ...notice, session_id: 'A'.repeat(32) },
+      { ...notice, archive_relative_path: `previous-sessions/${'b'.repeat(32)}` },
+      { ...notice, shutdown: 'verified' },
+      { ...notice, effects: 'safe' },
+      { ...notice, history_coverage: 'imported' },
+      { ...notice, journal_families: notice.journal_families.slice(1) },
+      { ...notice, journal_families: [...notice.journal_families].reverse() },
+      { ...notice, message: '\u00e9'.repeat(513) },
+      { ...notice, message: 'e\u0301' },
+      { ...notice, message: '\ud800' },
+      { ...notice, extra: true },
+    ]) {
+      expect(() => parseHealthResponse({ ...health, workbench_session_notice: invalid }))
+        .toThrow('health.workbench_session_notice');
+    }
+  });
+
+  it('parses the optional startup-project notice', () => {
+    const health = {
+      status: 'ok', mode: 'headless_client', components: {}, runtimeAvailability: null, timestamp: 1,
+    };
+    const notice = { path: '/p/cell.scenario', code: 'scenario_new_required', message: 'Startup project /p/cell.scenario was not opened.' };
+    expect(parseHealthResponse(health).startupScenarioNotice).toBeNull();
+    expect(parseHealthResponse({ ...health, startup_scenario_notice: notice }).startupScenarioNotice).toEqual(notice);
+    expect(() => parseHealthResponse({ ...health, startup_scenario_notice: { ...notice, extra: 1 } }))
+      .toThrow('health.startup_scenario_notice');
+  });
+
+  it('parses exact Manager status, graph, and diff identities', () => {
+    const source = {
+      available: true,
+      freshness: 'fresh',
+      known_gaps: [],
+      projection_generation: 4,
+      projection_owner_epoch: 'projection.epoch.1',
+      receiver_age_ns: 10,
+      source_content_digest: 'sha256:' + 'a'.repeat(64),
+      source_generation: 2,
+      source_owner_epoch: 'manager.epoch.1',
+      source_owner_id: 'component-manager.cell-a',
+    };
+    const statusWire = {
+      schema_version: 'manyforge.manager_status_projection.v1',
+      source,
+      status: {
+        api_version: 'manyforge.manager_source.v1',
+        active: { canonical_empty: false,
+          cell_graph: { cell_id: 'cell-a', components: [] },
+          graph_revision: 'graph.1',
+          retained_bundle_id: 'bundle.1',
+          publication: {},
+        },
+        apply: {
+          mutation_available: true,
+          records: [managerApplyRecordFixture()],
+          unavailable_reason_code: null,
+        },
+        cell_id: 'cell-a',
+        manager_ready: true,
+        runtime: {
+          converged: true,
+          desired_units: [],
+          observed_units: [],
+        },
+      },
+    };
+    const status = parseManagerStatusProjection(statusWire);
+    const graph = parseManagerGraphProjection({
+      schema_version: 'manyforge.manager_graph_projection.v1',
+      source,
+      graph_revision: 'graph.1',
+      retained_bundle_id: 'bundle.1',
+      cell_graph: { cell_id: 'cell-a', components: [] },
+    });
+    const diff = parseManagerDiffProjection({
+      schema_version: 'manyforge.manager_diff_projection.v1',
+      source,
+      converged: true,
+      desired_units: [],
+      observed_units: [],
+    });
+
+    expect(status.status.active.graphRevision).toBe('graph.1');
+    expect(status.status.apply.records[0]?.request.requestId).toBe('request-3');
+    expect(status.status.apply.records[0]?.phase).toBe('fence_held');
+    expect(graph.retainedBundleId).toBe('bundle.1');
+    expect(diff.converged).toBe(true);
+
+    for (const receipt of [undefined, null, {}, {
+      ...(managerApplyRecordFixture().prepared_activation as Record<string, unknown>),
+      unexpected_field: true,
+    }]) {
+      const invalid = managerApplyRecordFixture();
+      if (receipt === undefined) delete invalid.prepared_activation;
+      else invalid.prepared_activation = receipt;
+      statusWire.status.apply.records = [invalid];
+      expect(() => parseManagerStatusProjection(statusWire)).toThrow();
+    }
+
+    const terminal = managerApplyRecordFixture();
+    terminal.incomplete = false;
+    terminal.phase = 'terminal';
+    terminal.terminal_state = 'unknown_effect';
+    statusWire.status.apply.records = [terminal];
+    expect(
+      parseManagerStatusProjection(statusWire).status.apply.records[0]
+        ?.terminalState,
+    ).toBe('unknown_effect');
+
+    const malformed = managerApplyRecordFixture();
+    malformed.phase = 'browser_waiting';
+    statusWire.status.apply.records = [malformed];
+    expect(() => parseManagerStatusProjection(statusWire)).toThrow(
+      'a supported Manager Apply phase',
+    );
+  });
+
+  it('accepts optional Manager component simulator rows and still rejects unknown keys', () => {
+    const source = {
+      available: true,
+      freshness: 'fresh',
+      known_gaps: [],
+      projection_generation: 4,
+      projection_owner_epoch: 'projection.epoch.1',
+      receiver_age_ns: 10,
+      source_content_digest: 'sha256:' + 'a'.repeat(64),
+      source_generation: 2,
+      source_owner_epoch: 'manager.epoch.1',
+      source_owner_id: 'component-manager.cell-a',
+    };
+    const rows = [{ controllable_component_id: 'arm', simulator: 'none' }];
+    const active = {
+      canonical_empty: false,
+      cell_graph: { cell_id: 'cell-a', components: [] },
+      graph_revision: 'graph.1',
+      retained_bundle_id: 'bundle.1',
+      publication: {},
+    };
+    const status = (activeWire: Record<string, unknown>) => ({
+      schema_version: 'manyforge.manager_status_projection.v1',
+      source,
+      status: {
+        api_version: 'manyforge.manager_source.v1',
+        active: activeWire,
+        apply: { mutation_available: true, records: [], unavailable_reason_code: null },
+        cell_id: 'cell-a',
+        manager_ready: true,
+        runtime: { converged: true, desired_units: [], observed_units: [] },
+      },
+    });
+    const graph = {
+      schema_version: 'manyforge.manager_graph_projection.v1',
+      source,
+      graph_revision: 'graph.1',
+      retained_bundle_id: 'bundle.1',
+      cell_graph: { cell_id: 'cell-a', components: [] },
+    };
+
+    for (const activeWire of [active, { ...active, component_simulator_dependencies: rows }]) {
+      expect(parseManagerStatusProjection(status(activeWire)).status.active.graphRevision)
+        .toBe('graph.1');
+    }
+    for (const graphWire of [graph, { ...graph, component_simulator_dependencies: rows }]) {
+      expect(parseManagerGraphProjection(graphWire).retainedBundleId).toBe('bundle.1');
+    }
+    expect(() => parseManagerStatusProjection(status({ ...active, unexpected: true })))
+      .toThrow('managerStatus.status.active');
+    expect(() => parseManagerGraphProjection({ ...graph, unexpected: true }))
+      .toThrow('managerGraph');
+  });
+
+  it('accepts exact runtime and four-state alarm snapshots', () => {
+    const runtime = parseHeadlessRuntimeSnapshot(runtimeSnapshotFixture());
+    const alarms = parseOperatorAlarmSnapshot(alarmSnapshotFixture());
+
+    expect(runtime.sections.logicalScene.sourceOwnerEpoch).toBe('source-epoch-1');
+    expect(alarms.alarms[0]?.lifecycleState).toBe('active_unacknowledged');
+    expect(alarms.unacknowledgedMembership[0]?.recordRevision).toBe(3);
+    expect(alarms.motionAttentionMembership).toEqual([]);
+  });
+
+  it('parses the complete motion-attention membership with each canonical subject', () => {
+    const wire = alarmSnapshotFixture();
+    wire.motion_attention_membership = [{
+      activation_id: 'activation-2',
+      condition_id: 'condition-2',
+      definition_id: 'manyforge.motion.runtime_collision',
+      lifecycle_state: 'returned_unacknowledged',
+      record_revision: 4,
+      subject: {
+        resource_ids: ['robot.joint_1'],
+        subject_id: 'operation-1',
+        subject_kind: 'operation',
+      },
+    }];
+    expect(parseOperatorAlarmSnapshot(wire).motionAttentionMembership).toEqual([{
+      conditionId: 'condition-2',
+      activationId: 'activation-2',
+      recordRevision: 4,
+      lifecycleState: 'returned_unacknowledged',
+      definitionId: 'manyforge.motion.runtime_collision',
+      subject: { subjectKind: 'operation', subjectId: 'operation-1', resourceIds: ['robot.joint_1'] },
+    }]);
+    delete wire.motion_attention_membership;
+    expect(() => parseOperatorAlarmSnapshot(wire)).toThrow(/motion_attention_membership/);
+  });
+
+  it('rejects unsafe fence numbers and unknown alarm lifecycle values', () => {
+    const runtime = runtimeSnapshotFixture();
+    runtime.projection_generation = Number.MAX_SAFE_INTEGER + 1;
+    expect(() => parseHeadlessRuntimeSnapshot(runtime)).toThrow(
+      'runtime.projection_generation must be a non-negative safe integer',
+    );
+
+    const alarms = alarmSnapshotFixture();
+    const [record] = alarms.alarms as Record<string, unknown>[];
+    record.lifecycle_state = 'cleared';
+    expect(() => parseOperatorAlarmSnapshot(alarms)).toThrow(
+      'a supported four-state alarm lifecycle value',
+    );
+  });
+
+  it('accepts the bounded historian page and validates event schema identity', () => {
+    const wire = {
+      schema_version: 'manyforge.historian_summary_page.v2',
+      time_window: { start_utc_ns: null, end_utc_ns: null },
+      retention: null,
+      events: [{
+        sequence: 7,
+        event: {
+          schema_version: 'manyforge.historian_event_summary.v2',
+          condition_severity: 'ERROR',
+          occurred_at_utc_ns: '1785931200000000000',
+          clock_owner: 'headless:test-epoch',
+          wall_clock_regressed: false,
+          event_id: 'event-1',
+          component: 'manyforge.alarm',
+          event_type: 'operator_alarm_activated',
+          severity: 'INFO',
+          occurred_at_ns: '9007199254740992',
+          occurred_at_wall: '2026-08-05T12:00:00Z',
+          message: 'operator alarm activated',
+          program_run_id: null,
+          operation_id: null,
+          condition_id: 'condition-1',
+        },
+      }],
+      next_before_sequence: null,
+      truncated: false,
+    };
+    const page = parseHistorianPage(wire);
+
+    expect(page.events[0]?.event.eventType).toBe('operator_alarm_activated');
+    expect(page.events[0]?.sequence).toBe(7);
+    expect(() => parseHistorianPage({ ...wire, payload: {} })).toThrow();
+    const eventWithPayload = structuredClone(wire);
+    (eventWithPayload.events[0]!.event as Record<string, unknown>).payload = {};
+    expect(() => parseHistorianPage(eventWithPayload)).toThrow();
+    const numericTimestamp = structuredClone(wire);
+    (numericTimestamp.events[0]!.event as Record<string, unknown>).occurred_at_ns = 123;
+    expect(() => parseHistorianPage(numericTimestamp)).toThrow(
+      'must be a string',
+    );
+    const noncanonicalTimestamp = structuredClone(wire);
+    (noncanonicalTimestamp.events[0]!.event as Record<string, unknown>)
+      .occurred_at_ns = '0123';
+    expect(() => parseHistorianPage(noncanonicalTimestamp)).toThrow(
+      'a canonical nonnegative int64 decimal string',
+    );
+  });
+
+  it('accepts typed exact historian detail availability unions', () => {
+    const detail = parseHistorianDetail({
+      schema_version: 'manyforge.historian_detail.v2',
+      sequence: 7,
+      event: {
+        schema_version: 'manyforge.historian_event.v2',
+        event_id: 'event-1',
+        component: 'manyforge.execution',
+        event_type: 'operation_updated',
+        severity: 'INFO',
+        occurred_at_ns: '9007199254740992',
+        occurred_at_wall: '2026-08-05T12:00:00Z',
+        payload: {},
+      },
+      sections: {
+        incident: { available: false, reason: 'not an incident', value: null },
+        execution_digest: { available: true, reason: null, value: { operation_id: 'op.1' } },
+        blackboard: { available: false, reason: 'not published', value: null },
+        latency: { available: false, reason: 'not published', value: null },
+      },
+    });
+    expect(detail.sequence).toBe(7);
+    expect(detail.sections.executionDigest.available).toBe(true);
+    expect(() => parseHistorianDetail({
+      ...detail,
+      schema_version: 'manyforge.historian_detail.v2',
+    })).toThrow();
+  });
+});
+
+describe('addressed Robot Control parsers', () => {
+  const sceneRevision = {
+    scene_id: 'scene-1',
+    revision_id: 3,
+    content_hash: 'sha256:scene',
+  };
+
+  it('requires the backend-owned operation residency fact', () => {
+    const response = {
+      ok: true,
+      command: 'read',
+      resident: true,
+      operation: {
+        operation_id: 'operation-1',
+        operation_revision: 4,
+        state: 'completed',
+        participants: [{
+          progress: 1, terminal_error: null,
+          control_binding_id: 'binding-1', control_binding_revision: `sha256:${'a'.repeat(64)}`,
+        }],
+        active_stop_id: null,
+        active_stop_generation: null,
+      },
+    };
+    expect(parseOperationObservation(response).resident).toBe(true);
+
+    const missing = structuredClone(response) as Record<string, unknown>;
+    delete missing.resident;
+    expect(() => parseOperationObservation(missing)).toThrow();
+
+    for (const binding of [
+      { control_binding_id: null, control_binding_revision: null },
+      { control_binding_id: 'binding-1', control_binding_revision: null },
+      { control_binding_id: undefined, control_binding_revision: undefined },
+    ]) {
+      const participant = { ...response.operation.participants[0], ...binding };
+      expect(() => parseOperationObservation({
+        ...response, operation: { ...response.operation, participants: [participant] },
+      })).toThrow();
+    }
+  });
+
+  it('parses the persistent runtime-scale control without making its operation evidence routable', () => {
+    const selector = {
+      component_role_id: 'robot',
+      program_binding_id: 'binding-program-1',
+      target_role_id: 'arm',
+    };
+    const status = parseRuntimeScaleControlStatus({
+      api_version: 'manyforge.execution_command_response.v1',
+      command: 'get_runtime_scale_control',
+      ok: true,
+      runtime_scale_control: {
+        active_control_configuration_generation: 1,
+        active_control_configuration_id: 'active-1',
+        active_operation_id: 'operation-1',
+        active_operation_revision: 5,
+        active_operation_scale_generation: 2,
+        application_state: 'applied',
+        control_binding_id: 'binding-1',
+        control_binding_revision: 'revision-1',
+        control_domain_id: 'domain-1',
+        control_domain_revision: 'revision-1',
+        control_generation: 3,
+        effective_scale: 0.45,
+        frozen: false,
+        reason: null,
+        requested_scale: 0.5,
+        scaling_domain_id: 'scale-1',
+        selector,
+        supported: true,
+      },
+    });
+    expect(status).toMatchObject({
+      selector: {
+        componentRoleId: 'robot',
+        programBindingId: 'binding-program-1',
+        targetRoleId: 'arm',
+      },
+      controlGeneration: 3,
+      requestedScale: 0.5,
+      activeOperationId: 'operation-1',
+      activeOperationScaleGeneration: 2,
+    });
+
+    const accepted = parseRuntimeScaleControlAccepted({
+      accepted: {
+        accepted_at_ns: 123,
+        active_operation_id: 'operation-1',
+        active_operation_revision: 5,
+        active_operation_scale_generation: 3,
+        control_generation: 4,
+        replay_status: 'accepted_new',
+        request_id: 'request-scale-1',
+        requested_scale: 0.25,
+        selector,
+      },
+      api_version: 'manyforge.execution_command_response.v1',
+      command: 'set_runtime_scale_control',
+      ok: true,
+    });
+    expect(accepted).toMatchObject({
+      requestId: 'request-scale-1',
+      controlGeneration: 4,
+      requestedScale: 0.25,
+      activeOperationId: 'operation-1',
+    });
+  });
+
+  it('parses synchronized runtime-scale status only when its member set and scopes agree', () => {
+    const selector = {
+      program_binding_id: 'binding-program-1',
+      group_targets: [
+        { component_role_id: 'robot', target_role_id: 'arm' },
+        { component_role_id: 'robot', target_role_id: 'gripper' },
+      ],
+    };
+    const member = (target_role_id: string) => ({
+      active_control_configuration_generation: 1,
+      active_control_configuration_id: `active-${target_role_id}`,
+      control_binding_id: `binding-${target_role_id}`,
+      control_binding_revision: 'revision-1',
+      control_domain_id: `domain-${target_role_id}`,
+      control_domain_revision: 'revision-1',
+      scaling_domain_id: `scale-${target_role_id}`,
+      component_role_id: 'robot', target_role_id,
+    });
+    const memberFor = (component_role_id: string, target_role_id: string) => ({
+      ...member(target_role_id), component_role_id, target_role_id,
+    });
+    const response = {
+      api_version: 'manyforge.execution_command_response.v1', command: 'get_runtime_scale_control', ok: true,
+      runtime_scale_control: {
+        active_control_configuration_generation: null, active_control_configuration_id: null,
+        active_operation_id: null, active_operation_revision: null, active_operation_scale_generation: null,
+        application_state: null, control_binding_id: null, control_binding_revision: null,
+        control_domain_id: null, control_domain_revision: null, control_generation: 1,
+        effective_scale: null, frozen: false, reason: null, requested_scale: 0.5,
+        scaling_domain_id: null, selector, supported: true,
+        group_members: [
+          member('arm'), member('gripper'),
+        ],
+      },
+    };
+    expect(parseRuntimeScaleControlStatus(response).selector).toEqual({
+      kind: 'group', programBindingId: 'binding-program-1',
+      groupTargets: [
+        { componentRoleId: 'robot', targetRoleId: 'arm' },
+        { componentRoleId: 'robot', targetRoleId: 'gripper' },
+      ],
+    });
+    expect(parseRuntimeScaleControlAccepted({
+      accepted: {
+        accepted_at_ns: 123, active_operation_id: null, active_operation_revision: null,
+        active_operation_scale_generation: null, control_generation: 2,
+        replay_status: 'accepted_new', request_id: 'request-group-1', requested_scale: 0.25,
+        selector,
+      },
+      api_version: 'manyforge.execution_command_response.v1',
+      command: 'set_runtime_scale_control', ok: true,
+    }).selector).toMatchObject({ kind: 'group', programBindingId: 'binding-program-1' });
+    expect(() => parseRuntimeScaleControlStatus({
+      ...response,
+      runtime_scale_control: {
+        ...response.runtime_scale_control,
+        group_members: [member('arm'), member('arm')],
+      },
+    })).toThrow();
+    expect(() => parseRuntimeScaleControlStatus({
+      ...response,
+      runtime_scale_control: {
+        ...response.runtime_scale_control,
+        group_members: [member('arm'), member('other')],
+      },
+    })).toThrow();
+    expect(() => parseRuntimeScaleControlStatus({
+      ...response,
+      runtime_scale_control: {
+        ...response.runtime_scale_control,
+        selector: {
+          program_binding_id: 'binding-program-1',
+          group_targets: [
+            { component_role_id: 'a', target_role_id: 'b\u0000c' },
+            { component_role_id: 'a\u0000b', target_role_id: 'c' },
+          ],
+        },
+        group_members: [
+          memberFor('a', 'b\u0000c'), memberFor('a\u0000b', 'c'),
+        ],
+      },
+    })).not.toThrow();
+    expect(() => parseRuntimeScaleControlStatus({
+      ...response,
+      runtime_scale_control: {
+        ...response.runtime_scale_control,
+        selector: {
+          ...selector,
+          program_binding_id: 'x'.repeat(257),
+        },
+      },
+    })).toThrow();
+    expect(() => parseRuntimeScaleControlStatus({
+      ...response,
+      runtime_scale_control: {
+        ...response.runtime_scale_control,
+        group_members: [{
+          ...member('arm'), active_control_configuration_generation: -1,
+        }, member('gripper')],
+      },
+    })).toThrow();
+    expect(() => parseRuntimeScaleControlStatus({
+      ...response,
+      runtime_scale_control: {
+        ...response.runtime_scale_control,
+        group_members: [{
+          ...member('arm'), control_domain_id: '',
+        }, member('gripper')],
+      },
+    })).toThrow();
+  });
+
+  it('accepts source-local limits and exactly one matching observation', () => {
+    const exactRevision = `sha256:${'a'.repeat(64)}`;
+    const contracts = {
+      command_schema: null,
+      control_path: {
+        control_binding_id: 'binding-1',
+        control_binding_revision: exactRevision,
+        control_interface_contract_id: 'interface-1',
+        control_interface_revision: exactRevision,
+        controller_topology_id: 'topology-1',
+        stop_evidence_policy_id: 'stop-policy-1',
+        stop_evidence_policy_revision: exactRevision,
+        topology_revision: exactRevision,
+      },
+      operation_capability_definition_revision: exactRevision,
+      operation_capability_id: 'execution.trajectory.execute',
+      supporting_providers: [{
+        capability_definition_revision: exactRevision,
+        capability_id: 'planning.motion.joint_goal',
+        capability_provider_binding_id: 'provider-binding-1',
+        capability_provider_binding_revision: exactRevision,
+        provider_manifest_id: 'provider-1',
+        provider_manifest_revision: exactRevision,
+      }],
+    };
+    const response = {
+      ok: true,
+      command: 'status',
+      status: {
+        owner_epoch: 'owner-1',
+        cell_id: 'cell-1',
+        active_publication_generation: 1,
+        cell_stop_action: {
+          available: true,
+          expected_stop_generation: 4,
+          latest_terminal: null,
+          unavailable_reason: null,
+        },
+        graph_revision: 'sha256:graph',
+        retained_bundle_id: 'sha256:bundle',
+        direct_control: {
+          controllable_component_id: 'robot-a',
+          command_target_id: 'arm',
+          component_role_id: 'controlled_component',
+          target_role_id: 'command_target',
+          base_frame_role_id: 'base',
+          tcp_frame_role_id: 'tcp',
+          active_tcp: { entry: { component_id: 'robot-a', target_id: 'arm', frame_role_id: 'tcp' }, display: 'robot-a.tcp',
+            owner_epoch: 'owner-1', registration_generation: 1, sequence: 0 },
+          operation_capability_id: 'execution.trajectory.execute',
+          planning_capability_ids: ['planning.motion.joint_goal'],
+          frame_role_ids: ['base', 'tcp'],
+          program_id: 'manyforge.direct_control.motion',
+          program_revision: 'sha256:program',
+          program_binding_id: 'sha256:binding',
+          program_run_id: 'direct-control-owner-1',
+          observed_state: {
+            complete: true,
+            current_tcp_pose: {
+              position_m: { x_m: 0, y_m: 0, z_m: 0.4 },
+              orientation: { x: 0, y: 0, z: 0, w: 1 },
+            },
+            positions_rad: [0.2],
+            sequence: 7,
+            source_epoch: 'source-1',
+            source_joint_names: ['joint1'],
+            tcp_poses: [{
+              entry: { component_id: 'robot-a', target_id: 'arm', frame_role_id: 'tcp' },
+              pose: {
+                position_m: { x_m: 0.1, y_m: 0.2, z_m: 0.3 },
+                orientation: { x: 0, y: 0, z: 0, w: 1 },
+              },
+            }],
+          },
+          joints: [{
+            source_joint_name: 'joint1',
+            min_position_rad: -1,
+            max_position_rad: 1,
+            max_velocity_rad_s: 2,
+            max_acceleration_rad_s2: null,
+          }],
+          target_descriptor: {
+            schema_version: 'manyforge.manual_control_motion_descriptor.v6',
+            ordinary_jerk: null,
+            controllable_component_id: 'robot-a',
+            end_effector_component_id: null,
+            command_target_id: 'arm',
+            component_role_id: 'controlled_component',
+            target_role_id: 'command_target',
+            frames: [
+              { frame_role_id: 'base', compiled_frame_name: 'base_link', model_instance_id: 'robot-model', model_revision: exactRevision },
+              { frame_role_id: 'tcp', compiled_frame_name: 'tool0', model_instance_id: 'robot-model', model_revision: exactRevision },
+            ],
+            tcps: [{
+              entry: { component_id: 'robot-a', target_id: 'arm', frame_role_id: 'tcp' },
+              display: 'robot-a.tcp', target_role_id: 'command_target', default: true,
+              mounted_here: true, mounted_elsewhere: false,
+              frame: { frame_role_id: 'tcp', compiled_frame_name: 'tool0',
+                model_instance_id: 'robot-model', model_revision: exactRevision,
+                contact_body_role_ids: [] },
+            }],
+            joints: [{
+              compiled_joint_name: 'robot-a__joint1',
+              source_joint_name: 'joint1',
+              min_position_rad: -1,
+              max_position_rad: 1,
+              max_velocity_rad_s: 2,
+              max_acceleration_rad_s2: null,
+              unit: 'rad',
+            }],
+            operational_joint_limits: [{
+              source_joint_name: 'joint1',
+              model_max_velocity_rad_s: 2,
+              model_max_acceleration_rad_s2: null,
+              deployment_max_velocity_rad_s: 1.5,
+              deployment_max_acceleration_rad_s2: 2.5,
+              deployment_max_jerk_rad_s3: 10,
+              effective_max_velocity_rad_s: 1.5,
+              effective_max_acceleration_rad_s2: 2.5,
+              effective_max_jerk_rad_s3: 10,
+            }],
+            operational_limit: null,
+            contracts,
+          },
+        },
+        direct_control_gripper: {
+          command_schema_id: 'gripper.command_position',
+          command_schema_revision: exactRevision,
+          command_target_id: 'gripper',
+          component_role_id: 'controlled_component',
+          controllable_component_id: 'robot-a',
+          observed_state: {
+            complete: true,
+            position: { kind: 'linear_m', value_m: 0.02 },
+            sequence: 8,
+            source_coordinate_name: 'finger_joint',
+            source_epoch: 'gripper-source-1',
+          },
+          operation_capability_id: 'tool.gripper.command',
+          program_binding_id: 'sha256:gripper-binding',
+          program_id: 'manyforge.direct_control.gripper',
+          program_revision: 'sha256:gripper-program',
+          program_run_id: 'direct-control-gripper-owner-1',
+          resource: {
+            coordinate_kind: 'linear_m',
+            max_position: 0.04,
+            min_position: 0,
+            source_coordinate_name: 'finger_joint',
+            source_kind: 'model_role',
+          },
+          target_role_id: 'command_target',
+          target_descriptor: {
+            schema_version: 'manyforge.manual_control_gripper_descriptor.v3',
+            controllable_component_id: 'robot-a',
+            command_target_id: 'gripper',
+            component_role_id: 'controlled_component',
+            target_role_id: 'command_target',
+            description: 'Test gripper',
+            command_kind: 'gripper_position',
+            actuation_kind: 'position_commanded',
+            output_mode: 'commanded',
+            transport_kind: 'resolved_binding',
+            control_interface_contract_id: 'interface-1',
+            state_authority_id: 'state.gripper',
+            state_authority_class: 'measured',
+            completion_policy: 'goal_fenced_target_reached',
+            grasp_confirmation_policy: 'binding_feedback_required',
+            source_group_name: 'gripper',
+            source_coordinate_name: 'finger_joint',
+            source_kind: 'model_role',
+            coordinate_kind: 'linear_m',
+            unit: 'm',
+            min_position: 0,
+            max_position: 0.04,
+            open_state_ref: 'open',
+            closed_state_ref: 'closed',
+            command_duration_s: 0.5,
+            touch_links: ['finger_link'],
+            mount_frame: 'tool0',
+            attach_frame: 'tool0',
+            tcp_frame: 'tool0',
+            auxiliary_frames: [],
+            mimic_followers: [],
+            named_presets: [{
+              name: 'open',
+              master_position: 0.04,
+              coordinates: [{ source_coordinate_name: 'finger_joint', position: 0.04 }],
+            }, {
+              name: 'closed',
+              master_position: 0,
+              coordinates: [{ source_coordinate_name: 'finger_joint', position: 0 }],
+            }],
+            contracts: {
+              ...contracts,
+              command_schema: {
+                command_schema_id: 'gripper.command_position',
+                command_schema_revision: exactRevision,
+              },
+              operation_capability_id: 'tool.gripper.command',
+              supporting_providers: [],
+            },
+          },
+        },
+        observed_targets: [],
+      },
+    };
+    // execution_identity.v2: runtime identity only (H1a-IF.2).
+    const identity = {
+      active_publication_generation: 1,
+      cell_id: 'cell-1',
+      control_management_mode: 'component_lifecycle',
+      graph_revision: 'sha256:graph',
+      owner_epoch: 'owner-1',
+      retained_bundle_id: 'sha256:bundle',
+      schema_version: 'manyforge.execution_identity.v2',
+    };
+    const parsedIdentity = parseExecutionIdentity({
+      command: 'identity', identity, ok: true,
+      api_version: 'manyforge.execution_command_response.v1',
+    });
+    expect(parsedIdentity.ownerEpoch).toBe('owner-1');
+    expect(parsedIdentity.controlManagementMode).toBe('component_lifecycle');
+    // The Scene revision is not part of the execution identity.
+    expect(parsedIdentity).not.toHaveProperty('sceneRevision');
+    // v1's primary-target and Program fields are gone, not nulled.
+    expect(() => parseExecutionIdentity({
+      command: 'identity',
+      identity: { ...identity, motion_target_role_id: 'command_target' },
+      ok: true,
+      api_version: 'manyforge.execution_command_response.v1',
+    })).toThrow(/exactly/);
+    expect(() => parseExecutionIdentity({
+      command: 'identity',
+      identity: { ...identity, schema_version: 'manyforge.execution_identity.v1' },
+      ok: true,
+      api_version: 'manyforge.execution_command_response.v1',
+    })).toThrow(/execution_identity.v2/);
+
+    const {
+      observed_state: observedMotion,
+      ...motionTarget
+    } = structuredClone(response.status.direct_control);
+    const {
+      observed_state: observedGripper,
+      ...gripperTarget
+    } = structuredClone(response.status.direct_control_gripper);
+    // One wire target row: key fields out, binding fields in manual_control.
+    const wireTarget = (target: Record<string, unknown>, presentation: string) => {
+      const fields = { ...target };
+      delete fields.controllable_component_id;
+      delete fields.active_tcp;
+      const {
+        command_target_id: commandTargetId,
+        operation_capability_id: operationCapabilityId,
+        program_binding_id: programBindingId,
+        program_id: programId,
+        program_revision: programRevision,
+        program_run_id: programRunId,
+        ...command
+      } = fields;
+      return {
+        command: {
+          ...command,
+          manual_control: {
+            program_binding_id: programBindingId,
+            program_id: programId,
+            program_revision: programRevision,
+            program_run_id: programRunId,
+          },
+        },
+        command_target_id: commandTargetId,
+        operation_capability_id: operationCapabilityId,
+        presentation,
+      };
+    };
+    const byTargetKey = (rows: Array<Record<string, unknown>>) => [...rows].sort((left, right) => (
+      JSON.stringify([left.command_target_id, left.operation_capability_id])
+        < JSON.stringify([right.command_target_id, right.operation_capability_id]) ? -1 : 1));
+    const eligible = { command_eligible: true, reason: null };
+    const targetsV3 = (components: unknown[]) => ({
+      api_version: 'manyforge.execution_command_response.v1',
+      command: 'targets',
+      identity,
+      ok: true,
+      targets: { components, schema_version: 'manyforge.execution_targets.v3' },
+    });
+    const observedRow = (
+      target: Record<string, unknown>,
+      kind: string,
+      observed: unknown,
+    ) => ({
+      command_target_id: target.command_target_id,
+      controllable_component_id: target.controllable_component_id,
+      observed: observed === null ? null : { kind, ...(observed as Record<string, unknown>) },
+      operation_capability_id: target.operation_capability_id,
+      ...(kind === 'joint_positions' ? { active_tcp: target.active_tcp } : {}),
+    });
+    const runtimeScale = {
+      active_control_configuration_generation: 1,
+      active_control_configuration_id: 'active-1',
+      active_operation_id: null,
+      active_operation_revision: null,
+      active_operation_scale_generation: null,
+      application_state: null,
+      control_binding_id: 'binding-1',
+      control_binding_revision: exactRevision,
+      control_domain_id: 'domain-1',
+      control_domain_revision: exactRevision,
+      control_generation: 0,
+      effective_scale: null,
+      frozen: false,
+      reason: null,
+      requested_scale: 1,
+      scaling_domain_id: 'scale-1',
+      selector: {
+        component_role_id: 'controlled_component',
+        program_binding_id: 'sha256:binding',
+        target_role_id: 'command_target',
+      },
+      supported: true,
+    };
+    const controlV6 = (
+      observedTargets: unknown[],
+      runtimeScaleControl: unknown = runtimeScale,
+    ): { control_state: Record<string, unknown> } & Record<string, unknown> => ({
+      api_version: 'manyforge.execution_command_response.v1',
+      command: 'control_state',
+      control_state: {
+        cell_stop_action: response.status.cell_stop_action,
+        manual_operations: [] as unknown[],
+        observed_targets: observedTargets,
+        runtime_scale_control: runtimeScaleControl,
+        schema_version: 'manyforge.execution_control_state.v6',
+      },
+      identity,
+      ok: true,
+    });
+    type WireRow = Record<string, unknown>;
+    // The execution_status.v2 wire composition (identity.v2, targets.v3,
+    // control_state.v6 of one owner snapshot) of a fixture that lists its
+    // addressed targets in the internal layout.
+    const composed = (fixture: { status: WireRow }) => {
+      const source = fixture.status;
+      const rowsAt = (list: unknown, single: unknown) => (
+        list === undefined ? (single === null ? [] : [single]) : list) as WireRow[];
+      const motions = rowsAt(source.direct_control_targets, source.direct_control);
+      const grippers = rowsAt(
+        source.direct_control_gripper_targets,
+        source.direct_control_gripper,
+      );
+      const withoutObservation = (source: WireRow) => {
+        const row = { ...source };
+        delete row.observed_state;
+        delete row.active_tcp;
+        return row;
+      };
+      const componentIds = [...new Set([...motions, ...grippers]
+        .map((row) => row.controllable_component_id as string))].sort();
+      return {
+        api_version: 'manyforge.execution_command_response.v1',
+        command: 'status',
+        ok: true,
+        status: {
+          control_state: {
+            cell_stop_action: source.cell_stop_action,
+            manual_operations: [] as unknown[],
+            observed_targets: [
+              ...motions.map((row) => observedRow(row, 'joint_positions', row.observed_state)),
+              ...grippers.map((row) => observedRow(row, 'coordinate', row.observed_state)),
+            ],
+            runtime_scale_control: motions.length === 0 ? null : runtimeScale,
+            schema_version: 'manyforge.execution_control_state.v6',
+          },
+          identity,
+          schema_version: 'manyforge.execution_status.v2',
+          targets: {
+            components: componentIds.map((componentId) => ({
+              availability: eligible,
+              controllable_component_id: componentId,
+              targets: byTargetKey([
+                ...motions
+                  .filter((row) => row.controllable_component_id === componentId)
+                  .map((row) => wireTarget(withoutObservation(row), 'motion')),
+                ...grippers
+                  .filter((row) => row.controllable_component_id === componentId)
+                  .map((row) => wireTarget(withoutObservation(row), 'gripper')),
+              ]),
+            })),
+            schema_version: 'manyforge.execution_targets.v3',
+          },
+        },
+      };
+    };
+    const status = parseExecutionOwnerStatus(composed(response));
+    expect(status.directControl!.baseFrameRoleId).toBe('base');
+    expect(status.directControl!.targetDescriptor.endEffectorComponentId).toBeNull();
+    const selectedTool = structuredClone(response);
+    Object.assign(selectedTool.status.direct_control, {
+      tcp_frame_role_id: null,
+      active_tcp: { entry: null, display: null, owner_epoch: 'owner-1', registration_generation: 1, sequence: 0 },
+    });
+    Object.assign(selectedTool.status.direct_control.observed_state, { current_tcp_pose: null });
+    selectedTool.status.direct_control.target_descriptor.tcps[0].default = false;
+    // The fixture's inferred row type has a null End-effector component.
+    Object.assign(selectedTool.status.direct_control.target_descriptor, { end_effector_component_id: 'lite_gripper' });
+    expect(parseExecutionOwnerStatus(composed(selectedTool)).directControl!
+      .targetDescriptor.endEffectorComponentId).toBe('lite_gripper');
+    expect(status.observedMotion!.sourceJointNames).toEqual(['joint1']);
+    expect(status.observedMotion!.positionsRad).toEqual([0.2]);
+    expect(status.observedMotion!.currentTcpPose!.position_m.z_m).toBe(0.4);
+    expect(status.observedGripper?.position).toBe(0.02);
+    expect(status.cellStopAction.expectedStopGeneration).toBe(4);
+    expect(status.directControl!.targetDescriptor.operationalJointLimits[0])
+      .toMatchObject({
+        deploymentMaxVelocityRadS: 1.5,
+        effectiveMaxVelocityRadS: 1.5,
+        effectiveMaxAccelerationRadS2: 2.5,
+        effectiveMaxJerkRadS3: 10,
+      });
+    // A missing Active TCP owner stays unavailable even if the descriptor
+    // contains an End-effector TCP; it is not a fabricated active value.
+    const unavailableTcp = structuredClone(response);
+    Object.assign(unavailableTcp.status.direct_control, { active_tcp: null });
+    expect(parseExecutionOwnerStatus(composed(unavailableTcp)).directControl!.activeTcp).toBeNull();
+    // B1: a robot without an end-effector TCP has null TCP fields and no
+    // default row; joint jog still works.
+    const noTcp = structuredClone(response);
+    Object.assign(noTcp.status.direct_control, { tcp_frame_role_id: null,
+      active_tcp: { entry: null, display: null, owner_epoch: 'owner-1', registration_generation: 1, sequence: 0 } });
+    Object.assign(noTcp.status.direct_control.observed_state, { current_tcp_pose: null });
+    noTcp.status.direct_control.target_descriptor.tcps[0].default = false;
+    const withoutTcp = parseExecutionOwnerStatus(composed(noTcp));
+    expect(withoutTcp.directControl!.activeTcp).toMatchObject({ entry: null, display: null,
+      ownerEpoch: 'owner-1', registrationGeneration: 1, sequence: 0 });
+    expect(withoutTcp.directControl!.tcpFrameRoleId).toBeNull();
+    expect(withoutTcp.observedMotion!.currentTcpPose).toBeNull();
+    expect(withoutTcp.directControl!.targetDescriptor.tcps.map((tcp) => tcp.isDefault)).toEqual([false]);
+    // A default, when there is one, still leads.
+    const trailingDefault = structuredClone(noTcp);
+    const trailingTcps = trailingDefault.status.direct_control.target_descriptor.tcps;
+    trailingTcps.push({ ...trailingTcps[0],
+      entry: { ...trailingTcps[0].entry, frame_role_id: 'base' }, display: 'robot-a.base',
+      frame: { ...trailingTcps[0].frame, frame_role_id: 'base', compiled_frame_name: 'base_link' },
+      default: true });
+    trailingDefault.status.direct_control.observed_state.tcp_poses.push({
+      entry: { component_id: 'robot-a', target_id: 'arm', frame_role_id: 'base' },
+      pose: trailingDefault.status.direct_control.observed_state.tcp_poses[0].pose,
+    });
+    expect(() => parseExecutionOwnerStatus(composed(trailingDefault))).toThrow(/tcps/);
+
+    // TCP-C: a full Deployment list may exceed the old 256-row GUI cap.
+    // Unmounted rows have no pose entry, while the carried row still does.
+    const fullDeploymentList = structuredClone(response);
+    const baseRow = fullDeploymentList.status.direct_control.target_descriptor.tcps[0];
+    const { target_role_id: _legacyTargetRole, ...unmountedTemplate } = baseRow;
+    for (let index = 0; index < 256; index += 1) {
+      const componentId = `tool_component_${index}`;
+      const entry = { component_id: componentId, target_id: 'tool', frame_role_id: 'tcp' };
+      // The wire row omits the optional legacy target_role_id; the fixture's
+      // inferred row type still lists it.
+      fullDeploymentList.status.direct_control.target_descriptor.tcps.push({
+        ...unmountedTemplate,
+        entry,
+        display: `${componentId}.tcp`,
+        default: false,
+        mounted_here: false,
+        mounted_elsewhere: true,
+      } as typeof baseRow);
+    }
+    const manyTcpStatus = parseExecutionOwnerStatus(composed(fullDeploymentList));
+    expect(manyTcpStatus.directControl!.targetDescriptor.tcps).toHaveLength(257);
+    expect(Object.keys(manyTcpStatus.observedMotion!.tcpPoses)).toHaveLength(1);
+
+    const missingCarriedPose = structuredClone(response);
+    missingCarriedPose.status.direct_control.observed_state.tcp_poses = [];
+    expect(() => parseExecutionOwnerStatus(composed(missingCarriedPose)))
+      .toThrow(/a pose for every carried TCP/);
+
+    const poseForUnmounted = structuredClone(fullDeploymentList);
+    poseForUnmounted.status.direct_control.observed_state.tcp_poses.push({
+      entry: poseForUnmounted.status.direct_control.target_descriptor.tcps[1].entry,
+      pose: poseForUnmounted.status.direct_control.observed_state.tcp_poses[0].pose,
+    });
+    expect(() => parseExecutionOwnerStatus(composed(poseForUnmounted)))
+      .toThrow(/one unique pose row for a carried TCP entry/);
+
+    // Status is the composition only: no primary aliases, no old version.
+    const aliased = composed(response) as { status: WireRow };
+    aliased.status.direct_control = response.status.direct_control;
+    expect(() => parseExecutionOwnerStatus(aliased)).toThrow(/exactly/);
+    const oldStatus = composed(response) as { status: WireRow };
+    oldStatus.status.schema_version = 'manyforge.execution_status.v1';
+    expect(() => parseExecutionOwnerStatus(oldStatus)).toThrow(/execution_status.v2/);
+    const tornStatus = composed(response) as { status: WireRow };
+    tornStatus.status.targets = { components: [], schema_version: 'manyforge.execution_targets.v2' };
+    expect(() => parseExecutionOwnerStatus(tornStatus)).toThrow(/execution_targets.v3/);
+
+    const armRow = wireTarget(motionTarget, 'motion');
+    const gripperRow = wireTarget(gripperTarget, 'gripper');
+    const armObserved = observedRow(motionTarget, 'joint_positions', observedMotion);
+    const gripperObserved = observedRow(gripperTarget, 'coordinate', observedGripper);
+
+    // Arm and gripper owned by one component (the fixture's layout).
+    const targetsResponse = targetsV3([{
+      availability: eligible,
+      controllable_component_id: motionTarget.controllable_component_id,
+      targets: byTargetKey([armRow, gripperRow]),
+    }]);
+    const controlResponse = controlV6([armObserved, gripperObserved]);
+    const scoped = parseExecutionControlStatus(targetsResponse, controlResponse);
+    expect(scoped.directControlTargets).toHaveLength(1);
+    expect(scoped.directControlGripperTargets).toHaveLength(1);
+    expect(scoped.components).toEqual([{
+      controllableComponentId: motionTarget.controllable_component_id,
+      commandEligible: true,
+      unavailableReason: null,
+      unsupportedTargets: [],
+    }]);
+    // The direct-control binding is per target, never a runtime identity.
+    expect(scoped.directControl!.programBindingId).toBe(motionTarget.program_binding_id);
+    expect(scoped.directControlTargets[0].stopResponse).toBeUndefined();
+
+    // SX-2167: the optional qualified Stop chain of a motion target.
+    const stopResponse = {
+      control_binding_id: 'arm.control',
+      control_binding_revision: 'r1',
+      control_route_id: 'arm.route',
+      nominal_stop_mode: null,
+      stages: [
+        { stage_id: 'stage.nominal', stage_kind: 'nominal', command_kind: 'controlled_stop' },
+        { stage_id: 'stage.cancel', stage_kind: 'controlled_fallback', command_kind: 'controller_goal_cancel' },
+        { stage_id: 'stage.hard', stage_kind: 'software_hard', command_kind: 'software_hard_stop' },
+      ],
+    };
+    const withStop = (patch: unknown, error?: unknown) => {
+      const wire = structuredClone(targetsResponse) as {
+        targets: { components: Array<{ targets: Array<{ presentation: string; command: Record<string, unknown> }> }> };
+      };
+      const command = wire.targets.components[0].targets
+        .find((row) => row.presentation === 'motion')!.command;
+      command.stop_response = patch;
+      if (error !== undefined) command.stop_response_error = error;
+      return parseExecutionControlStatus(wire, controlResponse);
+    };
+    const chained = withStop(stopResponse);
+    expect(chained.directControlTargets[0].stopResponse).toEqual({
+      controlBindingId: 'arm.control',
+      controlBindingRevision: 'r1',
+      controlRouteId: 'arm.route',
+      nominalStopMode: null,
+      stages: [
+        { stageId: 'stage.nominal', stageKind: 'nominal', commandKind: 'controlled_stop' },
+        { stageId: 'stage.cancel', stageKind: 'controlled_fallback', commandKind: 'controller_goal_cancel' },
+        { stageId: 'stage.hard', stageKind: 'software_hard', commandKind: 'software_hard_stop' },
+      ],
+    });
+    expect(chained.directControl!.stopResponse?.controlRouteId).toBe('arm.route');
+    expect(withStop({ ...stopResponse, nominal_stop_mode: 'soft_on_path' }).directControlTargets[0]
+      .stopResponse?.nominalStopMode).toBe('soft_on_path');
+    for (const malformed of [
+      null,
+      { ...stopResponse, extra: 1 },
+      { ...stopResponse, control_route_id: '' },
+      { ...stopResponse, stages: [] },
+      { ...stopResponse, stages: [stopResponse.stages[0], stopResponse.stages[0]] },
+      { ...stopResponse, stages: [{ ...stopResponse.stages[0], stage_index: 0 }] },
+      { ...stopResponse, nominal_stop_mode: 3 },
+    ]) {
+      expect(() => withStop(malformed)).toThrow();
+    }
+    // An unreadable Stop metadata source is published as null plus the
+    // owner's error: a fact about the target, not a malformed snapshot.
+    const unreadable = {
+      code: 'invalid_request', details: {}, message: 'Stop metadata is outside the exact composed binding',
+    };
+    expect(withStop(null, unreadable).directControlTargets[0].stopResponse).toBeUndefined();
+    expect(() => withStop(stopResponse, unreadable)).toThrow(/only without a Stop response/);
+    expect(() => withStop(null, { code: 'x' })).toThrow();
+
+    // Pneumatic dwell may be zero; position duration stays strictly positive.
+    // The snapshot and paired targets/control delta use the same descriptor rule.
+    for (const [actuationKind, outputMode] of [
+      ['position_commanded', 'commanded'], ['pneumatic', 'commanded'], ['pneumatic', 'none'],
+    ] as const) {
+      for (const duration of [0, 0.5, 60, -0.1, 60.1, NaN, Infinity, -Infinity, null]) {
+        const configuredDuration = structuredClone(response);
+        Object.assign(configuredDuration.status.direct_control_gripper.target_descriptor, {
+          actuation_kind: actuationKind,
+          output_mode: outputMode,
+          command_duration_s: duration,
+          completion_policy: actuationKind === 'pneumatic'
+            ? outputMode === 'none' ? 'no_output' : 'output_delivery'
+            : 'goal_fenced_target_reached',
+          grasp_confirmation_policy: actuationKind === 'pneumatic' ? 'not_required' : 'binding_feedback_required',
+        });
+        const durationWire = composed(configuredDuration);
+        const parseSnapshot = () => parseExecutionOwnerStatus(durationWire);
+        const parseDelta = () => parseExecutionControlStatus(
+          { ...targetsResponse, targets: durationWire.status.targets },
+          { ...controlResponse, control_state: durationWire.status.control_state },
+        );
+        const valid = duration !== null && Number.isFinite(duration)
+          && duration >= 0 && duration <= 60
+          && (actuationKind === 'pneumatic' || duration > 0);
+        for (const parse of [parseSnapshot, parseDelta]) {
+          const label = `${actuationKind} ${outputMode} duration ${String(duration)}`;
+          if (valid) {
+            expect(parse().directControlGripper!.targetDescriptor.commandDurationS, label)
+              .toBe(duration);
+          } else {
+            expect(parse, label).toThrow(StructuralContractError);
+          }
+        }
+      }
+    }
+
+    const incompleteZeroDwell = structuredClone(response);
+    Object.assign(incompleteZeroDwell.status.direct_control_gripper.target_descriptor, {
+      actuation_kind: 'pneumatic', command_duration_s: 0, source_group_name: null,
+      completion_policy: 'output_delivery', grasp_confirmation_policy: 'not_required',
+    });
+    expect(() => parseExecutionOwnerStatus(composed(incompleteZeroDwell)))
+      .toThrow(/one complete, internally consistent gripper configuration/);
+
+    // Output mode and policies are exact actuation-dependent facts, not a
+    // generic extension of the descriptor's qualified semantics.
+    for (const [actuation, output, completion, grasp, valid] of [
+      ['position_commanded', 'commanded', 'goal_fenced_target_reached', 'binding_feedback_required', true],
+      ['pneumatic', 'commanded', 'output_delivery', 'not_required', true],
+      ['pneumatic', 'commanded', 'delivered_then_dwell', 'not_required', false],
+      ['pneumatic', 'none', 'dwell_elapsed', 'not_required', false],
+      ['pneumatic', 'none', 'no_output', 'not_required', true],
+      ['position_commanded', 'none', 'no_output', 'not_required', false],
+      ['position_commanded', 'commanded', 'output_delivery', 'not_required', false],
+      ['pneumatic', 'none', 'output_delivery', 'not_required', false],
+      ['pneumatic', 'commanded', 'no_output', 'not_required', false],
+      ['pneumatic', 'commanded', 'goal_fenced_target_reached', 'binding_feedback_required', false],
+      ['pneumatic', 'none', 'no_output', 'binding_feedback_required', false],
+      ['pneumatic', 'default', 'output_delivery', 'not_required', false],
+      ['pneumatic', false, 'output_delivery', 'not_required', false],
+      ['pneumatic', null, 'output_delivery', 'not_required', false],
+    ] as const) {
+      const outputFixture = structuredClone(response);
+      Object.assign(outputFixture.status.direct_control_gripper.target_descriptor, {
+        actuation_kind: actuation, output_mode: output,
+        completion_policy: completion, grasp_confirmation_policy: grasp,
+      });
+      const outputWire = composed(outputFixture);
+      for (const parse of [
+        () => parseExecutionOwnerStatus(outputWire),
+        () => parseExecutionControlStatus(
+          { ...targetsResponse, targets: outputWire.status.targets },
+          { ...controlResponse, control_state: outputWire.status.control_state },
+        ),
+      ]) {
+        if (valid) {
+          const descriptor = parse().directControlGripper!.targetDescriptor;
+          expect(descriptor.outputMode).toBe(output);
+          expect(descriptor.completionPolicy).toBe(completion);
+          expect(descriptor.graspConfirmationPolicy).toBe(grasp);
+          expect(descriptor.transportKind).toBe('resolved_binding');
+          expect(descriptor.controlInterfaceContractId).toBe('interface-1');
+        } else {
+          expect(parse).toThrow(StructuralContractError);
+        }
+      }
+    }
+    // Opt-in grasp confirmation: absent by default, `required` when present.
+    expect(parseExecutionOwnerStatus(composed(response)).directControlGripper!.targetDescriptor)
+      .not.toHaveProperty('graspConfirmation');
+    for (const [grasp, valid] of [['required', true], ['not_required', false], [true, false]] as const) {
+      const graspFixture = structuredClone(response);
+      Object.assign(graspFixture.status.direct_control_gripper.target_descriptor, {
+        grasp_confirmation: grasp,
+      });
+      const parse = () => parseExecutionOwnerStatus(composed(graspFixture));
+      if (valid) expect(parse().directControlGripper!.targetDescriptor.graspConfirmation).toBe('required');
+      else expect(parse).toThrow(StructuralContractError);
+    }
+    const missingOutput = structuredClone(response);
+    delete (missingOutput.status.direct_control_gripper.target_descriptor as Record<string, unknown>).output_mode;
+    expect(() => parseExecutionOwnerStatus(composed(missingOutput))).toThrow(StructuralContractError);
+    const oldDescriptor = structuredClone(response);
+    oldDescriptor.status.direct_control_gripper.target_descriptor.schema_version
+      = 'manyforge.manual_control_gripper_descriptor.v2';
+    expect(() => parseExecutionOwnerStatus(composed(oldDescriptor)))
+      .toThrow(/supported gripper descriptor/);
+
+    // Retained ROS targets can derive an SRDF group and presets without an
+    // optional authored tool configuration, in both snapshots and deltas.
+    const modelOnly = structuredClone(response);
+    Object.assign(modelOnly.status.direct_control_gripper.target_descriptor, {
+      description: null,
+      actuation_kind: null,
+      output_mode: null,
+      command_duration_s: null,
+      open_state_ref: null,
+      closed_state_ref: null,
+      mount_frame: null,
+      attach_frame: null,
+      tcp_frame: null,
+      touch_links: [],
+      auxiliary_frames: [],
+    });
+    const modelOnlyWire = composed(modelOnly);
+    const modelOnlyStatus = parseExecutionOwnerStatus(modelOnlyWire);
+    expect(modelOnlyStatus.directControlGripper!.targetDescriptor.outputMode).toBeNull();
+    expect(modelOnlyStatus.directControlGripper!.targetDescriptor.sourceGroupName)
+      .toBe('gripper');
+    expect(modelOnlyStatus.directControlGripper!.targetDescriptor.namedPresets)
+      .toHaveLength(2);
+    expect(parseExecutionControlStatus(
+      { ...targetsResponse, targets: modelOnlyWire.status.targets },
+      { ...controlResponse, control_state: modelOnlyWire.status.control_state },
+    ).directControlGripper!.targetDescriptor.sourceGroupName).toBe('gripper');
+
+    const partialToolConfiguration = structuredClone(modelOnly);
+    partialToolConfiguration.status.direct_control_gripper.target_descriptor.description
+      = 'Incomplete authored tool';
+    expect(() => parseExecutionOwnerStatus(composed(partialToolConfiguration)))
+      .toThrow(/one complete, internally consistent gripper configuration/);
+    const configuredWithoutGroup = structuredClone(response);
+    Object.assign(configuredWithoutGroup.status.direct_control_gripper.target_descriptor, {
+      source_group_name: null,
+    });
+    expect(() => parseExecutionOwnerStatus(composed(configuredWithoutGroup)))
+      .toThrow(/one complete, internally consistent gripper configuration/);
+
+    // Arm-only: one motion row, no gripper row and no null gripper fields.
+    const armOnly = parseExecutionControlStatus(
+      targetsV3([{
+        availability: eligible,
+        controllable_component_id: motionTarget.controllable_component_id,
+        targets: [armRow],
+      }]),
+      controlV6([armObserved]),
+    );
+    expect(armOnly.directControlGripper).toBeNull();
+    expect(armOnly.directControlGripperTargets).toEqual([]);
+    expect(armOnly.directControlTargets).toHaveLength(1);
+
+    // Independent arm and gripper components; the Disabled gripper stays
+    // listed with its manual-control details (the backend refuses commands).
+    const independentGripper = {
+      ...gripperTarget,
+      controllable_component_id: 'gripper-1',
+      target_descriptor: {
+        ...(gripperTarget.target_descriptor as Record<string, unknown>),
+        controllable_component_id: 'gripper-1',
+      },
+    };
+    const independent = parseExecutionControlStatus(
+      targetsV3([
+        {
+          availability: { command_eligible: false, reason: 'component_disabled' },
+          controllable_component_id: 'gripper-1',
+          targets: [wireTarget(independentGripper, 'gripper')],
+        },
+        {
+          availability: eligible,
+          controllable_component_id: motionTarget.controllable_component_id,
+          targets: [armRow],
+        },
+      ].sort((left, right) => (
+        left.controllable_component_id < right.controllable_component_id ? -1 : 1))),
+      controlV6([armObserved, observedRow(independentGripper, 'coordinate', observedGripper)]),
+    );
+    expect(independent.directControlGripperTargets[0].controllableComponentId).toBe('gripper-1');
+    expect(independent.components.find((row) => row.controllableComponentId === 'gripper-1'))
+      .toMatchObject({ commandEligible: false, unavailableReason: 'component_disabled' });
+
+    // Gripper-only: no motion identity anywhere and no runtime scaling.
+    const gripperOnly = parseExecutionControlStatus(
+      targetsV3([{
+        availability: eligible,
+        controllable_component_id: 'gripper-1',
+        targets: [wireTarget(independentGripper, 'gripper')],
+      }]),
+      controlV6([observedRow(independentGripper, 'coordinate', observedGripper)], null),
+    );
+    expect(gripperOnly.directControl).toBeNull();
+    expect(gripperOnly.observedMotion).toBeNull();
+    expect(gripperOnly.directControlTargets).toEqual([]);
+    expect(gripperOnly.directControlGripper!.controllableComponentId).toBe('gripper-1');
+    expect(gripperOnly.runtimeScaleControl).toBeNull();
+
+    // An unsupported capability is listed, never commandable or observed.
+    const withUnsupported = parseExecutionControlStatus(
+      targetsV3([{
+        availability: eligible,
+        controllable_component_id: 'gripper-1',
+        targets: byTargetKey([
+          wireTarget(independentGripper, 'gripper'),
+          {
+            command: null,
+            command_target_id: 'vacuum',
+            operation_capability_id: 'tool.vacuum.command',
+            presentation: 'unsupported',
+          },
+        ]),
+      }]),
+      controlV6([observedRow(independentGripper, 'coordinate', observedGripper)], null),
+    );
+    expect(withUnsupported.components[0].unsupportedTargets).toEqual([
+      { commandTargetId: 'vacuum', operationCapabilityId: 'tool.vacuum.command' },
+    ]);
+    expect(() => parseExecutionControlStatus(
+      targetsV3([{
+        availability: eligible,
+        controllable_component_id: 'gripper-1',
+        targets: [{
+          command: null,
+          command_target_id: 'vacuum',
+          operation_capability_id: 'tool.vacuum.command',
+          presentation: 'unsupported',
+        }],
+      }]),
+      controlV6([{
+        command_target_id: 'vacuum', controllable_component_id: 'gripper-1',
+        observed: null, operation_capability_id: 'tool.vacuum.command',
+      }], null),
+    )).toThrow(/observations only for commandable addressed targets/);
+
+    // An observation without its target, or a missing observation, is refused.
+    expect(() => parseExecutionControlStatus(targetsResponse, controlV6([armObserved])))
+      .toThrow(/one observation row for the exact addressed target/);
+    // Ineligibility needs an existing refusal reason, and vice versa.
+    expect(() => parseExecutionControlStatus(
+      targetsV3([{
+        availability: { command_eligible: false, reason: null },
+        controllable_component_id: motionTarget.controllable_component_id,
+        targets: [armRow],
+      }]),
+      controlV6([armObserved]),
+    )).toThrow(/refusal reason exactly when ineligible/);
+    // Old wire versions are not accepted (one clean cutover).
+    const legacyTargets = structuredClone(targetsResponse) as { targets: Record<string, unknown> };
+    legacyTargets.targets.schema_version = 'manyforge.execution_targets.v2';
+    expect(() => parseExecutionControlStatus(legacyTargets, controlResponse))
+      .toThrow(/execution_targets.v3/);
+    const groupedControlResponse: { control_state: Record<string, unknown> } = structuredClone(controlResponse);
+    groupedControlResponse.control_state.runtime_scale_control = {
+      ...runtimeScale,
+      active_control_configuration_generation: null,
+      active_control_configuration_id: null,
+      control_binding_id: null,
+      control_binding_revision: null,
+      control_domain_id: null,
+      control_domain_revision: null,
+      scaling_domain_id: null,
+      selector: {
+        program_binding_id: 'sha256:binding',
+        group_targets: [
+          { component_role_id: 'controlled_component', target_role_id: 'command_target' },
+          { component_role_id: 'controlled_component', target_role_id: 'gripper_target' },
+        ],
+      },
+      group_members: [
+        {
+          active_control_configuration_generation: 1,
+          active_control_configuration_id: 'active-motion',
+          control_binding_id: 'binding-motion', control_binding_revision: exactRevision,
+          control_domain_id: 'domain-motion', control_domain_revision: exactRevision,
+          scaling_domain_id: 'scale-motion', component_role_id: 'controlled_component',
+          target_role_id: 'command_target',
+        },
+        {
+          active_control_configuration_generation: 1,
+          active_control_configuration_id: 'active-gripper',
+          control_binding_id: 'binding-gripper', control_binding_revision: exactRevision,
+          control_domain_id: 'domain-gripper', control_domain_revision: exactRevision,
+          scaling_domain_id: 'scale-gripper', component_role_id: 'controlled_component',
+          target_role_id: 'gripper_target',
+        },
+      ],
+    };
+    expect(
+      parseExecutionControlStatus(targetsResponse, groupedControlResponse)
+        .runtimeScaleControl?.selector,
+    ).toMatchObject({ kind: 'group', programBindingId: 'sha256:binding' });
+    const retired = {
+      resident: false, operation: {
+        program_run_id: motionTarget.program_run_id, operation_id: 'manual-1', operation_revision: 2,
+        state: 'completed', participants: [{
+          progress: 1, terminal_error: null,
+          control_binding_id: 'binding-arm', control_binding_revision: exactRevision,
+        }],
+        active_stop_id: null, active_stop_generation: null,
+      },
+    };
+    controlResponse.control_state.manual_operations = [retired];
+    expect(parseExecutionControlStatus(targetsResponse, controlResponse).manualOperations[0])
+      .toMatchObject({operationId: 'manual-1', resident: false, state: 'completed'});
+    for (const rows of [
+      [{...retired, operation: {...retired.operation, program_run_id: 'foreign'}}],
+      [{...retired, operation: {...retired.operation, state: 'executing'}}],
+      [retired, {...retired, operation: {...retired.operation, operation_id: 'duplicate-target'}}],
+      [retired, retired, retired],
+    ]) {
+      controlResponse.control_state.manual_operations = rows;
+      expect(() => parseExecutionControlStatus(targetsResponse, controlResponse)).toThrow();
+    }
+    expect(scoped.directControl!.targetDescriptor).toEqual(
+      status.directControl!.targetDescriptor,
+    );
+    expect(scoped.observedMotion!.positionsRad).toEqual([0.2]);
+
+    const stopped = structuredClone(response);
+    Object.assign(stopped.status.cell_stop_action, {
+      latest_terminal: {
+        certificate: {
+          stop_certificate_id: 'stop-certificate.4',
+          stop_certificate_revision: 1,
+          stop_generation: 4,
+          stop_id: 'stop.4',
+        },
+        escalated: true,
+        executed_stages: [{
+          action_class: 'controlled',
+          executed_mode: 'hard_deceleration',
+          operation_id: 'operation.1',
+          outcome: 'succeeded',
+          participant_id: 'participant.1',
+          stage_id: 'controlled.1',
+          stage_index: 1,
+          substitution_reason: 'soft mode unavailable',
+        }],
+        hard_stop_floor_used: false,
+        result: 'succeeded_escalated',
+      },
+    });
+    const stoppedStatus = parseExecutionOwnerStatus(composed(stopped));
+    expect(stoppedStatus.cellStopAction.latestTerminal?.certificate.stopId)
+      .toBe('stop.4');
+    expect(stoppedStatus.cellStopAction.latestTerminal?.executedStages[0])
+      .toMatchObject({ executedMode: 'hard_deceleration', stageIndex: 1 });
+    // CONTRACTS §5: the stop-fault latch is gone; a `fault` field is refused.
+    const latched = structuredClone(stopped);
+    Object.assign(latched.status.cell_stop_action, { fault: null });
+    expect(() => parseExecutionOwnerStatus(composed(latched))).toThrow(/cell_stop_action/);
+
+    // Strict pneumatic targets expose a model coordinate for display, without
+    // claiming an authoritative finger observation. The control shell must
+    // accept that typed absence while preserving position-gripper validation.
+    const pneumaticAbsent = structuredClone(response);
+    Object.assign(pneumaticAbsent.status.direct_control_gripper.target_descriptor, {
+      actuation_kind: 'pneumatic', completion_policy: 'output_delivery',
+      grasp_confirmation_policy: 'not_required', state_authority_class: 'commanded',
+    });
+    Object.assign(pneumaticAbsent.status.direct_control_gripper, { observed_state: null });
+    const pneumaticWire = composed(pneumaticAbsent);
+    for (const parsed of [
+      parseExecutionOwnerStatus(pneumaticWire),
+      parseExecutionControlStatus(
+        { ...targetsResponse, targets: pneumaticWire.status.targets },
+        { ...controlResponse, control_state: pneumaticWire.status.control_state },
+      ),
+    ]) {
+      expect(parsed.directControlGripper?.targetDescriptor.actuationKind).toBe('pneumatic');
+      expect(parsed.directControlGripper?.sourceKind).toBe('model_role');
+      expect(parsed.observedGripper).toBeNull();
+      expect(parsed.observedMotion?.positionsRad).toEqual(observedMotion.positions_rad);
+    }
+    const mappedPneumatic = structuredClone(pneumaticAbsent);
+    Object.assign(mappedPneumatic.status.direct_control_gripper.target_descriptor, {
+      output_mode: 'commanded', completion_policy: 'no_output',
+      pneumatic_outputs: [{ controllable_component_id: 'valve_io', signal_name: 'clamp', open_value: false, close_value: true }],
+    });
+    const mappedDescriptor = parseExecutionOwnerStatus(composed(mappedPneumatic)).directControlGripper!.targetDescriptor;
+    expect(mappedDescriptor.pneumaticOutputs).toEqual([{ controllableComponentId: 'valve_io', signalName: 'clamp', openValue: false, closeValue: true }]);
+    const unmappedNoOutput = structuredClone(mappedPneumatic);
+    delete (unmappedNoOutput.status.direct_control_gripper.target_descriptor as Record<string, unknown>).pneumatic_outputs;
+    expect(() => parseExecutionOwnerStatus(composed(unmappedNoOutput))).toThrow();
+    const duplicateOutputs = structuredClone(mappedPneumatic);
+    const duplicate = { controllable_component_id: 'valve_io', signal_name: 'clamp', open_value: false, close_value: true };
+    Object.assign(duplicateOutputs.status.direct_control_gripper.target_descriptor, { pneumatic_outputs: [duplicate, duplicate] });
+    expect(() => parseExecutionOwnerStatus(composed(duplicateOutputs))).toThrow();
+    const positionAbsent = structuredClone(response);
+    Object.assign(positionAbsent.status.direct_control_gripper, { observed_state: null });
+    expect(() => parseExecutionOwnerStatus(composed(positionAbsent)))
+      .toThrow(/a model-backed observation/);
+    const invalidPneumaticObservation = structuredClone(pneumaticAbsent);
+    Object.assign(invalidPneumaticObservation.status.direct_control_gripper, {
+      observed_state: { ...observedGripper, source_coordinate_name: 'another_finger' },
+    });
+    expect(() => parseExecutionOwnerStatus(composed(invalidPneumaticObservation)))
+      .toThrow(StructuralContractError);
+
+    const componentLocal = structuredClone(response);
+    Object.assign(componentLocal.status.direct_control_gripper.resource, {
+      source_kind: 'component_local',
+      min_position: null,
+      max_position: null,
+    });
+    Object.assign(componentLocal.status.direct_control_gripper.target_descriptor, {
+      source_kind: 'component_local',
+      min_position: null,
+      max_position: null,
+    });
+    Object.assign(componentLocal.status.direct_control_gripper, {
+      observed_state: null,
+    });
+    const localStatus = parseExecutionOwnerStatus(composed(componentLocal));
+    expect(localStatus.directControlGripper?.sourceKind).toBe('component_local');
+    expect(localStatus.directControlGripper?.minPosition).toBeNull();
+    expect(localStatus.observedGripper).toBeNull();
+
+    // An arm-only native component publishes no gripper at all (H1a-B).
+    const armOnlyStatus = structuredClone(response) as { status: Record<string, unknown> };
+    armOnlyStatus.status.direct_control_gripper = null;
+    const armOnlyComposed = parseExecutionOwnerStatus(composed(armOnlyStatus));
+    expect(armOnlyComposed.directControlGripper).toBeNull();
+    expect(armOnlyComposed.observedGripper).toBeNull();
+    const armOnlyInventory = structuredClone(armOnlyStatus);
+    Object.assign(armOnlyInventory.status, {
+      direct_control_targets: [response.status.direct_control],
+      direct_control_gripper_targets: [],
+    });
+    const armOnlyParsed = parseExecutionOwnerStatus(composed(armOnlyInventory));
+    expect(armOnlyParsed.directControlTargets).toHaveLength(1);
+    expect(armOnlyParsed.directControlGripperTargets).toEqual([]);
+    expect(armOnlyParsed.observedGrippers).toEqual([]);
+    // A present gripper still pairs exactly with its component.
+    const paired = structuredClone(response) as { status: Record<string, unknown> };
+    Object.assign(paired.status, {
+      direct_control_targets: [response.status.direct_control],
+      direct_control_gripper_targets: [response.status.direct_control_gripper],
+    });
+    expect(parseExecutionOwnerStatus(composed(paired)).directControlGripperTargets).toHaveLength(1);
+    // H1a-IF.2: a gripper need not share a motion component; targets nest
+    // in their component on the wire, and keys are unique.
+    const independentStatus = structuredClone(paired);
+    const independentGripperTarget = {
+      ...response.status.direct_control_gripper,
+      controllable_component_id: 'gripper-without-motion',
+      target_descriptor: {
+        ...response.status.direct_control_gripper.target_descriptor,
+        controllable_component_id: 'gripper-without-motion',
+      },
+    };
+    independentStatus.status.direct_control_gripper_targets = [{
+      ...independentGripperTarget,
+    }];
+    independentStatus.status.direct_control_gripper = null;
+    expect(parseExecutionOwnerStatus(composed(independentStatus))
+      .directControlGripperTargets[0].controllableComponentId).toBe('gripper-without-motion');
+    const ambiguous = structuredClone(paired);
+    ambiguous.status.direct_control_gripper_targets = [
+      response.status.direct_control_gripper,
+      response.status.direct_control_gripper,
+    ];
+    expect(() => parseExecutionOwnerStatus(composed(ambiguous)))
+      .toThrow(/one observation row/);
+
+    const leaked = structuredClone(response);
+    Object.assign(leaked.status.direct_control, {
+      compiled_joint_names: ['robot-a__joint1'],
+    });
+    // The motion command allows only its fields (and the optional stop_response).
+    expect(() => parseExecutionOwnerStatus(composed(leaked))).toThrow(/optional \[stop_response, stop_response_error\]/);
+
+    const crossedDescriptor = structuredClone(response);
+    crossedDescriptor.status.direct_control.target_descriptor.frames.reverse();
+    expect(() => parseExecutionOwnerStatus(composed(crossedDescriptor))).toThrow(
+      /exact addressed targets/,
+    );
+
+    const dishonestLimit = structuredClone(response);
+    dishonestLimit.status.direct_control.target_descriptor
+      .operational_joint_limits[0].effective_max_velocity_rad_s = 2;
+    expect(() => parseExecutionOwnerStatus(composed(dishonestLimit))).toThrow(
+      /exact conservative Deployment\/model minimum/,
+    );
+
+    const ordinary = structuredClone(response);
+    const jerkRow: Record<string, unknown> = {
+      source_joint_name: 'joint1', source: 'override', maximum_rad_s3: 6,
+      preset_rad_s3: null,
+    };
+    Object.assign(ordinary.status.direct_control.target_descriptor, {
+      ordinary_jerk: { enabled: true, preset_reference_time_s: 1, joint_limits: [jerkRow] },
+    });
+    Object.assign(ordinary.status.direct_control.target_descriptor.operational_joint_limits[0], {
+      deployment_max_jerk_rad_s3: null, effective_max_jerk_rad_s3: 6,
+    });
+    expect(parseExecutionOwnerStatus(composed(ordinary)).directControl!.targetDescriptor.ordinaryJerk)
+      .toMatchObject({ enabled: true, jointLimits: [{ maximumRadS3: 6, source: 'override' }] });
+    // V2-9: the imported jerk source is gone.
+    jerkRow.source = 'imported';
+    expect(() => parseExecutionOwnerStatus(composed(ordinary))).toThrow(/known jerk-limit source/);
+    jerkRow.source = 'preset';
+    expect(() => parseExecutionOwnerStatus(composed(ordinary))).toThrow(/effective jerk limits/);
+    jerkRow.source = 'override';
+    jerkRow.imported = null;
+    expect(() => parseExecutionOwnerStatus(composed(ordinary))).toThrow();
+    delete jerkRow.imported;
+    jerkRow.source_joint_name = 'foreign-joint';
+    expect(() => parseExecutionOwnerStatus(composed(ordinary))).toThrow(/exact ordered model joints/);
+  });
+
+  it('accepts only a no-motion receipt with equal source arrays', () => {
+    const response = {
+      ok: true,
+      command: 'preview_motion',
+      preview_receipt: {
+        schema_version: 'manyforge.direct_control_motion_preview.v1',
+        receipt_digest: 'sha256:receipt',
+        intent_digest: 'sha256:intent',
+        request_id: 'request-1',
+        request_owner_epoch: 'owner-1',
+        program_id: 'manyforge.direct_control.motion',
+        program_revision: 'sha256:program',
+        program_binding_id: 'sha256:binding',
+        program_run_id: 'direct-control-owner-1',
+        graph_revision: 'sha256:graph',
+        retained_bundle_id: 'sha256:bundle',
+        scene_revision: sceneRevision,
+        component_role_id: 'controlled_component',
+        target_role_id: 'command_target',
+        required_capability_id: 'execution.trajectory.execute',
+        source_joint_names: ['joint1'],
+        start_positions_rad: [0],
+        final_positions_rad: [0.4],
+        final_tcp_pose: {
+          position_m: { x_m: 0, y_m: 0, z_m: 0.4 },
+          orientation: { x: 0, y: 0, z: 0, w: 1 },
+        },
+        collision_world_revision: {
+          revision_id: 2,
+          content_hash: 'collision-2',
+        },
+        commit_eligible: true,
+      },
+    };
+    const receipt = parseMotionPreviewResponse(response);
+
+    expect(receipt.finalPositionsRad).toEqual([0.4]);
+    expect(receipt.commitEligible).toBe(true);
+
+    const undeclared = structuredClone(response);
+    Object.assign(undeclared.preview_receipt, { trajectory: [] });
+    expect(() => parseMotionPreviewResponse(undeclared)).toThrow(
+      /exactly/,
+    );
+  });
+
+  it('accepts an exact unit-tagged capability-command preview', () => {
+    const response = {
+      ok: true,
+      command: 'preview_capability_command',
+      preview_receipt: {
+        schema_version:
+          'manyforge.direct_control_capability_command_preview.v1',
+        receipt_digest: 'sha256:receipt',
+        intent_digest: 'sha256:intent',
+        request_id: 'request-gripper-1',
+        request_owner_epoch: 'owner-1',
+        program_id: 'manyforge.direct_control.gripper',
+        program_revision: 'sha256:gripper-program',
+        program_binding_id: 'sha256:gripper-binding',
+        program_run_id: 'direct-control-gripper-owner-1',
+        graph_revision: 'sha256:graph',
+        retained_bundle_id: 'sha256:bundle',
+        component_role_id: 'controlled_component',
+        target_role_id: 'command_target',
+        required_capability_id: 'tool.gripper.command',
+        command_schema_id: 'gripper.command_position',
+        command_schema_revision: 'sha256:gripper-schema',
+        source_coordinate_name: 'finger_joint',
+        source_kind: 'model_role',
+        coordinate_kind: 'linear_m',
+        target_position: 0.03,
+        min_position: 0,
+        max_position: 0.04,
+        commit_eligible: true,
+      },
+    };
+    const receipt = parseCapabilityCommandPreviewResponse(response);
+
+    expect(receipt.targetPosition).toBe(0.03);
+    expect(receipt.coordinateKind).toBe('linear_m');
+
+    const componentLocal = structuredClone(response);
+    Object.assign(componentLocal.preview_receipt, {
+      source_kind: 'component_local',
+      min_position: null,
+      max_position: null,
+    });
+    expect(parseCapabilityCommandPreviewResponse(componentLocal).sourceKind)
+      .toBe('component_local');
+
+    // The capability preview does not involve the Scene and echoes no revision.
+    const withScene = structuredClone(response);
+    Object.assign(withScene.preview_receipt, { scene_revision: sceneRevision });
+    expect(() => parseCapabilityCommandPreviewResponse(withScene))
+      .toThrow(/exactly/);
+  });
+});
+
+
+describe('persistent key value parsers', () => {
+  const listing = {
+    schema_version: 'manyforge.persistent_key_values.v1',
+    scenario_id: 'cell-pick',
+    project_path: '/projects/cell-pick.scenario',
+    program_revision: `sha256:${'a'.repeat(64)}`,
+    program_run_id: null,
+    sequence: 3,
+    keys: [
+      {
+        key: 'layer', type: 'int64', access: 'read_write',
+        has_initial: true, initial: 0, stored: true, value: 3, sequence: 2,
+      },
+      {
+        key: 'part', type: 'string', access: 'read',
+        has_initial: false, initial: null, stored: false, value: null, sequence: null,
+      },
+    ],
+    edits: [{
+      sequence: 2, project_path: '/projects/cell-pick.scenario', key: 'layer', action: 'set',
+      request_id: 'request.1', source_label: 'operator_ui',
+      program_run_id: null, node_instance_id: null, node_attempt_id: null,
+      reason: null, detail: null,
+    }, {
+      sequence: 3, project_path: '/projects/cell-pick.scenario', key: 'layer', action: 'set',
+      request_id: null, source_label: 'program_node',
+      program_run_id: 'program-cycle.1', node_instance_id: 'set_layer', node_attempt_id: null,
+      reason: null, detail: null,
+    }],
+    storage_fault: null,
+    apply_observation_fault: null,
+  };
+
+  it('parses stored values, their starting values and the audited edits', () => {
+    const parsed = parsePersistentKeyValues(listing);
+    expect(parsed.keys).toEqual([
+      {
+        key: 'layer', type: 'int64', access: 'read_write',
+        initial: 0, stored: true, value: 3, sequence: 2,
+      },
+      {
+        key: 'part', type: 'string', access: 'read',
+        initial: undefined, stored: false, value: null, sequence: null,
+      },
+    ]);
+    expect(parsed.sequence).toBe(3);
+    expect(parsed.edits).toEqual([{
+      sequence: 2, key: 'layer', action: 'set',
+      requestId: 'request.1', sourceLabel: 'operator_ui',
+      programRunId: null, nodeInstanceId: null, nodeAttemptId: null,
+      reason: null, detail: null,
+    }, {
+      // A run's node write names the run and node instead of a request.
+      sequence: 3, key: 'layer', action: 'set',
+      requestId: null, sourceLabel: 'program_node',
+      programRunId: 'program-cycle.1', nodeInstanceId: 'set_layer', nodeAttemptId: null,
+      reason: null, detail: null,
+    }]);
+    expect(parsed.storageFault).toBeNull();
+    expect(parsed.applyObservationFault).toBeNull();
+    expect(parsePersistentKeyEdit({
+      schema_version: 'manyforge.persistent_key_edit.v1',
+      request_id: 'request.2', action: 'reset', key: 'layer', values: listing,
+    }).projectPath).toBe('/projects/cell-pick.scenario');
+    expect(parsePersistentKeyValuesCleared({
+      schema_version: 'manyforge.persistent_key_edit.v1',
+      request_id: 'request.3', action: 'clear',
+      project_path: '/projects/cell-pick.scenario', removed: 2,
+    })).toEqual({
+      requestId: 'request.3', projectPath: '/projects/cell-pick.scenario', removed: 2,
+    });
+  });
+
+  it('refuses inconsistent rows instead of guessing', () => {
+    const row = listing.keys[1];
+    expect(() => parsePersistentKeyValues({
+      ...listing, keys: [{ ...row, value: 'ghost' }],
+    })).toThrow(StructuralContractError);
+    expect(() => parsePersistentKeyValues({
+      ...listing, keys: [{ ...row, has_initial: true }],
+    })).toThrow(/has_initial/);
+    expect(() => parsePersistentKeyValues({
+      ...listing, keys: [{ ...row, access: 'owner' }],
+    })).toThrow(/access/);
+    expect(() => parsePersistentKeyValues({ ...listing, extra: true })).toThrow(/exactly/);
+    expect(() => parsePersistentKeyValues({ ...listing, sequence: null })).toThrow(/sequence/);
+    for (const projectPath of [
+      'projects/cell.scenario', '/projects/../cell.scenario', '/projects/./cell.scenario',
+      '/projects//cell.scenario', '/projects/cell.scenario/', '/projects/\0cell',
+      `/${'p'.repeat(4096)}`,
+    ]) {
+      expect(() => parsePersistentKeyValues({ ...listing, project_path: projectPath }))
+        .toThrow(/project_path/);
+    }
+    expect(() => parsePersistentKeyEdit({
+      schema_version: 'manyforge.persistent_key_edit.v1',
+      request_id: 'request.2', action: 'clear', key: 'layer', values: listing,
+    })).toThrow(/set or reset/);
+  });
+
+  it('parses dropped values with their reason and a storage fault', () => {
+    const dropped = {
+      sequence: 4, project_path: '/projects/cell-pick.scenario', key: null, action: 'dropped',
+      request_id: null, source_label: 'committed_apply',
+      program_run_id: null, node_instance_id: null, node_attempt_id: null,
+      reason: 'applied_program_not_observed', detail: null,
+    };
+    const parsed = parsePersistentKeyValues({
+      ...listing,
+      edits: [dropped],
+      storage_fault: {
+        code: 'persistent_key_storage_unavailable', message: 'read-only file system',
+      },
+    });
+    expect(parsed.edits[0]).toMatchObject({
+      action: 'dropped', key: null, reason: 'applied_program_not_observed',
+    });
+    expect(parsed.storageFault).toEqual({
+      code: 'persistent_key_storage_unavailable', message: 'read-only file system',
+    });
+    // A drop always names why; nothing else does.
+    expect(() => parsePersistentKeyValues({
+      ...listing, edits: [{ ...dropped, reason: null }],
+    })).toThrow(/reason/);
+    expect(() => parsePersistentKeyValues({
+      ...listing, edits: [{ ...listing.edits[0], reason: 'key_declaration_changed' }],
+    })).toThrow(/reason/);
+  });
+
+  it('parses a committed Apply the runner never observed as a named fault', () => {
+    const missed = `sha256:${'b'.repeat(64)}`;
+    const parsed = parsePersistentKeyValues({
+      ...listing,
+      edits: [{
+        sequence: 4, project_path: '/projects/cell-pick.scenario', key: null, action: 'fault',
+        request_id: null, source_label: 'committed_apply',
+        program_run_id: null, node_instance_id: null, node_attempt_id: null,
+        reason: 'applied_program_not_observed', detail: `committed Apply ${missed} was not observed`,
+      }],
+      apply_observation_fault: { code: 'applied_program_not_observed', record_digests: [missed] },
+    });
+    expect(parsed.edits[0]).toMatchObject({ action: 'fault', reason: 'applied_program_not_observed' });
+    expect(parsed.applyObservationFault).toEqual({
+      code: 'applied_program_not_observed', recordDigests: [missed],
+    });
+    expect(() => parsePersistentKeyValues({
+      ...listing,
+      apply_observation_fault: { code: 'applied_program_not_observed', record_digests: [] },
+    })).toThrow(/at least one/);
+  });
+});
+
+describe('expression check parser', () => {
+  const valid = {
+    schema_version: 'manyforge.expression_check.v1',
+    result_type: 'float64',
+    diagnostics: [],
+    preview: { value: -0.05, unavailable_reason: null },
+    names: [{ name: 'param.tube_length', type: 'float64' }, { name: 'key.part_pose', type: 'stored_pose' }],
+  };
+
+  it('parses a checked formula with its preview and names', () => {
+    expect(parseExpressionCheckResult(valid)).toEqual({
+      resultType: 'float64',
+      diagnostics: [],
+      preview: { value: -0.05 },
+      names: valid.names,
+    });
+    expect(parseExpressionCheckResult({
+      ...valid,
+      result_type: null,
+      diagnostics: [
+        { code: 'unknown_name', message: 'Unknown name param.tube', position: 1, length: 10, name: 'param.tube' },
+        { code: 'cycle', message: 'Computed keys a and b use each other', position: null, length: null, name: null },
+      ],
+      preview: { value: null, unavailable_reason: 'The formula has errors.' },
+    })).toMatchObject({
+      resultType: null,
+      diagnostics: [{ position: 1, length: 10 }, { position: null, length: null }],
+      preview: { unavailableReason: 'The formula has errors.' },
+    });
+  });
+
+  it('refuses a drifted or inconsistent check', () => {
+    expect(() => parseExpressionCheckResult({ ...valid, schema_version: 'v0' })).toThrow('manyforge.expression_check.v1');
+    expect(() => parseExpressionCheckResult({ ...valid, result_type: 'pose' })).toThrow('bool, int64, float64 or string');
+    expect(() => parseExpressionCheckResult({ ...valid, preview: { value: 'x', unavailable_reason: null } }))
+      .toThrow('a value of the result type');
+    expect(() => parseExpressionCheckResult({ ...valid, preview: { value: 1, unavailable_reason: 'both' } }))
+      .toThrow('either a value or a non-empty unavailable_reason');
+    expect(() => parseExpressionCheckResult({ ...valid, preview: { value: null, unavailable_reason: null } }))
+      .toThrow('either a value or a non-empty unavailable_reason');
+    expect(() => parseExpressionCheckResult({ ...valid, names: [{ name: 'tube_length', type: 'float64' }] }))
+      .toThrow('a param. or key. name');
+    expect(() => parseExpressionCheckResult({
+      ...valid,
+      diagnostics: [{ code: 'x', message: 'm', position: 1, length: null, name: null }],
+    })).toThrow('a position and a length together, or neither');
+    expect(() => parseExpressionCheckResult({ ...valid, extra: true })).toThrow('exactly');
+  });
+});
+
+describe('typed prepared activation origin v6', () => {
+  const digest = `sha256:${'a'.repeat(64)}`;
+  const receipt = () => ({ schema_version: 'manyforge.prepared_activation_input.v6',
+    origin: { kind: 'scenario', scenario_id: 'cell_a', source_document_digest: digest,
+      project_path: '/projects/cell_a' },
+    prepared_activation_id: digest, captured_input_digest: digest, deployment_artifact_id: 'deployment_a',
+    deployment_revision: digest, retained_bundle_id: digest, graph_revision: digest,
+    program_id: null, program_revision: null, program_outcome: { kind: 'no_program' },
+    node_environment_digest: digest, assistant_mode: 'optional' });
+
+  it('keeps the Scenario origin of an empty-cell preparation without a Program', () => {
+    const parsed = parsePreparedActivationInput(receipt(), 'prepared');
+    expect(parsed.origin).toEqual({ kind: 'scenario', scenarioId: 'cell_a', sourceDocumentDigest: digest,
+      projectPath: '/projects/cell_a' });
+    expect(parsed.programId).toBeNull();
+  });
+
+  it.each(['v3', 'v4', 'v5'])('refuses obsolete prepared schema %s', (version) => {
+    expect(() => parsePreparedActivationInput({ ...receipt(), schema_version: `manyforge.prepared_activation_input.${version}` }, 'prepared')).toThrow();
+  });
+
+  it.each([
+    { scenario_id: 'fake' }, { program_id: 'fake' }, { program_revision: digest }, { assistant_mode: 'required' },
+  ])('refuses branch-inconsistent receipt %j', (change) => {
+    expect(() => parsePreparedActivationInput({ ...receipt(), ...change }, 'prepared')).toThrow();
+  });
+
+  it.each([{ kind: 'future' }, { scenario_id: null }, { source_document_digest: 'not-a-digest' },
+    { project_path: 'projects/cell_a' }, { cell_id: 'cell_a' }])(
+    'refuses mixed or invalid origin %j', (change) => {
+      const value = receipt();
+      expect(() => parsePreparedActivationInput({ ...value, origin: { ...value.origin, ...change } }, 'prepared')).toThrow();
+    });
+});
+
+it('projects a no-Program status with its Scenario origin', () => {
+  const digest = `sha256:${'a'.repeat(64)}`;
+  const status = { schema_version: 'manyforge.applied_program_status.v2', deployment_artifact_id: 'deployment_a',
+    deployment_revision: digest, retained_bundle_id: digest, graph_revision: digest, record_digest: digest,
+    executable: false, program_id: null, program_revision: null, program_binding_id: null, program: null,
+    non_executable: null, message: 'No Program is selected',
+    origin: { kind: 'scenario', scenario_id: 'cell_a', source_document_digest: digest, project_path: '/projects/cell_a' } };
+  expect(parseAppliedProgramStatus(status).origin.kind).toBe('scenario');
+  for (const change of [{ scenario_id: 'fake' }, { program_id: 'fake' }]) {
+    expect(() => parseAppliedProgramStatus({ ...status, ...change })).toThrow();
+  }
+});
+
+
+describe('closed known Program Run outcomes', () => {
+  function outcome(code = 'program_run_started_then_failed') {
+    const before = code === 'program_run_stopped_before_start';
+    const stopped = before || code === 'program_run_superseded_by_stop';
+    return { detail: { code, message: stopped ? 'Operator Stop won' : 'Component became inactive',
+      details: { program_run_id: 'program-cycle.2', claim_generation: before ? null : 9,
+        needs_reset: true, cause_code: stopped ? 'program_run_superseded_by_stop' : 'program_required_component_not_active',
+        cause_message: stopped ? 'Operator Stop won' : 'Component became inactive',
+        ...(stopped ? { stopped_by_operator: true } : {}), ...(before ? { no_effect: true } : {}),
+        actual_native_comparison: 'preserved',
+      } } };
+  }
+  it.each(['program_run_started_then_failed', 'program_run_superseded_by_stop',
+    'program_run_stopped_before_start'])('reads the actual typed %s and native facts', (code) => {
+    const parsed = parseKnownProgramRunOutcome(outcome(code), code === 'program_run_stopped_before_start' ? 409 : 422);
+    expect(parsed.code).toBe(code);
+    expect(parsed.details?.actual_native_comparison).toBe('preserved');
+    expect(parsed.details?.needs_reset).toBe(true);
+  });
+  it.each(['envelope-extra', 'dto-extra', 'unknown-kind', 'missing-run', 'reset-string',
+    'claim-string', 'nested-native', 'foreign-stop-field', 'wrong-status'])('rejects %s', (caseName) => {
+    const value = outcome() as unknown as { detail: Record<string, unknown>; [key: string]: unknown };
+    const details = value.detail.details as Record<string, unknown>;
+    if (caseName === 'envelope-extra') value.extra = true;
+    if (caseName === 'dto-extra') value.detail.kind = 'failed';
+    if (caseName === 'unknown-kind') value.detail.code = 'program_outcome_other';
+    if (caseName === 'missing-run') delete details.program_run_id;
+    if (caseName === 'reset-string') details.needs_reset = 'true';
+    if (caseName === 'claim-string') details.claim_generation = '9';
+    if (caseName === 'nested-native') details.actual_native_comparison = { changed: true };
+    if (caseName === 'foreign-stop-field') details.stopped_by_operator = true;
+    expect(() => parseKnownProgramRunOutcome(value, caseName === 'wrong-status' ? 409 : 422)).toThrow();
+  });
+});

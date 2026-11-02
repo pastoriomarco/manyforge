@@ -1,0 +1,981 @@
+"""Focused NRT ports consumed by executable v2 orchestration adapters."""
+
+from __future__ import annotations
+
+from collections.abc import Collection, Mapping, Sequence
+from copy import deepcopy
+from dataclasses import dataclass, field
+from enum import Enum
+from hashlib import sha256
+from types import MappingProxyType
+from typing import Any, Callable, Final, Protocol
+
+from manyforge_behavior.failure_details import (
+    require_failure_details,
+    require_failure_origin,
+)
+from manyforge_behavior.kernel_client import ExecutionState
+
+
+PROGRAM_MOTION_STOP_RECOVERY_CLASS: Final = "ordinary_operator_stop"
+
+
+class OwnerTaskState(Enum):
+    ACTIVE = "active"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+
+
+class OwnerTaskObservationUnavailableError(RuntimeError):
+    """The exact accepted owner task is temporarily unavailable to observe."""
+
+
+class ProgramSelectionReleaseRejectedError(RuntimeError):
+    """The owner explicitly refused a selection release before changing holds.
+
+    ``code`` and ``details`` carry the owner's stable refusal (for example an
+    operator-alarm attention reason with its memberships) when it named one.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = dict(details or {})
+
+
+class ProgramRunScopeState(Enum):
+    ACTIVE = "active"
+    SETTLED = "settled"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class NodeAttemptIdentity:
+    program_run_id: str
+    node_instance_id: str
+    node_attempt_id: str
+    parent_node_attempt_id: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("program_run_id", "node_instance_id", "node_attempt_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{field_name} must be non-empty text")
+            if len(value.encode("utf-8")) > 512:
+                raise ValueError(f"{field_name} exceeds the Kernel field bound")
+        if self.parent_node_attempt_id is not None and (
+            not isinstance(self.parent_node_attempt_id, str)
+            or not self.parent_node_attempt_id
+            or len(self.parent_node_attempt_id.encode("utf-8")) > 512
+        ):
+            raise ValueError(
+                "parent_node_attempt_id must be absent or bounded non-empty text"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramRunPortContext:
+    """Immutable Applied Program/Binding coordinates used by client ports."""
+
+    program_run_id: str
+    applied_record_digest: str
+    scenario_id: str
+    source_document_digest: str
+    program_id: str
+    program_revision: str
+    program_binding_id: str
+    retained_bundle_id: str
+    graph_revision: str
+    node_environment_digest: str
+    program_binding: Mapping[str, Any]
+    program: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    assistant_projection: Mapping[str, Any] | None = None
+    # Simulator entity mapping of the active Deployment links
+    # ({cell_frame_id, scene_entities}); None when it has none.
+    simulation_scene: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("program_run_id", "scenario_id", "program_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{field_name} must be non-empty text")
+            if len(value.encode("utf-8")) > 512:
+                raise ValueError(f"{field_name} exceeds the client-port bound")
+        for field_name in (
+            "applied_record_digest",
+            "source_document_digest",
+            "program_revision",
+            "program_binding_id",
+            "retained_bundle_id",
+            "graph_revision",
+            "node_environment_digest",
+        ):
+            value = getattr(self, field_name)
+            if (
+                not isinstance(value, str)
+                or len(value) != 71
+                or not value.startswith("sha256:")
+                or any(character not in "0123456789abcdef" for character in value[7:])
+            ):
+                raise ValueError(f"{field_name} must be an exact SHA-256 identity")
+        if not isinstance(self.program_binding, Mapping):
+            raise TypeError("program_binding must be a mapping")
+        binding = dict(self.program_binding)
+        if (
+            binding.get("program_id") != self.program_id
+            or binding.get("program_revision") != self.program_revision
+            or binding.get("program_binding_id") != self.program_binding_id
+            or binding.get("retained_bundle_id") != self.retained_bundle_id
+            or binding.get("graph_revision") != self.graph_revision
+        ):
+            raise ValueError("Program-run context and Program Binding disagree")
+        object.__setattr__(self, "program_binding", _freeze(binding))
+        if not isinstance(self.program, Mapping):
+            raise TypeError("program must be a mapping")
+        program = dict(self.program)
+        if program and (
+            program.get("program_id") != self.program_id
+            or program.get("program_revision") != self.program_revision
+        ):
+            raise ValueError("Program-run context and Program disagree")
+        object.__setattr__(self, "program", _freeze(program))
+        if self.assistant_projection is not None and not isinstance(
+            self.assistant_projection, Mapping
+        ):
+            raise TypeError("assistant_projection must be absent or a mapping")
+        object.__setattr__(
+            self,
+            "assistant_projection",
+            (
+                None
+                if self.assistant_projection is None
+                else _freeze(dict(self.assistant_projection))
+            ),
+        )
+        if self.simulation_scene is not None and not isinstance(
+            self.simulation_scene, Mapping
+        ):
+            raise TypeError("simulation_scene must be absent or a mapping")
+        object.__setattr__(
+            self,
+            "simulation_scene",
+            (
+                None
+                if self.simulation_scene is None
+                else _freeze(dict(self.simulation_scene))
+            ),
+        )
+
+
+class ProgramRunContextPort(Protocol):
+    """Bind exact client-only coordinates before constructing a Program tree."""
+
+    def bind(self, context: ProgramRunPortContext) -> None: ...
+
+    def unbind(self, program_run_id: str) -> None: ...
+
+
+class ProgramRunContextError(RuntimeError):
+    """One atomic Program-run context transition could not be completed."""
+
+
+class CompositeProgramRunContextPort:
+    """Bind focused context ports as one ordered, rollback-safe unit.
+
+    The member ports keep their separate responsibilities.  This coordinator
+    only guarantees that a Program tree never observes a partly bound set.
+    """
+
+    def __init__(self, *ports: ProgramRunContextPort) -> None:
+        # Nested composites already unwind failed binds. Flatten them so a
+        # parent's rollback cannot clean up the same member a second time.
+        ports = tuple(
+            member
+            for port in ports
+            for member in (
+                port._ports if isinstance(port, CompositeProgramRunContextPort)
+                else (port,)
+            )
+        )
+        if not ports:
+            raise ValueError("composite context requires at least one port")
+        if any(
+            not callable(getattr(port, "bind", None))
+            or not callable(getattr(port, "unbind", None))
+            for port in ports
+        ):
+            raise TypeError("every composite member must be a context port")
+        if len({id(port) for port in ports}) != len(ports):
+            raise ValueError("composite context ports must be unique")
+        self._ports = tuple(ports)
+
+    def bind(self, context: ProgramRunPortContext) -> None:
+        bound: list[ProgramRunContextPort] = []
+        try:
+            for port in self._ports:
+                bound.append(port)
+                port.bind(context)
+        except Exception as bind_error:
+            rollback_errors: list[Exception] = []
+            for port in reversed(bound):
+                try:
+                    port.unbind(context.program_run_id)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+            if rollback_errors:
+                detail = "; ".join(
+                    str(error) or type(error).__name__ for error in rollback_errors
+                )
+                raise ProgramRunContextError(
+                    "Program-run context bind failed and rollback was not "
+                    f"complete: {detail}"
+                ) from bind_error
+            raise
+
+    def unbind(self, program_run_id: str) -> None:
+        errors: list[Exception] = []
+        for port in reversed(self._ports):
+            try:
+                port.unbind(program_run_id)
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            detail = "; ".join(str(error) or type(error).__name__ for error in errors)
+            raise ProgramRunContextError(
+                f"Program-run context cleanup was incomplete: {detail}"
+            ) from errors[0]
+
+
+class NodeAttemptSource(Protocol):
+    """Issue one fresh identity whenever a node attempt starts."""
+
+    def begin(self, node_instance_id: str) -> NodeAttemptIdentity: ...
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(nested) for key, nested in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(nested) for nested in value)
+    return deepcopy(value)
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerNodeInputs:
+    """One immutable node-attempt snapshot sent to a semantic owner."""
+
+    parameters: Mapping[str, Any]
+    blackboard: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.parameters, Mapping):
+            raise TypeError("owner parameters must be a mapping")
+        if not isinstance(self.blackboard, Mapping):
+            raise TypeError("owner blackboard inputs must be a mapping")
+        if any(not isinstance(key, str) or not key for key in self.parameters):
+            raise ValueError("owner parameter keys must be non-empty text")
+        if any(not isinstance(key, str) or not key for key in self.blackboard):
+            raise ValueError("owner blackboard keys must be non-empty text")
+        object.__setattr__(self, "parameters", _freeze(self.parameters))
+        object.__setattr__(self, "blackboard", _freeze(self.blackboard))
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerTaskSnapshot:
+    task_id: str
+    state: OwnerTaskState
+    output: Any = None
+    metadata: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    reason_code: str | None = None
+    message: str = ""
+    # Evidence carried by a terminal owner result, not a second lifecycle.
+    # False means no settlement proof is carried, not that motion is active.
+    # Successful native tasks still cross the exact acknowledgement gate.
+    settlement_proven: bool = False
+    # The owner's bounded structured cause (`bounded_failure_details`).
+    details: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.task_id, str) or not self.task_id:
+            raise ValueError("owner task id must be non-empty text")
+        if not isinstance(self.state, OwnerTaskState):
+            raise TypeError("owner task state must be an OwnerTaskState")
+        if type(self.settlement_proven) is not bool:
+            raise TypeError("owner task settlement proof must be boolean")
+        if self.settlement_proven and self.state not in {
+            OwnerTaskState.SUCCEEDED, OwnerTaskState.FAILED
+        }:
+            raise ValueError("settlement proof requires a terminal owner result")
+        if not isinstance(self.message, str):
+            raise TypeError("owner task message must be text")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("owner task metadata must be a mapping")
+        if any(not isinstance(key, str) or not key for key in self.metadata):
+            raise ValueError("owner task metadata keys must be non-empty text")
+        if self.state is OwnerTaskState.SUCCEEDED and self.reason_code is not None:
+            raise ValueError("a successful owner task cannot carry a failure reason")
+        if self.state in {OwnerTaskState.FAILED, OwnerTaskState.INTERRUPTED} and (
+            not isinstance(self.reason_code, str) or not self.reason_code
+        ):
+            raise ValueError("a failed owner task must carry a reason code")
+        if self.state is OwnerTaskState.SUCCEEDED and self.details is not None:
+            raise ValueError("a successful owner task cannot carry failure details")
+        object.__setattr__(self, "details", require_failure_details(self.details))
+        object.__setattr__(self, "output", deepcopy(self.output))
+        object.__setattr__(
+            self,
+            "metadata",
+            MappingProxyType(deepcopy(dict(self.metadata))),
+        )
+
+
+class OwnerTaskPort(Protocol):
+    """One focused owner family with normalized asynchronous observation."""
+
+    def start(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot: ...
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot: ...
+
+    def cancel(
+        self,
+        task_id: str,
+        identity: NodeAttemptIdentity,
+    ) -> None: ...
+
+    def acknowledge(
+        self,
+        task_id: str,
+        identity: NodeAttemptIdentity,
+    ) -> None: ...
+
+
+class OwnerTaskSettlementPendingError(RuntimeError):
+    """A terminal task is waiting for its owner to settle an accepted effect."""
+
+
+class PoseSourceLatchError(RuntimeError):
+    """A between-node pose-source latch could not be proven complete."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not isinstance(message, str) or not message:
+            raise ValueError("pose-source latch failure requires a message")
+        self.reason_code = "pose_source_apply_failed"
+        self.details = None if details is None else dict(details)
+        super().__init__(message)
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerInvocationResult:
+    succeeded: bool
+    output: Any = None
+    metadata: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    reason_code: str | None = None
+    message: str = ""
+    # The owner's bounded structured cause (`bounded_failure_details`).
+    details: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.succeeded) is not bool:
+            raise TypeError("owner invocation succeeded must be boolean")
+        if not isinstance(self.message, str):
+            raise TypeError("owner invocation message must be text")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("owner invocation metadata must be a mapping")
+        if any(not isinstance(key, str) or not key for key in self.metadata):
+            raise ValueError("owner invocation metadata keys must be non-empty text")
+        if self.succeeded and self.reason_code is not None:
+            raise ValueError("a successful invocation cannot carry a failure reason")
+        if not self.succeeded and (
+            not isinstance(self.reason_code, str) or not self.reason_code
+        ):
+            raise ValueError("a failed invocation must carry a reason code")
+        if self.succeeded and self.details is not None:
+            raise ValueError("a successful invocation cannot carry failure details")
+        object.__setattr__(self, "details", require_failure_details(self.details))
+        object.__setattr__(self, "output", deepcopy(self.output))
+        object.__setattr__(
+            self,
+            "metadata",
+            MappingProxyType(deepcopy(dict(self.metadata))),
+        )
+
+
+class OwnerInvocationPendingError(RuntimeError):
+    """Retain one call's read-only continuation, never a resubmission closure."""
+
+    def __init__(self, message: str,
+                 observe: Callable[[], OwnerInvocationResult | None]) -> None:
+        super().__init__(message)
+        self.observe = observe
+
+
+class OwnerInvocationHeldError(RuntimeError):
+    """The owner proved Stop prevented admission; no effect was started."""
+
+    def __init__(self, selection_revision: int) -> None:
+        super().__init__("Not started — held by Stop")
+        if type(selection_revision) is not int or not 0 <= selection_revision <= 9_007_199_254_740_991:
+            raise ValueError("held invocation requires an exact Stop selection revision")
+        self.selection_revision = selection_revision
+
+
+class OwnerInvocationRefusedByPriorityError(RuntimeError):
+    """The Kernel refused this motion: a higher-priority one holds the robot.
+
+    No effect was started. ``winner`` names the winning operation, node and
+    attempt exactly as the Kernel reported them.
+    """
+
+    def __init__(self, message: str, winner: Mapping[str, str]) -> None:
+        super().__init__(message or "refused by a higher-priority motion")
+        self.winner = dict(winner)
+
+
+class OwnerInvocationPort(Protocol):
+    """One focused owner family whose public request settles synchronously."""
+
+    def invoke(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        inputs: OwnerNodeInputs,
+    ) -> OwnerInvocationResult: ...
+
+
+class MockSimulationRefusedError(RuntimeError):
+    """The host closed-refused one node start's Mock simulation (its typed
+    ErrorResponse, code and details kept); nothing was started."""
+
+    def __init__(
+        self, code: str, message: str, details: Mapping[str, Any] | None = None
+    ) -> None:
+        super().__init__(message or "Mock simulation start was refused")
+        self.code = code
+        self.details = dict(details) if details is not None else None
+
+
+class MockSimulationPort(Protocol):
+    """Decision 133: one node attempt's literal Mock simulation start.
+
+    ``request`` builds the exact wire request once per attempt (the node then
+    resends that same request until it is answered); ``start`` sends it and
+    returns the host's exact acknowledgement; ``end`` ends that attempt's
+    simulation. ``start`` raises
+    ``MockSimulationRefusedError`` for a closed refusal; any other exception
+    leaves the outcome unknown.
+    """
+
+    def request(
+        self,
+        identity: NodeAttemptIdentity,
+        node_start_index: int,
+        signals: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any]: ...
+
+    def start(self, request: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    def end(self, start_request: Mapping[str, Any]) -> None:
+        """Decision 135: the attempt of this exact start ended (once per
+        attempt; never for a Halt). An unknown reply keeps that exact END
+        pending until ``resend_unknown_ends`` gets its ACK."""
+        ...
+
+    def resend_unknown_ends(self, program_run_id: str) -> tuple[Mapping[str, Any], ...]:
+        """Resend the Run's pending ENDs unchanged; those still unanswered."""
+        ...
+
+    def set_run_paused(
+        self,
+        program_run_id: str,
+        run_revision: int,
+        paused: bool,
+        held_node_instance_ids: Sequence[str] = (),
+    ) -> None:
+        """Decisions 135/138: the Run's snapshot at the Runner's run_revision
+        (Halt state and held-node mask); never raises (an unanswered
+        snapshot is resent unchanged)."""
+        ...
+
+
+
+def describe_owner_failure(message: str, details: object) -> str:
+    """Name an owner rejection's structured cause once in its human message.
+
+    Owner rejections carry the precise cause in ``details.reason``; a missing
+    or ambiguous reference also names the failed reference in
+    ``details.reference_type`` and ``details.reference_id`` (and
+    ``details.target_role_id`` for another robot's frame). The human message
+    alone is often generic, so it names them too, where the failure is
+    described; the same bounded details travel separately as the failure's
+    ``details`` and are never re-parsed from this text.
+    """
+
+    if not isinstance(details, Mapping):
+        return message
+    notes: list[str] = []
+    reason = details.get("reason")
+    if isinstance(reason, str) and reason and reason not in message:
+        notes.append(reason[:256])
+    reference_type = details.get("reference_type")
+    if isinstance(reference_type, str) and reference_type:
+        reference = reference_type[:64]
+        reference_id = details.get("reference_id")
+        if isinstance(reference_id, str) and reference_id:
+            reference += f" {reference_id[:256]!r}"
+        target_role_id = details.get("target_role_id")
+        if isinstance(target_role_id, str) and target_role_id:
+            reference += f" of target role {target_role_id[:256]!r}"
+        notes.append(f"reference {reference}")
+    return f"{message} ({'; '.join(notes)})" if notes else message
+
+
+class FrameTransformError(RuntimeError):
+    """The owner refused or could not answer one frame transform.
+
+    ``reason_code`` is the owner's stable reason (for example
+    ``program_reference_robot_not_local``) or ``frame_transform_failed``;
+    ``details`` the owner's bounded structured cause, if any.
+    """
+
+    def __init__(
+        self,
+        reason_code: str,
+        message: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.details = require_failure_details(details)
+
+
+@dataclass(frozen=True, slots=True)
+class FrameTransformResult:
+    """One owner-proven pose, as a stored pose in the requested frame."""
+
+    pose: Mapping[str, Any]
+    metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pose, Mapping) or not isinstance(self.metadata, Mapping):
+            raise TypeError("frame transform result pose and metadata must be mappings")
+        object.__setattr__(self, "pose", deepcopy(dict(self.pose)))
+        object.__setattr__(self, "metadata", deepcopy(dict(self.metadata)))
+
+
+class FrameTransformPort(Protocol):
+    """Express one stored pose in another declared frame.
+
+    The native cell frame resolver answers from one coherent state capture;
+    the client only forwards the two frames and never composes them.
+    """
+
+    def express_pose(
+        self,
+        identity: NodeAttemptIdentity,
+        pose: Mapping[str, Any],
+        target_frame: Mapping[str, Any],
+    ) -> FrameTransformResult: ...
+
+
+class ModelQueryPort(OwnerInvocationPort, FrameTransformPort, Protocol):
+    """Native model/target queries, including frame transforms."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramRunScopeSnapshot:
+    """Kernel operation/Stop quiescence for one exact Program run.
+
+    An ACTIVE snapshot may contain zero retained operations while an accepted
+    run-scoped Stop is fencing a first admission that has not yet returned to
+    the Program owner.
+    """
+
+    program_run_id: str
+    state: ProgramRunScopeState
+    active_operation_count: int | None
+    reason_code: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.program_run_id, str) or not self.program_run_id:
+            raise ValueError("program_run_id must be non-empty text")
+        if not isinstance(self.state, ProgramRunScopeState):
+            raise TypeError("Program-run scope state is invalid")
+        if self.active_operation_count is not None and (
+            type(self.active_operation_count) is not int
+            or not 0 <= self.active_operation_count <= 4_096
+        ):
+            raise ValueError("active_operation_count is outside its bound")
+        if self.state is ProgramRunScopeState.SETTLED and (
+            self.active_operation_count != 0 or self.reason_code is not None
+        ):
+            raise ValueError("a settled Program-run scope must be empty")
+        if self.state is ProgramRunScopeState.ACTIVE and (
+            self.active_operation_count is None or self.reason_code is not None
+        ):
+            raise ValueError(
+                "an active Program-run scope must provide a bounded work count"
+            )
+        if self.state is ProgramRunScopeState.UNKNOWN and (
+            self.active_operation_count is not None
+            or not isinstance(self.reason_code, str)
+            or not self.reason_code
+        ):
+            raise ValueError("an unknown Program-run scope requires one reason")
+
+
+class ProgramRunScopePort(Protocol):
+    """Stop, reset, and observe Kernel operations for one Program run."""
+
+    def request_stop(
+        self,
+        program_run_id: str,
+        stop_request_id: str,
+        reason: str | None,
+    ) -> ProgramRunScopeSnapshot: ...
+
+    def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot: ...
+
+    def execution_scope(self, program_run_id: str) -> Mapping[str, Any]:
+        """Read the exact Kernel capture and current indexed node holds."""
+        ...
+
+    def stop_selection(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Contain a captured selection; return the accepted current scope."""
+        ...
+
+    def retire_held_preparations(
+        self, program_run_id: str, selected_node_ids: frozenset[str],
+        expected_selection_revision: int,
+    ) -> None:
+        """Retire exact cancelled unsent preparations before selected release.
+
+        Unknown cleanup raises and retains the existing owner and node holds.
+        This internal hook neither releases selection nor performs operator Reset.
+        """
+        ...
+
+    def release_selection(
+        self, request: Mapping[str, Any], expected_selection_revision: int
+    ) -> Mapping[str, Any]:
+        """Release only that selection after its accepted effects are retired."""
+        ...
+
+    def start_selection(
+        self, request: Mapping[str, Any], expected_selection_revision: int
+    ) -> Mapping[str, Any]:
+        """Release only the selected initial Ready nodes."""
+        ...
+
+    def check_node_motion_attention(self, request: Mapping[str, Any]) -> None:
+        """Ask the Kernel, without effect, whether operator-alarm attention
+        gates the resources of this one captured node; raise its refusal if
+        so."""
+        ...
+
+    def capture_stop(self, program_run_id: str) -> tuple[str, int] | None:
+        """Capture the Program Stop; None means no Program-scope fence."""
+        ...
+
+    def release_stop(
+        self, program_run_id: str, *, expected_stop: tuple[str, int] | None = None
+    ) -> ProgramRunScopeSnapshot: ...
+
+    def reset(self, program_run_id: str) -> ProgramRunScopeSnapshot: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramInterventionSnapshot:
+    """One authored Program policy that requires an operator decision."""
+
+    identity: NodeAttemptIdentity
+    reason_code: str
+    message: str
+    policy_parameter: str
+    owner_port_name: str | None = None
+    owner_task_id: str | None = None
+    owner_assessment: Mapping[str, Any] | None = None
+    # The failure's bounded details and origin; both None when the
+    # intervention does not describe a failure (an operator Stop).
+    details: Mapping[str, Any] | None = None
+    origin: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, NodeAttemptIdentity):
+            raise TypeError("intervention identity is invalid")
+        object.__setattr__(self, "details", require_failure_details(self.details))
+        object.__setattr__(self, "origin", require_failure_origin(self.origin))
+        if self.details is not None and self.origin is None:
+            raise ValueError("intervention failure details require an origin")
+        for field_name, maximum_bytes in (
+            ("reason_code", 256),
+            ("policy_parameter", 256),
+        ):
+            value = getattr(self, field_name)
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value.encode("utf-8")) > maximum_bytes
+            ):
+                raise ValueError(f"{field_name} must be bounded non-empty text")
+        if (
+            not isinstance(self.message, str)
+            or len(self.message.encode("utf-8")) > 4_096
+        ):
+            raise ValueError("intervention message must be bounded text")
+        if self.owner_port_name is not None and (
+            not isinstance(self.owner_port_name, str)
+            or not self.owner_port_name
+            or len(self.owner_port_name.encode("utf-8")) > 128
+        ):
+            raise ValueError("owner_port_name must be bounded non-empty text")
+        if self.owner_task_id is not None and (
+            not isinstance(self.owner_task_id, str)
+            or not self.owner_task_id
+            or len(self.owner_task_id.encode("utf-8")) > 512
+        ):
+            raise ValueError("owner_task_id must be bounded non-empty text")
+        if self.owner_assessment is not None:
+            if not isinstance(self.owner_assessment, Mapping):
+                raise TypeError("owner_assessment must be absent or a mapping")
+            object.__setattr__(
+                self,
+                "owner_assessment",
+                _freeze(dict(self.owner_assessment)),
+            )
+
+
+class ProgramInterventionPort(Protocol):
+    """Record and read authored intervention without owning Kernel Pause."""
+
+    def register_run(
+        self, program_run_id: str, node_instance_ids: Collection[str]
+    ) -> None: ...
+
+    def require(
+        self,
+        identity: NodeAttemptIdentity,
+        *,
+        reason_code: str,
+        message: str,
+        policy_parameter: str,
+        owner_port_name: str | None = None,
+        owner_task_id: str | None = None,
+        owner_assessment: Mapping[str, Any] | None = None,
+        details: Mapping[str, Any] | None = None,
+        origin: Mapping[str, Any] | None = None,
+    ) -> ProgramInterventionSnapshot: ...
+
+    def read(self, program_run_id: str) -> ProgramInterventionSnapshot | None: ...
+
+    def read_all(
+        self, program_run_id: str
+    ) -> tuple[ProgramInterventionSnapshot, ...]: ...
+
+    def read_holds(
+        self, program_run_id: str
+    ) -> tuple[ProgramInterventionSnapshot, ...]: ...
+
+    def has_operator_stop(self, program_run_id: str) -> bool: ...
+
+    def refresh_owner_assessment(
+        self,
+        identity: NodeAttemptIdentity,
+        assessment: Mapping[str, Any],
+    ) -> ProgramInterventionSnapshot: ...
+
+    def resolve(
+        self,
+        identity: NodeAttemptIdentity,
+        *,
+        action: str,
+        result: object = None,
+    ) -> None: ...
+
+    def consume_resolution(
+        self, identity: NodeAttemptIdentity
+    ) -> tuple[str, object] | None: ...
+
+    def release(self, program_run_id: str) -> None: ...
+
+
+class PersistentValueUncertainError(RuntimeError):
+    """The register applied a change that may not survive a crash.
+
+    Unlike other register failures the change did happen, so the value store
+    shows it too; the register refuses further changes until reconciled.
+    """
+
+
+class PersistentKeyRegisterPort(Protocol):
+    """Values of `persistent` blackboard keys, owned by the Program runner.
+
+    Declarations stay in the Program; the register keeps only values, scoped
+    to one Scenario project folder (its canonical absolute path) and key name.
+    """
+
+    def restore(
+        self, project_path: str, declarations: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Return stored values still compatible with the committed Program.
+
+        The owner reconciles stored rows with Manager's committed Applies
+        before a run starts; restoring only reads, and returns nothing it
+        cannot show still belongs to this project's committed Program.
+        """
+        ...
+
+    def drop(
+        self,
+        project_path: str,
+        key: str,
+        *,
+        reason: str,
+        detail: str | None = None,
+        edit: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Durably forget a restored value the committed Program refuses.
+
+        The value store has already left it out; the drop is noticed for the
+        starting run's audit even if the removal fails, which raises.
+        """
+        ...
+
+    def commit(
+        self,
+        project_path: str,
+        declaration: Any,
+        value: Any,
+        *,
+        edit: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Durably store one value before the write is reported; raise on failure.
+
+        ``edit`` is the write's metadata (run, node, attempt or request
+        identity), audited with the change.
+        """
+        ...
+
+    def remove(
+        self, project_path: str, key: str, *, edit: Mapping[str, Any] | None = None
+    ) -> bool:
+        """Durably forget one stored value; raise on failure."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class NodeAdapterPorts:
+    """Explicit focused ports; co-location never merges semantic ownership."""
+
+    kernel_operations: OwnerTaskPort | None = None
+    scene_transactions: OwnerInvocationPort | None = None
+    gripper_status: OwnerInvocationPort | None = None
+    # Boolean input reads (`io.get_input`/`io.check_input`) and level-input
+    # watches (`io.wait_for_input`) on the native execution owner.
+    io_signals: OwnerInvocationPort | None = None
+    io_watches: OwnerTaskPort | None = None
+    # Decision 133: per-node Mock simulation starts of signal-reading nodes.
+    mock_simulation: MockSimulationPort | None = None
+    model_queries: ModelQueryPort | None = None
+    assistant_requests: OwnerTaskPort | None = None
+    simulator_control: OwnerTaskPort | None = None
+    kernel_controls: OwnerTaskPort | None = None
+    program_run_scope: ProgramRunScopePort | None = None
+    program_run_context: ProgramRunContextPort | None = None
+    program_interventions: ProgramInterventionPort | None = None
+    persistent_keys: PersistentKeyRegisterPort | None = None
+
+
+# The Kernel execution states of a failure and of an interruption (spec 230).
+FAILED_EXECUTION_STATES: Final = frozenset(
+    {ExecutionState.FAILED.value, ExecutionState.INTERVENTION_REQUIRED.value}
+)
+INTERRUPTED_EXECUTION_STATES: Final = frozenset(
+    {
+        ExecutionState.STOPPED.value,
+        ExecutionState.INTERRUPTED.value,
+        ExecutionState.CANCELLED_PRE_DISPATCH.value,
+    }
+)
+
+
+def is_ordinary_operator_stop(task: OwnerTaskSnapshot) -> bool:
+    """An ordinary operator Stop holds the node; it is not a failure."""
+
+    assessment = task.metadata.get("recovery_assessment")
+    return (
+        task.state is OwnerTaskState.INTERRUPTED
+        and isinstance(assessment, Mapping)
+        and assessment.get("recovery_class") == "ordinary_operator_stop"
+    )
+
+
+def recovery_outcome(result: object) -> bool | None:
+    """One recovery reply's exact outcome: True accepted, False refused, and
+    None unknown (no exact boolean verdict was received)."""
+
+    if not isinstance(result, Mapping) or type(result.get("accepted")) is not bool:
+        return None
+    return result["accepted"]
+
+
+def request_identity(prefix: str, *coordinates: str) -> str:
+    """A request identity that is exact for these coordinates."""
+
+    digest = sha256(b"\x00".join(value.encode("utf-8") for value in coordinates))
+    return f"{prefix}:{digest.hexdigest()}"
+
+
+__all__ = [
+    "NodeAdapterPorts",
+    "NodeAttemptIdentity",
+    "NodeAttemptSource",
+    "CompositeProgramRunContextPort",
+    "ProgramRunContextError",
+    "ProgramRunContextPort",
+    "ProgramInterventionPort",
+    "ProgramInterventionSnapshot",
+    "PROGRAM_MOTION_STOP_RECOVERY_CLASS",
+    "ProgramRunPortContext",
+    "OwnerNodeInputs",
+    "describe_owner_failure",
+    "FrameTransformError",
+    "FrameTransformPort",
+    "FrameTransformResult",
+    "ModelQueryPort",
+    "MockSimulationPort",
+    "MockSimulationRefusedError",
+    "PersistentKeyRegisterPort",
+    "PersistentValueUncertainError",
+    "OwnerInvocationPort",
+    "OwnerInvocationResult",
+    "OwnerInvocationPendingError",
+    "OwnerInvocationHeldError",
+    "OwnerInvocationRefusedByPriorityError",
+    "OwnerTaskPort",
+    "OwnerTaskObservationUnavailableError",
+    "OwnerTaskSettlementPendingError",
+    "PoseSourceLatchError",
+    "OwnerTaskSnapshot",
+    "OwnerTaskState",
+    "ProgramRunScopePort",
+    "ProgramRunScopeSnapshot",
+    "ProgramRunScopeState",
+]

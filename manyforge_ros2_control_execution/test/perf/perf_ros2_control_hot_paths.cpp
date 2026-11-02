@@ -1,389 +1,372 @@
-#include <manyforge_core/ports/iexecution_state_sink.hpp>
-#include <manyforge_core/time/fake_clock.hpp>
-#include <manyforge_core/time/manual_scheduler.hpp>
-#define MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
-#include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
-#undef MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
-
+// Report-only measurements through surviving public ROS APIs.
+// Counts process-wide C++ new (including aligned new), not C/RMW malloc.
+// Whole feedback delivery includes the fake server, SDK, executor and ReadGoal
+// polling. It is intentionally not the former isolated callback/storage probe.
+#include "ros2_control_fake_controller.hpp"
+#include <manyforge_core/execution_port_participant.hpp>
+#include <manyforge_core/observed_robot_state_publication.hpp>
+#include <manyforge_roboplan/execution_host_support.hpp>
+#include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <memory>
 #include <mutex>
 #include <new>
-#include <optional>
 #include <sstream>
 #include <string>
-#include <vector>
+#include <stdexcept>
+#include <thread>
 
 namespace {
-
-std::atomic<bool> g_count_allocations{false};
-std::atomic<std::size_t> g_allocation_count{0};
-
-[[gnu::noinline]] void* allocate_bytes(std::size_t size) {
-  return std::malloc(size == 0 ? 1 : size);
+std::atomic<bool> counting{false};
+std::atomic<std::size_t> allocations{0};
+void count_allocation() {
+  if (counting.load(std::memory_order_relaxed))
+    allocations.fetch_add(1, std::memory_order_relaxed);
 }
-
-[[gnu::noinline]] void free_bytes(void* ptr) {
-  std::free(ptr);
 }
-
-}  // namespace
-
 void* operator new(std::size_t size) {
-  if (g_count_allocations.load(std::memory_order_relaxed)) {
-    g_allocation_count.fetch_add(1, std::memory_order_relaxed);
-  }
-  void* ptr = allocate_bytes(size);
-  if (ptr == nullptr) {
-    throw std::bad_alloc();
-  }
-  return ptr;
+  count_allocation();
+  if (auto p = std::malloc(size ? size : 1)) return p;
+  throw std::bad_alloc();
 }
-
-void* operator new[](std::size_t size) {
-  return operator new(size);
+void* operator new[](std::size_t size) { return ::operator new(size); }
+void* operator new(std::size_t size, std::align_val_t alignment) {
+  count_allocation();
+  void* p = nullptr;
+  if (posix_memalign(&p, static_cast<std::size_t>(alignment), size ? size : 1) == 0)
+    return p;
+  throw std::bad_alloc();
 }
-
-void operator delete(void* ptr) noexcept {
-  free_bytes(ptr);
-}
-
-void operator delete[](void* ptr) noexcept {
-  free_bytes(ptr);
-}
-
-void operator delete(void* ptr, std::size_t) noexcept {
-  free_bytes(ptr);
-}
-
-void operator delete[](void* ptr, std::size_t) noexcept {
-  free_bytes(ptr);
-}
+void* operator new[](std::size_t s, std::align_val_t a) { return ::operator new(s, a); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
 
 namespace {
+namespace core = manyforge::core;
+namespace ros = manyforge::ros2_control_execution;
+namespace runtime = manyforge::roboplan_backend;
+namespace fake = ros::fake_controller;
+using namespace std::chrono_literals;
+using Action = control_msgs::action::FollowJointTrajectory;
+using ServerGoal = rclcpp_action::ServerGoalHandle<Action>;
 
-using manyforge::core::ExecutionStateSinkResult;
-using manyforge::core::ExecutionStateSinkStatus;
-using manyforge::core::ExecutionStateUpdateMode;
-using manyforge::ros2_control_execution::Ros2ControlExecutionBackend;
-using manyforge::ros2_control_execution::Ros2ControlExecutionBackendConfig;
-
-std::size_t read_size_env(const char* name, std::size_t fallback) {
+void require(bool condition, const char* reason) {
+  if (!condition) throw std::runtime_error(reason);
+}
+template<class Predicate> void await(Predicate predicate, const char* reason) {
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (!predicate()) {
+    require(std::chrono::steady_clock::now() < deadline, reason);
+    std::this_thread::sleep_for(1ms);
+  }
+}
+std::size_t positive_env(const char* name, std::size_t fallback) {
   const char* raw = std::getenv(name);
-  if (raw == nullptr || *raw == '\0') {
-    return fallback;
-  }
-  try {
-    const auto parsed = std::stoull(raw);
-    return parsed == 0 ? fallback : static_cast<std::size_t>(parsed);
-  } catch (...) {
-    return fallback;
-  }
+  if (!raw || !*raw) return fallback;
+  const std::string text(raw);
+  require(text.find_first_not_of("0123456789") == std::string::npos,
+          "Measurement dimensions must be positive integers");
+  const auto value = std::stoull(text);
+  require(value > 0 && value <= 1'000'000, "Measurement dimension out of range");
+  return value;
 }
-
-std::optional<std::size_t> read_optional_size_env(const char* name) {
-  const char* raw = std::getenv(name);
-  if (raw == nullptr || *raw == '\0') {
-    return std::nullopt;
+struct Measurement {
+  std::size_t count;
+  double elapsed_us;
+};
+class AllocationWindow {
+public:
+  AllocationWindow() : start_(std::chrono::steady_clock::now()) {
+    allocations.store(0);
+    counting.store(true);
   }
-  try {
-    return static_cast<std::size_t>(std::stoull(raw));
-  } catch (...) {
-    return std::nullopt;
+  ~AllocationWindow() { counting.store(false); }
+  Measurement finish() {
+    counting.store(false);
+    return {allocations.load(), std::chrono::duration<double, std::micro>(
+      std::chrono::steady_clock::now() - start_).count()};
   }
-}
-
-std::string format_double(double value) {
-  std::ostringstream out;
-  out << std::setprecision(12) << value;
-  return out.str();
-}
-
-struct AllocationProbeResult {
-  std::size_t iterations = 0;
-  std::size_t allocations = 0;
-  double allocations_per_iteration = 0.0;
-  double total_us = 0.0;
-  double mean_us = 0.0;
-  std::size_t checksum = 0;
+private:
+  std::chrono::steady_clock::time_point start_;
+};
+class NullSink final : public core::IExecutionStateSink {
+public:
+  core::ExecutionStateSinkResult apply_group_joint_positions(
+      const std::string&, const std::vector<double>&, core::ExecutionStateUpdateMode) override { return {}; }
+  core::ExecutionStateSinkResult apply_group_joint_position(
+      const std::string&, const std::string&, double, core::ExecutionStateUpdateMode) override { return {}; }
+  std::optional<double> group_joint_position(const std::string&, const std::string&) const override { return 0.0; }
 };
 
-std::string allocation_probe_json(const AllocationProbeResult& p) {
-  std::ostringstream out;
-  out << "\"iterations\":" << p.iterations
-      << ",\"allocations\":" << p.allocations
-      << ",\"allocations_per_iteration\":"
-      << format_double(p.allocations_per_iteration)
-      << ",\"total_us\":" << format_double(p.total_us)
-      << ",\"mean_us\":" << format_double(p.mean_us)
-      << ",\"checksum\":" << p.checksum;
-  return out.str();
-}
-
-template <typename Fn>
-AllocationProbeResult measure_allocations(std::size_t iterations, Fn&& fn) {
-  g_allocation_count.store(0, std::memory_order_relaxed);
-  g_count_allocations.store(true, std::memory_order_release);
-  const auto start = std::chrono::steady_clock::now();
-  const std::size_t checksum = fn();
-  const auto end = std::chrono::steady_clock::now();
-  g_count_allocations.store(false, std::memory_order_release);
-
-  AllocationProbeResult result;
-  result.iterations = iterations;
-  result.allocations = g_allocation_count.load(std::memory_order_relaxed);
-  result.allocations_per_iteration =
-      iterations == 0 ? 0.0
-                      : static_cast<double>(result.allocations) /
-                            static_cast<double>(iterations);
-  result.total_us = std::chrono::duration<double, std::micro>(end - start).count();
-  result.mean_us = iterations == 0 ? 0.0
-                                   : result.total_us /
-                                         static_cast<double>(iterations);
-  result.checksum = checksum;
-  return result;
-}
-
-class CountingExecutionStateSink final
-    : public manyforge::core::IExecutionStateSink {
- public:
-  ExecutionStateSinkResult apply_group_joint_positions(
-      const std::string&,
-      const std::vector<double>& positions_rad,
-      ExecutionStateUpdateMode) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    ++group_updates_;
-    for (const double value : positions_rad) {
-      checksum_ += value;
-    }
-    return {ExecutionStateSinkStatus::kApplied};
+class FeedbackRig {
+public:
+  runtime::WallClock clock;
+  ros::Ros2TransportResources resources;
+  std::unique_ptr<ros::Ros2ControlExecutionBackend> adapter;
+  core::ExecutionGoalKey key{core::ControllerGoalId("perf.feedback"), core::ControllerGoalGeneration(1)};
+  FeedbackRig() : resources("manyforge_perf_feedback_" + fake::unique_suffix(), "", 2,
+                            std::make_shared<NullSink>(), "arm", clock) {
+    const auto route = "/manyforge_perf_" + fake::unique_suffix();
+    server_ = rclcpp_action::create_server<Action>(resources.node(), route + "/fjt",
+      [](const auto&, auto) { return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE; },
+      [](auto) { return rclcpp_action::CancelResponse::ACCEPT; },
+      [this](std::shared_ptr<ServerGoal> value) { std::lock_guard lock(mutex_); goal_ = std::move(value); });
+    ros::JtcExecutionAdapterConfig config;
+    config.action_name = route + "/fjt";
+    config.state_topic = route + "/state";
+    config.scale_topic = route + "/scale";
+    config.binding_epoch = core::ExecutionBindingEpoch(1);
+    config.lane_facts.joint_names = {"joint_1"};
+    config.lane_facts.controller_update_rate_hz = 100.0;
+    adapter = std::make_unique<ros::Ros2ControlExecutionBackend>(resources, clock, config);
+    adapter->ObserveReadiness({true, true, true, core::ExecutionBindingEpoch(1)});
+    resources.start();
+    await([&] { return adapter->ActionServerIsReady(); }, "Fake FJT discovery timed out");
+    core::TrajectoryDTO trajectory;
+    trajectory.joint_names = {"joint_1"};
+    trajectory.waypoints = {{0.0, {0.0}, {0.0}, {0.0}}, {1.0, {0.1}, {0.0}, {0.0}}};
+    require(adapter->Submit(key, trajectory).dispatch == core::ExecutionPortDispatch::kDispatched,
+            "Fake FJT submission refused");
+    await([&] {
+      const auto observation = adapter->ReadGoal(key);
+      std::lock_guard lock(mutex_);
+      return goal_ && observation && observation->accepted_stamp_ns.has_value();
+    }, "Fake FJT acceptance timed out");
   }
-
-  std::optional<double> group_joint_position(
-      const std::string&,
-      const std::string&) const override {
-    return std::nullopt;
+  ~FeedbackRig() { adapter->shutdown(); resources.quiesce(); }
+  void deliver(const std::shared_ptr<Action::Feedback>& feedback, std::uint32_t sequence) {
+    feedback->header.stamp.sec = 1;
+    feedback->header.stamp.nanosec = sequence;
+    std::shared_ptr<ServerGoal> goal;
+    { std::lock_guard lock(mutex_); goal = goal_; }
+    goal->publish_feedback(feedback);
+    await([&] {
+      const auto observation = adapter->ReadGoal(key);
+      return observation && observation->latest_feedback &&
+             observation->latest_feedback->source_stamp_ns == 1'000'000'000 + sequence;
+    }, "Fake FJT feedback delivery timed out");
   }
-
-  ExecutionStateSinkResult apply_group_joint_position(
-      const std::string&,
-      const std::string&,
-      double,
-      ExecutionStateUpdateMode) override {
-    return {ExecutionStateSinkStatus::kApplied};
-  }
-
-  std::size_t group_updates() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return group_updates_;
-  }
-
-  double checksum() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return checksum_;
-  }
-
- private:
-  mutable std::mutex mutex_;
-  std::size_t group_updates_ = 0;
-  double checksum_ = 0.0;
+private:
+  std::mutex mutex_;
+  std::shared_ptr<ServerGoal> goal_;
+  rclcpp_action::Server<Action>::SharedPtr server_;
 };
 
-Ros2ControlExecutionBackendConfig make_config(std::vector<std::string> joints) {
-  Ros2ControlExecutionBackendConfig config;
-  config.node_name = "manyforge_ros2_control_hot_path_qualification";
-  config.action_name = "/manyforge_ros2_control_hot_path_qualification_fjt";
-  config.joint_state_topic =
-      "/manyforge_ros2_control_hot_path_qualification_joint_states";
-  config.controller_state_topic.clear();
-  config.required_joints = std::move(joints);
-  config.wait_for_state_timeout_s = 0.0;
-  config.wait_for_action_server_timeout_s = 0.0;
-  config.monitor_period_s = 0.01;
-  config.joint_state_max_age_s = 3600.0;
-  config.enable_jtc_speed_scaling_input = false;
-  return config;
+core::RuntimeParticipantBinding ArmBinding() {
+  core::RuntimeParticipantBindingDTO value{
+      core::ProgramId("program.physical"),
+      core::ProgramRevision("program-revision"),
+      core::ProgramBindingId("program-binding"),
+      core::RetainedBundleId("bundle"),
+      core::GraphRevision("graph"),
+      core::ComponentRoleId("robot"),
+      core::TargetRoleId("arm"),
+      core::ControllableComponentId("robot_1"),
+      core::ComponentTypeId("robot.type"),
+      core::ComponentTypeRevision("robot-type-revision"),
+      core::CommandTargetId("arm.target"),
+      core::CapabilityId("execution.trajectory.execute"),
+      core::CapabilityDefinitionRevision("capability-revision"),
+      std::nullopt,
+      {core::ProgramModelRoleBindingDTO{core::ModelRoleId("body"),
+                                        core::ModelInstanceId("robot.model"),
+                                        core::ModelRevision("model-revision")}},
+      {core::RuntimeModelGroupBindingDTO{core::ModelGroupRoleId("arm_group"),
+                                         core::ModelInstanceId("robot.model"), "arm",
+                                         {"joint_1"}}},
+      {core::ProgramFrameRoleBindingDTO{core::FrameRoleId("tcp"),
+                                        core::ModelInstanceId("robot.model"),
+                                        core::ModelRevision("model-revision"), "tcp"}},
+      {core::RuntimeResourceBindingDTO{core::ResourceRoleId("joint_1"),
+                                       core::ResourceId("robot.joint.1"), "source_joint_1",
+                                       "joint_1", core::CoordinateKind::kAngular}},
+      {},
+      core::RuntimeControlPathDTO{
+          core::ControlDomainId("domain.arm"), core::ControlDomainRevision("domain-revision"),
+          core::ControlBindingId("binding.arm"), core::ControlBindingRevision("binding-revision"),
+          core::ControlInterfaceContractId("interface.trajectory"),
+          core::ControlInterfaceRevision("interface-revision"),
+          core::ControllerTopologyId("topology.ros2_control"),
+          core::TopologyRevision("topology-revision"), core::ControlRouteId("route.ros2_control"),
+          core::ActivationSetId("activation.ros2_control"),
+          core::ActiveControlConfigurationId("active.ros2_control"),
+          core::ActiveControlConfigurationGeneration(1U),
+          core::ProviderInstanceId("provider.ros2_control"),
+          core::ProviderManifestId("provider-manifest.ros2_control"),
+          core::ProviderManifestRevision("provider-manifest-revision"),
+          core::RuntimeUnitId("runtime.ros2_control"), core::RuntimeEpoch("runtime-epoch.1"),
+          core::StateAuthorityId("state.commanded"), core::StateAuthorityClass::kCommanded,
+          core::StopEvidencePolicyId("stop.ros2_control"),
+          core::StopEvidencePolicyRevision("stop-revision"),
+          core::ContainmentGranularity::kResource, std::nullopt},
+      std::nullopt,
+      {},
+      {core::RuntimeUnitEpochBindingDTO{core::RuntimeUnitId("runtime.ros2_control"),
+                                        core::RuntimeEpoch("runtime-epoch.1")}}};
+  auto sealed = core::verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) throw std::logic_error(sealed.error().message);
+  return std::move(sealed.value());
 }
 
-std::vector<std::string> make_joint_names(std::size_t count) {
-  std::vector<std::string> names;
-  names.reserve(count);
-  for (std::size_t i = 0; i < count; ++i) {
-    names.push_back("j" + std::to_string(i));
+// The normal controller-manager fixture activates the lifecycle facts without
+// enabling FakeJtc's periodic publisher. One manually published sample remains
+// unchanged while the real public handle's 100 Hz observer timer runs.
+struct IdleRig {
+  runtime::WallClock clock;
+  runtime::SimpleScheduler scheduler;
+  core::RuntimeParticipantBinding binding = ArmBinding();
+  core::ObservedRobotStatePublication publication{
+    {"joint_1"}, {core::ObservedRobotStateSourceConfig{
+      core::ObservedRobotStateSourceKind::kCommandedState, "commanded_state",
+      core::ObservedRobotStateAuthorityProfile::kCommandedSimulation, 0}}};
+  std::string prefix = "/manyforge_perf_idle_" + fake::unique_suffix();
+  fake::FakeJtc jtc{prefix + "/arm_controller", {"source_joint_1"}};
+  fake::FakeControllerManager manager{prefix + "/controller_manager", "arm_controller", "TestSystem", nullptr};
+  std::atomic<std::size_t> observer_updates{0};
+  std::atomic<std::uint64_t> observed_epoch{0}, observed_receipt{0};
+  std::shared_ptr<runtime::RetainedRos2ControlRuntimeHandle> handle =
+      runtime::RetainedRos2ControlRuntimeHandle::Create();
+
+  IdleRig() {
+    runtime::RetainedRos2ControlArmTransport arm;
+    arm.adapter.action_name = prefix + "/arm_controller/follow_joint_trajectory";
+    arm.adapter.state_topic = prefix + "/arm_controller/controller_state";
+    arm.adapter.scale_topic = prefix + "/arm_controller/speed_scaling_input";
+    arm.adapter.lane_facts.joint_names = {"source_joint_1"};
+    arm.adapter.lane_facts.supports_scale = true;
+    arm.adapter.lane_facts.state_rate_hz = 100.0;
+    arm.adapter.lane_facts.feedback_rate_hz = 100.0;
+    arm.adapter.lane_facts.controller_update_rate_hz = 100.0;
+    arm.controller = {prefix + "/controller_manager", "arm_controller", "TestSystem"};
+    arm.compiled_joint_names = {"joint_1"};
+    const auto bound = handle->Bind(
+      std::make_unique<ros::Ros2TransportResources>(
+        "manyforge_perf_handle_" + fake::unique_suffix(), "/", 3,
+        std::make_shared<NullSink>(), "arm", clock), clock, std::move(arm),
+      [this](std::shared_ptr<core::IExecutionPort> port) {
+        // Existing runtime-handle test fixture values; no motion is submitted.
+        core::ExecutionPortParticipantConfig config;
+        config.stop.trip_authority = core::StateAuthorityClass::kCommanded;
+        config.stop.stop_traj_delta_s = 0.1;
+        config.stop.sample_period_s = 0.01;
+        config.stop.replacement_start_allowance_s = 0.02;
+        config.stop.hard_stop_completion_timeout_ns = 1'000'000'000;
+        config.late_cycle_margin_s = 0.5;
+        return std::make_shared<core::ExecutionPortParticipant>(
+          binding, std::move(port), clock, scheduler,
+          [](core::TimePoint, const std::stop_token&) { std::this_thread::sleep_for(1ms); },
+          core::ExecutionPortParticipantStateAuthority{
+            &publication, [] { return core::Result<void>::Ok(); }}, std::move(config));
+      }, nullptr, binding, std::nullopt);
+    require(bound.ok(), "Idle runtime handle binding failed");
+    handle->InstallSampleObserver([this](const core::ExecutionControllerSampleDTO& sample) {
+      observed_epoch.store(sample.binding_epoch.value());
+      observed_receipt.store(sample.local_receipt_count.value());
+      observer_updates.fetch_add(1);
+    });
+    handle->StartBackend();
+    await([&] {
+      const auto activity = handle->arm_activity();
+      return activity.observed && activity.controller_loaded && activity.hardware_active;
+    }, "Idle controller manager discovery timed out");
+    require(handle->PrepareArmController({}, std::chrono::steady_clock::now() + std::chrono::seconds(30)).outcome == runtime::RetainedRos2ControlSwitchOutcome::kSucceeded,
+            "Idle controller preparation failed");
+    require(handle->ActivateArmController({}, std::chrono::steady_clock::now() + std::chrono::seconds(30)).outcome == runtime::RetainedRos2ControlSwitchOutcome::kSucceeded,
+            "Idle controller activation failed");
+    auto publisher = jtc.node()->create_publisher<control_msgs::msg::JointTrajectoryControllerState>(
+      prefix + "/arm_controller/controller_state", rclcpp::QoS(10).reliable());
+    await([&] { return publisher->get_subscription_count() > 0; }, "Idle state discovery timed out");
+    control_msgs::msg::JointTrajectoryControllerState sample;
+    sample.header.stamp.sec = 1;
+    sample.joint_names = {"source_joint_1"};
+    sample.reference.positions = {0.1};
+    sample.reference.velocities = {0.0};
+    sample.reference.accelerations = {0.0};
+    sample.feedback.positions = {0.1};
+    sample.feedback.velocities = {0.0};
+    sample.speed_scaling_factor = 1.0;
+    publisher->publish(sample);
+    await([&] { return observer_updates.load() > 0; }, "Idle sample observer timed out");
   }
-  return names;
-}
-
-std::vector<double> make_positions(std::size_t count, double offset = 0.0) {
-  std::vector<double> positions;
-  positions.reserve(count);
-  for (std::size_t i = 0; i < count; ++i) {
-    positions.push_back(offset + 0.01 * static_cast<double>(i));
-  }
-  return positions;
-}
-
-AllocationProbeResult measure_feedback_storage_allocations(
-    Ros2ControlExecutionBackend& backend,
-    const std::vector<std::string>& warm_names,
-    const std::vector<double>& warm_positions,
-    const std::vector<std::string>& hot_names,
-    const std::vector<double>& hot_positions,
-    std::size_t iterations) {
-  const std::vector<double> no_velocities;
-  const auto t0 = std::chrono::steady_clock::now();
-  backend.testing_store_action_feedback_sample(
-      warm_names, warm_positions, no_velocities, t0);
-  backend.testing_store_action_feedback_sample(
-      hot_names, hot_positions, no_velocities, t0 + std::chrono::nanoseconds(1));
-  return measure_allocations(iterations, [&]() {
-    std::size_t checksum = 0;
-    for (std::size_t i = 0; i < iterations; ++i) {
-      backend.testing_store_action_feedback_sample(
-          hot_names,
-          hot_positions,
-          no_velocities,
-          t0 + std::chrono::nanoseconds(static_cast<long>(i + 2)));
-      checksum += backend.testing_latest_action_feedback_position_capacity();
-    }
-    return checksum;
-  });
-}
-
-AllocationProbeResult measure_idle_repeated_sample_skip_allocations(
-    Ros2ControlExecutionBackend& backend,
-    const std::vector<std::string>& names,
-    const std::vector<double>& positions,
-    std::size_t iterations) {
-  const auto t0 = std::chrono::steady_clock::now();
-  backend.testing_store_latest_joint_sample(names, positions, t0);
-  backend.testing_sync_idle_scene_from_latest_sample();
-  return measure_allocations(iterations, [&]() {
-    std::size_t checksum = 0;
-    for (std::size_t i = 0; i < iterations; ++i) {
-      backend.testing_sync_idle_scene_from_latest_sample();
-      checksum += positions.size();
-    }
-    return checksum;
-  });
-}
-
-}  // namespace
+};
+} // namespace
 
 int main() {
-  const std::size_t iterations =
-      read_size_env("MANYFORGE_ROS2_CONTROL_HOT_PATH_ITERATIONS", 10000);
-  const auto feedback_allocation_budget =
-      read_optional_size_env("MANYFORGE_ROS2_CONTROL_FEEDBACK_ALLOC_BUDGET");
-  const auto idle_skip_allocation_budget =
-      read_optional_size_env("MANYFORGE_ROS2_CONTROL_IDLE_SKIP_ALLOC_BUDGET");
-  const auto idle_skip_update_budget =
-      read_optional_size_env("MANYFORGE_ROS2_CONTROL_IDLE_SKIP_MAX_UPDATES");
-
-  auto hot_names = make_joint_names(6);
-  auto hot_positions = make_positions(hot_names.size());
-  auto warm_names = make_joint_names(64);
-  auto warm_positions = make_positions(warm_names.size(), 1.0);
-
-  manyforge::core::FakeClock feedback_clock;
-  manyforge::core::ManualScheduler feedback_scheduler;
-  auto feedback_sink = std::make_shared<CountingExecutionStateSink>();
-  Ros2ControlExecutionBackend feedback_backend(
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
-      feedback_sink,
-      "arm",
-      feedback_clock,
-      feedback_scheduler,
-      make_config(hot_names));
-  const auto feedback_allocations = measure_feedback_storage_allocations(
-      feedback_backend,
-      warm_names,
-      warm_positions,
-      hot_names,
-      hot_positions,
-      iterations);
-
-  manyforge::core::FakeClock idle_clock;
-  manyforge::core::ManualScheduler idle_scheduler;
-  auto idle_sink = std::make_shared<CountingExecutionStateSink>();
-  Ros2ControlExecutionBackend idle_backend(
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
-      idle_sink,
-      "arm",
-      idle_clock,
-      idle_scheduler,
-      make_config(hot_names));
-  const auto idle_skip_allocations =
-      measure_idle_repeated_sample_skip_allocations(
-          idle_backend, hot_names, hot_positions, iterations);
-  const std::size_t idle_group_updates = idle_sink->group_updates();
-
-  bool budget_pass = true;
-  if (feedback_allocation_budget.has_value() &&
-      feedback_allocations.allocations > *feedback_allocation_budget) {
-    budget_pass = false;
-  }
-  if (idle_skip_allocation_budget.has_value() &&
-      idle_skip_allocations.allocations > *idle_skip_allocation_budget) {
-    budget_pass = false;
-  }
-  if (idle_skip_update_budget.has_value() &&
-      idle_group_updates > *idle_skip_update_budget) {
-    budget_pass = false;
-  }
-
-  std::ostringstream out;
-  out << "{"
-      << "\"scenario\":\"ws8_ros2_control_hot_path_qualification\","
-      << "\"iterations\":" << iterations << ","
-      << "\"joint_count\":" << hot_names.size() << ","
-      << "\"warm_joint_count\":" << warm_names.size() << ","
-      << "\"allocation_counts\":{\"action_feedback_reused_storage\":{"
-      << allocation_probe_json(feedback_allocations)
-      << "},\"idle_repeated_sample_skip\":{"
-      << allocation_probe_json(idle_skip_allocations)
-      << "}},\"idle_scene_updates_after_repeated_sync\":"
-      << idle_group_updates
-      << ",\"idle_scene_update_checksum\":"
-      << format_double(idle_sink->checksum())
-      << ",\"budgets\":{\"action_feedback_reused_storage_allocations\":";
-  if (feedback_allocation_budget.has_value()) {
-    out << *feedback_allocation_budget;
-  } else {
-    out << "null";
-  }
-  out << ",\"idle_repeated_sample_skip_allocations\":";
-  if (idle_skip_allocation_budget.has_value()) {
-    out << *idle_skip_allocation_budget;
-  } else {
-    out << "null";
-  }
-  out << ",\"idle_repeated_sample_max_updates\":";
-  if (idle_skip_update_budget.has_value()) {
-    out << *idle_skip_update_budget;
-  } else {
-    out << "null";
-  }
-  out << ",\"passed\":" << (budget_pass ? "true" : "false") << "}}";
-
-  const std::string json = out.str();
-  if (const char* out_path =
-          std::getenv("MANYFORGE_ROS2_CONTROL_HOT_PATH_JSON_OUT");
-      out_path != nullptr && *out_path != '\0') {
-    std::ofstream f(out_path);
-    if (!f) {
-      std::cerr << "failed to open MANYFORGE_ROS2_CONTROL_HOT_PATH_JSON_OUT="
-                << out_path << "\n";
-      return 2;
+  try {
+    const auto iterations = positive_env("MANYFORGE_ROS2_CONTROL_HOT_PATH_ITERATIONS", 10000);
+    const auto idle_window_ms = positive_env("MANYFORGE_ROS2_CONTROL_IDLE_WINDOW_MS", 1000);
+    Measurement feedback_measurement{};
+    {
+      FeedbackRig rig;
+      auto feedback = std::make_shared<Action::Feedback>();
+      feedback->joint_names = {"joint_1"};
+      feedback->desired.positions = {0.1};
+      feedback->desired.velocities = {0.0};
+      feedback->desired.accelerations = {0.0};
+      feedback->actual.positions = {0.1};
+      // Warm up the actual goal's feedback path before counting allocations.
+      rig.deliver(feedback, 1);
+      AllocationWindow window;
+      for (std::size_t index = 0; index < iterations; ++index)
+        rig.deliver(feedback, static_cast<std::uint32_t>(index + 2));
+      feedback_measurement = window.finish();
     }
-    f << json << "\n";
+    Measurement idle_measurement{};
+    std::size_t before{}, after{};
+    std::uint64_t epoch{}, receipt{};
+    bool identity_unchanged{};
+    {
+      IdleRig rig;
+      before = rig.observer_updates.load();
+      epoch = rig.observed_epoch.load();
+      receipt = rig.observed_receipt.load();
+      AllocationWindow window;
+      std::this_thread::sleep_for(std::chrono::milliseconds(idle_window_ms));
+      idle_measurement = window.finish();
+      after = rig.observer_updates.load();
+      const auto sample = rig.handle->current_port()->ReadSample();
+      identity_unchanged = sample && sample->binding_epoch.value() == epoch &&
+        sample->local_receipt_count.value() == receipt;
+    }
+    std::ostringstream json;
+    json << std::setprecision(12)
+      << "{\"qualification\":\"ros2_control_hot_paths\",\"mode\":\"report_only\","
+      << "\"allocation_scope\":\"process_wide_cpp_new_including_aligned; C_and_RMW_malloc_unmeasured\","
+      << "\"feedback_delivery\":{\"scope\":\"normal_fake_FJT_server_SDK_executor_and_ReadGoal_polling\","
+      << "\"messages_delivered\":" << iterations
+      << ",\"allocations\":" << feedback_measurement.count
+      << ",\"allocations_per_message\":" << static_cast<double>(feedback_measurement.count) / iterations
+      << ",\"elapsed_us\":" << feedback_measurement.elapsed_us
+      << ",\"mean_delivery_us\":" << feedback_measurement.elapsed_us / iterations << "},"
+      << "\"idle_observer\":{\"scope\":\"public_runtime_handle_timer_unchanged_sample_window\","
+      << "\"configured_timer_hz\":100,\"requested_window_ms\":" << idle_window_ms
+      << ",\"elapsed_us\":" << idle_measurement.elapsed_us
+      << ",\"allocations\":" << idle_measurement.count
+      << ",\"observer_updates_before\":" << before
+      << ",\"observer_updates_after\":" << after
+      << ",\"observer_updates_during_window\":" << after - before
+      << ",\"binding_epoch\":" << epoch << ",\"local_receipt_count\":" << receipt
+      << ",\"sample_identity_unchanged\":" << (identity_unchanged ? "true" : "false")
+      << "}}";
+    if (const char* output = std::getenv("MANYFORGE_ROS2_CONTROL_HOT_PATH_JSON_OUT"); output && *output) {
+      std::ofstream file(output);
+      require(static_cast<bool>(file << json.str() << '\n'), "Cannot write qualification JSON");
+    }
+    std::cout << "MANYFORGE_QUALIFICATION_EVIDENCE " << json.str() << '\n';
+    return 0; // Measurements carry no pass/fail budget; setup/delivery errors do.
+  } catch (const std::exception& error) {
+    counting.store(false);
+    std::cerr << "ROS hot-path measurement failed: " << error.what() << '\n';
+    return 1;
   }
-
-  std::cout << "MANYFORGE_QUALIFICATION_EVIDENCE " << json << "\n";
-  return budget_pass ? 0 : 3;
 }

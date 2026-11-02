@@ -1,0 +1,10 @@
+#pragma once
+
+#include <string_view>
+
+namespace manyforge::component_manager::detail {
+
+inline constexpr std::string_view kEmbeddedManagerBootstrapJournalSchema =
+    R"mf_mbjs(@MANYFORGE_MANAGER_BOOTSTRAP_JOURNAL_SCHEMA_SQL@)mf_mbjs";
+
+}  // namespace manyforge::component_manager::detail

@@ -19,7 +19,10 @@ if [ -f "/opt/manyforge/topic_based_ros2_control/install/setup.bash" ]; then
     source "/opt/manyforge/topic_based_ros2_control/install/setup.bash"
 fi
 
-if [ -f "/workspace/install/setup.bash" ]; then
+if [ "${MANYFORGE_SOURCE_WORKSPACE_INSTALL:-OFF}" = "ON" ] &&
+    [ -f "/workspace/install/setup.bash" ]; then
+    # Explicit development escape hatch only. Canonical tests and launchers
+    # use container-local or immutable-image-keyed build roots instead.
     # shellcheck disable=SC1091
     source "/workspace/install/setup.bash"
 fi
@@ -28,7 +31,8 @@ export PYTHONPATH="/workspace/manyforge_ros:/workspace/manyforge_behavior:/works
 export MANYFORGE_BUILD_DIR="${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}"
 
 if [ -d "$MANYFORGE_BUILD_DIR" ] && [ ! -w "$MANYFORGE_BUILD_DIR" ]; then
-    echo "Build cache not writable by $(whoami). Run: docker compose down -v" >&2
+    echo "Build root is not writable by $(whoami): $MANYFORGE_BUILD_DIR" >&2
+    echo "Recreate the container with a writable build root; it is never deleted automatically." >&2
     exit 1
 fi
 

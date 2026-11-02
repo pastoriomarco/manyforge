@@ -1,0 +1,49 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
+# `scripts/manyforge component check manyforge_example_models/models/lite_gripper`.
+# Mounts on a robot's `flange` interface as its own component (merge 6).
+api_version: manyforge.component_package.v1
+kind: tool
+id: ufactory.lite_gripper
+version: 1.0.0
+title: UFACTORY Lite pneumatic gripper
+license: BSD-3-Clause
+model:
+  urdf: lite_gripper.urdf
+  srdf: lite_gripper.srdf
+mount:
+  frame: lite_gripper_mount
+tcps:                             # the first is the default TCP
+  - {id: tcp, frame: link_tcp}
+roles:
+  groups: {gripper: lite_gripper}
+  joints: {fingers: [right_finger_joint]}
+  collision_bodies:
+    gripper_collision: [lite_gripper_base_link, lite_gripper_left_finger, lite_gripper_right_finger]
+    gripper_fingers: [lite_gripper_left_finger, lite_gripper_right_finger]
+gripper:
+  actuation: pneumatic
+  states: {open: open, closed: closed}
+  attach_frame: link_tcp
+  command_duration_s: 0.8        # the valve dwell in seconds (lane-free profile)
+  touch_links: [lite_gripper_base_link, lite_gripper_left_finger, lite_gripper_right_finger]
+lanes:
+  mock:                           # Mock lane adapter (manyforge_ros2_control_execution/lane/)
+    adapter: mock
+    controller: lite_gripper_controller
+    controllers_file: mock_controllers.yaml
+    hard_stop_completion_timeout_s: 1.5
+    gripper_result_timeout_s: 5.0
+    gripper_stop_finish_tolerance: 0.0004 # m of finger travel (5% of the 8.1 mm stroke): a Stop this close lets the command finish
+  isaac:                          # Isaac lane adapter: the finger joint is in the robot's articulation
+    adapter: isaac
+    gripper_transport: isaac_joint_state_effort   # effort written straight to the joint command topic, no bridge
+    controller: lite_gripper_controller   # its GripperCommand action is <controller>/gripper_cmd
+    command_topic: /isaac_joint_commands_gripper
+    state_topic: /isaac_joint_states
+    completion_policy: dwell_elapsed
+    open_position: 0.0081
+    closed_position: 0.0
+    open_effort: 5.0
+    close_effort: -5.0
+    publish_nominal_position: true
+    gripper_result_timeout_s: 5.0

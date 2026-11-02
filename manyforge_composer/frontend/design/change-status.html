@@ -1,0 +1,416 @@
+<meta charset="utf-8">
+<title>Change Status Mock</title>
+<!-- Unapplied-change visibility, badge tooltips, Execute gating and the status
+     legend. Open via the dev server (/design/change-status.html) or file://.
+     Uses the app's real stylesheet; "proposed" pieces are defined below.
+     Lint, build, tests and packaging ignore this folder. -->
+<link rel="stylesheet" href="../src/styles/index.css">
+<style>
+  body { margin: 0; padding: 28px clamp(16px, 3vw, 40px) 64px; overflow: auto; }
+  .cs-wrap { max-width: 1380px; margin: 0 auto; display: grid; gap: 26px; }
+  .cs-wrap h1 { margin: 0; font-size: 1.3rem; }
+  .cs-wrap h2 { margin: 0; font-size: 0.95rem; }
+  .cs-lead { margin: 0; max-width: 92ch; color: var(--mf-text-neutral-68); font-size: 0.84rem; line-height: 1.5; }
+  .cs-block { display: grid; gap: 14px; padding: 16px; border: 1px solid var(--mf-border-neutral-23); border-radius: var(--mf-radius-lg); background: var(--mf-bg-neutral-08); }
+  .cs-block > p, .cs-block li { margin: 0; max-width: 92ch; color: var(--mf-text-neutral-68); font-size: 0.8rem; line-height: 1.5; }
+  .cs-block ul { margin: 0; padding-left: 1.1rem; display: grid; gap: 4px; }
+  .cs-block strong { color: var(--mf-text-neutral-90); }
+  .cs-caption { color: var(--mf-text-neutral-57); font-size: 0.68rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+  .cs-scroll { overflow-x: auto; padding-bottom: 6px; }
+
+  /* A real header row, clipped to what matters here. */
+  .cs-header { position: relative; min-width: 1320px; border: 1px solid var(--mf-border-neutral-23); border-radius: var(--mf-radius-md); overflow: visible; }
+  .cs-header { overflow: hidden; }
+  .cs-header .app-header { position: relative; }
+  /* Room for the marker inside the fixed-width switcher buttons. */
+  .cs-header .workspace-switcher button { min-width: max-content; }
+  .cs-header .deployment-status-button { padding-right: 1.3rem; }
+  /* Tooltips shown as cards under the bar, labelled with what you hover. */
+  .cs-tips { display: flex; flex-wrap: wrap; gap: 14px; }
+  .cs-tips .cs-tip { position: static; }
+  .cs-tips .cs-tip::before { display: none; }
+  .cs-tip i { display: block; margin-bottom: 3px; color: var(--mf-text-neutral-57); font-style: normal; font-size: 0.64rem; letter-spacing: 0.06em; text-transform: uppercase; }
+
+  /* ---- Proposed: unapplied marker on the workspace buttons ---------- */
+  .unapplied-marker { display: inline-block; width: 0.42rem; height: 0.42rem; margin-right: 0.38rem; border-radius: 50%;
+    background: var(--mf-status-running); box-shadow: 0 0 0 2px color-mix(in srgb, var(--mf-status-running) 25%, transparent); vertical-align: 0.08em; }
+
+  /* Mock header: name left, switcher (with optional badges) centred. */
+  .cs-header .app-header { display: grid; grid-template-columns: auto minmax(0,1fr) auto minmax(0,1fr); align-items: center; }
+  /* The switcher stays centred; the letters hang off its sides. */
+  .cs-center { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); }
+  .cs-center .workspace-switcher { position: static; transform: none; }
+  .cs-center .cs-das { position: absolute; top: 50%; transform: translateY(-50%); }
+  .cs-center .cs-das.left { right: calc(100% + 10px); }
+  .cs-center .cs-das.right { left: calc(100% + 18px); }
+
+  /* ---- Proposed A: amber fill on the pending document's button ------- */
+  .cs-header .workspace-switcher button.cs-pending,
+  .cs-header .workspace-switcher button.deployment-status-button.cs-pending {
+    background: color-mix(in srgb, var(--mf-status-running) 30%, var(--mf-bg-neutral-11));
+    color: var(--mf-text-neutral-96);
+  }
+  .cs-header .workspace-switcher button.active.cs-pending { border-color: var(--mf-status-running); }
+
+  /* ---- Proposed B: D / S / A initials -------------------------------- */
+  .cs-das { display: inline-flex; gap: 4px; }
+  .cs-initial { display: inline-grid; width: 1.35rem; height: 1.35rem; place-items: center; padding: 0; font-weight: 700; letter-spacing: 0; }
+
+  /* ---- Proposed: tooltips drawn open for the mock ------------------- */
+  .cs-tipped { position: relative; }
+  .cs-tip { position: absolute; z-index: 50; top: calc(100% + 8px); left: 0; width: max-content; max-width: 19rem;
+    padding: 0.45rem 0.6rem; border: 1px solid var(--mf-border-neutral-35); border-radius: var(--mf-radius-md);
+    color: var(--mf-text-neutral-86); background: var(--mf-bg-neutral-11); box-shadow: 0 0.6rem 1.4rem var(--mf-shadow-neutral-00-a40);
+    font-size: 0.72rem; line-height: 1.45; letter-spacing: 0; text-transform: none; white-space: normal; text-align: left; font-weight: 400; }
+  .cs-tip b { color: var(--mf-text-neutral-96); }
+  .cs-tip.right { left: auto; right: 0; }
+  .cs-tip.above { top: auto; bottom: calc(100% + 8px); }
+  .cs-tip::before { content: ""; position: absolute; top: -5px; left: 14px; width: 8px; height: 8px; transform: rotate(45deg);
+    border-left: 1px solid var(--mf-border-neutral-35); border-top: 1px solid var(--mf-border-neutral-35); background: var(--mf-bg-neutral-11); }
+  .cs-tip.right::before { left: auto; right: 14px; }
+  .cs-tip.above::before { top: auto; bottom: -5px; transform: rotate(225deg); }
+  .cs-tip-space { height: 118px; }
+
+  /* ---- Program panel mock (as in the viewer) ------------------------- */
+  .cs-program { display: grid; width: 9.5rem; gap: 6px; padding: 8px; border: 1px solid var(--mf-border-neutral-30); border-radius: var(--mf-radius-lg); background: var(--mf-bg-neutral-08-a94); }
+  .cs-program strong { font-size: 0.96rem; color: var(--mf-text-neutral-90); }
+  .cs-program button { height: 2.6rem; font-size: 0.84rem; }
+  .cs-program .ready { border-color: var(--mf-border-success-40); color: var(--mf-text-success-67); background: var(--mf-bg-success-24); }
+  .cs-row { display: flex; flex-wrap: wrap; gap: 28px; align-items: flex-start; }
+
+  /* ---- Legend (as it would sit in the viewer "i") -------------------- */
+  .cs-legend { display: grid; gap: 14px; max-width: 34rem; padding: 12px 14px; border: 1px solid var(--mf-border-neutral-30); border-radius: var(--mf-radius-lg); background: var(--mf-bg-neutral-08); }
+  .cs-legend h4 { margin: 0; font-size: 0.8rem; color: var(--mf-text-neutral-86); }
+  .cs-legend dl { display: grid; grid-template-columns: 8.5rem minmax(0,1fr); gap: 8px 12px; margin: 0; align-items: center; font-size: 0.75rem; }
+  .cs-legend dt { display: flex; align-items: center; justify-content: flex-start; }
+  .cs-legend dd { margin: 0; color: var(--mf-text-neutral-73); line-height: 1.4; }
+  .cs-swatch-btn { position: relative; display: inline-flex; align-items: center; height: 1.7rem; padding: 0 1.1rem 0 0.6rem; border: 1px solid; border-radius: var(--mf-radius-md);
+    font-size: 0.7rem; color: var(--mf-text-neutral-82); }
+  .cs-swatch-btn .deployment-status-indicator { right: -0.48rem; }
+  .cs-dot { position: relative; display: inline-block; width: 1rem; height: 1rem; }
+  .cs-dot .deployment-status-indicator { right: auto; left: 0; }
+</style>
+
+<div class="cs-wrap">
+  <header>
+    <h1>Changes, Apply and status: proposal</h1>
+    <p class="cs-lead">
+      Today the badges at the top left belong to the open workspace (Program and Scene show the
+      Program, Deployment shows the Deployment), so changes elsewhere are invisible; the
+      Deployment button's colour and dot show runtime health, not changes; and Execute is
+      allowed with unapplied changes. Proposed: an amber marker on the workspace whose Draft
+      is not applied, explaining tooltips, Execute blocked until Apply or Discard, and a legend.
+    </p>
+  </header>
+
+  <section class="cs-block">
+    <h2>1 · Where changes are</h2>
+    <p>
+      Two alternatives. Both show Program and Deployment state in every workspace; Scene edits
+      count as Program changes (the Scene is part of the Program document). Tooltips as in
+      section 2 go on the badges (and, for A, on the button).
+    </p>
+
+    <h2 style="font-size:0.88rem;">A · Amber fill when anything is pending</h2>
+    <p>
+      The Program or Deployment button fills amber when at least one of its Draft / Saved /
+      Applied badges is amber; otherwise it keeps the default look. Deployment keeps its border
+      colour and dot for runtime health. The badges at the top left stay as today.
+    </p>
+    <span class="cs-caption">Nothing pending</span>
+    <div class="cs-scroll"><div class="cs-header">
+      <header class="app-header">
+        <div class="app-identity"><span class="brand-mark">MF</span><strong>ManyForge</strong></div>
+        <div class="document-controls">
+          <div class="document-identity">
+            <strong>ur5e_lite6_wall_grouped</strong>
+            <span class="document-identity-divider"></span><span class="document-state state-draft">draft</span><span class="document-state state-saved">saved</span><span class="document-state state-applied">applied</span>
+          </div>
+        </div>
+        <div class="cs-center">
+          
+          <nav class="workspace-switcher">
+            <button type="button" class="active " aria-pressed="true">Program</button>
+            <button type="button">Scene</button>
+            <button type="button" class="deployment-status-button readiness-ready ">
+              <span>Deployment</span><span class="deployment-status-indicator"></span>
+            </button>
+          </nav>
+          
+        </div>
+      </header>
+    </div></div>
+
+    <span class="cs-caption">Program workspace open · Deployment has unapplied changes</span>
+    <div class="cs-scroll"><div class="cs-header">
+      <header class="app-header">
+        <div class="app-identity"><span class="brand-mark">MF</span><strong>ManyForge</strong></div>
+        <div class="document-controls">
+          <div class="document-identity">
+            <strong>ur5e_lite6_wall_grouped</strong>
+            <span class="document-identity-divider"></span><span class="document-state state-draft">draft</span><span class="document-state state-saved">saved</span><span class="document-state state-applied">applied</span>
+          </div>
+        </div>
+        <div class="cs-center">
+          
+          <nav class="workspace-switcher">
+            <button type="button" class="active " aria-pressed="true">Program</button>
+            <button type="button">Scene</button>
+            <button type="button" class="deployment-status-button readiness-ready cs-pending">
+              <span>Deployment</span><span class="deployment-status-indicator"></span>
+            </button>
+          </nav>
+          
+        </div>
+      </header>
+    </div></div>
+
+    <span class="cs-caption">Program workspace open · Program (a Scene object moved) not applied</span>
+    <div class="cs-scroll"><div class="cs-header">
+      <header class="app-header">
+        <div class="app-identity"><span class="brand-mark">MF</span><strong>ManyForge</strong></div>
+        <div class="document-controls">
+          <div class="document-identity">
+            <strong>ur5e_lite6_wall_grouped</strong>
+            <span class="document-identity-divider"></span><span class="document-state state-modified">modified</span><span class="document-state state-different">different</span><span class="document-state state-different">different</span>
+          </div>
+        </div>
+        <div class="cs-center">
+          
+          <nav class="workspace-switcher">
+            <button type="button" class="active cs-pending" aria-pressed="true">Program</button>
+            <button type="button">Scene</button>
+            <button type="button" class="deployment-status-button readiness-ready ">
+              <span>Deployment</span><span class="deployment-status-indicator"></span>
+            </button>
+          </nav>
+          
+        </div>
+      </header>
+    </div></div>
+
+    <div class="cs-tips">
+      <span class="cs-tip"><i>Hover: amber Deployment button</i><b>Deployment has unapplied changes.</b><br>Draft modified · Saved different · Applied different.<br>Open Deployment to Apply or Discard. Components: ready.</span>
+    </div>
+
+    <h2 style="font-size:0.88rem; margin-top:10px;">B · D / S / A initials beside the switcher (chosen: B2)</h2>
+    <p>
+      Each document's three badges shrink to their initials in the same colours: Program's on
+      the left of the three buttons, Deployment's on the right. The top-left strip keeps only
+      the name. B1 shows them always; B2 only while at least one is amber.
+    </p>
+    <span class="cs-caption">B1 (always) · nothing pending</span>
+    <div class="cs-scroll"><div class="cs-header">
+      <header class="app-header">
+        <div class="app-identity"><span class="brand-mark">MF</span><strong>ManyForge</strong></div>
+        <div class="document-controls">
+          <div class="document-identity">
+            <strong>ur5e_lite6_wall_grouped</strong>
+            
+          </div>
+        </div>
+        <div class="cs-center">
+          <span class="cs-das left" aria-label="Program state"><span class="document-state state-draft cs-initial" title="Program Draft: draft">D</span><span class="document-state state-saved cs-initial" title="Program Saved: saved">S</span><span class="document-state state-applied cs-initial" title="Program Applied: applied">A</span></span>
+          <nav class="workspace-switcher">
+            <button type="button" class="active " aria-pressed="true">Program</button>
+            <button type="button">Scene</button>
+            <button type="button" class="deployment-status-button readiness-ready ">
+              <span>Deployment</span><span class="deployment-status-indicator"></span>
+            </button>
+          </nav>
+          <span class="cs-das right" aria-label="Deployment state"><span class="document-state state-draft cs-initial" title="Deployment Draft: draft">D</span><span class="document-state state-saved cs-initial" title="Deployment Saved: saved">S</span><span class="document-state state-applied cs-initial" title="Deployment Applied: applied">A</span></span>
+        </div>
+      </header>
+    </div></div>
+
+    <span class="cs-caption">B1 (always) · Deployment has unapplied changes</span>
+    <div class="cs-scroll"><div class="cs-header">
+      <header class="app-header">
+        <div class="app-identity"><span class="brand-mark">MF</span><strong>ManyForge</strong></div>
+        <div class="document-controls">
+          <div class="document-identity">
+            <strong>ur5e_lite6_wall_grouped</strong>
+            
+          </div>
+        </div>
+        <div class="cs-center">
+          <span class="cs-das left" aria-label="Program state"><span class="document-state state-draft cs-initial" title="Program Draft: draft">D</span><span class="document-state state-saved cs-initial" title="Program Saved: saved">S</span><span class="document-state state-applied cs-initial" title="Program Applied: applied">A</span></span>
+          <nav class="workspace-switcher">
+            <button type="button" class="active " aria-pressed="true">Program</button>
+            <button type="button">Scene</button>
+            <button type="button" class="deployment-status-button readiness-ready ">
+              <span>Deployment</span><span class="deployment-status-indicator"></span>
+            </button>
+          </nav>
+          <span class="cs-das right" aria-label="Deployment state"><span class="document-state state-modified cs-initial" title="Deployment Draft: modified">D</span><span class="document-state state-different cs-initial" title="Deployment Saved: different">S</span><span class="document-state state-different cs-initial" title="Deployment Applied: different">A</span></span>
+        </div>
+      </header>
+    </div></div>
+
+    <span class="cs-caption">B2 (only when pending) · nothing pending</span>
+    <div class="cs-scroll"><div class="cs-header">
+      <header class="app-header">
+        <div class="app-identity"><span class="brand-mark">MF</span><strong>ManyForge</strong></div>
+        <div class="document-controls">
+          <div class="document-identity">
+            <strong>ur5e_lite6_wall_grouped</strong>
+            
+          </div>
+        </div>
+        <div class="cs-center">
+          
+          <nav class="workspace-switcher">
+            <button type="button" class="active " aria-pressed="true">Program</button>
+            <button type="button">Scene</button>
+            <button type="button" class="deployment-status-button readiness-ready ">
+              <span>Deployment</span><span class="deployment-status-indicator"></span>
+            </button>
+          </nav>
+          
+        </div>
+      </header>
+    </div></div>
+
+    <span class="cs-caption">B2 (only when pending) · Program not applied</span>
+    <div class="cs-scroll"><div class="cs-header">
+      <header class="app-header">
+        <div class="app-identity"><span class="brand-mark">MF</span><strong>ManyForge</strong></div>
+        <div class="document-controls">
+          <div class="document-identity">
+            <strong>ur5e_lite6_wall_grouped</strong>
+            
+          </div>
+        </div>
+        <div class="cs-center">
+          <span class="cs-das left" aria-label="Program state"><span class="document-state state-modified cs-initial" title="Program Draft: modified">D</span><span class="document-state state-different cs-initial" title="Program Saved: different">S</span><span class="document-state state-different cs-initial" title="Program Applied: different">A</span></span>
+          <nav class="workspace-switcher">
+            <button type="button" class="active " aria-pressed="true">Program</button>
+            <button type="button">Scene</button>
+            <button type="button" class="deployment-status-button readiness-ready ">
+              <span>Deployment</span><span class="deployment-status-indicator"></span>
+            </button>
+          </nav>
+          
+        </div>
+      </header>
+    </div></div>
+
+    <span class="cs-caption">B2 (only when pending) · both pending</span>
+    <div class="cs-scroll"><div class="cs-header">
+      <header class="app-header">
+        <div class="app-identity"><span class="brand-mark">MF</span><strong>ManyForge</strong></div>
+        <div class="document-controls">
+          <div class="document-identity">
+            <strong>ur5e_lite6_wall_grouped</strong>
+            
+          </div>
+        </div>
+        <div class="cs-center">
+          <span class="cs-das left" aria-label="Program state"><span class="document-state state-modified cs-initial" title="Program Draft: modified">D</span><span class="document-state state-different cs-initial" title="Program Saved: different">S</span><span class="document-state state-different cs-initial" title="Program Applied: different">A</span></span>
+          <nav class="workspace-switcher">
+            <button type="button" class="active " aria-pressed="true">Program</button>
+            <button type="button">Scene</button>
+            <button type="button" class="deployment-status-button readiness-ready ">
+              <span>Deployment</span><span class="deployment-status-indicator"></span>
+            </button>
+          </nav>
+          <span class="cs-das right" aria-label="Deployment state"><span class="document-state state-modified cs-initial" title="Deployment Draft: modified">D</span><span class="document-state state-different cs-initial" title="Deployment Saved: different">S</span><span class="document-state state-different cs-initial" title="Deployment Applied: different">A</span></span>
+        </div>
+      </header>
+    </div></div>
+
+    <div class="cs-tips">
+      <span class="cs-tip"><i>Hover: Program "A"</i><b>Program · Applied: different</b><br>The running Program is not your Draft. Apply to run your changes, or Discard to return to the applied Program. Execute is blocked until then.</span>
+      <span class="cs-tip"><i>Hover: Deployment "D"</i><b>Deployment · Draft: modified</b><br>Edits not saved to the file. Save writes them to the Scenario.</span>
+    </div>
+  </section>
+
+  <section class="cs-block">
+    <h2>2 · Badges that explain themselves</h2>
+    <p>Hovering each badge says what it compares and what to do. Shown open here for the "Program modified, not applied" case.</p>
+    <div class="cs-header" style="min-width: 0; padding: 10px 14px;">
+      <div class="document-identity" style="display:flex; gap: 10px; align-items:center;">
+        <strong style="margin-right: 8px;">ur5e_lite6_wall_grouped</strong>
+        <span class="document-state state-modified">modified</span>
+        <span class="document-state state-different">different</span>
+        <span class="document-state state-different">different</span>
+      </div>
+    </div>
+    <div class="cs-tips">
+      <span class="cs-tip"><i>Hover: 1st badge (Draft)</i><b>Draft: modified</b><br>Your working copy has edits not saved to the file. Save writes them to the Scenario.</span>
+      <span class="cs-tip"><i>Hover: 2nd badge (Saved)</i><b>Saved: different</b><br>The file differs from the Draft.<br>File: examples/mock_dual_arm_shared_group.scenario/program.yaml</span>
+      <span class="cs-tip"><i>Hover: 3rd badge (Applied)</i><b>Applied: different</b><br>The running Program is not your Draft. Apply to run your changes, or Discard to return to the applied Program. Execute is blocked until then.</span>
+    </div>
+  </section>
+
+  <section class="cs-block">
+    <h2>3 · Execute blocked until Apply or Discard</h2>
+    <p>
+      No new mechanism: Execute already requires the Program Draft to be the applied Program
+      (Scene edits included). The same check adds the Deployment Draft. Execute's tooltip names
+      which document is pending. During a run, authoring is locked, so nothing new can become
+      pending mid-run; Stop, Halt and Reset are never blocked.
+    </p>
+    <div class="cs-row">
+      <div>
+        <span class="cs-caption">Nothing pending</span>
+        <div class="cs-program" style="margin-top:8px;">
+          <strong>Program</strong>
+          <button type="button" class="ready">Execute</button>
+          <button type="button" disabled>Halt</button>
+          <button type="button" disabled>Reset</button>
+        </div>
+      </div>
+      <div>
+        <span class="cs-caption">Unapplied changes</span>
+        <div class="cs-program" style="margin-top:8px;">
+          <strong>Program</strong>
+          <span class="cs-tipped" style="display:grid;">
+            <button type="button" disabled>Execute</button>
+            <span class="cs-tip" style="left: calc(100% + 12px); top: 0;"><b>Apply or Discard first.</b><br>Unapplied changes in: Program (Scene edits), Deployment.<br>Execute runs only what is applied.</span>
+          </span>
+          <button type="button" disabled>Halt</button>
+          <button type="button" disabled>Reset</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="cs-block">
+    <h2>4 · Legend in the 3D viewer's <code>i</code> (for the chosen B2)</h2>
+    <p>A "Status colours" section next to the existing viewer legend, so the colours are explained where you run the Program.</p>
+    <div class="cs-legend">
+      <h4>Deployment button (runtime health)</h4>
+      <dl>
+        <dt><span class="cs-swatch-btn" style="border-color: var(--mf-border-success-40); background: color-mix(in srgb, var(--mf-bg-success-24) 40%, var(--mf-bg-neutral-11));">Deployment</span></dt>
+        <dd><b>Green</b>: every component is ready.</dd>
+        <dt><span class="cs-swatch-btn" style="border-color: var(--mf-border-warning-43); background: color-mix(in srgb, var(--mf-bg-warning-27b) 40%, var(--mf-bg-neutral-11));">Deployment</span></dt>
+        <dd><b>Amber</b>: degraded, some components need attention.</dd>
+        <dt><span class="cs-swatch-btn" style="border-color: var(--mf-border-danger-49); background: color-mix(in srgb, var(--mf-bg-danger-30) 40%, var(--mf-bg-neutral-11));">Deployment</span></dt>
+        <dd><b>Red</b>: a component is faulted.</dd>
+        <dt><span class="cs-swatch-btn" style="border-color: var(--mf-border-danger-37); background: color-mix(in srgb, var(--mf-bg-danger-21) 40%, var(--mf-bg-neutral-11));">Deployment</span></dt>
+        <dd><b>Dark red</b>: offline, no component status.</dd>
+        <dt><span class="cs-swatch-btn" style="border-color: var(--mf-border-neutral-35); background: color-mix(in srgb, var(--mf-bg-neutral-20) 40%, var(--mf-bg-neutral-11));">Deployment</span></dt>
+        <dd><b>Grey</b>: waiting for the first status.</dd>
+      </dl>
+      <h4>Dot on the Deployment button</h4>
+      <dl>
+        <dt><span class="cs-dot deployment-status-button"><span class="deployment-status-indicator"></span></span></dt>
+        <dd><b>Green</b>: the live status feed is connected.</dd>
+        <dt><span class="cs-dot deployment-status-button" data-backend-connected="false"><span class="deployment-status-indicator"></span></span></dt>
+        <dd><b>Grey</b>: live status unavailable; what you see may be stale.</dd>
+        <dt><span class="cs-dot deployment-status-button"><span class="deployment-status-indicator has-attention">2</span></span></dt>
+        <dd><b>Number</b>: alarms or errors to review (Runtime / history).</dd>
+      </dl>
+      <h4>Changes</h4>
+      <dl>
+        <dt><span class="cs-das"><span class="document-state state-saved cs-initial">D</span><span class="document-state state-saved cs-initial">S</span><span class="document-state state-different cs-initial">A</span></span></dt>
+        <dd><b>D / S / A</b>: Draft, Saved, Applied of the Program (left of the workspace buttons, Scene edits included) and of the Deployment (right). All three appear while any of them differs.</dd>
+        <dt><span class="document-state state-saved cs-initial">A</span></dt>
+        <dd><b>Green letter</b>: matches (no unsaved edits, the saved file, or what is applied).</dd>
+        <dt><span class="document-state state-different cs-initial">A</span></dt>
+        <dd><b>Amber letter</b>: differs; Save, or Apply (Execute waits), or Discard.</dd>
+      </dl>
+    </div>
+  </section>
+</div>

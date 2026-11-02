@@ -10,29 +10,14 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 function valueMatchesType(value: unknown, type: string): boolean {
-  if (type === 'string') {
-    return typeof value === 'string';
-  }
-  if (type === 'number') {
-    return typeof value === 'number' && Number.isFinite(value);
-  }
-  if (type === 'integer') {
-    return typeof value === 'number' && Number.isInteger(value);
-  }
-  if (type === 'boolean') {
-    return typeof value === 'boolean';
-  }
-  if (type === 'array') {
-    return Array.isArray(value);
-  }
-  if (type === 'object') {
-    return isPlainObject(value);
-  }
+  if (type === 'string') return typeof value === 'string';
+  if (type === 'number') return typeof value === 'number' && Number.isFinite(value);
+  if (type === 'integer') return typeof value === 'number' && Number.isInteger(value);
+  if (type === 'boolean') return typeof value === 'boolean';
+  if (type === 'array') return Array.isArray(value);
+  if (type === 'object') return isPlainObject(value);
+  if (type === 'null') return value === null;
   return true;
-}
-
-function typeLabel(type: string): string {
-  return type === 'number' ? 'number' : type;
 }
 
 function childPath(path: string, key: string): string {
@@ -44,9 +29,7 @@ function itemPath(path: string, index: number): string {
 }
 
 function valuesEqual(left: unknown, right: unknown): boolean {
-  if (left === right) {
-    return true;
-  }
+  if (left === right) return true;
   try {
     return JSON.stringify(left) === JSON.stringify(right);
   } catch {
@@ -54,7 +37,10 @@ function valuesEqual(left: unknown, right: unknown): boolean {
   }
 }
 
-function validateSubschemaPasses(schema: CatalogJsonSchema, value: unknown): boolean {
+function validateSubschemaPasses(
+  schema: CatalogJsonSchema,
+  value: unknown,
+): boolean {
   return validateCatalogJsonSchemaValue(schema, value, '').length === 0;
 }
 
@@ -63,9 +49,7 @@ export function validateCatalogJsonSchemaValue(
   value: unknown,
   path = 'value',
 ): CatalogSchemaValidationIssue[] {
-  if (!schema) {
-    return [];
-  }
+  if (!schema) return [];
 
   const issues: CatalogSchemaValidationIssue[] = [];
 
@@ -73,11 +57,16 @@ export function validateCatalogJsonSchemaValue(
     issues.push({ path, message: `${path} must be ${JSON.stringify(schema.const)}` });
   }
   if (schema.enum && !schema.enum.some((option) => valuesEqual(value, option))) {
-    issues.push({ path, message: `${path} must be one of: ${schema.enum.join(', ')}` });
+    issues.push({
+      path,
+      message: `${path} must be one of: ${schema.enum
+        .map((option) => JSON.stringify(option))
+        .join(', ')}`,
+    });
   }
 
   if (schema.type && !valueMatchesType(value, schema.type)) {
-    issues.push({ path, message: `${path} must be a ${typeLabel(schema.type)}` });
+    issues.push({ path, message: `${path} must be a ${schema.type}` });
     return issues;
   }
 
@@ -98,14 +87,26 @@ export function validateCatalogJsonSchemaValue(
 
   if (Array.isArray(value)) {
     if (schema.minItems !== undefined && value.length < schema.minItems) {
-      issues.push({ path, message: `${path} must contain at least ${schema.minItems} item(s)` });
+      issues.push({
+        path,
+        message: `${path} must contain at least ${schema.minItems} item(s)`,
+      });
     }
     if (schema.maxItems !== undefined && value.length > schema.maxItems) {
-      issues.push({ path, message: `${path} must contain at most ${schema.maxItems} item(s)` });
+      issues.push({
+        path,
+        message: `${path} must contain at most ${schema.maxItems} item(s)`,
+      });
     }
     if (schema.items) {
       value.forEach((item, index) => {
-        issues.push(...validateCatalogJsonSchemaValue(schema.items, item, itemPath(path, index)));
+        issues.push(
+          ...validateCatalogJsonSchemaValue(
+            schema.items,
+            item,
+            itemPath(path, index),
+          ),
+        );
       });
     }
   }
@@ -114,21 +115,26 @@ export function validateCatalogJsonSchemaValue(
     const properties = schema.properties ?? {};
     for (const requiredKey of schema.required ?? []) {
       if (!(requiredKey in value)) {
-        issues.push({
-          path: childPath(path, requiredKey),
-          message: `${childPath(path, requiredKey)} is required`,
-        });
+        const requiredPath = childPath(path, requiredKey);
+        issues.push({ path: requiredPath, message: `${requiredPath} is required` });
       }
     }
 
     for (const [key, nestedValue] of Object.entries(value)) {
       const nestedSchema = properties[key];
       if (nestedSchema) {
-        issues.push(...validateCatalogJsonSchemaValue(nestedSchema, nestedValue, childPath(path, key)));
+        issues.push(
+          ...validateCatalogJsonSchemaValue(
+            nestedSchema,
+            nestedValue,
+            childPath(path, key),
+          ),
+        );
       } else if (schema.additionalProperties === false) {
+        const unexpectedPath = childPath(path, key);
         issues.push({
-          path: childPath(path, key),
-          message: `${childPath(path, key)} is not allowed`,
+          path: unexpectedPath,
+          message: `${unexpectedPath} is not allowed`,
         });
       } else if (isPlainObject(schema.additionalProperties)) {
         issues.push(
@@ -147,14 +153,18 @@ export function validateCatalogJsonSchemaValue(
   }
 
   if (schema.anyOf && schema.anyOf.length > 0) {
-    const matches = schema.anyOf.some((subSchema) => validateSubschemaPasses(subSchema, value));
+    const matches = schema.anyOf.some((subSchema) =>
+      validateSubschemaPasses(subSchema, value),
+    );
     if (!matches) {
       issues.push({ path, message: `${path} must match at least one allowed schema` });
     }
   }
 
   if (schema.oneOf && schema.oneOf.length > 0) {
-    const matchCount = schema.oneOf.filter((subSchema) => validateSubschemaPasses(subSchema, value)).length;
+    const matchCount = schema.oneOf.filter((subSchema) =>
+      validateSubschemaPasses(subSchema, value),
+    ).length;
     if (matchCount !== 1) {
       issues.push({ path, message: `${path} must match exactly one allowed schema` });
     }

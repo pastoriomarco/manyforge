@@ -1,87 +1,66 @@
 import { describe, expect, it } from 'vitest';
+import type { SceneUrdfJoint, SceneUrdfManifest } from '../types/api';
+import { modelJointsForQualifiedTarget } from './robotModelAuthority';
 
-import type { SceneUrdfManifest } from '../types/api';
-import {
-  robotControlJointNamesForGroup,
-  robotControlJointsForGroup,
-} from './robotModelAuthority';
-
-type ManifestJoint = NonNullable<SceneUrdfManifest['joints']>[number];
-
-function joint(name: string, options: Partial<ManifestJoint> = {}): ManifestJoint {
+function joint(name: string, type: string): SceneUrdfJoint {
   return {
     name,
-    type: 'revolute',
+    type,
     axis: [1, 0, 0],
     parent_link: 'base',
     child_link: `${name}_link`,
-    limit_lower: -1,
-    limit_upper: 1,
-    effort_limit: 1,
-    velocity_limit: 1,
-    ...options,
+    origin: {
+      relative_to: 'base',
+      position_m: [0, 0, 0],
+      orientation_rpy_rad: [0, 0, 0],
+      orientation_xyzw: [0, 0, 0, 1],
+    },
+    coordinate_unit: type === 'prismatic' ? 'm' : type === 'fixed' ? null : 'rad',
+    neutral_position: type === 'fixed' ? null : 0,
+    limit_lower: null,
+    limit_upper: null,
+    effort_limit: null,
+    velocity_limit: null,
+    mimic: null,
+    is_mimic_master: false,
   };
 }
 
-describe('Robot Model Authority UI helpers', () => {
-  it('limits Robot Control jogging to the active arm group command joints', () => {
-    const manifest: SceneUrdfManifest = {
-      robot_id: 'lite6',
-      root_link: 'link_base',
-      links: [],
-      joints: [
-        joint('joint1'),
-        joint('joint2'),
-        joint('joint3'),
-        joint('joint4'),
-        joint('joint5'),
-        joint('joint6'),
-        joint('right_finger_joint', {
-          type: 'prismatic',
-          is_mimic_master: true,
-        }),
-        joint('left_finger_joint', {
-          type: 'prismatic',
-          mimic: { master: 'right_finger_joint', multiplier: 1, offset: 0 },
-        }),
-      ],
-      authority: {
-        group_commandable_joint_names: {
-          lite6: ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6'],
-          lite_gripper: ['right_finger_joint'],
-        },
-      },
-    };
+function manifest(): SceneUrdfManifest {
+  return {
+    cell_id: 'cell-1',
+    graph_revision: 'graph-1',
+    retained_bundle_id: `sha256:${'a'.repeat(64)}`,
+    viewer_model_revision: `sha256:${'b'.repeat(64)}`,
+    model_key: 'sha256:model',
+    root_link: 'base',
+    projection: {
+      kind: 'retained_neutral',
+      source: 'active_retained_viewer_model',
+      root_frame: 'base',
+      position_unit: 'm',
+      angle_unit: 'rad',
+      quaternion_order: 'xyzw',
+      joint_coordinate_policy: 'zero_independent_with_retained_mimic',
+      operational_validity: 'not_asserted',
+      runtime_state_used: false,
+    },
+    links: [],
+    joints: [joint('joint_1', 'revolute'), joint('finger_slide', 'prismatic'), joint('fixed', 'fixed')],
+  };
+}
 
-    expect(robotControlJointNamesForGroup(manifest, 'lite6')).toEqual([
-      'joint1',
-      'joint2',
-      'joint3',
-      'joint4',
-      'joint5',
-      'joint6',
-    ]);
-    expect(robotControlJointNamesForGroup(manifest, 'lite_gripper')).toEqual([
-      'right_finger_joint',
-    ]);
+describe('qualified model target selection', () => {
+  it('preserves explicit ordered revolute/prismatic target membership', () => {
+    expect(
+      modelJointsForQualifiedTarget(manifest(), ['joint_1', 'finger_slide'])
+        ?.map((value) => [value.name, value.coordinate_unit]),
+    ).toEqual([['joint_1', 'rad'], ['finger_slide', 'm']]);
   });
 
-  it('falls back to hiding mimic chains when no authority metadata is present', () => {
-    const manifest: SceneUrdfManifest = {
-      robot_id: 'legacy',
-      root_link: 'base',
-      links: [],
-      joints: [
-        joint('shoulder_pan_joint'),
-        joint('finger_joint', { is_mimic_master: true }),
-        joint('left_inner_finger_joint', {
-          mimic: { master: 'finger_joint', multiplier: 1, offset: 0 },
-        }),
-      ],
-    };
-
-    expect(robotControlJointsForGroup(manifest, 'arm').map((j) => j.name)).toEqual([
-      'shoulder_pan_joint',
-    ]);
+  it('does not invent legacy group or mimic fallbacks', () => {
+    expect(modelJointsForQualifiedTarget(manifest(), null)).toBeNull();
+    expect(modelJointsForQualifiedTarget(manifest(), ['missing'])).toBeNull();
+    expect(modelJointsForQualifiedTarget(manifest(), ['fixed'])).toBeNull();
   });
 });

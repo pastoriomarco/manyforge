@@ -15,6 +15,8 @@
 #include <manyforge_core/types/execute_request.hpp>
 #include <manyforge_core/types/validation.hpp>
 #include <manyforge_core/types/scene_edit.hpp>
+#include <manyforge_core/types/logical_scene_snapshot.hpp>
+#include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/execution_result.hpp>
 
@@ -24,13 +26,14 @@
 
 // Port headers
 #include <manyforge_core/ports/iplanner_backend.hpp>
-#include <manyforge_core/ports/iplanner_scene_projection.hpp>
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
 #include <manyforge_core/ports/irobot_kinematics.hpp>
-#include <manyforge_core/ports/iscene_authority.hpp>
 #include <manyforge_core/ports/itrajectory_validator.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
+#include <manyforge_core/testing/addressed_request_fixtures.hpp>
+
+#include <type_traits>
 
 // Test that Result works
 TEST(ContractsCompile, ResultOk) {
@@ -94,18 +97,22 @@ TEST(ContractsCompile, DefaultDTOs) {
   manyforge::core::TrajectoryDTO traj;
   EXPECT_TRUE(traj.empty());
 
-  // Plan request DTO
-  manyforge::core::PlanRequestDTO plan_request;
-  EXPECT_TRUE(plan_request.robot_id.empty());
+  // Authority-bearing requests cannot be default-constructed without an
+  // exact resolved binding.
+  static_assert(!std::is_default_constructible_v<
+                manyforge::core::PlanRequestDTO>);
+  static_assert(!std::is_default_constructible_v<
+                manyforge::core::ExecuteRequestDTO>);
 
   // Plan result DTO
   manyforge::core::PlanResultDTO plan_result;
   EXPECT_FALSE(plan_result.trajectory.has_value());
   EXPECT_FALSE(plan_result.error.has_value());
 
-  // Execute request DTO
-  manyforge::core::ExecuteRequestDTO execute_request;
-  EXPECT_TRUE(execute_request.robot_id.empty());
+  const auto execute_request =
+      manyforge::core::testing::make_test_execute_request();
+  EXPECT_EQ(execute_request.binding.controllable_component_id.value(),
+            "component:test");
 
   // Validation DTOs
   manyforge::core::ValidationOptionsDTO validation_options;
@@ -131,38 +138,19 @@ TEST(ContractsCompile, DefaultDTOs) {
   manyforge::core::JointLimitsDTO joint_limits;
   EXPECT_TRUE(joint_limits.joint_names.empty());
 
-  // Scene edit DTOs
-  manyforge::core::AddObjectRequestDTO add_object_request;
-  EXPECT_TRUE(add_object_request.object_id.empty());
-
-  manyforge::core::RemoveObjectRequestDTO remove_object_request;
-  EXPECT_TRUE(remove_object_request.object_id.empty());
-
-  manyforge::core::UpdateObjectPoseRequestDTO update_object_pose_request;
-  EXPECT_TRUE(update_object_pose_request.object_id.empty());
-
-  manyforge::core::AttachObjectRequestDTO attach_object_request;
-  EXPECT_TRUE(attach_object_request.object_id.empty());
-
-  manyforge::core::DetachObjectRequestDTO detach_object_request;
-  EXPECT_TRUE(detach_object_request.object_id.empty());
-
-  manyforge::core::ObjectStateDTO object_state;
-  EXPECT_FALSE(object_state.exists);
-  EXPECT_FALSE(object_state.attached);
-
-  manyforge::core::SceneEditResultDTO scene_edit_result;
-  EXPECT_FALSE(scene_edit_result.success);
-  EXPECT_FALSE(scene_edit_result.error.has_value());
+  // Composite scene/projection identity DTOs remain explicitly invalid until
+  // an owner supplies their complete strong identities.
+  manyforge::core::SceneRevision scene_revision;
+  EXPECT_FALSE(scene_revision.valid());
+  manyforge::core::ProjectionRevisionDTO projection_revision;
+  EXPECT_FALSE(projection_revision.valid());
+  manyforge::core::ProjectionLeaseBindingDTO projection_binding;
+  EXPECT_FALSE(projection_binding.valid());
 
   // Execution result DTOs
   manyforge::core::StopResultDTO stop_result;
   EXPECT_FALSE(stop_result.accepted);
   EXPECT_FALSE(stop_result.error.has_value());
-
-  manyforge::core::PauseResultDTO pause_result;
-  EXPECT_FALSE(pause_result.accepted);
-  EXPECT_FALSE(pause_result.error.has_value());
 
   manyforge::core::ResetResultDTO reset_result;
   EXPECT_FALSE(reset_result.accepted);
@@ -199,7 +187,7 @@ TEST(ContractsCompile, MotionSpecVariant) {
 
   // Joint goal
   JointGoalDTO joint_goal;
-  joint_goal.joint_names.push_back("joint_1");
+  joint_goal.joint_names.emplace_back("joint_1");
   joint_goal.positions_rad.push_back(1.0);
   MotionSpecDTO m1 = joint_goal;
   EXPECT_TRUE(std::holds_alternative<JointGoalDTO>(m1));
@@ -220,18 +208,18 @@ TEST(ContractsCompile, MotionSpecVariant) {
   pose_ref.pose = Pose3DTO{};
   pose_ref.pose->position_m = {0.1, 0.2, 0.3};
   pose_ref.pose->orientation = {0.0, 0.0, 0.0, 1.0};
-  ExecuteRequestDTO relative_pose_request;
+  auto relative_pose_request =
+      manyforge::core::testing::make_test_execute_request();
   relative_pose_request.motion = pose_goal;
   relative_pose_request.target_mode = MotionTargetModeDTO::kRelative;
   relative_pose_request.target_reference = pose_ref;
   relative_pose_request.offset_reference = pose_ref;
-  relative_pose_request.planning_profile = PlanningProfileDTO::kBalanced;
+  relative_pose_request.planner.search = PlannerSearchDTO::kRrt;
   EXPECT_TRUE(std::holds_alternative<PoseGoalDTO>(
       relative_pose_request.motion));
   EXPECT_EQ(relative_pose_request.target_mode,
             MotionTargetModeDTO::kRelative);
-  EXPECT_EQ(relative_pose_request.planning_profile,
-            PlanningProfileDTO::kBalanced);
+  EXPECT_EQ(relative_pose_request.planner.search, PlannerSearchDTO::kRrt);
 
   // Cartesian path
   CartesianPathDTO cartesian_path;
@@ -309,7 +297,6 @@ TEST(ContractsCompile, AllExecutionStates) {
   EXPECT_STREQ(to_string(ExecutionState::kValidating), "Validating");
   EXPECT_STREQ(to_string(ExecutionState::kExecuting), "Executing");
   EXPECT_STREQ(to_string(ExecutionState::kInterrupted), "Interrupted");
-  EXPECT_STREQ(to_string(ExecutionState::kPaused), "Paused");
   EXPECT_STREQ(to_string(ExecutionState::kStopping), "Stopping");
   EXPECT_STREQ(to_string(ExecutionState::kStopped), "Stopped");
   EXPECT_STREQ(to_string(ExecutionState::kCompleted), "Completed");
@@ -355,52 +342,50 @@ TEST(ContractsCompile, ErrorDTODetails) {
 TEST(ContractsCompile, ExecuteRequestComposition) {
   using namespace manyforge::core;
 
-  ExecuteRequestDTO req;
-  req.robot_id = "robot1";
-  req.group_id = "arm";
+  auto req = manyforge::core::testing::make_test_execute_request(
+      {"j1", "j2"});
+  req.binding.controllable_component_id =
+      ControllableComponentId("robot1");
   req.move_id = "move_001";
-  req.base_frame = "world";
-  req.tcp_frame = "tool0";
+  std::get<ResolvedComponentModelFrameDTO>(req.binding.base_frame)
+      .compiled_frame_name = "world";
+  std::get<ResolvedComponentModelFrameDTO>(req.binding.tcp_frame)
+      .compiled_frame_name = "tool0";
   req.tolerances.joint_position_tol_rad = 0.01;
   req.speed_profile.velocity_scale = 0.5;
   req.speed_profile.acceleration_scale = 0.5;
   req.timeouts.planning_timeout_s = 10.0;
   req.timeouts.execution_timeout_s = 30.0;
   req.cache_mode = CacheMode::kDefault;
-  req.motion = JointGoalDTO{{"j1", "j2"}, {0.0, 1.57}};
+  req.motion = ResolvedJointGoalDTO{{ResourceId("r1"), ResourceId("r2")},
+                                    {"j1", "j2"}, {0.0, 1.57}};
 
-  EXPECT_EQ(req.robot_id, "robot1");
+  EXPECT_EQ(req.binding.controllable_component_id.value(), "robot1");
   EXPECT_EQ(req.cache_mode, CacheMode::kDefault);
-  EXPECT_TRUE(std::holds_alternative<JointGoalDTO>(req.motion));
+  EXPECT_TRUE(std::holds_alternative<ResolvedJointGoalDTO>(req.motion));
 }
 
 // Test that port interfaces can be declared (not instantiated - they're abstract)
 TEST(ContractsCompile, PortInterfaces) {
   // Just verify the types exist and are accessible
   using PlannerBackendType = manyforge::core::IPlannerBackend;
-  using PlannerSceneProjectionType = manyforge::core::IPlannerSceneProjection;
   using ReferenceResolverType = manyforge::core::IReferencePoseResolver;
   using RobotKinematicsType = manyforge::core::IRobotKinematics;
-  using SceneAuthorityType = manyforge::core::ISceneAuthority;
   using TrajectoryValidatorType = manyforge::core::ITrajectoryValidator;
   using ExecutionBackendType = manyforge::core::IExecutionBackend;
   using ExecutionStateSinkType = manyforge::core::IExecutionStateSink;
   
   // Verify they're pointers (abstract classes)
   PlannerBackendType* planner = nullptr;
-  PlannerSceneProjectionType* projection = nullptr;
   ReferenceResolverType* reference_resolver = nullptr;
   RobotKinematicsType* kinematics = nullptr;
-  SceneAuthorityType* scene_authority = nullptr;
   TrajectoryValidatorType* trajectory_validator = nullptr;
   ExecutionBackendType* execution = nullptr;
   ExecutionStateSinkType* execution_state_sink = nullptr;
   
   EXPECT_EQ(planner, nullptr);
-  EXPECT_EQ(projection, nullptr);
   EXPECT_EQ(reference_resolver, nullptr);
   EXPECT_EQ(kinematics, nullptr);
-  EXPECT_EQ(scene_authority, nullptr);
   EXPECT_EQ(trajectory_validator, nullptr);
   EXPECT_EQ(execution, nullptr);
   EXPECT_EQ(execution_state_sink, nullptr);

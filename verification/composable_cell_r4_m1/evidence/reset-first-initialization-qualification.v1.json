@@ -1,0 +1,104 @@
+{
+  "schema_version": "manyforge.reset_first_initialization_qualification.v1",
+  "status": "qualified_private_mock_and_deployed",
+  "qualified_at_utc": "2026-10-16T12:36:14Z",
+  "lane": "Mock GenericSystem, ROS Lyrical, isolated private process fixture",
+  "runtime_image_sha256": "38e8d72a6b700059332aa63baa63e7a21c672376ad6582102fc62088081f74ab",
+  "scope": {
+    "native_distinct_cases_cumulative": 213,
+    "mock_launch_python_cases": 19,
+    "headless_python_binding_import": "pass",
+    "actual_managed_process_socket_case": "pass; capability true, exact unacquired claim known-no-effect refusal, malformed commands refused",
+    "positive_mock": {
+      "status": "PASS",
+      "authored_target": [
+        0,
+        0,
+        1.57,
+        0,
+        0,
+        0
+      ],
+      "noninitial_arm": [
+        0.1,
+        0,
+        1.57,
+        0,
+        0,
+        0
+      ],
+      "gripper_delivered_state_reference": "closed",
+      "actual_effect": "Mock only; real Runner accepted intent and claim, native teleport, actual CM active JTC and commanded/projected postcondition",
+      "limits": "Pneumatic gripper proof is exact completed delivery transaction/memory and unchanged Scene, not finger-position or grasp feedback. No independent raw arm JointState reader is added; native Reset's own fresh raw ACK gate remains the delivery proof."
+    }
+  },
+  "proofs": {
+    "plain_reset": {
+      "cycle_before": 1,
+      "cycle_after": 2,
+      "arm_scene_pneumatic_memory": "preserved"
+    },
+    "selected_position_reset": {
+      "cycle_before": 2,
+      "cycle_after": 3,
+      "correlation": "private-mock-reset.position",
+      "commanded_and_projected_arm": [
+        0,
+        0,
+        1.57,
+        0,
+        0,
+        0
+      ],
+      "admission": {
+        "admission_generation": 35,
+        "authoring_allowed": true
+      }
+    },
+    "controller": {
+      "arm": [
+        "lite6_traj_controller",
+        "joint_trajectory_controller/JointTrajectoryController",
+        "active"
+      ],
+      "reset_writer": "inactive"
+    },
+    "final_cycle": [
+      "idle_after_reset",
+      null,
+      null,
+      null,
+      0
+    ]
+  },
+  "provenance": {
+    "qualified_source_manifest_sha256": "f922bd4f7a0d7470b15a1a98f0e999dc288208d458a159adcfdd271ed04bc0ca",
+    "positive_script_sha256": "e20895c4309a9c635b9efb1a1b227598c4ef1af4931300caa2e150c0c7f536bc",
+    "positive_result_sha256": "68256faaaef50ec0182e64ecfa5bfa6c1f243282b6cc88ba68729193930dbf80",
+    "host_source_sha256": "5d29bae2b92feb1fdde813d16d0a287e76b3f2fe2fc0124ecae4f0798017007d",
+    "writer_source_sha256": "69751bc572bec2ef353565d6ea46bc6c4cf35de765d7866e4bfc84029398f0cb",
+    "host_binary_sha256": "12fd5466c8dda8abf78c131c6c57cdd979ec6cfd475f0c0d79e1c118fc4f2410"
+  },
+  "historical_failures_preserved": [
+    "Compile closure errors corrected through reviewed source/test successors; raw logs retained.",
+    "Four initial focused failures corrected and only affected cases rerun; original ROS process skip later exercised successfully.",
+    "Actual managed capability exposed composition-owner mismatch; corrected existing managed facade capture and passed actual managed case.",
+    "Private attempt01 stopped before manual commands on named read-change race.",
+    "Private attempt02 stopped before Reset on redundant client acknowledgement versus automatic manual settlement.",
+    "Private attempt03 plain Reset completed; helper asserted an inapplicable retained correlation field.",
+    "Private attempt04 passed both Reset variants without command retries."
+  ],
+  "limits": [
+    "Cumulative focused coverage retains unaffected prior passes; it is not a broad suite rerun on final source.",
+    "Pneumatic proof is completed delivery transaction and unchanged memory/Scene, not finger position or grasp.",
+    "No independent raw arm reader; native fresh exact loopback ACK is the delivery proof.",
+    "No real hardware, Isaac, or user runtime operation qualified."
+  ],
+  "evidence_identifiers": [
+    "r4-reset-first-init-scope-20261016/warm-thor-gate-run01/cumulative-native-results06.json",
+    "r4-reset-first-init-scope-20261016/warm-thor-gate-run01/positive-mock04-result"
+  ],
+  "user_runtime_changed": true,
+  "deployment_receipt": "reset-first-initialization-deployment.v1.json",
+  "deployment_actions": "Authorized standard stop/start; source and qualified native graph deployment only. No user Load, Activate, Run or Reset."
+}

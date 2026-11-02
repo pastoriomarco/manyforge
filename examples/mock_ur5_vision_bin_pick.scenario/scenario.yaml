@@ -1,0 +1,170 @@
+{
+  "api_version": "manyforge.scenario.project.v2",
+  "content": {
+    "assignment_present": true,
+    "deployment_present": true,
+    "program_present": true
+  },
+  "description": "Mock UR5 vision-guided bin pick. Needs one connected viewer snapshot source so assistant.query_model can attach a live scene snapshot. Load and Execute the Program.",
+  "members": {
+    "assignment.yaml": "sha256:3efa8a6729b59a3e9625812198609af1fdacb880319c79d84a7d86e55277de43",
+    "deployment.yaml": "sha256:98d755acf47c3991d97c24fdfb56f8a3f6c6e2a6364e1b130a6edc3c7c1172b6",
+    "program.yaml": "sha256:cbc49435d4bf740c6374efd9b5e30cab794c53cfe408d2f5750d302ef22d5773"
+  },
+  "name": "mock_ur5_vision_bin_pick",
+  "saved_status": {
+    "checked_content_digest": "sha256:437764e170db449d3237cfb60bbefc97c12542bc624e45924e0998cae27297c3",
+    "last_known_status": "ready",
+    "manyforge_version": "0.2.0"
+  },
+  "scenario_id": "mock_ur5_vision_bin_pick",
+  "source_snapshot": {
+    "entries": [
+      {
+        "content_digest": "sha256:5fb9e5659c735e48eb55269da431cf61b3b7a6745922c1932a7adefb1db86dc3",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_finger.dae"
+      },
+      {
+        "content_digest": "sha256:f39a50be121122fc1c53c588a762ad1da8a0f64d39bc6f299cbe9b0597e7257b",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_finger.stl"
+      },
+      {
+        "content_digest": "sha256:785ec7a83b4fc6357c211a39bb117833b1cfd4e9bccbef2efc7f35aeb2fdb92e",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_finger_tip.dae"
+      },
+      {
+        "content_digest": "sha256:9d90031cd99106a8be63609f8ff78580638d91cc4167bf66c09198329f2e65cf",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_finger_tip.stl"
+      },
+      {
+        "content_digest": "sha256:2df009ef28868c90a4904370f5f4995c74ec84e0b8ca1371044e0ea669edcd71",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_inner_knuckle.dae"
+      },
+      {
+        "content_digest": "sha256:f250a3fea49be4d1bb2383d9980172c59fc44031193ef2293ca540f756f6c1e6",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_inner_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:1b82214363d9548f3562be70e25cd23217a304c72ccd37bc1551cf1a3a64029d",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_knuckle.dae"
+      },
+      {
+        "content_digest": "sha256:b7ec787f57a7db5b2b14e64ffbedaac28739e38f14aac8afa8b575bac941feb7",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:3b2245b5537eb596d7f8a4c64b12e3aedea46e365fc589019184d3b4200e664f",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_finger.dae"
+      },
+      {
+        "content_digest": "sha256:1d018fa2f0b50aca5941778d78810b211b1abfc8637c7953451d76d4833ba6f8",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_finger.stl"
+      },
+      {
+        "content_digest": "sha256:568371d25ddbcee8e432c0610bdcc7afcd1393d48d973eed92168e353eb4edf5",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_finger_tip.dae"
+      },
+      {
+        "content_digest": "sha256:126f1559f2f7dca62449a6ca926c609fbdaa93ca66df805ff7c069bb206e3d10",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_finger_tip.stl"
+      },
+      {
+        "content_digest": "sha256:4cc6de99e177773ba755805b58b67537c3af24b2fd8f3a1bf4bbced87d6240a5",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_inner_knuckle.dae"
+      },
+      {
+        "content_digest": "sha256:c936d951ede875b91c180bd41d45b22ae23f8a39d9c3e09e29066453a8e863ef",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_inner_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:532b6f6f8794883ff34995701036ca392461f26127757f92003db127693bc57c",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_knuckle.dae"
+      },
+      {
+        "content_digest": "sha256:d151fb38f59748f1e6e627312e2ede96f2c98ba267bf722091665b20c78e7a8d",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:761a79d586a48d367d60f146ca77ef7d2821ad790f7b1b1c93b061ac59799267",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/robotiq_base.dae"
+      },
+      {
+        "content_digest": "sha256:ede5cd7d7846c051b88645f33d6bbb5ed9b36bbef404a19a46557639bfab7060",
+        "source_id": "component:robotiq_2f_85:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/robotiq_base.stl"
+      },
+      {
+        "content_digest": "sha256:bf6730faade5228d9ccc4137dadbc8e01c91708f56bf679053c04d16e3c0bb14",
+        "source_id": "component:robotiq_2f_85:srdf"
+      },
+      {
+        "content_digest": "sha256:c88964f9467edd60ee1f16d87d4f9848e4b6b93dccb2275ab77cb45c259cc3ff",
+        "source_id": "component:robotiq_2f_85:urdf"
+      },
+      {
+        "content_digest": "sha256:9a145e0d46f2130afdf2a2e8825a00a929870c4c3d6d8e4d1adc5f04db3aac1b",
+        "source_id": "component:ur5_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/collision/base.stl"
+      },
+      {
+        "content_digest": "sha256:2e7423cab807c34160ec4f770daee5e747d70e777eb01b7beeace2b8c5751816",
+        "source_id": "component:ur5_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/collision/forearm.stl"
+      },
+      {
+        "content_digest": "sha256:ceb92532177daa77682f5fbd628e01c2137d168f949a7a706ce1dabe9f002387",
+        "source_id": "component:ur5_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/collision/shoulder.stl"
+      },
+      {
+        "content_digest": "sha256:ee893044caf00075cb55b4cf666d1f1311c7979786212a501009f33bee945209",
+        "source_id": "component:ur5_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/collision/upperarm.stl"
+      },
+      {
+        "content_digest": "sha256:f8c9f9337b6fd98c75f052e96de10e14a107ddb6874ba6b904e546f8a4e4f43a",
+        "source_id": "component:ur5_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/collision/wrist1.stl"
+      },
+      {
+        "content_digest": "sha256:2964a63f60ce3e3cf3ad55bcf190d7876d50e373cb64b70a57cea5885eaf3c86",
+        "source_id": "component:ur5_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/collision/wrist2.stl"
+      },
+      {
+        "content_digest": "sha256:83b3666b4ae2badd54af0d2c25a921682ecbc29e849eec646c3ed55fb74c78a3",
+        "source_id": "component:ur5_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/collision/wrist3.stl"
+      },
+      {
+        "content_digest": "sha256:c30e4d7228ef633dca2a02c26df2316741f6642cb6333e8289dba6e6d0b22819",
+        "source_id": "component:ur5_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/visual/base.dae"
+      },
+      {
+        "content_digest": "sha256:04694bf57dac46e9b8bc7c30f2eec75a1bc762e1f1a879ea30c944f24cacbad8",
+        "source_id": "component:ur5_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/visual/forearm.dae"
+      },
+      {
+        "content_digest": "sha256:c581bfa55b86061d9b99d315ed53817b6b693e6a500643bbf9bbb783322d585d",
+        "source_id": "component:ur5_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/visual/shoulder.dae"
+      },
+      {
+        "content_digest": "sha256:c040a05bb224f14cfab6aa6704d70cbb773ada940eca9a3e34e6ce486c4c4c29",
+        "source_id": "component:ur5_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/visual/upperarm.dae"
+      },
+      {
+        "content_digest": "sha256:a07a3d96d2540f9be12e4a07bcb8577d9f1e36005920c396a407804343a3b588",
+        "source_id": "component:ur5_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/visual/wrist1.dae"
+      },
+      {
+        "content_digest": "sha256:982fa42933c6f81629882ad7975e9ba5dac5d474a6b56694e233708376cf840e",
+        "source_id": "component:ur5_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/visual/wrist2.dae"
+      },
+      {
+        "content_digest": "sha256:7a7664ac4adcd53b0870fe6a2b8b975693d846dd4d07a5f44194c7d16f4890ba",
+        "source_id": "component:ur5_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/visual/wrist3.dae"
+      },
+      {
+        "content_digest": "sha256:5081a3a6e6a64528db0e28435b0b47067aa679d55a3b669657ecdb695c27a04a",
+        "source_id": "component:ur5_robot:srdf"
+      },
+      {
+        "content_digest": "sha256:01457461c22185342757cd6be9df8c9e6d83003e15167924794c0b77cb5cb9b6",
+        "source_id": "component:ur5_robot:urdf"
+      }
+    ],
+    "schema_version": "manyforge.scenario.source_snapshot.v1"
+  }
+}

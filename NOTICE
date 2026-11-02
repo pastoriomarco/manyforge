@@ -7,102 +7,166 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-This product bundles, vendors, or depends on the following third-party
-software. Each is used under the terms of its own license, which is
-listed below. See the individual LICENSE files in each dependency's
-source tree for the full text.
+ManyForge includes, builds on, or depends on the third-party software and
+data listed below. Each is used under its own license. The full license
+texts are in the files named below or in each project's source tree.
 
----
+When redistributing ManyForge in source or object form, You must retain
+this NOTICE file alongside the LICENSE file, as required by Section 4(d)
+of the Apache License, Version 2.0.
 
-### RoboPlan (vendored under `.docker/roboplan/`)
-Copyright (c) 2025 Sebastian Castro
+===========================================================================
+1. Included in this repository
+===========================================================================
+
+### NVIDIA Isaac Sim sample asset meshes (example scene)
+Files: examples/isaac_manipulator_scene_light/meshes/
+Derived from NVIDIA Isaac Sim sample assets; property of their owners and NOT covered by ManyForge's license. See
+examples/isaac_manipulator_scene_light/meshes/NOTICE.md.
+
+### UFACTORY xarm_ros2 robot descriptions
+Files: manyforge_example_models/models/lite6_lite_gripper/,
+       manyforge_example_models/models/uf850_xarm_gripper/
+Copyright (c) 2018, UFACTORY Inc.
+License: BSD-3-Clause
+License file: licenses/xarm_ros2.LICENSE in each model folder
+Source: https://github.com/xArm-Developer/xarm_ros2 (via the fork
+        https://github.com/pastoriomarco/xarm_ros2; commits in each
+        model folder's README.md)
+
+### Universal Robots ROS 2 description (UR5e, UR10e)
+Files: manyforge_example_models/models/ur5e_robotiq_2f_85/,
+       manyforge_example_models/models/ur10e_robotiq_2f_140/
+License: BSD-3-Clause
+License file: licenses/Universal_Robots_ROS2_Description.LICENSE in each
+              model folder
+Source: https://github.com/UniversalRobots/Universal_Robots_ROS2_Description
+
+### Robotiq 2F-85 and 2F-140 gripper descriptions
+Files: manyforge_example_models/models/ur5e_robotiq_2f_85/,
+       manyforge_example_models/models/ur10e_robotiq_2f_140/
+Copyright (c) 2022, PickNik Robotics
+License: BSD-3-Clause
+License file: licenses/ros2_robotiq_gripper.LICENSE in each model folder
+Source: https://github.com/PickNikRobotics/ros2_robotiq_gripper (as
+        packaged in NVIDIA Isaac ROS)
+
+### ManyMove robot semantics
+Files: manyforge_example_models/models/ur5e_robotiq_2f_85/ (base SRDF
+       collision semantics)
+Copyright (c) 2024-2025, Flexin Group SRL
+License: BSD-3-Clause
+License file: manyforge_example_models/models/ur5e_robotiq_2f_85/licenses/manymove.LICENSE
+
+### RoboPlan patches
+Files: third_party/roboplan/patches/ (modifications to RoboPlan)
+Copyright (c) 2025-2026 Open Planning
+License: MIT (see RoboPlan below)
+
+===========================================================================
+2. Downloaded and built by the image build (not included in this repository)
+===========================================================================
+
+scripts/setup-docker.sh and Dockerfile.ros-lyrical-full download the
+following exact, pinned sources and packages when you build the workbench
+image. They are not part of this repository.
+
+### RoboPlan 0.8.0, including roboplan_example_models
+Copyright (c) 2025-2026 Open Planning
 License: MIT
-Source: bundled in the Docker build context for reproducible builds
-LICENSE file: `.docker/roboplan/LICENSE`
+Source: https://github.com/open-planning/roboplan
+Note: the example robot models in roboplan_example_models (used by the UR5
+example Scenarios) carry their upstream provenance; see that package.
 
-### Pinocchio
-Copyright (c) CNRS, INRIA, LAAS-CNRS contributors
+### ProxSuite 0.8.2
+Copyright (c) 2022-2026, Inria
+License: BSD-2-Clause
+Source: https://github.com/Simple-Robotics/proxsuite
+
+### jrl-cmakemodules 2.3.0 (build-time CMake modules for ProxSuite; not installed)
+Copyright 2025-2026 Inria and contributors
+License: LGPL-3.0-only
+Source: https://github.com/jrl-umi3218/jrl-cmakemodules
+
+### nanoflann 2.0.1 (header-only, compiled into RoboPlan RRT)
+Copyright 2008-2009 Marius Muja, David G. Lowe; Copyright 2011-2026 Jose L. Blanco
+License: BSD-2-Clause
+Source: https://github.com/jlblancoc/nanoflann
+
+### TOPPRA 0.6.10
+Copyright (c) 2017 Hung Pham
+License: MIT
+Source: https://github.com/hungpham2511/toppra
+
+### Pinocchio 4.1.0
+Copyright (c) 2014-2023, CNRS; Copyright (c) 2018-2025, INRIA
 License: BSD-2-Clause
 Source: https://github.com/stack-of-tasks/pinocchio
-Used by: RoboPlan (motion-planning kinematics + dynamics backend)
 
-### HPP-FCL (Flexible Collision Library)
-Copyright (c) CNRS, INRIA, LAAS-CNRS contributors
+### Coal 3.0.3 (formerly HPP-FCL)
+Copyright (c) Willow Garage, Inc.; Open Source Robotics Foundation; CNRS;
+INRIA and contributors
 License: BSD-3-Clause
-Source: https://github.com/humanoid-path-planner/hpp-fcl
-Used by: RoboPlan (collision-checking backend)
+Source: https://github.com/coal-library/coal
 
-### py_trees
-Copyright (c) Daniel Stonier and py_trees contributors
-License: BSD-3-Clause
-Source: https://github.com/splintered-reality/py_trees
-Used by: manyforge_behavior (behavior-tree runtime)
+### Planning-stack libraries (Python wheels from the cmeel project)
+eigenpy (BSD-2-Clause), urdfdom (BSD-3-Clause), TinyXML-2 (Zlib),
+Assimp (BSD-3-Clause), Boost (BSL-1.0), console_bridge (BSD-3-Clause),
+OctoMap (BSD-3-Clause), Qhull (Qhull license), zlib (Zlib).
+Source: https://github.com/cmake-wheel and each project's upstream
 
-### pybind11
-Copyright (c) Wenzel Jakob and pybind11 contributors
-License: BSD-3-Clause
-Source: https://github.com/pybind/pybind11
-Used by: manyforge_core, manyforge_roboplan (Python bindings to C++ kernel)
-
-### FastAPI
-Copyright (c) Sebastián Ramírez and FastAPI contributors
-License: MIT
-Source: https://github.com/tiangolo/fastapi
-Used by: manyforge_composer (backend HTTP API)
-
-### React + React-DOM
-Copyright (c) Meta Platforms, Inc. and React contributors
-License: MIT
-Source: https://github.com/facebook/react
-Used by: manyforge_composer/frontend
-
-### @xyflow/react (React Flow)
-Copyright (c) webkid GmbH and xyflow contributors
-License: MIT
-Source: https://github.com/xyflow/xyflow
-Used by: manyforge_composer/frontend (behavior-tree visualization)
-
-### Zustand
-Copyright (c) Paul Henschel and Zustand contributors
-License: MIT
-Source: https://github.com/pmndrs/zustand
-Used by: manyforge_composer/frontend (state management)
-
-### Tailwind CSS
-Copyright (c) Tailwind Labs, Inc.
-License: MIT
-Source: https://github.com/tailwindlabs/tailwindcss
-Used by: manyforge_composer/frontend (styling)
-
-### ROS 2 (Jazzy and dependent message/action packages)
+### ROS 2 Lyrical
 Copyright (c) Open Source Robotics Foundation, Inc. and ROS 2 contributors
-License: Apache-2.0 (most components; some Python tooling under BSD-3-Clause)
-Source: https://github.com/ros2
-Used by: manyforge_ros_bringup, manyforge_roboplan (Isaac ros2_control lane)
+License: Apache-2.0 (most packages; some packages BSD-3-Clause)
+Source: NVIDIA Isaac ROS buildfarm and the ROS 2 apt repository
+
+### ros2_control and ros2_controllers (incl. joint_trajectory_controller 6.10.0)
+License: Apache-2.0
+Source: https://github.com/ros-controls/ros2_control,
+        https://github.com/ros-controls/ros2_controllers
+
+### realtime_tools 5.4.0
+License: BSD-3-Clause
+Source: https://github.com/ros-controls/realtime_tools
+
+### ros2_control_cmake 1.0.0
+License: Apache-2.0
+Source: https://github.com/ros-controls/ros2_control_cmake
+
+### control_msgs
+License: BSD-3-Clause
+Source: https://github.com/ros-controls/control_msgs
 
 ### topic_based_ros2_control
-Copyright (c) PickNik Robotics and contributors
 License: BSD-3-Clause
 Source: https://github.com/PickNikRobotics/topic_based_ros2_control
-Used by: manyforge_ros_bringup (Isaac Sim arm-controller bridge)
 
-### control_msgs (FollowJointTrajectory, GripperCommand actions)
-Copyright (c) Open Source Robotics Foundation, Inc.
-License: Apache-2.0
-Source: https://github.com/ros-controls/control_msgs
-Used by: manyforge_roboplan (ros2_control execution backend)
+### UFACTORY xArm ROS 2 driver and xArm C++ SDK
+Copyright (c) 2018, UFACTORY Inc.
+License: BSD-3-Clause
+Source: https://github.com/pastoriomarco/xarm_ros2 (branch
+        lyrical-no-gazebo; fork of https://github.com/xArm-Developer/xarm_ros2),
+        https://github.com/xArm-Developer/xArm-CPLUS-SDK
 
----
+### Ubuntu 24.04 and Node.js 22
+The image is based on Ubuntu 24.04 and copies Node.js 22 (MIT) with npm
+(Artistic-2.0) from the official node:22-slim image. Ubuntu packages are
+under their own licenses; see /usr/share/doc/*/copyright in the image.
 
-The following license categories cover all third-party software listed
-above:
+===========================================================================
+3. Main application libraries
+===========================================================================
 
-- Apache-2.0: ROS 2 message/action packages, control_msgs
-- MIT: RoboPlan, FastAPI, React, React Flow, Zustand, Tailwind
-- BSD-2-Clause: Pinocchio
-- BSD-3-Clause: HPP-FCL, py_trees, pybind11, topic_based_ros2_control,
-  ROS 2 Python tooling
+### Python (installed in the image's application environment)
+FastAPI (MIT), Uvicorn (BSD-3-Clause), HTTPX (BSD-3-Clause),
+websockets (BSD-3-Clause), MCP Python SDK (MIT), py_trees (BSD-3-Clause,
+Copyright (c) 2020 Daniel Stonier), pybind11 (BSD-3-Clause),
+nanobind (BSD-3-Clause), NumPy (BSD-3-Clause), PyYAML (MIT),
+rfc8785 (Apache-2.0), Pillow (HPND), trimesh (MIT), yourdfpy (MIT).
 
-When redistributing ManyForge in source or object form, You must
-retain this NOTICE file alongside the LICENSE file, as required by
-Section 4(d) of the Apache License, Version 2.0.
+### Composer web interface (bundled into the frontend build)
+React and React DOM (MIT, Meta Platforms, Inc. and affiliates),
+@xyflow/react (MIT, webkid GmbH), three.js (MIT),
+@react-three/fiber and @react-three/drei (MIT, Poimandres).
+Their transitive runtime dependencies are listed with their licenses in
+manyforge_composer/frontend/package-lock.json.

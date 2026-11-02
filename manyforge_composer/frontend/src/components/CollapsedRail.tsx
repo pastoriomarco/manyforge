@@ -1,24 +1,31 @@
+import type { Ref } from 'react';
+
 interface CollapsedRailProps {
   label: string;
   side: 'left' | 'right';
   onExpand: () => void;
+  buttonRef?: Ref<HTMLButtonElement>;
 }
 
-export function CollapsedRail({ label, side, onExpand }: CollapsedRailProps) {
-  const arrow = side === 'left' ? '›' : '‹';
+export function CollapsedRail({
+  label,
+  side,
+  onExpand,
+  buttonRef,
+}: CollapsedRailProps) {
   return (
     <button
       type="button"
+      ref={buttonRef}
       onClick={onExpand}
-      className="group flex h-full w-10 shrink-0 flex-col items-center justify-center border-l border-r border-gray-700 bg-gray-800 text-gray-400 transition-colors hover:bg-gray-700 hover:text-white"
+      className="collapsed-rail"
+      aria-label={`Expand ${label} pane`}
       title={`Expand ${label}`}
     >
-      <span className="mb-3 text-xl leading-none text-blue-400 transition-transform group-hover:scale-110">
-        {arrow}
+      <span className="collapsed-rail-arrow" aria-hidden="true">
+        {side === 'left' ? '›' : '‹'}
       </span>
-      <span className="origin-center -rotate-90 whitespace-nowrap text-[11px] font-semibold uppercase tracking-[0.24em]">
-        {label}
-      </span>
+      <span className="collapsed-rail-label">{label}</span>
     </button>
   );
 }

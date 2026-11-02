@@ -1,0 +1,243 @@
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <manyforge_core/types/coordinate_state.hpp>
+#include <manyforge_core/types/json_value.hpp>
+#include <manyforge_core/types/retained_artifact.hpp>
+#include <manyforge_core/types/stop_evidence_policy.hpp>
+#include <optional>
+#include <span>
+#include <string_view>
+#include <variant>
+#include <vector>
+
+namespace manyforge::core {
+
+inline constexpr std::string_view kMotionControlledStopContractSchemaId =
+    "manyforge.value_schema.provider_contract.motion_controlled_stop.v1";
+inline constexpr std::string_view kMotionControlledStopContractSchemaRevision =
+    "sha256:65e6f4462981225916834490d4e3cb4d42b70611a2287e1b76fdb1cbcabcb113";
+inline constexpr std::size_t kMaxMotionControlledStopResourceLimits = 256U;
+
+enum class MotionControlledStopMode : std::uint8_t {
+  kSoftOnPath = 0,
+  kSpringBackHold,
+  kHardDeceleration,
+  kSpringBackFast,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(MotionControlledStopMode value) noexcept {
+  switch (value) {
+    case MotionControlledStopMode::kSoftOnPath:
+      return "soft_on_path";
+    case MotionControlledStopMode::kSpringBackHold:
+      return "spring_back_hold";
+    case MotionControlledStopMode::kHardDeceleration:
+      return "hard_deceleration";
+    case MotionControlledStopMode::kSpringBackFast:
+      return "spring_back_fast";
+  }
+  return {};
+}
+
+/// Hard containment is implicit and cannot appear in this bounded list.
+[[nodiscard]] inline bool motion_controlled_stop_fallbacks_valid(
+    MotionControlledStopMode primary, std::span<const MotionControlledStopMode> modes) noexcept {
+  const auto rank = [](MotionControlledStopMode mode) {
+    switch (mode) {
+      case MotionControlledStopMode::kSoftOnPath:
+        return 0;
+      case MotionControlledStopMode::kSpringBackHold:
+        return 1;
+      case MotionControlledStopMode::kSpringBackFast:
+        return 2;
+      case MotionControlledStopMode::kHardDeceleration:
+        return 3;
+    }
+    return -1;
+  };
+  int previous = rank(primary);
+  if (previous < 0 || modes.size() > 2U) return false;
+  for (const auto mode : modes) {
+    const int current = rank(mode);
+    if (current <= previous || current >= 3) return false;
+    previous = current;
+  }
+  return true;
+}
+
+struct ControlledStopResourceLimitDTO final {
+  ResourceId resource_id;
+  CoordinateAccelerationDTO max_deceleration;
+  CoordinateVelocityDTO settle_velocity_threshold;
+  std::optional<CoordinateJerkDTO> max_jerk;
+
+  friend bool operator==(const ControlledStopResourceLimitDTO&,
+                         const ControlledStopResourceLimitDTO&) = default;
+};
+
+struct HardStopResourceLimitDTO final {
+  ResourceId resource_id;
+  CoordinateVelocityDTO settle_velocity_threshold;
+
+  friend bool operator==(const HardStopResourceLimitDTO&,
+                         const HardStopResourceLimitDTO&) = default;
+};
+
+struct SoftOnPathStopParametersDTO final {
+  MotionControlledStopMode stop_mode{MotionControlledStopMode::kSoftOnPath};
+  double deceleration_time_s{};
+  /// Q28/Q51 (`main`'s per-profile override): the robot's controlled-Stop
+  /// deadline from the Stop request; absent: deceleration time + 0.5 s.
+  std::optional<double> max_stop_time_s;
+  std::vector<ControlledStopResourceLimitDTO> per_resource_limits;
+  bool allow_natural_completion_on_short_path{};
+  std::vector<MotionControlledStopMode> fallback_stop_modes;
+  bool jerk_limits_enabled{false};
+
+  friend bool operator==(const SoftOnPathStopParametersDTO&,
+                         const SoftOnPathStopParametersDTO&) = default;
+};
+
+/// Also carries `kSpringBackFast` (Q130): the same parameters, a different law.
+struct SpringBackHoldStopParametersDTO final {
+  MotionControlledStopMode stop_mode{MotionControlledStopMode::kSpringBackHold};
+  double deceleration_time_s{};
+  /// Q28/Q51 (`main`'s per-profile override): the robot's controlled-Stop
+  /// deadline from the Stop request; absent: deceleration time + 0.5 s.
+  std::optional<double> max_stop_time_s;
+  std::vector<ControlledStopResourceLimitDTO> per_resource_limits;
+  bool allow_natural_completion_on_short_path{false};
+  bool jerk_limits_enabled{false};
+  std::vector<MotionControlledStopMode> fallback_stop_modes;
+
+  friend bool operator==(const SpringBackHoldStopParametersDTO&,
+                         const SpringBackHoldStopParametersDTO&) = default;
+};
+
+struct HardDecelerationStopParametersDTO final {
+  MotionControlledStopMode stop_mode{MotionControlledStopMode::kHardDeceleration};
+  std::vector<HardStopResourceLimitDTO> per_resource_limits;
+
+  friend bool operator==(const HardDecelerationStopParametersDTO&,
+                         const HardDecelerationStopParametersDTO&) = default;
+};
+
+using MotionControlledStopContractParametersDTO =
+    std::variant<SoftOnPathStopParametersDTO, SpringBackHoldStopParametersDTO,
+                 HardDecelerationStopParametersDTO>;
+
+enum class StopActionClass : std::uint8_t {
+  kControlled = 0,
+  kSoftwareHard,
+  kSafetySystemRequest,
+};
+
+enum class SafetySystemRequestActionClass : std::uint8_t {
+  kProtectiveStopRequest = 0,
+  kEmergencyStopRequest,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(StopActionClass value) noexcept {
+  switch (value) {
+    case StopActionClass::kControlled:
+      return "controlled";
+    case StopActionClass::kSoftwareHard:
+      return "software_hard";
+    case StopActionClass::kSafetySystemRequest:
+      return "safety_system_request";
+  }
+  return {};
+}
+
+[[nodiscard]] constexpr std::string_view to_string(SafetySystemRequestActionClass value) noexcept {
+  switch (value) {
+    case SafetySystemRequestActionClass::kProtectiveStopRequest:
+      return "protective_stop_request";
+    case SafetySystemRequestActionClass::kEmergencyStopRequest:
+      return "emergency_stop_request";
+  }
+  return {};
+}
+
+struct RegisteredStopCommandDefinitionDTO final {
+  RegisteredStopCommandKindId registered_command_kind_id;
+  StopActionClass stop_action_class;
+  std::optional<SafetySystemRequestActionClass> safety_system_request_action_class;
+
+  friend bool operator==(const RegisteredStopCommandDefinitionDTO&,
+                         const RegisteredStopCommandDefinitionDTO&) = default;
+};
+
+/// Complete immutable table fixed by spec 240. Consumers classify a
+/// registered command only through this table, never through token spelling.
+inline const std::array<RegisteredStopCommandDefinitionDTO, 4U> kRegisteredStopCommandDefinitions{{
+    {RegisteredStopCommandKindId("manyforge.stop.controlled.provider"),
+     StopActionClass::kControlled, std::nullopt},
+    {RegisteredStopCommandKindId("manyforge.stop.safety.emergency_request"),
+     StopActionClass::kSafetySystemRequest, SafetySystemRequestActionClass::kEmergencyStopRequest},
+    {RegisteredStopCommandKindId("manyforge.stop.safety.protective_request"),
+     StopActionClass::kSafetySystemRequest, SafetySystemRequestActionClass::kProtectiveStopRequest},
+    {RegisteredStopCommandKindId("manyforge.stop.software_hard"), StopActionClass::kSoftwareHard,
+     std::nullopt},
+}};
+
+[[nodiscard]] inline std::span<const RegisteredStopCommandDefinitionDTO>
+registered_stop_command_definitions() noexcept {
+  return kRegisteredStopCommandDefinitions;
+}
+
+[[nodiscard]] inline const RegisteredStopCommandDefinitionDTO*
+find_registered_stop_command_definition(
+    const RegisteredStopCommandKindId& registered_command_kind_id) noexcept {
+  const auto found =
+      std::lower_bound(kRegisteredStopCommandDefinitions.begin(),
+                       kRegisteredStopCommandDefinitions.end(), registered_command_kind_id,
+                       [](const RegisteredStopCommandDefinitionDTO& candidate,
+                          const RegisteredStopCommandKindId& key) {
+                         return candidate.registered_command_kind_id < key;
+                       });
+  return found == kRegisteredStopCommandDefinitions.end() ||
+                 found->registered_command_kind_id != registered_command_kind_id
+             ? nullptr
+             : &*found;
+}
+
+inline constexpr std::string_view kStopInterfaceCommissioningArtifactRole =
+    "stop_interface_commissioning_evidence";
+inline constexpr std::string_view kStopInterfaceCommissioningMediaType =
+    "application/vnd.manyforge.stop-interface-commissioning-evidence.v1+json";
+
+/// The closed ordered controlled-mode fallbacks supported by this command.
+/// This is runtime policy, not evidence that a binary or test report is
+/// qualified.
+struct ControlledStopSubstitutionContractDTO final {
+  ProviderContractRefDTO provider_contract_ref;
+  MotionControlledStopMode requested_stop_mode{MotionControlledStopMode::kSoftOnPath};
+  std::vector<MotionControlledStopMode> fallback_stop_modes;
+
+  friend bool operator==(const ControlledStopSubstitutionContractDTO&,
+                         const ControlledStopSubstitutionContractDTO&) = default;
+};
+
+struct StopStageParametersDTO final {
+  ControlDomainId control_domain_id;
+  ControlDomainRevision control_domain_revision;
+  ControlBindingId control_binding_id;
+  ControlBindingRevision control_binding_revision;
+  ControllerTopologyId controller_topology_id;
+  TopologyRevision topology_revision;
+  ControlRouteId control_route_id;
+  StopEvidencePolicyId stop_evidence_policy_id;
+  StopEvidencePolicyRevision stop_evidence_policy_revision;
+  StopEscalationStageId stop_escalation_stage_id;
+  ProviderContractRefDTO provider_contract_ref;
+  JsonObjectDTO default_contract_parameters;
+
+  friend bool operator==(const StopStageParametersDTO&, const StopStageParametersDTO&) = default;
+};
+
+}  // namespace manyforge::core

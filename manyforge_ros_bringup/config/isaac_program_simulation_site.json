@@ -1,0 +1,5 @@
+{
+  "api_version": "manyforge.simulation_program_site_config.v2",
+  "service_prefix": "auto",
+  "service_timeout_s": 10.0
+}

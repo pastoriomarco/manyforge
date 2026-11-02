@@ -1,0 +1,109 @@
+api_version: manyforge.closed_schema.v1
+schema_id: manyforge.control_interface_contract.v1
+schema_revision: sha256:4abdf2c402d8e6e818bc26df59ce1c9cdc911d1e807144bdf525d2f69d0a449d
+schema_purpose: artifact_document
+root_definition_id: control_interface_contract
+definitions:
+  - definition_id: control_interface_contract
+    value_schema:
+      kind: object
+      fields:
+        - field_id: api_version
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - manyforge.control_interface_contract.v1
+              - kind: string_format
+                value: api_version
+        - field_id: control_interface_contract_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: control_interface_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+        - field_id: command_interfaces
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 4096
+            collection:
+              kind: ordered
+            item_schema:
+              kind: local_ref
+              definition_id: resource_interface_claim
+        - field_id: state_interfaces
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 4096
+            collection:
+              kind: ordered
+            item_schema:
+              kind: local_ref
+              definition_id: resource_interface_claim
+        - field_id: ordering
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 4096
+            collection:
+              kind: ordered
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: string_format
+                  value: portable_id
+  - definition_id: resource_interface_claim
+    value_schema:
+      kind: object
+      fields:
+        - field_id: resource_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: interface_name
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id

@@ -1,0 +1,413 @@
+api_version: manyforge.closed_schema.v1
+schema_id: manyforge.model_asset.v1
+schema_revision: sha256:397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6
+schema_purpose: artifact_document
+root_definition_id: model_asset
+definitions:
+  - definition_id: model_asset
+    value_schema:
+      kind: object
+      fields:
+        - field_id: api_version
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - manyforge.model_asset.v1
+              - kind: string_format
+                value: api_version
+        - field_id: model_asset_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: model_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+        - field_id: instance_cardinality
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - one_per_cell
+                  - multiple_per_cell
+        - field_id: expanded_source
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: expanded_source
+        - field_id: root_frame_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: frame_role_bindings
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 4096
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - frame_role_id
+            item_schema:
+              kind: local_ref
+              definition_id: frame_role_binding
+        - field_id: model_group_role_bindings
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 4096
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - model_group_role_id
+            item_schema:
+              kind: local_ref
+              definition_id: model_group_role_binding
+        - field_id: resource_role_bindings
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 4096
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - resource_role_id
+            item_schema:
+              kind: local_ref
+              definition_id: resource_role_binding
+        - field_id: collision_body_role_bindings
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 4096
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - collision_body_role_id
+            item_schema:
+              kind: local_ref
+              definition_id: collision_body_role_binding
+        - field_id: payload
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: model_payload
+  - definition_id: expanded_source
+    value_schema:
+      kind: object
+      fields:
+        - field_id: urdf_logical_uri
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: min_length
+                value: 1
+              - kind: max_length
+                value: 2048
+        - field_id: srdf_logical_uri
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: min_length
+                value: 1
+              - kind: max_length
+                value: 2048
+        - field_id: artifacts
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 4096
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - logical_uri
+            item_schema:
+              kind: local_ref
+              definition_id: source_artifact
+  - definition_id: source_artifact
+    value_schema:
+      kind: object
+      fields:
+        - field_id: logical_uri
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: min_length
+                value: 1
+              - kind: max_length
+                value: 2048
+        - field_id: media_type
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: min_length
+                value: 3
+              - kind: max_length
+                value: 255
+        - field_id: byte_size
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: integer
+            constraints:
+              - kind: minimum
+                value: 1
+              - kind: maximum
+                value: 9007199254740991
+        - field_id: content_digest
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+  - definition_id: frame_role_binding
+    value_schema:
+      kind: object
+      fields:
+        - field_id: frame_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: source_link_name
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: min_length
+                value: 1
+              - kind: max_length
+                value: 1024
+        - field_id: pose_in_source_link
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: placement_pose
+  - definition_id: placement_pose
+    value_schema:
+      kind: object
+      fields:
+        - field_id: position_m
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 3
+            max_items: 3
+            collection:
+              kind: ordered
+            item_schema:
+              kind: scalar
+              scalar_type: number
+              constraints: []
+        - field_id: orientation_xyzw
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 4
+            max_items: 4
+            collection:
+              kind: ordered
+            item_schema:
+              kind: scalar
+              scalar_type: number
+              constraints: []
+  - definition_id: model_payload
+    value_schema:
+      kind: object
+      fields:
+        - field_id: mass_kg
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints: []
+        - field_id: center_of_mass_m
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 3
+            max_items: 3
+            collection:
+              kind: ordered
+            item_schema:
+              kind: scalar
+              scalar_type: number
+              constraints: []
+  - definition_id: model_group_role_binding
+    value_schema:
+      kind: object
+      fields:
+        - field_id: model_group_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: source_group_name
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: min_length
+                value: 1
+              - kind: max_length
+                value: 1024
+  - definition_id: resource_role_binding
+    value_schema:
+      kind: object
+      fields:
+        - field_id: resource_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: source_joint_names
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 4096
+            collection:
+              kind: ordered
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: min_length
+                  value: 1
+                - kind: max_length
+                  value: 1024
+  - definition_id: collision_body_role_binding
+    value_schema:
+      kind: object
+      fields:
+        - field_id: collision_body_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: source_link_names
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 4096
+            collection:
+              kind: scalar_set
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: min_length
+                  value: 1
+                - kind: max_length
+                  value: 1024

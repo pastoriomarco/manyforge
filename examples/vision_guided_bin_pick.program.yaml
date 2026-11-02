@@ -1,155 +1,800 @@
-api_version: manyforge.program.v0
-program_profile: v0.1
-name: vision_guided_bin_pick
-description: >-
-  Vision-guided pick-and-place example. A `query_model` node captures the live
-  native viewer scene snapshot, asks the configured vision model which of two candidate
-  objects should be picked next, and mirrors the validated decision onto the
-  blackboard. The tree then routes into one of two fixed pick/place sequences.
-catalog_version: "0.5.0"
-
-robot:
-  robot_id: ur5
-  group_id: arm
-  base_frame: base_link
-  tcp_frame: tool0
-
-scene:
-  - object_id: table
-    shape:
-      type: box
-      box_dimensions_m: [0.8, 0.6, 0.04]
-    pose:
-      frame_id: base_link
-      position_m: [0.45, 0.0, -0.021]
-      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
-
-  - object_id: left_part
-    shape:
-      type: box
-      box_dimensions_m: [0.02, 0.02, 0.02]
-    pose:
-      frame_id: base_link
-      position_m: [0.40, -0.14, 0.009]
-      orientation_rpy_deg: [0.0, 0.0, 0.0]
-
-  - object_id: right_part
-    shape:
-      type: box
-      box_dimensions_m: [0.02, 0.02, 0.02]
-    pose:
-      frame_id: base_link
-      position_m: [0.40, 0.14, 0.009]
-      orientation_rpy_deg: [0.0, 0.0, 0.0]
-
+api_version: manyforge.program.v2
 blackboard:
-  namespaces:
-    - id: pick_target
-      contract: query_model_output_v1
-      prefix: perception/pick_target
-      description: QueryModel target-selection response namespace.
-      fields:
-        - name: pick_left_bin
-          type: bool
-        - name: selected_object_id
-          type: string
-        - name: confidence
-          type: float
-        - name: reason
-          type: string
   keys:
-    - id: gripper_closed
+  - access: read_write
+    fields:
+    - field: confidence
+      type: float64
+    - field: pick_left_bin
       type: bool
-      key: gripper_closed
-      description: Simulated gripper closed/open flag.
-
+    - field: reason
+      type: string
+    - field: selected_object_id
+      type: scene_resource
+    key: perception.pick_target
+    persistence: run
+    type: model_response
+  - access: read_write
+    fields:
+    - field: approach_pose
+      type: stored_pose
+    - field: descend_path
+      type: cartesian_path
+    - field: pick_pose
+      type: stored_pose
+    - field: retreat_path
+      type: cartesian_path
+    - field: retreat_pose
+      type: stored_pose
+    - field: selected_object_id
+      type: scene_resource
+    - field: tool_position
+      type: coordinate_position
+    key: pick_place.pick_left_part
+    persistence: run
+    type: pick_planning_result
+  - access: read_write
+    fields:
+    - field: approach_pose
+      type: stored_pose
+    - field: descend_path
+      type: cartesian_path
+    - field: pick_pose
+      type: stored_pose
+    - field: retreat_path
+      type: cartesian_path
+    - field: retreat_pose
+      type: stored_pose
+    - field: selected_object_id
+      type: scene_resource
+    - field: tool_position
+      type: coordinate_position
+    key: pick_place.pick_right_part
+    persistence: run
+    type: pick_planning_result
+  - access: read_write
+    fields:
+    - field: approach_pose
+      type: stored_pose
+    - field: descend_path
+      type: cartesian_path
+    - field: pick_pose
+      type: stored_pose
+    - field: retreat_path
+      type: cartesian_path
+    - field: retreat_pose
+      type: stored_pose
+    - field: selected_object_id
+      type: scene_resource
+    - field: tool_position
+      type: coordinate_position
+    key: pick_place.place_left_part
+    persistence: run
+    type: pick_planning_result
+  - access: read_write
+    fields:
+    - field: approach_pose
+      type: stored_pose
+    - field: descend_path
+      type: cartesian_path
+    - field: pick_pose
+      type: stored_pose
+    - field: retreat_path
+      type: cartesian_path
+    - field: retreat_pose
+      type: stored_pose
+    - field: selected_object_id
+      type: scene_resource
+    - field: tool_position
+      type: coordinate_position
+    key: pick_place.place_right_part
+    persistence: run
+    type: pick_planning_result
+  - access: read_write
+    description: Operation-scoped selected-object binding for contact policy resolution.
+    key: selected_object
+    persistence: run
+    type: scene_resource
+  namespaces:
+  - namespace_id: perception
+    owner: program
+  - namespace_id: pick_place
+    owner: program
+catalog:
+  api_version: manyforge.node_catalog.v2
+  content_version: 2.9.0
+compatibility:
+  assistant: required
+  lanes:
+  - manyforge-only
+  requires:
+  - vision_pose_inference
+  tags:
+  - bin-pick
+  - ur5
+  - vision-pick
+component_roles:
+  robot:
+    required_component_type_tags:
+    - articulated-arm
+    required_model_roles:
+    - arm_model
+  tool:
+    required_component_type_tags:
+    - gripper
+contact_policies:
+- api_version: manyforge.contact_policy.v1
+  default_unmatched_response: hard_stop
+  mode: contact_grasp
+  policy_id: selected_object_grasp
+  sensing_mode: geometry_only
+  version: sha256:13cce018403acdc3768ed8f1e86656fa482cf40aa3a1eb7984cd6c93e9acc47c
+  zones:
+  - body_pairs:
+    - body_a:
+        collision_body_role_id: gripper_collision
+        component_role_id: tool
+        kind: component_model_body
+      body_b:
+        kind: runtime_object
+        runtime_object_id: selected_object
+    max_penetration_m: 0.002
+    terminal_window_start_fraction: 0.8
+    violation_response: hard_stop
+    zone_id: tool_contact
+description: Vision-guided pick-and-place Program. A bounded model request selects one of two declared
+  scene resources, an ordered fallback chooses the matching branch, and visible ordinary Pick/Place subtrees
+  plan and execute the selected operation through the same motion, gripper, and Scene nodes used elsewhere.
+name: vision_guided_bin_pick
+program_id: vision_guided_bin_pick
+program_profile: composable-cell-v1
+program_revision: sha256:da65f79d2a4c3e18bb07066a9901493ffa55b17a128da4e59dee60bd19245726
+scene:
+- pose:
+    frame_ref:
+      component_role: robot
+      frame_role: base
+      kind: component_frame
+      model_role: arm_model
+    orientation:
+      rpy_deg:
+      - 0
+      - 0
+      - 0
+    position_m:
+    - 0.4
+    - -0.14
+    - 0.009
+  resource_roles:
+  - pick_candidate
+  scene_resource_id: left_part
+  shape:
+    box_dimensions_m:
+    - 0.02
+    - 0.02
+    - 0.02
+    type: box
+- pose:
+    frame_ref:
+      component_role: robot
+      frame_role: base
+      kind: component_frame
+      model_role: arm_model
+    orientation:
+      rpy_deg:
+      - 0
+      - 0
+      - 0
+    position_m:
+    - 0.4
+    - 0.14
+    - 0.009
+  resource_roles:
+  - pick_candidate
+  scene_resource_id: right_part
+  shape:
+    box_dimensions_m:
+    - 0.02
+    - 0.02
+    - 0.02
+    type: box
+- pose:
+    frame_ref:
+      component_role: robot
+      frame_role: base
+      kind: component_frame
+      model_role: arm_model
+    orientation:
+      xyzw:
+      - 0
+      - 0
+      - 0
+      - 1
+    position_m:
+    - 0.45
+    - 0
+    - -0.021
+  scene_resource_id: table
+  shape:
+    box_dimensions_m:
+    - 0.8
+    - 0.6
+    - 0.04
+    type: box
+target_roles:
+  arm:
+    component_role: robot
+    required_capabilities:
+    - capability_id: execution.feedback.phase_events
+      disposition: required
+      parameters: {}
+    - capability_id: execution.trajectory.execute
+      disposition: required
+      parameters: {}
+    - capability_id: model.kinematics.fk
+      disposition: required
+      parameters: {}
+    - capability_id: planning.motion.cartesian_path
+      disposition: required
+      parameters: {}
+    - capability_id: planning.motion.pose_goal
+      disposition: required
+      parameters: {}
+    - capability_id: planning.trajectory.time_parameterized
+      disposition: required
+      parameters: {}
+    - capability_id: state.observed.current
+      disposition: required
+      parameters: {}
+    - capability_id: validation.trajectory.non_collision
+      disposition: required
+      parameters: {}
+    required_collision_body_roles:
+    - arm_collision
+    required_frame_roles:
+    - base
+    required_model_roles:
+    - arm_model
+    required_resource_roles:
+    - arm_joints
+  gripper:
+    component_role: tool
+    required_capabilities:
+    - capability_id: model.kinematics.fk
+      disposition: required
+      parameters: {}
+    - capability_id: tool.gripper.command
+      disposition: required
+      parameters: {}
+    - capability_id: tool.gripper.feedback
+      disposition: required
+      parameters: {}
+    required_collision_body_roles:
+    - gripper_collision
+    required_frame_roles:
+    - tcp
+    required_resource_roles:
+    - fingers
 tree:
-  id: sequence
-  name: vision_guided_pick_cycle
+  node_id: sequence
+  instance_id: vision_guided_pick_cycle
+  parameters: {}
   children:
-    - id: query_model
-      name: choose_pick_target
-      params:
-        model_endpoint_alias: vision_model
-        prompt_template_id: choose_bin_target_v1
-        output_key_prefix:
-          namespace_ref: pick_target
-        include_scene_snapshot: true
-        scene_snapshot_width: 640
-        scene_snapshot_height: 480
-        scene_snapshot_format: jpeg
-        timeout_s: 5.0
-        min_confidence: 0.70
-
-    - id: fallback
-      name: execute_selected_pick
+  - node_id: assistant.query_model
+    instance_id: choose_pick_target
+    parameters:
+      min_confidence: 0.7
+      model_endpoint_alias: vision_model
+      output_key: perception.pick_target
+      prompt_template_id: choose_bin_target_v1
+      scene_attachment: snapshot_image
+      scene_snapshot_format: jpeg
+      scene_snapshot_height: 480
+      scene_snapshot_width: 640
+      timeout_s: 5
+    children: []
+  - node_id: fallback
+    instance_id: execute_selected_pick
+    parameters: {}
+    children:
+    - node_id: sequence
+      instance_id: pick_left_branch
+      parameters: {}
       children:
-        - id: sequence
-          name: pick_left_branch
-          children:
-            - id: check_key_bool_value
-              name: left_was_selected
-              params:
-                key:
-                  field_ref:
-                    namespace: pick_target
-                    field: pick_left_bin
-                expected_value: true
-
-            - id: pick_object
-              name: pick_left_part
-              params:
-                object_id: left_part
-                approach_height_m: 0.08
-                grasp_offset_z_m: 0.0
-                tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
-                velocity_scale: 0.4
-                tcp_frame: tool0
-
-            - id: place_object
-              name: place_left_part
-              params:
-                object_id: left_part
-                place_pose:
-                  frame_id: base_link
-                  position_m: [0.22, 0.26, 0.28]
-                  orientation_rpy_deg: [180.0, 0.0, -90.0]
-                approach_height_m: 0.08
-                tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
-                velocity_scale: 0.4
-                tcp_frame: tool0
-
-        - id: sequence
-          name: pick_right_branch
-          children:
-            - id: check_key_bool_value
-              name: right_was_selected
-              params:
-                key:
-                  field_ref:
-                    namespace: pick_target
-                    field: pick_left_bin
-                expected_value: false
-
-            - id: pick_object
-              name: pick_right_part
-              params:
-                object_id: right_part
-                approach_height_m: 0.08
-                grasp_offset_z_m: 0.0
-                tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
-                velocity_scale: 0.4
-                tcp_frame: tool0
-
-            - id: place_object
-              name: place_right_part
-              params:
-                object_id: right_part
-                place_pose:
-                  frame_id: base_link
-                  position_m: [0.22, -0.26, 0.28]
-                  orientation_rpy_deg: [180.0, 0.0, -90.0]
-                approach_height_m: 0.08
-                tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
-                velocity_scale: 0.4
-                tcp_frame: tool0
+      - node_id: logic.check_condition
+        instance_id: left_was_selected
+        parameters: {}
+        children: []
+        value_sources:
+          condition:
+            field: pick_left_bin
+            kind: blackboard_field
+            reference: perception.pick_target
+      - node_id: sequence
+        instance_id: pick_left_part
+        parameters: {}
+        children:
+        - node_id: planning.plan_pick_sequence
+          instance_id: pick_left_part.plan
+          parameters:
+            base_frame_role: base
+            carrier_frame_role: tcp
+            contact_policy_id: selected_object_grasp
+            motion_options:
+              approach_velocity_scale: 0.4
+              descend_velocity_scale: 0.4
+              retreat_velocity_scale: 0.4
+            output_key: pick_place.pick_left_part
+            selected_object_id: left_part
+            synthesis:
+              approach_offset_envelope:
+                orientation_rpy_max_deg:
+                - 0
+                - 0
+                - 0
+                orientation_rpy_min_deg:
+                - 0
+                - 0
+                - 0
+                position_max_m:
+                - 0
+                - 0
+                - 0.08
+                position_min_m:
+                - 0
+                - 0
+                - 0.08
+              base_tool_orientation_rpy_deg:
+              - 180
+              - 0
+              - -90
+              maximum_candidate_count: 1
+              pick_offset_envelope:
+                orientation_rpy_max_deg:
+                - 0
+                - 0
+                - 0
+                orientation_rpy_min_deg:
+                - 0
+                - 0
+                - 0
+                position_max_m:
+                - 0
+                - 0
+                - 0
+                position_min_m:
+                - 0
+                - 0
+                - 0
+              search_strategy: first_feasible
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            tool_position:
+              kind: named_preset
+              name: closed
+            tool_target_role: gripper
+          children: []
+        - node_id: motion.move_to_pose
+          instance_id: pick_left_part.approach
+          parameters:
+            base_frame_role: base
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            velocity_scale: 0.4
+          children: []
+          value_sources:
+            goal:
+              field: approach_pose
+              kind: blackboard_field
+              reference: pick_place.pick_left_part
+        - node_id: motion.follow_cartesian_path
+          instance_id: pick_left_part.descend
+          parameters:
+            base_frame_role: base
+            contact_policy_id: selected_object_grasp
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            velocity_scale: 0.4
+          children: []
+          value_sources:
+            contact_scene_resource_id:
+              field: selected_object_id
+              kind: blackboard_field
+              reference: pick_place.pick_left_part
+            path:
+              field: descend_path
+              kind: blackboard_field
+              reference: pick_place.pick_left_part
+        - node_id: gripper.command_position
+          instance_id: pick_left_part.close
+          parameters:
+            target_role: gripper
+          children: []
+          value_sources:
+            position:
+              field: tool_position
+              kind: blackboard_field
+              reference: pick_place.pick_left_part
+        - node_id: scene.attach_carried_object
+          instance_id: pick_left_part.attach
+          parameters:
+            carrier_frame_role: tcp
+            target_role: gripper
+            touch_body_roles:
+            - gripper_collision
+          children: []
+          value_sources:
+            scene_resource_id:
+              field: selected_object_id
+              kind: blackboard_field
+              reference: pick_place.pick_left_part
+        - node_id: motion.follow_cartesian_path
+          instance_id: pick_left_part.retreat
+          parameters:
+            base_frame_role: base
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            velocity_scale: 0.4
+          children: []
+          value_sources:
+            path:
+              field: retreat_path
+              kind: blackboard_field
+              reference: pick_place.pick_left_part
+      - node_id: sequence
+        instance_id: place_left_part
+        parameters: {}
+        children:
+        - node_id: planning.plan_place_sequence
+          instance_id: place_left_part.plan
+          parameters:
+            approach_offset_m:
+            - 0
+            - 0
+            - 0.08
+            base_frame_role: base
+            carrier_frame_role: tcp
+            motion_options:
+              approach_velocity_scale: 0.4
+              descend_velocity_scale: 0.4
+              retreat_velocity_scale: 0.4
+            output_key: pick_place.place_left_part
+            place_pose:
+              frame_ref:
+                frame_role: base
+                kind: target_frame
+                target_role: arm
+              orientation:
+                rpy_deg:
+                - 180
+                - 0
+                - -90
+              position_m:
+              - 0.22
+              - 0.26
+              - 0.28
+            selected_object_id: left_part
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            tool_position:
+              kind: named_preset
+              name: open
+            tool_target_role: gripper
+          children: []
+        - node_id: motion.move_to_pose
+          instance_id: place_left_part.approach
+          parameters:
+            base_frame_role: base
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            velocity_scale: 0.4
+          children: []
+          value_sources:
+            goal:
+              field: approach_pose
+              kind: blackboard_field
+              reference: pick_place.place_left_part
+        - node_id: motion.follow_cartesian_path
+          instance_id: place_left_part.descend
+          parameters:
+            base_frame_role: base
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            velocity_scale: 0.4
+          children: []
+          value_sources:
+            path:
+              field: descend_path
+              kind: blackboard_field
+              reference: pick_place.place_left_part
+        - node_id: gripper.command_position
+          instance_id: place_left_part.open
+          parameters:
+            target_role: gripper
+          children: []
+          value_sources:
+            position:
+              field: tool_position
+              kind: blackboard_field
+              reference: pick_place.place_left_part
+        - node_id: scene.detach_carried_object
+          instance_id: place_left_part.detach
+          parameters:
+            target_role: gripper
+          children: []
+          value_sources:
+            scene_resource_id:
+              field: selected_object_id
+              kind: blackboard_field
+              reference: pick_place.place_left_part
+        - node_id: motion.follow_cartesian_path
+          instance_id: place_left_part.retreat
+          parameters:
+            base_frame_role: base
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            velocity_scale: 0.4
+          children: []
+          value_sources:
+            path:
+              field: retreat_path
+              kind: blackboard_field
+              reference: pick_place.place_left_part
+    - node_id: sequence
+      instance_id: pick_right_branch
+      parameters: {}
+      children:
+      - node_id: logic.check_condition
+        instance_id: right_was_selected
+        parameters: {}
+        children: []
+        value_sources:
+          condition:
+            expression: '!key.perception.pick_target.pick_left_bin'
+            kind: expression
+      - node_id: sequence
+        instance_id: pick_right_part
+        parameters: {}
+        children:
+        - node_id: planning.plan_pick_sequence
+          instance_id: pick_right_part.plan
+          parameters:
+            base_frame_role: base
+            carrier_frame_role: tcp
+            contact_policy_id: selected_object_grasp
+            motion_options:
+              approach_velocity_scale: 0.4
+              descend_velocity_scale: 0.4
+              retreat_velocity_scale: 0.4
+            output_key: pick_place.pick_right_part
+            selected_object_id: right_part
+            synthesis:
+              approach_offset_envelope:
+                orientation_rpy_max_deg:
+                - 0
+                - 0
+                - 0
+                orientation_rpy_min_deg:
+                - 0
+                - 0
+                - 0
+                position_max_m:
+                - 0
+                - 0
+                - 0.08
+                position_min_m:
+                - 0
+                - 0
+                - 0.08
+              base_tool_orientation_rpy_deg:
+              - 180
+              - 0
+              - -90
+              maximum_candidate_count: 1
+              pick_offset_envelope:
+                orientation_rpy_max_deg:
+                - 0
+                - 0
+                - 0
+                orientation_rpy_min_deg:
+                - 0
+                - 0
+                - 0
+                position_max_m:
+                - 0
+                - 0
+                - 0
+                position_min_m:
+                - 0
+                - 0
+                - 0
+              search_strategy: first_feasible
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            tool_position:
+              kind: named_preset
+              name: closed
+            tool_target_role: gripper
+          children: []
+        - node_id: motion.move_to_pose
+          instance_id: pick_right_part.approach
+          parameters:
+            base_frame_role: base
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            velocity_scale: 0.4
+          children: []
+          value_sources:
+            goal:
+              field: approach_pose
+              kind: blackboard_field
+              reference: pick_place.pick_right_part
+        - node_id: motion.follow_cartesian_path
+          instance_id: pick_right_part.descend
+          parameters:
+            base_frame_role: base
+            contact_policy_id: selected_object_grasp
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            velocity_scale: 0.4
+          children: []
+          value_sources:
+            contact_scene_resource_id:
+              field: selected_object_id
+              kind: blackboard_field
+              reference: pick_place.pick_right_part
+            path:
+              field: descend_path
+              kind: blackboard_field
+              reference: pick_place.pick_right_part
+        - node_id: gripper.command_position
+          instance_id: pick_right_part.close
+          parameters:
+            target_role: gripper
+          children: []
+          value_sources:
+            position:
+              field: tool_position
+              kind: blackboard_field
+              reference: pick_place.pick_right_part
+        - node_id: scene.attach_carried_object
+          instance_id: pick_right_part.attach
+          parameters:
+            carrier_frame_role: tcp
+            target_role: gripper
+            touch_body_roles:
+            - gripper_collision
+          children: []
+          value_sources:
+            scene_resource_id:
+              field: selected_object_id
+              kind: blackboard_field
+              reference: pick_place.pick_right_part
+        - node_id: motion.follow_cartesian_path
+          instance_id: pick_right_part.retreat
+          parameters:
+            base_frame_role: base
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            velocity_scale: 0.4
+          children: []
+          value_sources:
+            path:
+              field: retreat_path
+              kind: blackboard_field
+              reference: pick_place.pick_right_part
+      - node_id: sequence
+        instance_id: place_right_part
+        parameters: {}
+        children:
+        - node_id: planning.plan_place_sequence
+          instance_id: place_right_part.plan
+          parameters:
+            approach_offset_m:
+            - 0
+            - 0
+            - 0.08
+            base_frame_role: base
+            carrier_frame_role: tcp
+            motion_options:
+              approach_velocity_scale: 0.4
+              descend_velocity_scale: 0.4
+              retreat_velocity_scale: 0.4
+            output_key: pick_place.place_right_part
+            place_pose:
+              frame_ref:
+                frame_role: base
+                kind: target_frame
+                target_role: arm
+              orientation:
+                rpy_deg:
+                - 180
+                - 0
+                - -90
+              position_m:
+              - 0.22
+              - -0.26
+              - 0.28
+            selected_object_id: right_part
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            tool_position:
+              kind: named_preset
+              name: open
+            tool_target_role: gripper
+          children: []
+        - node_id: motion.move_to_pose
+          instance_id: place_right_part.approach
+          parameters:
+            base_frame_role: base
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            velocity_scale: 0.4
+          children: []
+          value_sources:
+            goal:
+              field: approach_pose
+              kind: blackboard_field
+              reference: pick_place.place_right_part
+        - node_id: motion.follow_cartesian_path
+          instance_id: place_right_part.descend
+          parameters:
+            base_frame_role: base
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            velocity_scale: 0.4
+          children: []
+          value_sources:
+            path:
+              field: descend_path
+              kind: blackboard_field
+              reference: pick_place.place_right_part
+        - node_id: gripper.command_position
+          instance_id: place_right_part.open
+          parameters:
+            target_role: gripper
+          children: []
+          value_sources:
+            position:
+              field: tool_position
+              kind: blackboard_field
+              reference: pick_place.place_right_part
+        - node_id: scene.detach_carried_object
+          instance_id: place_right_part.detach
+          parameters:
+            target_role: gripper
+          children: []
+          value_sources:
+            scene_resource_id:
+              field: selected_object_id
+              kind: blackboard_field
+              reference: pick_place.place_right_part
+        - node_id: motion.follow_cartesian_path
+          instance_id: place_right_part.retreat
+          parameters:
+            base_frame_role: base
+            target_role: arm
+            tcp_endpoint:
+              kind: current
+            velocity_scale: 0.4
+          children: []
+          value_sources:
+            path:
+              field: retreat_path
+              kind: blackboard_field
+              reference: pick_place.place_right_part

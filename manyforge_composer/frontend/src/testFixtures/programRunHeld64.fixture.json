@@ -1,0 +1,68 @@
+{
+  "schema_version": "manyforge.program_run_status.v3",
+  "owner_id": "program-runner.development-workbench",
+  "owner_epoch": "program-runner-06566edc14494853af0a54703d97e6b8",
+  "run_revision": 3,
+  "state": "running",
+  "capture": {
+    "schema_version": "manyforge.program_run_capture.v2",
+    "program_run_id": "program-cycle.1",
+    "applied_record_digest": "sha256:4b39f8dfc0979342d42ccc425c4e0a4a03df5e468b7579814dcfd0015f03a002",
+    "scenario_id": "mock_lite6_motion_retry",
+    "source_document_digest": "sha256:542f008bd464f6705d4e8210abfaa537072326fb0f8281cc792593b35d849215",
+    "program_id": "mock_lite6_motion_retry",
+    "program_revision": "sha256:20aa40b7c5966d2ef8088973fb2148a2b59352fd7de5c8e98260fd42dd492482",
+    "program_binding_id": "sha256:b9701ae35e41ad4ea45e4143724deccdc197b022a2c092f34e1d12b81234f44c",
+    "retained_bundle_id": "sha256:d33503cb1347224c8d95a086c7aecfa83a95a15adcf66678109ecfe934002e0c",
+    "graph_revision": "sha256:8ccd8e32689f97c4e695222d666eeb3f8a665edc2632997d54eea50988744695",
+    "node_environment_digest": "sha256:890608dcda93357d7ee76f1969b030c95254f2cd1e6a7d01a9c38e0aa43ee36a",
+    "node_policies": [],
+    "node_policy_digest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "owner_identities": [
+      {
+        "owner_role": "headless_projection",
+        "owner_id": "headless-api.development-workbench",
+        "owner_epoch": "headless-api-effc85b4ac278195473cadb79f6dc709"
+      },
+      {
+        "owner_role": "manager",
+        "owner_id": "component-manager.c1_build_authority_cell",
+        "owner_epoch": "manager-5c61ab4c530848dfb1a3481dbcbeb4a7"
+      },
+      {
+        "owner_role": "program_runner",
+        "owner_id": "program-runner.development-workbench",
+        "owner_epoch": "program-runner-06566edc14494853af0a54703d97e6b8"
+      },
+      {
+        "owner_role": "scene_runtime",
+        "owner_id": "scene-runtime.c1_build_authority_cell",
+        "owner_epoch": "scene-runtime-4c51b67bc317194be8842bedf9cca4d3"
+      },
+      {
+        "owner_role": "scene_transactions",
+        "owner_id": "logical-scene.c1_build_authority_cell",
+        "owner_epoch": "sha256:041aeec7ab733c39e2c894d8f75e011e9f20db226ce11c6eec32b52db4be686e"
+      }
+    ]
+  },
+  "tree_status": "running",
+  "node_status_revision": 2,
+  "node_statuses": {
+    "start_rest": "held",
+    "retry_move": "idle",
+    "wait_before_fix": "idle",
+    "make_goal_reachable": "idle",
+    "fix_goal_later": "idle",
+    "retry_window": "idle",
+    "retry_move_completed": "idle",
+    "end_rest": "idle",
+    "trial_a": "running"
+  },
+  "active_operation_count": null,
+  "reason_code": null,
+  "message": "",
+  "details": null,
+  "origin": null,
+  "operation_failures": []
+}

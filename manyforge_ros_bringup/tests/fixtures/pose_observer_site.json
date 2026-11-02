@@ -1,0 +1,60 @@
+{
+  "api_version": "manyforge.isaac_pose_observer_site.v1",
+  "cell_id": "isaac_ur10e_light_cell",
+  "detection3d_sources": [],
+  "joint_state": {
+    "eligible": false,
+    "lifetime_ns": 1000000000,
+    "object_id": "isaac_ur10e_light_robot",
+    "policy_id": "viewer.measured_robot",
+    "required_joint_names": [
+      "shoulder_pan_joint",
+      "shoulder_lift_joint",
+      "elbow_joint",
+      "wrist_1_joint",
+      "wrist_2_joint",
+      "wrist_3_joint"
+    ],
+    "topic": "/isaac_joint_states"
+  },
+  "simulation_entities": [
+    {
+      "eligible": false,
+      "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link/robotiq_arg2f_base_link",
+      "frame_kind": "cell_frame",
+      "lifetime_ns": 1000000000,
+      "local_orientation_xyzw": [0, 0, 0, 1],
+      "local_position_xyz": [0, 0, 0.2],
+      "object_id": "isaac_ur10e_light_robot",
+      "policy_id": "viewer.measured_tcp",
+      "source_coordinate_frame_id": "universe",
+      "source_header_frame_id": "robotiq_arg2f_base_link",
+      "target_frame_id": "universe"
+    },
+    {
+      "eligible": true,
+      "entity": "/mac_n_cheese_centered",
+      "frame_kind": "cell_frame",
+      "lifetime_ns": 2000000000,
+      "local_orientation_xyzw": [0, 0, 0, 1],
+      "local_position_xyz": [0, 0, 0],
+      "object_id": "isaac_cheese_box",
+      "policy_id": "scene",
+      "relative_references": [
+        {
+          "controllable_component_id": "isaac_ur10e_light_robot",
+          "command_target_id": "gripper",
+          "gripper_link": "robotiq_base_link",
+          "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link/robotiq_arg2f_base_link",
+          "link": "robotiq_base_link",
+          "source_header_frame_id": "robotiq_arg2f_base_link"
+        }
+      ],
+      "source_coordinate_frame_id": "universe",
+      "source_header_frame_id": "mac_n_cheese_centered",
+      "target_frame_id": "universe"
+    }
+  ],
+  "simulation_poll_period_ms": 250,
+  "source_id": "isaac_scene_objects"
+}

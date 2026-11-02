@@ -1,0 +1,113 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="lite_gripper" version="1.2">
+  <material name="White">
+    <color rgba="1.0 1.0 1.0 1.0" />
+  </material>
+  <ros2_control name="XArmGripperSystem" type="system">
+    <hardware>
+      <plugin>topic_based_ros2_control/TopicBasedSystem</plugin>
+      <!-- <param name="joint_commands_topic">${isaac_cmd_topic}</param> -->
+      <param name="joint_states_topic">/isaac_joint_states</param>
+    </hardware>
+    <!-- Drive joint: only this joint is commandable -->
+    <joint name="right_finger_joint">
+      <command_interface name="position" />
+      <state_interface name="position" />
+      <state_interface name="velocity" />
+    </joint>
+    <!-- Mimic joint(s): state-only, no command interfaces -->
+    <!-- REMOVED TO AVOID CONFLICTS WITH TF AS IT'S NOT CONTROLLED-->
+    <!-- <joint name="${prefix}left_finger_joint">
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+      </joint> -->
+  </ros2_control>
+  <!-- The robot flange plane: cut at gripper_fix from the combined model; the robot's `flange` attachment puts this link on link_eef. -->
+  <link name="lite_gripper_mount"/>
+  <joint name="gripper_fix" type="fixed">
+    <parent link="lite_gripper_mount" />
+    <child link="lite_gripper_base_link" />
+    <origin rpy="0 0 0" xyz="0 0 0" />
+  </joint>
+  <link name="lite_gripper_base_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.030" />
+      <mass value="0.28" />
+      <inertia ixx="0.00047106" ixy="3.9292E-07" ixz="2.6537E-06" iyy="0.00033072" iyz="-1.0975E-05" izz="0.00025642" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_body.stl" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <material name="White" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_body.stl" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+    </collision>
+  </link>
+  <link name="lite_gripper_left_finger">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0.0078 0.0543" />
+      <mass value="0.012105" />
+      <inertia ixx="3.7322E-06" ixy="-4.1705E-06" ixz="4.0142E-06" iyy="1.744E-05" iyz="-1.2237E-06" izz="1.7775E-05" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_finger.stl" />
+      </geometry>
+      <origin rpy="0 0 3.14159" xyz="0 0.0078 0.0543" />
+      <material name="White" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_finger.stl" />
+      </geometry>
+      <origin rpy="0 0 3.14159" xyz="0 0.0078 0.0543" />
+    </collision>
+  </link>
+  <joint name="left_finger_joint" type="prismatic">
+    <origin rpy="0 0 0" xyz="0 0 0" />
+    <parent link="lite_gripper_base_link" />
+    <child link="lite_gripper_left_finger" />
+    <axis xyz="0 1 0" />
+    <limit effort="10000" lower="0.0" upper="0.0081" velocity="0.1" />
+    <mimic joint="right_finger_joint" multiplier="1" offset="0" />
+  </joint>
+  <link name="lite_gripper_right_finger">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 -0.0078 0.0543" />
+      <mass value="0.012068" />
+      <inertia ixx="4.1413E-06" ixy="3.9682E-06" ixz="4.5734E-06" iyy="1.6115E-05" iyz="1.6711E-06" izz="1.6032E-05" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_finger.stl" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 -0.0078 0.0543" />
+      <material name="White" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_finger.stl" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 -0.0078 0.0543" />
+    </collision>
+  </link>
+  <joint name="right_finger_joint" type="prismatic">
+    <parent link="lite_gripper_base_link" />
+    <child link="lite_gripper_right_finger" />
+    <origin rpy="0 0 0" xyz="0 0 0" />
+    <axis xyz="0 -1 0" />
+    <limit effort="10000" lower="0.0" upper="0.0081" velocity="0.1" />
+  </joint>
+  <link name="link_tcp" />
+  <joint name="joint_tcp" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0.0836" />
+    <parent link="lite_gripper_base_link" />
+    <child link="link_tcp" />
+  </joint>
+</robot>

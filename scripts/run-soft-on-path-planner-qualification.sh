@@ -22,7 +22,6 @@ fi
 
 run_inside_container() {
   export MANYFORGE_SOFT_ON_PATH_PLAN_P999_BUDGET_US="${MANYFORGE_SOFT_ON_PATH_PLAN_P999_BUDGET_US:-5000}"
-  export MANYFORGE_SOFT_ON_PATH_ENVELOPE_P99_BUDGET_US="${MANYFORGE_SOFT_ON_PATH_ENVELOPE_P99_BUDGET_US:-250000}"
   local workspace="${WORKSPACE:-/workspace}"
   local build_dir="${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}/core"
   local source_file="${workspace}/manyforge_core/test/perf/perf_soft_on_path_planner.cpp"

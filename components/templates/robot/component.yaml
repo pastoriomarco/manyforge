@@ -1,0 +1,45 @@
+# Component descriptor of one arm. A gripper is a separate tool descriptor.
+# Guide: docs/authoring/ADDING_A_COMPONENT.md. Replace every <TODO>,
+# put the URDF, SRDF, meshes/ and licenses/ in this folder, then run
+#   scripts/manyforge component check <this folder>
+api_version: manyforge.component_package.v1
+kind: robot
+id: __ID__
+version: 1.0.0
+title: <TODO vendor and model>
+license: <TODO SPDX id of the model files, for example BSD-3-Clause>
+provenance:
+  source: <TODO repository the URDF and SRDF come from>
+  revision: <TODO commit or release>
+model:
+  urdf: __NAME__.urdf
+  srdf: __NAME__.srdf
+  package_name: manyforge_example_models
+roles:
+  root_frame: world               # the URDF root link
+  frames:
+    base: <TODO>                  # robot base link
+    flange: <TODO>                # tool flange link
+  groups:
+    arm: <TODO>                   # SRDF group of the arm joints
+  joints:
+    arm_joints: [<TODO>]          # commanded arm joints, base to tip
+  collision_bodies:
+    arm_collision: [<TODO>]       # arm links
+tcps:                             # the first is the default TCP; each id is its name
+  - {id: flange, frame: <TODO>}   # usually the flange link
+limits:
+  max_tcp_linear_speed_mps: <TODO vendor TCP speed limit in m/s, from the datasheet>
+lanes:
+  mock:                           # Mock lane adapter (manyforge_ros2_control_execution/lane/)
+    adapter: mock
+    controller: <TODO>              # the arm's JointTrajectoryController, e.g. acme_r6_traj_controller
+    arrival_tolerance_rad: 0.01     # Mock arrival: every arm joint's JTC goal
+    controllers_file: mock_controllers.yaml   # in this folder; fill in from the vendor's controller file
+    # A model of a vendor with an adapter (xArm) names it instead of the file:
+    # `vendor: xarm` and `vendor_model: <model>` (its controllers, as on the real lane).
+    hard_stop_completion_timeout_s: 1.5
+    gripper_result_timeout_s: 5.0
+defaults:
+  initial_joint_positions_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # one per arm joint
+  maximum_tcp_linear_speed_mps: 0.15

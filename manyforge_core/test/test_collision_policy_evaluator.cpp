@@ -7,7 +7,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <memory>
+#include <optional>
+#include <vector>
 
 namespace manyforge::core {
 namespace {
@@ -45,8 +48,9 @@ const CollisionPairResult* find_pair(const std::vector<CollisionPairResult>& v,
 
 TEST(CollisionPolicyEvaluator, FreeSpacePairBlocks) {
   CollisionPolicyEvaluator ev(make_free_space_policy());
-  const auto p = pair("object/box_a/shape/0",
-                      "robot/ur10e/link/wrist_3_link/collision/0");
+  const auto p = pair(
+      "component/ur10e/model/ur10e_model/body/wrist/collision/0",
+      "scene/box_a/shape/0");
   auto out = ev.classify({p}, rev(2, "world-r2"));
   ASSERT_EQ(out.pairs.size(), 1u);
   EXPECT_EQ(out.pairs[0].classification,
@@ -69,7 +73,8 @@ TEST(CollisionPolicyEvaluator, NoObservedPairsAccepts) {
 
 TEST(CollisionPolicyEvaluator, StaticStaticAllowedWhenListed) {
   auto snapshot = make_free_space_policy();
-  const auto p = pair("object/fixture_a/shape/0", "object/fixture_b/shape/0");
+  const auto p = pair("scene/fixture_a/shape/0",
+                      "scene/fixture_b/shape/0");
   snapshot.allowed_static_static_pairs.push_back(p);
   CollisionPolicyEvaluator ev(std::move(snapshot));
 
@@ -83,10 +88,11 @@ TEST(CollisionPolicyEvaluator, StaticStaticAllowedWhenListed) {
 TEST(CollisionPolicyEvaluator,
      StaticStaticAllowanceDoesNotMaskUnrelatedCollisions) {
   auto snapshot = make_free_space_policy();
-  const auto allowed = pair("object/fixture_a/shape/0",
-                            "object/fixture_b/shape/0");
-  const auto unrelated = pair("object/cheese_box/shape/0",
-                              "robot/ur10e/link/wrist_3_link/collision/0");
+  const auto allowed = pair("scene/fixture_a/shape/0",
+                            "scene/fixture_b/shape/0");
+  const auto unrelated = pair(
+      "component/ur10e/model/ur10e_model/body/wrist/collision/0",
+      "scene/cheese_box/shape/0");
   snapshot.allowed_static_static_pairs.push_back(allowed);
   CollisionPolicyEvaluator ev(std::move(snapshot));
 
@@ -108,8 +114,9 @@ TEST(CollisionPolicyEvaluator,
 TEST(CollisionPolicyEvaluator,
      TouchLinkAllowedPairClassifiedAsAllowedTouchLink) {
   auto snapshot = make_free_space_policy();
-  const auto p = pair("object/cheese_box/shape/0",
-                      "robot/ur10e/link/wrist_3_link/collision/0");
+  const auto p = pair(
+      "component/ur10e/model/ur10e_model/body/wrist/collision/0",
+      "scene/cheese_box/shape/0");
   snapshot.allowed_touch_link_pairs.push_back(p);
   CollisionPolicyEvaluator ev(std::move(snapshot));
 
@@ -123,10 +130,11 @@ TEST(CollisionPolicyEvaluator,
 TEST(CollisionPolicyEvaluator,
      TouchLinkAllowanceDoesNotMaskOtherCollisions) {
   auto snapshot = make_free_space_policy();
-  const auto allowed = pair("object/cheese_box/shape/0",
-                            "robot/ur10e/link/wrist_3_link/collision/0");
-  const auto blocking = pair("object/cheese_box/shape/0",
-                             "fixture/table_top/shape/0");
+  const auto allowed = pair(
+      "component/ur10e/model/ur10e_model/body/wrist/collision/0",
+      "scene/cheese_box/shape/0");
+  const auto blocking = pair("scene/cheese_box/shape/0",
+                             "scene/table_top/shape/0");
   snapshot.allowed_touch_link_pairs.push_back(allowed);
   CollisionPolicyEvaluator ev(std::move(snapshot));
 
@@ -141,6 +149,26 @@ TEST(CollisionPolicyEvaluator,
   EXPECT_EQ(b->classification,
             CollisionPairClassification::kBlockingCollision);
   EXPECT_FALSE(out.decision.accepted);
+}
+
+TEST(ContactGraspPolicy,
+     ExactOwnerResolvedBodyDoesNotMatchSameRoleOnAnotherComponent) {
+  ContactGraspPolicyEntry policy;
+  policy.policy_id = "contact_grasp.bound.test";
+  policy.selected_object_id = "part";
+  policy.allowed_robot_links = {
+      "component/tool_a/model/gripper/body/finger_left/collision/0"};
+  policy.max_penetration_m = 0.002;
+  policy.terminal_window_start_fraction = 0.75;
+
+  EXPECT_TRUE(contact_grasp_pair_matches(
+      pair("component/tool_a/model/gripper/body/finger_left/collision/0",
+           "scene/part/shape/0"),
+      policy));
+  EXPECT_FALSE(contact_grasp_pair_matches(
+      pair("component/tool_b/model/gripper/body/finger_left/collision/0",
+           "scene/part/shape/0"),
+      policy));
 }
 
 // --- Support-contact state machine -----------------------------------------
@@ -160,8 +188,8 @@ CollisionPolicySnapshot make_support_contact_policy(
 }
 
 TEST(CollisionPolicyEvaluator, SupportContactStartAllowedThenContinued) {
-  const auto p = pair("object/cheese_box/shape/0",
-                      "robot/ur10e/attached/cheese_box/shape/0");
+  const auto p = pair("scene/cheese_box/shape/0",
+                      "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
       make_support_contact_policy(p, /*allow_recontact=*/false));
 
@@ -179,8 +207,8 @@ TEST(CollisionPolicyEvaluator, SupportContactStartAllowedThenContinued) {
 }
 
 TEST(CollisionPolicyEvaluator, SupportContactSeparationEmitsSeparatedEntry) {
-  const auto p = pair("object/cheese_box/shape/0",
-                      "robot/ur10e/attached/cheese_box/shape/0");
+  const auto p = pair("scene/cheese_box/shape/0",
+                      "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
       make_support_contact_policy(p, /*allow_recontact=*/false));
 
@@ -196,8 +224,8 @@ TEST(CollisionPolicyEvaluator, SupportContactSeparationEmitsSeparatedEntry) {
 
 TEST(CollisionPolicyEvaluator,
      SupportContactRecontactBlocksWhenRecontactDisallowed) {
-  const auto p = pair("object/cheese_box/shape/0",
-                      "robot/ur10e/attached/cheese_box/shape/0");
+  const auto p = pair("scene/cheese_box/shape/0",
+                      "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
       make_support_contact_policy(p, /*allow_recontact=*/false));
 
@@ -213,8 +241,8 @@ TEST(CollisionPolicyEvaluator,
 }
 
 TEST(CollisionPolicyEvaluator, SupportContactRecontactAllowedWhenPolicySays) {
-  const auto p = pair("object/cheese_box/shape/0",
-                      "robot/ur10e/attached/cheese_box/shape/0");
+  const auto p = pair("scene/cheese_box/shape/0",
+                      "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
       make_support_contact_policy(p, /*allow_recontact=*/true));
 
@@ -229,8 +257,8 @@ TEST(CollisionPolicyEvaluator, SupportContactRecontactAllowedWhenPolicySays) {
 }
 
 TEST(CollisionPolicyEvaluator, ResetClearsSupportContactStateMachine) {
-  const auto p = pair("object/cheese_box/shape/0",
-                      "robot/ur10e/attached/cheese_box/shape/0");
+  const auto p = pair("scene/cheese_box/shape/0",
+                      "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
       make_support_contact_policy(p, /*allow_recontact=*/false));
 
@@ -249,7 +277,7 @@ TEST(CollisionPolicyEvaluator, ResetClearsSupportContactStateMachine) {
 TEST(ContactReleaseTransition,
      BinaryContactUsesPresenceOnlyAndAllowsContactPlateaus) {
   SupportContactPolicyEntry policy;
-  policy.pair = pair("object/part", "fixture/table");
+  policy.pair = pair("scene/part/shape/0", "scene/table/shape/0");
   policy.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
   policy.enforce_max_start_penetration = false;
   policy.release_tolerance_m = 0.0;
@@ -497,7 +525,9 @@ TEST(ContactReleaseTransition,
 
 TEST(CollisionPolicyEvaluator,
      BoundedPenetrationRecontactIsAllowedIndependentOfReleaseFlag) {
-  const auto p = pair("object/part", "robot/tool");
+  const auto p = pair(
+      "component/arm/model/arm_model/body/tool/collision/0",
+      "scene/part/shape/0");
   auto snapshot = make_support_contact_policy(p, /*allow_recontact=*/false);
   snapshot.support_contacts.front().mode =
       CollisionContactPolicyMode::kBoundedPenetration;
@@ -515,8 +545,8 @@ TEST(CollisionPolicyEvaluator,
 
 TEST(CollisionPolicyEvaluator,
      SharedPolicyIndexDoesNotShareSupportContactStateMachine) {
-  const auto p = pair("object/cheese_box/shape/0",
-                      "robot/ur10e/attached/cheese_box/shape/0");
+  const auto p = pair("scene/cheese_box/shape/0",
+                      "scene/table/shape/0");
   auto snapshot = std::make_shared<CollisionPolicySnapshot>(
       make_support_contact_policy(p, /*allow_recontact=*/false));
   auto index = build_collision_policy_index(*snapshot);
@@ -608,6 +638,108 @@ TEST(CollisionPolicyEvaluator,
   EXPECT_EQ(out.pairs[0].pair, early);
   EXPECT_TRUE(out.pairs[0].is_first_failure);
   EXPECT_FALSE(out.pairs[1].is_first_failure);
+}
+
+// --- M6 collision clearance: per-pair margins from the policy -------------
+
+CollisionWorldBody clearance_body(const std::string& id, CollisionOwnerKind owner,
+                                  std::optional<CollisionBodyId> parent = std::nullopt) {
+  CollisionWorldBody body;
+  body.body_id = id;
+  body.owner_kind = owner;
+  body.parent_body_id = std::move(parent);
+  body.frame_id = "world";
+  return body;
+}
+
+TEST(CollisionClearanceMargins, MarginFollowsTheContactPolicies) {
+  // M6 decision 17: a pair the contact policy allows to touch keeps margin 0;
+  // every other robot <-> environment pair gets the move's clearance. The
+  // move's target object is not exempt by itself.
+  const std::string base = "component/arm/model/arm_model/body/base/collision/0";
+  const std::string wrist = "component/arm/model/arm_model/body/wrist/collision/0";
+  const std::string fingers = "component/arm/model/arm_model/body/fingers/collision/0";
+  const std::string carried = "scene/part/shape/0";
+  const std::string table = "scene/table/shape/0";
+  const std::string wall = "scene/wall/shape/0";
+  const std::string tray = "scene/tray/shape/0";
+  const std::string target = "scene/graspable/shape/0";
+  const std::string runtime_box = "runtime_object/box/shape/0";
+  CollisionWorldSnapshot world;
+  world.bodies = {
+      clearance_body(base, CollisionOwnerKind::kComponentModelBody),
+      clearance_body(fingers, CollisionOwnerKind::kComponentModelBody),
+      clearance_body(wrist, CollisionOwnerKind::kComponentModelBody),
+      clearance_body(runtime_box, CollisionOwnerKind::kRuntimeObject),
+      clearance_body(target, CollisionOwnerKind::kSceneResource),
+      clearance_body(carried, CollisionOwnerKind::kSceneResource, wrist),
+      clearance_body(table, CollisionOwnerKind::kSceneResource),
+      clearance_body(tray, CollisionOwnerKind::kSceneResource),
+      clearance_body(wall, CollisionOwnerKind::kSceneResource),
+  };
+  auto policy = make_free_space_policy();
+  policy.allowed_static_static_pairs = {pair(base, table)};   // static
+  policy.allowed_touch_link_pairs = {pair(fingers, carried)};  // touch link
+  SupportContactPolicyEntry support;
+  support.pair = pair(carried, table);                         // support contact
+  policy.support_contacts = {support};
+  ContactGraspPolicyEntry grasp;
+  grasp.policy_id = "grasp_tray";
+  grasp.selected_object_id = "tray";
+  grasp.allowed_robot_links = {fingers};                       // grasp target contact
+  grasp.max_penetration_m = 0.002;
+  policy.contact_grasps = {grasp};
+
+  const auto margins = build_collision_clearance_margins(world, policy, "grasp_tray", 0.003);
+  ASSERT_NE(margins, nullptr);
+  EXPECT_DOUBLE_EQ(margins->margin_m, 0.003);
+  std::vector<CollisionPairId> expected{
+      pair(base, runtime_box),    pair(base, target),     pair(base, tray),
+      pair(base, wall),           pair(fingers, runtime_box), pair(fingers, target),
+      pair(fingers, table),       pair(fingers, wall),    pair(wrist, runtime_box),
+      pair(wrist, target),        pair(wrist, table),     pair(wrist, tray),
+      pair(wrist, wall),          pair(carried, runtime_box), pair(carried, target),
+      pair(carried, tray),        pair(carried, wall)};
+  std::sort(expected.begin(), expected.end());
+  std::vector<CollisionPairId> actual;
+  for (const auto& entry : margins->pairs) {
+    actual.push_back(entry.pair);
+    EXPECT_DOUBLE_EQ(entry.margin_m, 0.003);
+  }
+  EXPECT_EQ(actual, expected);
+  EXPECT_TRUE(std::is_sorted(actual.begin(), actual.end()));
+
+  // An allowed contact keeps margin 0 (its penetration tolerance stays with
+  // the policy evaluator); the normal pair next to it gets the clearance.
+  EXPECT_DOUBLE_EQ(margins->margin_for(pair(fingers, tray)), 0.0);     // grasp contact
+  EXPECT_DOUBLE_EQ(margins->margin_for(pair(wrist, tray)), 0.003);     // normal pair
+  EXPECT_DOUBLE_EQ(margins->margin_for(pair(base, table)), 0.0);       // static
+  EXPECT_DOUBLE_EQ(margins->margin_for(pair(fingers, carried)), 0.0);  // touch link
+  EXPECT_DOUBLE_EQ(margins->margin_for(pair(carried, table)), 0.0);    // support contact
+  EXPECT_DOUBLE_EQ(margins->margin_for(pair(fingers, target)), 0.003); // target, no policy
+  EXPECT_DOUBLE_EQ(margins->margin_for(pair(base, wrist)), 0.0);       // self
+  EXPECT_DOUBLE_EQ(margins->margin_for(pair(table, wall)), 0.0);       // environment only
+
+  // Without the active grasp the grasp pair is a normal pair; a per-move
+  // clearance is used as given.
+  const auto without_grasp = build_collision_clearance_margins(world, policy, "", 0.0015);
+  ASSERT_NE(without_grasp, nullptr);
+  EXPECT_DOUBLE_EQ(without_grasp->margin_m, 0.0015);
+  EXPECT_DOUBLE_EQ(without_grasp->margin_for(pair(fingers, tray)), 0.0015);
+  EXPECT_DOUBLE_EQ(without_grasp->margin_for(pair(wrist, runtime_box)), 0.0015);
+}
+
+TEST(CollisionClearanceMargins, ZeroClearanceOrNoEnvironmentMeansNoMargins) {
+  CollisionWorldSnapshot world;
+  world.bodies = {
+      clearance_body("component/arm/model/arm_model/body/wrist/collision/0",
+                     CollisionOwnerKind::kComponentModelBody),
+      clearance_body("scene/wall/shape/0", CollisionOwnerKind::kSceneResource)};
+  EXPECT_EQ(build_collision_clearance_margins(world, make_free_space_policy(), "", 0.0),
+            nullptr);
+  world.bodies.pop_back();
+  EXPECT_EQ(build_collision_clearance_margins(world, make_free_space_policy(), "", 0.003),
+            nullptr);
 }
 
 }  // namespace

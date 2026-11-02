@@ -1,80 +1,81 @@
-import { useComposerStore } from '../store/composerStore';
-import { useProgramStore } from '../store/programStore';
-import { useEditLocked } from '../store/cycleStore';
-import type { EdgeStyle } from '../store/composerStore';
+import { EDGE_STYLE_OPTIONS, type EdgeStyle, type LayoutDirection } from '../store/composerStore';
 
-const EDGE_STYLE_OPTIONS: { value: EdgeStyle; label: string }[] = [
-  { value: 'smoothstep', label: 'Orthogonal' },
-  { value: 'simplebezier', label: 'Smooth' },
-  { value: 'default', label: 'Bezier' },
-  { value: 'straight', label: 'Straight' },
-  { value: 'step', label: 'Step' },
-];
+interface CanvasViewControlsProps {
+  edgeStyle: EdgeStyle;
+  layoutDirection: LayoutDirection;
+  disabled?: boolean;
+  onEdgeStyleChange: (style: EdgeStyle) => void;
+  onLayoutDirectionChange: (direction: LayoutDirection) => void;
+  onAutoLayout: () => void;
+  onFitView?: () => void;
+}
 
-/**
- * CanvasViewControls — graph-view options (orientation, auto-align, edge
- * style) as a compact pill overlaying the tree canvas, next to the thing
- * they affect. These are view preferences, not document actions, so they
- * are deliberately quiet: icon buttons, neutral chrome, tooltips.
- */
-export function CanvasViewControls() {
-  const { edgeStyle, setEdgeStyle } = useComposerStore();
-  const nodes = useProgramStore((state) => state.nodes);
-  const layoutDirection = useProgramStore((state) => state.layoutDirection);
-  const setLayoutDirection = useProgramStore((state) => state.setLayoutDirection);
-  const autoLayout = useProgramStore((state) => state.autoLayout);
-  const editLocked = useEditLocked();
-  const disabled = editLocked || nodes.length === 0;
-
+/** Prop-driven graph presentation controls, independent of runtime stores. */
+export function CanvasViewControls({
+  edgeStyle,
+  layoutDirection,
+  disabled = false,
+  onEdgeStyleChange,
+  onLayoutDirectionChange,
+  onAutoLayout,
+  onFitView,
+}: CanvasViewControlsProps) {
+  const nextDirection = layoutDirection === 'vertical' ? 'horizontal' : 'vertical';
   return (
-    <div className="pointer-events-none absolute inset-x-0 bottom-3 z-20 flex justify-center">
-      <div className="pointer-events-auto flex items-center gap-1 rounded-md border border-gray-600/70 bg-gray-900/85 px-1.5 py-1 shadow-lg shadow-black/40 backdrop-blur-sm">
+    <div className="canvas-view-controls" aria-label="Canvas view controls">
+      <button
+        type="button"
+        onClick={() => onLayoutDirectionChange(nextDirection)}
+        disabled={disabled}
+        title={`Switch to ${nextDirection} layout`}
+      >
+        {/* Drawn icons: text glyphs sit on font metrics and are not centered. */}
+        <svg className="canvas-tool-icon" viewBox="0 0 16 16" aria-hidden="true">
+          {layoutDirection === 'vertical'
+            ? <path d="M2 8h12M4.5 5.5 2 8l2.5 2.5M11.5 5.5 14 8l-2.5 2.5" />
+            : <path d="M8 2v12M5.5 4.5 8 2l2.5 2.5M5.5 11.5 8 14l2.5-2.5" />}
+        </svg>
+        <span className="sr-only">Switch layout direction</span>
+      </button>
+      <button
+        type="button"
+        onClick={onAutoLayout}
+        disabled={disabled}
+        title="Auto-align nodes"
+      >
+        <svg className="canvas-tool-icon" viewBox="0 0 16 16" aria-hidden="true">
+          <rect x="2.5" y="2.5" width="11" height="11" rx="1.2" />
+          <path d="M6.17 2.5v11M9.83 2.5v11M2.5 6.17h11M2.5 9.83h11" />
+        </svg>
+        <span className="sr-only">Auto-align nodes</span>
+      </button>
+      {onFitView && (
         <button
           type="button"
-          onClick={() => setLayoutDirection(layoutDirection === 'vertical' ? 'horizontal' : 'vertical')}
-          disabled={disabled}
-          title={layoutDirection === 'vertical' ? 'Switch to horizontal layout' : 'Switch to vertical layout'}
-          className="rounded p-1.5 text-gray-300 transition-colors hover:bg-gray-700 hover:text-white disabled:cursor-not-allowed disabled:text-gray-600"
+          onClick={onFitView}
+          title="Fit complete tree in canvas"
+          aria-label="Fit complete tree in canvas"
         >
-          {layoutDirection === 'vertical' ? (
-            <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.5" aria-hidden>
-              <path d="M2 8h9M8 4l4 4-4 4" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-          ) : (
-            <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.5" aria-hidden>
-              <path d="M8 2v9M4 8l4 4 4-4" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-          )}
-        </button>
-        <button
-          type="button"
-          onClick={autoLayout}
-          disabled={disabled}
-          title="Auto-align nodes"
-          className="rounded p-1.5 text-gray-300 transition-colors hover:bg-gray-700 hover:text-white disabled:cursor-not-allowed disabled:text-gray-600"
-        >
-          <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.5" aria-hidden>
-            <rect x="2" y="2" width="4.5" height="4.5" rx="0.5" />
-            <rect x="9.5" y="2" width="4.5" height="4.5" rx="0.5" />
-            <rect x="2" y="9.5" width="4.5" height="4.5" rx="0.5" />
-            <rect x="9.5" y="9.5" width="4.5" height="4.5" rx="0.5" />
+          <svg
+            className="canvas-tool-icon"
+            viewBox="0 0 16 16"
+            aria-hidden="true"
+          >
+            <path d="M6 3H3v3M10 3h3v3M3 10v3h3M13 10v3h-3" />
           </svg>
         </button>
-        <div className="mx-0.5 h-5 w-px bg-gray-600/70" />
-        <select
-          value={edgeStyle}
-          onChange={(e) => setEdgeStyle(e.target.value as EdgeStyle)}
-          disabled={editLocked}
-          className="rounded border-none bg-transparent py-1 pl-1 pr-5 text-xs text-gray-300 hover:text-white focus:outline-none disabled:cursor-not-allowed disabled:text-gray-600"
-          title="Connection line style"
-        >
-          {EDGE_STYLE_OPTIONS.map((option) => (
-            <option key={option.value} value={option.value} className="bg-gray-800 text-gray-200">
-              {option.label}
-            </option>
-          ))}
-        </select>
-      </div>
+      )}
+      <select
+        value={edgeStyle}
+        onChange={(event) => onEdgeStyleChange(event.target.value as EdgeStyle)}
+        disabled={disabled}
+        title="Connection line style"
+        aria-label="Connection line style"
+      >
+        {EDGE_STYLE_OPTIONS.map((option) => (
+          <option key={option.value} value={option.value}>{option.label}</option>
+        ))}
+      </select>
     </div>
   );
 }

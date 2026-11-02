@@ -1,16 +1,39 @@
 #!/usr/bin/env python3
-"""Validate observation-only startup of the real-Lite6 product lane."""
+"""Retain pure fail-closed Lite6 startup reduction behind an I10/R gate.
+
+The mapping reducers remain effect-free acceptance input for observation-only
+startup: motion admission must stay closed, component roles and epochs must be
+complete and unique, and supervision progress must advance.  The historical
+Composer HTTP routes and CLI loop are removed because no I10 client contract
+exists yet.  Direct execution fails before parsing arguments or opening a
+socket.
+
+Exact historical source: ManyForge
+``08222188293df8e12f90dc72e204c21f22f92ea1``, blob
+``5d2aa09d302a159bb03a0f086d4bf99484c41f09``.  The reducer returns through
+the I5/H0 status owner and the I10/R real-Lite6 product client; the old route
+names are not a compatibility promise.
+"""
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import sys
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Final, Mapping
 import urllib.error
-import urllib.request
+
+
+LITE6_PRODUCT_SMOKE_UNAVAILABLE_REASON_CODE: Final = (
+    "composable_cell_lite6_product_smoke_unavailable"
+)
+HISTORICAL_SOURCE_COMMIT: Final = (
+    "08222188293df8e12f90dc72e204c21f22f92ea1"
+)
+HISTORICAL_SOURCE_BLOB: Final = (
+    "5d2aa09d302a159bb03a0f086d4bf99484c41f09"
+)
 
 REQUIRED_COMPONENT_ROLES = frozenset(
     {
@@ -170,49 +193,15 @@ def wait_for_observation_only_smoke(
         sleep(0.1)
 
 
-def _load_json(url: str, *, timeout_s: float) -> Mapping[str, Any]:
-    with urllib.request.urlopen(url, timeout=timeout_s) as response:
-        payload = json.load(response)
-    if not isinstance(payload, Mapping):
-        raise ValueError(f'status response is not an object: {url}')
-    return payload
+def main(_argv: object = None) -> int:
+    """Fail before parsing arguments or contacting Composer/ROS/hardware."""
 
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--composer-url', required=True)
-    parser.add_argument('--expected-cell-id', required=True)
-    parser.add_argument('--timeout-s', required=True, type=float)
-    args = parser.parse_args(argv)
-
-    request_timeout_s = min(5.0, max(0.1, args.timeout_s))
-    base_url = args.composer_url.rstrip('/')
-
-    def fetch_status() -> tuple[Mapping[str, Any], Mapping[str, Any]]:
-        return (
-            _load_json(
-                f'{base_url}/api/robot-lifecycle/status',
-                timeout_s=request_timeout_s,
-            ),
-            _load_json(
-                f'{base_url}/api/runtime/status',
-                timeout_s=request_timeout_s,
-            ),
-        )
-
-    try:
-        wait_for_observation_only_smoke(
-            fetch_status=fetch_status,
-            expected_cell_id=args.expected_cell_id,
-            timeout_s=args.timeout_s,
-        )
-    except (SmokeValidationError, TimeoutError, ValueError) as error:
-        print(str(error), file=sys.stderr)
-        return 1
     print(
-        'real-robot startup supervision is advancing and ' 'motion admission is closed'
+        f"{LITE6_PRODUCT_SMOKE_UNAVAILABLE_REASON_CODE}: the real-Lite6 "
+        "status client returns at I10/R after the I5/H0 status contract",
+        file=sys.stderr,
     )
-    return 0
+    return 78
 
 
 if __name__ == '__main__':

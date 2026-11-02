@@ -1,9 +1,8 @@
 #include <manyforge_core/runtime_collision_monitor.hpp>
+#include <manyforge_core/time/stuck_drain_wait.hpp>
 
 #include <algorithm>
 #include <chrono>
-#include <exception>
-#include <iostream>
 #include <limits>
 #include <utility>
 
@@ -30,29 +29,6 @@ TimePoint saturating_add(TimePoint base, Duration positive_delta) noexcept {
     return std::numeric_limits<TimePoint>::max();
   }
   return base + positive_delta;
-}
-
-[[noreturn]] void terminate_runtime_monitor_drain_timeout(
-    const char* phase, const std::function<void()>& dump_hook) {
-  // Fail closed: monitor callbacks can own borrowed kernel state. Once stop()
-  // is draining for teardown, continuing after the bound risks UAF and an
-  // unbounded wait can hang shutdown.
-  std::cerr << "manyforge_runtime_collision_monitor_drain_timeout"
-            << " phase=" << phase
-            << " timeout_ms="
-            << std::chrono::duration_cast<std::chrono::milliseconds>(
-                   kDrainCallbacksTimeout)
-                   .count()
-            << '\n';
-  if (dump_hook) {
-    // Best-effort flight-evidence flush before dying; never let the hook
-    // turn a fail-closed teardown into an exception escape.
-    try {
-      dump_hook();
-    } catch (...) {
-    }
-  }
-  std::terminate();
 }
 
 }  // namespace
@@ -101,22 +77,32 @@ void RuntimeCollisionMonitor::stop(bool drain_callbacks) {
         handle_ = 0;
       }
     }
+    // Monitor callbacks can own borrowed kernel state: a missed drain bound
+    // must not continue into teardown or a new session. It keeps waiting.
     if (drain_callbacks) {
-      if (!scheduler_.drain_for(SchedulerPriority::RuntimeSafety,
-                                kDrainCallbacksTimeout)) {
-        terminate_runtime_monitor_drain_timeout("scheduler_runtime_safety_lane",
-                                                 fail_closed_dump_hook_);
-      }
+      WaitForDrain(
+          "runtime_collision_monitor.scheduler_runtime_safety_lane",
+          kDrainCallbacksTimeout,
+          [this](std::chrono::nanoseconds bound) {
+            return scheduler_.drain_for(SchedulerPriority::RuntimeSafety, bound);
+          },
+          [this] {
+            if (fail_closed_dump_hook_) fail_closed_dump_hook_();
+          });
     }
     std::unique_lock<std::mutex> lock(mutex_);
     auto no_callbacks_in_flight = [this]() {
       return callbacks_in_flight_ == 0;
     };
     if (drain_callbacks) {
-      if (!cv_.wait_for(lock, kDrainCallbacksTimeout, no_callbacks_in_flight)) {
-        terminate_runtime_monitor_drain_timeout("monitor_callbacks",
-                                                 fail_closed_dump_hook_);
-      }
+      WaitForDrain(
+          "runtime_collision_monitor.monitor_callbacks", kDrainCallbacksTimeout,
+          [&](std::chrono::nanoseconds bound) {
+            return cv_.wait_for(lock, bound, no_callbacks_in_flight);
+          },
+          [this] {
+            if (fail_closed_dump_hook_) fail_closed_dump_hook_();
+          });
     } else {
       (void)cv_.wait_for(lock, std::chrono::milliseconds(250),
                          no_callbacks_in_flight);

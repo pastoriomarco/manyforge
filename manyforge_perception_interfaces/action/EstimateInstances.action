@@ -1,0 +1,64 @@
+# Copyright 2026 Marco Pastorio
+# SPDX-License-Identifier: Apache-2.0
+# One capture, one detection pass, serial instances. See package README.
+string request_id
+uint32 attempt
+string model_id
+string model_revision
+# Optional caller Program-run identity; empty means unavailable.
+string execution_id
+uint8 CAPTURE_NEXT=0
+uint8 CAPTURE_LATEST=1
+uint8 capture_mode
+uint32 settle_frames
+builtin_interfaces/Duration max_capture_age
+builtin_interfaces/Duration work_budget
+uint32 max_instances
+float32 min_detection_score
+uint8 ORDER_SCORE=0
+uint8 ORDER_REGION_CENTER=1
+uint8 ORDER_TOP_TO_BOTTOM=2
+uint8 order
+Region region
+uint8 REGION_WHOLE=0
+uint8 REGION_CENTRE=1
+uint8 region_membership
+uint8 REUSE_NONE=0
+uint8 REUSE_REFINE=1
+uint8 REUSE_AND_REFINE=2
+uint8 reuse_policy
+string viewpoint_id
+bool preempt
+---
+string request_id
+uint32 attempt
+string provider_session
+uint8 COMPLETE=0
+uint8 VALID_EMPTY=1
+uint8 PARTIAL=2
+uint8 CANCELLED=3
+uint8 FAILED=4
+uint8 outcome
+string reason
+# Original source capture, never the internal processing timestamp.
+std_msgs/Header capture
+uint32 capture_epoch
+string calibration_id
+uint32 detections_total
+Detection[] detections
+Instance[] instances
+JobTiming timing
+---
+string request_id
+uint32 attempt
+string provider_session
+std_msgs/Header capture
+uint32 capture_epoch
+string calibration_id
+uint8 KIND_DETECTIONS=0
+uint8 KIND_INSTANCE=1
+uint8 kind
+Detection[] detections
+uint32 selected_total
+uint32 finished_count
+Instance instance

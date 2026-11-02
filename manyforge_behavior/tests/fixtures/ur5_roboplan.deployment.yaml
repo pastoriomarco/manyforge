@@ -10,7 +10,6 @@ robot_config:
   group_id: arm
   urdf_path: package://roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf
   srdf_path: package://roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf
-  global_max_tcp_linear_speed_mps: 0.25
 
 adapters:
   planning:
@@ -21,9 +20,6 @@ adapters:
       - planning.motion.joint_goal
       - planning.motion.pose_goal
       - planning.motion.cartesian_path
-      - planning.profile.first_feasible
-      - planning.profile.balanced
-      - planning.profile.quality_bounded
       - planning.trajectory.time_parameterized
     config:
       rng_seed: 12345
@@ -62,12 +58,9 @@ adapters:
       - execution.feedback.phase_events
       - execution.feedback.state_snapshots
       - execution.stop.soft
-      - execution.pause
-      - execution.resume
       - execution.reset
     config:
       action_name: /joint_trajectory_controller/follow_joint_trajectory
-      supports_pause_resume: true
 
 orchestrator:
   engine: py_trees

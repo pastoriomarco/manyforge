@@ -16,8 +16,8 @@
   },
   "xarm_ros2": {
     "repo": "https://github.com/pastoriomarco/xarm_ros2",
-    "branch": "jazzy_no_gazebo",
-    "commit": "012731afb9ef1d4289ec45112e8d083ab59a5c1e"
+    "branch": "lyrical-no-gazebo",
+    "commit": "ef7351f90e451a37ef73de69c643b7e85040401a"
   },
   "artifacts": {
     "urdf": "manyforge_example_models/models/lite6_lite_gripper/manymove_runtime_capture/manymove_lite6_runtime.urdf",

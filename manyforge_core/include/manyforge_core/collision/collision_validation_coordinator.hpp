@@ -81,6 +81,10 @@ struct CollisionValidationPassConfig {
   /// Concrete per-request contact policy. Empty means free-space validation.
   std::string contact_policy_id;
 
+  /// Clearance margins carried by every query of this pass. Null (runtime
+  /// lookahead, monitor) means margin 0 for every pair.
+  std::shared_ptr<const CollisionClearanceMargins> clearance_margins;
+
   /// Optional plan-global sample fractions for a bounded runtime-lookahead
   /// prefix. Contact-grasp terminal windows are properties of the accepted
   /// expanded trajectory; a truncated prefix must never renormalize itself to

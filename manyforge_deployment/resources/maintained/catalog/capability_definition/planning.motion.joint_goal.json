@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
+  "capability_id": "planning.motion.joint_goal",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "target_binding"
+}
