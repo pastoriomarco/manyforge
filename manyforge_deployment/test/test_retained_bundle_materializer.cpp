@@ -61,7 +61,7 @@ public:
   [[nodiscard]] static BuildQualifiedRetentionContext make_context() {
     return BuildQualifiedRetentionContext(
         core::RetainedNodeEnvironmentDTO{
-            "manyforge_i3_materializer_test",
+            "manyforge_retained_materializer_test",
             "1.0.0",
             core::ContentDigest("sha256:"
                                 "2222222222222222222222222222222222222222222222"
@@ -220,10 +220,10 @@ array_member(const CanonicalValue &value, std::string_view name) {
 
 [[nodiscard]] std::string deployment_document(std::string_view cell_id) {
   return "{\"api_version\":\"manyforge.deployment.v1\","
-         "\"deployment_artifact_id\":\"i3_canonical_empty\","
+         "\"deployment_artifact_id\":\"materializer_canonical_empty\","
          "\"deployment_revision\":\"" +
          std::string(kZeroDigest) + "\",\"cell_id\":\"" + std::string(cell_id) +
-         "\",\"name\":\"I3 canonical empty\","
+         "\",\"name\":\"Materializer canonical empty\","
          "\"catalogs\":{\"records\":[]},"
          "\"graph\":" +
          empty_graph() +
@@ -338,10 +338,9 @@ make_contact_policy_retention_fixture() {
                         {"body_a",
                          CanonicalValue(CanonicalValue::Object{
                              {"kind", CanonicalValue("component_model_body")},
-                             {"component_role_id", CanonicalValue("robot")},
-                             {"model_role_id", CanonicalValue("arm_model")},
-                             {"collision_body_role_id",
-                              CanonicalValue("tool_collision")},
+                             {"body", CanonicalValue(CanonicalValue::Object{
+                                 {"component_id", CanonicalValue("robot")},
+                                 {"collision_body_id", CanonicalValue("tool_collision")}})},
                          })},
                         {"body_b",
                          CanonicalValue(CanonicalValue::Object{
@@ -372,7 +371,7 @@ make_contact_policy_retention_fixture() {
       core::SchemaId("manyforge.contact_policy.v1"),
       core::SchemaRevision(
           "sha256:"
-          "c7ad633867abbe4583dee2eda51dca5b33bd8e8827777a8ac9ab86b2aba20490"),
+          "f7adb173ef71d9de9011c85a19224cace5e721918fb1659fcada6ab93901ad33"),
       core::ContentDigest(policy_digest),
       core::ContentAddressedStoreKey("sha256/" + policy_digest.substr(7U)),
   };
@@ -603,7 +602,7 @@ private:
 
 TEST(RetainedBundleMaterializer,
      CanonicalEmptyUsesOrdinaryCompilerUrdfSrdfAndClosedEnvelope) {
-  const auto qualified = qualify_empty("i3_empty_cell");
+  const auto qualified = qualify_empty("empty_cell");
   const auto &composition =
       qualified.compiler_ir().applicability().composition();
   const std::string expected_urdf =
@@ -634,7 +633,7 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(string_member(root, "api_version"),
             core::kRetainedBundleApiVersion);
   EXPECT_EQ(string_member(root, "deployment_artifact_id"),
-            "i3_canonical_empty");
+            "materializer_canonical_empty");
   EXPECT_EQ(string_member(root, "retained_bundle_id"),
             bundle->retained_bundle_id().value());
   EXPECT_EQ(bundle->value().api_version, core::kRetainedBundleApiVersion);
@@ -742,7 +741,7 @@ TEST(RetainedBundleMaterializer,
 TEST(RetainedBundleMaterializer,
      RehashedViewerCannotDivergeFromAuthoritativePlanningUrdf) {
   test::InMemoryRawArtifactStoreFixture store;
-  const auto bundle = materialize_empty("i3_viewer_splice_cell", store);
+  const auto bundle = materialize_empty("viewer_splice_cell", store);
   const auto &products = bundle->value().compiled_products;
   ASSERT_TRUE(products.viewer_model.has_value());
   ASSERT_EQ(products.planning_collision_model.artifact_refs.size(), 3U);
@@ -1096,7 +1095,7 @@ TEST(RetainedBundleMaterializer,
      ControllableLite6RetainsExactTargetBindingAndCatalogClosure) {
   const auto fixture =
       test::make_lite6_ros2_control_observed_consumer_retention_fixture();
-  // DX-753: retain observation-only controller assertions at the cold emit seam.
+  // Retain observation-only controller assertions at the cold emit seam.
   const auto cold_fixture = test::make_lite6_controllable_retention_fixture();
   const test::Lite6ControllableCompilerInputArtifactSource input_source(
       fixture);
@@ -1479,46 +1478,6 @@ TEST(RetainedBundleMaterializer,
 }
 
 TEST(RetainedBundleMaterializer,
-     GripperOnlyNativeCellRetainsAUnitWithoutAnyMotionConfiguration) {
-  GTEST_SKIP() << "NOT_RUN/A1: shared hosted-gripper/no-motion reference awaits genuine ROS coverage";
-  // DX-741: native admission retires; the shared assertion reference remains.
-  const auto assert_hosted_gripper_without_motion =
-      [](const RetainedBundle *bundle,
-         const execution_runtime_contract::Configuration &configuration) {
-      ASSERT_NE(bundle, nullptr);
-      EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
-
-      const auto &graph = bundle->value().cell_graph;
-      ASSERT_EQ(graph.runtime_units.size(), 1U);
-      const auto &runtime_unit_id = graph.runtime_units.front().runtime_unit_id;
-      // The arm target stays declared by the component type but is unbound:
-      // the one unit hosts the gripper and nothing that moves an arm.
-      EXPECT_TRUE(std::none_of(
-          graph.control_bindings.begin(), graph.control_bindings.end(),
-          [](const auto &binding) {
-            return binding.capability_id.value() == "execution.trajectory.execute" ||
-                   binding.command_target_id.value() == test::kLite6ArmTargetId;
-          }));
-      EXPECT_TRUE(std::any_of(
-          graph.control_bindings.begin(), graph.control_bindings.end(),
-          [&](const auto &binding) {
-            return binding.capability_id.value() == "tool.gripper.command" &&
-                   binding.provider_runtime_unit_id == runtime_unit_id;
-          }));
-      EXPECT_TRUE(bundle->value().capability_provider_bindings.empty());
-      ASSERT_EQ(bundle->value().desired_control_configurations.size(), 1U);
-
-      EXPECT_TRUE(configuration.initial_joint_positions_rad.empty());
-      EXPECT_TRUE(configuration.motion_target_limits.empty());
-      EXPECT_TRUE(configuration.direct_control_joint_limits.empty());
-      ASSERT_EQ(configuration.gripper_target_configurations.size(), 1U);
-      EXPECT_EQ(configuration.gripper_target_configurations.front().command_target_id,
-                core::CommandTargetId(std::string(test::kLite6GripperTargetId)));
-      };
-  (void)assert_hosted_gripper_without_motion;
-}
-
-TEST(RetainedBundleMaterializer,
      GripperOnlyRosCellRetainsAUnitWithoutAnyMotionConfiguration) {
   const auto fixture =
       test::make_lite_gripper_only_retention_fixture(test::kWithLifecycleOffers);
@@ -1553,8 +1512,7 @@ TEST(RetainedBundleMaterializer,
           *bundle, unit.runtime_unit_id);
   EXPECT_TRUE(configuration.initial_joint_positions_rad.empty());
   EXPECT_TRUE(configuration.motion_target_limits.empty());
-  // ROS has no authored direct-control-limit field. The archived Native
-  // empty-vector assertion also runs in NativeConfigurationCarriesMotionFields...
+  // ROS has no authored direct-control-limit field.
   EXPECT_EQ(unit.configuration.find("direct_control_joint_limits"),
             unit.configuration.end());
   auto with_native_direct_limits = unit.configuration;
@@ -1611,7 +1569,7 @@ TEST(RetainedBundleMaterializer,
   EXPECT_THROW(static_cast<void>(detail::decode_execution_motion_target_limits(
                    core::JsonValueDTO::Array{extra})),
                RetainedBundleError);
-  // V2-9: the authored ordinary-jerk switch and typed values decode.
+  // The authored ordinary-jerk switch and typed values decode.
   auto jerk = row(0.25);
   std::get<core::JsonObjectDTO>(jerk.value).emplace(
       "ordinary_motion_jerk",
@@ -2503,7 +2461,7 @@ TEST(
       const auto control = detail::parse_and_verify_control_domain_control(
           bytes, &graph, coordinates);
       EXPECT_EQ(canonical_json(control), bytes);
-      // DX817 is source context, not a new member in the retained control wire.
+      // The actuation kind is source context, not a new member in the retained control wire.
       EXPECT_EQ(control.find_object_member("gripper_actuation_kind"), nullptr);
       EXPECT_NO_THROW(
           detail::require_control_domain_control_matches_retained_bundle(
@@ -2607,7 +2565,7 @@ TEST(ControlDomainControlVerifier,
   EXPECT_EQ(string_member(stop, "disposition"), "stoppable");
   EXPECT_EQ(string_member(stop, "stop_evidence_policy_id"),
             "lite6_controller_goal_terminal_stop");
-  // Q51: the retained Stop policy carries no shared cell Stop budget.
+  // The retained Stop policy carries no shared cell Stop budget.
   EXPECT_FALSE(std::get<CanonicalValue::Object>(stop.storage()).end() !=
                std::find_if(std::get<CanonicalValue::Object>(stop.storage()).begin(),
                             std::get<CanonicalValue::Object>(stop.storage()).end(),
@@ -3183,8 +3141,8 @@ TEST(RetainedBundleMaterializer,
      RegenerationIsByteExactAndRepositoryRoundTripReverifiesWholeEnvelope) {
   test::InMemoryRawArtifactStoreFixture first_store;
   test::InMemoryRawArtifactStoreFixture second_store;
-  const auto first = materialize_empty("i3_empty_cell", first_store);
-  const auto second = materialize_empty("i3_empty_cell", second_store);
+  const auto first = materialize_empty("empty_cell", first_store);
+  const auto second = materialize_empty("empty_cell", second_store);
 
   EXPECT_EQ(first->retained_bundle_id(), second->retained_bundle_id());
   EXPECT_EQ(first->normalized_root(), second->normalized_root());
@@ -3210,8 +3168,8 @@ TEST(RetainedBundleMaterializer,
      SealedRepositoryEnforcesActualBundleCountAndByteBounds) {
   test::InMemoryRawArtifactStoreFixture first_store;
   test::InMemoryRawArtifactStoreFixture second_store;
-  const auto first = materialize_empty("i3_bound_cell_a", first_store);
-  const auto second = materialize_empty("i3_bound_cell_b", second_store);
+  const auto first = materialize_empty("bound_cell_a", first_store);
+  const auto second = materialize_empty("bound_cell_b", second_store);
 
   ASSERT_GT(first->canonical_bytes().size(), 1U);
   test::InMemoryRetainedBundleRepositoryFixture byte_bounded(
@@ -3237,8 +3195,8 @@ TEST(RetainedBundleMaterializer,
      ValidCellIdentityChangesRemainOrdinaryCellSpecificProducts) {
   test::InMemoryRawArtifactStoreFixture first_store;
   test::InMemoryRawArtifactStoreFixture second_store;
-  const auto first = materialize_empty("i3_empty_cell_a", first_store);
-  const auto second = materialize_empty("i3_empty_cell_b", second_store);
+  const auto first = materialize_empty("empty_cell_a", first_store);
+  const auto second = materialize_empty("empty_cell_b", second_store);
 
   EXPECT_NE(first->retained_bundle_id(), second->retained_bundle_id());
   EXPECT_NE(first->canonical_bytes(), second->canonical_bytes());
@@ -3272,8 +3230,8 @@ TEST(RetainedBundleMaterializer, ScenePosePolicySelectionSurvivesSealedReload) {
       {"camera", "part",
        core::ScenePoseDetection3dKeyDTO{"part", "", 0.5, 0.0025, "first"},
        "continuous_unattached"}};
-  const auto ordinary = materialize_empty("i3_pose_policy_cell", store, 1.0);
-  const auto selected = materialize_empty("i3_pose_policy_cell", store, 1.0,
+  const auto ordinary = materialize_empty("pose_policy_cell", store, 1.0);
+  const auto selected = materialize_empty("pose_policy_cell", store, 1.0,
                                           std::nullopt, policies);
   EXPECT_EQ(selected->value().scene_pose_sources, policies);
   EXPECT_NE(selected->retained_bundle_id(), ordinary->retained_bundle_id());
@@ -3349,13 +3307,13 @@ TEST(RetainedBundleMaterializer,
 TEST(RetainedBundleMaterializer,
      MovingTakeoverBudgetIsOptionalRetainedAndBoundByTheBundleIdentity) {
   test::InMemoryRawArtifactStoreFixture store;
-  const auto ordinary = materialize_empty("i3_budget_cell", store);
+  const auto ordinary = materialize_empty("budget_cell", store);
   EXPECT_FALSE(
       ordinary->value().motion_takeover_preparation_budget_s.has_value());
   EXPECT_EQ(ordinary->normalized_root().find_object_member(
                 "motion_takeover_preparation_budget_s"),
             nullptr);
-  const auto moving = materialize_empty("i3_budget_cell", store, 3.5);
+  const auto moving = materialize_empty("budget_cell", store, 3.5);
   EXPECT_EQ(moving->value().motion_takeover_preparation_budget_s,
             std::optional<double>(3.5));
   EXPECT_NE(moving->retained_bundle_id(), ordinary->retained_bundle_id());
@@ -3380,7 +3338,7 @@ TEST(RetainedBundleMaterializer,
 TEST(RetainedBundleMaterializer,
      MovingTakeoverBudgetRejectsInvalidPresentValuesEvenWithFreshIdentity) {
   test::InMemoryRawArtifactStoreFixture store;
-  const auto moving = materialize_empty("i3_budget_invalid_cell", store, 3.5);
+  const auto moving = materialize_empty("budget_invalid_cell", store, 3.5);
   for (const auto &invalid : std::vector<CanonicalValue>{
            CanonicalValue(nullptr), CanonicalValue(false),
            CanonicalValue("3.5"), CanonicalValue(0.0), CanonicalValue(-1.0)}) {
@@ -3397,9 +3355,9 @@ TEST(RetainedBundleMaterializer,
 TEST(RetainedBundleMaterializer,
      MovingPlanningBudgetIsSealedAndValidatedAgainstTheWholeBudget) {
   test::InMemoryRawArtifactStoreFixture store;
-  const auto legacy = materialize_empty("i3_planning_budget_cell", store, 3.5);
+  const auto legacy = materialize_empty("planning_budget_cell", store, 3.5);
   const auto moving =
-      materialize_empty("i3_planning_budget_cell", store, 3.5, 1.25);
+      materialize_empty("planning_budget_cell", store, 3.5, 1.25);
   EXPECT_FALSE(legacy->value().motion_takeover_planning_budget_s);
   EXPECT_EQ(legacy->normalized_root().find_object_member(
                 "motion_takeover_planning_budget_s"),
@@ -3423,7 +3381,7 @@ TEST(RetainedBundleMaterializer,
         RetainedBundleError);
   }
   // A freshly sealed planning-only payload cannot bypass the authored boundary.
-  const auto empty = materialize_empty("i3_planning_only_cell", store);
+  const auto empty = materialize_empty("planning_only_cell", store);
   auto fields = empty->normalized_root().as_object();
   fields.emplace_back("motion_takeover_planning_budget_s", CanonicalValue(1.0));
   EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(

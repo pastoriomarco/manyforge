@@ -1,4 +1,4 @@
-"""Bounded C2 recovery/value state attached to existing Program runs.
+"""Bounded recovery/value state attached to existing Program runs.
 
 This module deliberately owns no scheduler, Kernel effect, artifact, or
 browser state.  It records exact run-scoped intents and delegates validation
@@ -445,7 +445,7 @@ class ProgramRuntimeControls:
             )
         if not operator_stop_recovery:
             # Continue: close the held operation, the node returns FAILURE to
-            # the tree, and the hold's groups resume (contract item 40).
+            # the tree, and the hold's groups resume.
             closable = intervention.owner_task_id is None or (
                 isinstance(owner, dict)
                 and (

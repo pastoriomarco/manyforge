@@ -1,5 +1,5 @@
 """Per-node interrupt rules: catalog fields, condition validation, key union,
-node outcome keys and the Runner's typed-result mapping (schema02/03)."""
+node outcome keys and the Runner's typed-result mapping."""
 
 from __future__ import annotations
 
@@ -33,13 +33,14 @@ from manyforge_behavior.program import (
     require_global_rule_operands,
     require_interrupt_key_initials,
 )
+from .v3_fixtures import frame, signal, target
 
 _ROOT = Path(__file__).resolve().parents[2]
 _CATALOG = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
 _NODES = ("motion.move_until_signal", "motion.probe_search")
-_SIGNAL = {"signal": {"target_role": "arm", "resource_role": "part_present"}}
+_SIGNAL = {"signal": signal("ur5_robot", "part_present")}
 _GOAL = {
-    "frame_ref": {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
+    "frame_ref": {"kind": "target_frame", "frame": frame("ur5_robot", "base")},
     "position_m": [0.3, 0.0, 0.2],
     "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
 }
@@ -93,24 +94,13 @@ def _document(
         "api_version": _CATALOG.api_version,
         "content_version": _CATALOG.content_version,
     }
-    arm = document["target_roles"]["arm"]
-    arm["required_resource_roles"] = sorted({*arm["required_resource_roles"], "part_present"})
-    capabilities = {row["capability_id"] for row in arm["required_capabilities"]}
-    for name in _NODES:
-        for requirement in _CATALOG.get(name).required_capabilities:
-            if requirement.scope == "target_binding" and requirement.when_parameter is None:
-                capabilities.add(requirement.capability_id)
-    arm["required_capabilities"] = [
-        {"capability_id": capability, "parameters": {}, "disposition": "required"}
-        for capability in sorted(capabilities)
-    ]
     document["blackboard"] = {
         "namespaces": [{"namespace_id": "cell", "owner": "program"}],
         "keys": sorted(deepcopy(_KEYS), key=lambda row: row["key"]),
     }
     parameters: dict[str, Any] = {
-        "target_role": "arm",
-        "base_frame_role": "base",
+        "target": target("ur5_robot", "arm"),
+        "base_frame": frame("ur5_robot", "base"),
         "tcp_endpoint": {"kind": "current"},  # TCP migration: old selector without kind; missing/current = own TCP
         "goal": deepcopy(_GOAL),
         "stop_mode": "soft_on_path",
@@ -129,8 +119,8 @@ def _document(
         "node_id": "motion.move_until_signal",
         "instance_id": "probe",
         "parameters": {
-            "target_role": "arm",
-            "base_frame_role": "base",
+            "target": target("ur5_robot", "arm"),
+            "base_frame": frame("ur5_robot", "base"),
             "tcp_endpoint": {"kind": "current"},  # TCP migration: old selector without kind; missing/current = own TCP
             "goal": deepcopy(_GOAL),
             "stop_mode": "soft_on_path",
@@ -147,7 +137,7 @@ def _program(document: dict[str, Any]) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, _CATALOG)
 
@@ -159,17 +149,17 @@ def _program(document: dict[str, Any]) -> Program:
 def test_catalog_declares_the_per_node_interrupt_fields(node_id: str) -> None:
     parameters = {parameter.id: parameter for parameter in _CATALOG.get(node_id).parameters}
     assert parameters["stop_mode"].required
-    assert "interrupt_policy_id" not in parameters  # contract 63
+    assert "interrupt_policy_id" not in parameters
     # The ordinary motion fields of the move (same as motion.move_to_pose).
-    assert parameters["base_frame_role"].required  # TCP migration: tcp_endpoint optional (default current)
+    assert parameters["base_frame"].required
     pose = {parameter.id: parameter for parameter in _CATALOG.get("motion.move_to_pose").parameters}
     for setting in ("velocity_scale", "acceleration_scale", "joint_position_tol_rad",
                     "translation_tol_m", "rotation_tol_rad", "planning_timeout_s",
                     "execution_timeout_s", "cache_mode"):
         assert parameters[setting].default == pose[setting].default
-    assert "automatic_retries" not in parameters  # spec 410 §4.1
+    assert "automatic_retries" not in parameters
     condition = parameters["interrupt_condition"]
-    assert condition.required and condition.schema.schema_type == "interrupt_condition"
+    assert condition.required and condition.schema.schema_type == "component_interrupt_condition"
     for optional in ("on_signal", "on_no_signal", "stop_entry_stage_id", "success_through_stage_id"):
         assert not parameters[optional].required and not parameters[optional].has_default
     assert parameters["on_signal"].schema.enum_values == ("success", "failure")
@@ -179,7 +169,7 @@ def test_catalog_declares_the_per_node_interrupt_fields(node_id: str) -> None:
         "max_inclusive": 100,
     }
     assert parameters["success_through_stage_id"].schema.schema_type == "string"
-    assert "fallback_outcome" not in parameters  # contract 70
+    assert "fallback_outcome" not in parameters
     registry = _CATALOG.schema_registry
     json_schema = registry.to_json_schema(condition.schema)
     assert json_schema["properties"]["not"] == {"$ref": "#"}
@@ -228,7 +218,7 @@ def _deep(depth: int) -> dict[str, Any]:
         ({"xor": [_compare(_SIGNAL, "==", True)]}, "unknown operator 'xor'"),
         ({"compare": {"operand": _SIGNAL, "op": "==", "value": True, "x": 1}}, "unknown fields"),
         (_compare({"key": "cell.count", "signal": _SIGNAL["signal"]}, "==", 1), "exactly one operand"),
-        (_compare({"signal": {"target_role": "arm"}}, "==", True), "is missing fields"),
+        (_compare({"signal": {"component_id": "ur5_robot"}}, "==", True), "is missing fields"),
         (_compare(_SIGNAL, "~", True), "must be one of"),
         (_compare(_key("cell.count"), "==", _key("cell.count")), "no operand-to-operand"),
         (_deep(9), "exceeds the depth bound 8"),
@@ -241,19 +231,18 @@ def _deep(depth: int) -> dict[str, Any]:
         (_compare(_key("cell.done"), "==", 1), "io_signal_type_mismatch: a int64 literal"),
         (_compare(_key("cell.count"), "==", True), "a bool literal does not compare"),
         (_compare(_key("cell.label"), "==", 3), "no coercion"),
-        (
-            _compare({"signal": {"target_role": "hand", "resource_role": "x"}}, "==", True),
-            "does not name a declared target role",
-        ),
-        (
-            _compare({"signal": {"target_role": "arm", "resource_role": "x"}}, "==", True),
-            "is not a resource role required by target role 'arm'",
-        ),
     ],
 )
 def test_invalid_conditions_are_refused_with_their_reason(condition, message) -> None:
     with pytest.raises(ProgramValidationError, match=message.replace("(", r"\(")):
         _program(_document(condition))
+
+
+@pytest.mark.parametrize("reference", [signal("unknown_component", "x"), signal("ur5_robot", "unknown_signal")])
+def test_direct_signal_identity_is_retained_for_deployment_validation(reference) -> None:
+    condition = _compare({"signal": reference}, "==", True)
+    program = _program(_document(condition))
+    assert program.to_dict()["tree"]["children"][0]["parameters"]["interrupt_condition"] == condition
 
 
 @pytest.mark.parametrize("literal", [2**53, -(2**53), float(2**60)])
@@ -264,9 +253,9 @@ def test_integer_literals_beyond_the_safe_range_are_refused(literal) -> None:
 
 
 def test_seventeen_distinct_operands_are_accepted() -> None:
-    # Contract 137: no separate input limit; only the node and depth bounds.
-    signals = [{"signal": {"target_role": "arm", "resource_role": f"in{index}"}} for index in range(17)]
-    check_condition_structure({"any": [_compare(signal, "==", True) for signal in signals]})
+    # No separate input limit; only the node and depth bounds.
+    signals = [{"signal": signal("ur5_robot", f"in{index}")} for index in range(17)]
+    check_condition_structure({"any": [_compare(signal, "==", True) for signal in signals]}, direct_references=True)
     keys = [f"cell.k{index}" for index in range(17)]
     check_condition_structure({"any": [_compare(_key(key), "==", 1) for key in keys]})
 
@@ -459,14 +448,14 @@ _THROUGH_CANCEL = {"success_through_stage_id": "controller_goal_cancel"}
         ("motion.probe_search", _row("signal_trip", **_NOMINAL), {}, (True, "signal_trip")),
         ("motion.probe_search", _row("signal_trip", **_NOMINAL), {"on_signal": "failure"},
          (False, "signal_trip")),
-        # Natural completion without a trip: existing spec 260 mapping.
+        # Natural completion without a trip: the existing mapping.
         ("motion.move_until_signal", _row("no_signal_trip"), {}, (True, "no_signal_trip")),
         ("motion.probe_search", _row("no_signal_trip"), {}, (False, "no_signal_trip")),
         ("motion.probe_search", _row("no_signal_trip"), {"on_no_signal": "success"},
          (True, "no_signal_trip")),
         ("motion.move_until_signal", _row("no_signal_trip"), {"on_no_signal": "failure"},
          (False, "no_signal_trip")),
-        # Contract 70: a later stage counts only up to success_through_stage_id.
+        # A later stage counts only up to success_through_stage_id.
         ("motion.move_until_signal", _row("failed", **_ESCALATED), {}, (False, "failed")),
         ("motion.move_until_signal", _row("signal_trip", **_ESCALATED), {}, (False, "failed")),
         ("motion.move_until_signal", _row("failed", **_ESCALATED), _THROUGH_CANCEL,
@@ -588,7 +577,7 @@ def test_contained_stage_reads_authoritative_attempts_of_the_rows_own_certificat
         row, {**terminal, "stop_certificate_revision": 2}, operation_id="op") is None
     assert contained_stages_from_stop_terminal(
         row, {**terminal, "details_truncated": True}, operation_id="op") is None
-    # Another Stop identity or generation (SX-2215): not proven.
+    # Another Stop identity or generation: not proven.
     for patch in ({"stop_id": "stop-2"}, {"stop_generation": 2}, {"stop_generation": None}):
         assert contained_stages_from_stop_terminal(
             row, {**terminal, **patch}, operation_id="op") is None
@@ -644,7 +633,7 @@ def _targets_reply(
         "identity": {"owner_epoch": "kernel-1", "retained_bundle_id": "bundle-1",
                      "graph_revision": graph},
         "targets": {
-            "schema_version": "manyforge.execution_targets.v3",
+            "schema_version": "manyforge.execution_targets.v4",
             "components": [{"controllable_component_id": "arm.component", "targets": [
                 {"command_target_id": "arm.target", "operation_capability_id": _MOTION,
                  "presentation": "motion", "command": motion_command},
@@ -685,7 +674,7 @@ def _chains_from_targets(reply: dict[str, Any], **participant: Any):
 
 
 def test_stop_chain_comes_from_the_used_targets_motion_command() -> None:
-    # SX-2211: the qualified stage order of the exact binding the operation used.
+    # The qualified stage order of the exact binding the operation used.
     chains, result = _chains_from_targets(_targets_reply(_STOP_RESPONSE))
     assert chains == {"arm": _CHAIN}
     assert (result.success, result.node_outcome) == (True, "signal_trip")
@@ -750,7 +739,7 @@ def test_an_ordinary_stop_keeps_the_existing_stop_handling() -> None:
     assert _map("motion.move_until_signal", _row("stopped", stop_result="succeeded_nominal")) is None
 
 
-# Compact BB evidence (kernel-rule-result-wire02) ----------------------------
+# Compact BB evidence ----------------------------------------------------------
 
 
 def _bb_scope(**overrides: Any) -> dict[str, Any]:
@@ -903,7 +892,7 @@ def test_interrupted_fault_is_a_failure_never_a_trip_success(stop_result) -> Non
 
 
 def test_a_bounded_summary_without_attempts_is_unknown_and_fails() -> None:
-    # SX-2211: no attempted_stages (bounded summary) is unknown, never
+    # No attempted_stages (bounded summary) is unknown, never
     # inferred from the configured chain.
     row = _row("failed", **_ESCALATED)
     summary = {
@@ -920,7 +909,7 @@ def test_a_bounded_summary_without_attempts_is_unknown_and_fails() -> None:
         False, "motion_interrupt_containing_stage_unproven")
 
 
-# ---- Contract 87: interrupt condition keys declare `initial:` ----
+# ---- Interrupt condition keys declare `initial:` ----
 
 
 def _key_rule(rule_id: str, key: str, value: Any) -> dict[str, Any]:
@@ -957,7 +946,7 @@ def test_false_and_zero_initials_count_as_declared() -> None:
 
 
 def test_system_keys_need_no_initial_their_start_value_is_defined() -> None:
-    # Contract 105: node_outcome.* starts at `none`, interrupt_state.* follows
+    # node_outcome.* starts at `none`, interrupt_state.* follows
     # its rule; neither needs `initial:`.
     condition = {
         "all": [
@@ -972,7 +961,7 @@ def test_system_keys_need_no_initial_their_start_value_is_defined() -> None:
     require_interrupt_key_initials(program, [_key_rule("after_pick", "node_outcome.probe", "none")])
 
 
-# ---- Contract 106: global rules' keys against the Program and the Deployment ----
+# ---- Global rules' keys against the Program and the Deployment ----
 
 
 def test_a_program_missing_a_global_rule_key_is_refused_naming_rule_and_key() -> None:
@@ -987,7 +976,7 @@ def test_a_program_missing_a_global_rule_key_is_refused_naming_rule_and_key() ->
 
 
 def test_global_rules_cannot_read_rule_states_but_programs_can() -> None:
-    # Contract 111: refused in Deployment conditions; node rules keep them
+    # Refused in Deployment conditions; node rules keep them
     # (test_system_keys_need_no_initial_their_start_value_is_defined).
     require_global_rule_operands([_key_rule("a", "cell.force", 1.0)])
     with pytest.raises(ProgramValidationError,

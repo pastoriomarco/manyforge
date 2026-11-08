@@ -8,8 +8,8 @@
 namespace manyforge::deployment {
 
 /// Lower the actual literal node conditions from one exact sealed Program and
-/// Binding. Signal operands resolve only through that Binding's retained signal
-/// roles; key operands resolve only through that Program's scalar declarations.
+/// Binding. Signal operands resolve only through that Binding's exact retained
+/// signal references; key operands resolve only through that Program's scalar declarations.
 /// The projection preserves each node's own desired-trip selection metadata;
 /// it selects no Deployment policy and grants no prepared Stop/runtime scope.
 /// It cannot substitute for the complete Program plus Deployment reference union.

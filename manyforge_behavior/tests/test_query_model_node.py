@@ -19,7 +19,6 @@ from manyforge_behavior.nodes.blackboard_output import (
     BlackboardOutputMixin,
 )
 from manyforge_behavior.nodes.model import (
-    MODEL_NODE_RESTORATION_GATES,
     ModelNodeUnavailableError,
     ModelOutputValidationError,
     QueryModelNode,
@@ -354,8 +353,6 @@ def test_provider_call_and_node_fail_before_secrets_or_inputs() -> None:
         match="composable_cell_model_node_unavailable",
     ):
         QueryModelNode(poison, endpoint=poison)
-
-    assert MODEL_NODE_RESTORATION_GATES == ("I5", "H0", "I6", "N")
 
 
 def test_blackboard_output_gate_fails_before_binding_or_payload_access() -> None:

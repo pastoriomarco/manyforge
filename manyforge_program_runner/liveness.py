@@ -79,7 +79,7 @@ class ProgramRunnerLivenessReceiver:
         self._on_reconciliation = on_reconciliation
         self._cycle_status = cycle_status
         self._clock = monotonic_ns
-        # Starts pending BB key sources (BBK-1 (a)), run on the watchdog.
+        # Starts pending BB key sources, run on the watchdog.
         self._publication_check = publication_check
         self._started_ns = self._clock()
         self._lock = RLock()
@@ -378,7 +378,7 @@ class ProgramRunnerLivenessReceiver:
         self, fault: Mapping[str, Any], reference: str
     ) -> bool:
         """Latch the first BB publication fault for this receiver's lifetime,
-        unless its owner clears it (`clear_publisher_fault`, F-2). True when
+        unless its owner clears it (`clear_publisher_fault`). True when
         this call latched it."""
 
         message = fault.get("message")
@@ -409,7 +409,7 @@ class ProgramRunnerLivenessReceiver:
         return True
 
     def clear_publisher_fault(self, reference: str) -> bool:
-        """Clear exactly the latched fault with this reference (F-2: a
+        """Clear exactly the latched fault with this reference (a
         between-Runs source whose loss the Kernel confirmed, or that a newer
         source superseded). True when it was cleared."""
 
@@ -461,7 +461,7 @@ class ProgramRunnerLivenessReceiver:
                 "local_heartbeat_age_ns": age,
                 "state": self._state,
                 # A publisher fault reuses the digested fence; its reference
-                # is the digest of the emitted publisher ErrorDTO (SX-2210a).
+                # is the digest of the emitted publisher ErrorDTO.
                 # A Manager-loss reference stays in manager_fault_reference.
                 "command_fenced": self._fenced or publisher_fault is not None,
                 "fault_reference": (

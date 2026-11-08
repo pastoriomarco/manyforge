@@ -11,6 +11,7 @@
 
 namespace manyforge::core {
 namespace {
+thread_local const RuntimeCollisionLookaheadSession* current_lookahead_worker = nullptr;
 
 const char* runtime_snapshot_prepare_status_name(
     RuntimeCollisionQueryPrepareStatus status) noexcept {
@@ -413,7 +414,11 @@ RuntimeCollisionLookaheadSession::RuntimeCollisionLookaheadSession(
   selection_scratch_.sample_times_ns.reserve(config_.max_samples);
   required_times_scratch_.reserve(config_.max_samples);
   target_times_scratch_.reserve(config_.max_samples * 2);
-  worker_ = std::jthread([this](std::stop_token stop_token) { worker_loop(stop_token); });
+  worker_ = std::jthread([this](std::stop_token stop_token) {
+    current_lookahead_worker = this;
+    worker_loop(stop_token);
+    current_lookahead_worker = nullptr;
+  });
 }
 
 RuntimeCollisionLookaheadSession::~RuntimeCollisionLookaheadSession() {
@@ -423,6 +428,23 @@ RuntimeCollisionLookaheadSession::~RuntimeCollisionLookaheadSession() {
   if (worker_.joinable()) {
     worker_.join();
   }
+}
+
+bool RuntimeCollisionLookaheadSession::is_worker_thread() const noexcept {
+  return current_lookahead_worker == this;
+}
+
+bool RuntimeCollisionLookaheadSession::in_any_worker_thread() noexcept {
+  return current_lookahead_worker != nullptr;
+}
+
+void RuntimeCollisionLookaheadSession::detach() {
+  closing_.store(true, std::memory_order_release);
+  disarm();
+  worker_.request_stop();
+  cv_.notify_all();
+  if (worker_.joinable()) worker_.join();
+  pool_.detach();
 }
 
 RuntimeCollisionLookaheadSession::PreparedArm RuntimeCollisionLookaheadSession::prepare_arm(
@@ -442,6 +464,8 @@ RuntimeCollisionLookaheadSession::PreparedArm RuntimeCollisionLookaheadSession::
 void RuntimeCollisionLookaheadSession::arm(
     std::uint64_t execution_id, std::uint64_t execution_generation,
     std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id) {
+  if (closing_.load(std::memory_order_acquire))
+    throw std::logic_error("runtime collision lookahead is detached");
   if (execution_generation == 0)
     throw std::invalid_argument("runtime collision lookahead arm invalid");
   publish_prepared_arm(prepare_arm(execution_id, execution_generation, std::move(trajectory),
@@ -449,9 +473,11 @@ void RuntimeCollisionLookaheadSession::arm(
 }
 
 void RuntimeCollisionLookaheadSession::publish_prepared_arm(PreparedArm prepared) noexcept {
+  if (closing_.load(std::memory_order_acquire)) return;
   accepting_clear_permits_.store(false, std::memory_order_release);
   const auto arm_permit_generation = permit_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
   std::lock_guard<std::mutex> lock(mutex_);
+  if (closing_.load(std::memory_order_acquire)) return;
   if (const auto active_cancel = active_cancel_.load(std::memory_order_acquire)) {
     active_cancel->request_cancel(std::move(prepared.active_cancel_reason));
   }
@@ -509,6 +535,7 @@ bool RuntimeCollisionLookaheadSession::quiescent_for_resource_replacement() cons
 void RuntimeCollisionLookaheadSession::request(
     std::int64_t requested_at_ns, RuntimeCollisionQueryBundlePtr bundle,
     RuntimeContactReleaseStateSnapshot contact_state) noexcept {
+  if (closing_.load(std::memory_order_acquire)) return;
   if (!accepting_clear_permits_.load(std::memory_order_acquire) || !bundle) {
     return;
   }

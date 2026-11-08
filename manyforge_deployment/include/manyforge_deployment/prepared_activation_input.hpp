@@ -19,7 +19,7 @@
 namespace manyforge::deployment {
 
 inline constexpr std::string_view kPreparedActivationInputSchemaVersion =
-    "manyforge.prepared_activation_input.v6";
+    "manyforge.prepared_activation_input.v7";
 
 struct PreparedScenarioOrigin final {
   std::string scenario_id;
@@ -115,13 +115,6 @@ public:
   program_outcome() const noexcept {
     return program_outcome_;
   }
-  /// The authored role assignment the outcome was compiled from, carried so
-  /// the outcome can be recompiled on readback (see
-  /// `verify_prepared_program_outcome`).
-  [[nodiscard]] const core::ProgramRoleAssignmentDTO &
-  program_role_assignment() const noexcept {
-    return program_role_assignment_;
-  }
   [[nodiscard]] const core::ContentDigest &node_environment_digest() const
       noexcept {
     return node_environment_digest_;
@@ -149,7 +142,6 @@ private:
       std::optional<core::ProgramRevision> program_revision,
       std::optional<core::ProgramBindingId> program_binding_id,
       std::optional<ProgramNonExecutableOutcomeDTO> program_outcome,
-      core::ProgramRoleAssignmentDTO program_role_assignment,
       core::ContentDigest node_environment_digest, std::string assistant_mode,
       CanonicalValue normalized_root,
       VerifiedPreparedActivationClosure closure);
@@ -165,7 +157,6 @@ private:
   std::optional<core::ProgramRevision> program_revision_;
   std::optional<core::ProgramBindingId> program_binding_id_;
   std::optional<ProgramNonExecutableOutcomeDTO> program_outcome_;
-  core::ProgramRoleAssignmentDTO program_role_assignment_;
   core::ContentDigest node_environment_digest_;
   std::string assistant_mode_;
   CanonicalValue normalized_root_;

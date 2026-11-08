@@ -11,7 +11,7 @@ import sys
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
-DESCRIPTOR = ROOT / "manyforge_deployment/resources/program_binding_transport.v1.json"
+DESCRIPTOR = ROOT / "manyforge_deployment/resources/program_binding_transport.v3.json"
 FIXTURE_RELATIVE = Path(
     "manyforge_deployment/resources/program_binding_lite6_native.fixture.json"
 )
@@ -52,40 +52,117 @@ EXPECTED_ENUMS = {
     "operator_stop_policy": ["inherit", "hold", "continue"],
     "intervention_stop_scope": ["all", "own_groups"],
 }
-EXPECTED_RECORDS = {
-    "binding": ["api_version", "program_binding_id", "program_id", "program_revision", "retained_bundle_id", "graph_revision", "node_environment", "component_role_bindings", "target_role_bindings", "node_policies", "contact_grasp_bindings", "provenance"],
-    "node_environment": ["catalog_id", "content_version", "catalog_digest", "environment_digest"],
-    "component": ["component_role_id", "controllable_component_id", "component_type_id", "component_type_revision", "model_role_bindings"],
-    "model": ["model_role_id", "model_instance_id", "model_revision"],
-    "target": ["target_role_id", "component_role_id", "controllable_component_id", "command_target_id", "frame_role_bindings", "resource_role_bindings", "collision_body_role_bindings", "capability_bindings", "signal_role_bindings", "pneumatic_io", "robot_tcps", "default_tcp"],
-    "frame": ["frame_role_id", "model_instance_id", "model_revision", "compiled_frame_name", "contact_body_role_ids"],
-    "tcp_entry": ["component_id", "target_id", "frame_role_id"],
-    "robot_tcp": ["entry", "frame", "end_effector", "component_default"],
-    "resource": ["resource_role_id", "resource_ids", "compiled_resource_names"],
-    "signal": ["resource_role_id", "signal_name", "value_type", "direction", "transition_capability", "signal_descriptor_digest"],
-    "pneumatic_io": ["outputs", "inputs"],
-    "pneumatic_output": ["target_role_id", "resource_role_id", "open_value", "close_value"],
-    "pneumatic_input": ["input", "target_role_id", "resource_role_id"],
-    "collision": ["collision_body_role_id", "model_instance_id", "model_revision", "compiled_collision_body_names"],
-    "capability": ["capability_id", "capability_definition_revision", "control_binding", "capability_provider_binding", "command_schema"],
-    "node_policy": ["instance_id", "recovery_policy", "operator_stop_policy"],
-    "recovery_policy": ["allow_intervention", "max_retries", "intervention_stop_scope"],
-    "control": ["control_binding_id", "control_binding_revision"],
-    "provider": ["capability_provider_binding_id", "capability_provider_binding_revision"],
-    "command_schema": ["command_schema_id", "command_schema_revision"],
-    "contact": ["contact_policy_id", "contact_policy_revision", "runtime_object_id", "allowed_body_bindings", "max_penetration_m", "terminal_window_start_fraction", "bodies_from_motion_endpoint"],
-    "contact_release": ['contact_policy_id', 'contact_policy_revision', 'runtime_object_id', 'allowed_body_bindings', 'mode', 'release_evidence_mode', 'enforce_max_start_penetration', 'max_start_penetration_m', 'min_release_progress_m', 'release_tolerance_m', 'require_strictly_decreasing_penetration', 'require_separation_by_end', 'allow_recontact', 'bodies_from_motion_endpoint'],
-    "contact_body": ["component_role_id", "target_role_id", "controllable_component_id", "command_target_id", "model_role_id", "collision_body_role_id", "model_instance_id", "model_revision", "collision_body_ids"],
-    "provenance": ["binding_compiler_contract_digest", "role_assignment_digest", "source_records", "resolved_output_records"],
-    "provenance_record": ["record_kind", "record_id", "revision"],
-}
-EXPECTED_OPTIONAL_RECORD_FIELDS = {
-    "frame": ["contact_body_role_ids"],
-    "contact": ["bodies_from_motion_endpoint"],
-    "contact_release": ["bodies_from_motion_endpoint"],
-    "target": ["signal_role_bindings", "pneumatic_io", "robot_tcps", "default_tcp"],
-    "recovery_policy": ["intervention_stop_scope"],
-}
+EXPECTED_RECORDS = {'binding': ['api_version',
+             'program_binding_id',
+             'program_id',
+             'program_revision',
+             'retained_bundle_id',
+             'graph_revision',
+             'node_environment',
+             'component_bindings',
+             'target_bindings',
+             'frame_bindings',
+             'collision_body_bindings',
+             'signal_bindings',
+             'node_policies',
+             'contact_grasp_bindings',
+             'provenance'],
+ 'node_environment': ['catalog_id',
+                      'content_version',
+                      'catalog_digest',
+                      'environment_digest'],
+ 'component': ['component_id',
+               'component_type_id',
+               'component_type_revision',
+               'model_bindings'],
+ 'model': ['model_role_id', 'model_instance_id', 'model_revision'],
+ 'target': ['target',
+            'frame_references',
+            'frame_associations',
+            'collision_body_references',
+            'signal_references',
+            'resource_role_bindings',
+            'capability_bindings',
+            'pneumatic_io',
+            'robot_tcps',
+            'default_tcp'],
+ 'frame': ['reference',
+           'model_instance_id',
+           'model_revision',
+           'compiled_frame_name'],
+ 'tcp_entry': ['target', 'frame'],
+ 'robot_tcp': ['entry',
+               'frame',
+               'contact_body_role_ids',
+               'end_effector',
+               'component_default'],
+ 'resource': ['resource_role_id', 'resource_ids', 'compiled_resource_names'],
+ 'collision': ['reference',
+               'model_instance_id',
+               'model_revision',
+               'compiled_collision_body_names'],
+ 'capability': ['capability_id',
+                'capability_definition_revision',
+                'control_binding',
+                'capability_provider_binding',
+                'command_schema'],
+ 'node_policy': ['instance_id', 'recovery_policy', 'operator_stop_policy'],
+ 'recovery_policy': ['allow_intervention',
+                     'max_retries',
+                     'intervention_stop_scope'],
+ 'control': ['control_binding_id', 'control_binding_revision'],
+ 'provider': ['capability_provider_binding_id',
+              'capability_provider_binding_revision'],
+ 'command_schema': ['command_schema_id', 'command_schema_revision'],
+ 'contact': ['contact_policy_id',
+             'contact_policy_revision',
+             'runtime_object_id',
+             'allowed_body_bindings',
+             'max_penetration_m',
+             'terminal_window_start_fraction',
+             'bodies_from_motion_endpoint'],
+ 'contact_body': ['body',
+                  'model_role_id',
+                  'model_instance_id',
+                  'model_revision',
+                  'collision_body_ids'],
+ 'provenance': ['binding_compiler_contract_digest',
+                'source_records',
+                'resolved_output_records'],
+ 'provenance_record': ['record_kind', 'record_id', 'revision'],
+ 'signal': ['reference',
+            'target',
+            'runtime_unit_id',
+            'value_type',
+            'direction',
+            'transition_capability',
+            'signal_descriptor_digest'],
+ 'pneumatic_io': ['outputs', 'inputs'],
+ 'pneumatic_output': ['signal', 'open_value', 'close_value'],
+ 'pneumatic_input': ['input', 'signal'],
+ 'contact_release': ['contact_policy_id',
+                     'contact_policy_revision',
+                     'runtime_object_id',
+                     'allowed_body_bindings',
+                     'mode',
+                     'release_evidence_mode',
+                     'enforce_max_start_penetration',
+                     'max_start_penetration_m',
+                     'min_release_progress_m',
+                     'release_tolerance_m',
+                     'require_strictly_decreasing_penetration',
+                     'require_separation_by_end',
+                     'allow_recontact',
+                     'bodies_from_motion_endpoint'],
+ 'target_reference': ['component_id', 'command_target_id'],
+ 'frame_reference': ['component_id', 'frame_id'],
+ 'body_reference': ['component_id', 'collision_body_id'],
+ 'signal_reference': ['component_id', 'signal_name'],
+ 'frame_association': ['frame', 'contact_body_role_ids']}
+EXPECTED_OPTIONAL_RECORD_FIELDS = {'recovery_policy': ['intervention_stop_scope'],
+ 'target': ['pneumatic_io', 'robot_tcps', 'default_tcp'],
+ 'contact': ['bodies_from_motion_endpoint'],
+ 'contact_release': ['bodies_from_motion_endpoint']}
 EXPECTED_KINDS = [
     "model_asset", "runtime_profile", "component_type",
     "control_interface_contract", "controller_topology", "provider_manifest",
@@ -95,33 +172,39 @@ EXPECTED_KINDS = [
 EXPECTED_FORMULAS = {
     "collision_body_id": "component/{controllable_component_id}/model/{model_instance_id}/body/{collision_body_role_id}/collision/{index}",
 }
-EXPECTED_INVARIANTS = [
-    "closed_records", "bounded_scalars", "bounded_tables",
-    "canonical_sorted_unique",
-    "node_policy_enums_and_cross_fields", "node_policy_sparse_rows",
-    "resource_vector_correspondence",
-    "resource_vector_independent_uniqueness", "collision_name_uniqueness",
-    "capability_has_resolution", "target_component_correspondence",
-    "robot_tcp_entry_frame_correspondence", "robot_tcp_sorted_unique",
-    "finite_contact_ranges", "contact_target_collision_model_correspondence",
-    "generated_collision_body_ids", "provenance_kind_and_tuple_order",
-]
+EXPECTED_INVARIANTS = ['closed_records',
+ 'bounded_scalars',
+ 'bounded_tables',
+ 'canonical_sorted_unique',
+ 'node_policy_enums_and_cross_fields',
+ 'node_policy_sparse_rows',
+ 'resource_vector_correspondence',
+ 'resource_vector_independent_uniqueness',
+ 'collision_name_uniqueness',
+ 'capability_has_resolution',
+ 'direct_reference_correspondence',
+ 'robot_tcp_entry_frame_correspondence',
+ 'robot_tcp_sorted_unique',
+ 'finite_contact_ranges',
+ 'contact_body_model_correspondence',
+ 'generated_collision_body_ids',
+ 'provenance_kind_and_tuple_order']
 
 TYPE_NAMES = {
     "binding": "ProgramBindingDocument",
     "node_environment": "ProgramBindingNodeEnvironment",
-    "component": "ProgramComponentRoleBinding",
+    "component": "ProgramComponentBinding",
     "model": "ProgramModelRoleBinding",
-    "target": "ProgramTargetRoleBinding",
-    "frame": "ProgramFrameRoleBinding",
+    "target": "ProgramTargetBinding",
+    "frame": "ProgramFrameBinding",
     "tcp_entry": "ProgramTcpEntry",
     "robot_tcp": "ProgramRobotTcpBinding",
     "resource": "ProgramResourceRoleBinding",
-    "signal": "ProgramSignalRoleBinding",
+    "signal": "ProgramSignalBinding",
     "pneumatic_io": "ProgramPneumaticIoBinding",
     "pneumatic_output": "ProgramPneumaticOutputBinding",
     "pneumatic_input": "ProgramPneumaticInputBinding",
-    "collision": "ProgramCollisionBodyRoleBinding",
+    "collision": "ProgramCollisionBodyBinding",
     "capability": "ProgramCapabilityBinding",
     "node_policy": "ProgramNodePolicy",
     "recovery_policy": "ProgramNodeRecoveryPolicy",
@@ -133,6 +216,11 @@ TYPE_NAMES = {
     "contact_body": "ProgramContactGraspBodyBinding",
     "provenance": "ProgramBindingProvenance",
     "provenance_record": "ProgramBindingProvenanceRecord",
+    "target_reference": "ProgramTargetReference",
+    "frame_reference": "ProgramFrameReference",
+    "body_reference": "ProgramBodyReference",
+    "signal_reference": "ProgramSignalReference",
+    "frame_association": "ProgramFrameAssociation",
 }
 FIELD_TYPES = {
     ("binding", "api_version"): "{api_version!r}",
@@ -197,6 +285,34 @@ FIELD_TYPES = {
     ("provenance_record", "record_kind"): "CatalogRecordKind",
 }
 
+# Direct reference records are exact closed pairs from the native v3 codec.
+FIELD_TYPES.update({
+    ("binding", "component_bindings"): "ProgramComponentBinding[]",
+    ("binding", "target_bindings"): "ProgramTargetBinding[]",
+    ("binding", "frame_bindings"): "ProgramFrameBinding[]",
+    ("binding", "collision_body_bindings"): "ProgramCollisionBodyBinding[]",
+    ("binding", "signal_bindings"): "ProgramSignalBinding[]",
+    ("component", "model_bindings"): "ProgramModelRoleBinding[]",
+    ("target", "target"): "ProgramTargetReference",
+    ("target", "frame_references"): "ProgramFrameReference[]",
+    ("target", "frame_associations"): "ProgramFrameAssociation[]",
+    ("target", "collision_body_references"): "ProgramBodyReference[]",
+    ("target", "signal_references"): "ProgramSignalReference[]",
+    ("frame", "reference"): "ProgramFrameReference",
+    ("collision", "reference"): "ProgramBodyReference",
+    ("signal", "reference"): "ProgramSignalReference",
+    ("signal", "target"): "ProgramTargetReference",
+    ("tcp_entry", "target"): "ProgramTargetReference",
+    ("tcp_entry", "frame"): "ProgramFrameReference",
+    ("frame_association", "frame"): "ProgramFrameReference",
+    ("frame_association", "contact_body_role_ids"): "string[]",
+    ("robot_tcp", "frame"): "ProgramFrameBinding",
+    ("robot_tcp", "contact_body_role_ids"): "string[]",
+    ("pneumatic_output", "signal"): "ProgramSignalReference",
+    ("pneumatic_input", "signal"): "ProgramSignalReference",
+    ("contact_body", "body"): "ProgramBodyReference",
+})
+
 
 def load_and_validate(path: Path) -> dict[str, Any]:
     try:
@@ -209,9 +325,9 @@ def load_and_validate(path: Path) -> dict[str, Any]:
     }
     if not isinstance(value, dict) or set(value) != expected_root:
         raise ValueError("descriptor root is not the closed v1 record")
-    if value["api_version"] != "manyforge.program_binding_transport_descriptor.v1":
+    if value["api_version"] != "manyforge.program_binding_transport_descriptor.v3":
         raise ValueError("descriptor API version is invalid")
-    if value["binding_api_version"] != "manyforge.program_binding.v2":
+    if value["binding_api_version"] != "manyforge.program_binding.v3":
         raise ValueError("Binding API version is invalid")
     exact = (
         ("limits", EXPECTED_LIMITS),
@@ -225,7 +341,7 @@ def load_and_validate(path: Path) -> dict[str, Any]:
     )
     for name, expected in exact:
         if value[name] != expected:
-            raise ValueError(f"descriptor {name} differ from native v1 contract")
+            raise ValueError(f"descriptor {name} differ from native v3 contract")
     return value
 
 
@@ -359,8 +475,8 @@ def _validate_fixture(source: bytes) -> None:
         raise ValueError("fixture source is not canonical JSON") from error
     if (
         not isinstance(value, dict)
-        or value.get("api_version") != "manyforge.program_binding.v2"
-        or not value.get("component_role_bindings")
+        or value.get("api_version") != "manyforge.program_binding.v3"
+        or not value.get("component_bindings")
         or source
         != json.dumps(
             value, ensure_ascii=False, separators=(",", ":"), sort_keys=True

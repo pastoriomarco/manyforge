@@ -379,7 +379,7 @@ ManyForge's own validation and collision checks. Adapter details:
   joint and pose goals. `smooth`: TOPP-RA within the joint limits, then one
   uniform stretch until the active TCP is at 0.98 of its speed limit at the
   samples (and joint caps and jerk limits, if set, hold): gentle, slower.
-  `fast` (RP-3): TOPP-RA holds the TCP at 0.98 of its limit on its grid:
+  `fast`: TOPP-RA holds the TCP at 0.98 of its limit on its grid:
   quicker, with abrupt acceleration changes. Cartesian paths follow
   `cartesian_timing` only.
 - **TCP speed limit.** Either way the active TCP targets 0.98 of its speed
@@ -497,6 +497,8 @@ execution host publishes every change; the Headless API serves
 outputs). One action runs at a time per component; a Stop interrupts an
 action in progress; an action whose effect is unknown ends `unknown` and is
 never resent. Actions stay available during a cell latch and during a run.
+Declaring `sim_reset` identifies a simulator; its state never latches the cell
+or blocks Execute.
 
 ### Faults and the cell latch
 
@@ -507,22 +509,27 @@ there is one, and the `operator_action` that clears it (`enable`, `recover`
 or `none`). The adapter maps vendor codes; unmapped ones pass through as
 `fault_vendor`.
 
-The **cell latch** is derived, never stored: after a Stop, it is set while any
-component in the cell is in `fault` or `offline` or reports
-`activity: unknown`, and also when a component faults while anything
-executes. It clears by itself once every component is healthy and idle; there
-is no recovery endpoint or acknowledgement. While latched, Program run and
-resume, every node, interrupt evaluation, manual motion and manual I/O are
-refused (`cell_latched`); component actions, Apply, Load and New are not.
+The **cell latch** is derived, never stored: after a Stop, non-exempt
+components in the cell cause it while in `fault` or `offline` or reporting
+`activity: unknown`; a fault raised while anything executes can also latch
+the cell. A component declaring `sim_reset` is the simulator and is exempt in
+every state, including `offline` or `fault`. The existing operator-power and
+unavailable-owner-member exemptions also apply. The latch clears by itself
+when its causes are gone; there is no recovery endpoint or acknowledgement.
+While latched, Program run and resume, every node, interrupt evaluation,
+manual motion and manual I/O are refused (`cell_latched`); component actions,
+Apply, Load and New are not.
 `GET /api/cell/latch` and the `cell_latch` event carry it.
 
-A simulation that isn't playing is simulator state, never a fault or latch:
-a simulated robot or tool keeps the lifecycle its controller reports with the
-reason `simulation_not_playing` and its streams stale, and the simulator
-component shows `prepared`. Enable and Execute are admitted, so the Program's
-own nodes can play the simulation. New motion and tool commands on such a
-component are refused with `simulation_not_playing`, and the node fails with
-that code.
+A simulation that isn't playing doesn't itself fault or latch the cell. When
+reachable and paused or stopped, the simulator component shows `prepared`; if
+unreachable, it stays `offline` with reason `simulator_unreachable`. Declaring
+`sim_reset` identifies the simulator, whose own state never latches the cell
+or blocks Execute. A simulated robot or tool keeps the lifecycle its
+controller reports with reason `simulation_not_playing` and stale streams.
+Enable and Execute remain available when otherwise ready, so the Program's
+own nodes can play the simulation. New motion and tool commands on a component
+showing `simulation_not_playing` are refused with that reason.
 
 ### Machines: owners and members
 
@@ -636,7 +643,7 @@ specific: a Mock pass never qualifies an Isaac or physical run by itself.
 Arm and gripper lifecycles are deliberately separate. A deployment's gripper
 profile selects its command transport, progress/feedback source, dwell or result
 timeout, terminal policy, and any grasp-confirmation requirement. Mock, Isaac
-bridges, ROS `GripperCommand`, and future device transports keep the same
+bridges, ROS `ParallelGripperCommand`, and future device transports keep the same
 gripper node meaning. The viewer renders the authoritative gripper state it
 receives; it does not progress a command. On Stop, a gripper already within
 its finish tolerance of the target (`gripper_stop_finish_tolerance` in the

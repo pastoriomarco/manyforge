@@ -4,7 +4,7 @@
 
 namespace manyforge::core {
 
-/// 3D vector in meters (spec §2)
+/// 3D vector in meters
 struct Vector3DTO {
     double x_m = 0.0;
     double y_m = 0.0;
@@ -12,7 +12,7 @@ struct Vector3DTO {
     friend bool operator==(const Vector3DTO&, const Vector3DTO&) = default;
 };
 
-/// Unit quaternion (spec §2)
+/// Unit quaternion
 struct QuaternionDTO {
     double x = 0.0;
     double y = 0.0;
@@ -21,7 +21,7 @@ struct QuaternionDTO {
     friend bool operator==(const QuaternionDTO&, const QuaternionDTO&) = default;
 };
 
-/// 6-DOF pose (spec §2)
+/// 6-DOF pose
 struct Pose3DTO {
     Vector3DTO position_m;
     QuaternionDTO orientation;

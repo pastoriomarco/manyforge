@@ -63,7 +63,7 @@ class ManagerBootstrapJournalClosedError final
 
 /// Exact immutable input persisted before a future bootstrap scene-owner call.
 ///
-/// This value carries only identities already frozen by the I4 owner contract.
+/// This value carries only identities already frozen by the owner contract.
 /// It does not accept a caller-built retained bundle, compiler manifest,
 /// planning product, process command, or runtime-readiness assertion.
 struct ManagerBootstrapIntentDTO final {

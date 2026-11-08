@@ -3,9 +3,9 @@
 The former module selected arbitrary Python provider factories from raw
 ``runtime_resources`` mappings, opened handles, owned rollback/close state, and
 served alias-based resources to behavior nodes.  That is runtime binding and
-lifecycle authority, not portable authoring logic.  I5/H0 now projects the
+lifecycle authority, not portable authoring logic.  The headless owner now projects the
 verified retained implementation identity and runtime availability without
-constructing it; native resource-addressed behavior binding returns at I6/N.
+constructing it; native resource-addressed behavior binding is not available.
 The raw v0 registry is never restored.
 """
 
@@ -17,7 +17,6 @@ from typing import Final, NoReturn
 RUNTIME_RESOURCE_BINDING_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_runtime_resource_binding_unavailable"
 )
-RUNTIME_RESOURCE_BINDING_RESTORATION_GATES: Final = ("I6", "N")
 
 
 class RuntimeResourceBindingUnavailableError(RuntimeError):
@@ -26,9 +25,9 @@ class RuntimeResourceBindingUnavailableError(RuntimeError):
 
 def _raise_runtime_resource_binding_unavailable() -> NoReturn:
     raise RuntimeResourceBindingUnavailableError(
-        f"{RUNTIME_RESOURCE_BINDING_UNAVAILABLE_REASON_CODE}: H0 provides "
+        f"{RUNTIME_RESOURCE_BINDING_UNAVAILABLE_REASON_CODE}: the headless owner provides "
         "read-only implementation availability; resource-addressed native "
-        "behavior binding returns at I6/N"
+        "behavior binding is not available"
     )
 
 
@@ -57,7 +56,6 @@ def build_runtime_resource_registry(*_args: object, **_kwargs: object) -> NoRetu
 
 
 __all__ = [
-    "RUNTIME_RESOURCE_BINDING_RESTORATION_GATES",
     "RUNTIME_RESOURCE_BINDING_UNAVAILABLE_REASON_CODE",
     "RuntimeResourceBindingUnavailableError",
     "RuntimeResourceFactoryRegistry",

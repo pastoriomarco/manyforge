@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit RT-6 realtime architecture qualification evidence.
+"""Emit realtime architecture qualification evidence.
 
 The probe is intentionally observational. It records the source-level
 architecture contract and the OS realtime properties visible to this process;
@@ -203,7 +203,7 @@ def build_evidence(env: dict[str, str] | None = None) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Emit RT-6 realtime qualification evidence.",
+        description="Emit realtime qualification evidence.",
     )
     parser.add_argument(
         "--json-only",

@@ -132,14 +132,14 @@ manyforge_validate_rt_resource_profile() {
     fi
     : "${MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY:?strict RT profile requires MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY}"
     : "${MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY:?strict RT profile requires MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY}"
+    : "${MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY:?strict RT profile requires MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY}"
 
     export MANYFORGE_RT_SCHED_POLICY="${MANYFORGE_RT_SCHED_POLICY:-FIFO}"
     export MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY="${MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY:-50}"
     export MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY="${MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY:-45}"
     export MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY="${MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY:-40}"
-    export MANYFORGE_RT_STOP_CONTROL_PRIORITY="${MANYFORGE_RT_STOP_CONTROL_PRIORITY:-35}"
-    export MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY="${MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY:-${MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY}}"
-    export MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY="${MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY:-true}"
+    # OD-58: StopControl is the highest ManyForge lane, on its own CPUs.
+    export MANYFORGE_RT_STOP_CONTROL_PRIORITY="${MANYFORGE_RT_STOP_CONTROL_PRIORITY:-48}"
 
     case "${MANYFORGE_RT_SCHED_POLICY}" in
         FIFO|SCHED_FIFO|RR|SCHED_RR) ;;
@@ -148,33 +148,26 @@ manyforge_validate_rt_resource_profile() {
             return 2
             ;;
     esac
-    case "${MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY}" in
-        true|false) ;;
-        *)
-            printf 'MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY must be true or false\n' >&2
-            return 2
-            ;;
-    esac
 
     _manyforge_validate_priority MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY "${MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY}" || return $?
     _manyforge_validate_priority MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY "${MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY}" || return $?
     _manyforge_validate_priority MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY "${MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY}" || return $?
     _manyforge_validate_priority MANYFORGE_RT_STOP_CONTROL_PRIORITY "${MANYFORGE_RT_STOP_CONTROL_PRIORITY}" || return $?
+    local priority_rule='stop_control > controller_command > runtime_safety'
+    if [[ "${controller_manager_present}" == "true" ]]; then
+        priority_rule="${priority_rule} and controller_manager > controller_command"
+    fi
     if ! ((
-        10#${MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY} > 10#${MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY} &&
-        10#${MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY} > 10#${MANYFORGE_RT_STOP_CONTROL_PRIORITY}
+        10#${MANYFORGE_RT_STOP_CONTROL_PRIORITY} > 10#${MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY} &&
+        10#${MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY} > 10#${MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY}
     )); then
-        if [[ "${controller_manager_present}" == "true" ]]; then
-            printf 'RT priorities must satisfy controller_manager > controller_command > runtime_safety > stop_control\n' >&2
-        else
-            printf 'RT priorities must satisfy controller_command > runtime_safety > stop_control\n' >&2
-        fi
+        printf 'RT priorities must satisfy %s\n' "${priority_rule}" >&2
         return 2
     fi
     if [[ "${controller_manager_present}" == "true" ]] && ! ((
         10#${MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY} > 10#${MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY}
     )); then
-        printf 'RT priorities must satisfy controller_manager > controller_command > runtime_safety > stop_control\n' >&2
+        printf 'RT priorities must satisfy %s\n' "${priority_rule}" >&2
         return 2
     fi
 
@@ -199,9 +192,10 @@ manyforge_validate_rt_resource_profile() {
     done
 
     # NRT work must not share any reserved RT capacity. Controller-manager,
-    # ManyForge command, and RuntimeSafety are also pairwise isolated. The rare
-    # StopControl worker may deliberately share ControllerCommand capacity on a
-    # constrained target, but never RuntimeSafety or controller_manager.
+    # ManyForge command, and RuntimeSafety are also pairwise isolated.
+    # StopControl has its own CPUs (OD-58: no default share with
+    # ControllerCommand); a deployment may name shared ones explicitly, where
+    # it preempts ControllerCommand. Never RuntimeSafety or controller_manager.
     _manyforge_require_disjoint_cpu_sets NRT "${MANYFORGE_NRT_CPU_AFFINITY}" controller_command "${MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY}" || return $?
     _manyforge_require_disjoint_cpu_sets NRT "${MANYFORGE_NRT_CPU_AFFINITY}" runtime_safety "${MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY}" || return $?
     _manyforge_require_disjoint_cpu_sets NRT "${MANYFORGE_NRT_CPU_AFFINITY}" stop_control "${MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY}" || return $?

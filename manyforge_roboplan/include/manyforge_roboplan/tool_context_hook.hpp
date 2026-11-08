@@ -11,7 +11,7 @@
 
 namespace manyforge::roboplan_backend {
 
-/// CONTRACTS §6: the tool-context hook a vendor family exports for its robot
+/// The tool-context hook a vendor family exports for its robot
 /// (e.g. xArm `ApplyToolContext`); the host sets it on the robot's
 /// ros2_control connection. ROS-free: a vendor library includes it without
 /// linking RoboPlan.

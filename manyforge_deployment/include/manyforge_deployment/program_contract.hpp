@@ -8,7 +8,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -16,25 +18,53 @@
 
 namespace manyforge::deployment {
 
+class ICatalogArtifactSource;
+
 inline constexpr std::size_t kMaxDurableProgramCount = 4096U;
 inline constexpr std::uint64_t kMaxDurableProgramBytes =
     512ULL * 1024ULL * 1024ULL;
 
 class ProgramContractError final : public std::invalid_argument {
 public:
+  struct UnsupportedFormat final {
+    std::string actual_api_version;
+    std::string supported_api_version;
+  };
   using std::invalid_argument::invalid_argument;
   ProgramContractError(const std::string &message, std::string code)
       : std::invalid_argument(message), code_(std::move(code)) {}
+  ProgramContractError(const std::string &message, UnsupportedFormat format)
+      : std::invalid_argument(message), code_("program_format_unsupported"),
+        unsupported_format_(std::move(format)) {}
   [[nodiscard]] const std::string &code() const noexcept { return code_; }
+  [[nodiscard]] const std::optional<UnsupportedFormat> &unsupported_format() const noexcept {
+    return unsupported_format_;
+  }
 
 private:
   std::string code_;
+  std::optional<UnsupportedFormat> unsupported_format_;
 };
+
+/// Reject unsupported versions before normalization or identity checks.
+/// Missing and non-string API versions remain structural errors.
+void require_supported_program_format(const CanonicalValue &source_root);
 
 /// Pure bounded authoring normalization shared by revision tools and the
 /// verifier. This is not a Program/catalog/binding proof or a migration.
 [[nodiscard]] CanonicalValue
 normalize_program_authoring(const CanonicalValue &source_root);
+
+/// Read-only view of the build-owned node catalog, qualified against the
+/// candidate's exact retained catalog identity. The referenced data has
+/// process lifetime. This does not validate an authored Program.
+struct QualifiedProgramCatalogView final {
+  const CanonicalValue &schema_types;
+  const std::map<std::string, CanonicalValue, std::less<>> &entries;
+};
+
+[[nodiscard]] QualifiedProgramCatalogView qualified_program_catalog(
+    const core::RetainedNodeEnvironmentDTO &environment);
 
 namespace detail {
 class ProgramBindingContractConstructionAuthority;
@@ -42,11 +72,12 @@ class ProgramBindingContractConstructionAuthority;
 
 /// Sealed binding-relevant projection of one canonical Program revision.
 ///
-/// The complete canonical Program remains attached to the projection so a
-/// caller cannot manufacture or omit a role requirement. Node-catalog
-/// parameter/dataflow validation is the preceding program-loader phase; this
-/// boundary independently closes the Program envelope, revision, roles, tree
-/// structure, and exact retained capability revisions needed by binding.
+/// The complete canonical Program remains attached to the projection.
+/// The existing Program loader validates node-catalog parameters and dataflow
+/// on the exact captured Program before native preparation derives effects.
+/// Durable reload rechecks the admitted Program's shape and identity, and
+/// this boundary validates references against the exact retained candidate
+/// before deriving and sealing its binding-relevant projection.
 class ProgramBindingContract final {
 public:
   ~ProgramBindingContract() = default;
@@ -106,6 +137,13 @@ private:
 [[nodiscard]] std::shared_ptr<const ProgramBindingContract>
 verify_program_binding_contract(std::string_view canonical_program_bytes,
                                 const RetainedBundle &retained_bundle);
+
+/// Verify against the exact immutable model map and catalog before deriving effects.
+[[nodiscard]] std::shared_ptr<const ProgramBindingContract>
+verify_program_binding_contract(std::string_view canonical_program_bytes,
+                                const RetainedBundle &retained_bundle,
+                                const std::optional<VerifiedRetainedModelMap> &model_map,
+                                const ICatalogArtifactSource &catalog_source);
 
 /// Immutable content-addressed Program read port.
 ///

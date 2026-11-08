@@ -18,7 +18,7 @@
 
 namespace manyforge::deployment {
 
-// C0.2m owns one aggregate budget for each retained composition family. These
+// Cell composition owns one aggregate budget for each retained composition family. These
 // limits prevent legal per-source inputs from multiplying into an unbounded
 // cell-wide product when the same reusable asset is instantiated many times.
 inline constexpr std::size_t kMaxCompositionSymbols = 1000000U;
@@ -396,7 +396,7 @@ struct CompositionFramePath final {
                          const CompositionFramePath&) = default;
 };
 
-/// Immutable, non-caller-constructible C0.2m composition result.
+/// Immutable, non-caller-constructible composition result.
 ///
 /// This object proves deterministic occurrence composition only. It deliberately
 /// does not claim control/provider/Stop applicability, retained products,

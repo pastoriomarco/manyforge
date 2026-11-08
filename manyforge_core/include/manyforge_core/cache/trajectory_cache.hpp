@@ -13,7 +13,7 @@
 
 namespace manyforge::core {
 
-/// Stable program-scoped cache slot from spec 210 section 3.10.
+/// Stable program-scoped cache slot.
 ///
 /// A source-authored `move_id` is not globally unique: repeated Program runs,
 /// different bindings, targets, and capabilities may legitimately reuse it.
@@ -52,7 +52,7 @@ struct TrajectoryCacheLookupResult {
 };
 
 /// Trajectory cache indexed by the complete stable Program/move slot and the
-/// full canonical planner-intent identity (spec 210 §3.10 and spec 230 §3.1).
+/// full canonical planner-intent identity.
 /// One trajectory per exact slot. No LRU, no TTL.
 /// Thread-safe.
 ///

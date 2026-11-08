@@ -107,7 +107,7 @@ function ConditionNode({ value, choices, groups, disabled, path, onChange, onRem
   const record = objectOf(value);
   const kindSelect = (
     <select aria-label={`${path} operator`} value={kind ?? ''} disabled={disabled}
-      onChange={(event) => onChange(convert(value, event.target.value as Kind, choices[0]))}>
+      onChange={(event) => onChange(convert(value, event.target.value as Kind, choices.find((choice) => !choice.disabled)))}>
       {kind === null && <option value="">(invalid)</option>}
       {(Object.keys(KIND_LABELS) as Kind[]).map((item) => (
         <option key={item} value={item}>{KIND_LABELS[item]}</option>
@@ -131,7 +131,7 @@ function ConditionNode({ value, choices, groups, disabled, path, onChange, onRem
           onChange={(event) => {
             if (handleToggle(event.target.value)) return;
             const next = choices.find((item) => item.id === event.target.value);
-            if (next === undefined) return;
+            if (next === undefined || next.disabled) return;
             const op = operatorsFor(next.valueType).includes(compare.op as ConditionOperator) ? compare.op : '==';
             const keepValue = choice?.valueType === next.valueType
               && (next.values === undefined || next.values.includes(String(compare.value)));
@@ -140,14 +140,15 @@ function ConditionNode({ value, choices, groups, disabled, path, onChange, onRem
           {choice === undefined && <option value="">{compare.operand === undefined ? 'Choose an input' : `Unknown: ${id}`}</option>}
           <NamespaceGroupOptions groups={groups} expanded={expanded} current={id}
             valueOf={(item) => item.id}
-            option={(item) => <option key={item.id} value={item.id}>{item.label}</option>} />
+            option={(item) => <option key={item.id} value={item.id} disabled={item.disabled}
+              title={item.reason}>{item.label}{item.reason === undefined ? '' : ` · ${item.reason}`}</option>} />
         </select>
-        <select aria-label={`${path} comparison`} value={String(compare.op ?? '')} disabled={disabled || choice === undefined}
+        <select aria-label={`${path} comparison`} value={String(compare.op ?? '')} disabled={disabled || choice === undefined || choice.disabled}
           onChange={(event) => update({ op: event.target.value })}>
           {!operators.includes(compare.op as ConditionOperator) && <option value={String(compare.op ?? '')}>{String(compare.op ?? '—')}</option>}
           {operators.map((op) => <option key={op} value={op}>{op}</option>)}
         </select>
-        <LiteralField choice={choice} value={compare.value ?? null} disabled={disabled || choice === undefined}
+        <LiteralField choice={choice} value={compare.value ?? null} disabled={disabled || choice === undefined || choice.disabled === true}
           label={`${path} value`} onChange={(next) => update({ value: next })} />
         {remove}
       </div>
@@ -174,7 +175,7 @@ function ConditionNode({ value, choices, groups, disabled, path, onChange, onRem
             onRemove={() => onChange({ [kind]: children.filter((_, at) => at !== index) })} />
         ))}
         <button type="button" className="text-button" disabled={disabled}
-          onClick={() => onChange({ [kind]: [...children, newCompare(choices[0])] })}>Add condition</button>
+          onClick={() => onChange({ [kind]: [...children, newCompare(choices.find((choice) => !choice.disabled))] })}>Add condition</button>
       </fieldset>
     );
   }
@@ -188,7 +189,7 @@ function ConditionNode({ value, choices, groups, disabled, path, onChange, onRem
 }
 
 /**
- * Structured editor of one interrupt condition (schema02 §1): compare / all /
+ * Structured editor of one interrupt condition: compare / all /
  * any / not, operands from the given choices (signals and declared scalar
  * keys grouped by namespace), operators by value type and a typed literal.
  * A change commits only when the whole condition is valid; otherwise it stays
@@ -206,8 +207,8 @@ export function InterruptConditionEditor({ value, choices, disabled, label, onCo
   const valueKey = JSON.stringify(value ?? null);
   useEffect(() => { setDraft(value); }, [valueKey]); // eslint-disable-line react-hooks/exhaustive-deps
   const groups = useMemo(() => {
-    // Change-only signals are labelled "liveness unproven" and refused here
-    // (contract 81); they stay listed so an existing operand is explained.
+    // Change-only signals are labelled "liveness unproven" and refused here;
+    // they stay listed so an existing operand is explained.
     const signals = choices.filter((choice) => choice.key === '');
     const keys = groupByNamespace(choices.filter((choice) => choice.key !== ''), (choice) => choice.key);
     return [
@@ -233,7 +234,7 @@ export function InterruptConditionEditor({ value, choices, disabled, label, onCo
           <p className="program-form-hint">No bound input signal or declared scalar key is available.</p>
         )}
         <button type="button" disabled={disabled || choices.length === 0}
-          onClick={() => change(newCompare(choices[0]))}>Add condition</button>
+          onClick={() => change(newCompare(choices.find((choice) => !choice.disabled)))}>Add condition</button>
       </div>
     );
   }

@@ -2,6 +2,7 @@
 
 #include <manyforge_core/types/gripper.hpp>
 #include <string>
+#include <memory>
 
 namespace manyforge::core {
 
@@ -15,6 +16,10 @@ class RuntimeParticipantBinding;
 class IGripperCommandBackend {
  public:
   virtual ~IGripperCommandBackend() = default;
+
+  /// Exact process-local sessions retained for unresolved old gripper goals.
+  virtual std::vector<std::shared_ptr<GripperPreparedSessionPin>>
+  tracked_gripper_prepared_sessions() const { return {}; }
 
   /// Side-effect-free private-wire admission check. Backends with retained
   /// hardware/model limits override this so the addressed owner can reject an
@@ -36,6 +41,21 @@ class IGripperCommandBackend {
   virtual GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) = 0;
 
   virtual GripperCommandStatusDTO get_gripper_status(const std::string& gripper_id) const = 0;
+
+  /// Exact old command whose failed owner has been joined and replaced. The
+  /// backend retains the owner identities; no ROS identity crosses this port.
+  virtual bool rebuilt_unknown_pending(const std::string&, std::uint64_t, std::uint64_t) const {
+    return false;
+  }
+  /// Pins the exact current replacement owner that may supply recovery proof.
+  virtual std::shared_ptr<const void> rebuilt_unknown_owner(
+      const std::string&, std::uint64_t, std::uint64_t) const { return {}; }
+  /// Retire only the exact previously reported command without asserting a
+  /// successful outcome or sending a command. Caller supplies qualified proof.
+  virtual Result<void> retire_rebuilt_unknown(const std::string&, std::uint64_t, std::uint64_t,
+                                               const std::shared_ptr<const void>&) {
+    return Result<void>::Err(ErrorDTO{"recovery_unavailable", "No rebuilt unknown gripper command", {}});
+  }
 
   /// Internal source-adapter boundary. The native host resolves a currently
   /// qualified confirmation binding and its explicit freshness policy before

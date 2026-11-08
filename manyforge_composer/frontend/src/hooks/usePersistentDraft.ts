@@ -23,7 +23,7 @@ export function persistentDraftHasSettled(
 
 /**
  * Hold an authored numeric draft until its qualified owner discards it or an
- * observed value settles. The I6 caller must supply `ownerActive`; this hook no
+ * observed value settles. The caller must supply `ownerActive`; this hook no
  * longer subscribes to the deleted singleton candidate store.
  */
 export function usePersistentDraft(

@@ -38,6 +38,8 @@ const apiMock = vi.hoisted(() => ({
   deploymentWorkspace: {
     get: vi.fn(),
     mutate: vi.fn(),
+    discard: vi.fn(),
+    openDraft: vi.fn(),
   },
   cellApply: { preview: vi.fn(), apply: vi.fn(), revertPreview: vi.fn(), revert: vi.fn() },
   scenarioDocuments: { discard: vi.fn() },
@@ -90,6 +92,7 @@ type Hold = 'failure_pause' | 'operator_stop' | 'halt' | 'never_run' | 'stopping
   | 'containment_unconfirmed' | 'manual_operation' | 'idle';
 
 interface Environment {
+  previewVisible?: boolean;
   hold: Hold;
   cycle: Partial<ProgramCycleStatus>;
   admissionGeneration: number;
@@ -279,7 +282,7 @@ function identity(environment: Environment) {
 function publication(environment: Environment): PublishedAuthoringWorkspace {
   const current = programWorkspace(environment);
   const snapshot = {
-    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2' as const,
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v3' as const,
     workspaceEpoch: 'workspace.epoch.1',
     workspaceRevision: environment.draftRevision + environment.deploymentRevision,
     program: { draft: current.draft, saved: current.saved },
@@ -294,7 +297,7 @@ function publication(environment: Environment): PublishedAuthoringWorkspace {
     },
     project: {
       documentPath: '/cell', readOnly: false, documentId: null, documentName: null, documentDescription: null,
-      sourceDiagnostics: [], sourceDocumentDigest: null, programRoleAssignment: null,
+      sourceDiagnostics: [], sourceDocumentDigest: null,
       sourceProgramDigest: null, sourceDeploymentDigest: null,
     },
   };
@@ -312,6 +315,9 @@ function headlessSnapshot(environment: Environment): ComposerHeadlessState {
       manualOperations: environment.hold === 'manual_operation'
         ? [{ resident: true, state: 'executing', operationId: 'manual.1', programRunId: 'manual-run' }]
         : [],
+      cellStopAction: {
+        available: true, unavailableReason: null, expectedStopGeneration: 0, latestTerminal: null,
+      },
     },
     componentOverview: { basis: { appliedProgramOwnerEpoch: 'applied.1', appliedProgramGeneration: 1 } },
     runtime: { sections: { manager: { sourceOwnerEpoch: 'manager.1', payload: {} } } },
@@ -387,6 +393,7 @@ function Host({ environment }: { environment: Environment }) {
     runtime, program, deployment, snapshot, activation: environment.activation,
   });
   const preview = useHeldNodePreview({
+    visible: environment.previewVisible ?? true,
     runtime, workspace: program, snapshot, catalogEntries: heldCatalog, motionTargets: NO_TARGETS,
   });
   useAppliedSettlementRefresh({
@@ -479,7 +486,7 @@ describe('A refused stale Deployment fence', () => {
   });
 });
 
-describe('Deployment Apply through the server (CONTRACTS §11)', () => {
+describe('Deployment Apply through the server', () => {
   const preview = applyPreviewFixture([
     { component_id: 'arm', disposition: 'replace', reasons: ['mount'], restarts: true },
     { component_id: 'gripper', disposition: 'retain', reasons: [], restarts: false }]);
@@ -809,7 +816,7 @@ describe('Apply while a run exists', () => {
     expect(transport.sendExecutionCommand).toHaveBeenCalledOnce();
   });
 
-  it('Deployment: Resets the held run, waits for its Idle, then Applies exactly the confirmed Preview (AUD-4)', async () => {
+  it('Deployment: Resets the held run, waits for its Idle, then Applies exactly the confirmed Preview', async () => {
     const edited = { ...HELD, programRevision: digest('a'), deploymentRevision: 2, deploymentContent: digest('e') };
     const render = await mount(edited);
     expect(hooks!.resetApply.deploymentRunReset).toBe(true);
@@ -861,6 +868,7 @@ describe('Apply while a run exists', () => {
       deploymentRevision: 2, deploymentContent: digest('e'),
     };
     await mount(edited);
+    expect(hooks!.program.scenarioDraftInputResetEpoch).toBe(0);
     expect(programActionUnavailableReason(hooks!.program.state.workspace, 'discard', null))
       .toMatch(/^Nothing to apply/);
     apiMock.scenarioDocuments.discard.mockResolvedValue(programWorkspace(HELD));
@@ -874,6 +882,76 @@ describe('Apply while a run exists', () => {
       expectedDeploymentDraftRevision: 2,
     }));
     expect(apiMock.programWorkspace.discard).not.toHaveBeenCalled();
+    expect(hooks!.program.scenarioDraftInputResetEpoch).toBe(1);
+  });
+
+  it('keeps Deployment resets scoped and resets the Scenario only after Revert commits', async () => {
+    const edited = {
+      ...HELD, hold: 'idle' as const, cycle: idleCycle(null), programRevision: digest('a'),
+      deploymentRevision: 2, deploymentContent: digest('e'), savedDeployment: digest('s'),
+    };
+    const render = await mount(edited);
+    expect(hooks!.program.programDraftInputResetEpoch).toBe(0);
+    expect(hooks!.program.scenarioDraftInputResetEpoch).toBe(0);
+    expect(hooks!.deployment.deploymentDraftInputResetEpoch).toBe(0);
+    expect(hooks!.deployment.scenarioDraftInputResetEpoch).toBe(0);
+
+    apiMock.deploymentWorkspace.discard.mockRejectedValueOnce(new Error('discard failed'));
+    await act(async () => { await hooks!.deployment.discard(); });
+    expect(hooks!.deployment.deploymentDraftInputResetEpoch).toBe(0);
+
+    const discarded = { ...edited, deploymentRevision: 3, deploymentContent: APPLIED_DEPLOYMENT };
+    apiMock.deploymentWorkspace.discard.mockResolvedValueOnce(deploymentWorkspace(discarded));
+    await act(async () => { await hooks!.deployment.discard(); });
+    expect(hooks!.deployment.deploymentDraftInputResetEpoch).toBe(1);
+    expect(hooks!.program.programDraftInputResetEpoch).toBe(0);
+    expect(hooks!.program.scenarioDraftInputResetEpoch).toBe(0);
+
+    apiMock.deploymentWorkspace.openDraft.mockRejectedValueOnce(new Error('open failed'));
+    await act(async () => { await hooks!.deployment.open('/cell/other.deployment.yaml', true); });
+    expect(hooks!.deployment.deploymentDraftInputResetEpoch).toBe(1);
+    apiMock.deploymentWorkspace.openDraft.mockResolvedValueOnce(deploymentWorkspace(edited));
+    await act(async () => { await hooks!.deployment.open('/cell/other.deployment.yaml', true); });
+    expect(hooks!.deployment.deploymentDraftInputResetEpoch).toBe(2);
+    expect(hooks!.program.programDraftInputResetEpoch).toBe(0);
+
+    // Opening a document consumes the current admission generation. The owner
+    // must publish the next generation before a Scenario-wide Revert can run.
+    expect(hooks!.deployment.documentUnavailableReason).toMatch(/Waiting for updated backend authoring permissions/);
+    let staleRevert: unknown = 'not called';
+    await act(async () => { staleRevert = await hooks!.deployment.revert(); });
+    expect(staleRevert).toBeNull();
+    expect(apiMock.cellApply.revertPreview).not.toHaveBeenCalled();
+
+    // `edited` carries the old generation. Advancing it mirrors the backend's
+    // post-open admission update and clears only that stale-generation gate.
+    const reopened = { ...edited, admissionGeneration: edited.admissionGeneration + 1 };
+    await render(reopened);
+
+    apiMock.cellApply.revertPreview.mockResolvedValueOnce(applyPreviewFixture([]));
+    await act(async () => { await hooks!.deployment.revert(); });
+    expect(apiMock.cellApply.revertPreview).toHaveBeenCalledOnce();
+    expect(hooks!.deployment.applyPreviewKind).toBe('revert');
+    expect(hooks!.deployment.scenarioDraftInputResetEpoch).toBe(0);
+    apiMock.cellApply.revert.mockResolvedValueOnce({ outcome: 'failed', components: [],
+      error: { code: 'fault_estop', message: 'e-stop' } });
+    await act(async () => { await hooks!.deployment.confirmApply(); });
+    expect(hooks!.deployment.scenarioDraftInputResetEpoch).toBe(0);
+
+    apiMock.cellApply.revertPreview.mockResolvedValueOnce(applyPreviewFixture([]));
+    await act(async () => { await hooks!.deployment.revert(); });
+    apiMock.deploymentWorkspace.get.mockRejectedValueOnce(new Error('postimage unavailable'));
+    apiMock.cellApply.revert.mockResolvedValueOnce({ outcome: 'succeeded', components: [] });
+    await act(async () => { await hooks!.deployment.confirmApply(); });
+    expect(hooks!.deployment.scenarioDraftInputResetEpoch).toBe(0);
+
+    apiMock.cellApply.revertPreview.mockResolvedValueOnce(applyPreviewFixture([]));
+    await act(async () => { await hooks!.deployment.revert(); });
+    expect(apiMock.cellApply.revertPreview).toHaveBeenCalledTimes(3);
+    apiMock.cellApply.revert.mockResolvedValueOnce({ outcome: 'succeeded', components: [] });
+    await act(async () => { await hooks!.deployment.confirmApply(); });
+    expect(hooks!.deployment.scenarioDraftInputResetEpoch).toBe(1);
+    expect(hooks!.program.programDraftInputResetEpoch).toBe(0);
   });
 
   it('re-reads the Deployment owner after a Scenario Discard, so nothing is left to apply, revert or discard', async () => {
@@ -968,7 +1046,7 @@ describe('Apply while a run exists', () => {
       { component_id: 'arm', disposition: 'replace', reasons: ['mount'], restarts: true }]);
     apiMock.cellApply.revertPreview.mockResolvedValue(preview);
     apiMock.cellApply.revert.mockResolvedValue({ outcome: 'succeeded', components: [] });
-    // Revert goes through Preview → confirm → Apply (§11).
+    // Revert goes through Preview → confirm → Apply.
     await act(async () => { await hooks!.deployment.revert(); });
     expect(apiMock.cellApply.revertPreview).toHaveBeenCalledOnce();
     expect(apiMock.cellApply.revert).not.toHaveBeenCalled();
@@ -1128,6 +1206,30 @@ describe('Applied view after an Apply settles', () => {
 });
 
 describe('Advisory preview of the failed node in the ordinary editor', () => {
+  it('clears a hidden preview and cannot restore an earlier reply after reopening', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const authoring = heldAuthoring();
+      authoring.forest[0].children[0].parameters.speed = 0.5;
+      let resolveOld!: (value: unknown) => void;
+      apiMock.programs.nodeCorrectionPreview.mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }));
+      const render = await mount({ ...HELD, authoring, previewVisible: true });
+      await act(async () => { vi.advanceTimersByTime(1_000); });
+      expect(apiMock.programs.nodeCorrectionPreview).toHaveBeenCalledTimes(1);
+      await render({ ...HELD, authoring, previewVisible: false });
+      expect(hooks!.preview.preview).toBeNull();
+      expect(hooks!.preview.ghost).toBeNull();
+      await render({ ...HELD, authoring, previewVisible: true });
+      await act(async () => { vi.advanceTimersByTime(1_000); });
+      await act(async () => { resolveOld({ unavailableReason: null, target: null,
+        preview: { ok: false, error: { code: 'old', message: 'stale' } } }); await Promise.resolve(); });
+      expect(hooks!.preview.preview?.status).toBe('pending');
+      expect(hooks!.preview.statusText).not.toContain('stale');
+      expect(apiMock.programs.nodeCorrectionPreview).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it('is no longer ready once the native execution owner is replaced', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {

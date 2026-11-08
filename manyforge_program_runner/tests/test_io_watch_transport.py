@@ -15,23 +15,23 @@ from manyforge_program_runner.execution_transport import (
 )
 
 _A = "sha256:" + "a" * 64
+_API = {"api_version": "manyforge.execution_command_response.v4"}
 
 
 def _query() -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.target_observation_query.v1",
+        "schema_version": "manyforge.target_observation_query.v2",
         "owner_epoch": "kernel.epoch.7",
         "program_binding_id": _A,
-        "target_role_id": "cell_io",
         "kind": "io_signal",
-        "resource_role_id": "part_present",
+        "signal": {"component_id": "cell_io", "signal_name": "part_present"},
     }
 
 
 def _value(**overrides: Any) -> dict[str, Any]:
     return {
         "liveness": {"mode": "in_process", "warning": None},
-        "signal_name": "di_0",
+        "signal_name": "part_present",
         "value_type": "bool",
         "value": False,
         "quality": "fresh",
@@ -47,7 +47,7 @@ def _value(**overrides: Any) -> dict[str, Any]:
 
 def _request() -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.io_watch_request.v1",
+        "schema_version": "manyforge.io_watch_request.v2",
         "owner_epoch": "kernel.epoch.7",
         "program_binding_id": _A,
         "program_runner_owner_epoch": "runner.epoch.3",
@@ -55,8 +55,7 @@ def _request() -> dict[str, Any]:
         "program_run_id": "run.1",
         "node_instance_id": "wait",
         "node_attempt_id": "attempt.1",
-        "target_role_id": "cell_io",
-        "resource_role_id": "part_present",
+        "signal": {"component_id": "cell_io", "signal_name": "part_present"},
         "condition": {"kind": "level", "expected_value": True},
     }
 
@@ -78,10 +77,10 @@ def _result(state: str = "pending") -> dict[str, Any]:
     return {"state": state, "observation": _value(quality="stale"), "matched_sample": None}
 
 
-def test_query_model_names_a_resource_role_only_for_io_signal() -> None:
+def test_query_requires_a_signal_only_for_io_signal() -> None:
     TargetObservationQuery.model_validate(_query())
     with pytest.raises(ValueError):
-        TargetObservationQuery.model_validate({**_query(), "resource_role_id": None})
+        TargetObservationQuery.model_validate({**_query(), "signal": None})
     with pytest.raises(ValueError):
         TargetObservationQuery.model_validate({**_query(), "kind": "gripper_status"})
 
@@ -105,12 +104,12 @@ def test_io_signal_answers_are_exact(monkeypatch, tmp_path, bad) -> None:
     transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
     observation = {
         **_query(),
-        "schema_version": "manyforge.target_observation.v1",
+        "schema_version": "manyforge.target_observation.v2",
         # The actual host projection names its outer evaluation time.
         "evaluated_at_ns": "9223372036854775807",
         "value": _value(),
     }
-    response = {"ok": True, "command": "query_target", "target_observation": observation}
+    response = {**_API, "ok": True, "command": "query_target", "target_observation": observation}
     monkeypatch.setattr(ExecutionCommandClient, "_exchange", lambda *_: deepcopy(response))
     assert transport.query_target(_query())["target_observation"]["value"]["value"] is False
     stale = deepcopy(response)
@@ -138,11 +137,11 @@ def test_watch_commands_use_the_ordinary_socket_and_exact_token(monkeypatch, tmp
     sent: list[tuple[dict[str, Any], str]] = []
     replies = {
         "register_io_watch": {
-            "ok": True, "command": "register_io_watch",
+            **_API, "ok": True, "command": "register_io_watch",
             "registration": _registration(), "result": _result(),
         },
-        "read_io_watch": {"ok": True, "command": "read_io_watch", "result": _result()},
-        "release_io_watch": {"ok": True, "command": "release_io_watch"},
+        "read_io_watch": {**_API, "ok": True, "command": "read_io_watch", "result": _result()},
+        "release_io_watch": {**_API, "ok": True, "command": "release_io_watch"},
     }
 
     def exchange_on(_self, command, socket_path):
@@ -170,6 +169,7 @@ def test_registration_reply_must_carry_a_valid_result(monkeypatch, tmp_path) -> 
         ExecutionCommandClient,
         "_exchange_on",
         lambda *_: {
+            **_API,
             "ok": True, "command": "register_io_watch",
             "registration": _registration(), "result": result,
         },
@@ -189,6 +189,7 @@ def test_registration_echo_is_not_compared(monkeypatch, tmp_path) -> None:
         ExecutionCommandClient,
         "_exchange_on",
         lambda *_: {
+            **_API,
             "ok": True, "command": "register_io_watch",
             "registration": registration, "result": _result(),
         },
@@ -207,9 +208,6 @@ def test_edge_conditions_never_reach_the_socket(monkeypatch, tmp_path) -> None:
     with pytest.raises(HeadlessApiError) as refused:
         transport.register_io_watch(request)
     assert refused.value.code == "execution_command_invalid"
-
-
-_API = {"api_version": "manyforge.execution_command_response.v1"}
 
 
 def test_actual_released_reply_carries_neither_observation_nor_sample(
@@ -238,7 +236,7 @@ def test_only_released_omits_the_observation(result) -> None:
 
 
 def _matched_sample(**identity) -> dict:
-    return {**identity, "signal_name": "di_0", "source_id": "mock.io", "source_epoch": "1",
+    return {**identity, "signal_name": "part_present", "source_id": "mock.io", "source_epoch": "1",
             "source_sequence": "10", "value": True, "received_at_ns": 55}
 
 
@@ -308,7 +306,7 @@ def test_scope_release_sends_the_closed_eight_field_scope_request(
     monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", exchange_on)
     assert transport.release_io_watch_scope(_scope_request()) is None
     assert sent == [{
-        "api_version": "manyforge.execution_command.v1",
+        "api_version": "manyforge.execution_command.v3",
         "command": "release_io_watch",
         "attribution": sent[0]["attribution"],
         "scope_request": _scope_request(),
@@ -356,7 +354,7 @@ def test_scope_release_reply_must_name_its_command(monkeypatch, tmp_path) -> Non
 
 
 def test_matched_sample_source_epoch_is_opaque_and_its_sequence_a_counter() -> None:
-    """SX-2518: the host mints `sha256:` incarnations (spec 260 §2.3)."""
+    """The host mints `sha256:` incarnations."""
 
     epoch = "sha256:" + "5c" * 32
     sample = {**_matched_sample(controllable_component_id="io.1"), "source_epoch": epoch}

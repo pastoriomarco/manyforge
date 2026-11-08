@@ -629,7 +629,7 @@ struct RouteTables final {
   }
   // An absent optional row keeps the established physical-required path.
   // Only an exact matched strict None row, or a lane-free tool's pneumatic
-  // row (D4: no controller profile, its lane in the referenced I/O), may
+  // row (no controller profile, its lane in the referenced I/O), may
   // remove those expectations.
   if (target == nullptr) return false;
   const bool lane_free =
@@ -933,13 +933,13 @@ load_verified_controller_lifecycle_expected_domain(
       fail("Stop actuation source lost its exact expected binding");
     const auto actuation = detail::classify_ros_gripper_actuation_kind(
         graph, *source, coordinate_maps);
-    // DX817: preserve all old arm/position/default serialized identities.
+    // Preserve all old arm/position/default serialized identities.
     if (actuation == core::GripperActuationKind::kPneumatic)
       expected_binding.gripper_actuation_kind = actuation;
   }
   if (selected_pneumatic_none_domain(retained_bundle, control_domain_id,
                                       value.source_runtime_unit_id)) {
-    // DX791: preserve verified logical bindings/routes/endpoints and source
+    // Preserve verified logical bindings/routes/endpoints and source
     // identities, but never turn their abstract topology into a fake CM.
     value.physical_expectation =
         core::ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone;

@@ -381,7 +381,7 @@ def test_remote_source_check_preserves_existing_g_clean_exact_source_rule(tmp_pa
     commands = []
     monkeypatch.setattr(launcher, "_ssh_json", lambda command, **kwargs: (commands.append(command) or actual.model_dump(mode="json")))
     launcher._verify_remote_source(actual)
-    assert "scripts/qualification/source_identity.py --repo-root" in commands[0]
+    assert "scripts/lib/source_identity.py --repo-root" in commands[0]
     assert "source " not in commands[0] and "docker" not in commands[0]
     actual = source_factory(dirty=True)
     with pytest.raises(LauncherError, match="dirty"):

@@ -1,4 +1,4 @@
-"""Parity tests for the immutable C0.2f runtime-profile boundary."""
+"""Parity tests for the immutable runtime-profile boundary."""
 
 from __future__ import annotations
 

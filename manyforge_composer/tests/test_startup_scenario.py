@@ -87,20 +87,16 @@ def _non_executable_outcome(
     return {
         "affected_execution_groups": ["grasp"],
         "affected_nodes": ["close_gripper"],
-        "api_version": "manyforge.program-binding-outcome.v1",
+        "api_version": "manyforge.program-binding-outcome.v2",
         "graph_revision": selection["graph_revision"],
         "program_id": selection["program_id"],
         "program_revision": selection["program_revision"],
         "retained_bundle_id": selection["retained_bundle_id"],
-        "role_assignment_digest": "sha256:" + "a" * 64,
-        "unresolved_roles": [
+        "unresolved_targets": [
             {
-                "command_target_id": command_target_id,
-                "component_role_id": "gripper",
-                "controllable_component_id": "gripper-1",
+                "target": {"component_id": "gripper-1", "command_target_id": command_target_id},
                 "detail": "The assigned target is not present in this Deployment.",
                 "reason": "target_missing",
-                "target_role_id": "jaw",
             }
         ],
     }
@@ -139,7 +135,6 @@ def _captured_activation(
     intent = {
         "deployment": deepcopy(selection["deployment"]),
         "model_source_closure": {},
-        "program_role_assignment": {},
         "source_document_digest": selection["source_document_digest"],
         "scenario_id": selection["scenario_id"],
         "project_path": "/projects/" + selection["scenario_id"] + ".scenario",
@@ -364,7 +359,7 @@ def test_candidate_apply_returns_acceptance_without_polling(
     headless.manager_target = True
     state = _state(headless, _Coordinator(), program=None)
     acceptance = {
-        "api_version": "manyforge.manager_command_response.v1",
+        "api_version": "manyforge.manager_command_response.v2",
         "apply_id": "apply-1",
         "apply_generation": 1,
         "request_id": "request-1",

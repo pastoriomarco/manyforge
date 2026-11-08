@@ -3,7 +3,7 @@
 <package format="3">
   <name>manyforge_xarm_control</name>
   <version>0.2.0</version>
-  <description>xArm vendor adapter (CONTRACTS §6/§7/§12): robot and I/O component adapters, driver services, launch contribution.</description>
+  <description>xArm vendor adapter: robot and I/O component adapters, driver services, launch contribution.</description>
   <maintainer email="pastoriomarco@gmail.com">Marco Pastorio</maintainer>
   <license>Apache-2.0</license>
 

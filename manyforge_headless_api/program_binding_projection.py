@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import posixpath
+
+from manyforge_behavior.program_frame_facts import ProgramFrameFacts
 from typing import Any
 
 from .program_binding_transport import (
@@ -24,6 +26,7 @@ _APPLIED_SELECTION_FIELDS = frozenset(
         "preparation_digest",
         "program",
         "program_binding",
+        "program_frame_facts",
         "program_binding_id",
         "program_id",
         "program_revision",
@@ -163,8 +166,8 @@ def validate_applied_program_selection(
 
     if not isinstance(value, dict) or set(value) != _APPLIED_SELECTION_FIELDS:
         _fail(label, "the closed Applied Program selection record")
-    if value.get("schema_version") != "manyforge.applied_program_selection.v3":
-        _fail(f"{label}.schema_version", "manyforge.applied_program_selection.v3")
+    if value.get("schema_version") != "manyforge.applied_program_selection.v4":
+        _fail(f"{label}.schema_version", "manyforge.applied_program_selection.v4")
     if value.get("assistant_mode") not in {"required", "optional", "forbidden"}:
         _fail(f"{label}.assistant_mode", "a supported assistant mode")
     if value.get("assistant_projection") is not None and not isinstance(
@@ -213,6 +216,13 @@ def validate_applied_program_selection(
     if not isinstance(source, dict) or set(source) != _APPLIED_SOURCE_FIELDS:
         _fail(f"{label}.source", "the closed Applied source record")
     _sha256(source.get("record_digest"), f"{label}.source.record_digest")
+    try:
+        ProgramFrameFacts.from_capture(value["program_frame_facts"], {
+            **value, "applied_record_digest": source["record_digest"],
+        })
+    except ValueError as error:
+        _fail(f"{label}.program_frame_facts", str(error))
+
     _sha256(
         source.get("semantic_content_digest"),
         f"{label}.source.semantic_content_digest",
@@ -252,6 +262,10 @@ _COMMITTED_ACTIVATION_FIELDS = frozenset(
         "committed_applies",
         "scene_initialization",
         "program",
+        "program_frame_facts",
+        "program_binding_id",
+        "retained_bundle_id",
+        "graph_revision",
         "publication_generation",
         "record_digest",
         "origin",
@@ -279,9 +293,9 @@ def validate_committed_scenario_activation(
 
     if not isinstance(value, dict) or set(value) != _COMMITTED_ACTIVATION_FIELDS:
         _fail(label, "the closed committed Scenario activation record")
-    if value.get("schema_version") != "manyforge.committed_scenario_activation.v3":
+    if value.get("schema_version") != "manyforge.committed_scenario_activation.v4":
         _fail(
-            f"{label}.schema_version", "manyforge.committed_scenario_activation.v3"
+            f"{label}.schema_version", "manyforge.committed_scenario_activation.v4"
         )
     generation = value.get("publication_generation")
     if type(generation) is not int or not 2 <= generation <= _MAXIMUM_SAFE_INTEGER:
@@ -289,6 +303,25 @@ def validate_committed_scenario_activation(
     current = _committed_apply(value, label)
     if value.get("program") is not None and not isinstance(value.get("program"), dict):
         _fail(f"{label}.program", "an object or null")
+    binding_id = value.get("program_binding_id")
+    if binding_id is not None:
+        _sha256(binding_id, f"{label}.program_binding_id")
+        if not isinstance(value.get("program"), dict):
+            _fail(f"{label}.program_binding_id", "null without a committed Program")
+    for field in ("retained_bundle_id", "graph_revision"):
+        _sha256(value.get(field), f"{label}.{field}")
+    frame_facts = value.get("program_frame_facts")
+    if frame_facts is not None:
+        if binding_id is None or not isinstance(value.get("program"), dict):
+            _fail(f"{label}.program_frame_facts", "facts of an executable Program")
+        try:
+            ProgramFrameFacts.from_capture(frame_facts, {
+                **value,
+                "applied_record_digest": value["record_digest"],
+                "program_revision": value["program"].get("program_revision"),
+            })
+        except ValueError as error:
+            _fail(f"{label}.program_frame_facts", str(error))
     committed = value.get("committed_applies")
     if not isinstance(committed, list) or len(committed) > generation - 1:
         _fail(f"{label}.committed_applies", "at most one record per Apply publication")

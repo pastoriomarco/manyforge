@@ -17,7 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <control_msgs/action/gripper_command.hpp>
+#include <control_msgs/action/parallel_gripper_command.hpp>
 #include <cstdint>
 #include <functional>
 #include <manyforge_core/component_stream_health.hpp>
@@ -25,6 +25,7 @@
 #include <manyforge_core/ports/igripper_command_backend.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
+#include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 #include <memory>
 #include <mutex>
@@ -38,8 +39,11 @@
 #include <vector>
 
 namespace manyforge::ros2_control_execution {
+
+class GraphEventObserver;
 namespace detail {
 struct SceneProjectionCompletion;
+class SceneProjectionWorker;
 }
 
 struct Ros2GripperActionConfig {
@@ -64,12 +68,12 @@ struct Ros2GripperActionConfig {
   double close_effort = 0.0;
   bool publish_nominal_position = false;
   /// Feedback staleness threshold (no code default; must be positive): the
-  /// budget of the component's CP9 `gripper_feedback` stream row.
+  /// budget of the component's `gripper_feedback` stream row.
   double state_freshness_timeout_s{};
   /// That row's severity/recovery, used when the host declares the stream.
   core::StreamSeverityDTO feedback_stream_severity{};
   core::StreamRecoveryDTO feedback_stream_recovery{};
-  /// CP9 `gripper_feedback` stream of the owning component, declared by the
+  /// The `gripper_feedback` stream of the owning component, declared by the
   /// host. When set it records every matched feedback sample and owns the
   /// staleness judgement (the readiness snapshot no longer ages feedback).
   std::shared_ptr<core::StreamRecorder> feedback_stream{};
@@ -91,8 +95,8 @@ struct Ros2GripperActionConfig {
   std::optional<GraspStallWindow> grasp_stall_window;
   /// Stop finish tolerance (the gripper's position units, >= 0): a Stop that
   /// finds the fingers this close to the commanded target lets the action
-  /// goal finish instead of cancelling it (the stock GripperActionController
-  /// never answers a cancel that races its own success). 0 always cancels.
+  /// goal finish instead of cancelling it (the stock parallel gripper action
+  /// controller never answers a cancel that races its own success). 0 always cancels.
   double stop_finish_tolerance{};
 };
 
@@ -135,17 +139,45 @@ struct Ros2GripperTransportReadinessSnapshot {
 class Ros2GripperCommandBackend final : public core::IGripperCommandBackend {
 public:
   Ros2GripperCommandBackend(
-      Ros2TransportResources &resources,
+      std::shared_ptr<Ros2TransportResources> resources,
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
       core::IClock &clock, core::IScheduler &scheduler, bool commanded_sim);
   ~Ros2GripperCommandBackend() override;
   void complete_ros_configuration();
+  void set_retirement_wake(std::function<void()> wake);
   void shutdown() noexcept;
+  // Only after motion and gripper projection producers have joined.
+  // A false result requires the host to retain this backend and its owner.
+  [[nodiscard]] bool StopSceneProjectionUntil(
+      std::chrono::steady_clock::time_point deadline) noexcept;
 
   void configure_gripper_action(std::string gripper_id,
-                                Ros2GripperActionConfig config);
+                                Ros2GripperActionConfig config,
+                                core::Duration lifecycle_timeout_ns);
+  struct StagedRosRebind;
+  /// Builds gated, unpublished entities for the existing runtime records.
+  [[nodiscard]] std::shared_ptr<StagedRosRebind> stage_ros_rebind(
+      std::shared_ptr<Ros2TransportResources> replacement);
+  /// Publish the exact staged replacement after the previous owner joined.
+  /// The caller retains the stage until after releasing its own locks.
+  [[nodiscard]] core::Result<void> commit_ros_rebind(
+      const std::shared_ptr<StagedRosRebind> &stage);
+  /// Validate under the gripper's existing authority/map/runtime locks, then
+  /// run the enclosing no-throw commit before the final owner publication.
+  /// A false callback must leave every enclosing slot unchanged.
+  [[nodiscard]] bool commit_ros_rebind_with(
+      const std::shared_ptr<StagedRosRebind> &stage,
+      bool (*commit)(void *) noexcept, void *context,
+      const std::shared_ptr<Ros2TransportResources> &failed_dependency = {});
+  /// Enable staged feedback only after the enclosing owner transaction has
+  /// published all of its consumers.
+  [[nodiscard]] core::Result<void> activate_ros_rebind(
+      const std::shared_ptr<StagedRosRebind> &stage);
   [[nodiscard]] Ros2GripperTransportReadinessSnapshot
   gripper_transport_readiness(const std::string &gripper_id) const;
+  /// Pure local owner-readiness snapshot; absent or stale evidence is false.
+  [[nodiscard]] bool
+  cached_gripper_local_owner_ready(const std::string &gripper_id) const;
   [[nodiscard]] core::Result<void> validate_gripper_command(
       const core::GripperCommandRequestDTO &request) const override;
   core::GripperActuationKind
@@ -163,6 +195,13 @@ public:
   get_gripper_status(const std::string &gripper_id) const override;
   void invalidate_gripper_commands(
       core::GripperInvalidationReason reason) noexcept override;
+  [[nodiscard]] bool rebuilt_unknown_pending(const std::string &gripper_id,
+      std::uint64_t command_id, std::uint64_t generation) const override;
+  [[nodiscard]] std::shared_ptr<const void> rebuilt_unknown_owner(const std::string &gripper_id,
+      std::uint64_t command_id, std::uint64_t generation) const override;
+  [[nodiscard]] core::Result<void> retire_rebuilt_unknown(const std::string &gripper_id,
+      std::uint64_t command_id, std::uint64_t generation,
+      const std::shared_ptr<const void> &expected_owner) override;
   void authorize_gripper_commands() noexcept override;
   core::Result<void> try_authorize_gripper_commands() noexcept override;
   [[nodiscard]] Ros2GripperLifecycleResult authorize_lifecycle_gripper(
@@ -172,18 +211,70 @@ public:
   [[nodiscard]] Ros2GripperLifecycleResult prepare_lifecycle_gripper(
       const std::string &gripper_id);
   [[nodiscard]] Ros2GripperLifecycleResult disable_lifecycle_gripper(
-      const std::string &gripper_id, std::stop_token cancellation);
+      const std::string &gripper_id, std::stop_token cancellation,
+      std::chrono::steady_clock::time_point deadline =
+          std::chrono::steady_clock::time_point::max());
+
+  using LateCancelJournalHook = std::function<core::Result<void>(
+      std::uint64_t, std::uint64_t, std::uint64_t, const core::CommandTargetId &, const std::string &)>;
+  [[nodiscard]] core::Result<void> InstallGripperLateCancelJournalHook(
+      const std::string &gripper_id, const void *engine_identity,
+      LateCancelJournalHook hook);
+  enum class LateCancelShutdownStatus { kSettled, kPendingOrFailed, kDurableUnknown, kStuck };
+  [[nodiscard]] LateCancelShutdownStatus gripper_late_cancel_shutdown_status() const noexcept;
+  [[nodiscard]] bool gripper_late_cancel_failed() const noexcept;
+  [[nodiscard]] std::vector<std::shared_ptr<core::GripperPreparedSessionPin>>
+  tracked_gripper_prepared_sessions() const override;
+  [[nodiscard]] LateCancelShutdownStatus CloseGripperLateCancels(
+      std::chrono::steady_clock::time_point deadline);
 
 private:
-  using GripperCommand = control_msgs::action::GripperCommand;
+  struct GripperRuntime;
+  struct RosEntities;
+  struct LateCancelTracking {
+    struct Entry {
+      std::string gripper_id;
+      std::shared_ptr<core::GripperLateCancelSlot> slot;
+      std::shared_ptr<GripperRuntime> runtime;
+      std::shared_ptr<RosEntities> bundle;
+      std::shared_ptr<core::GripperPreparedSessionPin> session;
+    };
+    mutable std::mutex mutex;
+    std::condition_variable condition;
+    std::vector<Entry> entries;
+  };
+  std::shared_ptr<LateCancelTracking> late_cancel_tracking_ =
+      std::make_shared<LateCancelTracking>();
+  std::shared_ptr<std::atomic<std::uint64_t>> late_cancel_failure_epoch_ =
+      std::make_shared<std::atomic<std::uint64_t>>(0);
+  std::atomic<std::uint64_t> late_cancel_cleared_epoch_{0};
+  friend class Ros2GripperCommandBackendTestPeer;
+  void invalidate_gripper_commands_impl(
+      core::GripperInvalidationReason reason) noexcept;
+  core::Result<void> try_authorize_gripper_commands_impl(
+      const std::shared_ptr<Ros2TransportResources> &owner) noexcept;
+  Ros2GripperLifecycleResult authorize_lifecycle_gripper_impl(
+      const std::string &gripper_id, const std::shared_ptr<Ros2TransportResources> &owner);
+  Ros2GripperLifecycleResult prepare_lifecycle_gripper_impl(
+      const std::string &gripper_id, const std::shared_ptr<Ros2TransportResources> &owner);
+  core::GripperCommandResultDTO mark_gripper_grasp_lost_impl(
+      const std::string &gripper_id, std::uint64_t expected_command_id,
+      std::uint64_t expected_generation, const std::string &evidence_label,
+      const std::string &message, const std::string &reason_code);
+  using GripperCommand = control_msgs::action::ParallelGripperCommand;
   using GoalHandleGripper = rclcpp_action::ClientGoalHandle<GripperCommand>;
+  struct RosEntities;
   struct GripperRuntime {
     Ros2GripperActionConfig config;
-    rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
-    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub;
-    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
-        joint_state_sub;
+    core::Duration lifecycle_timeout_ns{};
+    std::shared_ptr<RosEntities> ros;
+    /// The exact transport that sent the current action goal.
+    std::shared_ptr<RosEntities> goal_ros;
     mutable std::mutex mutex;
+    const void *late_cancel_engine_identity{};
+    LateCancelJournalHook late_cancel_journal_hook;
+    std::shared_ptr<core::GripperLateCancelSlot> goal_late_cancel_slot;
+    std::atomic<std::uint64_t> send_generation{0};
     std::condition_variable_any lifecycle_condition;
     GoalHandleGripper::SharedPtr active_goal_handle;
     std::string state = "idle";
@@ -235,6 +326,10 @@ private:
     int projection_retry_count = 0;
     std::optional<std::size_t> scene_projection_slot;
     std::uint64_t scene_projection_request_id = 0;
+    /// Whether the current pending projection has actually entered the worker.
+    bool scene_projection_submitted = false;
+    std::uint64_t scene_projection_submitted_request_id = 0;
+    bool scene_projection_missed_settled = false;
     std::vector<std::string> evidence;
     std::string evidence_state;
     bool externally_failed = false;
@@ -242,8 +337,36 @@ private:
     std::string reason_code;
   };
 
+  struct RosEntities {
+    struct ActionLeaf { std::timed_mutex mutex; };
+    struct PublisherLeaf {
+      enum class State : std::uint8_t { kOpen, kRebindFenced, kRetired };
+      std::timed_mutex mutex;
+      std::atomic<State> state{State::kOpen};
+    };
+    std::shared_ptr<Ros2TransportResources> owner;
+    std::shared_ptr<std::atomic<bool>> callbacks_enabled;
+    // OD-66: the action client's own time-critical group (null on an owner
+    // without a time-critical thread: the default group).
+    rclcpp::CallbackGroup::SharedPtr action_callback_group;
+    rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
+    std::shared_ptr<ActionLeaf> action_leaf;
+    std::shared_ptr<PublisherLeaf> publisher_leaf;
+    std::shared_ptr<std::atomic<int>> action_ready;
+    std::shared_ptr<GraphEventObserver> action_graph_observer;
+    // -1 until the exact publisher receives a matched event.
+    std::shared_ptr<std::atomic<std::int64_t>> command_matches;
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub;
+    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub;
+  };
+  [[nodiscard]] static bool old_effect_owner_retired(const GripperRuntime &runtime) noexcept;
+  [[nodiscard]] static RosEntities create_ros_entities(
+      const std::shared_ptr<Ros2TransportResources> &owner,
+      const std::shared_ptr<GripperRuntime> &runtime,
+      std::shared_ptr<std::atomic<bool>> callbacks_enabled = {});
+
   void advance_pneumatic_locked(GripperRuntime &runtime) const;
-  // GRP-2: a controller completion of a wait_for_duration command before
+  // A controller completion of a wait_for_duration command before
   // duration_s has elapsed holds it executing (controller_done); the
   // lifecycle tick then completes it. False when the command completes now.
   bool hold_until_duration_locked(GripperRuntime &runtime) const;
@@ -268,13 +391,21 @@ private:
                          std::uint64_t command_id, std::uint64_t generation,
                          const GoalHandleGripper::WrappedResult &result);
   // Sends the cancel of a pending disable's goal (command_id, generation).
-  // N10b: for a command already fenced by a Stop/invalidation, the server's
+  // For a command already fenced by a Stop/invalidation, the server's
   // ACCEPT settles it like the goal's own result, whichever comes first.
-  static void dispatch_disable_cancel(
+  // send_on_calling_thread: the Stop invalidation sends directly under the
+  // action leaf (its caller holds no lock). ROS callbacks keep the
+  // StopControl hop: they run under rclcpp_action's internal locks, so
+  // entering the leaf there would order those locks before the leaf, the
+  // reverse of async_send_goal under the leaf.
+  void dispatch_disable_cancel(
       const std::shared_ptr<GripperRuntime> &runtime,
-      const rclcpp_action::Client<GripperCommand>::SharedPtr &client,
+      const std::shared_ptr<RosEntities> &goal_ros,
       const GoalHandleGripper::SharedPtr &goal, std::uint64_t command_id,
-      std::uint64_t generation);
+      std::uint64_t generation,
+      const std::shared_ptr<core::GripperLateCancelSlot> &slot,
+      bool settle_lifecycle_on_accept = true,
+      bool send_on_calling_thread = false);
   bool
   schedule_gripper_lifecycle(const std::shared_ptr<GripperRuntime> &runtime,
                              std::uint64_t command_id, std::uint64_t generation,
@@ -284,12 +415,11 @@ private:
                                std::uint64_t generation,
                                std::uint64_t schedule_generation);
 
-  Ros2TransportResources &resources_;
+  std::atomic<std::shared_ptr<Ros2TransportResources>> resources_;
   std::shared_ptr<core::IExecutionStateSink> execution_state_sink_;
   core::IClock &clock_;
   core::IScheduler &scheduler_;
-  rclcpp::Node::SharedPtr node_;
-  detail::SceneProjectionWorker *scene_projection_worker_;
+  std::unique_ptr<detail::SceneProjectionWorker> scene_projection_worker_;
   bool commanded_sim_;
   bool is_commanded_sim_mode() const noexcept { return commanded_sim_; }
   mutable std::mutex ros_configuration_mutex_;
@@ -300,9 +430,13 @@ private:
   // Lock order is authority -> map -> per-runtime; callbacks only take the
   // per-runtime leaf lock.
   mutable std::mutex gripper_authority_mutex_;
-  std::uint64_t gripper_authority_generation_ = 1;
-  std::uint64_t gripper_lifecycle_generation_ = 1;
+  std::function<void()> retirement_wake_;
+  // Admission closes under the authority mutex, but the SDK send leaf cannot
+  // take that mutex. These generations publish the same invalidations to it.
+  std::atomic<std::uint64_t> gripper_authority_generation_{1};
+  std::atomic<std::uint64_t> gripper_lifecycle_generation_{1};
   bool gripper_admission_blocked_ = false; // Destructive lifecycle fence.
+  bool gripper_terminally_closed_ = false; // Protected by gripper_authority_mutex_.
   bool gripper_motion_admission_blocked_ = false; // Stop affects motion only.
   mutable std::mutex gripper_map_mutex_;
   std::unordered_map<std::string, std::shared_ptr<GripperRuntime>> grippers_;

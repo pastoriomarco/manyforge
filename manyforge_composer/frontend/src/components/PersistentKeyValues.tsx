@@ -7,6 +7,7 @@ import type {
   PersistentKeyValue,
   PersistentKeyValues,
   ProgramDocument,
+  ProgramFrameReference,
 } from '../types/api';
 import type { FrameScope } from '../utils/programFrames';
 import {
@@ -29,16 +30,27 @@ function initialLabel(row: PersistentKeyValue): string {
     : formatBlackboardValue(row.type, row.initial);
 }
 
-/** The declarations a stored pose is chosen from: frames and each key's `allowed_frames`. */
-export type PersistentKeyFrameProgram = Pick<ProgramDocument, 'target_roles' | 'scene' | 'blackboard'>;
+/**
+ * What a stored pose is chosen from: the Applied Program's Scene and key
+ * declarations (each key's `allowed_frames`) and the frames its binding sealed.
+ */
+export interface PersistentKeyFrameProgram {
+  program: Pick<ProgramDocument, 'scene' | 'blackboard'>;
+  /** The Applied binding's frames (`frame_bindings[].reference`). */
+  frames: readonly ProgramFrameReference[];
+}
 
 function keyFrameScope(
-  program: PersistentKeyFrameProgram | undefined,
+  source: PersistentKeyFrameProgram | undefined,
   key: string,
 ): FrameScope | undefined {
-  if (program === undefined) return undefined;
-  const allowed = program.blackboard?.keys.find((row) => row.key === key)?.allowed_frames;
-  return { program, ...(allowed === undefined ? {} : { allowedFrames: allowed }) };
+  if (source === undefined) return undefined;
+  const allowed = source.program.blackboard?.keys.find((row) => row.key === key)?.allowed_frames;
+  return {
+    program: source.program,
+    frames: source.frames,
+    ...(allowed === undefined ? {} : { allowedFrames: allowed }),
+  };
 }
 
 export interface PersistentKeyValuesViewProps {

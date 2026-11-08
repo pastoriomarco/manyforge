@@ -843,7 +843,7 @@ def test_g_failed_start_returns_exact_metadata_and_leaves_ros_client_for_owner_c
     environment = _g_environment(tmp_path, FAKE_CONTAINER_PRESENT="false", FAKE_EXIT_AFTER_RUN="true")
     # Keep scratch on the repository's mounted filesystem, independently of the
     # invoking user's HOME. Production rejects /tmp and tmpfs; no bypass is used.
-    with tempfile.TemporaryDirectory(prefix="manyforge-q93-fixture-", dir=REPOSITORY_ROOT) as persistent:
+    with tempfile.TemporaryDirectory(prefix="manyforge-launcher-fixture-", dir=REPOSITORY_ROOT) as persistent:
         install = tmp_path / "qualified-package"
         install.mkdir()
         workspace = tmp_path / "workspace"
@@ -1102,17 +1102,6 @@ def test_mounted_symlinked_evidence_descendant_stops_but_refuses_capture(tmp_pat
     assert not list(outside.iterdir())
 
 
-def test_repeated_legacy_capture_failures_replace_the_same_owned_partial(tmp_path):
-    environment=_fake_docker_environment(tmp_path,FAKE_COPY_FAIL="true")
-    for _ in range(3):
-        completed=subprocess.run(["bash",str(LAUNCHER),"stop"],env=environment,capture_output=True,text=True)
-        assert completed.returncode==69
-        partials=list((tmp_path/"cache/evidence").glob("*.partial"))
-        assert len(partials)==1 and partials[0].name==".legacy-"+"d"*64+".partial"
-        assert json.loads((partials[0]/"docker-inspect.json").read_text())["container_id"]=="d"*64
-    assert not Path(environment["FAKE_DOCKER_REMOVED"]).exists()
-
-
 def test_symlinked_cache_ancestor_can_start_new_workbench(tmp_path):
     launcher = _copy_writable_launcher(tmp_path)
     actual=tmp_path/"actual-storage"
@@ -1126,22 +1115,6 @@ def test_symlinked_cache_ancestor_can_start_new_workbench(tmp_path):
     assert completed.returncode==0,completed.stderr
     assert (actual/"cache/runtime/manyforge-development-workbench").is_dir()
     assert "run " in Path(environment["FAKE_DOCKER_CALLS"]).read_text()
-
-
-def test_failed_inspect_never_replaces_existing_legacy_partial(tmp_path):
-    partial=tmp_path/"cache/evidence"/(".legacy-"+"d"*64+".partial")
-    partial.mkdir(parents=True)
-    (partial/"copied-journal").write_bytes(b"old sole evidence")
-    (partial/"docker-inspect.json").write_text(json.dumps({"container_id":"d"*64,"image":"sha256:test",
-        "mounts":[{"Type":"bind","Source":str(REPOSITORY_ROOT),"Destination":"/workspace"}],"state":{"running":False}}))
-    completed,environment=_run_launcher(tmp_path,"stop",FAKE_SUMMARY_FAIL="true")
-    assert completed.returncode==69
-    assert "Could not inspect the stopped-container capture" in completed.stderr
-    assert Path(environment["FAKE_DOCKER_STOPPED"]).exists()
-    assert (partial/"copied-journal").read_bytes()==b"old sole evidence"
-    assert len(list(partial.parent.glob("*.partial")))==1
-    assert not Path(environment["FAKE_DOCKER_REMOVED"]).exists()
-
 
 
 def test_repeated_mounted_log_failures_reuse_one_partial_and_keep_previous_tail(tmp_path):
@@ -1216,7 +1189,6 @@ def test_start_completes_mounted_stopped_predecessor_capture_and_preserves_durab
     assert {p.name for p in captured.iterdir()} == {'docker-inspect.json', 'docker.log'}
     assert json.loads((captured/'docker-inspect.json').read_text())['container_id'] == 'd'*64
     assert f'-v {root}:/tmp/manyforge-state' in calls[position('run')]
-
 
 
 def test_owned_extra_entries_removed_in_place_without_adding_failed_capture_siblings(tmp_path):

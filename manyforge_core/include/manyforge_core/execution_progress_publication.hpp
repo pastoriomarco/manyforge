@@ -53,7 +53,7 @@ enum class ExecutionProgressHazardClaimResult {
   kGenerationMismatch,
 };
 
-/// Scalar, latest-only execution-progress publication (spec/210 section 3.14).
+/// Scalar, latest-only execution-progress publication.
 /// Writers serialize on one leaf mutex; readers perform bounded atomic
 /// snapshots and never take that mutex. The publication owns no trajectory and
 /// cannot infer authority: the backend constructor fixes source/profile for its

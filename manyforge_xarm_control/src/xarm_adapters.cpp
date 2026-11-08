@@ -56,11 +56,11 @@ bool xarm_controller_reachable(const std::string &address,
 }
 
 XArmMachine make_xarm_machine(rclcpp::Node &node, core::IClock &clock,
-                              XArmMachineInputs inputs) {
+                              XArmMachineInputs inputs, const XArmRosOwner *ros_owner) {
   XArmMachine made;
   made.robot_states =
-      std::make_shared<XArmRobotStatesTransport>(node, inputs.driver_namespace, clock);
-  made.driver = std::make_shared<XArmDriverServices>(node, inputs.driver_namespace);
+      std::make_shared<XArmRobotStatesTransport>(node, inputs.driver_namespace, clock, ros_owner);
+  made.driver = std::make_shared<XArmDriverServices>(node, inputs.driver_namespace, ros_owner);
   made.owner = std::make_shared<XArmOwnerAdapter>(XArmOwnerAdapterPorts{
       made.robot_states, made.driver, std::move(inputs.lane), std::move(inputs.restart_driver),
       [address = inputs.address, probe = inputs.settings.reboot_probe_interval] {
@@ -71,7 +71,7 @@ XArmMachine make_xarm_machine(rclcpp::Node &node, core::IClock &clock,
       inputs.settings.reboot_probe_interval, inputs.lifecycle_command_timeout,
       std::move(inputs.launch_settling)});
   made.io_states =
-      std::make_shared<XArmIoStatesTransport>(node, inputs.driver_namespace, clock, made.owner);
+      std::make_shared<XArmIoStatesTransport>(node, inputs.driver_namespace, clock, made.owner, ros_owner);
   return made;
 }
 

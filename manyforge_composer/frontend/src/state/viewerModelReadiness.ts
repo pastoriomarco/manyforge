@@ -140,7 +140,7 @@ function resourceStateMessage<T>(
  * verifies is retained, mounted and marked not current (``retained``),
  * instead of being unmounted and rebuilt on recovery: commands are disabled
  * by the transport condition itself, and the not-verified notice keeps the
- * view from being presented as healthy (spec 450 §5). Geometry stays hidden
+ * view from being presented as healthy. Geometry stays hidden
  * for a new or closed session (``connecting``/``disconnected``), semantic
  * synchronization, an accepted or Manager transition, a stale projection, an
  * identity mismatch and every unavailable case.

@@ -69,9 +69,7 @@ RUNTIME_UNAVAILABLE_MESSAGE = (
     "Composer is not a runtime owner; configure the headless API for owner-issued "
     "status, scene, alarm/history, preview, operation, Program Apply/Run, and "
     "explicit operation/Program Stop facts. The structural-only Composer profile "
-    "does not launch those owners. I6 cumulative qualification, lifecycle, full "
-    "Stop, simulation, real-robot, and generalized-tool work remain at their "
-    "later gates. The "
+    "does not launch those owners. The "
     "assistant operator workflow also requires a configured "
     "assistant bridge"
 )
@@ -96,20 +94,10 @@ _PROGRAM_NON_EXECUTABLE_OUTCOME_FIELDS = frozenset(
         "program_id",
         "program_revision",
         "retained_bundle_id",
-        "role_assignment_digest",
-        "unresolved_roles",
+        "unresolved_targets",
     }
 )
-_PROGRAM_UNRESOLVED_ROLE_FIELDS = frozenset(
-    {
-        "command_target_id",
-        "component_role_id",
-        "controllable_component_id",
-        "detail",
-        "reason",
-        "target_role_id",
-    }
-)
+_PROGRAM_UNRESOLVED_TARGET_FIELDS = frozenset({"target", "reason", "detail"})
 _APPLIED_PROGRAM_STATUS_FIELDS = frozenset(
     {
         "deployment_artifact_id",
@@ -180,7 +168,7 @@ _PREPARED_ACTIVATION_FIELDS = (
     "graph_revision",
     "program_id",
     "program_revision",
-    # Bound binding id or named non-executable result (H1a); part of the
+    # Bound binding id or named non-executable result; part of the
     # confirmation digest, so a changed Program impact is a stale confirmation.
     "program_outcome",
     "node_environment_digest",
@@ -362,7 +350,7 @@ class ComposerState:
         if (
             not isinstance(detail, dict)
             or set(detail) != _PROGRAM_NON_EXECUTABLE_OUTCOME_FIELDS
-            or detail.get("api_version") != "manyforge.program-binding-outcome.v1"
+            or detail.get("api_version") != "manyforge.program-binding-outcome.v2"
             or detail.get("program_id") != publication.get("program_id")
             or detail.get("program_revision") != publication.get("program_revision")
             or detail.get("retained_bundle_id")
@@ -374,7 +362,6 @@ class ComposerState:
             "graph_revision",
             "program_revision",
             "retained_bundle_id",
-            "role_assignment_digest",
         ):
             value = detail.get(name)
             if not isinstance(value, str) or not value:
@@ -383,32 +370,27 @@ class ComposerState:
             "graph_revision",
             "program_revision",
             "retained_bundle_id",
-            "role_assignment_digest",
         ):
             if not _is_sha256_identity(detail[name]):
                 raise ValueError(f"non-executable Program outcome has invalid {name}")
-        unresolved = detail.get("unresolved_roles")
+        unresolved = detail.get("unresolved_targets")
         if not isinstance(unresolved, list) or not unresolved:
-            raise ValueError("non-executable Program outcome has no unresolved roles")
+            raise ValueError("non-executable Program outcome has no unresolved targets")
         for row in unresolved:
             if (
                 not isinstance(row, dict)
-                or set(row) != _PROGRAM_UNRESOLVED_ROLE_FIELDS
+                or set(row) != _PROGRAM_UNRESOLVED_TARGET_FIELDS
                 or any(
                     not isinstance(row.get(name), str) or not row[name]
-                    for name in (
-                        "component_role_id",
-                        "controllable_component_id",
-                        "detail",
-                        "reason",
-                    )
+                    for name in ("detail", "reason")
                 )
-                or any(
-                    row.get(name) is not None and not isinstance(row.get(name), str)
-                    for name in ("command_target_id", "target_role_id")
-                )
+                or not isinstance(row.get("target"), dict)
+                or set(row["target"]) != {"component_id", "command_target_id"}
+                or any(not isinstance(row["target"].get(name), str)
+                       or not row["target"][name]
+                       for name in ("component_id", "command_target_id"))
             ):
-                raise ValueError("non-executable Program outcome has an invalid role row")
+                raise ValueError("non-executable Program outcome has an invalid target row")
         for name in ("affected_nodes", "affected_execution_groups"):
             values = detail.get(name)
             if not isinstance(values, list) or any(
@@ -559,7 +541,6 @@ class ComposerState:
             "deployment": deepcopy(deployment),
             "program_authoring": deepcopy(intent.get("program_authoring")),
             "model_source_closure": deepcopy(intent["model_source_closure"]),
-            "program_role_assignment": deepcopy(intent["program_role_assignment"]),
             "source_document_digest": intent["source_document_digest"],
             "scenario_id": intent["scenario_id"],
             "scenario_project_path": intent["project_path"],
@@ -657,10 +638,6 @@ class ComposerState:
     @property
     def scenario_source_document_digest(self) -> str | None:
         return self._authoring_project_fact("source_document_digest")
-
-    @property
-    def scenario_program_role_assignment(self) -> dict[str, Any] | None:
-        return self._authoring_project_fact("program_role_assignment")
 
     @property
     def scenario_source_program_digest(self) -> str | None:
@@ -871,7 +848,7 @@ class ComposerState:
             if error.code == "program_applied_selection_not_found":
                 return None
             if error.code in {"program_applied_non_executable", "program_not_selected"}:
-                # H1a: the Applied Program is preserved but has no executable
+                # The Applied Program is preserved but has no executable
                 # selection; its named status is read separately.
                 return None
             if allow_inactive and error.code == "program_applied_selection_not_active":
@@ -1086,7 +1063,7 @@ class ComposerState:
                     "candidate_graph_revision"
                 ],
                 "diff": preview.get("diff"),
-                # The Manager's authoritative impact (H1a): a changed impact
+                # The Manager's authoritative impact: a changed impact
                 # makes an earlier confirmation stale.
                 "impact": preview.get("impact"),
             }
@@ -1124,9 +1101,6 @@ class ComposerState:
                             intent["model_source_closure"]
                         ),
                         "program": deepcopy(intent["program"]),
-                        "program_role_assignment": deepcopy(
-                            intent["program_role_assignment"]
-                        ),
                         "expected_admission_generation": intent[
                             "expected_admission_generation"
                         ],

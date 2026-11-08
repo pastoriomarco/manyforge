@@ -45,6 +45,7 @@ _PROGRAM_DIAGNOSTIC_SCHEMAS = frozenset(
         "manyforge.program_diagnostic.v1",
         "manyforge.program_diagnostic.v2",
         "manyforge.program_diagnostic.v3",
+        "manyforge.program_diagnostic.v4",
     )
 )
 

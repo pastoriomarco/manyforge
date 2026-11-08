@@ -1,5 +1,5 @@
 {
-  "schema_version": "manyforge.program_run_status.v3",
+  "schema_version": "manyforge.program_run_status.v4",
   "owner_id": "program-runner.development-workbench",
   "owner_epoch": "program-runner-06566edc14494853af0a54703d97e6b8",
   "run_revision": 3,

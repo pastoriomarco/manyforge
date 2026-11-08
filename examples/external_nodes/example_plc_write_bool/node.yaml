@@ -48,4 +48,4 @@
 # Even this commented entry is only illustrative. A usable extension also
 # requires the future compiler-owned extension identity, compatibility,
 # executable-package digest, source provenance, dependency, and bounded NRT
-# cancellation contract. Availability returns at I5/H0; execution at I6/N.
+# cancellation contract; none of these exists yet.

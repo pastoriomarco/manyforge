@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <iostream>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -12,8 +11,6 @@
 #include <vector>
 
 namespace manyforge::qualification {
-
-inline constexpr int kUnavailableExitCode = 78;
 
 struct AcceptanceDisposition {
   std::string_view historical_case;
@@ -99,18 +96,5 @@ struct SupportContactFixtureContract {
   static constexpr double kReleaseToleranceM = 0.001;
   static constexpr int kDistractorCount = 10;
 };
-
-inline int emit_unavailable(
-    const std::string_view harness,
-    const std::string_view restoration_gates,
-    const std::span<const AcceptanceDisposition> dispositions) {
-  std::cerr << "composable_cell_collision_qualification_unavailable: harness="
-            << harness << " gates=" << restoration_gates
-            << " mapped_acceptance_groups=" << dispositions.size()
-            << " historical_source="
-               "manyforge@08222188293df8e12f90dc72e204c21f22f92ea1"
-            << '\n';
-  return kUnavailableExitCode;
-}
 
 }  // namespace manyforge::qualification

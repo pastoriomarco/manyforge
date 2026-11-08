@@ -25,24 +25,229 @@ ResourceAddressedExecutionKernel::find_pending_motion_operation_locked(
 }
 
 std::optional<OperationId> ResourceAddressedExecutionKernel::find_event_operation_locked(
-    const IResolvedParticipantExecutionEngine* engine, const std::uint64_t subordinate_id) const {
+    const IResolvedParticipantExecutionEngine* engine, const std::uint64_t subordinate_id,
+    const std::optional<std::uint64_t> subscription_id) const {
   if (engine == nullptr || subordinate_id == 0U) {
     return std::nullopt;
   }
   std::optional<OperationId> result;
+  bool ambiguous = false;
+  const auto consider = [&](const OperationId& id, const ActiveOperation& operation) {
+    const ActiveOperationParticipant* participant = nullptr;
+    if (subscription_id) {
+      const auto found = std::find_if(operation.participants.begin(), operation.participants.end(),
+          [&](const auto& item) { return item.engine_subscription_id == *subscription_id; });
+      if (found != operation.participants.end()) participant = &*found;
+    } else {
+      participant = operation.participant_for(engine);
+    }
+    if (!participant || participant->subordinate_id != subordinate_id) return;
+    if (result) ambiguous = true;
+    else result = id;
+  };
   for (const auto& [operation_id, operation] : active_operations_) {
-    const auto* participant = operation->participant_for(engine);
-    if (participant == nullptr || participant->subordinate_id != subordinate_id) {
-      continue;
-    }
-    if (result.has_value()) {
-      // Admission prevents one engine instance from owning two operations.
-      // Fail closed if corrupted state ever violates that invariant.
-      return std::nullopt;
-    }
-    result = operation_id;
+    consider(operation_id, *operation);
+    for (const auto* slot : {&operation->pending_motion_takeover, &operation->next_motion_takeover})
+      if (!slot->empty()) consider(slot->key(), *slot->mapped());
   }
+  if (ambiguous) return std::nullopt;
   return result;
+}
+
+Result<void> ResourceAddressedExecutionKernel::record_late_cancel_uncertain(
+    IResolvedParticipantExecutionEngine* engine, const std::uint64_t execution_id) {
+  std::optional<OperationId> operation_id;
+  double progress = 0.0;
+  std::optional<OperationId> takeover_owner;
+  const auto exact_uncertain = [&](const ActiveOperation& operation) {
+    const auto* participant = operation.participant_for(engine);
+    if (!participant || participant->subordinate_id != execution_id ||
+        participant->payload_kind != OperationParticipantPayloadKind::kMotion)
+      return false;
+    const auto row = std::find_if(operation.state.participants.begin(),
+                                  operation.state.participants.end(), [&](const auto& value) {
+      return value.participant_id == participant->slot_owner.participant_id;
+    });
+    return operation.state.state == OperationStateKind::kInterventionRequired &&
+           row != operation.state.participants.end() &&
+           row->state == OperationStateKind::kInterventionRequired && row->terminal_fact &&
+           row->terminal_fact->effect == ParticipantEffectKnowledge::kEffectUncertain;
+  };
+  {
+    std::lock_guard lock(state_mutex_);
+    operation_id = find_event_operation_locked(engine, execution_id);
+    if (!operation_id)
+      return reject<void>("Late cancel does not name a unique active execution",
+                          "late_cancel_execution_unmapped", ErrorCode::kInvariantViolation);
+    const auto* operation = find_active_operation_locked(*operation_id);
+    if (!operation) {
+      operation = find_pending_motion_operation_locked(*operation_id);
+      for (const auto& [owner_id, owner] : active_operations_) {
+        for (const auto* slot : {&owner->pending_motion_takeover, &owner->next_motion_takeover})
+          if (!slot->empty() && slot->key() == *operation_id) takeover_owner = owner_id;
+      }
+    }
+    if (!operation)
+      return reject<void>("Late cancel operation is no longer active",
+                          "late_cancel_execution_unmapped", ErrorCode::kInvariantViolation);
+    if (terminal(operation->state.state) &&
+        operation->state.state != OperationStateKind::kInterventionRequired)
+      return reject<void>("Late cancel names a finalized operation",
+                          "late_cancel_operation_terminal", ErrorCode::kInvariantViolation);
+    const auto* participant = operation->participant_for(engine);
+    if (!participant || participant->payload_kind != OperationParticipantPayloadKind::kMotion)
+      return reject<void>("Late cancel does not name an active motion participant",
+                          "late_cancel_execution_unmapped", ErrorCode::kInvariantViolation);
+    const auto row = std::find_if(operation->state.participants.begin(),
+                                  operation->state.participants.end(), [&](const auto& value) {
+      return value.participant_id == participant->slot_owner.participant_id;
+    });
+    if (row == operation->state.participants.end())
+      return reject<void>("Late cancel participant row is unavailable",
+                          "late_cancel_execution_unmapped", ErrorCode::kInvariantViolation);
+    if (terminal(row->state) && row->state != OperationStateKind::kInterventionRequired)
+      return reject<void>("Late cancel names a finalized participant",
+                          "late_cancel_participant_terminal", ErrorCode::kInvariantViolation);
+    progress = row->progress;
+  }
+  if (takeover_owner) {
+    // Serialize against the incumbent's existing takeover journal writer.
+    // Re-journal the exact candidate snapshot; observing its in-memory state
+    // alone cannot acknowledge a concurrent or failed journal write.
+    OperationCommitGuard commit(*this, *takeover_owner);
+    std::unique_lock lock(state_mutex_);
+    auto* owner = find_active_operation_locked(*takeover_owner);
+    auto* operation = find_pending_motion_operation_locked(*operation_id);
+    const auto owned_by_original = [&] {
+      if (!commit.claimed() || !owner || !owner->ordinary_commit_in_flight || !operation) return false;
+      for (const auto* slot : {&owner->pending_motion_takeover, &owner->next_motion_takeover})
+        if (!slot->empty() && slot->key() == *operation_id && slot->mapped().get() == operation)
+          return true;
+      return false;
+    };
+    if (!owned_by_original() || !exact_uncertain(*operation))
+      return reject<void>("Takeover uncertainty awaits durable reconciliation",
+                          "late_cancel_projection_pending", ErrorCode::kExecutionRejected);
+    const auto prior = operation->state;
+    auto capture = prior;
+    stamp_operation_capture_locked(*operation, capture);
+    lock.unlock();
+    const auto written = attempt_journal_write([&] {
+      return journal_.RecordOperationState(config_.request_owner_epoch, capture, nullptr,
+                                           "late_cancel_uncertainty_confirmed");
+    });
+    lock.lock();
+    if (!written.ok()) {
+      retain_operation_journal_write_fault_locked("late_cancel_uncertainty_confirmed",
+                                                  written.error(), &capture);
+      return Result<void>::Err(written.error());
+    }
+    owner = find_active_operation_locked(*takeover_owner);
+    operation = find_pending_motion_operation_locked(*operation_id);
+    if (!owned_by_original() || operation->state != prior ||
+        operation->last_capture_order != capture.journal_capture_order ||
+        !exact_uncertain(*operation))
+      return reject<void>("Takeover uncertainty changed during journal projection",
+                          "late_cancel_projection_pending", ErrorCode::kExecutionRejected);
+    operation->state.journal_capture_order = capture.journal_capture_order;
+    return Result<void>::Ok();
+  }
+  const auto failure = error("execution_aborted", "Late goal cancellation outcome is uncertain",
+                             "late_cancel_outcome_unknown");
+  const ParticipantExecutionFact fact{ParticipantExecutionFactKind::kLocalFailure,
+                                      ParticipantEffectKnowledge::kEffectUncertain, failure};
+  bool durable_applied = false;
+  const auto applied = apply_subordinate_state(*operation_id, engine, execution_id,
+      OperationStateKind::kInterventionRequired, progress, failure, false, fact, true,
+      &durable_applied);
+  if (!applied.ok()) return applied;
+  if (!durable_applied)
+    return reject<void>("Late cancel uncertainty awaits durable projection",
+                        "late_cancel_projection_pending", ErrorCode::kExecutionRejected);
+  std::lock_guard lock(state_mutex_);
+  const auto* operation = find_active_operation_locked(*operation_id);
+  if (!operation || !exact_uncertain(*operation))
+    return reject<void>("Late cancel uncertainty has not been durably projected",
+                        "late_cancel_projection_pending", ErrorCode::kExecutionRejected);
+  return Result<void>::Ok();
+}
+
+Result<void> ResourceAddressedExecutionKernel::record_late_cancel_uncertain(
+    IResolvedParticipantExecutionEngine* engine, const std::uint64_t preparation_id,
+    const std::uint64_t command_id, const std::uint64_t generation, const CommandTargetId& target) {
+  if (!engine || preparation_id == 0U || command_id == 0U || generation == 0U || target.empty())
+    return reject<void>("Late gripper cancel identity is incomplete",
+                        "late_cancel_execution_unmapped", ErrorCode::kInvariantViolation);
+  std::optional<OperationId> operation_id;
+  double progress = 0.0;
+  std::optional<ErrorDTO> prior_owner_loss;
+  std::optional<ParticipantExecutionFact> prior_owner_loss_fact;
+  {
+    std::lock_guard lock(state_mutex_);
+    for (const auto& [id, operation] : active_operations_) {
+      const auto* participant = operation->participant_for(engine);
+      if (!participant || participant->payload_kind != OperationParticipantPayloadKind::kCapabilityCommand ||
+          participant->preparation_id != preparation_id || participant->subordinate_id != command_id ||
+          participant->subordinate_generation != generation ||
+          participant->binding.value().command_target_id != target) continue;
+      if (operation_id)
+        return reject<void>("Late gripper cancel identity is ambiguous",
+                            "late_cancel_execution_unmapped", ErrorCode::kInvariantViolation);
+      operation_id = id;
+      const auto row = std::find_if(operation->state.participants.begin(), operation->state.participants.end(),
+          [&](const auto& value) { return value.participant_id == participant->slot_owner.participant_id; });
+      if (row == operation->state.participants.end())
+        return reject<void>("Late gripper cancel participant is unavailable",
+                            "late_cancel_execution_unmapped", ErrorCode::kInvariantViolation);
+      if (terminal(operation->state.state) && operation->state.state != OperationStateKind::kInterventionRequired)
+        return reject<void>("Late gripper cancel names a finalized operation",
+                            "late_cancel_operation_terminal", ErrorCode::kInvariantViolation);
+      if (terminal(row->state) && row->state != OperationStateKind::kInterventionRequired)
+        return reject<void>("Late gripper cancel names a finalized participant",
+                            "late_cancel_participant_terminal", ErrorCode::kInvariantViolation);
+      progress = row->progress;
+      if (row->state == OperationStateKind::kInterventionRequired && row->terminal_fact &&
+          row->terminal_fact->effect == ParticipantEffectKnowledge::kEffectUncertain &&
+          row->terminal_error && row->terminal_error->details.contains("reason") &&
+          row->terminal_error->details.at("reason") == "gripper_owner_lost_outcome_unknown") {
+        prior_owner_loss = row->terminal_error;
+        prior_owner_loss_fact = row->terminal_fact;
+      }
+    }
+  }
+  if (!operation_id)
+    return reject<void>("Late gripper cancel does not name an active command",
+                        "late_cancel_projection_pending", ErrorCode::kExecutionRejected);
+  const auto failure = prior_owner_loss.value_or(
+      error("execution_aborted", "Late gripper cancellation outcome is uncertain",
+            "late_gripper_cancel_outcome_unknown"));
+  const ParticipantExecutionFact fact = prior_owner_loss_fact.value_or(
+      ParticipantExecutionFact{ParticipantExecutionFactKind::kLocalFailure,
+                               ParticipantEffectKnowledge::kEffectUncertain, failure});
+  bool durable_applied = false;
+  const auto applied = apply_subordinate_state(*operation_id, engine, command_id,
+      OperationStateKind::kInterventionRequired, progress, failure, false, fact, true,
+      &durable_applied, preparation_id, generation, target);
+  if (!applied.ok()) return applied;
+  if (!durable_applied)
+    return reject<void>("Late gripper cancel awaits durable projection",
+                        "late_cancel_projection_pending", ErrorCode::kExecutionRejected);
+  std::lock_guard lock(state_mutex_);
+  const auto* operation = find_active_operation_locked(*operation_id);
+  const auto* participant = operation ? operation->participant_for(engine) : nullptr;
+  if (!participant || participant->preparation_id != preparation_id ||
+      participant->subordinate_id != command_id || participant->subordinate_generation != generation ||
+      participant->binding.value().command_target_id != target)
+    return reject<void>("Late gripper cancel identity changed after projection",
+                        "late_cancel_projection_pending", ErrorCode::kExecutionRejected);
+  const auto row = std::find_if(operation->state.participants.begin(), operation->state.participants.end(),
+      [&](const auto& value) { return value.participant_id == participant->slot_owner.participant_id; });
+  if (operation->state.state != OperationStateKind::kInterventionRequired ||
+      row == operation->state.participants.end() || row->state != OperationStateKind::kInterventionRequired ||
+      !row->terminal_fact || row->terminal_fact->effect != ParticipantEffectKnowledge::kEffectUncertain)
+    return reject<void>("Late gripper cancel projection changed",
+                        "late_cancel_projection_pending", ErrorCode::kExecutionRejected);
+  return Result<void>::Ok();
 }
 
 Result<bool> ResourceAddressedExecutionKernel::confirm_prepared_command_no_effect(
@@ -531,7 +736,7 @@ void ResourceAddressedExecutionKernel::settle_deferred_capability_stop(
     IResolvedParticipantExecutionEngine* settlement_engine,
     const AddressedParticipantStopSettlementRequestDTO& request) {
   // The same exact settlement the Stop would have requested had the command
-  // already returned (Q58: the Stop did not wait for it).
+  // already returned (the Stop did not wait for it).
   std::optional<ErrorDTO> failure;
   if (settlement_engine == nullptr) {
     failure = error(std::string(to_string(ErrorCode::kInvariantViolation)),
@@ -836,7 +1041,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           return apply_subordinate_state(operation_id, cancelled_engine, cancelled_id,
               OperationStateKind::kCancelledPreDispatch, 0.0, std::nullopt);
         }
-        // Final pre-dispatch recheck (spec 450 §5.2, spec 530 §11). The
+        // Final pre-dispatch recheck. The
         // prepared-state write above released state_mutex_, so attention is
         // evaluated only here, in the same lock hold that transitions the
         // slots and releases dispatch: an alarm published or a projection
@@ -854,7 +1059,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           }
         }
 
-        // R1: interrupt evaluation is paused while the cell is latched.
+        // Interrupt evaluation is paused while the cell is latched.
         if (global_io_rule_catalog_ && !cell_latched_locked()) {
           const auto evaluated = global_io_rule_service_->EvaluateRules();
           if (!evaluated.ok()) return evaluated;
@@ -1015,7 +1220,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         continue;
       }
       if (participant->stop_owns_reconciliation()) continue;
-      // R1: interrupt evaluation is paused while the cell is latched.
+      // Interrupt evaluation is paused while the cell is latched.
       if (global_io_rule_catalog_ && !cell_latched_locked()) {
         const auto evaluated = global_io_rule_service_->EvaluateRules();
         if (!evaluated.ok()) return evaluated;
@@ -1217,6 +1422,60 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         if (!dispatched.ok()) participant->last_subordinate_error = dispatched.error();
       }
     }
+    if (command_result && command_result->late_cancel_slot) {
+      const auto& slot = command_result->late_cancel_slot;
+      std::optional<CommandTargetId> failed_target;
+      std::string failed_gripper_id;
+      {
+        std::lock_guard lock(slot->mutex);
+        if (slot->preparation_id == dispatch_target.preparation_id &&
+            slot->command_id == command_result->command_id &&
+            slot->generation == command_result->generation && slot->target) {
+          slot->receipt_installed = true;
+          if (slot->state == GripperLateCancelState::kFailed && !slot->gripper_id.empty()) {
+            if (!slot->handoff_running.exchange(true, std::memory_order_acq_rel)) {
+              failed_target = slot->target;
+              failed_gripper_id = slot->gripper_id;
+            }
+          }
+        }
+      }
+      if (failed_target) {
+        struct ReleaseHandoff {
+          std::atomic<bool>& running;
+          ~ReleaseHandoff() { running.store(false, std::memory_order_release); }
+        } release_handoff{slot->handoff_running};
+        // The session stays pinned across this unlocked journal call. A failed
+        // projection remains visible to teardown and can be retried safely.
+        const auto handed_off = record_late_cancel_uncertain(dispatch_target.engine,
+            dispatch_target.preparation_id, command_result->command_id,
+            command_result->generation, *failed_target);
+        bool owner_notified = false;
+        if (handed_off.ok()) {
+          try {
+            owner_notified = dispatch_target.engine->notify_exact_gripper_owner_loss_recorded(
+                failed_gripper_id, command_result->command_id, command_result->generation);
+          } catch (...) {
+            // Preserve the failed slot until exact-session notification succeeds.
+          }
+        }
+        if (owner_notified) {
+          std::function<void()> state_changed;
+          {
+            std::lock_guard lock(slot->mutex);
+            if (slot->state == GripperLateCancelState::kFailed &&
+                slot->preparation_id == dispatch_target.preparation_id &&
+                slot->command_id == command_result->command_id &&
+                slot->generation == command_result->generation && slot->target == failed_target &&
+                slot->gripper_id == failed_gripper_id) {
+              slot->state = GripperLateCancelState::kHandedOff;
+              state_changed = slot->state_changed;
+            }
+          }
+          if (state_changed) state_changed();
+        }
+      }
+    }
     if (dispatched.ok()) {
       continue;
     }
@@ -1250,7 +1509,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
       auto failed = apply_subordinate_state(operation_id, dispatch_target.engine,
           dispatch_target.preparation_id, OperationStateKind::kFailed, 0.0, dispatched.error());
       if (!failed.ok()) return failed;
-      continue;  // DX778: ordinary final Failure, not coordinated containment/fault.
+      continue;  // Ordinary final Failure, not coordinated containment/fault.
     }
     if (dispatch_targets.size() == 1U) {
       return apply_subordinate_state(
@@ -1580,7 +1839,11 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine,
     std::uint64_t subordinate_id, OperationStateKind state, double progress,
     std::optional<ErrorDTO> terminal_error, const bool observe_current_motion,
-    std::optional<ParticipantExecutionFact> terminal_fact) {
+    std::optional<ParticipantExecutionFact> terminal_fact, const bool require_unfinalized_motion,
+    bool* durable_applied, std::optional<std::uint64_t> exact_gripper_preparation,
+    std::optional<std::uint64_t> exact_gripper_generation,
+    std::optional<CommandTargetId> exact_gripper_target) {
+  if (durable_applied) *durable_applied = false;
   {
     std::lock_guard state_lock(state_mutex_);
     auto* operation = find_active_operation_locked(operation_id);
@@ -1634,7 +1897,18 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
                                  "gripper_command_lost");
           break;
         case GripperCommandState::kExecuting:
-          state = OperationStateKind::kExecuting;
+          if (engine->rebuilt_gripper_unknown_pending(command_target, subordinate_id,
+                                                      expected_generation)) {
+            state = OperationStateKind::kInterventionRequired;
+            terminal_error = error("execution_aborted",
+                                   "Gripper command outcome is unknown after owner loss",
+                                   "gripper_owner_lost_outcome_unknown");
+            terminal_fact = ParticipantExecutionFact{ParticipantExecutionFactKind::kLocalFailure,
+                                                       ParticipantEffectKnowledge::kEffectUncertain,
+                                                       terminal_error};
+          } else {
+            state = OperationStateKind::kExecuting;
+          }
           break;
         case GripperCommandState::kCompleted:
           state = OperationStateKind::kCompleted;
@@ -1673,6 +1947,15 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
       active_operation->coordinated_cancellation_in_flight) {
     return Result<void>::Ok();
   }
+  if (exact_gripper_preparation &&
+      (active_participant->payload_kind != OperationParticipantPayloadKind::kCapabilityCommand ||
+       active_participant->preparation_id != *exact_gripper_preparation ||
+       active_participant->subordinate_id != subordinate_id ||
+       !exact_gripper_generation || active_participant->subordinate_generation != *exact_gripper_generation ||
+       !exact_gripper_target ||
+       active_participant->binding.value().command_target_id != *exact_gripper_target))
+    return reject<void>("Late gripper cancel identity changed before projection",
+                        "late_cancel_execution_unmapped", ErrorCode::kInvariantViolation);
   if (sampled_command_generation.has_value() &&
       (active_participant->subordinate_id != subordinate_id ||
        active_participant->subordinate_generation != *sampled_command_generation ||
@@ -1725,6 +2008,20 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
                         "operation_participant_state_missing", ErrorCode::kInvariantViolation);
   }
   const auto& participant = *participant_iterator;
+  if (require_unfinalized_motion && terminal(participant.state) &&
+      participant.state != OperationStateKind::kInterventionRequired)
+    return reject<void>("Late cancel names a finalized participant",
+                        "late_cancel_participant_terminal", ErrorCode::kInvariantViolation);
+  if (active_participant->payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
+      participant.terminal_fact && participant.terminal_fact->effect == ParticipantEffectKnowledge::kEffectUncertain &&
+      participant.terminal_error && participant.terminal_error->details.contains("reason") &&
+      participant.terminal_error->details.at("reason") == "gripper_owner_lost_outcome_unknown" &&
+      !(durable_applied && state == participant.state && terminal_error == participant.terminal_error &&
+        terminal_fact == participant.terminal_fact)) {
+    // Rebuilt-owner retirement may make the backend idle, but cannot rewrite
+    // the already journaled uncertain outcome as a success or lost command.
+    return Result<void>::Ok();
+  }
   if (active_participant->non_motion_transaction() && terminal(participant.state) &&
       state != participant.state)
     return Result<void>::Ok();
@@ -1794,7 +2091,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
        (participant.terminal_error->code == terminal_error->code &&
         participant.terminal_error->message == terminal_error->message &&
         participant.terminal_error->details == terminal_error->details));
-  if (!slot_changed && participant.state == state && same_terminal_fact &&
+  if (!durable_applied && !slot_changed && participant.state == state && same_terminal_fact &&
       (!terminal(state) || same_terminal_error)) {
     // Progress is current presentation, not a durable lifecycle transition.
     // Retain the latest scalar without writing a full operation snapshot on
@@ -1878,6 +2175,11 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
       }
     }
   }
+  const bool journaled_gripper_owner_loss = sampled_command_generation && sampled_command_target &&
+      terminal_fact && terminal_fact->effect == ParticipantEffectKnowledge::kEffectUncertain &&
+      terminal_error && terminal_fact->error == terminal_error &&
+      terminal_error->details.contains("reason") &&
+      terminal_error->details.at("reason") == "gripper_owner_lost_outcome_unknown";
   observed_participant.state = state;
   observed_participant.progress = bounded_progress;
   observed_participant.terminal_fact = std::move(terminal_fact);
@@ -1929,10 +2231,19 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     active_participant->slot_state = desired_slot_value;
   }
   active_operation->state = std::move(observed_state);
+  if (durable_applied) *durable_applied = true;
+  state_lock.unlock();
+  if (journaled_gripper_owner_loss) {
+    // Only a committed owner-loss fact authorizes retiring this command.
+    try { engine->notify_gripper_owner_loss_recorded(*sampled_command_target, subordinate_id,
+                                                      *sampled_command_generation); }
+    catch (...) { /* The exact command remains unknown. */ }
+  }
   return Result<void>::Ok();
 }
 
 void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecutionEngine* engine,
+                                                       const std::uint64_t subscription_id,
                                                        const KernelEvent& event) {
   std::optional<OperationId> pending_owner;
   {
@@ -1940,7 +2251,7 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     for (const auto& [id, operation] : active_operations_) {
       if (operation->pending_motion_takeover.empty()) continue;
       const auto& pending = *operation->pending_motion_takeover.mapped();
-      if (pending.participants.front().engine == engine &&
+      if (pending.participants.front().engine_subscription_id == subscription_id &&
           pending.participants.front().subordinate_id == event.execution_id &&
           event.execution_id != 0U) {
         pending_owner = id;
@@ -1957,7 +2268,7 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     std::optional<StopControlWorkToken> escalation_wakeup;
     {
       std::lock_guard state_lock(state_mutex_);
-      const auto operation_id = find_event_operation_locked(engine, event.execution_id);
+      const auto operation_id = find_event_operation_locked(engine, event.execution_id, subscription_id);
       auto* operation =
           operation_id.has_value() ? find_active_operation_locked(*operation_id) : nullptr;
       auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
@@ -2062,7 +2373,7 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
   }
   if (event.type == KernelEventType::kStopRequested) {
     // The participant held its motion at zero speed for the user-set hold
-    // timeout (item 40). Like an operator Stop, the Kernel ends the operation
+    // timeout. Like an operator Stop, the Kernel ends the operation
     // Stopped (no error) through its own Stop, which issues the lane's hard
     // stop; an operation already owned by a Stop or ended is left alone.
     const auto reason = event.details.find("reason");
@@ -2072,7 +2383,7 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     std::optional<StopIntentDTO> hold_stop;
     {
       std::lock_guard state_lock(state_mutex_);
-      const auto operation_id = find_event_operation_locked(engine, event.execution_id);
+      const auto operation_id = find_event_operation_locked(engine, event.execution_id, subscription_id);
       auto* operation =
           operation_id.has_value() ? find_active_operation_locked(*operation_id) : nullptr;
       auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
@@ -2104,7 +2415,7 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     std::optional<OperationId> operation_id;
     {
       std::lock_guard state_lock(state_mutex_);
-      operation_id = find_event_operation_locked(engine, event.execution_id);
+      operation_id = find_event_operation_locked(engine, event.execution_id, subscription_id);
     }
     if (operation_id.has_value()) {
       (void)advance_prepared_motion(*operation_id, engine);
@@ -2119,7 +2430,7 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     std::optional<StopIntentDTO> containment;
     {
       std::lock_guard state_lock(state_mutex_);
-      operation_id = find_event_operation_locked(engine, event.execution_id);
+      operation_id = find_event_operation_locked(engine, event.execution_id, subscription_id);
       if (operation_id.has_value()) {
         auto* active_operation = find_active_operation_locked(*operation_id);
         if (active_operation != nullptr) {
@@ -2181,13 +2492,13 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
   std::optional<ErrorDTO> coordinated_pre_dispatch_failure;
   {
     std::lock_guard state_lock(state_mutex_);
-    operation_id = find_event_operation_locked(engine, event.execution_id);
+    operation_id = find_event_operation_locked(engine, event.execution_id, subscription_id);
     auto* operation =
         operation_id.has_value() ? find_active_operation_locked(*operation_id) : nullptr;
     if (auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
         participant != nullptr && participant->deferred_cancel_settlement.has_value() &&
         participant->deferred_cancel_settlement->request.execution_id == event.execution_id) {
-      // Q60: the late cancellation reply of a never-dispatched participant
+      // The late cancellation reply of a never-dispatched participant
       // whose Stop already closed. The closed Stop keeps owning this
       // participant's terminal; only its deferred settlement is tidied up, on
       // the Stop lane (never inside the subordinate's callback).
@@ -2325,7 +2636,7 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
       // that exact operation; disjoint operations still reconcile. The claim
       // also coalesces concurrent scheduler calls without holding a lock over
       // subordinate I/O.
-      if (operation->pending_control.has_value() || operation->runtime_scale_effect_in_flight ||
+      if (operation->pending_control.has_value() ||
           operation->recovery_effect_in_flight ||
           operation->coordinated_cancellation_in_flight) {
         continue;

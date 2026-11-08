@@ -72,6 +72,14 @@ ManyForge does the rotation math at one boundary. Omitting orientation, supplyin
 
 If the user request implies a different action and you're unsure of the catalog id, call `catalog_read` and pick from the result. **Never invent ids.**
 
+## Component references
+
+Use the active catalog's typed component references in node parameters. A target
+uses `component_id` and `command_target_id`; signals, frames, and collision bodies
+use their component ID and their respective source name. Read the current Draft
+and diagnostics, then fix each reference through an ordinary Draft edit. Do not
+invent identities or convert an older Program automatically.
+
 ## Root alias
 
 When you need to target the program's root node in `wrap_node`, `replace_subtree`, `update_node_params`, `insert_node.parentName`, or `move_node.newParentName`, pass the literal string `"@root"`. You do NOT need to know the root node's actual name.

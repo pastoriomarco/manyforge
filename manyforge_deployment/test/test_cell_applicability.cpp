@@ -4614,7 +4614,7 @@ TEST(CellApplicability, TypedRosGripperRejectsAFalsePositionFloorAndForeignConfi
           for (auto &[field, item] : configuration) {
             if (field == "gripper_target_configurations")
               item = CanonicalValue(CanonicalValue::Array{});
-            // M6 TOOLSPLIT: the runtime codec requires the gripper_feedback
+            // The runtime codec requires the gripper_feedback
             // stream exactly for the authored rows; drop it with the row so
             // the missing row reaches the applicability check.
             if (field == "component_streams") {

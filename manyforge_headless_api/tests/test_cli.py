@@ -1,4 +1,4 @@
-"""Headless CLI component, I/O and readiness commands (CONTRACTS §2, §7, §10)."""
+"""Headless CLI component, I/O and readiness commands."""
 
 from __future__ import annotations
 
@@ -25,10 +25,11 @@ class _Client:
     def components(self) -> list[dict[str, Any]]:
         self.calls.append(("components",))
         return [
-            {"component_id": "lite6", "lifecycle": "prepared"},
-            {"component_id": "lite6_arm", "lifecycle": "prepared", "owner_id": "lite6"},
-            {"component_id": "gripper", "lifecycle": "not_prepared"},
-            {"component_id": "camera", "lifecycle": "enabled"},
+            {"component_id": "lite6", "lifecycle": "prepared", "capabilities": []},
+            {"component_id": "lite6_arm", "lifecycle": "prepared", "owner_id": "lite6",
+             "capabilities": []},
+            {"component_id": "gripper", "lifecycle": "not_prepared", "capabilities": []},
+            {"component_id": "camera", "lifecycle": "enabled", "capabilities": []},
         ]
 
     def component_action(self, component_id: str, action: str) -> dict[str, Any]:

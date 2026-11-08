@@ -98,10 +98,13 @@ def _project_scenario_id(raw_path: str, *, allowed_root: Path) -> str:
         value = load_strict_json_yaml(manifest)
     except StrictArtifactError as error:
         raise WorkbenchError(str(error)) from error
+    if value.get("api_version") != "manyforge.scenario.project.v3":
+        raise WorkbenchError(
+            "Unsupported Scenario project version; re-author it with direct references"
+        )
     scenario_id = value.get("scenario_id")
     if (
-        value.get("api_version") != "manyforge.scenario.project.v2"
-        or not isinstance(scenario_id, str)
+        not isinstance(scenario_id, str)
         # One name: folder `<name>.scenario`, scenario_id == name == <name>.
         or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", scenario_id) is None
         or value.get("name") != scenario_id
@@ -295,7 +298,7 @@ def _ensure_current_ros_backend() -> tuple[Path, Path]:
     # children inherit this same environment through their existing protocol.
     os.environ.update(_ros_setup_environment((overlay,), environment))
     # The execution host loads its adapter families from the build tree's
-    # ament prefix (CONTRACTS §6).
+    # ament prefix.
     os.environ["AMENT_PREFIX_PATH"] = os.pathsep.join(
         path for path in (str(ros_build / "ament_cmake_index"),
                           os.environ.get("AMENT_PREFIX_PATH", "")) if path
@@ -432,7 +435,7 @@ def _capture_ros_bootstrap_project(
             )
         catalog = build_node_environment().catalog
         authoring = scenario["program_draft"]
-        if authoring is None or scenario["program_role_assignment"] is None:
+        if authoring is None:
             raise WorkbenchError("intended first ROS Scenario is incomplete")
         validate_invariants(authoring, catalog)
         program, diagnostics = derive_candidate(authoring, catalog)
@@ -450,7 +453,6 @@ def _capture_ros_bootstrap_project(
                 deployment, project_root=Path(source_path)
             ),
             "program": program.to_dict() if program is not None else None,
-            "program_role_assignment": scenario["program_role_assignment"],
         }
     except (ScenarioArtifactError, AuthoringForestError, ModelSourceCaptureError) as error:
         raise WorkbenchError(str(error)) from error
@@ -786,7 +788,7 @@ class Workbench:
                 "MANYFORGE_COMPOSER_URL": f"http://127.0.0.1:{self.composer_port}",
                 "MANYFORGE_ASSISTANT_BRIDGE_HOST": "127.0.0.1",
                 "MANYFORGE_ASSISTANT_BRIDGE_PORT": str(ASSISTANT_BRIDGE_PORT),
-                # Rotated by the bridge at 10 MB x 3 files.
+                # 10 MiB per file; active plus three backups (four files, 40 MiB total by default).
                 "MANYFORGE_ASSISTANT_AUDIT_LOG": str(
                     self.runtime_root / "assistant-bridge" / "audit.jsonl"
                 ),
@@ -1247,7 +1249,7 @@ class Workbench:
                 response = client.recv(16 * 1024)
                 receipt = json.loads(response)
                 if not isinstance(receipt, dict) or receipt.get("ok") is not True or receipt != {
-                    "api_version": "manyforge.manager_command_response.v1",
+                    "api_version": "manyforge.manager_command_response.v2",
                     "manager_source_generation": None,
                     "ok": True,
                     "operation": "shutdown_runtime",

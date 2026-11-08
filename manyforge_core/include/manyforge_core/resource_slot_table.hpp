@@ -169,7 +169,7 @@ struct ResourceSlotAdmissionSnapshotDTO final {
   /// Apply fence. Apply/Disable reconciliation consumes this inventory.
   std::vector<DomainActiveControlConfigurationDTO> active_control_configurations;
   /// Only configurations with an authoritative Kernel route publication.
-  /// CCLC route-fence admission consumes this inventory so an unready
+  /// Kernel route-fence admission consumes this inventory so an unready
   /// Apply-staged candidate cannot masquerade as a published predecessor.
   std::vector<DomainActiveControlConfigurationDTO> route_published_active_control_configurations;
   std::uint64_t affected_queued_operation_count{};

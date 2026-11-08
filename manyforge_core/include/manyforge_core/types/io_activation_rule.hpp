@@ -10,9 +10,9 @@
 
 namespace manyforge::core {
 
-/// CONTRACTS §8: what a trip does.
+/// What a trip does.
 enum class IoRuleOnTripDTO { kStop, kNotify };
-/// CONTRACTS §8: after a `stop` trip, hold the run (the operator Resumes) or
+/// After a `stop` trip, hold the run (the operator Resumes) or
 /// fail the interrupted motion node with `interrupt_fault`.
 enum class IoRuleAfterStopDTO { kHold, kFailNode };
 

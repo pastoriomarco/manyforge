@@ -5,13 +5,11 @@ import json
 import pytest
 
 from manyforge_behavior.cycle_recovery import (
-    CYCLE_RECOVERY_RESTORATION_GATES,
     CycleRecoveryCoordinator,
     CycleRecoveryOwnerUnavailableError,
 )
 from manyforge_behavior.runtime_pause import RuntimePauseRegistry
 from manyforge_behavior.runtime_pause import (
-    RUNTIME_PAUSE_RESTORATION_GATES,
     RuntimePauseOwnerUnavailableError,
     sanitize_runtime_diagnostics,
 )
@@ -28,8 +26,6 @@ def test_v1_recovery_coordinator_fails_before_inputs_or_callbacks() -> None:
         match="composable_cell_cycle_recovery_owner_unavailable",
     ):
         CycleRecoveryCoordinator(on_offer_published=poison, kernel=poison)
-
-    assert CYCLE_RECOVERY_RESTORATION_GATES == ("I6", "N", "I8", "P5")
 
 
 def test_diagnostic_sanitizer_bounds_and_json_normalizes_nested_values():
@@ -64,5 +60,3 @@ def test_runtime_pause_registry_fails_before_allocating_live_state() -> None:
         match="composable_cell_runtime_pause_owner_unavailable",
     ):
         RuntimePauseRegistry()
-
-    assert RUNTIME_PAUSE_RESTORATION_GATES == ("I6", "N", "I8", "P5")

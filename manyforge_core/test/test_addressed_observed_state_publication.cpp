@@ -477,7 +477,7 @@ TEST(AddressedObservedStatePublicationTest,
 
   auto rebound = publication.query_context();
   rebound.control_route_id = ControlRouteId("route-b");
-  // CP8 step 1: the route identity may change, but the measurement is never
+  // The route identity may change, but the measurement is never
   // re-stamped; the new route has no state until a fresh measurement.
   ASSERT_TRUE(publication.rebind_route_context(rebound, 110).ok());
   EXPECT_EQ(publication.query_context().control_route_id, ControlRouteId("route-b"));

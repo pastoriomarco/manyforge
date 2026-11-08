@@ -738,7 +738,7 @@ def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
         assert (installed / target.name).read_bytes() == target.name.encode()
         assert os.access(installed / target.name, os.X_OK)
     assert not (installed / "manyforge_execution_host").exists()
-    # The adapter families' index prefix comes first (CONTRACTS §6).
+    # The adapter families' index prefix comes first.
     ament_prefix = f"{ros_build / 'ament_cmake_index'}{os.pathsep}/current/overlay"
     assert parent_environment["AMENT_PREFIX_PATH"] == ament_prefix
     assert parent_environment["ROS_STATIC_PEERS"] == "orin;laptop"
@@ -761,7 +761,7 @@ def test_project_status_reads_only_the_bounded_manifest_identity(tmp_path: Path)
     project = tmp_path / "My_Cell-2.scenario"
     project.mkdir()
     (project / "scenario.yaml").write_text(
-        '{"api_version":"manyforge.scenario.project.v2",'
+        '{"api_version":"manyforge.scenario.project.v3",'
         '"scenario_id":"My_Cell-2","name":"My_Cell-2"}',
         encoding="utf-8",
     )
@@ -769,6 +769,17 @@ def test_project_status_reads_only_the_bounded_manifest_identity(tmp_path: Path)
     assert dev_workbench._project_scenario_id(
         str(project), allowed_root=tmp_path
     ) == "My_Cell-2"
+
+
+def test_project_status_refuses_legacy_v2_project(tmp_path: Path) -> None:
+    project = tmp_path / "legacy.scenario"
+    project.mkdir()
+    (project / "scenario.yaml").write_text(
+        '{"api_version":"manyforge.scenario.project.v2",'
+        '"scenario_id":"legacy","name":"legacy"}', encoding="utf-8"
+    )
+    with pytest.raises(dev_workbench.WorkbenchError, match="re-author.*direct references"):
+        dev_workbench._project_scenario_id(str(project), allowed_root=tmp_path)
 
 
 def test_composer_roots_include_launcher_mounted_folders(
@@ -801,7 +812,7 @@ def test_project_status_refuses_names_outside_the_one_name_rule(
     project = tmp_path / folder
     project.mkdir()
     (project / "scenario.yaml").write_text(
-        '{"api_version":"manyforge.scenario.project.v2",'
+        '{"api_version":"manyforge.scenario.project.v3",'
         f'"scenario_id":"{scenario_id}","name":"{name}"}}',
         encoding="utf-8",
     )

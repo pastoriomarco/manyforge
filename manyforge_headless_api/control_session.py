@@ -1,4 +1,4 @@
-"""Versioned bidirectional UI6-G execution-control WebSocket session."""
+"""Versioned bidirectional execution-control WebSocket session."""
 
 from __future__ import annotations
 

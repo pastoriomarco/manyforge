@@ -90,7 +90,7 @@ def test_failed_startup_load_reports_its_failed_step(
     def commit_then_fail(_state: ComposerState, path: str) -> dict[str, Any]:
         document = build_scenario_document(
             scenario_id="cell", name="cell", description="", program_draft=None,
-            deployment_draft=None, program_role_assignment=None,
+            deployment_draft=None,
             manyforge_version="1.0.0", last_known_status="incomplete",
         )
         state.authoring_workspace.commit_project(facts=scenario_project_facts(
@@ -127,7 +127,7 @@ def test_failed_startup_load_reports_its_failed_step(
 def test_restart_with_a_startup_project_keeps_an_applied_scenario(
     graph: dict[str, Any] | None, code: str,
 ) -> None:
-    """As M7: a Composer restart never replaces the Scenario still applied in
+    """A Composer restart never replaces the Scenario still applied in
     the Manager; the startup Load is refused before any effect."""
 
     class _AppliedHeadless(_Headless):

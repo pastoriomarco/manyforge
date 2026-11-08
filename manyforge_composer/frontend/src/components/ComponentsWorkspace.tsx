@@ -3,7 +3,7 @@ import { useMemo, useState } from 'react';
 import type { ComponentCatalogState } from '../hooks/useComponentCatalog';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import type { StructuralResourceState } from '../state/structuralResource';
-import type { JsonValue, SourceModelProjection } from '../types/api';
+import type { SourceModelProjection } from '../types/api';
 import type { ComponentProfileFacts } from '../types/componentCatalog';
 import type { CellState, ComponentState } from '../types/components';
 import type {
@@ -18,8 +18,6 @@ import {
   componentSignals,
   draftComponents,
   draftGripperFrames,
-  roleFeedback,
-  rolesOfComponent,
   toolOnFlange,
   type ComponentManagerRow,
   type ComponentManagerTab,
@@ -46,14 +44,14 @@ import {
  * The Components section: the cell's components on the left (kind, mount,
  * state, Add component), and the selected component's page on the right
  * (state and actions, placement and lane, frames, I/O signals and settings).
- * Every state shown is the pushed `ComponentState` (R4); edits go through the
+ * Every state shown is the pushed `ComponentState`; edits go through the
  * Deployment Draft and the one Preview → Apply path. Jogging stays in Robot
  * Control (linked).
  */
 export interface ComponentsWorkspaceProps {
   enabled: boolean;
   controller: DeploymentWorkspaceController;
-  /** The pushed component states (CONTRACTS §1). */
+  /** The pushed component states. */
   cellState: CellState;
   catalog: ComponentCatalogState;
   sourceModel: StructuralResourceState<SourceModelProjection>;
@@ -61,10 +59,7 @@ export interface ComponentsWorkspaceProps {
   gripperDescriptors: ManualControlGripperDescriptor[];
   /** The Program Draft's scene object ids; null without a Program. */
   programSceneIds?: readonly string[] | null;
-  /** The Program Draft's component roles; null without a Program. */
-  programComponentRoles?: Record<string, JsonValue> | null;
-  /** The Scenario's Program role assignment; null when none is loaded. */
-  programRoleAssignment?: Record<string, JsonValue> | null;
+  sceneResourceIds?: readonly string[];
   /** Components Robot Control addresses (a motion or gripper target). */
   robotControlIds: readonly string[];
   onOpenRobotControl: (componentId: string) => void;
@@ -72,6 +67,10 @@ export interface ComponentsWorkspaceProps {
 }
 
 const NO_PROFILES: Readonly<Record<string, ComponentProfileFacts>> = {};
+
+export function sceneResourceChoices(authored: readonly string[] | null, runtime: readonly string[]): string[] {
+  return [...new Set([...(authored ?? []), ...runtime])].sort();
+}
 
 export function ComponentsWorkspace({
   enabled,
@@ -82,12 +81,13 @@ export function ComponentsWorkspace({
   motionDescriptors,
   gripperDescriptors,
   programSceneIds = null,
-  programComponentRoles = null,
-  programRoleAssignment = null,
+  sceneResourceIds = [],
   robotControlIds,
   onOpenRobotControl,
   onOpenDeployment,
 }: ComponentsWorkspaceProps) {
+  const sceneChoices = useMemo(() => sceneResourceChoices(programSceneIds, sceneResourceIds),
+    [programSceneIds, sceneResourceIds]);
   const document = controller.workspace?.draft.document ?? null;
   const appliedIds = controller.workspace?.managerApplied.activationOrder?.componentIds ?? null;
   const rows = useMemo(
@@ -95,15 +95,12 @@ export function ComponentsWorkspace({
     [appliedIds, catalog.catalog, document],
   );
   const mounts = useMemo(() => mountParents(document), [document]);
-  const feedback = useMemo(() => roleFeedback(
-    programComponentRoles, programRoleAssignment, rows, catalog.catalog?.componentProfiles ?? {},
-  ), [catalog.catalog, programComponentRoles, programRoleAssignment, rows]);
   const states = useMemo(() => Object.fromEntries((cellState.components ?? [])
     .map((state): [string, ComponentState] => [state.component_id, state])), [cellState.components]);
   const [selected, setSelected] = useState<string | null>(null);
   const row = rows.find((candidate) => candidate.componentId === selected) ?? rows[0] ?? null;
   const selectedId = row?.componentId ?? null;
-  // A machine is one card (CONTRACTS §16): selecting its owner or a member shows it.
+  // A machine is one card: selecting its owner or a member shows it.
   const owner = row === null ? null : row.kind === 'machine' ? row
     : rows.find((candidate) => candidate.componentId === row.owner && candidate.kind === 'machine') ?? null;
   const members = owner === null ? [] : rows.filter((candidate) => candidate.owner === owner.componentId);
@@ -120,7 +117,7 @@ export function ComponentsWorkspace({
     motionDescriptors,
     gripperDescriptors,
     programSceneIds,
-    roles: rolesOfComponent(feedback, pageRow.componentId).map((role) => role.roleId),
+    sceneResourceIds: sceneChoices,
     robotControl: robotControlIds.includes(pageRow.componentId),
     onOpenRobotControl,
     onOpenDeployment,
@@ -156,10 +153,9 @@ export function ComponentsWorkspace({
             controller={controller}
             catalog={catalog.catalog}
             catalogError={catalog.error}
-            feedback={feedback}
             onAdded={setSelected}
           />
-          <CustomComponentAdd controller={controller}
+          <CustomComponentAdd controller={controller} sceneResourceIds={sceneChoices}
             geometricContactRobots={geometricContactRobotOptions(motionDescriptors)} />
         </div>
         <div className="components-column">
@@ -196,7 +192,7 @@ export function ComponentsWorkspace({
  */
 function ComponentPage({
   row, enabled, controller, state, states, statesKnown, sourceModel, profileFacts, profiles, motionDescriptors,
-  gripperDescriptors, programSceneIds, roles, robotControl, onOpenRobotControl, onOpenDeployment, onRemoved,
+  gripperDescriptors, programSceneIds, sceneResourceIds, robotControl, onOpenRobotControl, onOpenDeployment, onRemoved,
   member = false,
 }: {
   row: ComponentManagerRow;
@@ -217,7 +213,7 @@ function ComponentPage({
   motionDescriptors: ManualControlMotionDescriptor[];
   gripperDescriptors: ManualControlGripperDescriptor[];
   programSceneIds: readonly string[] | null;
-  roles: readonly string[];
+  sceneResourceIds: readonly string[];
   robotControl: boolean;
   onOpenRobotControl: (componentId: string) => void;
   onOpenDeployment: (tab: ComponentManagerTab) => void;
@@ -245,7 +241,6 @@ function ComponentPage({
           {row.mount !== null && <div><dt>Mounted on</dt><dd>{row.mount}</dd></div>}
           {mountedTool !== null && <div><dt>Tool on its flange</dt><dd>{mountedTool}</dd></div>}
           <div><dt>Deployment</dt><dd>{CHANGE_LABELS[row.change]}</dd></div>
-          <div><dt>Program roles</dt><dd>{roles.length === 0 ? 'none' : roles.join(', ')}</dd></div>
         </dl>
         {withoutTcp.map((item) => (
           <p className="inline-message severity-warning" role="status" key={`${item.robotId}:${item.toolId}`}>
@@ -256,9 +251,6 @@ function ComponentPage({
           {robotControl && (
             <button type="button" title="Jog, move or command this component in the viewer's Robot Control."
               onClick={() => onOpenRobotControl(id)}>Open in Robot Control</button>
-          )}
-          {roles.length > 0 && (
-            <button type="button" onClick={() => onOpenDeployment('roles')}>Roles in Deployment</button>
           )}
           {row.change !== 'applied' && (
             <button type="button" onClick={() => onOpenDeployment('changes')}>Review in Deployment Changes</button>
@@ -322,6 +314,7 @@ function ComponentPage({
           motionDescriptors={motionDescriptors}
           gripperDescriptors={gripperDescriptors}
           programSceneIds={programSceneIds}
+          sceneResourceIds={sceneResourceIds}
         />
       )}
     </>
@@ -348,9 +341,10 @@ function SignalRows({ title, signals, own = false }: {
 }
 
 /** I/O devices and AI models that no catalog entry has, written by hand. */
-function CustomComponentAdd({ controller, geometricContactRobots }: {
+function CustomComponentAdd({ controller, geometricContactRobots, sceneResourceIds }: {
   controller: DeploymentWorkspaceController;
   geometricContactRobots: ReturnType<typeof geometricContactRobotOptions>;
+  sceneResourceIds: readonly string[];
 }) {
   const [form, setForm] = useState<'io_device' | 'ai_model' | null>(null);
   const document = controller.workspace?.draft.document ?? null;
@@ -368,7 +362,7 @@ function CustomComponentAdd({ controller, geometricContactRobots }: {
       )}
       {form === 'io_device' && (
         <AddIoDeviceForm controller={controller} document={document}
-          geometricContactRobots={geometricContactRobots} onDone={() => setForm(null)} />
+          geometricContactRobots={geometricContactRobots} sceneResourceIds={sceneResourceIds} onDone={() => setForm(null)} />
       )}
       {form === 'ai_model' && (
         <AddAiModelForm controller={controller}

@@ -109,7 +109,7 @@ class RetainedBundle final {
 [[nodiscard]] bool
 verify_retained_bundle_identity(const RetainedBundle& bundle);
 
-/// CP9 Deployment overrides of component stream parameters
+/// Deployment overrides of component stream parameters
 /// (`policies.component_streams`) retained by the bundle, sorted by
 /// `(controllable_component_id, stream_id)`; empty when the Deployment
 /// declares none. The table is checked by the bundle verification.
@@ -403,7 +403,7 @@ verify_runtime_unit_product(
     const RetainedBundle &bundle, const core::RuntimeUnitId &runtime_unit_id,
     const IVerifiedRetainedProductArtifactSource &artifact_source);
 
-/// Verify one exact reference runtime product for an I4 consumer.
+/// Verify one exact reference runtime product for a runtime consumer.
 ///
 /// Missing runtime-unit coordinates return no value. A present bundle,
 /// product, manifest, or launchable artifact that fails any exact contract,
@@ -671,7 +671,7 @@ class VerifiedRetainedPlanningResource final {
 
 /// The exact, independently verified URDF entrypoint of one graph-selected
 /// model asset's source closure (the ManyForge model URDF of the model
-/// bundle, design Q69: the controller-description generator input).
+/// bundle: the controller-description generator input).
 struct VerifiedRetainedModelSourceUrdf final {
   core::ModelAssetId model_asset_id;
   core::ModelRevision model_revision;

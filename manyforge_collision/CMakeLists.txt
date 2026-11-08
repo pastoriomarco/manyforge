@@ -68,9 +68,15 @@ find_package(Eigen3 REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(OpenSSL REQUIRED)
 
+# Core's own tests belong to the manyforge_core lane, not this one.
 if(NOT TARGET manyforge_core)
+  set(_MANYFORGE_COLLISION_BUILD_TESTING "${BUILD_TESTING}")
+  set(BUILD_TESTING OFF)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_core
-                   ${CMAKE_CURRENT_BINARY_DIR}/manyforge_core)
+                   ${CMAKE_CURRENT_BINARY_DIR}/manyforge_core
+                   EXCLUDE_FROM_ALL)
+  set(BUILD_TESTING "${_MANYFORGE_COLLISION_BUILD_TESTING}")
+  unset(_MANYFORGE_COLLISION_BUILD_TESTING)
 endif()
 
 add_library(manyforge_collision
@@ -94,17 +100,11 @@ target_compile_definitions(manyforge_collision PRIVATE
 
 if(BUILD_TESTING)
   enable_testing()
-  find_package(GTest QUIET)
-
-  # The old strategy probe depended on NativeKernelBundle. Keep its historical
-  # target name as an explicit source-level gate; owner-neutral distributions
-  # and fixed contracts are compiled by the active focused tests below.
-  add_executable(perf_collision_strategy EXCLUDE_FROM_ALL
-    test/perf/perf_collision_strategy.cpp)
-  target_include_directories(perf_collision_strategy PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/../tests/cpp")
-
   add_subdirectory(
     "${CMAKE_CURRENT_SOURCE_DIR}/../tests/cpp"
-    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_integration_tests")
+    "${CMAKE_CURRENT_BINARY_DIR}/collision_engine_integration_tests")
+  get_filename_component(_MANYFORGE_COLLISION_TEST_SOURCE_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/.." REALPATH)
+  target_compile_definitions(test_collision_engine_integration PRIVATE
+    MANYFORGE_COLLISION_TEST_SOURCE_ROOT="${_MANYFORGE_COLLISION_TEST_SOURCE_ROOT}")
 endif()

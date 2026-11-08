@@ -1,4 +1,4 @@
-"""Server-side Apply orchestration order (CONTRACTS §11) with a fake host."""
+"""Server-side Apply orchestration order with a fake host."""
 
 from typing import Any
 
@@ -6,6 +6,7 @@ import pytest
 
 from manyforge_composer.backend.apply_orchestration import (
     DEFAULT_LIFECYCLE_TIMEOUT_S,
+    HOST_COMPONENT_STOP_GRACE_S,
     ApplyRefused,
     ApplyStepFailed,
     ComponentImpact,
@@ -55,9 +56,6 @@ class _FakeCell:
     def reset_cycle(self) -> None:
         self.calls.append(("reset",))
         self.cycle = "idle_after_reset"
-
-    def await_authoring(self) -> None:
-        self.awaited_authoring = True
 
     def lifecycle_timeout_s(self, component_id: str) -> float:
         return 0.0 if component_id in self.silent else DEFAULT_LIFECYCLE_TIMEOUT_S
@@ -145,7 +143,6 @@ def test_dead_or_faulted_components_are_removed_without_disable() -> None:
     )
     run_apply(cell)
     assert cell.calls == [("preview",), ("apply",)]
-    assert cell.awaited_authoring  # idle cycle: the reopened admission first
 
 
 # `running` here is a run whose motion is executing (not held).
@@ -194,7 +191,7 @@ def test_a_failed_reset_ends_the_apply_before_its_preview() -> None:
 
 
 def test_a_held_run_is_reset_by_the_apply_itself() -> None:
-    # R3, as M7's Close: a run with all its motion stopped and held is Reset
+    # As Close does: a run with all its motion stopped and held is Reset
     # first, like a finished one.
     cell = _FakeCell(
         {"robot": "enabled"},
@@ -279,7 +276,7 @@ def test_allowed_during_a_cell_latch() -> None:
 
 
 def test_a_failed_disable_is_reported_and_the_apply_still_goes_ahead() -> None:
-    # N28: the gripper stays enabled because its Disable failed; the host
+    # The gripper stays enabled because its Disable failed; the host
     # stops its process like a dead one, so the Apply is submitted.
     cell = _FakeCell(
         {"robot": "enabled", "gripper": "enabled", "camera": "enabled"},
@@ -397,9 +394,8 @@ def test_a_manager_failure_is_mapped_by_the_route() -> None:
 
 def test_preview_view_carries_the_impact_program_attachments_and_scope() -> None:
     reference = {
-        "command_target_id": None, "component_role_id": "picker",
-        "controllable_component_id": "robot", "detail": "removed",
-        "reason": "component_missing", "target_role_id": None,
+        "target": {"component_id": "robot", "command_target_id": "arm"},
+        "detail": "removed", "reason": "component_missing",
     }
     manager_preview = {
         "impact": {
@@ -415,7 +411,7 @@ def test_preview_view_carries_the_impact_program_attachments_and_scope() -> None
                 "program_id": "pick",
                 "program_revision": "sha256:" + "1" * 64,
                 "non_executable": {
-                    "unresolved_roles": [reference],
+                    "unresolved_targets": [reference],
                     "affected_nodes": ["move_1"],
                     "affected_execution_groups": ["main"],
                 },
@@ -584,42 +580,59 @@ def test_the_apply_bound_counts_every_component_like_the_manager() -> None:
                         applied_deployment_document=applied),
         {"components": []},
     )
-    assert ports._apply_bound_s() == 2 * DEFAULT_LIFECYCLE_TIMEOUT_S + 4.0
+    # Each component also gets the host's stop grace (a hung launch).
+    grace = HOST_COMPONENT_STOP_GRACE_S
+    assert ports._apply_bound_s() == 2 * (DEFAULT_LIFECYCLE_TIMEOUT_S + grace) + 4.0 + grace
     # The Applied document not verified yet: the installed cell still counts.
     unverified = HeadlessApplyPorts(
         SimpleNamespace(headless_client=_Installed(["arm", "gripper"]),  # type: ignore[arg-type]
                         applied_deployment_document=None),
         {"components": []},
     )
-    assert unverified._apply_bound_s() == 2 * DEFAULT_LIFECYCLE_TIMEOUT_S
+    assert unverified._apply_bound_s() == 2 * (DEFAULT_LIFECYCLE_TIMEOUT_S + grace)
     assert _ports(_Installed([]))._apply_bound_s() == DEFAULT_LIFECYCLE_TIMEOUT_S
 
 
-def test_an_apply_on_an_idle_cycle_waits_for_the_reopened_admission() -> None:
-    # The operator's Reset just ended: the cycle reads idle, the Kernel
-    # admission reopens a moment later. The Apply waits (R3), never refused.
-    class _Reopening(_CycleClient):
-        admission_reads = 0
+def test_the_apply_leaves_the_admission_wait_to_the_preparation() -> None:
+    # One wait in one place. An idle cycle goes straight to the Preview;
+    # Headless's activation preparation waits for a momentarily closed
+    # admission, the Composer reads none.
+    from manyforge_composer.backend.apply_orchestration import ApplyPorts
 
-        def authoring_admission(self) -> dict[str, Any]:
-            self.admission_reads += 1
-            return {"authoring_allowed": self.admission_reads >= 3, "admission_generation": 7}
-
-    client = _Reopening({"state": "idle_after_reset", "cycle_generation": 5})
-    _ports(client).await_authoring()
-    assert client.admission_reads == 3
+    assert not hasattr(ApplyPorts, "await_authoring")
+    cell = _FakeCell({"arm": "enabled"}, _impact(arm="retain"))
+    run_apply(cell)
+    assert cell.calls[0] == ("preview",)
 
 
-def test_admission_that_never_reopens_fails_the_apply_typed() -> None:
-    class _Closed(_CycleClient):
-        def authoring_admission(self) -> dict[str, Any]:
-            return {"authoring_allowed": False, "admission_generation": 7}
+def test_a_lone_hung_component_fits_the_apply_bound() -> None:
+    # New after a one-arm cell whose arm node hangs: the host waits its
+    # stop grace, then kills and reaps the group; the wait must cover it.
+    from types import SimpleNamespace
 
-    ports = _ports(_Closed({"state": "idle_after_reset", "cycle_generation": 5}))
-    ports._apply_bound_s = lambda: 0.0  # type: ignore[method-assign]
-    with pytest.raises(ApplyStepFailed) as failed:
-        ports.await_authoring()
-    assert failed.value.code == "authoring_not_ready"
+    from manyforge_composer.backend.routes_deployment_draft import HeadlessApplyPorts
+
+    class _Installed:
+        def components(self) -> list[dict[str, Any]]:
+            return [{"component_id": "arm"}]
+
+    ports = HeadlessApplyPorts(
+        SimpleNamespace(headless_client=_Installed(), applied_deployment_document=None),  # type: ignore[arg-type]
+        {"components": []},
+    )
+    assert ports._apply_bound_s() > HOST_COMPONENT_STOP_GRACE_S + 1.0
+
+
+def test_the_stop_grace_mirrors_the_hosts_constant() -> None:
+    # One source: manyforge::core::kControllerLaunchStopGrace.
+    import re
+    from pathlib import Path
+
+    header = Path(__file__).resolve().parents[2] / (
+        "manyforge_core/include/manyforge_core/types/controller_launch_group_drain.hpp")
+    match = re.search(r"kControllerLaunchStopGrace\{([0-9']+)\}", header.read_text())
+    assert match is not None
+    assert int(match.group(1).replace("'", "")) / 1000.0 == HOST_COMPONENT_STOP_GRACE_S
 
 
 def test_the_server_resets_a_finished_run_like_the_program_tab() -> None:
@@ -660,42 +673,16 @@ def test_a_failed_reset_ends_the_apply_with_its_code() -> None:
     assert failed.value.code == "program_cycle_reset_failed"
 
 
-def test_the_reset_returns_once_the_kernel_admission_reopens() -> None:
-    # The Runner reports Idle before the Manager's readiness update reaches
-    # the Kernel: the Apply's preparation needs the reopened admission.
-    class _LaggingAdmission(_CycleClient):
-        admission_reads = 0
-
-        def program_cycle_status(self) -> dict[str, Any]:
-            return self.reads.pop(0) if len(self.reads) > 1 else dict(self.reads[0])
-
+def test_the_reset_returns_once_the_cycle_is_idle() -> None:
+    # The Runner's Idle reaches the Kernel admission a moment later; the
+    # Apply's preparation waits for it (Headless), the Reset doesn't.
+    class _NoAdmissionRead(_CycleClient):
         def authoring_admission(self) -> dict[str, Any]:
-            self.admission_reads += 1
-            return {"authoring_allowed": self.admission_reads >= 3, "admission_generation": 7}
+            raise AssertionError("the Reset reads no admission")
 
-    client = _LaggingAdmission({"state": "idle_after_reset", "cycle_generation": 5})
+    client = _NoAdmissionRead({"state": "idle_after_reset", "cycle_generation": 5})
     _ports(client).reset_cycle()
-    assert client.admission_reads == 3
-
-
-def test_admission_that_stays_closed_after_the_reset_fails_typed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import manyforge_composer.backend.routes_deployment_draft as routes
-
-    class _Closed(_CycleClient):
-        def program_cycle_status(self) -> dict[str, Any]:
-            return self.reads.pop(0) if len(self.reads) > 1 else dict(self.reads[0])
-
-        def authoring_admission(self) -> dict[str, Any]:
-            return {"authoring_allowed": False, "admission_generation": 7}
-
-    monkeypatch.setattr(routes, "DEFAULT_LIFECYCLE_TIMEOUT_S", 0.0)
-    client = _Closed({"state": "idle_after_reset", "cycle_generation": 5})
-    client.reads.pop(1)  # Idle at the first read after the Reset
-    with pytest.raises(ApplyStepFailed) as failed:
-        _ports(client).reset_cycle()
-    assert failed.value.code == "authoring_not_ready"
+    assert client.reads == []
 
 
 def test_the_reset_wait_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -749,7 +736,7 @@ def test_a_terminal_manager_apply_reports_its_retained_failure() -> None:
 
 def test_a_host_refusal_reports_its_typed_cause_on_the_component() -> None:
     # The Manager's phase code wraps the host's composition refusal, which
-    # wraps the typed cause (CONTRACTS §15 failure record).
+    # wraps the typed cause (failure record).
     failure = {
         "code": "configuration_preservation_failed",
         "cause_code": "scenario_composition_refused",
@@ -853,6 +840,31 @@ def test_an_empty_cell_apply_returns_once_its_scene_clear_ended() -> None:
     )
     _ports(client).wait_for_scene_clear(_ACCEPTED_EMPTY)
     assert len(client.reads) == 1  # returned at the first ended clear
+
+
+@pytest.mark.parametrize("state,details,logged", [
+    ("unknown", {"cause_code": "manager_command_unavailable", "cause_details": {"reason": "timeout"}}, True),
+    ("unknown", {}, False),
+    ("succeeded", {"cause_code": "manager_command_unavailable"}, False),
+])
+def test_scene_clear_cause_warning_does_not_change_wait(
+    state: str, details: dict[str, Any], logged: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clear = {"apply_id": "a", "apply_generation": 2, "state": state,
+             "reason": {"details": details}}
+    client = _SceneClearClient(clear, {"apply_id": "a", "apply_generation": 2, "state": "pending"})
+    assert _ports(client).wait_for_scene_clear(_ACCEPTED_EMPTY) is None
+    assert len(client.reads) == 1
+    messages = [record.getMessage() for record in caplog.records
+                if record.name == "manyforge_composer.backend.routes_deployment_draft"]
+    if logged:
+        assert messages == [
+            "Scene clear after Apply a/2 outcome unknown: "
+            "cause_code=manager_command_unavailable cause_details={'reason': 'timeout'}"
+        ]
+    else:
+        assert messages == []
 
 
 @pytest.mark.parametrize("result", [

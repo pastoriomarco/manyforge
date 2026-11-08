@@ -12,6 +12,8 @@ import {
   VIEWER_CONTEXT_DRAG_THRESHOLD_PX,
   clonePreviewMesh,
   candidateGhostColor,
+  previewContactColor,
+  previewSampleBaseColor,
   MeasuredStateGhostLayers,
   MeasuredStateGhostToggle,
   frameableContentBounds,
@@ -62,10 +64,17 @@ describe('viewer failure isolation', () => {
     expect(preview.material).toBeInstanceOf(THREE.MeshBasicMaterial);
     expect(preview.material.color.getHexString()).toBe('58ddff');
     expect(preview.material).toMatchObject({ transparent: true, opacity: 0.5,
-      toneMapped: false, depthWrite: false, side: THREE.FrontSide });
+      toneMapped: false, depthWrite: false, depthTest: true, side: THREE.FrontSide });
     expect(preview.geometry).toBe(original.geometry);
     expect(original.material).toMatchObject({ transparent: false, opacity: 1 });
     expect(preview.material).not.toBe(original.material);
+    const rejected = clonePreviewMesh(original, '#ff7066', 0.5, false) as THREE.Mesh<THREE.BoxGeometry, THREE.MeshBasicMaterial>;
+    expect(rejected.material.depthTest).toBe(false);
+    expect(rejected.material.depthWrite).toBe(false);
+    expect(rejected.renderOrder).toBeGreaterThan(16);
+    expect(preview.renderOrder).toBe(14);
+    expect(original.material.depthTest).toBe(true);
+    rejected.material.dispose();
     preview.material.dispose();
     original.material.dispose();
     original.geometry.dispose();
@@ -271,7 +280,7 @@ describe('viewer failure isolation', () => {
     for (const [axes] of source.matchAll(/<axesHelper[^>]*\/>/g)) {
       if (!axes.includes('args={[0.45]}')) expect(axes).toContain('raycast={ignoreViewerRaycast}');
     }
-    expect(source).toContain('<mesh rotation={cylinderRotation} renderOrder={14} raycast={ignoreViewerRaycast}>');
+    expect(source).toContain('<mesh rotation={cylinderRotation} renderOrder={depthTest ? 14 : 19} raycast={ignoreViewerRaycast}>');
     expect(source).not.toContain('transformRevision');
     expect(source).not.toContain('markTransformChange');
     expect(source).toContain('transformEnabled={transformEnabled && objectEditorActive}');
@@ -897,4 +906,18 @@ describe('viewer failure isolation', () => {
     expect(source).toContain('frameloop="demand"');
     expect(source).not.toContain('frameloop="always"');
   });
+});
+
+
+it('uses the existing contact palette and leaves unrelated ghosts unchanged', async () => {
+  const { STATUS_COLORS, VIEWPORT_COLORS } = await import('../styles/tokens');
+  const ordinary = candidateGhostColor('receipt', false);
+  expect(previewContactColor('allowed')).toBe(STATUS_COLORS.running);
+  expect(previewContactColor('refused')).toBe(STATUS_COLORS.failure);
+  expect(previewContactColor('unknown')).toBe(STATUS_COLORS.idle);
+  expect(previewContactColor(undefined)).toBeUndefined();
+  expect(previewSampleBaseColor('clear', null, false)).toBe(VIEWPORT_COLORS.previewCurrent);
+  expect(previewSampleBaseColor('unknown', 'receipt', false)).toBe(STATUS_COLORS.idle);
+  expect(previewSampleBaseColor(undefined, 'receipt', false)).toBe(ordinary);
+  expect(candidateGhostColor('receipt', false)).toBe(ordinary);
 });

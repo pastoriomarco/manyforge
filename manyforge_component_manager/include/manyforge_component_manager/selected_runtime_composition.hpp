@@ -26,11 +26,11 @@ inline constexpr std::string_view kScenarioCompositionRefusedCode =
 /// The producer of that refusal (the execution host).
 inline constexpr std::string_view kExecutionHostProducer = "execution_host";
 
-/// CONTRACTS §15: the Manager's one Apply call to the execution host, made
+/// The Manager's one Apply call to the execution host, made
 /// while the Apply's Kernel configuration fence is held. The host refuses
 /// `apply_requires_inactive_component` for an enabled replaced or removed
 /// component (dead or faulted ones are accepted, and so is one whose Disable
-/// failed, N28), stops removed and replaced
+/// failed), stops removed and replaced
 /// components, installs the candidate bundle, hands the new component set to
 /// its component runtime and closes the routes of removed domains.
 struct HostApplyRequest final {
@@ -132,7 +132,7 @@ struct ManagerComponentProcessOccurrenceDTO final {
 /// Uses the existing MFNSRC4 collection bound, never a truncated union.
 inline constexpr std::size_t kMaximumComponentProcessInventoryEntries = 4096U;
 
-/// CONTRACTS §11: a component whose process is gone is removed or replaced
+/// A component whose process is gone is removed or replaced
 /// without a clean Disable. Gone means it has launch processes and every one
 /// is a drained process group (cleanup-proven, not merely an exited leader).
 /// A component with no launch process or with a local owner is not gone.

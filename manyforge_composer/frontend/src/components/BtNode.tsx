@@ -204,7 +204,7 @@ export function BtNode({
         className={`bt-node-react-flow-handle${targetConnectable ? '' : ' disabled'}`}
         aria-label={`Connect ${node.label} as child`}
       />
-      {/* UI6-I-VC D3: icon band, name, empty band of the same width. */}
+      {/* Icon band, name, empty band of the same width. */}
       <span className="bt-node-band" aria-hidden="true">
         <ProgramCategoryIcon category={node.category} catalogId={node.catalogId} />
       </span>

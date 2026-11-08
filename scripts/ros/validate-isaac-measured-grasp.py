@@ -4,7 +4,7 @@
 The bounded rigid-transform math is independent of Composer, ROS, and the
 simulator and remains as same-role qualification logic.  The old live harness
 and its unused ``EvidenceRow``/``QualificationResult`` wire are pinned at blob
-``58f32e3a926f0c3d54183b985bd16ecea6805469``.  They return only at I9 as a
+``58f32e3a926f0c3d54183b985bd16ecea6805469``.  They may return only as a
 client and evidence contract of the headless scene and Kernel Stop owners.
 """
 
@@ -18,10 +18,9 @@ from typing import Any, Iterable, Sequence
 
 
 UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
-RESTORATION_GATE = "I5/H0 + I8/P5 + I9/I"
 UNAVAILABLE_MESSAGE = (
-    f"{UNAVAILABLE_REASON_CODE}: live measured-grasp qualification requires "
-    f"the {RESTORATION_GATE} restoration gates"
+    f"{UNAVAILABLE_REASON_CODE}: live measured-grasp qualification is not "
+    "available yet"
 )
 MAX_FRAME_ID_CHARS = 1024
 RIGID_TRANSFORM_TOLERANCE = 1e-6

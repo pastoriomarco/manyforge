@@ -9,7 +9,7 @@
 namespace manyforge::core {
 namespace {
 
-thread_local bool t_inside_runtime_collision_monitor_callback = false;
+thread_local const RuntimeCollisionMonitor* t_current_runtime_collision_monitor = nullptr;
 
 constexpr auto kDrainCallbacksTimeout = std::chrono::seconds(1);
 
@@ -45,6 +45,10 @@ RuntimeCollisionMonitor::RuntimeCollisionMonitor(
       tick_callback_(std::move(tick_callback)),
       should_continue_callback_(std::move(should_continue_callback)) {}
 
+bool RuntimeCollisionMonitor::in_callback() const noexcept {
+  return t_current_runtime_collision_monitor == this;
+}
+
 RuntimeCollisionMonitor::~RuntimeCollisionMonitor() {
   stop(/*drain_callbacks=*/true);
 }
@@ -56,6 +60,7 @@ void RuntimeCollisionMonitor::set_fail_closed_dump_hook(
 
 void RuntimeCollisionMonitor::start() {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (detached_) return;
   active_ = true;
   ++generation_;
   if (handle_ != 0) {
@@ -67,7 +72,11 @@ void RuntimeCollisionMonitor::start() {
 }
 
 void RuntimeCollisionMonitor::stop(bool drain_callbacks) {
-  if (!t_inside_runtime_collision_monitor_callback) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (detach_completed_) return;
+  }
+  if (!in_callback()) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       active_ = false;
@@ -119,6 +128,24 @@ void RuntimeCollisionMonitor::stop(bool drain_callbacks) {
       handle_ = 0;
     }
   }
+}
+
+Result<void> RuntimeCollisionMonitor::detach() {
+  if (in_callback())
+    return Result<void>::Err(ErrorDTO{kErrorExecutionRejected,
+        "Cannot detach a monitor from its own callback", {{"reason", "scheduler_not_ready"}}});
+  std::lock_guard detach_lock(detach_mutex_);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (detach_completed_) return Result<void>::Ok();
+    detached_ = true;
+  }
+  // Owner admission is closed; callbacks still in flight may finish and must
+  // be drained before the scheduler borrow can be released.
+  stop(/*drain_callbacks=*/true);
+  std::lock_guard<std::mutex> lock(mutex_);
+  detach_completed_ = true;
+  return Result<void>::Ok();
 }
 
 void RuntimeCollisionMonitor::set_active_contact_policy_id(
@@ -173,15 +200,15 @@ void RuntimeCollisionMonitor::schedule_next_locked(std::uint64_t generation,
         update_atomic_max(timing_start_jitter_max_ns_, jitter_ns);
         struct CallbackGuard {
           RuntimeCollisionMonitor* self;
-          bool was_inside = t_inside_runtime_collision_monitor_callback;
+          const RuntimeCollisionMonitor* previous = t_current_runtime_collision_monitor;
 
           explicit CallbackGuard(RuntimeCollisionMonitor* monitor)
               : self(monitor) {
-            t_inside_runtime_collision_monitor_callback = true;
+            t_current_runtime_collision_monitor = monitor;
           }
 
           ~CallbackGuard() {
-            t_inside_runtime_collision_monitor_callback = was_inside;
+            t_current_runtime_collision_monitor = previous;
             {
               std::lock_guard<std::mutex> lock(self->mutex_);
               if (self->callbacks_in_flight_ > 0) {

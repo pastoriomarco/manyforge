@@ -188,7 +188,7 @@ def _validate_custom_tcps(value: Any, label: str) -> list[dict[str, Any]]:
 
     `parent_frame` names a frame of the component's model (a descriptor frame
     role or a URDF link); the compiler resolves it and refuses chaining and
-    name collisions. The pose is the spec 210 authoring shape.
+    name collisions. The pose is the authoring pose shape.
     """
     if type(value) is not list or len(value) > _MAX_CUSTOM_TCPS:
         _fail(f"{label} must be a bounded list")
@@ -349,7 +349,7 @@ def _validate_controlled_stop(value: Any, label: str) -> dict[str, Any]:
         ),
         "per_joint_limits": normalized_limits,
     }
-    # Q28/Q51 (`main`'s per-profile override): the robot's controlled-Stop
+    # Per-profile override: the robot's controlled-Stop
     # deadline from the Stop request; absent: deceleration time + 0.5 s.
     if "max_stop_time_s" in profile:
         result["max_stop_time_s"] = _positive_finite(
@@ -471,7 +471,7 @@ def _validate_sensor_component(component: dict[str, Any], label: str) -> dict[st
 
 
 def _is_machine_owner(component: dict[str, Any]) -> bool:
-    """A machine's owner row (CONTRACTS §16): no owner, no model source and no
+    """A machine's owner row: no owner, no model source and no
     runtime kind; it holds the machine's lane and address reference."""
     configuration = component.get("configuration")
     return (
@@ -539,7 +539,7 @@ def _validate_io_member(component: dict[str, Any], label: str) -> dict[str, Any]
 
 
 def _validate_default_tcp(value: Any, label: str) -> dict[str, str]:
-    """B5 `default_tcp` `{command_target_id, frame_role_id}`; the compiler
+    """`default_tcp` `{command_target_id, frame_role_id}`; the compiler
     checks the pair against the component's TCPs."""
     row = _require_object(value, label)
     _require_exact_fields(

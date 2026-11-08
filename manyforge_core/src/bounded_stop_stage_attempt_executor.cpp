@@ -14,13 +14,33 @@
 
 namespace manyforge::core {
 
+namespace {
+
+/// Each executor's lane generations start in their own range of this width,
+/// so handles never repeat across the executors of one process.
+constexpr unsigned kGenerationRangeBits = 40U;
+constexpr std::uint64_t kGenerationRange = std::uint64_t{1} << kGenerationRangeBits;
+
+[[nodiscard]] std::uint64_t next_generation_base() {
+  static std::atomic<std::uint64_t> executors{0U};
+  const auto ordinal = executors.fetch_add(1U, std::memory_order_relaxed) + 1U;
+  if (ordinal >= (std::numeric_limits<std::uint64_t>::max() >> kGenerationRangeBits)) {
+    throw std::length_error("Stop-stage attempt executor generation ranges are exhausted");
+  }
+  return ordinal << kGenerationRangeBits;
+}
+
+}  // namespace
+
 class BoundedStopStageAttemptExecutor::Impl final {
  public:
   Impl(const std::size_t capacity, const std::size_t prequalified_max_live_participants,
-       IStopStageAttemptCompletionReceiver& receiver)
+       IStopStageAttemptCompletionReceiver& receiver, BoundedStopStageAttemptExecutor& owner)
       : capacity_(capacity),
         prequalified_max_live_participants_(prequalified_max_live_participants),
-        receiver_(receiver) {
+        receiver_(receiver),
+        owner_(owner),
+        generation_base_(next_generation_base()) {
     if (prequalified_max_live_participants == 0U ||
         prequalified_max_live_participants >
             kMaximumPrequalifiedStopStageAttemptLanes / kMaxStopEscalationStages ||
@@ -33,6 +53,7 @@ class BoundedStopStageAttemptExecutor::Impl final {
     slots_.reserve(capacity_);
     for (std::size_t index = 0U; index < capacity_; ++index) {
       slots_.push_back(std::make_unique<Slot>());
+      slots_.back()->generation = generation_base_;
     }
     try {
       for (std::size_t index = 0U; index < capacity_; ++index) {
@@ -116,7 +137,7 @@ class BoundedStopStageAttemptExecutor::Impl final {
       if (slot.state != State::kFree) {
         continue;
       }
-      if (slot.generation == std::numeric_limits<std::uint64_t>::max()) {
+      if (slot.generation + 1U == generation_base_ + kGenerationRange) {
         replenishment_healthy_.store(false, std::memory_order_release);
         return {StopStageAttemptStartStatus::kNotPrequalified, std::nullopt};
       }
@@ -271,7 +292,7 @@ class BoundedStopStageAttemptExecutor::Impl final {
             slot.spring_return_point) return false;
         slot.spring_return_point = std::move(immutable);
       }
-      receiver_.StageAttemptCompleted(handle);
+      receiver_.StageAttemptCompleted(owner_, handle);
       return true;
     } catch (...) {
       // Progress is optional. Containment continues on the same stage lane.
@@ -362,7 +383,7 @@ class BoundedStopStageAttemptExecutor::Impl final {
         completed_handle = StopStageAttemptHandle{slot_index, slot.generation};
       }
       SignalStateChange();
-      receiver_.StageAttemptCompleted(completed_handle);
+      receiver_.StageAttemptCompleted(owner_, completed_handle);
       active_calls_.fetch_sub(1U, std::memory_order_acq_rel);
       SignalStateChange();
     }
@@ -374,6 +395,8 @@ class BoundedStopStageAttemptExecutor::Impl final {
   const std::size_t capacity_;
   const std::size_t prequalified_max_live_participants_;
   IStopStageAttemptCompletionReceiver& receiver_;
+  BoundedStopStageAttemptExecutor& owner_;
+  const std::uint64_t generation_base_;
   std::vector<std::unique_ptr<Slot>> slots_;
   std::atomic<bool> accepting_{true};
   std::atomic<bool> replenishment_healthy_{true};
@@ -387,7 +410,8 @@ class BoundedStopStageAttemptExecutor::Impl final {
 BoundedStopStageAttemptExecutor::BoundedStopStageAttemptExecutor(
     const std::size_t capacity, const std::size_t prequalified_max_live_participants,
     IStopStageAttemptCompletionReceiver& receiver)
-    : impl_(std::make_unique<Impl>(capacity, prequalified_max_live_participants, receiver)) {}
+    : impl_(std::make_unique<Impl>(capacity, prequalified_max_live_participants, receiver,
+                                   *this)) {}
 
 BoundedStopStageAttemptExecutor::~BoundedStopStageAttemptExecutor() = default;
 

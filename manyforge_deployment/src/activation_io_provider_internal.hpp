@@ -19,7 +19,7 @@ struct ActivationPreparedIoType final {
     std::span<const ActivationComponentProfile> profiles,
     std::span<const QualifiedCapabilityDefinition> capabilities);
 
-/// CONTRACTS §16: one derived component type per machine owner (tag
+/// One derived component type per machine owner (tag
 /// `machine`, no command targets) with its `machines` runtime row
 /// `{controllable_component_id, lane, machine_lane_row?, device_address_ref?,
 /// arm_lane_row?, arm_model_family_id?, arm_description?, arm_joint_names?}`

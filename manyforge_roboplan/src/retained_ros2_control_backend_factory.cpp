@@ -16,12 +16,12 @@
 namespace manyforge::roboplan_backend {
 namespace {
 
-/// CP9: the gripper's `gripper_feedback` stream with the component's row
+/// The gripper's `gripper_feedback` stream with the component's row
 /// budget/severity/recovery (carried in the gripper config). A gripper
 /// without output declares none.
 /// - Isaac effort transport: declared here; the backend records the arrival
 ///   of every matched raw feedback sample.
-/// - Mock (stock GripperCommand): its sample is the gripper joint in the
+/// - Mock (stock ParallelGripperCommand): its sample is the gripper joint in the
 ///   controller manager's measured JointState, so the declaration rides the
 ///   measured lane; the runtime handle declares it with that lane and records
 ///   the stamp of every message carrying the joint.
@@ -117,10 +117,10 @@ sole_compiled_group(const core::RuntimeParticipantBinding &binding,
 void require_decided_lane_inputs(const core::ExecutionPortParticipantConfig &config) {
   std::string missing;
   if (!config.stop.replacement_start_allowance_s.has_value()) {
-    missing += " replacement_start_allowance_s (Q26/Q42)";
+    missing += " replacement_start_allowance_s";
   }
   if (!(config.late_cycle_margin_s > 0.0)) {
-    missing += " late_cycle_margin_s (Q52)";
+    missing += " late_cycle_margin_s";
   }
   if (!missing.empty()) {
     throw std::invalid_argument(
@@ -132,14 +132,16 @@ void require_decided_lane_inputs(const core::ExecutionPortParticipantConfig &con
 /// sample period, whichever comes first (the participant re-reads the port
 /// after every return).
 [[nodiscard]] core::StopStageWaiter make_sample_period_waiter(
-    const core::IClock &clock, const double state_rate_hz) {
+    std::shared_ptr<core::IClock> clock, const double state_rate_hz) {
   if (!(state_rate_hz > 0.0)) {
     throw std::invalid_argument("ros2_control lane has no controller state rate");
   }
   const auto period = static_cast<core::Duration>(1e9 / state_rate_hz);
-  return [&clock, period](const core::TimePoint deadline, const std::stop_token &cancellation) {
+  return [clock = std::move(clock), period](
+             const core::TimePoint deadline,
+             const std::stop_token &cancellation) {
     if (cancellation.stop_requested()) return;
-    const auto wait = std::clamp<core::Duration>(deadline - clock.now(), 0, period);
+    const auto wait = std::clamp<core::Duration>(deadline - clock->now(), 0, period);
     std::this_thread::sleep_for(std::chrono::nanoseconds(wait));
   };
 }
@@ -149,7 +151,7 @@ void require_decided_lane_inputs(const core::ExecutionPortParticipantConfig &con
 RetainedObservedStateChannelConfig retained_ros2_control_motion_state_config(
     const RetainedRos2ControlBackendConfig &config) {
   if (config.participant.stop.trip_authority == core::StateAuthorityClass::kMeasured) {
-    // CP8 step 1: a measured authority's addressed arm state is the bound
+    // A measured authority's addressed arm state is the bound
     // lane's measured JointState, with the lane's freshness budget. There is
     // no commanded or seeded fallback: an absent, incomplete (NaN) or stale
     // sample leaves the state unavailable.
@@ -179,7 +181,7 @@ RetainedObservedStateChannelConfig retained_ros2_control_motion_state_config(
         "ros2_control runtime composes commanded-simulation or measured arm "
         "state only");
   }
-  // Non-expiring commanded source (item 20): the controller's own reference.
+  // Non-expiring commanded source: the controller's own reference.
   const std::string source_id = "commanded_state";
   return RetainedObservedStateChannelConfig{
       core::ObservedStateSourceKind::kCommandedState,
@@ -226,17 +228,21 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
        runtime_handle = std::move(runtime_handle)](
           const core::RuntimeParticipantBinding &motion_binding,
           const std::shared_ptr<RetainedObservedStateChannel> &motion_channel,
-          core::IClock &clock,
+          std::shared_ptr<core::IClock> clock,
           core::IScheduler &scheduler) -> RetainedRuntimeBackendSet {
         auto selected = single_use->take();
         require_decided_lane_inputs(selected.participant);
+        if (!clock) {
+          throw std::invalid_argument(
+              "ros2_control backend requires its shared host clock");
+        }
         if (selected.arm.measured_joint_state_lane.has_value()) {
           if (!selected.measured_receiver_clock) {
             throw std::invalid_argument(
                 "measured_receiver_clock_missing: measured lane requires its "
                 "owning receiver clock");
           }
-          if (selected.measured_receiver_clock.get() != &clock) {
+          if (selected.measured_receiver_clock.get() != clock.get()) {
             throw std::invalid_argument(
                 "measured_receiver_clock_mismatch: measured lane requires the "
                 "exact factory receiver clock");
@@ -266,11 +272,16 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
             {motion_group, motion_channel, false}};
         auto sink = std::make_shared<RetainedExecutionStateSink>(
             clock, std::move(sink_bindings));
-        auto resources =
-            std::make_unique<ros2_control_execution::Ros2TransportResources>(
-                selected.node_name, selected.node_namespace,
-                selected.executor_thread_count, sink, motion_group, clock,
-                selected.ros_context_provider);
+        auto transport_factory =
+            [sink, motion_group, receiver_clock = clock,
+             node_name = selected.node_name, node_namespace = selected.node_namespace,
+             threads = selected.executor_thread_count,
+             provider = selected.ros_context_provider] {
+              return ros2_control_execution::Ros2TransportResources::create(
+                  node_name, node_namespace, threads, sink, motion_group,
+                  *receiver_clock, provider);
+            };
+        auto resources = transport_factory();
         const auto state_rate_hz = selected.arm.adapter.lane_facts.state_rate_hz;
         auto participant_config = selected.participant;
         if (const auto trace = selected.arm.adapter.motion_trace) {
@@ -280,8 +291,8 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
             trace->Preregister(action, epoch, key, participant);
           };
         }
-        // TOOLCTX, Active TCP (M7): before each new goal (its own action,
-        // M6b) the robot's Active TCP becomes the move's TCP entry: nothing
+        // Active TCP: before each new goal (its own
+        // action) the robot's Active TCP becomes the move's TCP entry: nothing
         // when it already is, else the confirmed TCP step and the commit
         // (Mock and Isaac: the commit alone). A preempt never gets here.
         {
@@ -320,30 +331,31 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
               return handle->RebindPendingRearm();
             }};
         const auto bound = runtime_handle->Bind(
-            std::move(resources), clock, std::move(selected.arm),
+            std::move(resources), *clock, scheduler, std::move(selected.arm),
             [&](std::shared_ptr<core::IExecutionPort> port) {
               return std::make_shared<core::ExecutionPortParticipant>(
-                  motion_binding, std::move(port), clock, scheduler,
+                  motion_binding, std::move(port), *clock, scheduler,
                   make_sample_period_waiter(clock, state_rate_hz),
                   state_authority, std::move(participant_config));
             },
             nullptr, motion_binding, std::nullopt,
-            std::move(selected.measured_receiver_clock));
+            clock);
         if (!bound.ok()) {
           throw std::invalid_argument(bound.error().message);
         }
+        runtime_handle->InstallTransportFactory(std::move(transport_factory));
 
         const std::weak_ptr<RetainedObservedStateChannel> weak_channel =
             motion_channel;
         if (selected.participant.stop.trip_authority ==
             core::StateAuthorityClass::kMeasured) {
-          // CP8 step 1: the measured lane's JointState is the addressed arm
+          // The measured lane's JointState is the addressed arm
           // state. Samples are reordered by the controller's (source) joint
           // names; a missing, duplicated or non-finite joint publishes an
           // incomplete sample, which replaces the prior one (never a fill).
           runtime_handle->InstallMeasuredStateObserver(
               [weak_channel, sink, motion_group, compiled,
-               source = source_resources(motion_binding), &clock,
+               source = source_resources(motion_binding), clock,
                positions = std::vector<double>(compiled.size()),
                velocities = std::vector<double>(compiled.size())](
                   const sensor_msgs::msg::JointState &message) mutable {
@@ -377,7 +389,7 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
                     complete && with_velocities
                         ? std::span<const double>(velocities)
                         : std::span<const double>{},
-                    source_time, clock.now());
+                    source_time, clock->now());
                 if (published.published && published.complete) {
                   (void)sink->apply_group_joint_positions(
                       motion_group, positions,
@@ -389,7 +401,7 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
           // published for every new sample (velocities at the applied factor).
           runtime_handle->InstallSampleObserver(
               [weak_channel, sink, motion_group, compiled,
-               &clock](const core::ExecutionControllerSampleDTO &sample) {
+               clock](const core::ExecutionControllerSampleDTO &sample) {
                 const auto channel = weak_channel.lock();
                 if (!channel ||
                     sample.reference_positions_rad.size() != compiled.size()) {
@@ -404,7 +416,7 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
                 (void)channel->publish_adapter_state(
                     core::ObservedRobotStateSourceKind::kCommandedState, compiled,
                     sample.reference_positions_rad, velocities,
-                    sample.local_receipt_stamp_ns, clock.now());
+                    sample.local_receipt_stamp_ns, clock->now());
                 (void)sink->apply_group_joint_positions(
                     motion_group, sample.reference_positions_rad,
                     core::ExecutionStateUpdateMode::kBestEffort);
@@ -422,14 +434,14 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
             std::shared_ptr<core::ExecutionPortParticipant>(runtime_handle,
                                                             participant.get());
         result.execution = owned_participant;
-        // Active TCP (M7, T-MQ15, T-A2): the robot's Set TCP, an immediate
+        // Active TCP: the robot's Set TCP, an immediate
         // Kernel step; it holds the robot with the checkbox on.
         {
           const std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner =
               runtime_handle->weak_from_this();
           result.set_tcp = core::SetTcpStep{
               runtime_handle->ActiveTcpHoldsRobot(),
-              [owner](const core::TcpEntryDTO& entry, const bool robot_control) {
+              [owner](const core::TcpEntryReferenceDTO& entry, const bool robot_control) {
                 const auto handle = owner.lock();
                 if (!handle)
                   return core::Result<void>::Err(
@@ -456,13 +468,13 @@ make_retained_ros2_control_gripper_backend(
     RetainedRos2ControlBackendConfig config,
     const core::RuntimeParticipantBinding& binding,
     const std::shared_ptr<RetainedObservedStateChannel>& channel,
-    core::IClock& clock, core::IScheduler& scheduler,
+    std::shared_ptr<core::IClock> clock, core::IScheduler& scheduler,
     const std::shared_ptr<RetainedRos2ControlRuntimeHandle>& handle) {
   const bool no_output = config.gripper && config.gripper->output_mode == core::GripperOutputMode::kNone &&
       config.gripper->actuation_kind == core::GripperActuationKind::kPneumatic;
   // A commanded owner either drives its own controller manager (Mock) or an
   // Isaac transport with no controller-manager primitive (merge 6 tool).
-  if (!handle || !channel || !config.gripper ||
+  if (!handle || !channel || !clock || !config.gripper ||
       (!no_output && !config.arm.measured_joint_state_lane) ||
       (no_output && config.arm.gripper_controller) || !binding.value().control_path ||
       binding.value().control_path->state_authority_class != core::StateAuthorityClass::kCommanded ||
@@ -488,20 +500,29 @@ make_retained_ros2_control_gripper_backend(
     };
   }
   auto sink = std::make_shared<RetainedExecutionStateSink>(clock, std::move(sinks));
-  auto resources = std::make_unique<ros2_control_execution::Ros2TransportResources>(
-      config.node_name, config.node_namespace, config.executor_thread_count, sink, group, clock,
-      config.ros_context_provider);
+  auto transport_factory =
+      [sink, group, receiver_clock = clock, node_name = config.node_name,
+       node_namespace = config.node_namespace, threads = config.executor_thread_count,
+       provider = config.ros_context_provider] {
+        return ros2_control_execution::Ros2TransportResources::create(
+            node_name, node_namespace, threads, sink, group, *receiver_clock, provider);
+      };
+  auto resources = transport_factory();
   auto gripper = std::make_unique<ros2_control_execution::Ros2GripperCommandBackend>(
-      *resources, sink, clock, scheduler, true);
+      resources, sink, *clock, scheduler, true);
   declare_gripper_feedback_stream(config, binding);
-  gripper->configure_gripper_action(binding.value().command_target_id.value(), *config.gripper);
+  gripper->configure_gripper_action(binding.value().command_target_id.value(), *config.gripper,
+                                    config.gripper_lifecycle_timeout_ns);
   auto* const backend = gripper.get();
   const auto bound = handle->BindGripperOnly(
-      std::move(resources), clock, std::move(gripper), binding,
+      std::move(resources), *clock, std::move(gripper), binding,
       config.arm.gripper_controller.value_or(RetainedRos2ControlArmController{}),
-      std::move(config.measured_receiver_clock),
+      config.measured_receiver_clock
+          ? std::move(config.measured_receiver_clock)
+          : clock,
       no_output ? std::nullopt : config.arm.measured_joint_state_lane);
   if (!bound.ok()) throw std::invalid_argument(bound.error().message);
+  handle->InstallTransportFactory(std::move(transport_factory));
   if (pneumatic) {
     const auto display = handle->BindGripperDisplayChannel(channel);
     if (!display.ok()) throw std::invalid_argument(display.error().message);

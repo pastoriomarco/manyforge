@@ -16,7 +16,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kProgramBindingApiVersion =
-    "manyforge.program_binding.v2";
+    "manyforge.program_binding.v3";
 inline constexpr std::size_t kMaxProgramRoleBindings = 4096U;
 inline constexpr std::size_t kMaxProgramNestedRoleBindings = 4096U;
 inline constexpr std::size_t kMaxProgramCapabilityBindings = 4096U;
@@ -31,35 +31,32 @@ struct ProgramModelRoleBindingDTO final {
                          const ProgramModelRoleBindingDTO&) = default;
 };
 
-struct ProgramComponentRoleBindingDTO final {
-  ComponentRoleId component_role_id;
-  ControllableComponentId controllable_component_id;
+struct ProgramComponentBindingDTO final {
+  ControllableComponentId component_id;
   ComponentTypeId component_type_id;
   ComponentTypeRevision component_type_revision;
-  std::vector<ProgramModelRoleBindingDTO> model_role_bindings;
+  std::vector<ProgramModelRoleBindingDTO> model_bindings;
 
-  friend bool operator==(const ProgramComponentRoleBindingDTO&,
-                         const ProgramComponentRoleBindingDTO&) = default;
+  friend bool operator==(const ProgramComponentBindingDTO&,
+                         const ProgramComponentBindingDTO&) = default;
 };
 
-struct ProgramFrameRoleBindingDTO final {
-  FrameRoleId frame_role_id;
+struct ProgramFrameBindingDTO final {
+  ProgramFrameReferenceDTO reference;
   ModelInstanceId model_instance_id;
   ModelRevision model_revision;
   std::string compiled_frame_name;
-  // Omitted from canonical bytes when empty. These portable body roles are
-  // qualified against this exact model instance and revision.
-  std::vector<CollisionBodyRoleId> contact_body_role_ids{};
 
-  friend bool operator==(const ProgramFrameRoleBindingDTO&,
-                         const ProgramFrameRoleBindingDTO&) = default;
+  friend bool operator==(const ProgramFrameBindingDTO&,
+                         const ProgramFrameBindingDTO&) = default;
 };
 
 /// One selectable TCP known to a moving robot. `entry` names its owner while
 /// `frame` carries the exact retained frame and the owner's contact bodies.
 struct ProgramRobotTcpBindingDTO final {
-  TcpEntryDTO entry;
-  ProgramFrameRoleBindingDTO frame;
+  TcpEntryReferenceDTO entry;
+  ProgramFrameBindingDTO frame;
+  std::vector<CollisionBodyRoleId> contact_body_role_ids{};
   bool end_effector{};
   bool component_default{};
 
@@ -76,14 +73,14 @@ struct ProgramResourceRoleBindingDTO final {
                          const ProgramResourceRoleBindingDTO&) = default;
 };
 
-struct ProgramCollisionBodyRoleBindingDTO final {
-  CollisionBodyRoleId collision_body_role_id;
+struct ProgramCollisionBodyBindingDTO final {
+  ProgramCollisionBodyReferenceDTO reference;
   ModelInstanceId model_instance_id;
   ModelRevision model_revision;
   std::vector<std::string> compiled_collision_body_names;
 
-  friend bool operator==(const ProgramCollisionBodyRoleBindingDTO&,
-                         const ProgramCollisionBodyRoleBindingDTO&) = default;
+  friend bool operator==(const ProgramCollisionBodyBindingDTO&,
+                         const ProgramCollisionBodyBindingDTO&) = default;
 };
 
 struct ProgramControlBindingRefDTO final {
@@ -123,24 +120,24 @@ struct ProgramCapabilityBindingDTO final {
                          const ProgramCapabilityBindingDTO&) = default;
 };
 
-struct ProgramSignalRoleBindingDTO final {
-  ResourceRoleId resource_role_id;
-  std::string signal_name;
+struct ProgramSignalBindingDTO final {
+  ProgramSignalReferenceDTO reference;
+  ProgramTargetReferenceDTO target;
+  RuntimeUnitId runtime_unit_id;
   IoSignalValueType value_type;
   IoSignalDirection direction;
   IoTransitionCapability transition_capability;
   ContentDigest signal_descriptor_digest;
 
-  friend bool operator==(const ProgramSignalRoleBindingDTO&,
-                         const ProgramSignalRoleBindingDTO&) = default;
+  friend bool operator==(const ProgramSignalBindingDTO&,
+                         const ProgramSignalBindingDTO&) = default;
 };
 
 /// Compiler-owned references to the ordinary I/O roles of a pneumatic tool.
 /// The output effects remain ordinary I/O operations; these rows do not prove
 /// that a valve was delivered or that a grasp occurred.
 struct ProgramPneumaticOutputBindingDTO final {
-  TargetRoleId target_role_id;
-  ResourceRoleId resource_role_id;
+  ProgramSignalReferenceDTO signal;
   bool open_value{};
   bool close_value{};
   friend bool operator==(const ProgramPneumaticOutputBindingDTO&,
@@ -149,8 +146,7 @@ struct ProgramPneumaticOutputBindingDTO final {
 
 struct ProgramPneumaticInputBindingDTO final {
   std::string input;
-  TargetRoleId target_role_id;
-  ResourceRoleId resource_role_id;
+  ProgramSignalReferenceDTO signal;
   friend bool operator==(const ProgramPneumaticInputBindingDTO&,
                          const ProgramPneumaticInputBindingDTO&) = default;
 };
@@ -162,41 +158,41 @@ struct ProgramPneumaticIoBindingDTO final {
                          const ProgramPneumaticIoBindingDTO&) = default;
 };
 
-struct ProgramTargetRoleBindingDTO final {
-  TargetRoleId target_role_id;
-  ComponentRoleId component_role_id;
-  ControllableComponentId controllable_component_id;
-  CommandTargetId command_target_id;
-  std::vector<ProgramFrameRoleBindingDTO> frame_role_bindings;
+struct ProgramTargetFrameAssociationDTO final {
+  ProgramFrameReferenceDTO frame;
+  std::vector<CollisionBodyRoleId> contact_body_role_ids;
+
+  friend bool operator==(const ProgramTargetFrameAssociationDTO&,
+                         const ProgramTargetFrameAssociationDTO&) = default;
+};
+
+struct ProgramTargetBindingDTO final {
+  ProgramTargetReferenceDTO target;
+  std::vector<ProgramFrameReferenceDTO> frame_references;
+  std::vector<ProgramCollisionBodyReferenceDTO> collision_body_references;
+  std::vector<ProgramSignalReferenceDTO> signal_references;
   std::vector<ProgramResourceRoleBindingDTO> resource_role_bindings;
-  std::vector<ProgramCollisionBodyRoleBindingDTO>
-      collision_body_role_bindings;
   std::vector<ProgramCapabilityBindingDTO> capability_bindings;
-  // Omitted from canonical binding bytes when empty.
-  std::vector<ProgramSignalRoleBindingDTO> signal_role_bindings{};
   // Omitted for all targets without an authored pneumatic I/O mapping.
   std::optional<ProgramPneumaticIoBindingDTO> pneumatic_io{};
   // Present for a trajectory-execution target, including an empty list;
   // omitted for other targets. Rows cover this robot's own TCPs and every
   // tool component's TCPs in the Deployment.
   std::optional<std::vector<ProgramRobotTcpBindingDTO>> robot_tcps{};
-  // The bound component role's explicit or declared default TCP, if any.
-  std::optional<TcpEntryDTO> default_tcp{};
+  // The target component's explicit or declared default TCP, if any.
+  std::optional<TcpEntryReferenceDTO> default_tcp{};
+  // Exact target/frame associations; geometry stays in root frame bindings.
+  std::vector<ProgramTargetFrameAssociationDTO> frame_associations{};
 
-  friend bool operator==(const ProgramTargetRoleBindingDTO&,
-                         const ProgramTargetRoleBindingDTO&) = default;
+  friend bool operator==(const ProgramTargetBindingDTO&,
+                         const ProgramTargetBindingDTO&) = default;
 };
 
-/// One portable body selector resolved through an exact Program target and
-/// retained model map. `collision_body_ids` use the immutable component/model/
+/// One direct body selector resolved through the exact retained model map. `collision_body_ids` use the immutable component/model/
 /// role/index identity consumed by the retained collision-world projector.
 struct ProgramContactGraspBodyBindingDTO final {
-  ComponentRoleId component_role_id;
-  TargetRoleId target_role_id;
-  ControllableComponentId controllable_component_id;
-  CommandTargetId command_target_id;
+  ProgramCollisionBodyReferenceDTO body;
   std::optional<ModelRoleId> model_role_id;
-  CollisionBodyRoleId collision_body_role_id;
   ModelInstanceId model_instance_id;
   ModelRevision model_revision;
   std::vector<std::string> collision_body_ids;
@@ -225,7 +221,6 @@ struct ProgramContactGraspBindingDTO final {
 
 struct ProgramBindingProvenanceDTO final {
   ContentDigest binding_compiler_contract_digest;
-  ContentDigest role_assignment_digest;
   std::vector<RetainedSourceRecordDTO> source_records;
   std::vector<RetainedSourceRecordDTO> resolved_output_records;
 
@@ -233,7 +228,7 @@ struct ProgramBindingProvenanceDTO final {
                          const ProgramBindingProvenanceDTO&) = default;
 };
 
-/// Complete closed `manyforge.program_binding.v2` semantic value.
+/// Complete closed `manyforge.program_binding.v3` semantic value.
 ///
 /// This aggregate is an untrusted value representation. The deployment
 /// package's binding compiler and reload authority are the only producers of
@@ -246,8 +241,11 @@ struct ProgramBindingDTO final {
   RetainedBundleId retained_bundle_id;
   GraphRevision graph_revision;
   RetainedNodeEnvironmentDTO node_environment;
-  std::vector<ProgramComponentRoleBindingDTO> component_role_bindings;
-  std::vector<ProgramTargetRoleBindingDTO> target_role_bindings;
+  std::vector<ProgramComponentBindingDTO> component_bindings;
+  std::vector<ProgramTargetBindingDTO> target_bindings;
+  std::vector<ProgramFrameBindingDTO> frame_bindings;
+  std::vector<ProgramSignalBindingDTO> signal_bindings;
+  std::vector<ProgramCollisionBodyBindingDTO> collision_body_bindings;
   ProgramBindingProvenanceDTO provenance;
   std::vector<ProgramContactGraspBindingDTO> contact_grasp_bindings{};
   std::vector<ProgramNodePolicyDTO> node_policies{};

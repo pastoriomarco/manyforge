@@ -14,7 +14,7 @@ from manyforge_headless_api.process_tests.test_interrupt_signal_nodes_process im
     _signal_stack,
     _skip_reason,
 )
-from manyforge_headless_api.process_tests.test_ui6i_grouped_execution import (
+from manyforge_headless_api.process_tests.test_dual_robot_grouped_execution import (
     _activate_loaded_components,
     _disable_for_reload,
     _wait_components_reached_requested_target,
@@ -49,7 +49,6 @@ def _geometric_candidate(project: Path) -> Path:
         description="Adds the first geometric input to a retained robot cell.",
         program_draft=original["program_draft"],
         deployment_draft=deployment,
-        program_role_assignment=original["program_role_assignment"],
         manyforge_version=(REPOSITORY_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
         last_known_status="unknown",
     )
@@ -71,7 +70,7 @@ def test_first_geometric_profile_recollects_retained_cell_sources() -> None:
         assert {"lite6_robot", "lite_gripper", "station_io"}.issubset(components)
         _wait_components_reached_requested_target(stack, components)
 
-        # Load is Close, then Apply of the file (CONTRACTS §11): every
+        # Load is Close, then Apply of the file: every
         # component comes back prepared and is enabled again.
         candidate = _geometric_candidate(project)
         _disable_for_reload(stack, "station_io")
@@ -83,12 +82,11 @@ def test_first_geometric_profile_recollects_retained_cell_sources() -> None:
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
             owner = headless.execution_identity()["identity"]["owner_epoch"]
             request = {
-                "schema_version": "manyforge.target_observation_query.v1",
+                "schema_version": "manyforge.target_observation_query.v2",
                 "owner_epoch": owner,
                 "program_binding_id": applied["program_binding_id"],
-                "target_role_id": "station",
                 "kind": "io_signal",
-                "resource_role_id": "probe_contact",
+                "signal": {"component_id": "station_io", "signal_name": "probe_contact"},
             }
             deadline = time.monotonic() + 10.0
             while True:

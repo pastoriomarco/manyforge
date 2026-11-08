@@ -12,6 +12,7 @@
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/prepared_operation_participant.hpp>
 #include <map>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -20,16 +21,25 @@
 
 namespace manyforge::core {
 
+/// One exact goal's cancel result shared by its participant and Stop helper.
+struct GoalCancelAttempt final {
+  std::optional<std::uint64_t> execution_id;
+  std::mutex mutex;
+  bool started{false};
+  std::promise<ExecutionPortCommandResultDTO> result;
+  std::shared_future<ExecutionPortCommandResultDTO> completion{result.get_future().share()};
+};
+
 // ---------------------------------------------------------------------------
-// Core Stop-stage helper (shared execution design §4.2, §7.3).
+// Core Stop-stage helper.
 //
 // Realizes one robot participant's Stop stages over `IExecutionPort` with the
 // Kernel's existing stage contract (`IControlDomainExecutionPort`). It is the
 // single owner of the Stop policy previously duplicated in the native and ROS
 // backends: stage identity and membership, the on-path soft Stop and its
 // spring-back substitution (levels 1-2), natural completion, the controlled
-// hard stop (level 3, Q42) and the controller cancel (level 4, Q2/Q35), and
-// the outcome mapping (Q18, Q33, item 25). Stop selection, escalation and the
+// hard stop (level 3) and the controller cancel (level 4), and
+// the outcome mapping. Stop selection, escalation and the
 // deadline watchdog stay with the Kernel; the helper never extends a deadline.
 // ---------------------------------------------------------------------------
 
@@ -70,7 +80,7 @@ struct StopStageDispatchedGoalDTO final {
 struct StopStageHelperConfig final {
   /// The participant binding's resources (source and compiled joint names).
   std::vector<RuntimeResourceBindingDTO> resources;
-  /// Trip-evidence authority (§4.2 step 1): kMeasured on real robots (measured
+  /// Trip-evidence authority: kMeasured on real robots (measured
   /// position and velocity), kCommanded on Isaac and offline (the controller's
   /// reference, velocity from the cursor at the frozen factor).
   StateAuthorityClass trip_authority{StateAuthorityClass::kCommanded};
@@ -84,19 +94,19 @@ struct StopStageHelperConfig final {
   double sample_period_s{0.0};
   std::optional<double> max_initial_path_deviation_rad;
   std::optional<double> max_initial_velocity_deviation_rad_s;
-  /// Q26/Q42: lane-measured wall time from a replacement's dispatch until the
+  /// Lane-measured wall time from a replacement's dispatch until the
   /// mechanism starts it (sample transport included). Required lane input:
   /// there is no default; the helper refuses construction without it.
   std::optional<double> replacement_start_allowance_s{};
-  /// Q42: the lane's JTC `max_deceleration_on_cancel` per compiled joint. Empty
+  /// The lane's JTC `max_deceleration_on_cancel` per compiled joint. Empty
   /// disables level 3 (the hard stop is then the cancel, level 4).
   std::map<std::string, double> max_deceleration_on_cancel_rad_s2;
-  /// Q28 completion tolerance (`main`'s `complete_move_on_signal_timeout_ns`).
+  /// Completion tolerance (`main`'s `complete_move_on_signal_timeout_ns`).
   Duration complete_move_on_signal_timeout_ns{500'000'000};
-  /// Q28 (as `main`'s `stop_completion_timeout_s`): the lane's bound on one
+  /// As `main`'s `stop_completion_timeout_s`: the lane's bound on one
   /// hard-stop stage (levels 3 and 4), measured from the stage start. Required.
   Duration hard_stop_completion_timeout_ns{0};
-  /// Q59 (`main`'s `joint_state_max_age_s`): while a Stop stage waits on the
+  /// As `main`'s `joint_state_max_age_s`: while a Stop stage waits on the
   /// controller, a newest controller sample older than this (local receipt)
   /// is stale controller state and fails the stage at once. 0: the lane
   /// declares no maximum age.
@@ -108,10 +118,10 @@ struct StopStageHelperConfig final {
 /// event). Tests drive time and port facts through it.
 using StopStageWaiter = std::function<void(TimePoint deadline, const std::stop_token& cancellation)>;
 
-/// Stops the speed-factor publication (Q17/Q38) and returns the frozen factor:
+/// Stops the speed-factor publication and returns the frozen factor:
 /// the last value sent on this binding epoch (or the lane's initial factor when
 /// none was sent). Idempotent.
-using StopSpeedFactorFreeze = std::function<double()>;
+using StopSpeedFactorFreeze = std::function<std::optional<double>(std::chrono::steady_clock::time_point)>;
 
 class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
  public:
@@ -120,23 +130,31 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
                              StopStageHelperConfig config);
 
   /// Records the goal the participant submitted through the port with its
-  /// sample association (Q50, shared with the participant). Replaces any
+  /// sample association (shared with the participant). Replaces any
   /// earlier goal and its Stop replacements.
   void BindDispatchedGoal(StopStageDispatchedGoalDTO goal,
-                          std::shared_ptr<ExecutionSampleAssociation> association);
+                          std::shared_ptr<ExecutionSampleAssociation> association,
+                          std::shared_ptr<GoalCancelAttempt> cancel = {});
+  /// Remove only an exact goal whose Submit returned known-not-dispatched.
+  void ForgetKnownUnsent(const ExecutionGoalKey& key);
 
   /// Pending moving replacement, recorded in the sole sent-goal list. All
   /// storage is reserved before the transport call; Record cannot allocate.
   [[nodiscard]] bool ReserveReplacement(const ExecutionGoalKey& source);
   void RecordReplacement(ExecutionGoalKey key, TrajectoryDTO trajectory,
                          std::shared_ptr<ExecutionSampleAssociation> association,
-                         double planned_controller_offset_s = 0.0) noexcept;
+                         double planned_controller_offset_s,
+                         std::shared_ptr<GoalCancelAttempt> cancel) noexcept;
   [[nodiscard]] bool HasPendingReplacement() const;
   /// The owning participant has exact rejected/no-effect or scoped Stop proof.
   void RetireSettledReplacement(const ExecutionGoalKey& key) noexcept;
   [[nodiscard]] bool CanCompleteNaturally(const ExecutionGoalKey& source) const;
   /// Requests cancellation newest-first for every possibly live retained key.
-  [[nodiscard]] bool CancelLiveGoals();
+  [[nodiscard]] bool CancelLiveGoals(std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::time_point::max());
+  [[nodiscard]] ExecutionPortCommandResultDTO CancelExactGoal(
+      const ExecutionGoalKey& key, std::shared_ptr<GoalCancelAttempt> attempt,
+      std::chrono::steady_clock::time_point deadline);
   /// Exact supersession/recognition was checked under the participant mutex.
   /// Swap prebuilt Stop authority and compact only that proven predecessor.
   void AdoptReplacement(std::optional<StopStageDispatchedGoalDTO>& goal) noexcept;
@@ -149,7 +167,7 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
   /// (its goal record is not terminal).
   [[nodiscard]] bool HasLiveGoal() const { return !LiveGoals().empty(); }
 
-  /// §3.3: the dispatched trajectory's own cursor during and after its newest
+  /// The dispatched trajectory's own cursor during and after its newest
   /// on-path Stop replacement (soft Stop, spring-back), mapped with the Stop
   /// planner's sample mapping: from `sample` once it is associated with the
   /// replacement, its end once the replacement succeeded (the hold freezes
@@ -162,23 +180,29 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
   [[nodiscard]] ParticipantStopStageResultDTO TranslateStopStageForTakeover(
       const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
       std::stop_token cancellation, IStopStageSpringReturnObserver& observer) override;
+  [[nodiscard]] ParticipantStopStageResultDTO TranslateStopStageWithDeadline(
+      const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
+      std::stop_token cancellation, IStopStageSpringReturnObserver* observer,
+      std::chrono::steady_clock::time_point deadline);
 
  private:
   [[nodiscard]] ParticipantStopStageResultDTO TranslateStopStageImpl(
       const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
-      std::stop_token cancellation, IStopStageSpringReturnObserver* observer);
+      std::stop_token cancellation, IStopStageSpringReturnObserver* observer,
+      std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
 
   struct SentGoal {
     ExecutionGoalKey key;
     TrajectoryDTO trajectory;
     /// On-path replacements only: the mapping back to the dispatched path.
     std::optional<StopReplacementCursorMapDTO> cursor_map;
-    /// The goal's sample association (Q50; shared by copies).
+    /// The goal's sample association (shared by copies).
     std::shared_ptr<ExecutionSampleAssociation> association;
     bool moving_replacement{false};
     /// Exact terminal port fact read before the bounded native ring evicts it.
     std::optional<ExecutionGoalObservationDTO> terminal_observation{};
     double planned_controller_offset_s{0.0};
+    std::shared_ptr<GoalCancelAttempt> cancel{};
   };
   struct Run;
 
@@ -187,7 +211,7 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
       Run& run, const SoftOnPathStopPlanDTO& plan, const ExecutionControllerSampleDTO& trip,
       double frozen_factor, TimePoint stop_deadline,
       const std::function<Result<SoftOnPathStopPlanDTO>(double)>& replan);
-  /// Q130: the fast spring-back, sent at once with no planning or checks.
+  /// The fast spring-back, sent at once with no planning or checks.
   [[nodiscard]] ParticipantStopStageResultDTO RunFastSpringBack(
       Run& run, const ExecutionControllerSampleDTO& trip,
       const std::vector<double>& trip_positions, double frozen_factor, TimePoint stop_deadline);
@@ -203,7 +227,7 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
       const std::optional<ExecutionControllerSampleDTO>& baseline, TimePoint dispatched_at,
       const ExecutionControllerSampleDTO& trip, const std::string& mode,
       double initial_path_deviation_rad, TimePoint stop_deadline, double controller_offset_s,
-      double frozen_factor);
+      double frozen_factor, std::shared_ptr<GoalCancelAttempt> cancel_slot);
   [[nodiscard]] ParticipantStopStageResultDTO RunNaturalCompletion(Run& run,
                                                                    TimePoint stop_deadline,
                                                                    std::string basis);
@@ -219,17 +243,20 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
   [[nodiscard]] ParticipantStopStageResultDTO Succeed(Run& run, TimePoint finish_receipt,
                                                       std::string finish_basis);
   [[nodiscard]] ParticipantStopStageResultDTO Fail(const Run& run, ErrorDTO error) const;
-  /// Q59: the stale-controller-state fault, when the lane declares a maximum
+  /// The stale-controller-state fault, when the lane declares a maximum
   /// age and the newest sample is older (or none exists).
   [[nodiscard]] std::optional<ErrorDTO> StaleControllerState() const;
   /// Waits like the free `await`, but every poll first checks the controller
-  /// state's age (Q59); a stale state ends the wait unsuccessfully and is
+  /// state's age; a stale state ends the wait unsuccessfully and is
   /// retained on `run` as the stage's failure.
   template <typename Done>
   bool Await(Run& run, TimePoint deadline, Done&& done);
-  [[nodiscard]] bool CancelGoals(const std::vector<SentGoal>& goals);
+  [[nodiscard]] bool CancelGoals(const std::vector<SentGoal>& goals,
+      std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
   /// Non-terminal sent goals, newest first.
   [[nodiscard]] std::vector<SentGoal> LiveGoals() const;
+  [[nodiscard]] std::optional<std::uint64_t> SourceExecutionId(
+      const ExecutionGoalKey& key) const;
   /// Next replacement key of the dispatched goal (generation advances).
   [[nodiscard]] ExecutionGoalKey NextKey() const;
   /// Records a replacement that may have reached the mechanism.

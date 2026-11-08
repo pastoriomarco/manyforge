@@ -204,7 +204,7 @@ controlled_stage_fixture(double jerk_limit = 1'000'000.0) {
   return stage;
 }
 
-/// The Kernel's per-robot Stop-time values at the Stop request (Q51): a
+/// The Kernel's per-robot Stop-time values at the Stop request: a
 /// controlled stage carries its own profile deadline, nothing else is shared.
 [[nodiscard]] core::RemainingStopBudgetDTO
 remaining_budget(const core::ResolvedParticipantStopStageDTO &stage) {
@@ -299,7 +299,7 @@ public:
         [this](core::TimePoint deadline, const std::stop_token &) {
           Tick(deadline);
         },
-        [this] { return frozen; }, config);
+        [this](auto) -> std::optional<double> { return frozen; }, config);
   }
 
   void Tick(core::TimePoint deadline) {
@@ -359,7 +359,16 @@ public:
          stage.stop_evidence_policy_revision,
          {stage.participant_stop_plan}},
         std::make_shared<core::ExecutionSampleAssociation>(
-            core::ExecutionBindingEpoch(1U), port->ReadSample(), clock.now()));
+            core::ExecutionBindingEpoch(1U), port->ReadSample(), clock.now()),
+        BoundCancel());
+  }
+
+  // A dispatched goal carries its owning execution identity, as the Kernel
+  // dispatch does.
+  static std::shared_ptr<core::GoalCancelAttempt> BoundCancel() {
+    auto cancel = std::make_shared<core::GoalCancelAttempt>();
+    cancel->execution_id = 1U;
+    return cancel;
   }
 
   void
@@ -632,7 +641,7 @@ void ExpectSameSnapshot(const core::ExecutionSnapshot &before,
 }
 
 // Items 1/26: controller-reference containment and exact fresh terminal
-// observation; no measured physical-rest claim. Kernel owns Reset (Q27).
+// observation; no measured physical-rest claim. Kernel owns Reset.
 TEST(CoreStopQualificationSeamTest,
      TerminalGoalAcceptsExactHardStopWithOneFreshPostCommandSample) {
   // Native direct-Reset and hard-request counters retire with that port.
@@ -724,8 +733,8 @@ TEST(CoreStopQualificationSeamTest,
 
 TEST(CoreStopQualificationSeamTest,
      HardStageObservesAlreadyCompletedGoalWithoutRewritingItsTerminalEvent) {
-  // DX728/DX729: only the old-aged native terminal success assertion retires.
-  // Core freshness is unchanged in M1. Its correction follows separately.
+  // Only the old-aged native terminal success assertion retires.
+  // Core freshness is unchanged here. Its correction follows separately.
   CoreParticipantSeam seam;
   auto &world = seam.world;
   auto stage = software_hard_stage_fixture();
@@ -1169,7 +1178,7 @@ TEST(CoreStopQualificationSeamTest,
   EXPECT_TRUE(world.Calls<CoreStopSeam::Port::SetScaleCall>().empty());
   EXPECT_DOUBLE_EQ(
       seam.participant->runtime_velocity_scale_status().commanded_scale, 0.25);
-  // Q17: actual surviving participant releases publication at next Dispatch.
+  // Actual surviving participant releases publication at next Dispatch.
   ASSERT_TRUE(seam.participant->RetirePreparedExecution(1U).ok());
   auto next = stage;
   next.controller_goal_id = core::ControllerGoalId("goal.next-scale");

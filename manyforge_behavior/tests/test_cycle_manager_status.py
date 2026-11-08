@@ -1,4 +1,4 @@
-"""Node-status traversal moves to the typed native execution snapshot at I6/N."""
+"""Node-status traversal moves to the typed native execution snapshot."""
 
 import pytest
 

@@ -16,12 +16,6 @@ export interface DeploymentArmControlledStop {
   fallbackStopModes: string[];
 }
 
-interface TargetRoleBinding {
-  target_role_id: string;
-  controllable_component_id: string;
-  command_target_id: string;
-}
-
 type JsonObject = Record<string, JsonValue>;
 const object = (value: unknown): JsonObject | null => (
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as JsonObject : null
@@ -99,7 +93,6 @@ export function deploymentArmControlledStop(
 export function precisionContactStopWarnings(
   node: ProgramTreeNode,
   deploymentDocument: JsonObject | null | undefined,
-  targetRoleBindings: readonly TargetRoleBinding[] | null | undefined,
 ): string[] {
   if (!PRECISION_CONTACT_NODE_IDS.has(node.node_id)) return [];
   const entry = node.parameters.stop_entry_stage_id;
@@ -107,14 +100,14 @@ export function precisionContactStopWarnings(
   // controlled_fallback motion_controlled_stop stages would carry their own
   // settings, but none are generated today.)
   if (typeof entry === 'string' && entry !== 'motion_controlled_stop') return [];
-  const binding = targetRoleBindings?.find((row) => row.target_role_id === node.parameters.target_role);
-  if (binding === undefined) return [];
+  const selected = object(node.parameters.target);
+  if (typeof selected?.component_id !== 'string' || typeof selected.command_target_id !== 'string') return [];
   const stop = deploymentArmControlledStop(
-    deploymentDocument, binding.controllable_component_id, binding.command_target_id,
+    deploymentDocument, selected.component_id, selected.command_target_id,
   );
   if (stop === null) return [];
   const mode = stop.stopMode;
-  const target = `${binding.controllable_component_id} · ${binding.command_target_id}`;
+  const target = `${selected.component_id} · ${selected.command_target_id}`;
   const inherited = node.value_sources?.stop_mode === undefined
     ? `is inherited from the Deployment's arm Stop settings (${target}) and applies to this node's Stop mode ${mode}.`
     : `is inherited from the Deployment's arm Stop settings (${target}). This node's Stop mode is set at run time; it must resolve to ${mode}, the Deployment's Stop mode, for the probe to run.`;

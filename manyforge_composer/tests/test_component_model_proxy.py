@@ -1,4 +1,4 @@
-"""Composer forwards the component model routes (CONTRACTS §1, §2, §5, §7, §10)."""
+"""Composer forwards the component model routes."""
 
 from typing import Any
 
@@ -58,7 +58,7 @@ def test_component_model_routes_forward_unchanged() -> None:
         assert client.get("/api/components").json()[0]["component_id"] == "robot"
         action = client.post("/api/components/robot/actions", json={"action": "enable"})
         group = client.post("/api/components/actions", json={"action": "enable"})
-        assert group.status_code == 422  # CONTRACTS §2: the caller names the components
+        assert group.status_code == 422  # The caller names the components
         named = client.post(
             "/api/components/actions",
             json={"action": "disable", "component_ids": ["robot"]},

@@ -28,7 +28,7 @@ function status(
 ): ManagerApplyStatus {
   const phase = state === 'pending' ? 'accepted' : 'settled';
   return {
-    ...applyIdentity, apiVersion: 'manyforge.manager_command_response.v1', ok: true,
+    ...applyIdentity, apiVersion: 'manyforge.manager_command_response.v2', ok: true,
     state, phase, candidateProjectionRevision: null, error: null, failure: null,
     failureAcknowledgement: 'unavailable',
     lastProgress: { phase, recordDigest: digest },

@@ -88,6 +88,28 @@ describe('pneumatic gripper authoring', () => {
     expect(declaredPneumaticInputs(split, 'robot', 'gripper')).toEqual([]);
   });
 
+  it('keeps incomplete pneumatic configuration in the inline form until Add succeeds or Cancel is chosen', async () => {
+    const controller = {
+      workspace: { draft: { document: document() } }, mutationAvailable: true, busy: false,
+      mutate: vi.fn().mockResolvedValue({}), updateMotionTargetLimit: vi.fn(),
+    } as unknown as DeploymentWorkspaceController;
+    const { host, find } = reactPropsHost();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    await act(() => root.render(<DeploymentFocusedEditor controller={controller}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
+    const click = (label: string) => act(() => find((props) => props.type === 'button' && props.children === label).onClick?.());
+    try {
+      await click('Configure pneumatic I/O');
+      await click('Add valve output');
+      expect(controller.mutate).not.toHaveBeenCalled();
+      expect(find((props) => props.role === 'alert').children).toContain('Choose a signal and Open and Close values');
+      await click('Cancel');
+      expect(find((props) => props.children === 'Configure pneumatic I/O')).toBeDefined();
+      expect(controller.mutate).not.toHaveBeenCalled();
+    } finally { await act(() => root.unmount()); }
+  });
+
   it('authors signals from different I/O components in a Draft without any Applied descriptors', async () => {
     const controller = {
       workspace: { draft: { document: document() } }, mutationAvailable: true, busy: false,
@@ -102,36 +124,40 @@ describe('pneumatic gripper authoring', () => {
     const select = (label: string, value: string) => act(() => find((props) => props['aria-label'] === label).onChange?.({ target: { value } }));
     try {
       await click('Configure pneumatic I/O');
-      await click('Update pneumatic I/O Draft');
-      expect(controller.mutate).not.toHaveBeenCalled();
+      await select('New valve output signal', JSON.stringify(['valve_io', 'valve']));
+      await select('New valve output open value', 'false');
+      await select('New valve output close value', 'true');
       await click('Add valve output');
-      await select('Valve output 1 signal', JSON.stringify(['valve_io', 'valve']));
-      await select('Valve output 1 open value', 'false');
-      await select('Valve output 1 close value', 'true');
       await select('Workpiece grasped input signal', JSON.stringify(['sensor_io', 'part']));
-      await click('Update pneumatic I/O Draft');
-      expect(controller.mutate).toHaveBeenCalledExactlyOnceWith(
+      expect(controller.mutate).toHaveBeenNthCalledWith(1,
         ['components', 0, 'configuration', 'runtime_configuration', 'gripper_target_configurations', 0, 'pneumatic_io'],
-        'set', io,
+        'set', { outputs: [{ signal: { controllable_component_id: 'valve_io', signal_name: 'valve' }, open_value: false, close_value: true }] },
+      );
+      expect(controller.mutate).toHaveBeenNthCalledWith(2,
+        ['components', 0, 'configuration', 'runtime_configuration', 'gripper_target_configurations', 0, 'pneumatic_io', 'inputs', 'workpiece_grasped'],
+        'set', { signal: { controllable_component_id: 'sensor_io', signal_name: 'part' } },
       );
     } finally { await act(() => root.unmount()); }
   });
 
-  it('preserves local edits across an identical re-fetch and blocks stale submission after a real mapping change', async () => {
+  it('writes an existing valve field directly and follows a later Draft mapping refresh', async () => {
     const controller = {
       workspace: { draft: { document: document(io) } }, mutationAvailable: true, busy: false,
       mutate: vi.fn().mockResolvedValue({}), updateMotionTargetLimit: vi.fn(),
     } as unknown as DeploymentWorkspaceController;
-    const { host, find, all } = reactPropsHost();
+    const { host, find } = reactPropsHost();
     const { createRoot } = await import('react-dom/client');
     const root = createRoot(host as unknown as Element);
     const render = () => act(() => root.render(<DeploymentFocusedEditor controller={controller}
       sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
     const control = (label: string) => find((props) => props['aria-label'] === label);
-    const button = (label: string) => find((props) => props.type === 'button' && props.children === label);
     await render();
     try {
       await act(() => control('Valve output 1 open value').onChange?.({ target: { value: 'true' } }));
+      expect(controller.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['components', 0, 'configuration', 'runtime_configuration', 'gripper_target_configurations', 0, 'pneumatic_io', 'outputs', 0, 'open_value'],
+        'set', true,
+      );
       const replacement = document(JSON.parse(JSON.stringify(io)) as JsonValue);
       replacement.name = 'An unrelated Draft change';
       controller.workspace!.draft.document = replacement;
@@ -140,17 +166,13 @@ describe('pneumatic gripper authoring', () => {
       const external = { ...io, outputs: [{ ...io.outputs[0], close_value: false }] };
       controller.workspace!.draft.document = document(external);
       await render();
-      expect(control('Valve output 1 open value').value).toBe('true');
-      expect(button('Update pneumatic I/O Draft').disabled).toBe(true);
-      expect(all((props) => props.role === 'alert').some((props) => String(props.children).includes('changed in the Deployment Draft'))).toBe(true);
-      expect(controller.mutate).not.toHaveBeenCalled();
-      await act(() => button('Discard pneumatic I/O edits').onClick?.());
       expect(control('Valve output 1 open value').value).toBe('false');
       expect(control('Valve output 1 close value').value).toBe('false');
+      expect(controller.mutate).toHaveBeenCalledTimes(1);
     } finally { await act(() => root.unmount()); }
   });
 
-  it('does not apply one gripper\'s local edits to a different gripper at the same row index', async () => {
+  it('does not write an invalid valve field while a different gripper replaces that row', async () => {
     const controller = {
       workspace: { draft: { document: document(io) } }, mutationAvailable: true, busy: false,
       mutate: vi.fn().mockResolvedValue({}), updateMotionTargetLimit: vi.fn(),
@@ -163,7 +185,7 @@ describe('pneumatic gripper authoring', () => {
     const control = (label: string) => find((props) => props['aria-label'] === label);
     await render();
     try {
-      await act(() => control('Valve output 1 open value').onChange?.({ target: { value: 'true' } }));
+      await act(() => control('Valve output 1 open value').onChange?.({ target: { value: '' } }));
       const replacement = document(io);
       const robot = (replacement.components as Array<Record<string, JsonValue>>)[0];
       const configuration = (robot.configuration as Record<string, JsonValue>).runtime_configuration as Record<string, JsonValue>;
@@ -171,12 +193,11 @@ describe('pneumatic gripper authoring', () => {
       controller.workspace!.draft.document = replacement;
       await render();
       expect(control('Valve output 1 open value').value).toBe('false');
-      expect(find((props) => props.type === 'button' && props.children === 'Update pneumatic I/O Draft').disabled).toBe(true);
       expect(controller.mutate).not.toHaveBeenCalled();
     } finally { await act(() => root.unmount()); }
   });
 
-  it('keeps one gripper\'s edits when its row moves and updates the new path', async () => {
+  it('writes the selected valve field at the current row path', async () => {
     const controller = {
       workspace: { draft: { document: document(io) } }, mutationAvailable: true, busy: false,
       mutate: vi.fn().mockResolvedValue({}), updateMotionTargetLimit: vi.fn(),
@@ -190,6 +211,10 @@ describe('pneumatic gripper authoring', () => {
     await render();
     try {
       await act(() => control('Valve output 1 open value').onChange?.({ target: { value: 'true' } }));
+      expect(controller.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['components', 0, 'configuration', 'runtime_configuration', 'gripper_target_configurations', 0, 'pneumatic_io', 'outputs', 0, 'open_value'],
+        'set', true,
+      );
       const replacement = document(io);
       const robot = (replacement.components as Array<Record<string, JsonValue>>)[0];
       const configuration = (robot.configuration as Record<string, JsonValue>).runtime_configuration as Record<string, JsonValue>;
@@ -199,11 +224,8 @@ describe('pneumatic gripper authoring', () => {
       controller.workspace!.draft.document = replacement;
       await render();
       expect(control('Valve output 1 open value').value).toBe('true');
-      await act(() => find((props) => props.type === 'button' && props.children === 'Update pneumatic I/O Draft').onClick?.());
-      expect(controller.mutate).toHaveBeenCalledWith(
-        ['components', 0, 'configuration', 'runtime_configuration', 'gripper_target_configurations', 1, 'pneumatic_io'],
-        'set', { ...io, outputs: [{ ...io.outputs[0], open_value: true }] },
-      );
+      expect(controller.mutate).toHaveBeenCalledTimes(1);
+      expect(controller.mutate).toHaveBeenCalledTimes(1);
     } finally { await act(() => root.unmount()); }
   });
 

@@ -14,10 +14,9 @@ import sys
 
 
 UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
-RESTORATION_GATE = "I6/N"
 UNAVAILABLE_MESSAGE = (
     f"{UNAVAILABLE_REASON_CODE}: ros2_medkit fault publication requires the "
-    f"{RESTORATION_GATE} addressed runtime diagnostics source"
+    "addressed runtime diagnostics source"
 )
 
 

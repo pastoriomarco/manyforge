@@ -29,7 +29,7 @@ class IdleAdapter final : public core::IComponentAdapter {
   [[nodiscard]] std::vector<core::Capability> capabilities() const override { return {}; }
 };
 
-// CONTRACTS §6: the execution host reaches Isaac only through the
+// The execution host reaches Isaac only through the
 // registry: the library registered under `isaac` exports the family with its
 // launch contribution and its ros2_control lane hooks (a simulator lane).
 TEST(IsaacAdapterFamily, LoadsFromTheIndexWithItsLaneHooks) {

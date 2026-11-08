@@ -531,6 +531,13 @@ bool KernelCellAdmissionOwner::MatchingProgramResetLocked(
          intent.request_payload_digest == cycle.accepted_reset->request_payload_digest;
 }
 
+std::optional<ProgramRunId> KernelCellAdmissionOwner::ProgramResetRunForCleanup(
+    const CellAdmissionClaimIntentDTO& intent, const PreparedProgramResetStatus& proof) const {
+  std::lock_guard lock(mutex_);
+  if (!MatchingProgramResetLocked(intent, proof) || !proof.status) return std::nullopt;
+  return proof.status->program_run_id;
+}
+
 Result<void> KernelCellAdmissionOwner::AdvanceGenerationLocked() {
   if (generation_.value() >= 9'007'199'254'740'991ULL) {
     return Result<void>::Err(ErrorDTO{"authoring_not_ready",
@@ -1010,7 +1017,7 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
   // never compared: every admission fact below is evaluated now, under these
   // locks, so a generation that merely moved since the caller's read is not a
   // refusal.
-  // Exact replay above remains observable during a fault. The private Q91
+  // Exact replay above remains observable during a fault. The private
   // parent alternative still requires its positive plan validation below.
   if (route_recovery_pending_ &&
       intent.claim_kind != CellAdmissionClaimKindDTO::kInterventionOrRecovery) {

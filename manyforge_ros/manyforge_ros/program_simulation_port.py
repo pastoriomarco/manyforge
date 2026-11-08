@@ -14,6 +14,7 @@ import json
 import math
 import os
 import stat
+import sys
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -254,40 +255,37 @@ def _simulation_scene(
 def _target_frames(
     program_binding: Mapping[str, Any],
 ) -> Mapping[tuple[str, str], str]:
-    rows = program_binding.get("target_role_bindings", ())
+    rows = program_binding.get("frame_bindings", ())
     if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
-        raise ValueError("captured Program Binding target roles are invalid")
+        raise ValueError("captured Program Binding frame bindings are invalid")
     result: dict[tuple[str, str], str] = {}
-    for target_index, row in enumerate(rows):
+    for frame_index, row in enumerate(rows):
         if not isinstance(row, Mapping):
             raise ValueError(
-                "captured Program Binding "
-                f"target_role_bindings[{target_index}] is invalid"
+                f"captured Program Binding frame_bindings[{frame_index}] is invalid"
             )
-        target_role = _text(
-            row.get("target_role_id"),
-            field_name="captured Program Binding target_role_id",
+        reference = row.get("reference")
+        if not isinstance(reference, Mapping):
+            raise ValueError(
+                f"captured Program Binding frame_bindings[{frame_index}].reference is invalid"
+            )
+        key = (
+            _text(
+                reference.get("component_id"),
+                field_name="captured Program Binding frame component_id",
+            ),
+            _text(
+                reference.get("frame_id"),
+                field_name="captured Program Binding frame_id",
+            ),
         )
-        frames = row.get("frame_role_bindings", ())
-        if not isinstance(frames, Sequence) or isinstance(frames, (str, bytes)):
-            raise ValueError("captured Program Binding frame roles are invalid")
-        for frame in frames:
-            if not isinstance(frame, Mapping):
-                raise ValueError("captured Program Binding frame role is invalid")
-            key = (
-                target_role,
-                _text(
-                    frame.get("frame_role_id"),
-                    field_name="captured Program Binding frame_role_id",
-                ),
-            )
-            compiled = _text(
-                frame.get("compiled_frame_name"),
-                field_name="captured Program Binding compiled_frame_name",
-            )
-            if key in result:
-                raise ValueError("captured Program Binding frame role is ambiguous")
-            result[key] = compiled
+        compiled = _text(
+            row.get("compiled_frame_name"),
+            field_name="captured Program Binding compiled_frame_name",
+        )
+        if key in result:
+            raise ValueError("captured Program Binding frame reference is ambiguous")
+        result[key] = compiled
     return MappingProxyType(result)
 
 
@@ -338,15 +336,18 @@ def _pose_for_simulator(
             )
         frame_id = bound.cell_frame_id
     elif kind == "target_frame":
+        reference = frame.get("frame")
+        if not isinstance(reference, Mapping):
+            raise ValueError("simulation.set_entity_pose pose frame_ref.frame is invalid")
         key = (
-            _text(frame.get("target_role"), field_name="target_role"),
-            _text(frame.get("frame_role"), field_name="frame_role"),
+            _text(reference.get("component_id"), field_name="frame component_id"),
+            _text(reference.get("frame_id"), field_name="frame frame_id"),
         )
         try:
             frame_id = bound.target_frames[key]
         except KeyError as error:
             raise ValueError(
-                f"Program Binding has no exact target frame {key[0]}/{key[1]}"
+                f"Program Binding has no exact frame {key[0]}/{key[1]}"
             ) from error
     elif kind == "scene_resource":
         resource_id = _text(
@@ -738,7 +739,8 @@ class RosSimulationProgramTaskPort:
         from rclpy.executors import SingleThreadedExecutor
 
         self._context = Context()
-        rclpy.init(args=None, context=self._context)
+        ros_args = [*sys.argv, "--ros-args", "--disable-external-lib-logs"]
+        rclpy.init(args=ros_args, context=self._context)
         self._node = rclpy.create_node(
             "manyforge_program_simulation_control",
             context=self._context,

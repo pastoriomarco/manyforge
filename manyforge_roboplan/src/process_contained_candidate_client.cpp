@@ -1364,12 +1364,27 @@ ProcessContainedRoboPlanCandidateClient::binding() const noexcept {
 core::Result<core::TrajectoryDTO>
 ProcessContainedRoboPlanCandidateClient::compute(
     const RoboPlanCandidateRequestDTO &selected_request) {
+  return compute_with_target(selected_request, nullptr);
+}
+
+core::Result<core::TrajectoryDTO>
+ProcessContainedRoboPlanCandidateClient::compute_with_target(
+    const RoboPlanCandidateRequestDTO &selected_request,
+    std::optional<core::ControlledStateDTO> *target) {
+  const auto request_started = Clock::now();
+  if (target) target->reset();
   // The selected projection's clearance margins and contact-policy pairs
   // travel with this plan.
   auto request = selected_request;
   if (const auto selected = impl_->selection.load(std::memory_order_acquire)) {
     request.collision_pair_margins = selected->pair_margins;
     request.contact_allowed_pairs = selected->contact_pairs;
+  }
+  if (request.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled) {
+    request.planning_timeout_s -= std::chrono::duration<double>(Clock::now() - request_started).count();
+    if (request.planning_timeout_s <= 0.0)
+      return core::Result<core::TrajectoryDTO>::Err(error(core::ErrorCode::kPlanningTimeout,
+          "Diagnostic planning timed out", "planning_timeout"));
   }
   return impl_->transact<core::TrajectoryDTO>(
       MessageType::kPlan, MessageType::kPlanResult,
@@ -1379,7 +1394,13 @@ ProcessContainedRoboPlanCandidateClient::compute(
       false,
       [&request](Clock::time_point deadline) {
         if (!request.moving_replacement) {
-          return worker_protocol::encode_candidate_request(request);
+          auto remaining = request;
+          if (request.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled) {
+            remaining.diagnostic_deadline_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                deadline.time_since_epoch()).count();
+            remaining.planning_timeout_s = std::chrono::duration<double>(deadline - Clock::now()).count();
+          }
+          return worker_protocol::encode_candidate_request(remaining);
         }
         auto remaining = request;
         const auto now = Clock::now();
@@ -1408,10 +1429,11 @@ ProcessContainedRoboPlanCandidateClient::compute(
         }
         return worker_protocol::encode_candidate_request(remaining, planning_deadline_ns);
       },
-      [](std::string_view bytes) {
-        return worker_protocol::decode_trajectory_result(bytes);
+      [target](std::string_view bytes) {
+        return worker_protocol::decode_trajectory_result(bytes, target);
       },
-      request.moving_replacement.has_value());
+      request.moving_replacement.has_value() ||
+          request.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled);
 }
 
 core::Result<std::vector<double>>
@@ -1436,6 +1458,27 @@ ProcessContainedRoboPlanCandidateClient::solve_ik(
       [](std::string_view bytes) {
         return worker_protocol::decode_ik_result(bytes);
       });
+}
+
+core::Result<std::vector<double>>
+ProcessContainedRoboPlanCandidateClient::solve_ik_diagnostic(
+    const core::Pose3DTO &goal, const core::ResolvedFrameDTO &base_frame,
+    const core::ResolvedFrameDTO &tcp_frame,
+    const core::ControlledStateDTO &seed_state, double timeout_s,
+    const std::optional<core::TolerancesDTO> &tolerances) {
+  return impl_->transact<std::vector<double>>(
+      MessageType::kIk, MessageType::kIkResult, timeout_s, true,
+      [&goal, &base_frame, &tcp_frame, &seed_state, &tolerances](Clock::time_point deadline) {
+        worker_protocol::WorkerIkRequestDTO request{goal, base_frame, tcp_frame,
+                                                    seed_state, std::chrono::duration<double>(deadline - Clock::now()).count()};
+        request.collision_mode = core::PlannerCollisionMode::kDiagnosticDisabled;
+        request.diagnostic_deadline_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            deadline.time_since_epoch()).count();
+        request.diagnostic_tolerances = tolerances;
+        return worker_protocol::encode_ik_request(request);
+      },
+      [](std::string_view bytes) { return worker_protocol::decode_ik_result(bytes); },
+      true);
 }
 
 bool ProcessContainedRoboPlanCandidateClient::requires_retained_projection()

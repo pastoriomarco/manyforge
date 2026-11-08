@@ -1,4 +1,4 @@
-"""The one held-run Draft-edit rule (spec 450 §5.1.1)."""
+"""The one held-run Draft-edit rule."""
 
 from __future__ import annotations
 

@@ -32,27 +32,22 @@ const entry: CatalogEntry = {
 const node: ProgramTreeNode = {
   node_id: entry.id,
   instance_id: 'attach',
-  parameters: { target_role: 'gripper' },
+  parameters: { target: { component_id: 'tool', command_target_id: 'gripper' } },
   children: [],
 };
 
 const program: ProgramAuthoringDocument = {
-  api_version: 'manyforge.program.v2',
+  api_version: 'manyforge.program.v3',
   program_id: 'schema_editor',
   program_profile: 'composable-cell-v1',
   name: 'Schema editor',
-  catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.4.0' },
-  component_roles: { tool: {} },
-  target_roles: {
-    arm: { required_collision_body_roles: ['arm_collision'] },
-    gripper: { required_collision_body_roles: ['finger', 'gripper_collision'] },
-  },
-  schema_version: 'manyforge.composer_authoring_forest.v1',
+  catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '3.0.0' },
+  schema_version: 'manyforge.composer_authoring_forest.v2',
   forest: [node],
   positions: {},
 };
 
-const context = { entry, node, parameterId: 'touch_body_roles', program };
+const context = { entry, node, parameterId: 'touch_bodies', program };
 
 describe('schema-derived Program value editor', () => {
   it('renders scoped semantic arrays as structured rows rather than JSON text', () => {
@@ -62,21 +57,28 @@ describe('schema-derived Program value editor', () => {
           type: 'array',
           minItems: 1,
           items: {
-            type: 'string',
-            'x-manyforge-semantic-type': 'collision_body_role',
-            'x-manyforge-semantic-scope-parameter': 'target_role',
+            type: 'object',
+            'x-manyforge-semantic-type': 'collision_body_reference',
           },
         }}
-        value={['gripper_collision']}
+        value={[{ component_id: 'tool', collision_body_id: 'gripper_collision' }]}
         disabled={false}
-        context={context}
+        context={{ ...context, directReferenceChoices: {
+          // The scoped choices: the moving gripper's bodies only (OD-28 direct references).
+          collision_body_reference: ['finger', 'gripper_collision'].map((collision_body_id) => ({
+            value: { component_id: 'tool', collision_body_id }, label: `tool · ${collision_body_id}`,
+          })),
+        } }}
         onCommit={vi.fn()}
       />,
     );
 
     expect(markup).toContain('<details');
-    expect(markup).toContain('gripper_collision');
-    expect(markup).toContain('finger');
+    expect(markup).toContain('tool · gripper_collision</option>');
+    expect(markup).toContain('tool · finger</option>');
+    // Exactly the scoped choices, the current one selected; no unavailable or other-target body.
+    expect(markup.match(/<option /g)).toHaveLength(2);
+    expect(markup).toContain('selected="">tool · gripper_collision</option>');
     expect(markup).not.toContain('arm_collision');
     expect(markup).not.toContain('<textarea');
     expect(markup).toContain('Add row');

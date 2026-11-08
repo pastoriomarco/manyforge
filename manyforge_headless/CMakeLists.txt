@@ -203,7 +203,7 @@ add_executable(manyforge_manager_daemon src/manager_daemon.cpp)
 target_link_libraries(manyforge_manager_daemon PRIVATE
   manyforge_headless_owner_publication
   manyforge::deployment_admission
-  # Apply acceptance recompiles the stored prepared Program outcome (H1a).
+  # Apply acceptance recompiles the stored prepared Program outcome.
   manyforge::deployment)
 
 option(BUILD_TESTING "Build unit tests" ON)
@@ -481,7 +481,7 @@ if(BUILD_TESTING)
 
   if(MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST)
     # Tests that start a ROS stack run in their own ROS domain (Fast DDS
-    # #6599, N16); same launcher as manyforge_roboplan's tests.
+    # #6599); same launcher as manyforge_roboplan's tests.
     find_program(MANYFORGE_RUN_RMW_ISOLATED run_rmw_isolated
       PATHS ENV AMENT_PREFIX_PATH
       PATH_SUFFIXES lib/rmw_test_fixture_implementation
@@ -698,10 +698,10 @@ if(BUILD_TESTING)
         TIMEOUT 180 RUN_SERIAL TRUE)
     endif()
 
-    # O1.4g: a compatible pick/place host consumes a second copy of the same
+    # A compatible pick/place host consumes a second copy of the same
     # semantic package.
     set(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_FIXTURE_ROOT
-      "${CMAKE_CURRENT_BINARY_DIR}/manager-apply-o1-4g-replacement-fixture")
+      "${CMAKE_CURRENT_BINARY_DIR}/manager-apply-replacement-fixture")
     set(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT
       "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_FIXTURE_ROOT}/retained-package")
     set(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA
@@ -885,7 +885,6 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_SOURCE_DIR}/../examples/mock_lite6_pick_and_place.scenario/scenario.yaml"
         "${CMAKE_CURRENT_SOURCE_DIR}/../examples/mock_lite6_pick_and_place.scenario/deployment.yaml"
         "${CMAKE_CURRENT_SOURCE_DIR}/../examples/mock_lite6_pick_and_place.scenario/program.yaml"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../examples/mock_lite6_pick_and_place.scenario/assignment.yaml"
         "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_lite_gripper_pick_and_place.program.yaml"
         ${_manager_ros_fixture_models}
       VERBATIM)
@@ -907,7 +906,7 @@ if(BUILD_TESTING)
   endif()
   target_link_libraries(test_manager_daemon_process PRIVATE
     manyforge_headless_owner_publication
-    # Publishes real prepared activations for each Apply (H1a).
+    # Publishes real prepared activations for each Apply.
     manyforge::deployment
     GTest::gtest_main)
   gtest_discover_tests(test_manager_daemon_process

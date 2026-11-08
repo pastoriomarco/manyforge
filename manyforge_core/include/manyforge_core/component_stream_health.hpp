@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <chrono>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -164,7 +165,7 @@ class StreamRecorder final {
   std::shared_ptr<Slot> slot_;
 };
 
-/// CCLC-side registry of every declared stream of one process (CP9 §3).
+/// CCLC-side registry of every declared stream of one process.
 ///
 /// One deadline timer for the earliest deadline (a heap of lazily refreshed
 /// deadlines; no polling, no scan of all streams). All classification and
@@ -175,8 +176,11 @@ class ComponentStreamHealth final {
   using Listener =
       std::function<void(const ControllableComponentId&, const ComponentStreamVerdictDTO&)>;
 
-  ComponentStreamHealth(IClock& clock, IScheduler& scheduler);
+  ComponentStreamHealth(std::shared_ptr<IClock> clock, IScheduler& scheduler);
   ~ComponentStreamHealth();
+  /// Retire callbacks before the borrowed scheduler and clock are destroyed.
+  void DetachScheduler() noexcept;
+  [[nodiscard]] bool DetachSchedulerUntil(std::chrono::steady_clock::time_point deadline) noexcept;
   ComponentStreamHealth(const ComponentStreamHealth&) = delete;
   ComponentStreamHealth& operator=(const ComponentStreamHealth&) = delete;
 

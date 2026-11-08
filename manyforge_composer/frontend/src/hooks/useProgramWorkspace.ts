@@ -183,6 +183,8 @@ export function useProgramWorkspace(
     INITIAL_PROGRAM_WORKSPACE_STATE,
   );
   const [acceptedApply, setAcceptedApply] = useState<ManagerApplyIdentity | null>(null);
+  const [programDraftInputResetEpoch, setProgramDraftInputResetEpoch] = useState(0);
+  const [scenarioDraftInputResetEpoch, setScenarioDraftInputResetEpoch] = useState(0);
   const scenarioOpened = useRef(onScenarioOpened);
   useEffect(() => { scenarioOpened.current = onScenarioOpened; }, [onScenarioOpened]);
   const generation = useRef(0);
@@ -293,6 +295,16 @@ export function useProgramWorkspace(
           message: result.message,
           transitionStatus: result.transitionStatus,
         });
+        const acceptedProgramRevert = action === 'revert'
+          && (result.transitionStatus === 'accepted' || result.transitionStatus === 'reverted');
+        if (action === 'discard_scenario' || action === 'load' || action === 'load_scenario_document'
+          || action === 'new_scenario_document' || acceptedProgramRevert) {
+          // The owner response carries the commit_saved Draft post-image. An
+          // accepted Manager Apply may still be progressing after this rebase.
+          setScenarioDraftInputResetEpoch((epoch) => epoch + 1);
+        } else if (action === 'discard' || action === 'open_draft') {
+          setProgramDraftInputResetEpoch((epoch) => epoch + 1);
+        }
       }
       return result;
     } catch (error: unknown) {
@@ -625,7 +637,7 @@ export function useProgramWorkspace(
   }, [requireWorkspace, run, scenarioFence]);
 
   /**
-   * New and Load are the server's one Apply path (CONTRACTS §11): New is
+   * New and Load are the server's one Apply path: New is
    * the Apply of the empty cell; Load is New, then Apply of the file. The
    * affected components come back prepared; Enable stays the operator's.
    */
@@ -664,7 +676,7 @@ export function useProgramWorkspace(
     (path: string, onRefusal?: (message: string) => void) => activateScenarioDocument('load', path, onRefusal),
     [activateScenarioDocument],
   );
-  /** R3: New always works; the Scene is initialized. */
+  /** New always works; the Scene is initialized. */
   const newScenarioDocument = useCallback(
     (onRefusal?: (message: string) => void) => activateScenarioDocument('new', null, onRefusal),
     [activateScenarioDocument],
@@ -699,6 +711,8 @@ export function useProgramWorkspace(
 
   return useMemo(() => ({
     state,
+    programDraftInputResetEpoch,
+    scenarioDraftInputResetEpoch,
     /** The authoring operation in progress (busy label and tooltip), or null. */
     busyOperation: authoring.operation,
     acceptedApply,
@@ -744,6 +758,8 @@ export function useProgramWorkspace(
     discard,
     discardScenario,
     documentUnavailableReason,
+    programDraftInputResetEpoch,
+    scenarioDraftInputResetEpoch,
     scenarioReplacementUnavailableReason,
     loadScenarioDocument,
     exportScenarioDocument,

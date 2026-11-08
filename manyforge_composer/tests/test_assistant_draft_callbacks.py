@@ -141,20 +141,22 @@ def _source_model(node_environment: VerifiedActiveNodeEnvironment):
 
 def _assistant_context(
     node_environment: VerifiedActiveNodeEnvironment,
+    tool_id: str = "scene_draft_add_object",
 ) -> VerifiedActiveAssistantContext:
     return VerifiedActiveAssistantContext(
         node_environment=node_environment,
         source_model=_source_model(node_environment),
-        assistant_mode=_assistant_mode(node_environment),
+        assistant_mode=_assistant_mode(node_environment, tool_id),
     )
 
 
 def _assistant_mode(
     node_environment: VerifiedActiveNodeEnvironment,
+    tool_id: str = "scene_draft_add_object",
 ) -> VerifiedActiveAssistantMode:
     registry = json.loads(_REGISTRY_PATH.read_text(encoding="utf-8"))
     source_tool = next(
-        row for row in registry["tools"] if row["tool_id"] == "scene_draft_add_object"
+        row for row in registry["tools"] if row["tool_id"] == tool_id
     )
     schema = source_tool["input_schema"]
     tool = {
@@ -334,6 +336,45 @@ def _body(
         "correlationId": None,
         "arguments": {"scene_resource": _resource()},
     }
+
+
+def test_validate_callback_returns_reference_diagnostics_for_exact_captured_draft(monkeypatch) -> None:
+    node_environment = _node_environment()
+    context = _assistant_context(node_environment, "program_validate")
+    environment = build_node_environment()
+    state = ComposerState(
+        node_environment=environment,
+        headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
+    )
+    draft = state.draft_session.snapshot()
+    draft["program_loaded"] = True
+    draft["authoring"] = {"schema_version": "manyforge.composer_authoring_forest.v1", "forest": []}
+    monkeypatch.setattr(state.draft_session, "snapshot", lambda: deepcopy(draft))
+    monkeypatch.setattr(state.draft_session, "validate", lambda _catalog: deepcopy(draft))
+    from manyforge_composer.backend import routes_assistant_draft as route
+    monkeypatch.setattr(route, "read_active_assistant_context", lambda _state, *, mode: context)
+    captured = []
+    reference = {"diagnostics": [{"code": "reference_missing", "path": "/tree/target"}],
+                 "total_count": 1, "truncated": False}
+
+    def validate(actual_state, authoring, *, expected_identity):
+        captured.append((actual_state, deepcopy(authoring), expected_identity))
+        return {"valid": False, "reference_validation": reference}
+
+    monkeypatch.setattr(route, "validate_captured_program_source", validate)
+    body = _body(state, node_environment, context.source_model, context.assistant_mode)
+    body["arguments"] = {}
+    response = TestClient(create_app(state)).post("/api/assistant/bridge/tools/program_validate", json=body)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["mutated"] is False
+    assert result["result"]["details"] == {"valid": False, "reference_validation": reference}
+    assert captured == [(state, state.draft_session.snapshot()["authoring"], state.authoring_workspace.identity())]
+    stale = deepcopy(body)
+    stale["expectedWorkspaceRevision"] += 1
+    rejected = TestClient(create_app(state)).post("/api/assistant/bridge/tools/program_validate", json=stale)
+    assert rejected.status_code == 409
+    assert len(captured) == 1
 
 
 def test_callback_uses_exact_active_context_and_mutates_only_the_draft(

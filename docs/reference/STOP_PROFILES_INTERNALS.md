@@ -172,7 +172,7 @@ identity from fresh state; it never resumes stale controller trajectory state.
 ## 4.1 Stops And The Cell Latch
 
 A Stop never latches the cell by itself, and nothing acknowledges its
-settlement. After a Stop, the cell latch (CONTRACTS §5, `get_cell_latch`) is
+settlement. After a Stop, the cell latch (`get_cell_latch`) is
 derived from component states: it holds while any component in the cell is
 in `fault` or `offline`, or reports `activity: unknown` (for a robot: a goal
 whose result cannot come back or is overdue,
@@ -332,7 +332,7 @@ before the replacement could be sent, the stage lets the accepted goal finish
 
 ## 7. Gripper Stop
 
-A Stop cancels a position gripper's `GripperActionController` goal unless the
+A Stop cancels a position gripper's `ParallelGripperCommand` goal unless the
 command is already done
 (`manyforge_ros2_control_execution/src/ros2_gripper_command_backend.cpp`).
 Then ManyForge does not send the cancel and lets the goal finish on the
@@ -363,9 +363,9 @@ holds the current position, and the Isaac gripper bridge
 current finger position as Isaac's target and stops republishing the goal's
 target. So the cancel's ACCEPT ends the stopped command, like the goal's own
 terminal result; whichever comes first settles it and a later result for that
-goal is ignored (N10b). The Kernel waits for that settlement
+goal is ignored. The Kernel waits for that settlement
 (`cancellation_pending` in the gripper status) before it retires the stopped
-operation and Reset reopens the gripper (Q70). With no cancel sent it settles
+operation and Reset reopens the gripper. With no cancel sent it settles
 on the goal's own result (then also `completed_by_natural_completion` on
 success). No timer is involved.
 

@@ -33,11 +33,11 @@ inline constexpr std::string_view kHeadlessApiMutationResponseSchemaVersion =
 inline constexpr std::string_view kViewerModelAssetSchemaVersion =
     "manyforge.viewer_model_asset.v1";
 inline constexpr std::string_view kAppliedProgramSelectionSchemaVersion =
-    "manyforge.applied_program_selection.v3";
+    "manyforge.applied_program_selection.v4";
 inline constexpr std::string_view kAppliedProgramStatusSchemaVersion =
     "manyforge.applied_program_status.v2";
 inline constexpr std::string_view kCommittedScenarioActivationSchemaVersion =
-    "manyforge.committed_scenario_activation.v3";
+    "manyforge.committed_scenario_activation.v4";
 inline constexpr std::string_view kSourceModelContextSchemaVersion =
     "manyforge.source_model_context.v1";
 inline constexpr std::string_view kAssistantModeContextSchemaVersion =
@@ -49,7 +49,7 @@ inline constexpr std::size_t kMaximumRuntimeFaultSnapshotBytes =
     manyforge::core::kMaximumCellAdmissionJsonResponseBytes;
 inline constexpr std::string_view kAlarmSourceRefreshSchemaVersion =
     "manyforge.alarm_source_refresh.v1";
-/// Alarm-source currency (spec 530 §11). Source health, the scene adapter and
+/// Alarm-source currency. Source health, the scene adapter and
 /// the active resource registry that decide motion-attention reconciliation
 /// are re-evaluated by `RefreshAlarmSources` at most once per period R; the
 /// execution event pump calls it on every pump iteration.
@@ -204,6 +204,8 @@ public:
   AssistantModeContext(std::string_view mode_id);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   AppliedProgramSelection();
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  LookupComponentFrame(const manyforge::content_identity::CanonicalValue &request);
   /// Derived executable/non-executable status of the active Applied Program.
   /// For a non-executable Program it carries the preserved authored Program
   /// and the named unresolved references; it never carries a binding.
@@ -444,6 +446,9 @@ private:
   manyforge::deployment::FilesystemProgramBindingRepository binding_repository_;
   manyforge::deployment::FilesystemVerifiedRetainedModelMapSource
       retained_model_map_source_;
+  // Single current Applied capture, protected by the existing core mutex.
+  std::optional<std::pair<std::string, manyforge::content_identity::CanonicalValue>>
+      applied_program_frame_facts_;
   ActiveNodeEnvironmentProjection node_environment_projection_;
   ActiveSourceModelProjection source_model_projection_;
   manyforge::deployment::FilesystemVerifiedRetainedViewerModelSource

@@ -11,17 +11,17 @@
 namespace manyforge::core {
 
 // ---------------------------------------------------------------------------
-// Stop replacement building blocks (shared execution design §4.2).
+// Stop replacement building blocks.
 //
 // Side-effect free functions used by the Core Stop-stage helper and by the
-// test-support exporter for Track 2's pinned-JTC characterization. Three time
+// test-support exporter for the pinned-JTC characterization. Three time
 // bases stay explicit: the active trajectory's path time (the controller's
-// cursor), wall time (the Stop planner's braking law, Q17/Q38) and the
+// cursor), wall time (the Stop planner's braking law) and the
 // replacement's own path time, whose zero is where the mechanism is expected to
 // start it.
 // ---------------------------------------------------------------------------
 
-/// Q26: the active trajectory's path time at which the mechanism is expected to
+/// The active trajectory's path time at which the mechanism is expected to
 /// start a replacement. Not wall-clock time since dispatch (wrong under speed
 /// scaling): the controller's own cursor from its latest associated sample,
 /// advanced at the frozen factor for the local time already spent since that
@@ -30,14 +30,14 @@ namespace manyforge::core {
 struct StopJoinElapsedInputDTO final {
   /// Cursor of the latest sample associated with the active trajectory.
   double sample_cursor_s{0.0};
-  /// Frozen speed factor in [0, 1] (Q17/Q35/Q38).
+  /// Frozen speed factor in [0, 1].
   double frozen_factor{0.0};
   /// Local monotonic time from the sample's receipt to the dispatch decision.
   double wall_since_sample_s{0.0};
   /// Lane-measured wall time from dispatch until the mechanism starts the
   /// replacement (characterization fact; no default exists).
   double start_allowance_s{0.0};
-  /// Q22 (`main`'s replacement-acceptance-within-lead-in rule): when present,
+  /// `main`'s replacement-acceptance-within-lead-in rule: when present,
   /// the elapsed time must stay strictly before this active-path time (the
   /// end of the lead-in, where the checked ramp starts).
   std::optional<double> lead_in_end_path_s{};
@@ -104,7 +104,7 @@ struct StopReplacementStartDTO final {
     const TrajectoryDTO& active, double start_path_s, const std::vector<double>& stop_positions,
     double stop_end_path_s);
 
-/// Q17/Q38: express a wall-time braking trajectory (the Stop planner's output,
+/// Express a wall-time braking trajectory (the Stop planner's output,
 /// planned at the frozen factor) in path time at that factor, so that a
 /// controller applying the factor once reproduces the planned wall-time
 /// motion: t -> f t, velocity -> v / f, acceleration -> a / f^2. Every waypoint
@@ -113,7 +113,7 @@ struct StopReplacementStartDTO final {
 [[nodiscard]] Result<TrajectoryDTO> convert_stop_trajectory_to_path_time(
     const TrajectoryDTO& wall_time_trajectory, double frozen_factor);
 
-/// §4.2 step 2: the trip point, where the Stop ramp leaves the original path,
+/// The trip point, where the Stop ramp leaves the original path,
 /// on the active trajectory's path clock: the continuation's origin advanced
 /// at the frozen factor through the wall-time lead-in (`stop_traj_delta_s`).
 [[nodiscard]] inline double stop_trip_path_s(double continuation_origin_s, double frozen_factor,
@@ -121,7 +121,7 @@ struct StopReplacementStartDTO final {
   return continuation_origin_s + frozen_factor * lead_in_s;
 }
 
-/// Q20 (ManyMove's past-point join, as clarified) and §4.2 steps 3-4. All
+/// ManyMove's past-point join. All
 /// times are shifted by `-elapsed_s`, so the expected start falls at 0 and
 /// past points keep negative times (never clamped). `continuation` is in path
 /// time with its time 0 at the active trajectory's path time
@@ -155,7 +155,7 @@ struct StopReplacementStartDTO final {
                                                                 double continuation_origin_s,
                                                                 double trip_path_s);
 
-/// §3.3 cursor mapping of one on-path Stop replacement built by
+/// Cursor mapping of one on-path Stop replacement built by
 /// `build_stop_replacement_join`: the controller's cursor on the replacement
 /// back to the active (original) trajectory's path time, with the Stop
 /// planner's own mapping of each ramp sample. No second integrator.
@@ -178,7 +178,7 @@ struct StopReplacementCursorMapDTO final {
 [[nodiscard]] double original_path_cursor(const StopReplacementCursorMapDTO& map,
                                           double replacement_cursor_s);
 
-/// Q42 level 3 (controlled hard stop) input: the controller's latest commanded
+/// Level 3 (controlled hard stop) input: the controller's latest commanded
 /// state and the lane's hard-stop limits. Vectors follow `joint_names`.
 struct ControlledHardStopBrakeInputDTO final {
   std::vector<std::string> joint_names;
@@ -187,11 +187,11 @@ struct ControlledHardStopBrakeInputDTO final {
   /// Latest associated sample's reference velocity in path-time units
   /// (unscaled); the physical speed is `frozen_factor` times this value.
   std::vector<double> reference_path_velocities;
-  /// The factor the controller applies (Q35: its actual applied value), in
+  /// The factor the controller applies (its actual applied value), in
   /// (0, 1]. At 0 nothing advances and level 4 applies directly.
   double frozen_factor{0.0};
   /// Physical per-joint deceleration limits: the lane's JTC
-  /// `max_deceleration_on_cancel` values (Q2: equal to the Stop profile's
+  /// `max_deceleration_on_cancel` values (equal to the Stop profile's
   /// limits). Must cover every joint with a finite positive value.
   std::map<std::string, double> max_deceleration_rad_s2;
   /// Controller update period; the brake is sampled at this period.
@@ -213,7 +213,7 @@ struct ControlledHardStopBrakeDTO final {
   std::string limiting_joint;
 };
 
-/// Q42 closed-form brake: one common stop time T = max_j(f |v_j| / d_j); every
+/// Closed-form brake: one common stop time T = max_j(f |v_j| / d_j); every
 /// joint decelerates linearly to rest at T along its current direction
 /// (physical velocity f v_j (1 - t / T)), so the physical start speed equals
 /// the actual speed (no drop) and each joint's physical deceleration

@@ -102,7 +102,7 @@ def test_catalog_offers_curated_rows_with_kinds_tags_and_assemblies() -> None:
     assert "articulated-arm" in robot["tags"] and "gripper" not in robot["tags"]
     assert robot["lane"] == "manyforge-only"
     assert [row["component_id"] for row in robot["components"]] == ["ur10e_robot"]
-    # AUD-5: a UFactory arm is always a machine member, added with its machine
+    # A UFactory arm is always a machine member, added with its machine
     # entry; no catalog entry offers it (or any machine row) alone.
     assert not [entry for entry in _row_entries(catalog)
                 if {"lite6_robot", "lite6", "uf850_robot"}
@@ -297,7 +297,7 @@ def test_profile_facts_carry_each_targets_tcp_roles_and_default(
 
     types = tmp_path / "component_type"
     types.mkdir()
-    # A two-target tool with a `tcp` on both targets (B5: its Deployment row
+    # A two-target tool with a `tcp` on both targets (its Deployment row
     # chooses the default), a one-target tool and a bracket without TCPs.
     for family, targets in (
         ("dual", [target("tool_b", ["tcp"], "tcp"), target("tool_a", ["tcp", "edge"], "tcp")]),
@@ -338,11 +338,11 @@ def test_maintained_models_declare_one_tcp_target_each() -> None:
     assert profiles["ufactory.lite_gripper"]["tcpTargets"] == [
         {"commandTargetId": "gripper", "tcpFrameRoleIds": ["tcp"], "defaultTcpFrameRoleId": "tcp"},
     ]
-    # No maintained model needs a Deployment `default_tcp` (B5 sweep).
+    # No maintained model needs a Deployment `default_tcp`.
     assert all(len(facts["tcpTargets"]) <= 1 for facts in profiles.values())
 
 
-# --- machines (CONTRACTS §16, BOUNDARY §5) ----------------------------------
+# --- machines ---------------------------------------------------------------
 
 
 def test_machine_entries_come_from_the_machine_models() -> None:

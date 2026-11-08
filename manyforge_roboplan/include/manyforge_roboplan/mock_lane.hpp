@@ -10,7 +10,7 @@ namespace manyforge::roboplan_backend {
 /// settings and their reasons: manyforge_ros2_control_execution/lane/.
 inline constexpr std::string_view kMockLaneAdapter = "mock";
 
-/// The Mock lane's `LaunchContribution` (CONTRACTS §12) for one model row:
+/// The Mock lane's `LaunchContribution` for one model row:
 /// `mock_components/GenericSystem` hardware and the vendor's controllers (a
 /// row naming `vendor`) or else the row's controllers file, plus, for an arm, the
 /// stock reset-position writer that serves `reset_position`.

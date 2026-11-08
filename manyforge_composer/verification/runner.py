@@ -16,16 +16,15 @@ Retained here:
 Removed ScenarioRunner methods are assigned as follows:
 
 * HTTP step execution, Program load, signal publication, cycle control, and
-  condition endpoint fetching return as thin clients at H0/I5 and N/I6;
-* execution/Stop assertions return against C++ owner facts at N/I6 and P5/I8;
-* scene/viewer assertions return at H0/I5 and I/I9; and
-* Isaac and real-robot scenario selection returns at I/I9 and R/I10.
+  condition endpoint fetching return as thin clients;
+* execution/Stop assertions return against C++ owner facts;
+* scene/viewer assertions return later; and
+* Isaac and real-robot scenario selection returns later.
 
 Historical test blob 947c44fb50d55d0f9ab018acb600966faf417b18 contains
 six acceptance cases. Matrix repeat/tag expansion, Git metadata, JSON output,
 and archive packaging are retained in focused tests. Pick/place, visual-scene,
-cycle, snapshot, and runtime endpoint assertions remain assigned to their
-named product gates.
+cycle, snapshot, and runtime endpoint assertions remain deferred.
 """
 
 from __future__ import annotations

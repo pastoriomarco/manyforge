@@ -53,8 +53,8 @@ export interface ResetApplyInputs {
  * Program Apply while a Program run exists: one informed confirmation, then
  * the ordinary Reset of exactly the confirmed run, its observed correlated
  * Idle, and the ordinary Apply of exactly the confirmed Program Draft
- * revision (spec 450 §5.1.1, maintainer 2026-10-02). The Deployment Apply
- * offers the same chain while a run is stopped or held (AUD-4): its Apply is
+ * revision. The Deployment Apply
+ * offers the same chain while a run is stopped or held: its Apply is
  * the server Apply of exactly the confirmed Preview's scope. The backend
  * fences stay authoritative. State lives only in this page: reopening
  * observes owners and never resumes a chain.
@@ -84,7 +84,7 @@ export function useResetApply({
 
   /** Apply must first Reset the run: one exists, whatever its motion. */
   const runExists = programRunExists(snapshot);
-  /** A Deployment Apply must first Reset a stopped or held run (AUD-4). */
+  /** A Deployment Apply must first Reset a stopped or held run. */
   const deploymentRunReset = deploymentApplyResetsRun(snapshot);
   const inProgress = sequence !== null && !resetApplyTerminal(sequence.phase);
   const programWorkspace = program.state.workspace;
@@ -307,6 +307,7 @@ export function useResetApply({
   // One Activity notice follows the chain with its correlation. A completed
   // Apply is a result, not progress: it clears by itself without Dismiss.
   const current = useMemo(
+    // eslint-disable-next-line react-hooks/refs -- resetApplyNotice stores dismiss without calling it during render.
     () => (sequence === null ? null : resetApplyNotice(sequence, dismiss)),
     [dismiss, sequence],
   );
@@ -321,7 +322,7 @@ export function useResetApply({
   return {
     /** A Program run exists: Apply Resets it first. */
     runExists,
-    /** A stopped or held run: the Deployment Apply Resets it first (AUD-4). */
+    /** A stopped or held run: the Deployment Apply Resets it first. */
     deploymentRunReset,
     unavailableReason,
     confirm,

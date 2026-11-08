@@ -4,7 +4,6 @@ import pytest
 import py_trees
 
 from manyforge_behavior.nodes.recovery import (
-    RECOVERY_NODE_RESTORATION_GATES,
     FallbackOverrideNode,
     RecoveryNodeUnavailableError,
     RecoverySkillNode,
@@ -128,5 +127,3 @@ def test_recovery_nodes_fail_before_child_or_offer_access(node_type: type) -> No
         match="composable_cell_recovery_node_unavailable",
     ):
         node_type(poison, child=poison, offer=poison)
-
-    assert RECOVERY_NODE_RESTORATION_GATES == ("I6", "N", "I8", "P5")

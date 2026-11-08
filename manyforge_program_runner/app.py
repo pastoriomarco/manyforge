@@ -358,7 +358,7 @@ def _status(code: str) -> int:
             "persistent_key_request_replayed",
             "stale_generation",
         }
-        # RunReadiness reasons and run refusals (CONTRACTS §10).
+        # RunReadiness reasons and run refusals.
         or code in RUN_REFUSAL_CODES
     ):
         return 409

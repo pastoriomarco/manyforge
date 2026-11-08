@@ -34,10 +34,10 @@ inline constexpr std::size_t kMaxLifecycleRequestLabelBytes = 256U;
 inline constexpr std::size_t kMaxLifecycleErrorCodeBytes = 128U;
 inline constexpr std::size_t kMaxLifecycleErrorMessageBytes = 1024U;
 inline constexpr std::size_t kMaxLifecycleErrorDetails = 8U;
-/// M6 XADAPT: the response cap of one component call (a controller-manager
+/// The response cap of one component call (a controller-manager
 /// switch or hardware-state request, a vendor service): no answer within
-/// min(this cap, the step's remaining time) ends the wait. Maintainer
-/// 2026-10-28: 10 s until measured live.
+/// min(this cap, the step's remaining time) ends the wait. 10 s until
+/// measured live.
 inline constexpr std::int64_t kComponentCallResponseCapNs = 10'000'000'000LL;
 inline constexpr std::size_t kMaxLifecycleErrorDetailKeyBytes = 64U;
 inline constexpr std::size_t kMaxLifecycleErrorDetailValueBytes = 256U;

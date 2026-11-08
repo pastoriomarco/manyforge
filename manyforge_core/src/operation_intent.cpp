@@ -94,7 +94,7 @@ namespace {
 }
 
 [[nodiscard]] Result<void> validate_motion_intent(const MotionParticipantIntentDTO& motion) {
-  if (motion.move_id.empty() || motion.base_frame_role_id.empty()) {
+  if (motion.move_id.empty() || (motion.base_frame.component_id.empty() || motion.base_frame.frame_id.empty())) {
     return invalid("motion intent has an empty portable identity", "motion_identity_empty");
   }
   if (!valid_tcp_selector(motion.tcp_endpoint)) {
@@ -277,7 +277,7 @@ Result<void> validate_operation_intent(const OperationIntentDTO& intent) {
     return invalid("Set TCP names exactly one robot", "set_tcp_shape_invalid");
   }
   for (const auto& participant : intent.participants) {
-    if (participant.component_role_id.empty() || participant.target_role_id.empty() ||
+    if (participant.target.component_id.empty() || participant.target.command_target_id.empty() ||
         participant.required_capability_id.empty()) {
       return invalid("operation participant has an empty role or capability",
                      "operation_participant_identity_empty");

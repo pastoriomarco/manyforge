@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <manyforge_xarm_control/xarm_arm_adapter.hpp>
+#include <manyforge_xarm_control/xarm_fault.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -131,6 +132,17 @@ XArmArmAdapter::XArmArmAdapter(XArmArmAdapterConfig config, XArmArmAdapterPorts 
     throw std::invalid_argument("an xArm-family robot has 1 to 7 axes");
 }
 
+void XArmArmAdapter::ObserveOwnerEstop() const {
+  std::lock_guard lock(mutex_);
+  if (armed_ && own_operations_ == 0)
+    stopped_by_estop_.store(true, std::memory_order_release);
+}
+
+void XArmArmAdapter::ForgetOwnerEstop() noexcept {
+  std::lock_guard lock(mutex_);
+  stopped_by_estop_.store(false, std::memory_order_release);
+}
+
 std::int64_t XArmArmAdapter::Now() const { return ports_.clock->now(); }
 
 bool XArmArmAdapter::Fresh(const XArmObservedState &observed, const std::int64_t now_ns) const {
@@ -146,7 +158,7 @@ bool XArmArmAdapter::ExternalControl(const XArmObservedState &observed,
   if (!armed_ || own_operations_ > 0 || !Fresh(observed, now_ns)) return false;
   if (observed.error_code != 0) {
     // A controller error explains the pair it reports (the owner's error
-    // fault) and drops the arm out of its armed state (as M7: an e-stop
+    // fault) and drops the arm out of its armed state (an e-stop
     // leaves it stopped with the motors off); its Enable re-arms it.
     armed_ = false;
     return false;
@@ -192,6 +204,27 @@ core::ComponentState XArmArmAdapter::State(const std::int64_t now_ns) const {
       state.lifecycle = ComponentLifecycle::kPrepared;
   }
   const auto observed = ports_.status->observe();
+  if (state.fault && state.fault->code == core::FaultCode::kStreamStale) {
+    // Read controller activity without the arm mutex. Serialize the final
+    // flag/report check with lifecycle and owner-replacement invalidation.
+    const bool inactive = ports_.controllers_inactive && ports_.controllers_inactive();
+    std::lock_guard lock(mutex_);
+    const auto current = ports_.status->observe();
+    if (stopped_by_estop_.load(std::memory_order_acquire) && Fresh(current, now_ns)) {
+      if (current.error_code >= 1 && current.error_code <= 3) {
+        state.fault.reset();
+        state.lifecycle = ComponentLifecycle::kPrepared;
+        state.reason = core::ComponentStateReason{
+            "stopped_by_estop", "Stopped by e-stop"};
+      } else if (current.error_code == 0 && inactive) {
+        state.fault.reset();
+        state.lifecycle = ComponentLifecycle::kPrepared;
+        state.reason = core::ComponentStateReason{
+            "controllers_stopped_after_estop",
+            "Controllers stopped after the e-stop. Enable the arm to resume"};
+      }
+    }
+  }
   // All motors off: nothing can be executing.
   if (Fresh(observed, now_ns) && observed.motion_enable_mask >= 0 &&
       (observed.motion_enable_mask & ((1 << config_.axis_count) - 1)) == 0)
@@ -203,6 +236,9 @@ std::vector<core::Capability> XArmArmAdapter::capabilities() const { return {}; 
 
 ActionResult XArmArmAdapter::Run(const ComponentAction action, const std::stop_token stop) {
   OwnOperation own(*this);
+  if (action == ComponentAction::kEnable || action == ComponentAction::kDisable ||
+      action == ComponentAction::kRecover)
+    ForgetOwnerEstop();
   switch (action) {
   case ComponentAction::kPrepare:
   case ComponentAction::kRecover: return Prepare(action, stop);
@@ -237,7 +273,7 @@ ActionResult XArmArmAdapter::Hardware(const bool active, const ComponentAction a
 }
 
 ActionResult XArmArmAdapter::Disable(const std::stop_token stop) {
-  // As M7: the arm controller off, then the hardware off (the plugin
+  // The arm controller off, then the hardware off (the plugin
   // selects position mode).
   auto disabled = Lane(ComponentAction::kDisable, ComponentAction::kDisable, stop);
   if (disabled.outcome != ActionOutcome::kSucceeded) return disabled;
@@ -250,9 +286,9 @@ ActionResult XArmArmAdapter::Disable(const std::stop_token stop) {
 }
 
 ActionResult XArmArmAdapter::Prepare(const ComponentAction action, const std::stop_token stop) {
-  // XPW-1: motors off. The owner, prepared first, connected the driver and
-  // cleared the controller's error and warning (`clean_error`, `clean_warn`;
-  // never `motion_enable`). The lane's prepare or recover leaves the
+  // Motors off. The owner, prepared first, connected the driver (its
+  // Recover, not its Prepare, also clears a latched error; never
+  // `motion_enable`). The lane's prepare or recover leaves the
   // hardware as it is; it is switched off (at once when it already is, as on
   // a fresh process: the launch starts it inactive).
   const auto deadline = Now() + config_.action_timeout.count();
@@ -286,7 +322,7 @@ bool XArmArmAdapter::NeedsArming() const {
 }
 
 ActionResult XArmArmAdapter::Arm(const std::stop_token stop) {
-  // As M7's Disable then Prepare: the arm controller off, the hardware off
+  // As a Disable then Prepare: the arm controller off, the hardware off
   // (when on, so that its activation runs the arming again), then on: the
   // plugin's `clean_error`, `clean_warn`, `motion_enable`, `set_mode(1)`,
   // `set_state(0)`, with the joint state broadcaster.
@@ -381,12 +417,28 @@ bool XArmArmAdapter::FlowingSince(const std::int64_t ready_at_ns) const {
          (!ports_.broadcaster_active || ports_.broadcaster_active());
 }
 
+std::optional<ActionResult> XArmArmAdapter::EstopStillActive() const {
+  // Enable's activation cleared the controller error; an e-stop error
+  // (C1-C3) that stays means the e-stop or the control box's emergency
+  // input is still active.
+  const auto observed = ports_.status->observe();
+  if (!Fresh(observed, Now()) || observed.error_code < 1 || observed.error_code > 3)
+    return std::nullopt;
+  return failed(ComponentAction::kEnable, "robot_estop_active",
+                "The e-stop is still active (" + std::string(xarm_error_text(observed.error_code)) +
+                    "): release it, then Enable.",
+                xarm_vendor_code(observed.error_code));
+}
+
 ActionResult XArmArmAdapter::Enable(const std::stop_token stop) {
   std::optional<std::int64_t> rearmed_at;
-  // XPW-1: the motors are switched on here, never at Prepare.
+  // The motors are switched on here, never at Prepare.
   if (!ports_.hardware_active() || NeedsArming()) {
     auto armed = Arm(stop);
-    if (armed.outcome != ActionOutcome::kSucceeded) return armed;
+    if (armed.outcome != ActionOutcome::kSucceeded) {
+      if (auto estop = EstopStillActive()) return *estop;
+      return armed;
+    }
     rearmed_at = Now();
   }
   if (auto refused = CheckEnableGate(rearmed_at, stop)) return *refused;
@@ -417,6 +469,7 @@ XArmArmAdapter::CheckEnableGate(const std::optional<std::int64_t> since_ns,
   if (!Fresh(observed, Now()))
     return refuse("xarm_status_unavailable",
                   "the robot controller's status report is missing or out of date");
+  if (auto estop = EstopStillActive()) return *estop;
   const int axes = (1 << config_.axis_count) - 1;
   if (observed.error_code != 0 || observed.mode != kXArmJointServoMode ||
       (observed.state != kXArmMovingState && observed.state != kXArmReadyState) ||
@@ -453,9 +506,8 @@ XArmJointSampleUse XArmArmAdapter::JointSampleUse(const std::int64_t now_ns,
       !std::all_of(positions.begin(), positions.end(),
                    [](const double value) { return std::isfinite(value); }))
     return XArmJointSampleUse::kIgnore;
-  // XPW-1: with the hardware off (prepared, motors off) the driver's own
-  // topic carries the true pose, e-stop included (XARM_CONTROLLER_FACTS,
-  // "The vendor joint topic"); the broadcaster isn't relied on.
+  // With the hardware off (prepared, motors off) the driver's own
+  // topic carries the true pose, e-stop included; the broadcaster isn't relied on.
   if (!ports_.hardware_active()) return XArmJointSampleUse::kLeads;
   const auto observed = ports_.status->observe();
   std::lock_guard lock(mutex_);

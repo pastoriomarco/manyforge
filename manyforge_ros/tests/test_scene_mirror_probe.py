@@ -324,6 +324,60 @@ def test_scene_mirror_reuses_exact_typed_clients_until_explicit_close() -> None:
         client.capture(entity_names=[])
 
 
+def test_scene_mirror_dispatches_client_entity_lifecycle_operations() -> None:
+    class _OwnedNode(_Node):
+        def __init__(self, handlers):
+            super().__init__(handlers)
+            self.in_owner_operation = False
+            self.operations: list[str] = []
+
+        def create_client(self, service_type: type, service_name: str) -> _Client:
+            assert self.in_owner_operation
+            self.operations.append("create")
+            return super().create_client(service_type, service_name)
+
+        def destroy_client(self, client: _Client) -> None:
+            assert self.in_owner_operation
+            self.operations.append("destroy")
+            super().destroy_client(client)
+
+    def state(_request):
+        response = _ok_response(GetEntityState)
+        response.state.header.frame_id = "world"
+        response.state.pose.orientation.w = 1.0
+        return response
+
+    node = _OwnedNode(
+        {
+            "/get_simulator_features": lambda _r: GetSimulatorFeatures.Response(),
+            "/get_entity_state": state,
+        }
+    )
+
+    def dispatch(operation, *, allow_stopped: bool = False):
+        del allow_stopped
+        node.in_owner_operation = True
+        try:
+            return operation()
+        finally:
+            node.in_owner_operation = False
+
+    client = scene_mirror_probe.SimulationSceneMirrorClient(
+        node,
+        entity_operation_dispatcher=dispatch,
+    )
+    snapshot = client.capture(
+        entity_names=["/World/a"],
+        include_info=False,
+        include_state=True,
+        include_bounds=False,
+    )
+    assert snapshot.entities[0].errors == ()
+    client.close()
+
+    assert node.operations == ["create", "create", "destroy", "destroy"]
+
+
 def test_scene_mirror_evicts_only_failed_client_and_recreates_it() -> None:
     state_calls = 0
 
@@ -608,7 +662,7 @@ def test_features_constants_and_bounds_reject_unbounded_or_invalid_rows() -> Non
         )
 
 
-def test_historical_live_case_is_replaced_by_active_i9_coverage() -> None:
+def test_historical_live_case_is_replaced_by_active_simulation_coverage() -> None:
     assert scene_mirror_probe.HISTORICAL_SOURCE_BLOB == (
         "07de241694d2e7738a55d8c6c74bab1ef5d11b20"
     )

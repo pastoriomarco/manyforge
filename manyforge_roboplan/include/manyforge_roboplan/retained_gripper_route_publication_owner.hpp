@@ -13,9 +13,9 @@ namespace manyforge::roboplan_backend {
 class RetainedCellRuntime;
 struct RetainedExecutionHost;
 
-/// CCLC route-publication owner for one independently retained native
-/// gripper. Reconciled publication verifies the gripper backend, complete
-/// cell registration set and Stop readiness before returning a Kernel
+/// Execution-host route-publication owner for one independently retained
+/// native gripper. Reconciled publication verifies the gripper backend,
+/// complete cell registration set and Stop readiness before returning a Kernel
 /// readback; uncertain results leave the route closed.
 struct RouteReadinessParticipant;
 
@@ -39,12 +39,13 @@ class RetainedGripperRoutePublicationOwner final {
 
   RetainedGripperRoutePublicationOwner(
       std::shared_ptr<RetainedGripperRuntime> gripper,
-      core::IClock& clock, core::ResourceAddressedExecutionKernel& kernel,
+      std::shared_ptr<core::IClock> clock,
+      core::ResourceAddressedExecutionKernel& kernel,
       CellKernelCandidateBuilder cell_candidate_builder = {},
       RetainedCellRuntime* cell_owner = nullptr);
 
-  /// Construction-only joins. Domain maps are immutable before CCLC uses
-  /// this owner; peers borrow the same existing transition mutex and Kernel.
+  /// Construction-only joins. Domain maps are immutable before route
+  /// publication; peers borrow the same existing transition mutex and Kernel.
   void BindMotionRoot(const std::shared_ptr<RetainedExecutionHost>& root);
   void BindParticipantPeers(
       const std::shared_ptr<RetainedGripperRoutePublicationOwner>& root,
@@ -68,7 +69,8 @@ class RetainedGripperRoutePublicationOwner final {
 
   /// Adopt a durable route from the predecessor runtime epoch into this
   /// process under the Kernel's route-recovery exclusion. The route is
-  /// deliberately command-closed until CCLC reconciles a current successor.
+  /// deliberately command-closed until this owner reconciles a current
+  /// successor.
   [[nodiscard]] core::Result<core::RuntimeRouteConfigurationReadbackDTO>
   AdoptAndReadBackRouteConfigurationPredecessor(
       const core::ActiveControlConfigurationDTO& configuration);
@@ -76,7 +78,7 @@ class RetainedGripperRoutePublicationOwner final {
  private:
   /// Retains the engine whose registration is already installed in the Kernel.
   std::shared_ptr<RetainedGripperRuntime> gripper_;
-  core::IClock& clock_;
+  std::shared_ptr<core::IClock> clock_;
   /// The stable Kernel owner must outlive this route-publication seam.
   core::ResourceAddressedExecutionKernel& kernel_;
   CellKernelCandidateBuilder cell_candidate_builder_;

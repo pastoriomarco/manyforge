@@ -55,7 +55,7 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     assert catalog.status_code == 200
     payload = catalog.json()
     assert len(payload["entries"]) == 52  # rules.set_active, io.clear_outside_change
-    assert payload["apiVersion"] == "manyforge.node_catalog.v2"
+    assert payload["apiVersion"] == "manyforge.node_catalog.v3"
     assert payload["contentVersion"] == NodeCatalog(BUILTIN_CATALOG_PATH).content_version
     assert payload["catalogId"] == "manyforge_builtin"
     assert payload["catalogDigest"].startswith("sha256:")
@@ -140,7 +140,7 @@ def test_program_workspace_is_available_while_effectful_actions_need_headless() 
     loaded = TestClient(create_app(state)).get("/api/program/draft")
     assert loaded.status_code == 200
     assert loaded.json()["program_loaded"] is True
-    assert loaded.json()["program"]["api_version"] == "manyforge.program.v2"
+    assert loaded.json()["program"]["api_version"] == "manyforge.program.v3"
     assert loaded.json()["draft_revision"] == 1
     assert loaded.json()["saved"] is True
     assert loaded.json()["applied"] is False

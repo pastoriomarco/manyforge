@@ -1,10 +1,10 @@
-"""Native O1.3 operator-launch orchestration.
+"""Native operator-launch orchestration.
 
 This module is deliberately a mechanical boundary around the already
 qualified Manager, Headless API, Program runner, and Composer processes.  It
 does not own graph, Apply, execution, scene, alarm, or health truth.  The
-standard profile is the only live profile in O1.3; Isaac is kept behind the
-explicit unavailable gate until its own dependency-ordered slice.
+standard profile is the only live profile; Isaac is kept behind the
+explicit unavailable gate.
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ ASSISTANT_BRIDGE_PORT = 8100
 def _safe_unix_timestamp() -> int:
     """Return a current, JSON-safe epoch tick for the frozen timestamp fields.
 
-    The O1.2 contract retains the ``*_unix_ns`` field names but bounds them
+    The contract retains the ``*_unix_ns`` field names but bounds them
     to JavaScript's safe integer range.  Current epoch nanoseconds exceed that
     bound, so the launcher records epoch microseconds as the finest safe tick.
     """
@@ -632,7 +632,7 @@ def _launch_input_digest(config: NativeLauncherConfig) -> str:
 
 
 def _source_identity(source_root: Path) -> SourceIdentityV1:
-    script = source_root / "scripts/qualification/source_identity.py"
+    script = source_root / "scripts/lib/source_identity.py"
     if not script.is_file():
         raise LauncherError("source_identity_unavailable", f"missing source identity collector: {script}", exit_code=71)
     spec = importlib.util.spec_from_file_location("manyforge_operator_source_identity", script)

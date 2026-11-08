@@ -1,4 +1,4 @@
-# The xArm vendor driver (CONTRACTS §12, plan "Vendor driver configuration").
+# The xArm vendor driver.
 # The image build pins `source.commit`; the base files are read from the
 # installed driver when a component's configuration is generated (no vendor
 # launch file or Python runs). See README.md.

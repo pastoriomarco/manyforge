@@ -27,8 +27,8 @@ namespace posix = detail::posix_durability;
 
 [[noreturn]] void fail_global_rule_qualification(const core::ErrorDTO &error) {
   std::string message = error.details.at("reason");
-  // Preserve the existing refusal code and exception type. Contract106 key
-  // and114 group diagnostics retain their actual names in visible text.
+  // Preserve the existing refusal code and exception type. Key and group
+  // diagnostics retain their actual names in visible text.
   const bool named_group =
       (message == "global_interrupt_group_unbound" ||
        message == "global_interrupt_program_binding_missing") &&
@@ -206,18 +206,18 @@ prepared_activation_artifact_rows(std::vector<PreparedActivationArtifact> artifa
 PreparedActivationInput assemble_prepared_activation(
     const PreparedActivationAssemblyInput &input, const RetainedBundle &bundle,
     const VerifiedRetainedModelMap &model_map,
-    const ProgramBindingContract &program, const CanonicalValue &role_assignment,
+    const ProgramBindingContract &program,
     const ICatalogArtifactSource &catalog,
     const IRawArtifactStore &raw_artifacts) {
   return assemble_prepared_activation(
       input, bundle, std::optional<VerifiedRetainedModelMap>{model_map},
-      program, role_assignment, catalog, raw_artifacts);
+      program, catalog, raw_artifacts);
 }
 
 PreparedActivationInput assemble_prepared_activation(
     const PreparedActivationAssemblyInput &input, const RetainedBundle &bundle,
     const std::optional<VerifiedRetainedModelMap> &model_map,
-    const ProgramBindingContract &program, const CanonicalValue &role_assignment,
+    const ProgramBindingContract &program,
     const ICatalogArtifactSource &catalog,
     const IRawArtifactStore &raw_artifacts) {
   const auto &maps = bundle.value().compiled_products.symbol_role_maps;
@@ -248,8 +248,7 @@ PreparedActivationInput assemble_prepared_activation(
   }
   const RecordingCatalogSource recording(catalog);
   const auto outcome = compile_program_binding_outcome(
-      program, parse_program_role_assignment(role_assignment), bundle,
-      model_map, recording);
+      program, bundle, model_map, recording);
   // Global scopes/conditions are resolved against this exact prospective
   // Program binding, or without a Program for signal-only activation rules.
   const auto globals = compile_retained_io_policies(
@@ -339,7 +338,6 @@ PreparedActivationInput assemble_prepared_activation(
             prepared_activation_artifact_rows(recording.recorded())},
            {"program", program.normalized_program_root()},
            {"program_binding", std::move(program_binding)},
-           {"program_role_assignment", role_assignment},
            {"raw_artifacts",
             prepared_activation_artifact_rows(
                 std::move(raw_artifacts_to_embed))},
@@ -394,8 +392,8 @@ recompile_prepared_program_outcome(const PreparedActivationInput &prepared) {
   ProgramBindingOutcome recompiled;
   try {
     recompiled = compile_program_binding_outcome(
-        *closure.program, prepared.program_role_assignment(),
-        *closure.retained_bundle, closure.retained_model_map, catalog);
+        *closure.program, *closure.retained_bundle, closure.retained_model_map,
+        catalog);
   } catch (const ProgramBindingCompilerError &error) {
     fail(std::string("prepared Program outcome does not recompile: ") +
          error.what());

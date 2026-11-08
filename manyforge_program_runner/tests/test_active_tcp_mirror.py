@@ -8,8 +8,14 @@ import pytest
 from manyforge_program_runner.active_tcp_mirror import ActiveTcpMirror, ActiveTcpWireError
 
 
-_TCP_A = {"component_id": "tool", "target_id": "gripper", "frame_role_id": "tcp"}
-_TCP_B = {**_TCP_A, "frame_role_id": "tip"}
+_TCP_A = {
+    "target": {"component_id": "tool", "command_target_id": "gripper"},
+    "frame": {"component_id": "tool", "frame_id": "tcp"},
+}
+_TCP_B = {
+    "target": {"component_id": "tool", "command_target_id": "gripper"},
+    "frame": {"component_id": "tool", "frame_id": "tip"},
+}
 
 
 def test_result_prevents_an_older_event_or_baseline_from_rolling_back_the_store() -> None:
@@ -35,9 +41,9 @@ def test_reset_none_and_detached_inputs_and_snapshots() -> None:
     mirror.set_owner("owner-1")
     entry = deepcopy(_TCP_A)
     assert mirror.apply("arm", "owner-1", 1, 0, entry)
-    entry["frame_role_id"] = "changed"
+    entry["frame"]["frame_id"] = "changed"
     snapshot = mirror.current()
-    snapshot["arm"][2]["frame_role_id"] = "changed_again"
+    snapshot["arm"][2]["frame"]["frame_id"] = "changed_again"
     assert mirror.current()["arm"] == (1, 0, _TCP_A)
     assert mirror.apply("arm", "owner-1", 1, 1, None)
     assert mirror.current()["arm"] == (1, 1, None)
@@ -120,7 +126,7 @@ def test_host_rows_and_active_tcp_event_use_the_same_per_robot_stamp() -> None:
     event = {
         "record_kind": "active_tcp_changed", "sequence": 42,
         "payload": {
-            **row, "api_version": "manyforge.active_tcp_change.v1",
+            **row, "api_version": "manyforge.active_tcp_change.v2",
             "previous": _TCP_A, "entry": _TCP_B, "sequence": 3,
             "source": "program", "offset_sent": True,
         },
@@ -136,6 +142,21 @@ def test_host_rows_and_active_tcp_event_use_the_same_per_robot_stamp() -> None:
         mirror.apply_rows([{key: value for key, value in row.items() if key != "entry"}])
     with pytest.raises(ActiveTcpWireError):
         mirror.apply_event("owner-2", event)
+
+
+def test_active_tcp_event_rejects_legacy_v1_payload() -> None:
+    mirror = ActiveTcpMirror(on_change=lambda _robot, _entry: None)
+    mirror.set_owner("owner-1")
+    row = {
+        "component_id": "arm", "owner_epoch": "owner-1",
+        "registration_generation": 1, "sequence": 1, "entry": _TCP_A,
+    }
+    event = {
+        "record_kind": "active_tcp_changed", "sequence": 42,
+        "payload": {**row, "api_version": "manyforge.active_tcp_change.v1"},
+    }
+    with pytest.raises(ActiveTcpWireError, match="event payload is invalid"):
+        mirror.apply_event("owner-1", event)
 
 
 def test_stream_loss_unsets_value_and_an_authoritative_equal_result_restores_it() -> None:
@@ -165,7 +186,10 @@ def test_same_confirmed_row_retries_incomplete_delivery() -> None:
 
     mirror = ActiveTcpMirror(on_change=write)
     mirror.set_owner("owner-1")
-    entry = {"component_id": "robot", "target_id": "arm", "frame_role_id": "flange"}
+    entry = {
+        "target": {"component_id": "robot", "command_target_id": "arm"},
+        "frame": {"component_id": "robot", "frame_id": "flange"},
+    }
     row = {"component_id": "robot", "owner_epoch": "owner-1", "registration_generation": 1, "sequence": 1, "entry": entry}
     with pytest.raises(RuntimeError):
         mirror.apply_result_row(row)

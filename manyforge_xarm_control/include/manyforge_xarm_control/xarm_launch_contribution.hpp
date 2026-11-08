@@ -40,7 +40,7 @@ struct XArmModelLaneRow final {
   double joint_agreement_tolerance_rad{kXArmJointAgreementToleranceRad};
 };
 
-/// An I/O member's row (CONTRACTS §16): its bank and the signals its model
+/// An I/O member's row: its bank and the signals its model
 /// declares.
 struct XArmIoRow final {
   XArmIoBank bank{XArmIoBank::kController};
@@ -76,7 +76,7 @@ struct XArmVendorSettings final {
 load_xarm_vendor_settings(const std::filesystem::path &vendor_dir);
 
 /// The controllers template of one model row on any lane's hardware (Mock and
-/// Isaac rows naming `vendor: xarm`; plan "Vendor driver configuration"): the
+/// Isaac rows naming `vendor: xarm`): the
 /// vendor base (or the row's own `controllers_file`) and ManyForge's
 /// controller additions, the arm claiming the hardware's command interfaces
 /// (`[__command_interfaces__]`). Needs the row's `vendor_model`.
@@ -85,7 +85,7 @@ make_xarm_controllers(const roboplan_backend::ModelLaneRow &row,
                       const std::filesystem::path &vendor_dir,
                       const DriverShare &driver_share);
 
-/// The launch contribution (CONTRACTS §12, the generator's controllers
+/// The launch contribution (the generator's controllers
 /// template) of one model row: the vendor base files (read from
 /// the driver packages' share folders (`driver_share`), or
 /// the row's own `controllers_file`), ManyForge's additions and the row's
@@ -93,8 +93,8 @@ make_xarm_controllers(const roboplan_backend::ModelLaneRow &row,
 /// `make_xarm_controllers`' with the hardware starting inactive. Instance values are the
 /// generator's tokens (`${address}`, `${namespace}`, `${hardware_component}`);
 /// each joint's `goal` and `max_deceleration_on_cancel` are the generator's.
-/// `arm` false: the machine's process with its arm deactivated (CONTRACTS
-/// §16; `row` is still the arm model's row, for the hardware): the same
+/// `arm` false: the machine's process with its arm deactivated
+/// (`row` is still the arm model's row, for the hardware): the same
 /// hardware, starting inactive, and driver parameters, but no arm controller
 /// (neither its block nor its type in the manager's), so nothing ever
 /// activates the hardware and the motors stay off.

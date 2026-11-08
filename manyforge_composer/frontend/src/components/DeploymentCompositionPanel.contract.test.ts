@@ -47,10 +47,11 @@ describe('DeploymentCompositionPanel Apply contract', () => {
     expect(components).not.toContain('<DeploymentDocumentEditor');
   });
 
-  it('keeps the cell-level settings and role assignment under Deployment', () => {
+  it('keeps the cell-level settings and Binding projection under Deployment', () => {
     const deployment = readFileSync(new URL('./DeploymentCompositionPanel.tsx', import.meta.url), 'utf8');
     expect(deployment).toContain('scope="cell"');
-    expect(deployment).toContain('<RoleFeedbackCard');
+    // OD-28: Program roles and their role-feedback card are gone.
+    expect(deployment).not.toContain('RoleFeedback');
     expect(deployment).toContain('<DeploymentBindingProjection');
     expect(deployment).toContain('<ComponentManagerChanges');
     // Add component and per-component editing moved to Components.

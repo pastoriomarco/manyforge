@@ -17,6 +17,9 @@ import type {
 } from '../types/robotControl';
 import type { ExecutionObservationFrame } from '../types/viewerObservation';
 import {
+  previewBodyIdentity,
+  previewContactPresentation,
+  sampledPreviewRobotPresentation,
   attachedScenePresentation,
   candidateGripperPresentation,
   candidateRobotPresentation,
@@ -197,16 +200,13 @@ function sourceModel(): SourceModelProjection {
 
 function motionDescriptor(): ManualControlMotionDescriptor {
   return {
-    schemaVersion: 'manyforge.manual_control_motion_descriptor.v6',
+    schemaVersion: 'manyforge.manual_control_motion_descriptor.v8',
     ordinaryJerk: null,
     controllableComponentId: 'robot-1',
     endEffectorComponentId: null,
     commandTargetId: 'arm',
-    componentRoleId: 'robot',
-    targetRoleId: 'arm',
     tcps: [{
-      entry: { componentId: 'robot-1', targetId: 'arm', frameRoleId: 'tcp' },
-      targetRoleId: 'arm',
+      entry: { componentId: 'robot-1', targetId: 'arm', frameComponentId: 'robot-1', frameRoleId: 'tcp' },
       controllableComponentId: 'robot-1',
       commandTargetId: 'arm',
       frameRoleId: 'tcp',
@@ -1675,23 +1675,33 @@ describe('runtime scene presentation', () => {
 
   it('materializes only an exact retained-model motion-preview ghost', () => {
     const receipt = {
-      schemaVersion: 'manyforge.direct_control_motion_preview.v1',
+      schemaVersion: 'manyforge.direct_control_motion_preview.v4',
       receiptDigest: 'receipt-1',
       retainedBundleId: 'bundle-1',
       graphRevision: 'graph-1',
-      componentRoleId: 'controlled_component',
-      targetRoleId: 'command_target',
+      target: { componentId: 'robot-1', commandTargetId: 'arm' },
+      resolvedTcp: {
+        entry: {
+          target: { componentId: 'robot-1', commandTargetId: 'arm' },
+          frame: { componentId: 'robot-1', frameId: 'tcp' },
+        },
+        source: 'active_tcp', ownerEpoch: 'owner-1', registrationGeneration: 1, sequence: 1,
+      },
       sourceJointNames: ['source-joint'],
       finalPositionsRad: [Math.PI / 2],
     } as MotionPreviewReceipt;
     const descriptor = {
       ...executionStatus().directControl!.targetDescriptor,
-      componentRoleId: 'controlled_component', targetRoleId: 'command_target',
     };
     const measured = measuredLinkTransforms(manifest(), new Map())!;
     const presentation = candidateRobotPresentation(receipt, manifest(), descriptor, measured);
     expect(presentation?.receiptDigest).toBe('receipt-1');
     expect(presentation?.linkTransforms.tip.position_m[1]).toBeCloseTo(1);
+    const start = sampledPreviewRobotPresentation(['source-joint'], [0], null, manifest(), descriptor, measured);
+    const end = sampledPreviewRobotPresentation(['source-joint'], [Math.PI / 2], null, manifest(), descriptor, measured);
+    expect(start?.linkTransforms.tip.position_m[1]).toBeCloseTo(0);
+    expect(end?.linkTransforms.tip.position_m[1]).toBeCloseTo(1);
+    expect(sampledPreviewRobotPresentation(['different'], [0], null, manifest(), descriptor, measured)).toBeNull();
 
     expect(candidateRobotPresentation({
       ...receipt,
@@ -1702,7 +1712,7 @@ describe('runtime scene presentation', () => {
       sourceJointNames: ['missing'],
     }, manifest(), descriptor, measured)).toBeNull();
     expect(candidateRobotPresentation({
-      ...receipt, targetRoleId: 'another-target',
+      ...receipt, target: { ...receipt.target, commandTargetId: 'another-target' },
     }, manifest(), descriptor, measured)).toBeNull();
     expect(presentation?.linkTransforms.base).toBeUndefined();
 
@@ -1758,7 +1768,6 @@ describe('runtime scene presentation', () => {
     const status = executionStatus();
     status.directControlGripper = {
       controllableComponentId: 'robot-1', commandTargetId: 'gripper', operationCapabilityId: 'tool.gripper.command',
-      componentRoleId: 'controlled_component', targetRoleId: 'command_target',
       commandSchemaId: 'gripper.command_position', commandSchemaRevision: 'schema-1',
       sourceCoordinateName: 'source-finger', sourceKind: 'model_role',
       coordinateKind: 'linear_m', minPosition: 0, maxPosition: 0.04,
@@ -1767,10 +1776,10 @@ describe('runtime scene presentation', () => {
       targetDescriptor: {} as NonNullable<ExecutionOwnerStatus['directControlGripper']>['targetDescriptor'],
     } as NonNullable<ExecutionOwnerStatus['directControlGripper']>;
     const receipt = {
-      schemaVersion: 'manyforge.direct_control_capability_command_preview.v1',
+      schemaVersion: 'manyforge.direct_control_capability_command_preview.v2',
       receiptDigest: 'gripper-receipt-1', retainedBundleId: 'bundle-1',
-      graphRevision: 'graph-1', componentRoleId: 'controlled_component',
-      targetRoleId: 'command_target', requiredCapabilityId: 'tool.gripper.command',
+      graphRevision: 'graph-1', target: { componentId: 'robot-1', commandTargetId: 'gripper' },
+      requiredCapabilityId: 'tool.gripper.command',
       commandSchemaId: 'gripper.command_position', commandSchemaRevision: 'schema-1',
       sourceCoordinateName: 'source-finger', sourceKind: 'model_role',
       coordinateKind: 'linear_m', targetPosition: 0.03,
@@ -1794,10 +1803,10 @@ describe('runtime scene presentation', () => {
     source.targets[1].model_groups[0].model_instance_id = 'model-instance-1';
     const status = executionStatus();
     status.directControl!.tcpFrameRoleId = 'tcp';
-    status.directControl!.targetRoleId = 'arm';
+    status.directControl!.commandTargetId = 'arm';
     status.directControl!.targetDescriptor = motionDescriptor();
     // The marker follows the owner's Active TCP.
-    status.directControl!.activeTcp = { entry: { componentId: 'robot-1', targetId: 'arm', frameRoleId: 'tcp' } } as
+    status.directControl!.activeTcp = { entry: { componentId: 'robot-1', targetId: 'arm', frameComponentId: 'robot-1', frameRoleId: 'tcp' } } as
       NonNullable<ExecutionOwnerStatus['directControl']>['activeTcp'];
     status.directControlGripper = { targetDescriptor: {
       controllableComponentId: 'robot-1', commandTargetId: 'gripper', operationCapabilityId: 'tool.gripper.command', touchLinks: ['source-tip'],
@@ -1812,4 +1821,88 @@ describe('runtime scene presentation', () => {
     source.occurrences[0].links.push({ source_link_name: 'source-tip', viewer_link_name: 'other-tip' });
     expect(candidateToolPresentation(pose, status, source, manifest(), measured)).toBeNull();
   });
+});
+
+
+describe('preview collision identity', () => {
+  it('joins the retained role index to exactly one viewer link', () => {
+    const model = sourceModel();
+    model.targets[0].collision_bodies = [{ collision_body_role_id: 'arm', model_instance_id: 'model-instance-1', source_link_names: ['base', 'link-1'] }];
+    model.targets[1].collision_bodies = [];
+    const body = 'component/robot-1/model/model-instance-1/body/arm/collision/1';
+    expect(previewBodyIdentity(body, model, [])).toEqual({ kind: 'link', name: 'link-1' });
+    model.occurrences[0].links.push({ source_link_name: 'link-1', viewer_link_name: 'other' });
+    expect(previewBodyIdentity(body, model, [])).toBeNull();
+    expect(previewBodyIdentity('runtime_object/part/shape/0', model, [])).toBeNull();
+  });
+});
+
+
+describe('sample contact presentation', () => {
+  it('maps link and Scene identities, applies refused over unknown over allowed, and never invents a mapping', () => {
+    const model = sourceModel();
+    model.targets[0].collision_bodies = [{ collision_body_role_id: 'arm', model_instance_id: 'model-instance-1', source_link_names: ['link-1'] }];
+    model.targets[1].collision_bodies = [];
+    const objects = [{ scene_resource_id: 'part', collision_shapes: [{}] }] as unknown as import('../types/api').LogicalSceneObject[];
+    const arm = 'component/robot-1/model/model-instance-1/body/arm/collision/0';
+    const path = { sourceJointNames: ['source-joint'], pairs: [
+      { bodyA: arm, bodyB: 'scene/part/shape/0' },
+      { bodyA: arm, bodyB: 'unknown-body' },
+      { bodyA: arm, bodyB: 'scene/part/shape/0' },
+    ], samples: [{ timeFromStartS: 0, positionsRad: [0], status: 'checked' as const, contacts: [
+      { pairIndex: 0, disposition: 'allowed' as const }, { pairIndex: 1, disposition: 'allowed' as const },
+      { pairIndex: 2, disposition: 'refused' as const },
+    ] }] };
+    const output = previewContactPresentation(path, 0, model, objects);
+    expect(output.defaultDisposition).toBe('unknown');
+    expect(output.links['link-1']).toBe('refused');
+    expect(output.objects.part).toBe('refused');
+    expect(output.links.base).toBeUndefined();
+    path.samples[0].contacts.pop();
+    expect(previewContactPresentation(path, 0, model, objects).links['link-1']).toBe('unknown');
+  });
+
+  it('uses the shown sample and never treats unknown or unresolvable evidence as clear', () => {
+    const model = sourceModel();
+    model.targets[0].collision_bodies = [{ collision_body_role_id: 'arm', model_instance_id: 'model-instance-1', source_link_names: ['base', 'link-1'] }];
+    model.targets[1].collision_bodies = [];
+    const objects = [{ scene_resource_id: 'part', collision_shapes: [{}] }] as unknown as import('../types/api').LogicalSceneObject[];
+    const path = { sourceJointNames: ['source-joint'], pairs: [
+      { bodyA: 'component/robot-1/model/model-instance-1/body/arm/collision/1', bodyB: 'scene/part/shape/0' },
+      { bodyA: 'unmapped', bodyB: 'scene/part/shape/0' },
+    ], samples: [
+      { timeFromStartS: 0, positionsRad: [0], status: 'checked' as const, contacts: [] },
+      { timeFromStartS: 1, positionsRad: [0], status: 'checked' as const, contacts: [{ pairIndex: 0, disposition: 'allowed' as const }] },
+      { timeFromStartS: 2, positionsRad: [0], status: 'checked' as const, contacts: [{ pairIndex: 0, disposition: 'refused' as const }] },
+      { timeFromStartS: 3, positionsRad: [0], status: 'unknown' as const, contacts: [] },
+      { timeFromStartS: 4, positionsRad: [0], status: 'checked' as const, contacts: [{ pairIndex: 1, disposition: 'allowed' as const }] },
+      { timeFromStartS: 5, positionsRad: [0], status: 'checked' as const, contacts: [{ pairIndex: 0, disposition: 'unknown' as const }] },
+    ] };
+    expect(previewContactPresentation(path, 0, model, objects).defaultDisposition).toBe('clear');
+    expect(previewContactPresentation(path, 1, model, objects).links['link-1']).toBe('allowed');
+    expect(previewContactPresentation(path, 2, model, objects).links['link-1']).toBe('refused');
+    expect(previewContactPresentation(path, 3, model, objects).defaultDisposition).toBe('unknown');
+    expect(previewContactPresentation(path, 4, model, objects).defaultDisposition).toBe('unknown');
+    expect(previewContactPresentation(path, 5, model, objects).defaultDisposition).toBe('unknown');
+    expect(previewContactPresentation(path, 99, model, objects).defaultDisposition).toBe('unknown');
+  });
+});
+
+
+it('keeps v2 uncertainty local and preserves proved violations over incomplete geometry', () => {
+  const model = sourceModel();
+  model.targets[0].collision_bodies = [{ collision_body_role_id: 'arm', model_instance_id: 'model-instance-1', source_link_names: ['link-1'] }];
+  model.targets[1].collision_bodies = [];
+  const objects = [{ scene_resource_id: 'part', collision_shapes: [{}] }] as unknown as import('../types/api').LogicalSceneObject[];
+  const path: import('../types/robotControl').MotionPreviewPath = {
+    schemaVersion: 'manyforge.motion_preview_diagnostic.v2', kind: 'validated_path', reason: 'collision',
+    sourceJointNames: ['joint'], pairs: [{ bodyA: 'component/robot-1/model/model-instance-1/body/arm/collision/0', bodyB: 'scene/part/shape/0' }],
+    samples: [{ timeFromStartS: 0, positionsRad: [0], status: 'checked', contacts: [{ pairIndex: 0, disposition: 'unknown' }], clearanceViolations: [] }],
+  };
+  expect(previewContactPresentation(path, 0, model, objects)).toMatchObject({ defaultDisposition: 'clear', links: { 'link-1': 'unknown' } });
+  path.samples[0].status = 'unknown';
+  path.samples[0].clearanceViolations = [{ pairIndex: 0, distanceM: .001, requiredClearanceM: .002 }];
+  expect(previewContactPresentation(path, 0, model, objects)).toMatchObject({ defaultDisposition: 'unknown', links: { 'link-1': 'clearance' } });
+  path.samples[0].contacts[0].disposition = 'refused';
+  expect(previewContactPresentation(path, 0, model, objects).links['link-1']).toBe('refused');
 });

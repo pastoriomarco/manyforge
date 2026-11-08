@@ -92,7 +92,7 @@ Result<void> validate_operator_alarm_attention_snapshot(
         return invalid("operator_alarm_attention_subject_invalid");
       }
     }
-    // spec 530 §5: the cell subject is the only resource-free subject.
+    // The cell subject is the only resource-free subject.
     const bool cell_subject = member.subject_kind == "cell";
     if (cell_subject != member.resource_ids.empty() ||
         (cell_subject && member.subject_id != snapshot.cell_id.value())) {

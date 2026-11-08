@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { JsonValue, SourceModelTarget } from '../types/api';
-import type { ComponentCatalogEntry, MachineCatalogEntry } from '../types/componentCatalog';
+import type { MachineCatalogEntry } from '../types/componentCatalog';
 import {
   addComponentProblem,
   machineCatalogEntry,
@@ -12,15 +12,12 @@ import {
   componentRowText,
   componentSignals,
   draftGripperFrames,
-  rolesOfComponent,
   framePrefixFor,
   mountCandidates,
   mountParents,
   nextFreeComponentId,
   renameComponentRows,
   resolvedRobotTcp,
-  roleFeedback,
-  rolesFittingEntry,
   toolMountRow,
   withMountRobot,
 } from './componentManager';
@@ -56,25 +53,6 @@ const device = {
 function document(...components: JsonValue[]): Record<string, JsonValue> {
   return { api_version: 'manyforge.deployment_intent.v2', components, attachments: [], policies: {} };
 }
-
-const entry: ComponentCatalogEntry = {
-  entryId: 'mock_lite6_pneumatic_pick_and_place.scenario/lite6_robot',
-  kind: 'robot',
-  componentId: 'lite6_robot',
-  componentProfileId: 'lite6_mock_commanded_v0',
-  modelFamilyId: 'lite6_lite_gripper',
-  tags: ['articulated-arm', 'gripper'],
-  lane: 'manyforge-only',
-  description: null,
-  sources: ['examples/mock_lite6_pneumatic_pick_and_place.scenario'],
-  components: [device, robot],
-};
-
-const roles = {
-  robot: { required_component_type_tags: ['articulated-arm'] },
-  tool: { required_component_type_tags: ['gripper'] },
-  camera: { required_component_type_tags: ['camera'] },
-};
 
 describe('Component Manager rows', () => {
   it('classifies Draft components against Manager Applied', () => {
@@ -205,65 +183,6 @@ describe('Add component rows', () => {
   });
 });
 
-describe('Program role feedback', () => {
-  const profiles = { [entry.componentProfileId]: { tags: entry.tags, attachmentInterfaces: ['flange'], tcpTargets: [] } };
-  const assignment = {
-    component_roles: [
-      { component_role_id: 'robot', controllable_component_id: 'lite6_robot' },
-      { component_role_id: 'tool', controllable_component_id: 'missing_tool' },
-      { component_role_id: 'camera', controllable_component_id: 'lite6_robot' },
-    ],
-  };
-
-  it('reports satisfied, unbound and incompatible roles', () => {
-    const rows = componentManagerRows(document(robot), ['lite6_robot']);
-    const feedback = roleFeedback({ ...roles, extra: {} }, assignment, rows, profiles);
-    expect(feedback.map((role) => [role.roleId, role.status])).toEqual([
-      ['robot', 'satisfied'],
-      ['tool', 'unbound'],
-      ['camera', 'incompatible'],
-      ['extra', 'unbound'],
-    ]);
-    expect(feedback[1].detail).toContain('"missing_tool" is not in the Deployment Draft');
-    expect(feedback[2].detail).toContain('camera');
-    expect(feedback[3].detail).toContain('assigns no component');
-  });
-
-  it('marks a role bound only by a Draft-added component as pending Apply', () => {
-    const rows = componentManagerRows(document(robot), null);
-    const [robotRole] = roleFeedback({ robot: roles.robot }, assignment, rows, profiles);
-    expect(robotRole.status).toBe('satisfied');
-    expect(robotRole.pendingApply).toBe(true);
-  });
-
-  it('reports unknown, never satisfied, for a profile without known type tags', () => {
-    const rows = componentManagerRows(document(robot), ['lite6_robot']);
-    const [camera] = roleFeedback({ camera: roles.camera }, assignment, rows, {});
-    expect(camera.status).toBe('unknown');
-    expect(camera.detail).toContain('not known');
-    // A role without required tags needs no type facts.
-    const [plain] = roleFeedback({ robot: {} }, assignment, rows, {});
-    expect(plain.status).toBe('satisfied');
-  });
-
-  it('reads tags from componentProfiles for a profile that has no catalog entry', () => {
-    const uf850 = { ...robot, component_id: 'uf850_robot', component_profile_id: 'uf850_xarm_gripper_mock_commanded_v0' };
-    const rows = componentManagerRows(document(uf850), ['uf850_robot']);
-    const bound = { component_roles: [{ component_role_id: 'tool', controllable_component_id: 'uf850_robot' }] };
-    expect(roleFeedback({ tool: roles.tool }, bound, rows, {})[0].status).toBe('unknown');
-    const known = { uf850_xarm_gripper_mock_commanded_v0: { tags: ['articulated-arm'], attachmentInterfaces: ['flange'], tcpTargets: [] } };
-    expect(roleFeedback({ tool: roles.tool }, bound, rows, known)[0].status).toBe('incompatible');
-    const withGripper = { uf850_xarm_gripper_mock_commanded_v0: { tags: ['articulated-arm', 'gripper'], attachmentInterfaces: ['flange'], tcpTargets: [] } };
-    expect(roleFeedback({ tool: roles.tool }, bound, rows, withGripper)[0].status).toBe('satisfied');
-  });
-
-  it('offers an entry for the open roles whose required tags it has', () => {
-    const rows = componentManagerRows(document(), null);
-    const feedback = roleFeedback(roles, assignment, rows, profiles);
-    expect(rolesFittingEntry(entry, feedback).map((role) => role.roleId)).toEqual(['robot', 'tool']);
-  });
-});
-
 describe('Component page facts', () => {
   const mockInput = (component: string, signal: string): Record<string, JsonValue> => ({
     controllable_component_id: component, command_target_id: 'io', resource_role_id: signal,
@@ -376,22 +295,10 @@ describe('Component page facts', () => {
     expect(componentFrameTargets(null, cell, 'lite6_robot')).toEqual([]);
   });
 
-  it('names the Program roles assigned to a component', () => {
-    const feedback = roleFeedback(
-      { arm: {}, gripper: {} },
-      { component_roles: [
-        { component_role_id: 'arm', controllable_component_id: 'lite6_robot' },
-        { component_role_id: 'gripper', controllable_component_id: 'lite_gripper' },
-      ] },
-      componentManagerRows(cell, ['lite6_robot']),
-      {},
-    );
-    expect(rolesOfComponent(feedback, 'lite6_robot').map((role) => role.roleId)).toEqual(['arm']);
-    expect(rolesOfComponent(feedback, 'gripper_io')).toEqual([]);
-  });
+
 });
 
-describe('machines: owners and members (CONTRACTS §16)', () => {
+describe('machines: owners and members', () => {
   const owner = { component_id: 'lite6', component_profile_id: 'ufactory.lite6_machine', lane: 'real', configuration: {} };
   const arm = {
     component_id: 'lite6_robot', component_profile_id: 'ufactory.lite6', owner: 'lite6', role: 'arm',

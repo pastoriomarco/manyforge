@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type { JsonValue, ProgramAuthoringDocument } from '../types/api';
+import type { ReferenceSelectorFacts } from '../utils/referenceValidation';
 import { reactPropsHost } from '../test/reactPropsHost';
 import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
 
@@ -44,7 +45,7 @@ function program(policies: JsonValue[]): ProgramAuthoringDocument {
   } as unknown as ProgramAuthoringDocument;
 }
 
-async function mount(policies: JsonValue[]) {
+async function mount(policies: JsonValue[], selectorFacts: ReferenceSelectorFacts | null = null) {
   const { host, find } = reactPropsHost();
   const mutate = vi.fn().mockResolvedValue({});
   const { createRoot } = await import('react-dom/client');
@@ -52,6 +53,7 @@ async function mount(policies: JsonValue[]) {
   await act(async () => {
     root.render(<ProgramContactPolicyEditor
       program={program(policies)}
+      selectorFacts={selectorFacts}
       draftRevision={1}
       busy={false}
       mutate={mutate as unknown as ProgramWorkspaceController['mutate']}
@@ -61,6 +63,36 @@ async function mount(policies: JsonValue[]) {
 }
 
 describe('ProgramContactPolicyEditor', () => {
+  it('preserves a direct component body on an existing policy', async () => {
+    const explicitPolicy = {
+      ...releasePolicy,
+      zones: [{ ...releasePolicy.zones[0], body_pairs: [{
+        ...endpointPair,
+        body_a: { kind: 'component_model_body', body: { component_id: 'tool', collision_body_id: 'jaw' } },
+      }] }],
+    };
+    const facts: ReferenceSelectorFacts = { components: [], targets: [], signals: [], frames: [], bodies: [
+      { reference: { component_id: 'tool', collision_body_id: 'jaw' }, ambiguous: false, moving_targets: [] },
+    ] };
+    const mounted = await mount([explicitPolicy as unknown as JsonValue], facts);
+    const startCap = mounted.find((props) => props.type === 'number' && props.value === 0.002);
+    await act(async () => { (startCap.onBlur as () => void)(); });
+    const written = mounted.mutate.mock.calls.at(-1);
+    expect((written?.[1] as { contact_policies: unknown[] }).contact_policies).toEqual([explicitPolicy]);
+    await mounted.unmount();
+  });
+
+  it('disables a body identity shared by multiple model occurrences', () => {
+    const facts: ReferenceSelectorFacts = { components: [], targets: [], signals: [], frames: [], bodies: [
+      { reference: { component_id: 'tool', collision_body_id: 'jaw' }, ambiguous: true, moving_targets: [] },
+    ] };
+    const markup = renderToStaticMarkup(<ProgramContactPolicyEditor
+      program={program([])} selectorFacts={facts} draftRevision={1} busy={false}
+      mutate={vi.fn() as unknown as ProgramWorkspaceController['mutate']}
+    />);
+    expect(markup).toContain('Ambiguous collision body identity.');
+    expect(markup).toContain('disabled=""');
+  });
   it('shows a release policy as Release with its own envelope, never as a grasp', () => {
     const markup = renderToStaticMarkup(<ProgramContactPolicyEditor
       program={program([releasePolicy as unknown as JsonValue])}

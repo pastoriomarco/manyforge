@@ -51,6 +51,7 @@ from .deployment_intent import (
 from .draft_session import DraftSessionError
 from .apply_orchestration import (
     DEFAULT_LIFECYCLE_TIMEOUT_S,
+    HOST_COMPONENT_STOP_GRACE_S,
     ApplyRefused,
     ApplyStepFailed,
     Preview,
@@ -197,7 +198,7 @@ class DiscardDeploymentRequest(_LocalFence):
 
 
 class DeploymentCandidateRequest(_Fence):
-    """The fence of one server-run Preview/Apply/Revert (CONTRACTS §11).
+    """The fence of one server-run Preview/Apply/Revert.
 
     Built by the server from the current Drafts, workspace and admission
     generation (:func:`server_deployment_fence`); the request body is ``{}``.
@@ -205,7 +206,7 @@ class DeploymentCandidateRequest(_Fence):
 
 
 class ServerApplyRequest(BaseModel):
-    """CONTRACTS §11: Preview takes an empty body."""
+    """Preview takes an empty body."""
 
     model_config = _DTO
 
@@ -224,8 +225,8 @@ def activation_scope(state: ComposerState) -> dict[str, Any]:
     """The complete activation input a Preview is computed from.
 
     Deployment activation compiles the Deployment Draft together with the
-    current Program Draft, the Scenario's Program role assignment and its
-    source document; the scope names all of them.
+    current Program Draft and the Scenario source document; the scope names
+    all of them.
     """
 
     deployment = state.deployment_draft_session.retained_state()
@@ -241,7 +242,6 @@ def activation_scope(state: ComposerState) -> dict[str, Any]:
         "program_draft_revision": program.get("draft_revision"),
         "program_revision": program.get("program_revision"),
         "source_document_digest": state.scenario_source_document_digest,
-        "program_role_assignment": deepcopy(state.scenario_program_role_assignment),
     }
 
 
@@ -992,7 +992,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             _raise(error)
 
     def revert_ports(body: DeploymentCandidateRequest) -> "HeadlessApplyPorts":
-        """Revert on the one Apply path (CONTRACTS §11): the Saved Scenario is
+        """Revert on the one Apply path: the Saved Scenario is
         applied like any Deployment, and both Drafts return to Saved in the
         workspace commit right before the Manager submission."""
 
@@ -1025,17 +1025,11 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             _raise(error)
         saved_program = program_restore.saved_program
         program = saved_program.to_dict() if saved_program is not None else None
-        assignment = (
-            deepcopy(state.scenario_program_role_assignment)
-            if program is not None
-            else {"component_roles": [], "target_roles": []}
-        )
         source_document_digest = state.scenario_source_document_digest
         scenario_id = state.scenario_document_id
         project_path = state.scenario_project_path
         if (
-            not isinstance(assignment, dict)
-            or not isinstance(source_document_digest, str)
+            not isinstance(source_document_digest, str)
             or not isinstance(scenario_id, str)
             or not isinstance(project_path, str)
         ):
@@ -1057,7 +1051,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     "deployment": saved,
                     "model_source_closure": source_closure,
                     "program": program,
-                    "program_role_assignment": assignment,
                 }
             )
         )
@@ -1085,7 +1078,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             "captured_input_digest": captured_input_digest,
             "model_source_closure": source_closure,
             "program": deepcopy(program),
-            "program_role_assignment": assignment,
             "deployment": deepcopy(saved),
             "expected_manager_current": {
                 "retained_bundle_id": current_bundle,
@@ -1201,7 +1193,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/deployment/revert/preview")
     def preview_revert(body: ServerApplyRequest) -> dict[str, Any]:
-        """Per-component impact of reverting to the Saved Scenario (§11)."""
+        """Per-component impact of reverting to the Saved Scenario."""
         try:
             scope = activation_scope(state)
             return preview_view(
@@ -1277,13 +1269,11 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 )
             )
         program = state.draft_session.retained_state().get("program")
-        assignment = deepcopy(state.scenario_program_role_assignment)
         source_document_digest = state.scenario_source_document_digest
         scenario_id = state.scenario_document_id
         project_path = state.scenario_project_path
         if (
             not isinstance(program, dict)
-            or not isinstance(assignment, dict)
             or not isinstance(source_document_digest, str)
             or not isinstance(scenario_id, str)
             or not isinstance(project_path, str)
@@ -1292,7 +1282,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 DeploymentDraftError(
                     "activation_input_incomplete",
                     "Save or load one complete Scenario document with Program, "
-                    "Deployment, and explicit role assignment before preparation",
+                    "and Deployment before preparation",
                     status_code=409,
                 )
             )
@@ -1318,7 +1308,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 applied_context is not None
                 and applied_context.get("deployment") == deployment
                 and applied_context.get("model_source_closure") == source_closure
-                and applied_context.get("program_role_assignment") == assignment
                 and applied_context.get("source_document_digest") == source_document_digest
                 and applied_context.get("scenario_id") == scenario_id
                 and applied_context.get("scenario_project_path") == project_path
@@ -1346,7 +1335,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     "deployment": deployment,
                     "model_source_closure": source_closure,
                     "program": program,
-                    "program_role_assignment": assignment,
                 }
             )
         )
@@ -1368,7 +1356,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             "model_source_closure": source_closure,
             "deployment": deepcopy(deployment),
             "program": deepcopy(program),
-            "program_role_assignment": assignment,
             "expected_manager_current": {
                 "retained_bundle_id": current_bundle,
                 "graph_revision": current_graph,
@@ -1403,7 +1390,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             latest_bundle, latest_graph = manager_current()
             if (
                 state.draft_session.retained_state().get("program") != program
-                or state.scenario_program_role_assignment != assignment
                 or state.scenario_source_document_digest != source_document_digest
                 or (
                     _claim is not None
@@ -1513,7 +1499,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/deployment/preview")
     def preview_deployment(body: ServerApplyRequest) -> dict[str, Any]:
-        """Per-component impact of applying the current Draft (CONTRACTS §11),
+        """Per-component impact of applying the current Draft,
         the Program's outcome, attachment changes and detached components, and
         the ``scope`` the Apply sends back."""
         try:
@@ -1648,16 +1634,13 @@ class HeadlessApplyPorts:
 
     def reset_cycle(self) -> None:
         """Reset the finished or held run (as the Program tab's Reset, no
-        options) and return once the cycle is idle again and the Kernel's
-        authoring admission has reopened.
+        options) and return once the cycle is idle again.
 
         The Runner's Idle reaches the Kernel admission through the Manager's
-        readiness update, a moment later; the Apply's preparation and claim
-        need that admission (as the Program tab's Reset-then-Apply waits for
-        it). Bounded by :meth:`_apply_bound_s`, as the Manager Apply's wait;
-        past it the Apply fails ``program_cycle_reset_failed``, or
-        ``authoring_not_ready`` when the cycle is idle but admission stays
-        closed.
+        readiness update, a moment later; the Apply's preparation waits for
+        that admission itself (Headless ``prepare_activation``). Bounded by
+        :meth:`_apply_bound_s`, as the Manager Apply's wait; past it the Apply
+        fails ``program_cycle_reset_failed``.
         """
 
         cycle = self._client.program_cycle_status()
@@ -1693,9 +1676,8 @@ class HeadlessApplyPorts:
                 and current["cycle_generation"] > generation
             )
             if idle:
-                if self._authoring_allowed():
-                    return
-            elif state not in (cycle.get("state"), "resetting"):
+                return
+            if state not in (cycle.get("state"), "resetting"):
                 failure = current.get("failure")
                 failure = failure if isinstance(failure, dict) else {}
                 raise ApplyStepFailed(
@@ -1706,39 +1688,9 @@ class HeadlessApplyPorts:
                     ),
                 )
             if time.monotonic() >= deadline:
-                if idle:
-                    raise ApplyStepFailed(
-                        "authoring_not_ready",
-                        "Authoring admission didn't reopen within "
-                        f"{bound_s:g} s after the Program Reset",
-                    )
                 raise ApplyStepFailed(
                     "program_cycle_reset_failed",
                     f"The Program Reset before the Apply didn't finish within {bound_s:g} s",
-                )
-            time.sleep(self._POLL_SECONDS)
-
-    def _authoring_allowed(self) -> bool:
-        return self._client.authoring_admission().get("authoring_allowed") is True
-
-    def await_authoring(self) -> None:
-        """Return once the Kernel's authoring admission is open.
-
-        The Runner's Idle reaches the Kernel admission a moment after the
-        cycle reads idle (see :meth:`reset_cycle`): a Load or Apply right
-        after the operator's Reset waits for it (R3). Bounded by
-        :meth:`_apply_bound_s`; past it the Apply fails
-        ``authoring_not_ready``."""
-
-        if self._authoring_allowed():
-            return
-        bound_s = self._apply_bound_s()
-        deadline = time.monotonic() + bound_s
-        while not self._authoring_allowed():
-            if time.monotonic() >= deadline:
-                raise ApplyStepFailed(
-                    "authoring_not_ready",
-                    f"Authoring admission didn't reopen within {bound_s:g} s",
                 )
             time.sleep(self._POLL_SECONDS)
 
@@ -1754,14 +1706,15 @@ class HeadlessApplyPorts:
     def _apply_bound_s(self) -> float:
         # The lifecycle timeouts of every component in the candidate or the
         # installed cell (the components the host may stop or start; the
-        # default for one without an authored timeout, as the Manager's
-        # `HostApplyTimeout`), at least one default timeout. The installed
-        # components are read from the host: the remembered Applied document
-        # may not be verified yet.
+        # default for one without an authored timeout), each with the host's
+        # stop grace for retiring its launch (a hung one waits for the group
+        # SIGKILL, F8), as the Manager's `HostApplyTimeout`; at least one
+        # default timeout. The installed components are read from the host:
+        # the remembered Applied document may not be verified yet.
         installed = {str(row.get("component_id")) for row in self.components()}
         return max(
             DEFAULT_LIFECYCLE_TIMEOUT_S,
-            sum(self.lifecycle_timeout_s(component_id)
+            sum(self.lifecycle_timeout_s(component_id) + HOST_COMPONENT_STOP_GRACE_S
                 for component_id in self._component_ids | installed),
         )
 
@@ -1831,6 +1784,15 @@ class HeadlessApplyPorts:
                 and (clear.get("apply_id"), clear.get("apply_generation")) == identity
                 and clear.get("state") != "pending"
             ):
+                reason = clear.get("reason")
+                details = reason.get("details") if isinstance(reason, dict) else None
+                if clear.get("state") == "unknown" and isinstance(details, dict):
+                    cause = details.get("cause_code")
+                    if isinstance(cause, str) and cause:
+                        logging.getLogger(__name__).warning(
+                            "Scene clear after Apply %s/%s outcome unknown: cause_code=%s cause_details=%s",
+                            *identity, cause, details.get("cause_details"),
+                        )
                 return
             if time.monotonic() >= deadline:
                 logging.getLogger(__name__).warning(

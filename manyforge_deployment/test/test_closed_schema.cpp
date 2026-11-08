@@ -812,7 +812,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       EXPECT_EQ(
           entry.compiled_schema()->schema_revision().value(),
           "sha256:"
-          "c7ad633867abbe4583dee2eda51dca5b33bd8e8827777a8ac9ab86b2aba20490");
+          "f7adb173ef71d9de9011c85a19224cace5e721918fb1659fcada6ab93901ad33");
       EXPECT_EQ(registry.find_qualified_catalog_schema(
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
@@ -1438,7 +1438,7 @@ TEST(ClosedSchema,
                  core::CatalogRecordKind::kContactPolicy) {
         expected_revision =
             "sha256:"
-            "c7ad633867abbe4583dee2eda51dca5b33bd8e8827777a8ac9ab86b2aba20490";
+            "f7adb173ef71d9de9011c85a19224cace5e721918fb1659fcada6ab93901ad33";
         expected_path = "catalog/manyforge.contact_policy.v1.yaml";
       } else if (built.record_kind() ==
                  core::CatalogRecordKind::kControlInterfaceContract) {

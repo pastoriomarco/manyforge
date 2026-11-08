@@ -7,7 +7,7 @@
 
 namespace manyforge::core {
 
-/// Exact original-Manager Q101 product-adoption input. Durable values and
+/// Exact original-Manager product-adoption input. Durable values and
 /// remote status readback do not recreate the original operation lifetime or
 /// an owner-local HeldStatusView. Scene independently checks its local state.
 struct QualifiedSceneProductAdoptionRequestDTO final {

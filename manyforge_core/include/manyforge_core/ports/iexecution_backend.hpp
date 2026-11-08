@@ -9,16 +9,18 @@
 #include <manyforge_core/types/prepared_execution.hpp>
 #include <manyforge_core/types/runtime_scale.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <stop_token>
 #include <utility>
 
 namespace manyforge::core {
 
-/// A critical internal fault of a dispatched execution (item 17; Q52: a
+/// A critical internal fault of a dispatched execution (a
 /// controller cycle later than the lane margin). A backend reports it by
-/// throwing it from the execution handle; the Kernel's item-17 path issues
+/// throwing it from the execution handle; the Kernel's critical-fault path issues
 /// the lane's hard stop (`stop()`) and ends the motion InterventionRequired
 /// with `error`, exactly as for a worker exception after dispatch.
 class ExecutionCriticalFault final : public std::runtime_error {
@@ -31,7 +33,7 @@ class ExecutionCriticalFault final : public std::runtime_error {
   ErrorDTO error_;
 };
 
-/// Execution backend interface (spec 220 §4)
+/// Execution backend interface
 ///
 /// Responsibilities:
 /// - Execute a time-parameterized joint trajectory
@@ -90,10 +92,16 @@ class IExecutionBackend : public IControlDomainExecutionPort {
         .value();
   }
 
+  /// Called by `DispatchReplacement` with no lock held, after any release
+  /// hold and immediately before the goal send. An error cancels the send:
+  /// the replacement is not dispatched and reports that error.
+  using ReplacementSendRecheck = std::function<std::optional<ErrorDTO>()>;
+
   virtual PreparedMotionReplacementDispatchDTO DispatchReplacement(
       const PreparedMotionReplacementSourceDTO& /*source*/, std::uint64_t /*candidate_id*/,
       const PreparedOperationParticipantDTO& /*participant*/,
-      const ExecutionGoalKey& /*successor_goal*/, std::int64_t /*preparation_deadline_ns*/) {
+      const ExecutionGoalKey& /*successor_goal*/, std::int64_t /*preparation_deadline_ns*/,
+      const ReplacementSendRecheck& /*recheck_before_send*/ = {}) {
     return {{ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kUnsupported,
              ErrorDTO{kErrorUnsupportedCapability, "Motion replacement is unsupported", {}}},
             std::nullopt};
@@ -110,7 +118,7 @@ class IExecutionBackend : public IControlDomainExecutionPort {
     return Result<void>::Err(ErrorCode::kUnsupportedCapability);
   }
 
-  /// M6b: the apply-tool-context action of a new (non-replacement) goal, run
+  /// The apply-tool-context action of a new (non-replacement) goal, run
   /// by the Kernel before the motion counts as running and before `Dispatch`:
   /// the lane sends the robot's TCP and payload for this motion when they
   /// differ and waits until the robot has settled. An error refuses the
@@ -126,7 +134,7 @@ class IExecutionBackend : public IControlDomainExecutionPort {
                                    const ControllerGoalId& controller_goal_id,
                                    ControllerGoalGeneration controller_goal_generation) = 0;
 
-  /// Execute a trajectory (spec 220 §4)
+  /// Execute a trajectory
   ///
   /// @param trajectory The trajectory to execute
   /// @return ExecutionHandle for tracking the execution
@@ -144,14 +152,14 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   /// contract; controller feedback remains conformance evidence there.
   virtual Result<void> sync_observed_state_before_planning() = 0;
 
-  /// Stop the current execution (spec 220 §4)
+  /// Stop the current execution
   ///
   /// If no execution is in flight, returns accepted=false with invalid_request.
   ///
   /// @return StopResultDTO indicating whether stop was accepted
   virtual StopResultDTO stop() = 0;
 
-  /// Reset the execution backend (spec 220 §4)
+  /// Reset the execution backend
   ///
   /// @return ResetResultDTO indicating whether reset was accepted
   virtual ResetResultDTO reset() = 0;
@@ -164,7 +172,7 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   /// know which ROS topics/actions produced it.
   virtual ExecutionSnapshot get_execution_snapshot() const = 0;
 
-  /// Dedicated observed-robot-state publication (spec/210 section 3.13).
+  /// Dedicated observed-robot-state publication.
   ///
   /// This is deliberately separate from get_execution_snapshot(): lifecycle
   /// state is not robot-state authority. The returned object is backend-owned,
@@ -175,7 +183,16 @@ class IExecutionBackend : public IControlDomainExecutionPort {
     return nullptr;
   }
 
-  /// Dedicated exact trajectory-time cursor publication (spec/210 §3.14).
+  /// Exact prepared execution (zero when none) and first observation sequence
+  /// after an owner rebuild.
+  virtual std::optional<std::pair<std::uint64_t, std::uint64_t>>
+  owner_rebuild_observation() const { return std::nullopt; }
+  virtual void record_owner_rebuild_rest(std::uint64_t) noexcept {}
+  virtual bool owner_rebuild_unknown_candidate(std::uint64_t, std::uint64_t) const {
+    return false;
+  }
+
+  /// Dedicated exact trajectory-time cursor publication.
   /// This is distinct from lifecycle progress and observed robot state. A
   /// null result means generation-fenced runtime lookahead is unavailable.
   virtual const ExecutionProgressPublication* execution_progress_publication() const noexcept {
@@ -206,7 +223,7 @@ class IExecutionBackend : public IControlDomainExecutionPort {
 
   /// Update the runtime velocity scale used by active execution.
   ///
-  /// ADR-0018: this is a live control surface, not a trajectory planning
+  /// This is a live control surface, not a trajectory planning
   /// parameter. Implementations SHOULD use an atomic / lock-free store so
   /// discrete trajectory workers can read it cheaply on every tick. A scale
   /// of 0.0 means "hold trajectory time" rather than Stop. Inputs MUST be
@@ -216,6 +233,13 @@ class IExecutionBackend : public IControlDomainExecutionPort {
     // Default: no-op. Backends that support runtime velocity scaling override.
   }
 
+  /// OD-72: the same update ordered by the accepted value's process-wide
+  /// sequence: a value older than one already applied is superseded (latest
+  /// value wins), never an error. Sequence 0 is unordered.
+  virtual void apply_runtime_velocity_scale(double scale, std::uint64_t /*sequence*/) {
+    set_runtime_velocity_scale(scale);
+  }
+
   /// Observer-safe acknowledgement/application status for the private
   /// mechanism. `supported=false` is the fail-closed default; retained
   /// binding qualification is a separate mandatory admission check.
@@ -223,8 +247,16 @@ class IExecutionBackend : public IControlDomainExecutionPort {
     return RuntimeScaleMechanismStatusDTO{};
   }
 
+  /// Lock-free, non-waiting availability of the mechanism (see
+  /// `RuntimeScaleMechanismAvailability`). Backends without a dynamic fact
+  /// keep the qualification-only default.
+  [[nodiscard]] virtual RuntimeScaleMechanismAvailability runtime_velocity_scale_availability()
+      const noexcept {
+    return RuntimeScaleMechanismAvailability::kAvailable;
+  }
+
   // ---------------------------------------------------------------
-  // Controlled-stop capability surface (spec/240).
+  // Controlled-stop capability surface.
   //
   // The kernel reads this once at arm time to enforce pre-dispatch
   // capability gating on `complete_move_on_signal` scopes. Default
@@ -241,7 +273,7 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   }
 
   // ---------------------------------------------------------------
-  // Controlled-stop result surface (spec/260 §5.6).
+  // Controlled-stop result surface.
   //
   // Called by the kernel at trip time when a `complete_move_on_signal`
   // latch fires. The backend MUST execute the requested stop mode (or the

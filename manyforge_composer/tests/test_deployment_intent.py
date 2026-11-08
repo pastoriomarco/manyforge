@@ -52,7 +52,7 @@ def test_mounted_child_omits_its_root_pose() -> None:
 
 
 def test_custom_tcps_are_validated_and_sorted() -> None:
-    # TCP-A: a component row's GUI-authored custom TCPs, in the spec 210
+    # A component row's GUI-authored custom TCPs, in the
     # authoring pose shape; the compiler resolves parents and chaining.
     intent = _intent()
     robot = next(row for row in intent["components"] if row["component_id"] == "robot_a")
@@ -94,7 +94,7 @@ def test_custom_tcps_are_validated_and_sorted() -> None:
 
 
 def test_default_tcp_and_primary_mount_pass_through() -> None:
-    # B5: a component's `default_tcp` pair and a mount's `primary` flag are
+    # A component's `default_tcp` pair and a mount's `primary` flag are
     # authored fields; the compiler checks them against the component types.
     intent = _intent()
     robot = next(row for row in intent["components"] if row["component_id"] == "robot_a")
@@ -425,10 +425,10 @@ def test_draft_session_edits_one_authored_stop_profile_by_target(stop_mode: str)
             "settle_velocity_threshold_rad_s": 0.02,
         }
     ]
-    # Q51: the robot's own explicit maximum Stop time lives in its profile.
+    # The robot's own explicit maximum Stop time lives in its profile.
     assert stop["max_stop_time_s"] == 3.0
     assert "timing" not in stop
-    # Q51: a maximum shorter than the deceleration is the robot's own choice,
+    # A maximum shorter than the deceleration is the robot's own choice,
     # not an Apply-time refusal.
     shorter = session.preview_controlled_stop_update(
         {**stop_profile, "deceleration_time_s": 1.1, "max_stop_time_s": 0.5},
@@ -862,7 +862,7 @@ def test_recorded_fallbacks_read_legacy_substitution_and_refuse_both() -> None:
     assert fallback_candidates("hard_deceleration") == ()
 
 
-# --- machines: owner and member rows (CONTRACTS §16) ----------------------
+# --- machines: owner and member rows ------------------------------------
 
 
 def _machine_intent() -> dict:

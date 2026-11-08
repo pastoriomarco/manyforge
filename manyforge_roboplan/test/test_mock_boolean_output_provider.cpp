@@ -309,7 +309,7 @@ TEST(MockBooleanOutputConfigurationTest,
   EXPECT_FALSE(MockBooleanOutputProvider::Create(clock, config).ok());
 }
 
-// CONTRACTS §6, §7: the one write of one exact alias: refused
+// The one write of one exact alias: refused
 // before anything is written while its occurrence is disabled, then taken by
 // the model at once with the same echo; another component's alias of the
 // same name stays its own.

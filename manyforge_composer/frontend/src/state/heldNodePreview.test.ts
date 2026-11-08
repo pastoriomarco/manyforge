@@ -102,32 +102,27 @@ describe('held node preview ghost', () => {
     program_revision: digest('a'),
     retained_bundle_id: 'bundle.1',
     graph_revision: digest('9'),
-    target_role_bindings: [{
-      target_role_id: 'arm', component_role_id: 'picker',
-      controllable_component_id: 'lite6', command_target_id: 'lite6.arm',
-    }],
+    target_bindings: [{ target: { component_id: 'lite6', command_target_id: 'lite6.arm' } }],
   } as unknown as ProgramBindingDocument;
   const receipt = {
     programBindingId: digest('c'), programRevision: digest('a'),
     retainedBundleId: 'bundle.1', graphRevision: digest('9'),
-    componentRoleId: 'picker', targetRoleId: 'arm',
+    target: { componentId: 'lite6', commandTargetId: 'lite6.arm' },
     sourceJointNames: ['j1', 'j2'], finalPositionsRad: [0.1, 0.2],
   } as unknown as MotionPreviewReceipt;
   const result = {
     programBindingId: digest('c'), programRevision: digest('a'),
     target: {
-      targetRoleId: 'arm', componentRoleId: 'picker',
-      controllableComponentId: 'lite6', commandTargetId: 'lite6.arm',
+      componentId: 'lite6', commandTargetId: 'lite6.arm',
     },
     unavailableReason: null,
     preview: { ok: true, receipt },
   } as unknown as ProgramNodeCorrectionPreview;
-  // Manual control uses its own binding and role names for the same robot.
+  // Manual control uses its own Binding for the same direct target identity.
   const manual = [{
-    programBindingId: digest('m'), componentRoleId: 'manual_arm', targetRoleId: 'manual',
+    programBindingId: digest('m'), controllableComponentId: 'lite6', commandTargetId: 'lite6.arm',
     targetDescriptor: {
       controllableComponentId: 'lite6', commandTargetId: 'lite6.arm',
-      componentRoleId: 'manual_arm', targetRoleId: 'manual',
       joints: [{ sourceJointName: 'j1' }, { sourceJointName: 'j2' }],
     },
   }] as unknown as DirectControlMotionStatus[];
@@ -150,8 +145,8 @@ describe('held node preview ghost', () => {
     ))).toContain('Applied');
     expect(reason(heldNodeGhostSource(result, {
       ...binding,
-      target_role_bindings: [{ ...binding.target_role_bindings[0], command_target_id: 'other.arm' }],
-    }, manual))).toContain('does not bind picker/arm');
+      target_bindings: [{ ...binding.target_bindings[0], target: { component_id: 'lite6', command_target_id: 'other.arm' } }],
+    }, manual))).toContain('does not bind lite6/lite6.arm');
     expect(reason(heldNodeGhostSource(result, binding, []))).toContain('No robot model');
     expect(reason(heldNodeGhostSource(result, binding, [{
       ...manual[0],

@@ -19,12 +19,12 @@ import { componentTree, flattenComponentTree } from '../state/componentPresentat
 
 /**
  * Pure helpers of the Components section (one page per component) and of the
- * Deployment tabs (Overview, Roles, Cell settings, Changes). The Deployment
+ * Deployment tabs (Overview, Program binding, Cell settings, Changes). The Deployment
  * Draft, Manager Applied and the Manager preview stay the authorities; these
  * only present them and prepare an Add component edit.
  */
 
-export type ComponentManagerTab = 'overview' | 'roles' | 'cell' | 'changes';
+export type ComponentManagerTab = 'overview' | 'binding' | 'cell' | 'changes';
 
 /** One component of the Draft or of Manager Applied. */
 export interface ComponentManagerRow {
@@ -34,7 +34,7 @@ export interface ComponentManagerRow {
   kind: ComponentCatalogKind | null;
   /** A mounted tool's parent interface, `<robot>.<interface>`; null otherwise. */
   mount: string | null;
-  /** A member's owner component (CONTRACTS §16); null for owners and owner-less components. */
+  /** A member's owner component; null for owners and owner-less components. */
   owner: string | null;
   /** A member's slot in its machine (`arm`, `controller_io`, ...); null otherwise. */
   role: string | null;
@@ -44,17 +44,6 @@ export interface ComponentManagerRow {
   change: 'applied' | 'added' | 'removed';
   /** Its level in the list's tree: 0 at the top, +1 under its owner or the component it is mounted on. */
   depth: number;
-}
-
-export interface RoleFeedback {
-  roleId: string;
-  componentId: string | null;
-  requiredTags: string[];
-  /** `unknown`: the role requires type tags and the component's profile has no known tags. */
-  status: 'satisfied' | 'unbound' | 'incompatible' | 'unknown';
-  /** Satisfied by a component that runs only after the next Apply. */
-  pendingApply: boolean;
-  detail: string;
 }
 
 export const COMPONENT_KIND_LABELS: Record<ComponentCatalogKind, string> = {
@@ -83,14 +72,10 @@ function record(value: JsonValue | undefined): Record<string, JsonValue> | null 
     ? value : null;
 }
 
-function strings(value: JsonValue | undefined): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
-}
-
 /**
  * A model row is a tool when its component type is tagged `tool`, else a
  * robot; a member without a model source is an I/O bank (its signals come
- * from its model, CONTRACTS §16).
+ * from its model).
  */
 export function componentKindOf(
   row: Record<string, JsonValue>,
@@ -102,7 +87,7 @@ export function componentKindOf(
     ?? (facts?.tags.includes('tool') ? 'tool' : 'robot');
 }
 
-/** The owner a Draft row names (CONTRACTS §16), or null. */
+/** The owner a Draft row names, or null. */
 export function ownerOf(row: Record<string, JsonValue>): string | null {
   return typeof row.owner === 'string' ? row.owner : null;
 }
@@ -245,7 +230,7 @@ export function componentManagerRows(
   ].sort((left, right) => left.componentId.localeCompare(right.componentId)), parents);
 }
 
-/** Sorted rows as one tree: members under their owner (CONTRACTS §16), a mounted component under its parent. */
+/** Sorted rows as one tree: members under their owner, a mounted component under its parent. */
 function componentListTree(
   rows: ComponentManagerRow[],
   mounts: Readonly<Record<string, string>>,
@@ -284,14 +269,14 @@ export function nextFreeComponentId(id: string, taken: ReadonlySet<string>): str
   }
 }
 
-/** A member's default id (CONTRACTS §11, §16). */
+/** A member's default id. */
 export function defaultMemberId(ownerId: string, role: string): string {
   return `${ownerId}_${role}`;
 }
 
 /**
- * Add component for a machine model (CONTRACTS §11, §16; MACHINES-BOUNDARY
- * §5): one entry with the model's ready rows as they are (ids
+ * Add component for a machine model: one entry with the model's ready
+ * rows as they are (ids
  * `default_owner_id` and `<default_owner_id>_<role>`, inner references
  * included): the owner on `lane`, each member naming its owner and role.
  * Id edits rename them like any catalog entry (`renameComponentRows`).
@@ -328,7 +313,7 @@ export function framePrefixFor(componentId: string): string {
 /**
  * The rows with components renamed: every `component_id` and
  * `controllable_component_id` naming a renamed component, a member row's
- * `owner` (CONTRACTS §16), and every `source_id` it prefixes (`<id>.<signal>`).
+ * `owner`, and every `source_id` it prefixes (`<id>.<signal>`).
  */
 export function renameComponentRows(
   rows: ReadonlyArray<Record<string, JsonValue>>,
@@ -394,59 +379,6 @@ export function addComponentProblem(
     seen.add(id);
   }
   return null;
-}
-
-/**
- * Each Program component role against the Draft: the Scenario's role
- * assignment names the component; the role is satisfied when the Draft has it
- * with the required type tags. The tags come from the catalog's
- * `componentProfiles`; a required tag on a profile without known tags is `unknown`.
- */
-export function roleFeedback(
-  componentRoles: Record<string, JsonValue> | null,
-  assignment: Record<string, JsonValue> | null,
-  rows: readonly ComponentManagerRow[],
-  profiles: Readonly<Record<string, ComponentProfileFacts>>,
-): RoleFeedback[] {
-  const assigned = new Map<string, string>();
-  const assignedRows = assignment?.component_roles;
-  for (const row of Array.isArray(assignedRows) ? assignedRows : []) {
-    const value = record(row);
-    if (typeof value?.component_role_id === 'string' && typeof value.controllable_component_id === 'string') {
-      assigned.set(value.component_role_id, value.controllable_component_id);
-    }
-  }
-  return Object.entries(componentRoles ?? {}).map(([roleId, role]): RoleFeedback => {
-    const requiredTags = strings(record(role)?.required_component_type_tags);
-    const componentId = assigned.get(roleId) ?? null;
-    const base = { roleId, componentId, requiredTags, pendingApply: false };
-    if (componentId === null) {
-      return { ...base, status: 'unbound', detail: 'The Scenario assigns no component to this role.' };
-    }
-    const row = rows.find((candidate) => candidate.componentId === componentId && candidate.change !== 'removed');
-    if (row === undefined) {
-      return { ...base, status: 'unbound',
-        detail: `"${componentId}" is not in the Deployment Draft. Add a component with this id.` };
-    }
-    const tags = row.profileId === null ? undefined : profiles[row.profileId]?.tags;
-    if (tags === undefined && requiredTags.length > 0) {
-      return { ...base, status: 'unknown', pendingApply: row.change === 'added',
-        detail: `The type of "${componentId}" is not known, so its fit for this role is not checked.` };
-    }
-    const missing = requiredTags.filter((tag) => !tags?.includes(tag));
-    if (missing.length > 0) {
-      return { ...base, status: 'incompatible',
-        detail: `"${componentId}" lacks the required type ${missing.join(', ')}.` };
-    }
-    return { ...base, status: 'satisfied', pendingApply: row.change === 'added',
-      detail: row.change === 'added' ? `"${componentId}" runs after the next Apply.` : `Bound to "${componentId}".` };
-  });
-}
-
-/** Unbound roles whose required type tags the entry has (roles with requirements only). */
-export function rolesFittingEntry(entry: ComponentCatalogEntry, feedback: readonly RoleFeedback[]): RoleFeedback[] {
-  return feedback.filter((role) => role.status === 'unbound' && role.requiredTags.length > 0
-    && role.requiredTags.every((tag) => entry.tags.includes(tag)));
 }
 
 /** One Applied target of a component with its frames (source model). */
@@ -591,9 +523,4 @@ export function componentSignals(
   const order = (left: ComponentSignal, right: ComponentSignal) => (
     left.componentId.localeCompare(right.componentId) || left.signalName.localeCompare(right.signalName));
   return { owned: owned.sort(order), uses: uses.sort(order), usedBy: usedBy.sort(order) };
-}
-
-/** The Program roles the Scenario assigns to a component, as their feedback rows. */
-export function rolesOfComponent(feedback: readonly RoleFeedback[], componentId: string): RoleFeedback[] {
-  return feedback.filter((role) => role.componentId === componentId);
 }

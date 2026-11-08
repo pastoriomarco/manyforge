@@ -1,6 +1,15 @@
 #!/bin/bash
 set -e
 
+# OD-59: the strict real-time profile locks the process memory (mlockall);
+# it needs an unlimited memlock limit (`docker run --ulimit memlock=-1:-1`,
+# compose `ulimits: memlock: -1`). Refuse to start without it.
+if [ "${MANYFORGE_RT_RESOURCE_PROFILE:-off}" = "strict" ] && [ "$(ulimit -l)" != "unlimited" ]; then
+    echo "manyforge_rt_profile_refused reason=rt_memlock_limit_not_unlimited limit=$(ulimit -l):" \
+         "the strict real-time profile needs an unlimited memlock limit" >&2
+    exit 1
+fi
+
 
 # Keep bytecode caches out of the bind-mounted workspace: container
 # processes run as root and root-owned __pycache__ dirs break host-side
@@ -25,9 +34,10 @@ if [ -f "/opt/manyforge/topic_based_ros2_control/install/setup.bash" ]; then
 fi
 
 # Pinned ROS dependency overlays of the full Lyrical image: xArm driver, then
-# the controller overlay (stock JTC 6.10.0) last so that its packages take
-# precedence. Local setups keep the order above unchanged.
-for overlay in /opt/manyforge/xarm_ws/install /opt/manyforge/control_overlay; do
+# the controller overlay (stock JTC 6.10.0) and the rmw_fastrtps 9.4.11 overlay
+# last so that their packages take precedence. Local setups keep the order above
+# unchanged.
+for overlay in /opt/manyforge/xarm_ws/install /opt/manyforge/control_overlay /opt/manyforge/rmw_fastrtps_overlay; do
     if [ -f "${overlay}/local_setup.bash" ]; then
         # shellcheck disable=SC1090,SC1091
         set +u

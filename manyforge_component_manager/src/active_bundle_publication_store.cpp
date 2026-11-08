@@ -1281,7 +1281,13 @@ class SqliteActiveBundlePublicationStore::Impl final {
     std::lock_guard lock(mutex_);
     RequireOpen();
     Transaction transaction(database_, "BEGIN IMMEDIATE");
-    const auto integrity = VerifyIntegrityLocked();
+    // The complete verification runs at open and on explicit request. Publish
+    // reads only the state it decides on; a receipt it reads is still
+    // decoded and digest-checked.
+    const auto current_generation = HeadLocked().generation;
+    const auto receipt_count = ScalarInteger(
+        database_,
+        "SELECT COUNT(*) FROM active_bundle_publication_receipts");
 
     if (const auto existing = ReceiptByTransactionLocked(encoded);
         existing.has_value()) {
@@ -1293,8 +1299,6 @@ class SqliteActiveBundlePublicationStore::Impl final {
       transaction.Commit();
       return existing->receipt;
     }
-    const auto current_generation =
-        static_cast<std::int64_t>(integrity.current_generation.value());
     if (encoded.expected_previous_generation != current_generation) {
       throw ActiveBundlePublicationConflictError(
           "active-bundle publication compare-and-swap generation "
@@ -1321,8 +1325,7 @@ class SqliteActiveBundlePublicationStore::Impl final {
     // receipt is the head or not yet written. A replay of an evicted old
     // transaction cannot republish: its expected previous generation is
     // older than the head, so the compare-and-swap below refuses it.
-    if (integrity.receipt_count >=
-        kMaximumActiveBundlePublicationReceipts) {
+    if (receipt_count >= kMaximumActiveBundlePublicationReceipts) {
       Statement evict(
           database_,
           "DELETE FROM active_bundle_publication_receipts WHERE "

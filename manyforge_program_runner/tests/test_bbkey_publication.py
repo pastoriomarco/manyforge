@@ -1,4 +1,4 @@
-"""Change-only BB key publication per captured Run (contract 52)."""
+"""Change-only BB key publication per captured Run."""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ def _program(*extra: dict[str, Any]) -> Program:
         deepcopy(document),
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, _CATALOG)
 
@@ -103,7 +103,7 @@ class _Host:
         if self.fail_with is not None:
             raise self.fail_with
         return {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": "publish_program_bbkeys",
             "ok": True,
             "status": "accepted",
@@ -155,7 +155,7 @@ _LOSS_SEQUENCE = str(2**64 - 1)
 
 
 def test_baseline_then_each_write_forwarded_before_it_returns() -> None:
-    # BBK-1: no pool, no queue: a write returns after its frame's ACK, so
+    # no pool, no queue: a write returns after its frame's ACK, so
     # the writer's next step (a node's motion) follows the Kernel's
     # evaluation of it. One frame per write, never merged.
     store = _store()
@@ -181,7 +181,7 @@ def test_baseline_then_each_write_forwarded_before_it_returns() -> None:
         {"name": "label", "value_type": "string", "value": None},
         {"name": "speed", "value_type": "float64", "value": 0.5},
     ]
-    # An update carries only its written key (bb-wire-shapes03).
+    # An update carries only its written key.
     assert [_rows(frame) for frame in host.frames[1:]] == [
         {"count": "7"}, {"label": "café"}, {"count": "8"},
     ]
@@ -194,7 +194,7 @@ def test_baseline_then_each_write_forwarded_before_it_returns() -> None:
 
 
 def test_a_pulse_reaches_the_kernel_as_two_frames() -> None:
-    # BBK-1: true then false at once is two evaluations, never the latest.
+    # true then false at once is two evaluations, never the latest.
     store = _store()
     host = _Host()
     publisher = _publisher(host, _Queue())
@@ -207,7 +207,7 @@ def test_a_pulse_reaches_the_kernel_as_two_frames() -> None:
 
 
 def test_operator_write_then_tree_write_are_both_forwarded_in_order() -> None:
-    # BBK-1: every writer commits through the one store. An operator write
+    # every writer commits through the one store. An operator write
     # (runtime control) still in flight holds the tree's write until its
     # frame is ACKed: the Kernel sees true, then false.
     store = _store()
@@ -280,7 +280,7 @@ def test_baseline_capture_is_atomic_with_concurrent_writes() -> None:
 def test_a_failed_forward_is_source_loss_before_the_write_returns(
     tmp_path: Path,
 ) -> None:
-    # BBK-1 (a): after the source exists, a refused or unanswered forward
+    # after the source exists, a refused or unanswered forward
     # makes the Kernel's source unavailable (exact-sender gap) before the
     # write returns, so its rules can't watch and hold their scope; then the
     # Run's Program Stop, then the fault fences liveness. No resend.
@@ -349,7 +349,7 @@ def test_a_sequence_gap_reply_confirms_the_loss() -> None:
 
 
 def test_writes_before_the_source_exists_are_carried_by_its_baseline() -> None:
-    # BBK-1 (a): while the Kernel answers the baseline `bb_source_not_ready`
+    # while the Kernel answers the baseline `bb_source_not_ready`
     # (Apply or Reset still installing), a write only commits; the owner's
     # next start sends a baseline built from the store then. No fault.
     events: list[Any] = []
@@ -447,7 +447,7 @@ def test_reset_retires_the_run_source_locally_without_a_clearing_frame() -> None
     store.write("label", "held")
     # Held/finished: the values stay and nothing is retired.
     store.write("total", 9)
-    publisher.retire()  # The Runner's own Reset transition (DX-1281).
+    publisher.retire()  # The Runner's own Reset transition.
     store.clear_run_values()
     assert [frame["message_sequence"] for frame in host.frames] == ["1", "2", "3"]
     assert events == []
@@ -494,7 +494,7 @@ def test_unknown_or_stale_reply_for_the_current_source_still_latches() -> None:
 
 
 def test_source_not_ready_after_the_baseline_is_source_loss() -> None:
-    # BBK-1 (a): only the baseline may wait for the Kernel's source; an
+    # only the baseline may wait for the Kernel's source; an
     # update refused not-ready is lost like any other refusal (no retry).
     events: list[Any] = []
     store = _store()
@@ -567,7 +567,7 @@ def test_transport_sends_closed_frame_and_validates_the_ack() -> None:
         "values": [{"name": "count", "value_type": "int64", "value": "-4"}],
     }
     reply = {
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "command": "publish_program_bbkeys",
         "ok": True,
         "status": "accepted",
@@ -584,7 +584,7 @@ def test_transport_sends_closed_frame_and_validates_the_ack() -> None:
     assert transport.publish_program_bbkeys(frame)["accepted_sequence"] == "2"
     assert sent[0]["command"] == "publish_program_bbkeys"
     assert sent[0]["request"] == frame
-    assert len(sent[0]["request"]) == 12  # The closed bb-wire-shapes03 request.
+    assert len(sent[0]["request"]) == 12  # The closed request.
     for bad_reply in (
         {k: v for k, v in reply.items() if k != "status"},
         {k: v for k, v in reply.items() if k != "cycle_generation"},
@@ -597,9 +597,9 @@ def test_transport_sends_closed_frame_and_validates_the_ack() -> None:
         transport._exchange = lambda command, r=bad_reply: dict(r)  # type: ignore[method-assign]  # noqa: SLF001
         with pytest.raises(HeadlessApiError):
             transport.publish_program_bbkeys(frame)
-    # The owner's ErrorDTO keeps its code (SX-2143 transient retry).
+    # The owner's ErrorDTO keeps its code (a transient retry).
     transport._exchange = lambda command: {  # type: ignore[method-assign]  # noqa: SLF001
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "command": "publish_program_bbkeys",
         "ok": False,
         "error": {"code": "bb_source_not_ready", "message": "installing", "details": {}},
@@ -665,10 +665,10 @@ def test_cell_level_source_between_runs_has_no_run_and_never_stops_one() -> None
 
 
 def _superseded(request: dict[str, Any]) -> dict[str, Any]:
-    """The actual SX-2105 reply: the installed replacement, no sequence."""
+    """The actual reply: the installed replacement, no sequence."""
 
     return {
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "command": "publish_program_bbkeys",
         "ok": True,
         "status": "superseded",
@@ -699,7 +699,7 @@ def test_superseded_reply_retires_the_source_without_a_fault() -> None:
 def test_between_run_baseline_start_failure_keeps_the_source_without_fence(
     tmp_path: Path,
 ) -> None:
-    # F-2: a between-Runs start failure changes no source and never fences.
+    # A between-Runs start failure changes no source and never fences.
     receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
     receiver._handle(_heartbeat())  # noqa: SLF001
     runtime = object.__new__(ProgramRuntime)
@@ -729,7 +729,7 @@ def test_between_run_baseline_start_failure_keeps_the_source_without_fence(
     receiver.require_current()
 
 
-# Runtime wiring: between-Runs source identity (bb-wire-shapes03) -----------
+# Runtime wiring: between-Runs source identity -----------------------
 
 
 class _Journal:
@@ -751,12 +751,24 @@ class _Applied:
 
     def program_applied(self) -> dict[str, Any]:
         self.reads += 1
+        record_digest = "sha256:" + "a" * 64
         return {
             "program": deepcopy(self.document),
-            "program_binding": {"target_role_bindings": [{
-                "controllable_component_id": "robot", "target_role_id": "arm", "robot_tcps": [],
+            "program_binding": {"target_bindings": [{
+                "target": {"component_id": "robot", "command_target_id": "arm"}, "robot_tcps": [],
             }]},
             "program_binding_id": self.binding,
+            "program_revision": self.document["program_revision"],
+            "program_frame_facts": {
+                "applied_record_digest": record_digest,
+                "program_binding_id": self.binding,
+                "program_revision": self.document["program_revision"],
+                "retained_bundle_id": "bundle-1",
+                "graph_revision": "graph-1",
+                "components": [],
+                "frames": [],
+            },
+            "source": {"record_digest": record_digest},
             "scenario_id": "scenario-1",
             "project_path": "/projects/scenario-1.scenario",
             "retained_bundle_id": "bundle-1",
@@ -849,7 +861,7 @@ def test_every_new_applied_publication_is_a_new_between_run_source() -> None:
     (first,) = hosts
     assert first.frames[0]["active_publication_generation"] == 5
     assert {row["name"]: row["value"] for row in first.frames[0]["values"]} == {
-        # Run-scoped key: its declared initial between Runs (D-M4-2).
+        # Run-scoped key: its declared initial between Runs.
         "door": False, "total": "4",
     }
     runtime._follow_cell_bbkey_source()  # The same publication notice: no-op.
@@ -868,11 +880,11 @@ def test_w0_keeps_an_idle_active_tcp_store_without_a_bb_publisher() -> None:
     assert None in runtime._active_tcp_stores  # noqa: SLF001
     store, roles = runtime._active_tcp_stores[None]  # noqa: SLF001
     assert roles == {"robot": ("arm",)}
-    assert "active_tcp.arm" in store.program.blackboard_keys
+    assert "active_tcp/robot/arm" in store.program.blackboard_keys
 
 
 def test_unchanged_identity_keeps_its_source_and_never_resends_its_baseline() -> None:
-    # F-2 root: a repeated notice whose catalog read transiently proves no
+    # A repeated notice whose catalog read transiently proves no
     # key (W0) must not retire a source of an unchanged identity; otherwise
     # the next notice sends the same scope's baseline again.
     applied, journal = _Applied(), _Journal()
@@ -932,7 +944,7 @@ def test_runtime_reset_retires_the_run_sender_without_a_frame() -> None:
 
 
 def test_manager_loss_and_publisher_fault_keep_each_cause(tmp_path: Path) -> None:
-    # SX-2210a: with both faults the emitted fault_reference is the digest of
+    # With both faults the emitted fault_reference is the digest of
     # the emitted publisher ErrorDTO; the Manager loss keeps its own field.
     from manyforge_program_runner.liveness import EXPIRY_TIMEOUT_NS
 
@@ -952,7 +964,7 @@ def test_manager_loss_and_publisher_fault_keep_each_cause(tmp_path: Path) -> Non
     assert losses[0] != status["fault_reference"]
 
 
-# F-2: a refused between-Runs publication never fences the Runner -----------
+# A refused between-Runs publication never fences the Runner -----------
 
 
 _SEQUENCE_STALE = HeadlessApiError(
@@ -1010,7 +1022,7 @@ class _ScriptedHost(_Host):
 def test_refused_between_run_baseline_is_declared_lost_without_fence(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # F-2 / SX-527: the refused sender is dropped and its Kernel source is
+    # The refused sender is dropped and its Kernel source is
     # made unavailable (exact-sender gap), so BB-backed gates fail closed;
     # the Runner itself is not fenced.
     host = _ScriptedHost(_SEQUENCE_STALE, _SEQUENCE_GAP)
@@ -1041,7 +1053,7 @@ def test_refused_between_run_baseline_is_declared_lost_without_fence(
     assert len(errors) == 1 and "program_bb_sequence_stale" in errors[0]
     assert any("declared lost" in r.getMessage() for r in caplog.records)
 
-    # SX-536: a repeated notice of the same scope is not a recovery; it is
+    # A repeated notice of the same scope is not a recovery; it is
     # refused and declared lost again, still without a fence.
     host.errors = [_SEQUENCE_STALE, _SEQUENCE_GAP]
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
@@ -1063,7 +1075,7 @@ def test_between_run_loss_not_confirmed_by_the_kernel_fences_as_before(
     tmp_path: Path,
 ) -> None:
     # Fail closed: without the Kernel's typed loss the source may still be
-    # usable, so the Runner fences itself as before F-2.
+    # usable, so the Runner fences itself.
     host = _ScriptedHost(_SEQUENCE_STALE, _SCOPE_STALE)
     runtime, _applied, _journal, receiver, stops = _fencing_runtime(tmp_path, host)
     runtime._applied_condition_keys = ("door",)  # noqa: SLF001
@@ -1100,7 +1112,7 @@ def _queued_fencing_runtime(
 def test_between_run_fault_is_lost_in_the_kernel_before_any_containment(
     tmp_path: Path,
 ) -> None:
-    # SX-543 (1) / BBK-1 (a): the refused sender declares its loss in the
+    # The refused sender declares its loss in the
     # Kernel before its containment runs (queued, not inline), so nothing
     # gated by the previous value can be admitted meanwhile.
     host = _ScriptedHost(_SEQUENCE_STALE, _SEQUENCE_GAP)
@@ -1118,7 +1130,7 @@ def test_between_run_fault_is_lost_in_the_kernel_before_any_containment(
 def test_late_reply_for_a_superseded_between_run_source_releases_the_fence(
     tmp_path: Path,
 ) -> None:
-    # SX-543 (2) / SX-547 (1): the old loss is unconfirmed (scope stale); the
+    # The old loss is unconfirmed (scope stale); the
     # Kernel's ACK of the newer baseline releases the fence.
     host = _ScriptedHost(_SEQUENCE_STALE, _SCOPE_STALE)
     runtime, journal, receiver, queue = _queued_fencing_runtime(tmp_path, host)
@@ -1141,7 +1153,7 @@ def test_late_reply_for_a_superseded_between_run_source_releases_the_fence(
 
 
 def test_unacked_successor_does_not_release_the_fence(tmp_path: Path) -> None:
-    # SX-547 (1): a successor whose baseline is refused too (and an old gap
+    # A successor whose baseline is refused too (and an old gap
     # reply that never confirms) is no proof: fence kept.
     host = _ScriptedHost(_SEQUENCE_STALE, _SCOPE_STALE, _SEQUENCE_STALE, _SCOPE_STALE)
     runtime, journal, receiver, queue = _queued_fencing_runtime(tmp_path, host)
@@ -1161,7 +1173,7 @@ def test_unacked_successor_does_not_release_the_fence(tmp_path: Path) -> None:
 
 
 def test_fence_waits_for_every_unconfirmed_loss(tmp_path: Path) -> None:
-    # SX-547 (2): A and B both fault; A's confirmed loss alone does not lift
+    # A and B both fault; A's confirmed loss alone does not lift
     # the fence while B's loss is unconfirmed.
     host = _ScriptedHost(_SEQUENCE_STALE, _SEQUENCE_GAP, _SEQUENCE_STALE, _SCOPE_STALE)
     runtime, journal, receiver, queue = _queued_fencing_runtime(tmp_path, host)
@@ -1179,7 +1191,7 @@ def test_fence_waits_for_every_unconfirmed_loss(tmp_path: Path) -> None:
 
 
 def test_late_ack_of_a_replaced_sender_leaves_the_newer_loss_open(tmp_path: Path) -> None:
-    # SX-554: A's baseline ACK is delayed; meanwhile a Reset installs B, whose
+    # A's baseline ACK is delayed; meanwhile a Reset installs B, whose
     # baseline is refused. A's late ACK callback must not settle B's loss.
     frames: list[dict[str, Any]] = []
     holder: dict[str, Any] = {}
@@ -1211,7 +1223,7 @@ def test_late_ack_of_a_replaced_sender_leaves_the_newer_loss_open(tmp_path: Path
 
 
 def test_concurrent_followers_of_one_scope_create_one_sender() -> None:
-    # SX-529: A and B both find no current source before either installs;
+    # A and B both find no current source before either installs;
     # serialized creation leaves one sender and one baseline.
     applied, journal = _Applied(), _Journal()
     runtime, hosts = _runtime(applied, journal)
@@ -1269,7 +1281,7 @@ def test_refused_run_publication_still_stops_the_run_and_fences(tmp_path: Path) 
 def test_a_source_not_ready_starts_later_from_the_values_committed_meanwhile(
     tmp_path: Path,
 ) -> None:
-    # BBK-1 (a): the Kernel has not installed the source yet (Reset just
+    # the Kernel has not installed the source yet (Reset just
     # journaled): writes only commit, and the next liveness observation sends
     # the baseline built from the store then. No fault, no fence.
     host = _ScriptedHost(HeadlessApiError("bb_source_not_ready", "cycle not observed"))

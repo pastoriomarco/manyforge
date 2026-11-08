@@ -92,7 +92,7 @@ describe('Program workspace lifecycle controls', () => {
     );
 
     expect(scenarioSource).toContain('New Scenario');
-    // New is the server's Apply of the empty cell (CONTRACTS §11): one call.
+    // New is the server's Apply of the empty cell: one call.
     expect(scenarioSource).toContain("kind === 'new' ? await newScenarioDocument(onRefusal)");
     expect(source).toContain('Revert to saved');
     expect(source).toContain('Discard changes');

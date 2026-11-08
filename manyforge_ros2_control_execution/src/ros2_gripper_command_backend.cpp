@@ -14,6 +14,7 @@
 
 #include "scene_projection_worker.hpp"
 #include "transport_helpers.hpp"
+#include <manyforge_ros2_control_execution/detail/leaf_timing.hpp>
 #include <action_msgs/srv/cancel_goal.hpp>
 #include <algorithm>
 #include <cmath>
@@ -21,6 +22,7 @@
 #include <manyforge_core/time/stuck_drain_wait.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
+#include <manyforge_ros2_control_execution/graph_event_observer.hpp>
 #include <manyforge_ros2_control_execution/ros2_gripper_command_backend.hpp>
 #include <stdexcept>
 #include <string_view>
@@ -28,8 +30,73 @@
 
 namespace manyforge::ros2_control_execution {
 using detail::clamp_progress;
-using detail::wait_for_action_server_until;
 namespace {
+void settle_gripper_cancel(const std::shared_ptr<core::GripperLateCancelSlot> &slot) noexcept {
+  if (!slot) return;
+  slot->cancel_allowed.store(false, std::memory_order_release);
+  {
+    std::lock_guard lock(slot->mutex);
+    if (slot->state == core::GripperLateCancelState::kPending)
+      slot->state = core::GripperLateCancelState::kSettled;
+  }
+  if (slot->state_changed) slot->state_changed();
+}
+void mark_gripper_cancel_unissued(const std::shared_ptr<core::GripperLateCancelSlot> &slot) noexcept {
+  if (!slot) return;
+  {
+    std::lock_guard lock(slot->mutex);
+    if (slot->state == core::GripperLateCancelState::kPending) {
+      slot->state = core::GripperLateCancelState::kFailed;
+      if (slot->failure_epoch) {
+        auto epoch = slot->failure_epoch->load(std::memory_order_acquire);
+        while (epoch != std::numeric_limits<std::uint64_t>::max() &&
+               !slot->failure_epoch->compare_exchange_weak(epoch, epoch + 1, std::memory_order_acq_rel)) {}
+      }
+    }
+  }
+  if (slot->state_changed) slot->state_changed();
+}
+void handoff_gripper_cancel_failure(const std::shared_ptr<core::GripperLateCancelSlot> &slot) noexcept {
+  if (!slot) return;
+  if (slot->handoff_running.exchange(true, std::memory_order_acq_rel)) return;
+  struct ReleaseClaim {
+    std::atomic<bool> &claim;
+    bool active{true};
+    ~ReleaseClaim() { if (active) claim.store(false, std::memory_order_release); }
+  } release{slot->handoff_running};
+  decltype(slot->handoff) handoff;
+  std::optional<core::CommandTargetId> target;
+  std::string gripper_id;
+  std::uint64_t preparation = 0, command = 0, generation = 0;
+  {
+    std::lock_guard lock(slot->mutex);
+    if (slot->state != core::GripperLateCancelState::kFailed || !slot->receipt_installed) {
+      // Drop the claim before the slot lock: receipt installation can then
+      // either claim the handoff or observe an already-running writer.
+      slot->handoff_running.store(false, std::memory_order_release);
+      release.active = false;
+      return;
+    }
+    handoff = slot->handoff;
+    target = slot->target;
+    gripper_id = slot->gripper_id;
+    preparation = slot->preparation_id;
+    command = slot->command_id;
+    generation = slot->generation;
+  }
+  if (!handoff || !target || gripper_id.empty()) return;
+  try {
+    if (!handoff(preparation, command, generation, *target, gripper_id).ok()) return;
+    {
+      std::lock_guard lock(slot->mutex);
+      if (slot->state == core::GripperLateCancelState::kFailed &&
+          slot->preparation_id == preparation && slot->command_id == command &&
+          slot->generation == generation && slot->target == target && slot->gripper_id == gripper_id)
+        slot->state = core::GripperLateCancelState::kHandedOff;
+    }
+    if (slot->state_changed) slot->state_changed();
+  } catch (...) { /* Keep the failure for teardown. */ }
+}
 core::Duration gripper_duration_ns(double seconds) noexcept {
   constexpr double kNanosecondsPerSecond = 1'000'000'000.0;
   const double nanoseconds = seconds * kNanosecondsPerSecond;
@@ -115,22 +182,34 @@ bool gripper_request_matches_transport(
                   "goal_fenced_target_reached"));
 }
 
+// The single finger joint's position in a ParallelGripperCommand state. The
+// stock controller's cancel result carries an empty state.
+std::optional<double>
+gripper_state_position(const sensor_msgs::msg::JointState &state) {
+  if (state.position.empty()) {
+    return std::nullopt;
+  }
+  return state.position.front();
+}
+
 } // namespace
 
 Ros2GripperCommandBackend::Ros2GripperCommandBackend(
-    Ros2TransportResources &resources,
+    std::shared_ptr<Ros2TransportResources> resources,
     std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
     core::IClock &clock, core::IScheduler &scheduler, bool commanded_sim)
-    : resources_(resources),
+    : resources_(std::move(resources)),
       execution_state_sink_(std::move(execution_state_sink)), clock_(clock),
-      scheduler_(scheduler), node_(resources.node()),
-      scene_projection_worker_(&resources.projection_worker()),
+      scheduler_(scheduler),
       commanded_sim_(commanded_sim) {
+  if (!resources_.load())
+    throw std::invalid_argument("gripper ROS transport must not be null");
   if (!execution_state_sink_)
     throw std::invalid_argument("execution state sink must not be null");
-  if (resources.started())
+  if (resources_.load()->started())
     throw std::logic_error(
         "gripper must be installed before ROS transport starts");
+  scene_projection_worker_ = resources_.load()->take_projection_worker();
 }
 
 Ros2GripperCommandBackend::~Ros2GripperCommandBackend() { shutdown(); }
@@ -142,16 +221,32 @@ void Ros2GripperCommandBackend::complete_ros_configuration() {
   ros_configuration_complete_ = true;
 }
 
+void Ros2GripperCommandBackend::set_retirement_wake(std::function<void()> wake) {
+  std::lock_guard lock(gripper_authority_mutex_);
+  retirement_wake_ = std::move(wake);
+}
+
 void Ros2GripperCommandBackend::shutdown() noexcept {
   if (shutdown_started_.exchange(true, std::memory_order_acq_rel))
     return;
-  invalidate_gripper_commands(core::GripperInvalidationReason::kShutdown);
+  // State fence plus a scheduled cancel: no owner dispatch (it already runs
+  // off-owner from invalidate_gripper_commands and CloseGripperLateCancels).
+  invalidate_gripper_commands_impl(core::GripperInvalidationReason::kShutdown);
   core::WaitForDrain("gripper_backend.scheduler_controller_command_lane",
                      std::chrono::seconds(1),
                      [this](std::chrono::nanoseconds bound) {
                        return scheduler_.drain_for(
                            core::SchedulerPriority::ControllerCommand, bound);
                      });
+}
+
+bool Ros2GripperCommandBackend::StopSceneProjectionUntil(
+    std::chrono::steady_clock::time_point deadline) noexcept {
+  if (!scene_projection_worker_) return true;
+  const auto now = std::chrono::steady_clock::now();
+  const auto remaining = deadline > now ? deadline - now : std::chrono::steady_clock::duration::zero();
+  return scene_projection_worker_->stop_and_join_for(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(remaining));
 }
 
 void Ros2GripperCommandBackend::advance_pneumatic_locked(
@@ -168,6 +263,9 @@ void Ros2GripperCommandBackend::advance_pneumatic_locked(
     runtime.reason_code.clear();
     ++runtime.revision;
   } else if (runtime.deadline_at_ns && now >= *runtime.deadline_at_ns) {
+    if (runtime.config.transport_kind == "ros_gripper_command" &&
+        old_effect_owner_retired(runtime))
+      return;
     runtime.state = "failed";
     runtime.executing = false;
     // Exact late callbacks cannot flip Failure.
@@ -277,6 +375,10 @@ bool Ros2GripperCommandBackend::schedule_gripper_scene_projection_locked(
                 *runtime->scene_projection_slot, position, clock_.now(), token)
           : scene_projection_worker_->submit_active_joint(
                 *runtime->scene_projection_slot, position, clock_.now(), token);
+  if (queued) {
+    runtime->scene_projection_submitted = true;
+    runtime->scene_projection_submitted_request_id = token.request_id;
+  }
   runtime->projection_state = core::GripperProjectionState::kPending;
   runtime->projection_reason =
       queued ? "scene_projection_queued" : "scene_projection_suspended";
@@ -296,6 +398,15 @@ void Ros2GripperCommandBackend::on_gripper_scene_projection_complete(
   std::uint64_t generation = 0;
   {
     std::lock_guard<std::mutex> lock(runtime->mutex);
+    if (runtime->command_id == completion.token.command_id &&
+        runtime->generation == completion.token.generation &&
+        runtime->scene_projection_submitted_request_id == completion.token.request_id &&
+        completion.outcome != detail::SceneProjectionOutcome::kSuperseded) {
+      if (completion.outcome == detail::SceneProjectionOutcome::kMissed)
+        runtime->scene_projection_missed_settled = true;
+      runtime->scene_projection_submitted = false;
+      runtime->scene_projection_submitted_request_id = 0;
+    }
     if (runtime->command_id != completion.token.command_id ||
         runtime->generation != completion.token.generation ||
         runtime->scene_projection_request_id != completion.token.request_id) {
@@ -310,6 +421,7 @@ void Ros2GripperCommandBackend::on_gripper_scene_projection_complete(
       runtime->projection_retry_count = 0;
       break;
     case detail::SceneProjectionOutcome::kMissed:
+      // The best-effort request completed; no worker obligation remains.
       runtime->projection_state = core::GripperProjectionState::kPending;
       runtime->projection_reason = "scene_sink_busy";
       break;
@@ -347,8 +459,339 @@ std::optional<double>
 position_for_joint(const sensor_msgs::msg::JointState &msg,
                    const std::string &joint_name);
 
+bool Ros2GripperCommandBackend::old_effect_owner_retired(
+    const GripperRuntime &runtime) noexcept {
+  return runtime.goal_ros &&
+      (runtime.goal_ros->owner->executor_failure_started() ||
+       runtime.goal_ros->owner->joined());
+}
+
+struct Ros2GripperCommandBackend::StagedRosRebind final {
+  struct Entry {
+    std::string id;
+    std::shared_ptr<GripperRuntime> runtime;
+    std::shared_ptr<RosEntities> previous;
+    std::shared_ptr<RosEntities> replacement;
+  };
+  std::shared_ptr<Ros2TransportResources> owner;
+  std::shared_ptr<Ros2TransportResources> previous_owner;
+  const Ros2GripperCommandBackend *backend{};
+  std::vector<Entry> entries;
+};
+
+std::shared_ptr<Ros2GripperCommandBackend::StagedRosRebind>
+Ros2GripperCommandBackend::stage_ros_rebind(
+    std::shared_ptr<Ros2TransportResources> replacement) {
+  if (!replacement)
+    throw std::invalid_argument("gripper rebind requires a different ROS owner");
+  auto stage = std::make_shared<StagedRosRebind>();
+  stage->backend = this;
+  stage->owner = std::move(replacement);
+  {
+    std::lock_guard authority_lock(gripper_authority_mutex_);
+    std::lock_guard map_lock(gripper_map_mutex_);
+    stage->previous_owner = resources_.load();
+    if (stage->owner == stage->previous_owner)
+      throw std::invalid_argument("gripper rebind requires a different ROS owner");
+    stage->entries.reserve(grippers_.size());
+    for (const auto &[id, runtime] : grippers_) {
+      std::lock_guard runtime_lock(runtime->mutex);
+      if (!runtime->ros || runtime->ros->owner != stage->previous_owner)
+        throw std::logic_error("gripper runtime does not belong to the current ROS owner");
+      stage->entries.push_back({id, runtime, runtime->ros, {}});
+    }
+  }
+  stage->owner->invoke_creation([&] {
+    for (auto &entry : stage->entries) {
+      auto gate = std::make_shared<std::atomic<bool>>(false);
+      auto entities = create_ros_entities(stage->owner, entry.runtime, std::move(gate));
+      entry.replacement = std::make_shared<RosEntities>(std::move(entities));
+    }
+  });
+  return stage;
+}
+
+core::Result<void> Ros2GripperCommandBackend::commit_ros_rebind(
+    const std::shared_ptr<StagedRosRebind> &stage) {
+  if (commit_ros_rebind_with(stage, [](void *) noexcept { return true; }, nullptr))
+    return core::Result<void>::Ok();
+  return core::Result<void>::Err(core::ErrorDTO{
+      "ros2_control_gripper_bridge_not_ready",
+      "The staged gripper transport is no longer current or ready", {}});
+}
+
+bool Ros2GripperCommandBackend::commit_ros_rebind_with(
+    const std::shared_ptr<StagedRosRebind> &stage,
+    bool (*commit)(void *) noexcept, void *context,
+    const std::shared_ptr<Ros2TransportResources> &failed_dependency) {
+  if (!stage || stage->backend != this || !stage->owner ||
+      !commit ||
+      !stage->previous_owner || !stage->previous_owner->joined() ||
+      !(stage->previous_owner->executor_failure_started() ||
+        (failed_dependency && failed_dependency->joined() &&
+         failed_dependency->executor_failure_started())) ||
+      !stage->owner->started() || stage->owner->joined() ||
+      stage->owner->executor_failure_started() ||
+      stage->owner->executor_fault())
+    return false;
+  struct PublisherFence {
+    std::vector<std::shared_ptr<RosEntities>> bundles;
+    bool committed{false};
+    ~PublisherFence() {
+      if (!committed)
+        for (const auto &bundle : bundles) {
+          auto fenced = RosEntities::PublisherLeaf::State::kRebindFenced;
+          MANYFORGE_GRIPPER_REBIND_ROLLBACK_TEST_POINT();
+          const bool reopened = bundle->publisher_leaf->state.compare_exchange_strong(
+              fenced, RosEntities::PublisherLeaf::State::kOpen, std::memory_order_acq_rel);
+          MANYFORGE_GRIPPER_REBIND_ROLLBACK_RESULT(reopened);
+          (void)reopened;
+        }
+    }
+  } fence;
+  fence.bundles.reserve(stage->entries.size());
+  {
+    std::lock_guard authority_lock(gripper_authority_mutex_);
+    std::lock_guard map_lock(gripper_map_mutex_);
+    if (resources_.load() != stage->previous_owner || grippers_.size() != stage->entries.size())
+      return false;
+    for (const auto &entry : stage->entries) {
+      const auto found = grippers_.find(entry.id);
+      if (found == grippers_.end() || found->second != entry.runtime || !entry.previous)
+        return false;
+      std::lock_guard runtime_lock(entry.runtime->mutex);
+      if (entry.runtime->ros != entry.previous) return false;
+      if (entry.previous->publisher_leaf) {
+        auto open = RosEntities::PublisherLeaf::State::kOpen;
+        if (!entry.previous->publisher_leaf->state.compare_exchange_strong(
+                open, RosEntities::PublisherLeaf::State::kRebindFenced,
+                std::memory_order_acq_rel)) return false;
+        fence.bundles.push_back(entry.previous);
+      }
+    }
+  }
+  const auto started = std::chrono::steady_clock::now();
+  for (const auto &entry : stage->entries) {
+    if (!entry.previous || !entry.previous->publisher_leaf) continue;
+    const auto budget = std::chrono::nanoseconds(entry.runtime->lifecycle_timeout_ns);
+    const auto remaining = std::chrono::steady_clock::time_point::max() - started;
+    const auto deadline = budget >= remaining ? std::chrono::steady_clock::time_point::max()
+                                               : started + budget;
+    std::unique_lock leaf(entry.previous->publisher_leaf->mutex, std::defer_lock);
+    if (!leaf.try_lock_until(deadline)) return false;
+  }
+  std::vector<rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr> retired_publishers;
+  retired_publishers.reserve(fence.bundles.size());
+  std::vector<std::unique_lock<std::mutex>> runtime_locks;
+  runtime_locks.reserve(stage->entries.size());
+  {
+    std::lock_guard authority_lock(gripper_authority_mutex_);
+    std::lock_guard map_lock(gripper_map_mutex_);
+    if (resources_.load() != stage->previous_owner ||
+        grippers_.size() != stage->entries.size())
+      return false;
+    for (const auto &entry : stage->entries) {
+      const auto found = grippers_.find(entry.id);
+      if (found == grippers_.end() || found->second != entry.runtime ||
+          !entry.replacement || entry.replacement->owner != stage->owner ||
+          !entry.replacement->callbacks_enabled ||
+          entry.replacement->callbacks_enabled->load(std::memory_order_acquire))
+        return false;
+      runtime_locks.emplace_back(entry.runtime->mutex);
+      if (entry.runtime->ros != entry.previous)
+        return false;
+      if (entry.previous->publisher_leaf &&
+          entry.previous->publisher_leaf->state.load(std::memory_order_acquire) !=
+              RosEntities::PublisherLeaf::State::kRebindFenced)
+        return false;
+    }
+    if (!commit(context))
+      return false;
+    for (const auto &entry : stage->entries) {
+      entry.runtime->send_generation.store(0, std::memory_order_release);
+      // A known completed goal needs no old SDK handle after its owner joined.
+      // Unknown or pending outcomes retain their exact old bundle.
+      if (entry.runtime->goal_ros == entry.previous &&
+          entry.runtime->state == "completed" && !entry.runtime->executing &&
+          !entry.runtime->goal_accepted && !entry.runtime->active_goal_handle &&
+          !entry.runtime->cancel_pending && !entry.runtime->lifecycle_disable_pending)
+        entry.runtime->goal_ros.reset();
+      entry.runtime->ros = entry.replacement;
+    }
+    resources_.store(stage->owner);
+  }
+  runtime_locks.clear();
+  fence.committed = true;
+  for (const auto &bundle : fence.bundles) {
+    std::lock_guard leaf(bundle->publisher_leaf->mutex);
+    bundle->publisher_leaf->state.store(RosEntities::PublisherLeaf::State::kRetired,
+                                       std::memory_order_release);
+    if (bundle->command_matches) bundle->command_matches->store(-1, std::memory_order_release);
+    if (bundle->joint_state_pub) retired_publishers.push_back(std::move(bundle->joint_state_pub));
+  }
+  // The owner finalizer takes the same leaf; release aliases after unlocking.
+  retired_publishers.clear();
+  return true;
+}
+
+core::Result<void> Ros2GripperCommandBackend::activate_ros_rebind(
+    const std::shared_ptr<StagedRosRebind> &stage) {
+  const auto refused = [] {
+    return core::Result<void>::Err(core::ErrorDTO{
+        "ros2_control_gripper_bridge_not_ready",
+        "The staged gripper transport is no longer current or ready", {}});
+  };
+  if (!stage || stage->backend != this || !stage->owner ||
+      stage->owner->joined() || stage->owner->executor_failure_started() ||
+      stage->owner->executor_fault())
+    return refused();
+  std::vector<std::unique_lock<std::mutex>> runtime_locks;
+  runtime_locks.reserve(stage->entries.size());
+  {
+    std::lock_guard authority_lock(gripper_authority_mutex_);
+    std::lock_guard map_lock(gripper_map_mutex_);
+    if (resources_.load() != stage->owner || grippers_.size() != stage->entries.size())
+      return refused();
+    for (const auto &entry : stage->entries) {
+      const auto found = grippers_.find(entry.id);
+      if (found == grippers_.end() || found->second != entry.runtime ||
+          !entry.replacement || !entry.replacement->callbacks_enabled)
+        return refused();
+      runtime_locks.emplace_back(entry.runtime->mutex);
+      if (entry.runtime->ros != entry.replacement)
+        return refused();
+    }
+    for (const auto &entry : stage->entries)
+      entry.replacement->callbacks_enabled->store(true, std::memory_order_release);
+  }
+  return core::Result<void>::Ok();
+}
+
+Ros2GripperCommandBackend::RosEntities
+Ros2GripperCommandBackend::create_ros_entities(
+    const std::shared_ptr<Ros2TransportResources> &owner,
+    const std::shared_ptr<GripperRuntime> &runtime,
+    std::shared_ptr<std::atomic<bool>> callbacks_enabled) {
+  RosEntities entities;
+  entities.owner = owner;
+  entities.callbacks_enabled = std::move(callbacks_enabled);
+  const auto node = owner->node();
+  if (runtime->config.output_mode == core::GripperOutputMode::kNone) {
+    // The genuine local owner has no ROS command entities.
+  } else if (runtime->config.transport_kind == "ros_gripper_command") {
+    entities.action_leaf = std::make_shared<RosEntities::ActionLeaf>();
+    // OD-66: goal response, feedback, result and cancel responses run on the
+    // owner's time-critical thread, in a group of this client's own.
+    entities.action_callback_group = owner->create_time_critical_callback_group();
+    entities.action_client = rclcpp_action::create_client<GripperCommand>(
+        node, runtime->config.action_name, entities.action_callback_group);
+    entities.action_ready = std::make_shared<std::atomic<int>>(-1);
+    const auto refresh = [client = std::weak_ptr(entities.action_client),
+                          ready = entities.action_ready] {
+      try {
+        const auto current = client.lock();
+        ready->store(current ? static_cast<int>(current->action_server_is_ready()) : -1,
+                     std::memory_order_release);
+      } catch (...) {
+        ready->store(-1, std::memory_order_release);
+      }
+    };
+    entities.action_graph_observer = owner->retain_entity(std::make_shared<GraphEventObserver>(
+        node, node->get_node_base_interface()->get_default_callback_group(), refresh));
+    refresh();
+  } else {
+    // The cache belongs to this exact ROS entity bundle. Staged bundles may
+    // record their own matches before publication, but cannot affect the
+    // installed runtime until the bundle is committed and its gate opens.
+    entities.publisher_leaf = std::make_shared<RosEntities::PublisherLeaf>();
+    entities.command_matches = std::make_shared<std::atomic<std::int64_t>>(-1);
+    rclcpp::PublisherOptions options;
+    options.event_callbacks.matched_callback =
+        [matches = entities.command_matches](rclcpp::MatchedInfo &info) {
+          matches->store(info.current_count, std::memory_order_release);
+        };
+    entities.joint_state_pub =
+        node->create_publisher<sensor_msgs::msg::JointState>(
+            runtime->config.command_topic, rclcpp::SystemDefaultsQoS(), options);
+    const auto initial_count = static_cast<std::int64_t>(entities.joint_state_pub->get_subscription_count());
+    std::int64_t unobserved = -1;
+    (void)entities.command_matches->compare_exchange_strong(
+        unobserved, initial_count, std::memory_order_acq_rel);
+  }
+  if (!runtime->config.state_topic.empty() &&
+      (runtime->config.transport_kind == "isaac_joint_state_effort" ||
+       runtime->config.actuation_kind ==
+           core::GripperActuationKind::kPneumatic)) {
+    const std::weak_ptr<GripperRuntime> weak_runtime = runtime;
+    const auto gate = entities.callbacks_enabled;
+    entities.joint_state_sub =
+        node->create_subscription<sensor_msgs::msg::JointState>(
+            runtime->config.state_topic, rclcpp::SystemDefaultsQoS(),
+            [weak_runtime, gate](const sensor_msgs::msg::JointState::SharedPtr msg) {
+              if (gate && !gate->load(std::memory_order_acquire)) return;
+              const auto runtime = weak_runtime.lock();
+              if (!runtime || !msg) {
+                return;
+              }
+              const auto &observed_joint = runtime->config.state_joint_name;
+              if (observed_joint.empty()) {
+                return;
+              }
+              const auto position = position_for_joint(*msg, observed_joint);
+              // Liveness: lock-free, no allocation.
+              if (position.has_value() && runtime->config.feedback_stream)
+                runtime->config.feedback_stream->RecordArrival();
+              {
+                std::lock_guard<std::mutex> lock(runtime->mutex);
+                if (runtime->feedback_messages_received !=
+                    std::numeric_limits<std::uint64_t>::max()) {
+                  ++runtime->feedback_messages_received;
+                }
+                if (!position.has_value()) {
+                  return;
+                }
+                if (runtime->feedback_samples_matched !=
+                    std::numeric_limits<std::uint64_t>::max()) {
+                  ++runtime->feedback_samples_matched;
+                }
+                runtime->observed_position = *position;
+                runtime->observed_at = std::chrono::steady_clock::now();
+                if (runtime->config.actuation_kind !=
+                    core::GripperActuationKind::kPneumatic)
+                  ++runtime->revision;
+              }
+              if (runtime->config.actuation_kind ==
+                      core::GripperActuationKind::kPneumatic &&
+                  runtime->config.publish_display_position) {
+                try {
+                  (void)runtime->config.publish_display_position(*position);
+                } catch (...) { /* Display never changes an I/O result. */
+                }
+              }
+            });
+  }
+  entities.action_client = owner->retain_entity(std::move(entities.action_client),
+                                                entities.action_callback_group);
+  if (entities.joint_state_pub) {
+    auto publisher = std::move(entities.joint_state_pub);
+    auto *const pointer = publisher.get();
+    auto leaf = entities.publisher_leaf;
+    entities.joint_state_pub = decltype(entities.joint_state_pub)(
+        pointer, [publisher = std::move(publisher), leaf = std::move(leaf)](auto *) mutable {
+          std::lock_guard lock(leaf->mutex);
+          publisher.reset();
+        });
+  }
+  entities.joint_state_pub = owner->retain_entity(std::move(entities.joint_state_pub));
+  entities.joint_state_sub = owner->retain_entity(std::move(entities.joint_state_sub));
+  return entities;
+}
+
 void Ros2GripperCommandBackend::configure_gripper_action(
-    std::string gripper_id, Ros2GripperActionConfig config) {
+    std::string gripper_id, Ros2GripperActionConfig config,
+    core::Duration lifecycle_timeout_ns) {
+  if (lifecycle_timeout_ns <= 0)
+    throw std::invalid_argument("gripper lifecycle timeout must be positive");
   if (gripper_id.empty()) {
     throw std::invalid_argument("gripper_id must not be empty");
   }
@@ -448,75 +891,19 @@ void Ros2GripperCommandBackend::configure_gripper_action(
     throw std::invalid_argument(
         "gripper group_id and joint_name must be configured together");
   }
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr retired_publisher;
   std::lock_guard<std::mutex> ros_configuration_lock(ros_configuration_mutex_);
-  if (ros_configuration_complete_ || resources_.started()) {
+  if (ros_configuration_complete_ || resources_.load()->started()) {
     throw std::logic_error(
         "gripper transports must be configured before the ROS executor starts");
   }
   auto runtime = std::make_shared<GripperRuntime>();
   runtime->config = std::move(config);
-  if (runtime->config.output_mode == core::GripperOutputMode::kNone) {
-    // The genuine local owner has no ROS command entities.
-  } else if (runtime->config.transport_kind == "ros_gripper_command") {
-    runtime->action_client = rclcpp_action::create_client<GripperCommand>(
-        node_, runtime->config.action_name);
-  } else {
-    runtime->joint_state_pub =
-        node_->create_publisher<sensor_msgs::msg::JointState>(
-            runtime->config.command_topic, rclcpp::SystemDefaultsQoS());
-  }
-  if (!runtime->config.state_topic.empty() &&
-      (runtime->config.transport_kind == "isaac_joint_state_effort" ||
-       runtime->config.actuation_kind ==
-           core::GripperActuationKind::kPneumatic)) {
-    const std::weak_ptr<GripperRuntime> weak_runtime = runtime;
-    runtime->joint_state_sub =
-        node_->create_subscription<sensor_msgs::msg::JointState>(
-            runtime->config.state_topic, rclcpp::SystemDefaultsQoS(),
-            [weak_runtime](const sensor_msgs::msg::JointState::SharedPtr msg) {
-              const auto runtime = weak_runtime.lock();
-              if (!runtime || !msg) {
-                return;
-              }
-              const auto &observed_joint = runtime->config.state_joint_name;
-              if (observed_joint.empty()) {
-                return;
-              }
-              const auto position = position_for_joint(*msg, observed_joint);
-              // CP9 liveness: lock-free, no allocation.
-              if (position.has_value() && runtime->config.feedback_stream)
-                runtime->config.feedback_stream->RecordArrival();
-              {
-                std::lock_guard<std::mutex> lock(runtime->mutex);
-                if (runtime->feedback_messages_received !=
-                    std::numeric_limits<std::uint64_t>::max()) {
-                  ++runtime->feedback_messages_received;
-                }
-                if (!position.has_value()) {
-                  return;
-                }
-                if (runtime->feedback_samples_matched !=
-                    std::numeric_limits<std::uint64_t>::max()) {
-                  ++runtime->feedback_samples_matched;
-                }
-                runtime->observed_position = *position;
-                runtime->observed_at = std::chrono::steady_clock::now();
-                if (runtime->config.actuation_kind !=
-                    core::GripperActuationKind::kPneumatic)
-                  ++runtime->revision;
-              }
-              if (runtime->config.actuation_kind ==
-                      core::GripperActuationKind::kPneumatic &&
-                  runtime->config.publish_display_position) {
-                try {
-                  (void)runtime->config.publish_display_position(*position);
-                } catch (...) { /* Display never changes an I/O result. */
-                }
-              }
-            });
-  }
+  runtime->lifecycle_timeout_ns = lifecycle_timeout_ns;
+  runtime->ros = std::make_shared<RosEntities>(create_ros_entities(resources_.load(), runtime));
   runtime->generation =
       next_gripper_generation_.fetch_add(1, std::memory_order_relaxed);
+  runtime->send_generation.store(runtime->generation, std::memory_order_release);
   if (runtime->config.actuation_kind !=
           core::GripperActuationKind::kPneumatic &&
       !runtime->config.group_id.empty()) {
@@ -536,22 +923,45 @@ void Ros2GripperCommandBackend::configure_gripper_action(
     const auto existing = grippers_.find(gripper_id);
     if (existing != grippers_.end()) {
       replaced_runtime = existing->second;
+      // Preserve the exact same-component journal binding across an internal
+      // ROS reconfiguration; prior goal slots retain their captured hook.
+      std::lock_guard runtime_lock(replaced_runtime->mutex);
+      runtime->late_cancel_engine_identity = replaced_runtime->late_cancel_engine_identity;
+      runtime->late_cancel_journal_hook = replaced_runtime->late_cancel_journal_hook;
     }
     grippers_[std::move(gripper_id)] = std::move(runtime);
   }
   if (replaced_runtime) {
     GoalHandleGripper::SharedPtr goal_handle;
     rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
+    std::shared_ptr<RosEntities> replaced_ros;
+    std::shared_ptr<core::GripperLateCancelSlot> cancel_slot;
     std::optional<core::ScheduleHandle> lifecycle_handle;
+    std::uint64_t command_id = 0;
+    std::uint64_t generation = 0;
     {
       std::lock_guard<std::mutex> lock(replaced_runtime->mutex);
       goal_handle = replaced_runtime->active_goal_handle;
-      action_client = replaced_runtime->action_client;
+      cancel_slot = replaced_runtime->goal_late_cancel_slot;
+      replaced_ros = goal_handle ? replaced_runtime->goal_ros : replaced_runtime->ros;
+      if (replaced_ros) action_client = replaced_ros->action_client;
+      // Production config precedes Bind/publication and owner start; no
+      // command can reach this pre-start replacement publisher (DX4132).
+      if (replaced_runtime->ros && replaced_runtime->ros->publisher_leaf) {
+        replaced_runtime->ros->publisher_leaf->state.store(
+            RosEntities::PublisherLeaf::State::kRetired, std::memory_order_release);
+        if (replaced_runtime->ros->command_matches)
+          replaced_runtime->ros->command_matches->store(-1, std::memory_order_release);
+        retired_publisher = std::move(replaced_runtime->ros->joint_state_pub);
+      }
       lifecycle_handle = replaced_runtime->lifecycle_handle;
+      command_id = replaced_runtime->lifecycle_disable_command_id;
+      generation = replaced_runtime->lifecycle_disable_generation;
       replaced_runtime->lifecycle_handle.reset();
       ++replaced_runtime->lifecycle_schedule_generation;
       replaced_runtime->generation =
           next_gripper_generation_.fetch_add(1, std::memory_order_relaxed);
+      replaced_runtime->send_generation.store(replaced_runtime->generation, std::memory_order_release);
       replaced_runtime->active_goal_handle.reset();
       replaced_runtime->executing = false;
       replaced_runtime->goal_accepted = false;
@@ -568,58 +978,15 @@ void Ros2GripperCommandBackend::configure_gripper_action(
         // scheduler cleanup fails.
       }
     }
-    if (action_client && goal_handle) {
-      try {
-        const auto command_id = runtime->lifecycle_disable_command_id;
-        const auto generation = runtime->lifecycle_disable_generation;
-        const auto goal_id = goal_handle->get_goal_id();
-        (void)action_client->async_cancel_goal(
-            goal_handle,
-            [weak_runtime = std::weak_ptr<GripperRuntime>(runtime), command_id,
-             generation, goal_id](const auto response) {
-              const auto runtime = weak_runtime.lock();
-              if (!runtime)
-                return;
-              std::lock_guard lock(runtime->mutex);
-              if (!runtime->lifecycle_disable_pending ||
-                  runtime->lifecycle_disable_command_id != command_id ||
-                  runtime->lifecycle_disable_generation != generation)
-                return;
-              const bool accepted = response &&
-                  response->return_code ==
-                      action_msgs::srv::CancelGoal::Response::ERROR_NONE &&
-                  std::any_of(response->goals_canceling.begin(),
-                              response->goals_canceling.end(),
-                              [&](const auto &row) {
-                                return row.goal_id.uuid == goal_id;
-                              });
-              if (!accepted && !runtime->lifecycle_disable_terminal)
-                runtime->lifecycle_disable_failed = true;
-              runtime->lifecycle_condition.notify_all();
-            });
-      } catch (const std::exception &exc) {
-        {
-          std::lock_guard lock(runtime->mutex);
-          if (runtime->lifecycle_disable_pending)
-            runtime->lifecycle_disable_failed = true;
-          runtime->lifecycle_condition.notify_all();
-        }
-        RCLCPP_WARN(node_->get_logger(),
-                    "Failed to cancel replaced gripper action goal: %s",
-                    exc.what());
-      }
-    }
+    if (action_client && goal_handle)
+      dispatch_disable_cancel(replaced_runtime, replaced_ros, goal_handle,
+                              command_id, generation, cancel_slot, false);
   }
 }
 
-void publish_isaac_joint_state_gripper_command(
+sensor_msgs::msg::JointState make_isaac_joint_state_gripper_command(
     const rclcpp::Node::SharedPtr &node, const Ros2GripperActionConfig &config,
-    const rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr &publisher,
     double target_position) {
-  if (!publisher) {
-    throw std::runtime_error(
-        "Isaac gripper command publisher is not configured");
-  }
   std::vector<std::string> joint_names = config.command_joint_names;
   if (joint_names.empty()) {
     joint_names.push_back(config.joint_name);
@@ -635,7 +1002,7 @@ void publish_isaac_joint_state_gripper_command(
     msg.position.assign(joint_names.size(), target_position);
   }
   msg.effort.assign(joint_names.size(), effort);
-  publisher->publish(msg);
+  return msg;
 }
 
 std::optional<double>
@@ -664,10 +1031,14 @@ void Ros2GripperCommandBackend::on_gripper_feedback(
     // state.
     return;
   }
+  const std::optional<double> reported_position =
+      gripper_state_position(feedback->state);
   std::optional<double> feedback_position;
-  bool reached_goal = false;
+  GoalHandleGripper::SharedPtr retired_goal;
   std::optional<core::ScheduleHandle> lifecycle_handle;
   rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
+  std::shared_ptr<RosEntities> goal_ros;
+  std::shared_ptr<core::GripperLateCancelSlot> cancel_slot;
   {
     std::lock_guard<std::mutex> lock(runtime->mutex);
     if (runtime->command_id != command_id ||
@@ -677,15 +1048,17 @@ void Ros2GripperCommandBackend::on_gripper_feedback(
     if (!runtime->executing) {
       return;
     }
-    if (!std::isfinite(feedback->position)) {
+    if (!reported_position.has_value() || !std::isfinite(*reported_position)) {
+      cancel_slot = runtime->goal_late_cancel_slot;
       lifecycle_handle = runtime->lifecycle_handle;
       runtime->lifecycle_handle.reset();
       ++runtime->lifecycle_schedule_generation;
-      action_client = runtime->action_client;
+      goal_ros = runtime->goal_ros;
+      if (goal_ros) action_client = goal_ros->action_client;
       if (!goal_handle) {
         goal_handle = runtime->active_goal_handle;
       }
-      runtime->active_goal_handle.reset();
+      retired_goal = std::move(runtime->active_goal_handle);
       runtime->state = "failed";
       runtime->executing = false;
       runtime->goal_accepted = false;
@@ -696,29 +1069,15 @@ void Ros2GripperCommandBackend::on_gripper_feedback(
       runtime->projection_state = core::GripperProjectionState::kNotRequired;
       runtime->projection_reason.clear();
     } else {
-      runtime->current_position = feedback->position;
+      runtime->current_position = *reported_position;
       runtime->progress =
           clamp_progress(static_cast<double>(std::max<core::Duration>(
                              0, clock_.now() - runtime->started_at_ns)) /
                          static_cast<double>(std::max<core::Duration>(
                              1, gripper_duration_ns(runtime->duration_s))));
-      feedback_position = feedback->position;
-      reached_goal = feedback->reached_goal;
-      if (reached_goal) {
-        runtime->goal_accepted = false;
-        runtime->cancel_pending = false;
-        runtime->active_goal_handle.reset();
-        runtime->error.clear();
-        runtime->reason_code.clear();
-        if (!hold_until_duration_locked(*runtime)) {
-          runtime->state = "completed";
-          runtime->executing = false;
-          lifecycle_handle = runtime->lifecycle_handle;
-          runtime->lifecycle_handle.reset();
-          ++runtime->lifecycle_schedule_generation;
-          runtime->progress = 1.0;
-        }
-      }
+      // ParallelGripperCommand feedback carries only the state: completion
+      // (reached_goal) comes with the result.
+      feedback_position = *reported_position;
     }
     ++runtime->revision;
   }
@@ -731,31 +1090,14 @@ void Ros2GripperCommandBackend::on_gripper_feedback(
     }
   }
   if (action_client && goal_handle) {
-    try {
-      (void)action_client->async_cancel_goal(goal_handle);
-    } catch (const std::exception &exc) {
-      RCLCPP_WARN(node_->get_logger(),
-                  "Failed to cancel gripper goal after non-finite feedback: %s",
-                  exc.what());
-    }
+    dispatch_disable_cancel(runtime, goal_ros, goal_handle, command_id,
+                            generation, cancel_slot);
   }
-  if (feedback_position.has_value() &&
-      (!is_commanded_sim_mode() || reached_goal)) {
-    bool retry_projection = false;
-    {
-      std::lock_guard<std::mutex> lock(runtime->mutex);
-      if (runtime->command_id == command_id &&
-          runtime->generation == generation) {
-        const bool completed = reached_goal && !runtime->executing;
-        const bool queued = schedule_gripper_scene_projection_locked(
-            runtime, *feedback_position, completed);
-        retry_projection = completed && !queued;
-        ++runtime->revision;
-      }
-    }
-    if (retry_projection) {
-      (void)schedule_gripper_lifecycle(runtime, command_id, generation,
-                                       clock_.now() + 20'000'000);
+  if (feedback_position.has_value() && !is_commanded_sim_mode()) {
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    if (runtime->command_id == command_id && runtime->generation == generation) {
+      (void)schedule_gripper_scene_projection_locked(runtime, *feedback_position, false);
+      ++runtime->revision;
     }
   }
 }
@@ -763,6 +1105,7 @@ void Ros2GripperCommandBackend::on_gripper_feedback(
 void Ros2GripperCommandBackend::on_gripper_result(
     const std::shared_ptr<GripperRuntime> &runtime, std::uint64_t command_id,
     std::uint64_t generation, const GoalHandleGripper::WrappedResult &result) {
+  GoalHandleGripper::SharedPtr retired_goal;
   if (!runtime) {
     return;
   }
@@ -792,7 +1135,7 @@ void Ros2GripperCommandBackend::on_gripper_result(
       previous = runtime->lifecycle_handle;
       runtime->lifecycle_handle.reset();
       ++runtime->lifecycle_schedule_generation;
-      runtime->active_goal_handle.reset();
+      retired_goal = std::move(runtime->active_goal_handle);
       runtime->goal_accepted = false;
       if (result.code == rclcpp_action::ResultCode::SUCCEEDED &&
           result.result) {
@@ -831,7 +1174,7 @@ void Ros2GripperCommandBackend::on_gripper_result(
     std::lock_guard<std::mutex> lock(runtime->mutex);
     if (runtime->command_id != command_id ||
         runtime->generation != generation) {
-      // N10b: a result after the cancel's ACCEPT settled the stopped
+      // A result after the cancel's ACCEPT settled the stopped
       // command is ignored.
       if (runtime->lifecycle_disable_pending &&
           runtime->lifecycle_disable_command_id == command_id &&
@@ -842,7 +1185,7 @@ void Ros2GripperCommandBackend::on_gripper_result(
             result.code == rclcpp_action::ResultCode::ABORTED ||
             result.code == rclcpp_action::ResultCode::UNKNOWN;
         runtime->cancel_pending = false;
-        // N10: the goal's own success settled the stopped command first (no
+        // The goal's own success settled the stopped command first (no
         // cancel sent, or before the cancel's ACCEPT): it finished.
         if (result.code == rclcpp_action::ResultCode::SUCCEEDED)
           add_unique_evidence(runtime->evidence,
@@ -856,18 +1199,21 @@ void Ros2GripperCommandBackend::on_gripper_result(
       return;
     }
     runtime_config = runtime->config;
-    runtime->active_goal_handle.reset();
+    retired_goal = std::move(runtime->active_goal_handle);
     runtime->goal_accepted = false;
     runtime->cancel_pending = false;
     runtime->executing = false;
     lifecycle_handle = runtime->lifecycle_handle;
     runtime->lifecycle_handle.reset();
     ++runtime->lifecycle_schedule_generation;
+    const std::optional<double> reported_position =
+        result.result ? gripper_state_position(result.result->state)
+                      : std::nullopt;
     const bool result_position_not_finite =
-        result.result && !std::isfinite(result.result->position);
-    if (result.result && !result_position_not_finite) {
-      runtime->current_position = result.result->position;
-      result_position = result.result->position;
+        reported_position.has_value() && !std::isfinite(*reported_position);
+    if (reported_position.has_value() && !result_position_not_finite) {
+      runtime->current_position = *reported_position;
+      result_position = *reported_position;
     }
     if (result_position_not_finite) {
       runtime->state = "failed";
@@ -960,6 +1306,173 @@ void Ros2GripperCommandBackend::on_gripper_result(
 
 void Ros2GripperCommandBackend::invalidate_gripper_commands(
     core::GripperInvalidationReason reason) noexcept {
+  invalidate_gripper_commands_impl(reason);
+}
+
+bool Ros2GripperCommandBackend::rebuilt_unknown_pending(
+    const std::string &id, std::uint64_t command_id, std::uint64_t generation) const {
+  return static_cast<bool>(rebuilt_unknown_owner(id, command_id, generation));
+}
+
+std::shared_ptr<const void> Ros2GripperCommandBackend::rebuilt_unknown_owner(
+    const std::string &id, std::uint64_t command_id, std::uint64_t generation) const {
+  if (!command_id) return {};
+  std::shared_ptr<Ros2TransportResources> current_owner;
+  {
+    std::lock_guard authority_lock(gripper_authority_mutex_);
+    std::lock_guard map_lock(gripper_map_mutex_);
+    const auto found = grippers_.find(id);
+    if (found == grippers_.end()) return {};
+    const auto &runtime = *found->second;
+    std::lock_guard runtime_lock(runtime.mutex);
+    if (!runtime.ros) return {};
+    current_owner = runtime.ros->owner;
+    const bool unknown = runtime.executing ||
+        (runtime.state == "failed" && runtime.error == "Gripper action returned an unknown result code");
+    if (runtime.command_id == command_id && runtime.generation == generation && unknown &&
+        runtime.goal_ros && runtime.goal_ros->owner != current_owner &&
+        runtime.goal_ros->owner->joined() && current_owner == resources_.load() &&
+        current_owner->started() && !current_owner->executor_failure_started()) return current_owner;
+  }
+  if (!current_owner || current_owner != resources_.load() || !current_owner->started() ||
+      current_owner->executor_failure_started()) return {};
+  std::vector<LateCancelTracking::Entry> entries;
+  {
+    std::lock_guard lock(late_cancel_tracking_->mutex);
+    entries = late_cancel_tracking_->entries;
+  }
+  for (const auto &entry : entries) {
+    if (entry.gripper_id != id || !entry.bundle || !entry.bundle->owner ||
+        entry.bundle->owner == current_owner || !entry.bundle->owner->joined()) continue;
+    std::lock_guard lock(entry.slot->mutex);
+    if (entry.slot->command_id == command_id && entry.slot->generation == generation &&
+        (entry.slot->state == core::GripperLateCancelState::kFailed ||
+         entry.slot->state == core::GripperLateCancelState::kHandedOff)) return current_owner;
+  }
+  return {};
+}
+
+core::Result<void> Ros2GripperCommandBackend::retire_rebuilt_unknown(
+    const std::string &id, std::uint64_t command_id, std::uint64_t generation,
+    const std::shared_ptr<const void> &expected_owner) {
+  std::shared_ptr<core::GripperPreparedSessionPin> retired_session;
+  std::shared_ptr<GripperRuntime> retired_runtime;
+  std::shared_ptr<RosEntities> retired_bundle;
+  const auto retire_slot = [&](const std::shared_ptr<Ros2TransportResources> &current_owner) {
+    std::lock_guard tracking_lock(late_cancel_tracking_->mutex);
+    for (auto &entry : late_cancel_tracking_->entries) {
+      if (entry.gripper_id != id || !entry.bundle || !entry.bundle->owner ||
+          entry.bundle->owner == current_owner || !entry.bundle->owner->joined()) continue;
+      std::lock_guard slot_lock(entry.slot->mutex);
+      if (entry.slot->command_id != command_id || entry.slot->generation != generation ||
+          (entry.slot->state != core::GripperLateCancelState::kFailed &&
+           entry.slot->state != core::GripperLateCancelState::kHandedOff)) continue;
+      entry.slot->state = core::GripperLateCancelState::kSettled;
+      entry.slot->cancel_allowed.store(false, std::memory_order_release);
+      retired_session = std::move(entry.session);
+      retired_runtime = std::move(entry.runtime);
+      retired_bundle = std::move(entry.bundle);
+      const auto epoch = late_cancel_failure_epoch_->load(std::memory_order_acquire);
+      bool others_failed = false;
+      for (const auto &other : late_cancel_tracking_->entries) {
+        if (other.slot == entry.slot) continue;
+        std::lock_guard other_lock(other.slot->mutex);
+        if (other.slot->state == core::GripperLateCancelState::kFailed ||
+            other.slot->state == core::GripperLateCancelState::kHandedOff) {
+          others_failed = true;
+          break;
+        }
+      }
+      if (!others_failed && epoch != std::numeric_limits<std::uint64_t>::max())
+        late_cancel_cleared_epoch_.store(epoch, std::memory_order_release);
+      return true;
+    }
+    return false;
+  };
+  // A preempted slot may be retired without rewriting the newer command.
+  {
+    std::lock_guard authority_lock(gripper_authority_mutex_);
+    std::lock_guard map_lock(gripper_map_mutex_);
+    const auto current = grippers_.find(id);
+    if (current != grippers_.end() && expected_owner && command_id) {
+      std::lock_guard runtime_lock(current->second->mutex);
+      const auto current_owner = current->second->ros ? current->second->ros->owner : nullptr;
+      const bool exact_current = current->second->command_id == command_id &&
+                                 current->second->generation == generation;
+      if (!exact_current && current_owner && current_owner.get() == expected_owner.get() &&
+          current_owner == resources_.load() && current_owner->started() &&
+          !current_owner->executor_failure_started() && retire_slot(current_owner))
+        return core::Result<void>::Ok();
+    }
+  }
+  std::shared_ptr<GripperRuntime> runtime;
+  std::shared_ptr<RosEntities> old_bundle;
+  GoalHandleGripper::SharedPtr old_goal;
+  std::optional<core::ScheduleHandle> old_lifecycle;
+  std::function<void()> wake;
+  {
+    std::lock_guard authority_lock(gripper_authority_mutex_);
+    std::lock_guard map_lock(gripper_map_mutex_);
+    const auto found = grippers_.find(id);
+    if (found == grippers_.end())
+      return core::Result<void>::Err(core::ErrorDTO{"stale_gripper_state", "The exact gripper is unavailable", {}});
+    runtime = found->second;
+    std::lock_guard runtime_lock(runtime->mutex);
+    const bool unknown = runtime->executing ||
+        (runtime->state == "failed" && runtime->error == "Gripper action returned an unknown result code");
+    if (!expected_owner || !command_id || runtime->command_id != command_id || runtime->generation != generation ||
+        !unknown || !runtime->goal_ros || !runtime->ros ||
+        runtime->goal_ros->owner == runtime->ros->owner || !runtime->goal_ros->owner->joined() ||
+        runtime->ros->owner != resources_.load() || runtime->ros->owner.get() != expected_owner.get() ||
+        !runtime->ros->owner->started() ||
+        runtime->ros->owner->executor_failure_started())
+      return core::Result<void>::Err(core::ErrorDTO{"stale_gripper_state", "The rebuilt gripper command is no longer current", {}});
+    if (runtime->projection_state == core::GripperProjectionState::kPending &&
+        runtime->scene_projection_submitted)
+      return core::Result<void>::Err(core::ErrorDTO{
+          ros2_control_fault_reason::kGripperBusy, "The existing gripper projection is still pending", {}});
+    wake = retirement_wake_;
+    add_unique_evidence(runtime->evidence, "owner_rebuild_retired_unknown");
+    const bool projection_missed = runtime->scene_projection_missed_settled;
+    if (projection_missed) add_unique_evidence(runtime->evidence, "scene_projection_missed");
+    if (runtime->projection_state == core::GripperProjectionState::kPending) {
+      runtime->projection_state = core::GripperProjectionState::kNotRequired;
+      if (!projection_missed) runtime->projection_reason.clear();
+    }
+    old_bundle = std::move(runtime->goal_ros);
+    old_goal = std::move(runtime->active_goal_handle);
+    old_lifecycle = runtime->lifecycle_handle;
+    runtime->lifecycle_handle.reset();
+    ++runtime->lifecycle_schedule_generation;
+    runtime->state = "idle";
+    runtime->executing = false;
+    runtime->goal_accepted = false;
+    runtime->cancel_pending = false;
+    runtime->controller_done = false;
+    runtime->error.clear();
+    runtime->reason_code.clear();
+    if (runtime->lifecycle_disable_pending &&
+        runtime->lifecycle_disable_command_id == command_id &&
+        runtime->lifecycle_disable_generation == generation) {
+      runtime->lifecycle_disable_pending = false;
+      runtime->lifecycle_disable_terminal = true;
+      runtime->lifecycle_disable_failed = true;
+    }
+    ++runtime->revision;
+    (void)retire_slot(runtime->ros->owner);
+  }
+  runtime->lifecycle_condition.notify_all();
+  if (old_lifecycle) {
+    try { scheduler_.cancel(*old_lifecycle); } catch (...) {}
+  }
+  if (wake) {
+    try { wake(); } catch (...) {}
+  }
+  return core::Result<void>::Ok();
+}
+
+void Ros2GripperCommandBackend::invalidate_gripper_commands_impl(
+    core::GripperInvalidationReason reason) noexcept {
   std::vector<std::shared_ptr<GripperRuntime>> runtimes;
   {
     std::lock_guard<std::mutex> authority_lock(gripper_authority_mutex_);
@@ -976,7 +1489,10 @@ void Ros2GripperCommandBackend::invalidate_gripper_commands(
   }
   for (auto &runtime : runtimes) {
     GoalHandleGripper::SharedPtr goal_handle;
+    GoalHandleGripper::SharedPtr retired_goal;
+    std::shared_ptr<core::GripperLateCancelSlot> cancel_slot;
     rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
+    std::shared_ptr<RosEntities> goal_ros;
     std::optional<core::ScheduleHandle> lifecycle_handle;
     std::uint64_t disable_command_id = 0;
     std::uint64_t disable_generation = 0;
@@ -990,7 +1506,8 @@ void Ros2GripperCommandBackend::invalidate_gripper_commands(
         continue;
       }
       goal_handle = runtime->active_goal_handle;
-      // GRP-2: a command waiting for its duration is already done at the
+      cancel_slot = runtime->goal_late_cancel_slot;
+      // A command waiting for its duration is already done at the
       // controller; a Stop ends it like a goal finished in its last moment.
       const bool waiting_for_duration =
           runtime->executing && runtime->controller_done;
@@ -999,6 +1516,13 @@ void Ros2GripperCommandBackend::invalidate_gripper_commands(
           (runtime->executing && !waiting_for_duration &&
            runtime->config.output_mode != core::GripperOutputMode::kNone) ||
           goal_handle;
+      // A failed owner cannot establish the outcome of an admitted action.
+      // Keep its exact command and evidence until an existing settlement
+      // path proves the result; the closed send gate prevents a late cancel.
+      const bool terminal_unknown = runtime->state == "failed" &&
+          runtime->error == "Gripper action returned an unknown result code";
+      if ((command_unsettled || terminal_unknown) && old_effect_owner_retired(*runtime))
+        continue;
       // Only a ROS action goal has a remote terminal to settle. A scheduled
       // (Isaac publish) command is settled by this generation fence itself.
       if (command_unsettled &&
@@ -1014,12 +1538,11 @@ void Ros2GripperCommandBackend::invalidate_gripper_commands(
       // Stock GripperActionController quirk: a cancel that arrives after the
       // controller finished the goal but before realtime_tools sent its
       // success result is accepted and never answered (no result either);
-      // the ACCEPT itself settles the stopped command (N10b,
-      // dispatch_disable_cancel). A Stop also lets a command that is already
+      // the ACCEPT itself settles the stopped command
+      // (dispatch_disable_cancel). A Stop also lets a command that is already
       // done finish (like a robot move stopped in its last moment) and
-      // settles on the controller's own result instead of cancelling
-      // (GRP-1, N10): the
-      // fingers are within the finish tolerance of the target, or the node's
+      // settles on the controller's own result instead of cancelling:
+      // the fingers are within the finish tolerance of the target, or the node's
       // command_duration_s has elapsed since the start. A reached_goal
       // feedback already completed the command (on_gripper_feedback), so
       // nothing is left to cancel.
@@ -1051,16 +1574,18 @@ void Ros2GripperCommandBackend::invalidate_gripper_commands(
       }
       disable_command_id = runtime->lifecycle_disable_command_id;
       disable_generation = runtime->lifecycle_disable_generation;
-      action_client = runtime->action_client;
+      goal_ros = goal_handle ? runtime->goal_ros : runtime->ros;
+      if (goal_ros) action_client = goal_ros->action_client;
       lifecycle_handle = runtime->lifecycle_handle;
       runtime->lifecycle_handle.reset();
       ++runtime->lifecycle_schedule_generation;
       runtime->generation =
           next_gripper_generation_.fetch_add(1, std::memory_order_relaxed);
+      runtime->send_generation.store(runtime->generation, std::memory_order_release);
       runtime->executing = false;
       runtime->goal_accepted = false;
       runtime->cancel_pending = command_unsettled;
-      runtime->active_goal_handle.reset();
+      retired_goal = std::move(runtime->active_goal_handle);
       runtime->state = "idle";
       runtime->progress = 0.0;
       runtime->controller_done = false;
@@ -1086,47 +1611,92 @@ void Ros2GripperCommandBackend::invalidate_gripper_commands(
         // progressing.
       }
     }
+    // A Stop sends its cancel directly (no scheduler hop on the Stop path);
+    // its callers hold no state lock here. Reset and Shutdown keep the
+    // scheduled send: Stop settlement reaches the Reset fence under the
+    // engine's session mutex, and neither is time-critical.
     if (action_client && goal_handle)
-      dispatch_disable_cancel(runtime, action_client, goal_handle,
-                              disable_command_id, disable_generation);
+      dispatch_disable_cancel(runtime, goal_ros, goal_handle,
+                              disable_command_id, disable_generation, cancel_slot,
+                              true, reason == core::GripperInvalidationReason::kStop);
   }
 }
 
 void Ros2GripperCommandBackend::dispatch_disable_cancel(
     const std::shared_ptr<GripperRuntime> &runtime,
-    const rclcpp_action::Client<GripperCommand>::SharedPtr &client,
+    const std::shared_ptr<RosEntities> &goal_ros,
     const GoalHandleGripper::SharedPtr &goal, std::uint64_t command_id,
-    std::uint64_t generation) {
+    std::uint64_t generation,
+    const std::shared_ptr<core::GripperLateCancelSlot> &slot,
+    bool settle_lifecycle_on_accept, bool send_on_calling_thread) {
+  if (slot && slot->cancel_queued.exchange(true, std::memory_order_acq_rel))
+    return;
+  struct CancelItem {
+    rclcpp_action::Client<GripperCommand>::SharedPtr client;
+    GoalHandleGripper::SharedPtr goal;
+    std::shared_ptr<RosEntities::ActionLeaf> leaf;
+    std::weak_ptr<GripperRuntime> runtime;
+    std::shared_ptr<core::GripperLateCancelSlot> slot;
+    std::uint64_t command_id;
+    std::uint64_t generation;
+    bool settle_lifecycle_on_accept;
+  };
+  const auto owner = goal_ros->owner;
+  auto *const scheduler = &scheduler_;
   try {
-    const auto goal_id = goal->get_goal_id();
-    (void)client->async_cancel_goal(
-        goal, [weak_runtime = std::weak_ptr<GripperRuntime>(runtime),
-               command_id, generation, goal_id](const auto response) {
+    const auto scheduled_at = clock_.now();
+    auto item = owner->retain_entity(std::make_shared<CancelItem>(CancelItem{
+        goal_ros->action_client, goal, goal_ros->action_leaf, runtime, slot,
+        command_id, generation, settle_lifecycle_on_accept}));
+    // One non-waiting SDK call under the gripper action leaf; nothing else is
+    // acquired while it is held. The caller must hold no state lock.
+    const auto send = [owner, scheduler, scheduled_at](
+                          const std::shared_ptr<CancelItem> &cancel,
+                          bool on_scheduler) noexcept {
+      try {
+        MANYFORGE_LEAF_LOCK(leaf, cancel->leaf->mutex, detail::LeafEntity::kGripperCancel);
+        if (owner->executor_failure_started() || owner->joined())
+          throw std::runtime_error("gripper cancel owner failed");
+        if (cancel->slot) {
+          if (!cancel->slot->cancel_allowed.load(std::memory_order_acquire)) return;
+          const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count();
+          if (now_ns >= cancel->slot->lifecycle_deadline_ns.load(std::memory_order_acquire))
+            throw std::runtime_error("gripper cancel lifecycle deadline expired");
+        }
+        const auto goal_id = cancel->goal->get_goal_id();
+        (void)cancel->client->async_cancel_goal(cancel->goal,
+            [weak_runtime = cancel->runtime, slot = cancel->slot,
+             command_id = cancel->command_id, generation = cancel->generation,
+             settle_lifecycle_on_accept = cancel->settle_lifecycle_on_accept,
+             scheduler, scheduled_at,
+             goal_id](const auto response) {
+          const bool accepted = response &&
+              response->return_code == action_msgs::srv::CancelGoal::Response::ERROR_NONE &&
+              std::any_of(response->goals_canceling.begin(), response->goals_canceling.end(),
+                          [&](const auto &row) { return row.goal_id.uuid == goal_id; });
+          if (slot) {
+            if (!accepted) {
+              mark_gripper_cancel_unissued(slot);
+              try {
+                (void)scheduler->schedule(scheduled_at, [slot] {
+                  handoff_gripper_cancel_failure(slot);
+                }, core::SchedulerPriority::StopControl);
+              } catch (...) { /* The failed slot remains visible to teardown. */ }
+            }
+            else {
+              settle_gripper_cancel(slot);
+            }
+          }
           const auto runtime = weak_runtime.lock();
-          if (!runtime)
-            return;
+          if (!runtime) return;
           std::lock_guard lock(runtime->mutex);
           if (!runtime->lifecycle_disable_pending ||
               runtime->lifecycle_disable_command_id != command_id ||
               runtime->lifecycle_disable_generation != generation ||
-              runtime->lifecycle_disable_terminal)
-            return;
-          const bool accepted = response &&
-              response->return_code ==
-                  action_msgs::srv::CancelGoal::Response::ERROR_NONE &&
-              std::any_of(response->goals_canceling.begin(),
-                          response->goals_canceling.end(),
-                          [&](const auto &row) {
-                            return row.goal_id.uuid == goal_id;
-                          });
-          if (!accepted) {
-            runtime->lifecycle_disable_failed = true;
-          } else if (runtime->generation != generation) {
-            // N10b: every gripper action server we use holds the fingers
-            // before it answers ACCEPT (the stock GripperActionController,
-            // our Isaac bridge), so the accepted cancel ends the stopped
-            // command. The stock controller may never send a result after an
-            // ACCEPT; a later result for this goal is ignored.
+              runtime->lifecycle_disable_terminal) return;
+          if (!accepted) runtime->lifecycle_disable_failed = true;
+          else if (settle_lifecycle_on_accept && runtime->generation != generation) {
             runtime->lifecycle_disable_terminal = true;
             runtime->lifecycle_disable_failed = false;
             runtime->cancel_pending = false;
@@ -1134,10 +1704,31 @@ void Ros2GripperCommandBackend::dispatch_disable_cancel(
           }
           runtime->lifecycle_condition.notify_all();
         });
-  } catch (const std::exception &) {
+      } catch (...) {
+        mark_gripper_cancel_unissued(cancel->slot);
+        if (on_scheduler) {
+          handoff_gripper_cancel_failure(cancel->slot);
+        } else {
+          // The failure handoff (a journal write) stays on StopControl, as
+          // for a refused cancel response, not on the Stop caller.
+          try {
+            (void)scheduler->schedule(scheduled_at, [slot = cancel->slot] {
+              handoff_gripper_cancel_failure(slot);
+            }, core::SchedulerPriority::StopControl);
+          } catch (...) { /* The failed slot remains visible to teardown. */ }
+        }
+      }
+    };
+    if (send_on_calling_thread) {
+      send(item, false);
+      return;
+    }
+    (void)scheduler_.schedule(scheduled_at, [send, item] { send(item, true); },
+                              core::SchedulerPriority::StopControl);
+  } catch (...) {
+    mark_gripper_cancel_unissued(slot);
     std::lock_guard lock(runtime->mutex);
-    if (runtime->lifecycle_disable_pending &&
-        !runtime->lifecycle_disable_terminal) {
+    if (runtime->lifecycle_disable_pending && !runtime->lifecycle_disable_terminal) {
       runtime->lifecycle_disable_failed = true;
       runtime->lifecycle_condition.notify_all();
     }
@@ -1150,7 +1741,23 @@ void Ros2GripperCommandBackend::authorize_gripper_commands() noexcept {
 
 core::Result<void>
 Ros2GripperCommandBackend::try_authorize_gripper_commands() noexcept {
+  // Pure authority/runtime state under their own mutexes, which no gripper
+  // callback or send holds across a ROS call: run on the calling thread.
+  return try_authorize_gripper_commands_impl(resources_.load());
+}
+
+core::Result<void>
+Ros2GripperCommandBackend::try_authorize_gripper_commands_impl(
+    const std::shared_ptr<Ros2TransportResources> &owner) noexcept {
   std::lock_guard<std::mutex> lock(gripper_authority_mutex_);
+  if (gripper_terminally_closed_)
+    return core::Result<void>::Err(core::ErrorDTO{
+        "ros2_control_gripper_bridge_not_ready",
+        "The gripper transport has been closed", {}});
+  if (resources_.load() != owner)
+    return core::Result<void>::Err(core::ErrorDTO{
+        "ros2_control_gripper_bridge_disable_unsettled",
+        "The gripper transport changed during authorization", {}});
   {
     std::lock_guard map_lock(gripper_map_mutex_);
     for (const auto &row : grippers_) {
@@ -1178,7 +1785,22 @@ Ros2GripperCommandBackend::try_authorize_gripper_commands() noexcept {
 Ros2GripperLifecycleResult
 Ros2GripperCommandBackend::authorize_lifecycle_gripper(
     const std::string &gripper_id) {
+  // State only (see try_authorize_gripper_commands): calling thread.
+  return authorize_lifecycle_gripper_impl(gripper_id, resources_.load());
+}
+
+Ros2GripperLifecycleResult
+Ros2GripperCommandBackend::authorize_lifecycle_gripper_impl(
+    const std::string &gripper_id, const std::shared_ptr<Ros2TransportResources> &owner) {
   std::lock_guard authority_lock(gripper_authority_mutex_);
+  if (gripper_terminally_closed_)
+    return {false, false, core::ErrorDTO{
+        "ros2_control_gripper_bridge_not_ready",
+        "The gripper transport has been closed", {}}};
+  if (resources_.load() != owner)
+    return {false, false, core::ErrorDTO{
+        "ros2_control_gripper_bridge_disable_unsettled",
+        "The gripper transport changed during authorization", {}}};
   std::lock_guard map_lock(gripper_map_mutex_);
   const auto found = grippers_.find(gripper_id);
   if (found == grippers_.end())
@@ -1207,13 +1829,25 @@ bool Ros2GripperCommandBackend::lifecycle_disable_pending(
 
 Ros2GripperLifecycleResult Ros2GripperCommandBackend::prepare_lifecycle_gripper(
     const std::string &gripper_id) {
+  const auto owner = resources_.load();
   const auto readiness = gripper_transport_readiness(gripper_id);
   if (!readiness.configured || !readiness.ready ||
       readiness.transport_kind != "ros_gripper_command")
     return {false, false, core::ErrorDTO{
         "ros2_control_gripper_bridge_not_ready",
         "The exact ROS action gripper command bridge is not ready", {}}};
+  // State only (see try_authorize_gripper_commands): calling thread.
+  return prepare_lifecycle_gripper_impl(gripper_id, owner);
+}
+
+Ros2GripperLifecycleResult
+Ros2GripperCommandBackend::prepare_lifecycle_gripper_impl(
+    const std::string &gripper_id, const std::shared_ptr<Ros2TransportResources> &owner) {
   std::lock_guard authority_lock(gripper_authority_mutex_);
+  if (resources_.load() != owner)
+    return {false, false, core::ErrorDTO{
+        "ros2_control_gripper_bridge_not_ready",
+        "The gripper transport changed during preparation", {}}};
   std::lock_guard map_lock(gripper_map_mutex_);
   const auto found = grippers_.find(gripper_id);
   if (found == grippers_.end())
@@ -1237,50 +1871,69 @@ Ros2GripperLifecycleResult Ros2GripperCommandBackend::prepare_lifecycle_gripper(
 }
 
 Ros2GripperLifecycleResult Ros2GripperCommandBackend::disable_lifecycle_gripper(
-    const std::string &gripper_id, const std::stop_token cancellation) {
+    const std::string &gripper_id, const std::stop_token cancellation,
+    const std::chrono::steady_clock::time_point deadline) {
   std::shared_ptr<GripperRuntime> runtime;
   GoalHandleGripper::SharedPtr goal;
   rclcpp_action::Client<GripperCommand>::SharedPtr client;
+  std::shared_ptr<RosEntities> goal_ros;
   std::uint64_t command_id = 0;
   std::uint64_t generation = 0;
-  {
+  std::optional<Ros2GripperLifecycleResult> immediate;
+  const auto owner = resources_.load();
+  [&] {
     std::lock_guard authority_lock(gripper_authority_mutex_);
+    if (resources_.load() != owner) {
+      immediate = Ros2GripperLifecycleResult{false, false, core::ErrorDTO{
+          "ros2_control_gripper_bridge_disable_unsettled",
+          "The gripper transport changed during disable", {}}};
+      return;
+    }
     std::lock_guard map_lock(gripper_map_mutex_);
     const auto found = grippers_.find(gripper_id);
-    if (found == grippers_.end())
-      return {false, false, core::ErrorDTO{
+    if (found == grippers_.end()) {
+      immediate = Ros2GripperLifecycleResult{false, false, core::ErrorDTO{
           "ros2_control_gripper_bridge_not_configured",
           "The exact gripper command bridge is not configured", {}}};
+      return;
+    }
     runtime = found->second;
     std::lock_guard runtime_lock(runtime->mutex);
-    if (runtime->config.transport_kind != "ros_gripper_command")
-      return {false, false, core::ErrorDTO{
+    if (runtime->config.transport_kind != "ros_gripper_command") {
+      immediate = Ros2GripperLifecycleResult{false, false, core::ErrorDTO{
           "ros2_control_gripper_bridge_transport_unsupported",
           "Lifecycle disable requires the exact ROS action gripper bridge",
           {}}};
+      return;
+    }
     if (runtime->lifecycle_disable_pending) {
       if (runtime->lifecycle_disable_terminal) {
         const bool success = !runtime->lifecycle_disable_failed;
         runtime->lifecycle_disable_pending = false;
-        return {success, true,
+        immediate = Ros2GripperLifecycleResult{success, true,
                 success ? std::optional<core::ErrorDTO>{}
                         : std::optional<core::ErrorDTO>{core::ErrorDTO{
                               "ros2_control_gripper_bridge_disable_unsettled",
                               "The retained gripper cancellation did not settle successfully",
                               {}}}};
+        return;
       }
       command_id = runtime->lifecycle_disable_command_id;
       generation = runtime->lifecycle_disable_generation;
       goal = runtime->active_goal_handle;
-      client = runtime->action_client;
+      goal_ros = goal ? runtime->goal_ros
+                      : (runtime->goal_ros ? runtime->goal_ros : runtime->ros);
+      if (goal_ros) client = goal_ros->action_client;
     } else {
     gripper_admission_blocked_ = true;
     gripper_motion_admission_blocked_ = true;
     ++gripper_authority_generation_;
     ++gripper_lifecycle_generation_;
     if (!runtime->executing && !runtime->goal_accepted &&
-        !runtime->active_goal_handle)
-      return {true, true, std::nullopt};
+        !runtime->active_goal_handle) {
+      immediate = Ros2GripperLifecycleResult{true, true, std::nullopt};
+      return;
+    }
     runtime->lifecycle_disable_pending = true;
     runtime->lifecycle_disable_terminal = false;
     runtime->lifecycle_disable_failed = false;
@@ -1291,13 +1944,32 @@ Ros2GripperLifecycleResult Ros2GripperCommandBackend::disable_lifecycle_gripper(
     runtime->lifecycle_disable_command_id = command_id;
     runtime->lifecycle_disable_generation = generation;
     goal = runtime->active_goal_handle;
-    client = runtime->action_client;
+    goal_ros = goal ? runtime->goal_ros
+                    : (runtime->goal_ros ? runtime->goal_ros : runtime->ros);
+    if (goal_ros) client = goal_ros->action_client;
     }
-  }
+    if (runtime->goal_late_cancel_slot && deadline != std::chrono::steady_clock::time_point::max()) {
+      const auto deadline_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch()).count();
+      auto &cut = runtime->goal_late_cancel_slot->lifecycle_deadline_ns;
+      auto previous = cut.load(std::memory_order_acquire);
+      while (deadline_ns < previous &&
+             !cut.compare_exchange_weak(previous, deadline_ns, std::memory_order_acq_rel)) {}
+    }
+  }();
+  if (immediate)
+    return *immediate;
+  if (!goal_ros)
+    return {false, true, core::ErrorDTO{
+        "ros2_control_gripper_bridge_disable_unsettled",
+        "The exact gripper cancellation remains unsettled", {}}};
 
+  std::stop_source wait_stop;
+  std::stop_callback caller_stopped(cancellation, [&wait_stop] { wait_stop.request_stop(); });
+  std::stop_callback owner_failed(goal_ros->owner->executor_failure_token(),
+                                  [&wait_stop] { wait_stop.request_stop(); });
   std::unique_lock runtime_lock(runtime->mutex);
   if (!goal) {
-    runtime->lifecycle_condition.wait(runtime_lock, cancellation, [&] {
+    runtime->lifecycle_condition.wait_until(runtime_lock, wait_stop.get_token(), deadline, [&] {
       return shutdown_started_.load() ||
              runtime->lifecycle_disable_terminal ||
              runtime->lifecycle_disable_failed ||
@@ -1305,7 +1977,9 @@ Ros2GripperLifecycleResult Ros2GripperCommandBackend::disable_lifecycle_gripper(
              runtime->generation != generation || runtime->active_goal_handle;
     });
     goal = runtime->active_goal_handle;
-    client = runtime->action_client;
+    goal_ros = goal ? runtime->goal_ros
+                    : (runtime->goal_ros ? runtime->goal_ros : runtime->ros);
+    client = goal_ros ? goal_ros->action_client : nullptr;
   }
   if (runtime->lifecycle_disable_terminal &&
       !runtime->lifecycle_disable_failed) {
@@ -1320,8 +1994,14 @@ Ros2GripperLifecycleResult Ros2GripperCommandBackend::disable_lifecycle_gripper(
         "The exact gripper command did not establish a terminal cancellation outcome",
         {}}};
   }
-  if (runtime->lifecycle_cancel_dispatched) {
-    runtime->lifecycle_condition.wait(runtime_lock, cancellation, [&] {
+  if (goal_ros->owner->executor_failure_started())
+    return {false, true, core::ErrorDTO{
+        "ros2_control_gripper_bridge_disable_unsettled",
+        "The exact gripper cancellation remains unsettled", {}}};
+  const auto cancel_slot = runtime->goal_late_cancel_slot;
+  if (runtime->lifecycle_cancel_dispatched ||
+      (cancel_slot && cancel_slot->cancel_queued.exchange(true, std::memory_order_acq_rel))) {
+    runtime->lifecycle_condition.wait_until(runtime_lock, wait_stop.get_token(), deadline, [&] {
       return runtime->lifecycle_disable_terminal ||
              runtime->lifecycle_disable_failed;
     });
@@ -1336,11 +2016,42 @@ Ros2GripperLifecycleResult Ros2GripperCommandBackend::disable_lifecycle_gripper(
   }
   runtime->lifecycle_cancel_dispatched = true;
   runtime_lock.unlock();
+  auto *const scheduler = &scheduler_;
+  core::TimePoint scheduled_at{};
+  bool has_scheduled_at = false;
+  bool cancel_sent = false;
   try {
-    const auto goal_id = goal->get_goal_id();
-    (void)client->async_cancel_goal(
+    scheduled_at = clock_.now();
+    has_scheduled_at = true;
+    {
+      MANYFORGE_LEAF_DEFERRED_LOCK(leaf, goal_ros->action_leaf->mutex,
+                                  detail::LeafEntity::kGripperCancel);
+      const bool locked = deadline == std::chrono::steady_clock::time_point::max()
+          ? (leaf.lock(), true) : leaf.try_lock_until(deadline);
+      const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      if (locked && std::chrono::steady_clock::now() < deadline &&
+          !goal_ros->owner->executor_failure_started() && !goal_ros->owner->joined() &&
+          (!cancel_slot || (cancel_slot->cancel_allowed.load(std::memory_order_acquire) &&
+           now_ns < cancel_slot->lifecycle_deadline_ns.load(std::memory_order_acquire)))) {
+      const auto goal_id = goal->get_goal_id();
+      (void)client->async_cancel_goal(
         goal, [weak_runtime = std::weak_ptr<GripperRuntime>(runtime), command_id,
-               generation, goal_id](const auto response) {
+               generation, goal_id, cancel_slot, scheduler, scheduled_at](const auto response) {
+          const bool accepted = response &&
+              response->return_code == action_msgs::srv::CancelGoal::Response::ERROR_NONE &&
+              std::any_of(response->goals_canceling.begin(), response->goals_canceling.end(),
+                          [&](const auto &row) { return row.goal_id.uuid == goal_id; });
+          if (accepted && cancel_slot) {
+            settle_gripper_cancel(cancel_slot);
+          } else if (!accepted) {
+            mark_gripper_cancel_unissued(cancel_slot);
+            try {
+              (void)scheduler->schedule(scheduled_at, [cancel_slot] {
+                handoff_gripper_cancel_failure(cancel_slot);
+              }, core::SchedulerPriority::StopControl);
+            } catch (...) { /* Teardown retains the failed slot. */ }
+          }
           const auto runtime = weak_runtime.lock();
           if (!runtime)
             return;
@@ -1349,25 +2060,34 @@ Ros2GripperLifecycleResult Ros2GripperCommandBackend::disable_lifecycle_gripper(
               runtime->command_id != command_id ||
               runtime->generation != generation)
             return;
-          const bool accepted = response &&
-              response->return_code ==
-                  action_msgs::srv::CancelGoal::Response::ERROR_NONE &&
-              std::any_of(response->goals_canceling.begin(),
-                          response->goals_canceling.end(), [&](const auto &row) {
-                            return row.goal_id.uuid == goal_id;
-                          });
           if (!accepted) runtime->lifecycle_disable_failed = true;
           runtime->lifecycle_condition.notify_all();
         });
+      cancel_sent = true;
+      }
+    }
   } catch (...) {
+    mark_gripper_cancel_unissued(cancel_slot);
+    try { if (has_scheduled_at) (void)scheduler->schedule(scheduled_at, [cancel_slot] {
+      handoff_gripper_cancel_failure(cancel_slot);
+    }, core::SchedulerPriority::StopControl); } catch (...) {}
     runtime_lock.lock();
     runtime->lifecycle_disable_failed = true;
     return {false, true, core::ErrorDTO{
         "ros2_control_gripper_bridge_cancel_failed",
         "The gripper cancellation request could not be dispatched", {}}};
   }
+  if (!cancel_sent) {
+    mark_gripper_cancel_unissued(cancel_slot);
+    try { (void)scheduler->schedule(scheduled_at, [cancel_slot] {
+      handoff_gripper_cancel_failure(cancel_slot);
+    }, core::SchedulerPriority::StopControl); } catch (...) {}
+    return {false, true, core::ErrorDTO{
+        "ros2_control_gripper_bridge_disable_unsettled",
+        "The exact gripper cancellation remains unsettled", {}}};
+  }
   runtime_lock.lock();
-  runtime->lifecycle_condition.wait(runtime_lock, cancellation, [&] {
+  runtime->lifecycle_condition.wait_until(runtime_lock, wait_stop.get_token(), deadline, [&] {
     return shutdown_started_.load() ||
            runtime->lifecycle_disable_terminal ||
            runtime->lifecycle_disable_failed ||
@@ -1386,6 +2106,214 @@ Ros2GripperLifecycleResult Ros2GripperCommandBackend::disable_lifecycle_gripper(
       "ros2_control_gripper_bridge_disable_unsettled",
       "The exact gripper command did not establish a terminal cancellation outcome",
       {}}};
+}
+
+bool
+Ros2GripperCommandBackend::cached_gripper_local_owner_ready(
+    const std::string &gripper_id) const {
+  std::shared_ptr<GripperRuntime> runtime;
+  {
+    std::lock_guard lock(gripper_map_mutex_);
+    const auto found = grippers_.find(gripper_id);
+    if (found == grippers_.end()) return false;
+    runtime = found->second;
+  }
+  std::lock_guard lock(runtime->mutex);
+  if (runtime->config.output_mode == core::GripperOutputMode::kNone)
+    return runtime->config.actuation_kind == core::GripperActuationKind::kPneumatic &&
+           !shutdown_started_.load(std::memory_order_acquire);
+  const auto &ros = runtime->ros;
+  if (!ros || !ros->owner || ros->owner != resources_.load() ||
+      !ros->owner->started() || ros->owner->joined() ||
+      ros->owner->executor_failure_started() ||
+      shutdown_started_.load(std::memory_order_acquire) ||
+      (ros->callbacks_enabled && !ros->callbacks_enabled->load(std::memory_order_acquire)))
+    return false;
+  if (runtime->config.transport_kind == "isaac_joint_state_effort")
+    return ros->command_matches && ros->command_matches->load(std::memory_order_acquire) > 0;
+  if (runtime->config.transport_kind == "ros_gripper_command")
+    return ros->action_ready && ros->action_ready->load(std::memory_order_acquire) > 0;
+  return false;
+}
+
+core::Result<void> Ros2GripperCommandBackend::InstallGripperLateCancelJournalHook(
+    const std::string &gripper_id, const void *engine_identity,
+    LateCancelJournalHook hook) {
+  if (!engine_identity || !hook)
+    return core::Result<void>::Err({"late_cancel_owner_unavailable",
+                                    "Exact gripper journal owner is unavailable", {}});
+  std::shared_ptr<GripperRuntime> runtime;
+  {
+    std::lock_guard lock(gripper_map_mutex_);
+    const auto found = grippers_.find(gripper_id);
+    if (found == grippers_.end())
+      return core::Result<void>::Err({"gripper_not_configured", "Exact gripper is unavailable", {}});
+    runtime = found->second;
+  }
+  std::lock_guard lock(runtime->mutex);
+  if (runtime->late_cancel_journal_hook &&
+      runtime->late_cancel_engine_identity != engine_identity)
+    return core::Result<void>::Err({"late_cancel_owner_changed",
+                                    "Gripper journal owner changed", {}});
+  runtime->late_cancel_engine_identity = engine_identity;
+  runtime->late_cancel_journal_hook = std::move(hook);
+  return core::Result<void>::Ok();
+}
+
+Ros2GripperCommandBackend::LateCancelShutdownStatus
+Ros2GripperCommandBackend::gripper_late_cancel_shutdown_status() const noexcept {
+  std::lock_guard lock(late_cancel_tracking_->mutex);
+  bool unknown = false;
+  for (const auto &entry : late_cancel_tracking_->entries) {
+    const auto &slot = entry.slot;
+    std::lock_guard slot_lock(slot->mutex);
+    if (slot->state != core::GripperLateCancelState::kSettled &&
+        slot->state != core::GripperLateCancelState::kHandedOff)
+      return LateCancelShutdownStatus::kPendingOrFailed;
+    unknown |= slot->state == core::GripperLateCancelState::kHandedOff;
+  }
+  return unknown ? LateCancelShutdownStatus::kDurableUnknown
+                 : LateCancelShutdownStatus::kSettled;
+}
+
+bool Ros2GripperCommandBackend::gripper_late_cancel_failed() const noexcept {
+  const auto epoch = late_cancel_failure_epoch_->load(std::memory_order_acquire);
+  return epoch == std::numeric_limits<std::uint64_t>::max() ||
+         epoch != late_cancel_cleared_epoch_.load(std::memory_order_acquire);
+}
+
+std::vector<std::shared_ptr<core::GripperPreparedSessionPin>>
+Ros2GripperCommandBackend::tracked_gripper_prepared_sessions() const {
+  std::vector<std::shared_ptr<core::GripperPreparedSessionPin>> sessions;
+  std::lock_guard lock(late_cancel_tracking_->mutex);
+  for (const auto &entry : late_cancel_tracking_->entries)
+    if (entry.session) sessions.push_back(entry.session);
+  return sessions;
+}
+
+Ros2GripperCommandBackend::LateCancelShutdownStatus
+Ros2GripperCommandBackend::CloseGripperLateCancels(std::chrono::steady_clock::time_point deadline) {
+  const auto cutoff = deadline == std::chrono::steady_clock::time_point::max()
+      ? std::numeric_limits<std::int64_t>::max()
+      : std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch()).count();
+  std::vector<std::shared_ptr<core::GripperLateCancelSlot>> slots;
+  std::vector<LateCancelTracking::Entry> entries;
+  std::vector<std::shared_ptr<RosEntities>> bundles;
+  std::vector<rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr> retired_publishers;
+  {
+    // Registering an action slot takes the same authority before tracking.
+    // Fence new sends and publish every cutoff before queuing any cancels.
+    std::lock_guard authority_lock(gripper_authority_mutex_);
+    gripper_terminally_closed_ = true;
+    gripper_admission_blocked_ = true;
+    gripper_motion_admission_blocked_ = true;
+    ++gripper_authority_generation_;
+    ++gripper_lifecycle_generation_;
+    {
+      std::lock_guard map_lock(gripper_map_mutex_);
+      for (const auto &[id, runtime] : grippers_) {
+        (void)id;
+        std::lock_guard runtime_lock(runtime->mutex);
+        if (runtime->ros) {
+          if (runtime->ros->publisher_leaf)
+            runtime->ros->publisher_leaf->state.store(
+                RosEntities::PublisherLeaf::State::kRetired, std::memory_order_release);
+          bundles.push_back(runtime->ros);
+        }
+        if (runtime->goal_ros && runtime->goal_ros != runtime->ros) {
+          if (runtime->goal_ros->publisher_leaf)
+            runtime->goal_ros->publisher_leaf->state.store(
+                RosEntities::PublisherLeaf::State::kRetired, std::memory_order_release);
+          bundles.push_back(runtime->goal_ros);
+        }
+      }
+    }
+    std::lock_guard lock(late_cancel_tracking_->mutex);
+    entries = late_cancel_tracking_->entries;
+    for (const auto &entry : entries) slots.push_back(entry.slot);
+    for (const auto &slot : slots) {
+      auto previous = slot->lifecycle_deadline_ns.load(std::memory_order_acquire);
+      while (cutoff < previous && !slot->lifecycle_deadline_ns.compare_exchange_weak(
+                 previous, cutoff, std::memory_order_acq_rel)) {}
+    }
+  }
+  invalidate_gripper_commands_impl(core::GripperInvalidationReason::kShutdown);
+  const auto queue_failed_handoffs = [&] {
+    for (const auto &slot : slots) {
+      bool ready = false;
+      {
+        std::lock_guard lock(slot->mutex);
+        ready = slot->state == core::GripperLateCancelState::kFailed &&
+                slot->receipt_installed && static_cast<bool>(slot->handoff) &&
+                slot->target && !slot->gripper_id.empty();
+      }
+      if (!ready || slot->shutdown_handoff_queued.exchange(true, std::memory_order_acq_rel))
+        continue;
+      try {
+        (void)scheduler_.schedule(clock_.now(), [slot] {
+          handoff_gripper_cancel_failure(slot);
+        }, core::SchedulerPriority::StopControl);
+      } catch (...) {
+        // The exact Failed slot stays visible to the host and journal recovery.
+      }
+    }
+  };
+  queue_failed_handoffs();
+  {
+    std::unique_lock lock(late_cancel_tracking_->mutex);
+    late_cancel_tracking_->condition.wait_until(lock, deadline, [&] {
+      for (const auto &slot : slots) {
+        std::lock_guard slot_lock(slot->mutex);
+        if (slot->state == core::GripperLateCancelState::kPending) return false;
+      }
+      return true;
+    });
+  }
+  // The cutoff prevents subsequent admissions. Acquiring each exact leaf
+  // proves any SDK operation admitted before that cutoff has returned.
+  for (const auto &entry : entries) {
+    if (!entry.bundle || !entry.bundle->action_leaf) continue;
+    std::unique_lock leaf(entry.bundle->action_leaf->mutex, std::defer_lock);
+    const bool acquired = std::chrono::steady_clock::now() >= deadline
+        ? leaf.try_lock() : leaf.try_lock_until(deadline);
+    if (!acquired) {
+      for (const auto &slot : slots) mark_gripper_cancel_unissued(slot);
+      return LateCancelShutdownStatus::kStuck;
+    }
+  }
+  for (const auto &bundle : bundles) {
+    if (!bundle || !bundle->publisher_leaf) continue;
+    std::unique_lock leaf(bundle->publisher_leaf->mutex, std::defer_lock);
+    const bool acquired = std::chrono::steady_clock::now() >= deadline
+        ? leaf.try_lock() : leaf.try_lock_until(deadline);
+    if (!acquired) {
+      for (const auto &slot : slots) mark_gripper_cancel_unissued(slot);
+      return LateCancelShutdownStatus::kStuck;
+    }
+    bundle->publisher_leaf->state.store(RosEntities::PublisherLeaf::State::kRetired,
+                                        std::memory_order_release);
+    if (bundle->command_matches)
+      bundle->command_matches->store(-1, std::memory_order_release);
+    if (bundle->joint_state_pub)
+      retired_publishers.push_back(std::move(bundle->joint_state_pub));
+  }
+  // The last bundle alias enters the owner's retirement path only after the
+  // leaf is unlocked; the owner finalizer itself takes the exact leaf.
+  retired_publishers.clear();
+  for (const auto &slot : slots) mark_gripper_cancel_unissued(slot);
+  queue_failed_handoffs();
+  {
+    std::unique_lock lock(late_cancel_tracking_->mutex);
+    late_cancel_tracking_->condition.wait_until(lock, deadline, [&] {
+      for (const auto &slot : slots) {
+        std::lock_guard slot_lock(slot->mutex);
+        if (slot->state != core::GripperLateCancelState::kSettled &&
+            slot->state != core::GripperLateCancelState::kHandedOff) return false;
+      }
+      return true;
+    });
+  }
+  return gripper_late_cancel_shutdown_status();
 }
 
 Ros2GripperTransportReadinessSnapshot
@@ -1409,17 +2337,17 @@ Ros2GripperCommandBackend::gripper_transport_readiness(
   }
 
   Ros2GripperActionConfig runtime_config;
+  std::shared_ptr<RosEntities> ros;
   rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
-  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr command_publisher;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
       state_subscriber;
   std::optional<std::chrono::steady_clock::time_point> observed_at;
   {
     std::lock_guard<std::mutex> runtime_lock(runtime->mutex);
     runtime_config = runtime->config;
-    action_client = runtime->action_client;
-    command_publisher = runtime->joint_state_pub;
-    state_subscriber = runtime->joint_state_sub;
+    ros = runtime->ros;
+    action_client = ros->action_client;
+    state_subscriber = ros->joint_state_sub;
     observed_at = runtime->observed_at;
     result.feedback_messages_received = runtime->feedback_messages_received;
     result.feedback_samples_matched = runtime->feedback_samples_matched;
@@ -1439,25 +2367,35 @@ Ros2GripperCommandBackend::gripper_transport_readiness(
       // No action server, command endpoint, feedback gate or physical-ready
       // claim.
     } else if (runtime_config.transport_kind == "ros_gripper_command") {
-      result.command_path_ready =
-          action_client && action_client->action_server_is_ready();
+      // A thread-safe graph read: made directly, never through the owner.
+      if (action_client) {
+        result.command_path_ready = action_client->action_server_is_ready();
+        // The cached state reading follows this direct read: the server's
+        // endpoints can match after the last graph event, which then never
+        // refreshes the cache.
+        if (ros->action_ready)
+          ros->action_ready->store(result.command_path_ready ? 1 : 0, std::memory_order_release);
+      }
       result.feedback_path_ready = result.command_path_ready;
       if (!result.command_path_ready) {
         result.reason_codes.push_back("gripper_action_server_unavailable");
       }
     } else if (runtime_config.transport_kind == "isaac_joint_state_effort") {
-      result.command_path_ready =
-          command_publisher && command_publisher->get_subscription_count() > 0U;
+      result.command_path_ready = ros->publisher_leaf &&
+          ros->publisher_leaf->state.load(std::memory_order_acquire) == RosEntities::PublisherLeaf::State::kOpen && ros->command_matches &&
+          ros->command_matches->load(std::memory_order_acquire) > 0;
       if (!result.command_path_ready) {
         result.reason_codes.push_back("gripper_command_subscriber_unavailable");
       }
       if (runtime_config.state_topic.empty()) {
         result.feedback_path_ready = true;
       } else {
-        result.feedback_publisher_count =
-            state_subscriber ? state_subscriber->get_publisher_count() : 0U;
+        // A thread-safe graph read: made directly, never through the owner.
+        if (state_subscriber)
+          result.feedback_publisher_count =
+              state_subscriber->get_publisher_count();
         if (observed_at.has_value() && runtime_config.feedback_stream) {
-          // CP9: the pushed `gripper_feedback` stream owns staleness.
+          // The pushed `gripper_feedback` stream owns staleness.
           result.feedback_path_ready = true;
         } else if (observed_at.has_value()) {
           const auto age = std::chrono::steady_clock::now() - *observed_at;
@@ -1491,7 +2429,12 @@ Ros2GripperCommandBackend::gripper_transport_readiness(
   {
     std::lock_guard<std::mutex> map_lock(gripper_map_mutex_);
     const auto current = grippers_.find(gripper_id);
-    if (current == grippers_.end() || current->second != runtime) {
+    bool same = current != grippers_.end() && current->second == runtime;
+    if (same) {
+      std::lock_guard runtime_lock(runtime->mutex);
+      same = runtime->ros == ros;
+    }
+    if (!same) {
       result.configured = false;
       result.logical_owner_ready = false;
       result.command_path_ready = false;
@@ -1505,8 +2448,9 @@ Ros2GripperCommandBackend::gripper_transport_readiness(
       result.reason_codes.end());
   // Readiness describes actual physical transport for commanded output, or
   // the explicitly configured local owner for none. It cannot reopen admission.
-  // Including admission here would create a startup cycle: CCLC needs readiness
-  // before it selects the route whose existing reset flow opens the gate.
+  // Including admission here would create a startup cycle: the execution host
+  // needs readiness before it opens the route whose existing reset flow opens
+  // the gate.
   result.ready = result.output_mode == core::GripperOutputMode::kNone
                      ? result.configured && result.logical_owner_ready &&
                            result.reason_codes.empty()
@@ -1622,6 +2566,7 @@ core::Result<void> Ros2GripperCommandBackend::validate_gripper_command(
 
 core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
     const core::GripperCommandRequestDTO &request) {
+  GoalHandleGripper::SharedPtr retired_goal;
   const double max_effort = request.max_effort.value_or(0.0);
   if (request.gripper_id.empty() || !std::isfinite(request.target_position) ||
       !std::isfinite(request.duration_s) || !std::isfinite(max_effort) ||
@@ -1696,6 +2641,11 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
            gripper_authority_generation_ == authority_generation;
   };
   const Ros2GripperActionConfig runtime_config = runtime->config;
+  std::shared_ptr<RosEntities> ros;
+  {
+    std::lock_guard lock(runtime->mutex);
+    ros = runtime->ros;
+  }
   const auto runtime_is_current = [this, &request, &runtime]() {
     std::lock_guard<std::mutex> lock(gripper_map_mutex_);
     const auto current = grippers_.find(request.gripper_id);
@@ -1773,11 +2723,13 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
   }
 
   if (runtime_config.transport_kind == "ros_gripper_command") {
+    // Position commands wait for graph discovery (no lock is held here);
+    // pneumatic commands fail fast on the current server state.
     const bool ready =
         runtime_config.actuation_kind == core::GripperActuationKind::kPneumatic
-            ? runtime->action_client->action_server_is_ready()
-            : wait_for_action_server_until(
-                  runtime->action_client,
+            ? ros->action_client->action_server_is_ready()
+            : detail::wait_for_action_server_until(
+                  ros->action_client,
                   runtime_config.wait_for_action_server_timeout_s);
     if (!ready) {
       return rejected_gripper_command(
@@ -1786,7 +2738,7 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
                   core::GripperActuationKind::kPneumatic
               ? "Gripper action server is unavailable: " +
                     runtime_config.action_name
-              : "Timed out waiting for gripper action server " +
+              : "Gripper action server is unavailable: " +
                     runtime_config.action_name);
     }
   }
@@ -1795,8 +2747,69 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
       next_gripper_command_id_.fetch_add(1, std::memory_order_relaxed);
   const auto generation =
       next_gripper_generation_.fetch_add(1, std::memory_order_relaxed);
+  std::shared_ptr<RosEntities> prior_goal_ros;
+  // Called under runtime->mutex only before an SDK send has happened.
+  const auto owner_closed_before_send = [&]() {
+    if (!runtime->executing || runtime->command_id != command_id ||
+        runtime->generation != generation)
+      return rejected_gripper_command(
+          "gripper_command_not_authorized",
+          "Gripper command was invalidated before dispatch", command_id,
+          generation);
+    runtime->state = "failed";
+    runtime->executing = false;
+    runtime->goal_accepted = false;
+    runtime->cancel_pending = false;
+    runtime->goal_ros = prior_goal_ros;
+    runtime->projection_state = core::GripperProjectionState::kNotRequired;
+    runtime->projection_reason.clear();
+    runtime->reason_code = ros2_control_fault_reason::kGripperGoalDispatchFailed;
+    runtime->error = "The gripper ROS owner closed before command dispatch";
+    if (runtime->lifecycle_disable_pending &&
+        runtime->lifecycle_disable_command_id == command_id &&
+        runtime->lifecycle_disable_generation == generation) {
+      runtime->lifecycle_disable_terminal = true;
+      runtime->lifecycle_disable_failed = false;
+      runtime->lifecycle_condition.notify_all();
+    }
+    ++runtime->revision;
+    return rejected_gripper_command(runtime->reason_code, runtime->error,
+                                    command_id, generation);
+  };
+  // The authority lock is held and this dispatch has not entered an SDK
+  // send. A concurrent Disable may already be waiting for a goal response
+  // which cannot arrive for this exact never-sent command.
+  const auto authority_closed_before_send = [&]() {
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    if (runtime->executing && runtime->command_id == command_id &&
+        runtime->generation == generation) {
+      runtime->state = "failed";
+      runtime->executing = false;
+      runtime->goal_accepted = false;
+      runtime->cancel_pending = false;
+      runtime->goal_ros = prior_goal_ros;
+      runtime->projection_state = core::GripperProjectionState::kNotRequired;
+      runtime->projection_reason.clear();
+      runtime->reason_code = "gripper_command_not_authorized";
+      runtime->error = "Gripper lifecycle authority changed before command dispatch";
+      if (runtime->lifecycle_disable_pending &&
+          runtime->lifecycle_disable_command_id == command_id &&
+          runtime->lifecycle_disable_generation == generation) {
+        runtime->lifecycle_disable_terminal = true;
+        runtime->lifecycle_disable_failed = false;
+        runtime->lifecycle_condition.notify_all();
+      }
+      ++runtime->revision;
+    }
+    return rejected_gripper_command(
+        "gripper_command_not_authorized",
+        "Gripper lifecycle authority changed before command dispatch",
+        command_id, generation);
+  };
   std::optional<core::ScheduleHandle> superseded_lifecycle_handle;
+  std::optional<core::GripperCommandResultDTO> admission_result;
   {
+    const auto admit = [&]() -> std::optional<core::GripperCommandResultDTO> {
     std::lock_guard<std::mutex> authority_lock(gripper_authority_mutex_);
     if (!admission_authorized() || !runtime_is_current()) {
       return rejected_gripper_command(
@@ -1804,6 +2817,10 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
           "Gripper lifecycle authority changed during command admission");
     }
     std::lock_guard<std::mutex> lock(runtime->mutex);
+    if (runtime->ros != ros)
+      return rejected_gripper_command(
+          "gripper_command_not_authorized",
+          "Gripper transport changed during command admission");
     if (runtime->executing) {
       return rejected_gripper_command(ros2_control_fault_reason::kGripperBusy,
                                       "Gripper " + request.gripper_id +
@@ -1833,6 +2850,12 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
           "Gripper terminal scene projection failed; reset before retrying",
           runtime->command_id, runtime->generation);
     }
+    prior_goal_ros = runtime->goal_ros;
+    runtime->scene_projection_submitted = false;
+    runtime->scene_projection_submitted_request_id = 0;
+    runtime->scene_projection_missed_settled = false;
+    if (runtime_config.output_mode != core::GripperOutputMode::kNone)
+      runtime->goal_ros = ros;
     superseded_lifecycle_handle = runtime->lifecycle_handle;
     runtime->lifecycle_handle.reset();
     ++runtime->lifecycle_schedule_generation;
@@ -1841,6 +2864,7 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
     runtime->command_id = command_id;
     runtime->addressed_identity = request.addressed_identity;
     runtime->generation = generation;
+    runtime->send_generation.store(generation, std::memory_order_release);
     ++runtime->revision;
     runtime->progress = 0.0;
     runtime->goal_accepted = false;
@@ -1867,7 +2891,7 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
                   : gripper_duration_ns(request.duration_s),
               gripper_duration_ns(*runtime->config.result_timeout_s)));
     }
-    runtime->active_goal_handle.reset();
+    retired_goal = std::move(runtime->active_goal_handle);
     runtime->commanded_state = request.commanded_state;
     runtime->actuation_kind = request.actuation_kind;
     runtime->state_authority = request.state_authority;
@@ -1895,7 +2919,12 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
       if (!requires_pneumatic_commanded_projection(runtime_config))
         advance_pneumatic_locked(*runtime);
     }
+    return std::nullopt;
+    };
+    admission_result = admit();
   }
+  if (admission_result)
+    return *admission_result;
   if (superseded_lifecycle_handle.has_value()) {
     try {
       scheduler_.cancel(*superseded_lifecycle_handle);
@@ -1947,15 +2976,21 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
   }
 
   if (runtime_config.transport_kind == "isaac_joint_state_effort") {
+    std::optional<core::GripperCommandResultDTO> dispatch_result;
     {
-      std::lock_guard<std::mutex> authority_lock(gripper_authority_mutex_);
+      const auto dispatch = [&]() -> std::optional<core::GripperCommandResultDTO> {
+      std::unique_lock<std::mutex> authority_lock(gripper_authority_mutex_);
       if (!admission_authorized() || !runtime_is_current()) {
-        return rejected_gripper_command(
-            "gripper_command_not_authorized",
-            "Gripper lifecycle authority changed before command dispatch",
-            command_id, generation);
+        auto refused = authority_closed_before_send();
+        if (ros->publisher_leaf && ros->publisher_leaf->state.load(std::memory_order_acquire) != RosEntities::PublisherLeaf::State::kOpen)
+          refused.error = core::ErrorDTO{"ros2_control_gripper_bridge_not_ready",
+              "The exact gripper command publisher is unavailable", {}};
+        return refused;
       }
-      std::lock_guard<std::mutex> lock(runtime->mutex);
+      std::unique_lock<std::mutex> lock(runtime->mutex);
+      if (runtime->ros != ros && runtime->executing && runtime->command_id == command_id &&
+          runtime->generation == generation)
+        return owner_closed_before_send();
       if (!runtime->executing || runtime->command_id != command_id ||
           runtime->generation != generation) {
         return rejected_gripper_command(
@@ -1963,10 +2998,49 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
             "Gripper command was invalidated before dispatch", command_id,
             generation);
       }
+      bool entered_publish = false;
       try {
-        publish_isaac_joint_state_gripper_command(node_, runtime_config,
-                                                  runtime->joint_state_pub,
-                                                  request.target_position);
+        lock.unlock();
+        authority_lock.unlock();
+        bool sent = false;
+        bool publisher_missing = false;
+        try {
+        const auto msg = make_isaac_joint_state_gripper_command(
+            ros->owner->node(), runtime_config, request.target_position);
+        {
+          MANYFORGE_LEAF_LOCK(leaf, ros->publisher_leaf->mutex,
+                              detail::LeafEntity::kGripperPublish);
+          const bool pneumatic = runtime_config.actuation_kind == core::GripperActuationKind::kPneumatic;
+          const bool proof_current = !pneumatic || !owner_proof_supplied ||
+              (request.admission_token && request.admission_token->load(std::memory_order_acquire) ==
+                  request.admission_token_expected);
+          publisher_missing = ros->publisher_leaf->state.load(std::memory_order_acquire) != RosEntities::PublisherLeaf::State::kOpen || !ros->joint_state_pub;
+          if (!publisher_missing && !ros->owner->executor_failure_started() && !ros->owner->joined() && proof_current &&
+              runtime->send_generation.load(std::memory_order_acquire) == generation &&
+              gripper_lifecycle_generation_.load(std::memory_order_acquire) == lifecycle_generation &&
+              (pneumatic || gripper_authority_generation_.load(std::memory_order_acquire) == authority_generation)) {
+            entered_publish = true;
+            MANYFORGE_GRIPPER_PUBLISH_ENTERED();
+            ros->joint_state_pub->publish(msg);
+            sent = true;
+          }
+        }
+        } catch (...) {
+          authority_lock.lock();
+          lock.lock();
+          throw;
+        }
+        authority_lock.lock();
+        lock.lock();
+        if (!sent) {
+          auto refused = owner_closed_before_send();
+          if (publisher_missing)
+            refused.error = core::ErrorDTO{"ros2_control_gripper_bridge_not_ready",
+                "The exact gripper command publisher is unavailable", {}};
+          return refused;
+        }
+        if (runtime->command_id != command_id || runtime->generation != generation)
+          return core::GripperCommandResultDTO{true, command_id, generation, std::nullopt};
         if (runtime_config.actuation_kind ==
             core::GripperActuationKind::kPneumatic) {
           add_unique_evidence(runtime->evidence,
@@ -1974,6 +3048,10 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
           confirm_pneumatic_delivery_locked(*runtime);
         }
       } catch (const std::exception &exc) {
+        if (runtime->command_id != command_id || runtime->generation != generation)
+          return core::GripperCommandResultDTO{true, command_id, generation, std::nullopt};
+        if (entered_publish && ros->owner->executor_failure_started())
+          return core::GripperCommandResultDTO{true, command_id, generation, std::nullopt};
         runtime->state = "failed";
         runtime->executing = false;
         if (runtime_config.actuation_kind ==
@@ -1994,6 +3072,10 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
             ros2_control_fault_reason::kGripperGoalDispatchFailed,
             runtime->error, command_id, generation);
       } catch (...) {
+        if (runtime->command_id != command_id || runtime->generation != generation)
+          return core::GripperCommandResultDTO{true, command_id, generation, std::nullopt};
+        if (entered_publish && ros->owner->executor_failure_started())
+          return core::GripperCommandResultDTO{true, command_id, generation, std::nullopt};
         if (runtime_config.actuation_kind !=
             core::GripperActuationKind::kPneumatic)
           throw;
@@ -2010,7 +3092,12 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
         return rejected_gripper_command(runtime->reason_code, runtime->error,
                                         command_id, generation);
       }
+      return std::nullopt;
+      };
+      dispatch_result = dispatch();
     }
+    if (dispatch_result)
+      return *dispatch_result;
     if (runtime_config.actuation_kind ==
         core::GripperActuationKind::kPneumatic) {
       publish_pneumatic_display(runtime, request.target_position);
@@ -2027,11 +3114,58 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
     return {true, command_id, generation, std::nullopt};
   }
 
+  // One finger joint; an empty effort leaves the controller's configured
+  // max_effort (used only when it claims a max_effort_interface).
   GripperCommand::Goal goal;
-  goal.command.position = request.target_position;
-  goal.command.max_effort = max_effort;
+  goal.command.position = {request.target_position};
+  if (request.max_effort.has_value()) {
+    goal.command.effort = {max_effort};
+  }
 
   rclcpp_action::Client<GripperCommand>::SendGoalOptions options;
+  // The exact goal obligation exists before SDK admission, so a late response
+  // remains visible even if a newer prepared session becomes resident.
+  const auto late_cancel_slot = request.late_cancel_slot
+      ? request.late_cancel_slot : std::make_shared<core::GripperLateCancelSlot>();
+  std::vector<LateCancelTracking::Entry> retired_entries;
+  {
+    std::lock_guard authority_lock(gripper_authority_mutex_);
+    if (!admission_authorized() || !runtime_is_current())
+      return authority_closed_before_send();
+    {
+    std::lock_guard lock(runtime->mutex);
+    std::lock_guard slot_lock(late_cancel_slot->mutex);
+    late_cancel_slot->command_id = command_id;
+    late_cancel_slot->generation = generation;
+    late_cancel_slot->gripper_id = request.gripper_id;
+    late_cancel_slot->handoff = runtime->late_cancel_journal_hook;
+    late_cancel_slot->failure_epoch = late_cancel_failure_epoch_;
+    late_cancel_slot->state_changed = [weak = std::weak_ptr<LateCancelTracking>(late_cancel_tracking_)] {
+      if (const auto tracking = weak.lock()) {
+        std::lock_guard lock(tracking->mutex);
+        tracking->condition.notify_all();
+      }
+    };
+    late_cancel_slot->state = core::GripperLateCancelState::kPending;
+    if (runtime->command_id == command_id && runtime->generation == generation)
+      runtime->goal_late_cancel_slot = late_cancel_slot;
+    }
+    std::lock_guard lock(late_cancel_tracking_->mutex);
+    auto &entries = late_cancel_tracking_->entries;
+    for (auto it = entries.begin(); it != entries.end();) {
+      bool settled = false;
+      {
+        std::lock_guard slot_lock(it->slot->mutex);
+        settled = it->slot->state == core::GripperLateCancelState::kSettled;
+      }
+      if (settled) {
+        retired_entries.push_back(std::move(*it));
+        it = entries.erase(it);
+      } else ++it;
+    }
+    entries.push_back({request.gripper_id, late_cancel_slot, runtime, ros,
+                       request.prepared_session_pin});
+  }
   // Runtime state is generation-owned. Backend access is limited to cancelling
   // the owner-scheduled deadline; the retained host quiesces the ROS executor
   // before adapter destruction. The runtime owns the action client, which owns
@@ -2039,11 +3173,20 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
   // runtime weakly: a strong capture forms a cycle that leaks the client, node
   // and DDS participant whenever a goal never reaches a final result.
   const std::weak_ptr<GripperRuntime> weak_runtime = runtime;
-  options.goal_response_callback = [this, weak_runtime, command_id,
+  const std::weak_ptr<RosEntities> weak_ros = ros;
+  options.goal_response_callback = [this, weak_runtime, weak_ros, late_cancel_slot, command_id,
                                     generation](const GoalHandleGripper::SharedPtr& goal_handle) {
+    if (!goal_handle) {
+      settle_gripper_cancel(late_cancel_slot);
+    }
     const auto runtime = weak_runtime.lock();
-    if (!runtime)
+    const auto ros = weak_ros.lock();
+    if (!runtime || !ros)
       return;
+    const auto retained_goal = goal_handle ? ros->owner->retain_entity(goal_handle)
+                                           : GoalHandleGripper::SharedPtr{};
+    GoalHandleGripper::SharedPtr retired_callback_goal;
+    if (ros->action_graph_observer) (void)ros->action_graph_observer->request_refresh();
     GoalHandleGripper::SharedPtr handle_to_cancel;
     rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
     std::optional<core::ScheduleHandle> lifecycle_handle;
@@ -2055,8 +3198,8 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
         if (!(runtime->stop_lets_goal_finish &&
               runtime->lifecycle_disable_command_id == command_id &&
               runtime->lifecycle_disable_generation == generation)) {
-          handle_to_cancel = goal_handle;
-          action_client = runtime->action_client;
+          handle_to_cancel = retained_goal;
+          action_client = ros->action_client;
         }
       } else if (!goal_handle) {
         if (runtime->executing) {
@@ -2093,11 +3236,12 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
         return;
       } else if (runtime->lifecycle_disable_pending) {
         runtime->goal_accepted = true;
-        runtime->active_goal_handle = goal_handle;
+        retired_callback_goal = std::move(runtime->active_goal_handle);
+        runtime->active_goal_handle = retained_goal;
         if (!runtime->lifecycle_cancel_dispatched) {
           runtime->lifecycle_cancel_dispatched = true;
-          handle_to_cancel = goal_handle;
-          action_client = runtime->action_client;
+          handle_to_cancel = retained_goal;
+          action_client = ros->action_client;
         }
         runtime->lifecycle_condition.notify_all();
         ++runtime->revision;
@@ -2105,9 +3249,9 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
         lifecycle_handle = runtime->lifecycle_handle;
         runtime->lifecycle_handle.reset();
         ++runtime->lifecycle_schedule_generation;
-        handle_to_cancel = goal_handle;
-        action_client = runtime->action_client;
-        runtime->active_goal_handle.reset();
+        handle_to_cancel = retained_goal;
+        action_client = ros->action_client;
+        retired_callback_goal = std::move(runtime->active_goal_handle);
         runtime->goal_accepted = false;
         runtime->executing = false;
         runtime->cancel_pending = false;
@@ -2119,7 +3263,8 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
         ++runtime->revision;
       } else {
         runtime->goal_accepted = true;
-        runtime->active_goal_handle = goal_handle;
+        retired_callback_goal = std::move(runtime->active_goal_handle);
+        runtime->active_goal_handle = retained_goal;
         ++runtime->revision;
       }
     }
@@ -2131,8 +3276,8 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
       }
     }
     if (action_client && handle_to_cancel)
-      dispatch_disable_cancel(runtime, action_client, handle_to_cancel,
-                              command_id, generation);
+      dispatch_disable_cancel(runtime, ros, handle_to_cancel,
+                              command_id, generation, late_cancel_slot);
   };
   options.feedback_callback =
       [this, weak_runtime, command_id, generation](
@@ -2143,21 +3288,29 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
                               feedback);
       };
   options.result_callback =
-      [this, weak_runtime, command_id,
+      [this, weak_runtime, weak_ros, late_cancel_slot, command_id,
        generation](const GoalHandleGripper::WrappedResult &result) {
+        if (result.code != rclcpp_action::ResultCode::UNKNOWN) {
+          settle_gripper_cancel(late_cancel_slot);
+        }
+        if (const auto ros = weak_ros.lock(); ros && ros->action_graph_observer)
+          (void)ros->action_graph_observer->request_refresh();
         if (const auto runtime = weak_runtime.lock())
           on_gripper_result(runtime, command_id, generation, result);
       };
 
+  std::optional<core::GripperCommandResultDTO> dispatch_result;
+  bool sdk_entered = false;
   {
-    std::lock_guard<std::mutex> authority_lock(gripper_authority_mutex_);
+    const auto dispatch = [&]() -> std::optional<core::GripperCommandResultDTO> {
+    std::unique_lock<std::mutex> authority_lock(gripper_authority_mutex_);
     if (!admission_authorized() || !runtime_is_current()) {
-      return rejected_gripper_command(
-          "gripper_command_not_authorized",
-          "Gripper lifecycle authority changed before command dispatch",
-          command_id, generation);
+      return authority_closed_before_send();
     }
-    std::lock_guard<std::mutex> lock(runtime->mutex);
+    std::unique_lock<std::mutex> lock(runtime->mutex);
+    if (runtime->ros != ros && runtime->executing && runtime->command_id == command_id &&
+        runtime->generation == generation)
+      return owner_closed_before_send();
     if (!runtime->executing || runtime->command_id != command_id ||
         runtime->generation != generation) {
       return rejected_gripper_command(
@@ -2165,15 +3318,44 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
           "Gripper command was invalidated before dispatch", command_id,
           generation);
     }
-    if (runtime_config.actuation_kind ==
-            core::GripperActuationKind::kPneumatic &&
-        !runtime->action_client->action_server_is_ready()) {
+    const auto without_owner_locks = [&](auto &&operation) {
+      lock.unlock();
+      authority_lock.unlock();
+      try {
+        operation();
+      } catch (...) {
+        authority_lock.lock();
+        lock.lock();
+        throw;
+      }
+      authority_lock.lock();
+      lock.lock();
+    };
+    bool server_ready = true;
+    if (runtime_config.actuation_kind == core::GripperActuationKind::kPneumatic)
+      without_owner_locks([&] {
+        server_ready = ros->action_client->action_server_is_ready();
+      });
+    if (!runtime->executing || runtime->command_id != command_id ||
+        runtime->generation != generation)
+      return rejected_gripper_command("gripper_command_not_authorized",
+                                     "Gripper command was invalidated before dispatch",
+                                     command_id, generation);
+    if (!server_ready) {
+      runtime->goal_ros = prior_goal_ros;
       runtime->state = "failed";
       runtime->executing = false;
       runtime->externally_failed = true;
       runtime->reason_code =
           ros2_control_fault_reason::kGripperActionServerUnavailable;
       runtime->error = "Gripper action server disappeared before dispatch";
+      if (runtime->lifecycle_disable_pending &&
+          runtime->lifecycle_disable_command_id == command_id &&
+          runtime->lifecycle_disable_generation == generation) {
+        runtime->lifecycle_disable_terminal = true;
+        runtime->lifecycle_disable_failed = false;
+        runtime->lifecycle_condition.notify_all();
+      }
       add_unique_evidence(runtime->evidence,
                           "pneumatic_output_delivery_unconfirmed");
       ++runtime->revision;
@@ -2181,15 +3363,39 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
                                       command_id, generation);
     }
     try {
-      // rclcpp_action queues these callbacks on the executor; it does not
-      // invoke them inline. Keeping the authority and runtime leaf locks
-      // through this bounded enqueue makes dispatch linearizable with
-      // reset/replacement.
-      (void)runtime->action_client->async_send_goal(goal, options);
+      bool sent = false;
+      without_owner_locks([&] {
+        MANYFORGE_LEAF_LOCK(leaf, ros->action_leaf->mutex,
+                            detail::LeafEntity::kGripperGoal);
+        const bool pneumatic = runtime_config.actuation_kind ==
+                               core::GripperActuationKind::kPneumatic;
+        const bool proof_current = !pneumatic || !owner_proof_supplied ||
+            (request.admission_token &&
+             request.admission_token->load(std::memory_order_acquire) ==
+                 request.admission_token_expected);
+        if (ros->owner->executor_failure_started() || ros->owner->joined() || !proof_current ||
+            runtime->send_generation.load(std::memory_order_acquire) != generation ||
+            gripper_lifecycle_generation_.load(std::memory_order_acquire) != lifecycle_generation ||
+            (!pneumatic && gripper_authority_generation_.load(std::memory_order_acquire) != authority_generation))
+          return;
+        sdk_entered = true;
+        (void)ros->action_client->async_send_goal(goal, options);
+        sent = true;
+      });
+      if (!sent) return owner_closed_before_send();
+      if (runtime->command_id != command_id || runtime->generation != generation)
+        return core::GripperCommandResultDTO{true, command_id, generation, std::nullopt};
       if (runtime_config.actuation_kind ==
           core::GripperActuationKind::kPneumatic)
         add_unique_evidence(runtime->evidence, "ros_gripper_command_enqueued");
     } catch (const std::exception &exc) {
+      if (runtime->command_id != command_id || runtime->generation != generation)
+        return core::GripperCommandResultDTO{true, command_id, generation, std::nullopt};
+      if (ros->owner->executor_failure_started()) {
+        // The SDK was entered, but this owner failed before its send outcome
+        // could be established. Keep the exact command resident and unknown.
+        return core::GripperCommandResultDTO{true, command_id, generation, std::nullopt};
+      }
       runtime->state = "failed";
       runtime->executing = false;
       runtime->goal_accepted = false;
@@ -2210,6 +3416,10 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
           "Failed to dispatch gripper action goal: " + std::string(exc.what()),
           command_id, generation);
     } catch (...) {
+      if (runtime->command_id != command_id || runtime->generation != generation)
+        return core::GripperCommandResultDTO{true, command_id, generation, std::nullopt};
+      if (ros->owner->executor_failure_started())
+        return core::GripperCommandResultDTO{true, command_id, generation, std::nullopt};
       if (runtime_config.actuation_kind !=
           core::GripperActuationKind::kPneumatic)
         throw;
@@ -2226,6 +3436,16 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
       return rejected_gripper_command(runtime->reason_code, runtime->error,
                                       command_id, generation);
     }
+    return std::nullopt;
+    };
+    dispatch_result = dispatch();
+  }
+  if (dispatch_result) {
+    if (!sdk_entered || !dispatch_result->accepted) {
+      if (sdk_entered) mark_gripper_cancel_unissued(late_cancel_slot);
+      else settle_gripper_cancel(late_cancel_slot);
+    }
+    return *dispatch_result;
   }
   if (runtime_config.actuation_kind == core::GripperActuationKind::kPneumatic)
     publish_pneumatic_display(runtime, request.target_position);
@@ -2241,6 +3461,16 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
 
 core::GripperCommandResultDTO
 Ros2GripperCommandBackend::mark_gripper_grasp_lost(
+    const std::string &gripper_id, std::uint64_t expected_command_id,
+    std::uint64_t expected_generation, const std::string &evidence_label,
+    const std::string &message, const std::string &reason_code) {
+  return mark_gripper_grasp_lost_impl(
+      gripper_id, expected_command_id, expected_generation, evidence_label,
+      message, reason_code);
+}
+
+core::GripperCommandResultDTO
+Ros2GripperCommandBackend::mark_gripper_grasp_lost_impl(
     const std::string &gripper_id, std::uint64_t expected_command_id,
     std::uint64_t expected_generation, const std::string &evidence_label,
     const std::string &message, const std::string &reason_code) {
@@ -2263,6 +3493,8 @@ Ros2GripperCommandBackend::mark_gripper_grasp_lost(
 
   GoalHandleGripper::SharedPtr goal_handle;
   rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
+  std::shared_ptr<RosEntities> goal_ros;
+  std::shared_ptr<core::GripperLateCancelSlot> cancel_slot;
   std::optional<core::ScheduleHandle> lifecycle_handle;
   std::uint64_t command_id = 0;
   std::uint64_t generation = 0;
@@ -2283,11 +3515,14 @@ Ros2GripperCommandBackend::mark_gripper_grasp_lost(
     generation =
         next_gripper_generation_.fetch_add(1, std::memory_order_relaxed);
     goal_handle = runtime->active_goal_handle;
-    action_client = runtime->action_client;
+    cancel_slot = runtime->goal_late_cancel_slot;
+    goal_ros = goal_handle ? runtime->goal_ros : runtime->ros;
+    if (goal_ros) action_client = goal_ros->action_client;
     lifecycle_handle = runtime->lifecycle_handle;
     runtime->lifecycle_handle.reset();
     ++runtime->lifecycle_schedule_generation;
     runtime->generation = generation;
+    runtime->send_generation.store(generation, std::memory_order_release);
     runtime->active_goal_handle.reset();
     runtime->state = "failed";
     runtime->executing = false;
@@ -2314,15 +3549,9 @@ Ros2GripperCommandBackend::mark_gripper_grasp_lost(
     }
   }
 
-  if (action_client && goal_handle) {
-    try {
-      (void)action_client->async_cancel_goal(goal_handle);
-    } catch (const std::exception &exc) {
-      RCLCPP_WARN(node_->get_logger(),
-                  "Failed to cancel lost-grasp gripper action goal: %s",
-                  exc.what());
-    }
-  }
+  if (action_client && goal_handle)
+    dispatch_disable_cancel(runtime, goal_ros, goal_handle, command_id,
+                            expected_generation, cancel_slot, false);
   return {true, command_id, generation, std::nullopt};
 }
 
@@ -2436,13 +3665,14 @@ void Ros2GripperCommandBackend::advance_gripper_command(
     core::TimePoint next = 0;
     {
       std::lock_guard<std::mutex> lock(runtime->mutex);
-      if (runtime->command_id != command_id ||
-          runtime->generation != generation ||
+      if (runtime->command_id != command_id || runtime->generation != generation ||
           runtime->lifecycle_schedule_generation != schedule_generation)
         return;
       runtime->lifecycle_handle.reset();
       advance_pneumatic_locked(*runtime);
-      active = runtime->executing;
+      active = runtime->executing &&
+               !(runtime->config.transport_kind == "ros_gripper_command" &&
+                 old_effect_owner_retired(*runtime));
       next = clock_.now() + 10'000'000;
       if (runtime->deadline_at_ns)
         next = std::min(next, *runtime->deadline_at_ns);
@@ -2453,14 +3683,15 @@ void Ros2GripperCommandBackend::advance_gripper_command(
   }
   GoalHandleGripper::SharedPtr goal_handle;
   rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
+  std::shared_ptr<RosEntities> ros;
+  std::shared_ptr<core::GripperLateCancelSlot> cancel_slot;
   Ros2GripperActionConfig runtime_config;
   std::optional<double> scene_position;
   bool schedule_next = false;
   core::TimePoint next_deadline_ns = 0;
   {
     std::lock_guard<std::mutex> lock(runtime->mutex);
-    if (runtime->command_id != command_id ||
-        runtime->generation != generation ||
+    if (runtime->command_id != command_id || runtime->generation != generation ||
         runtime->lifecycle_schedule_generation != schedule_generation) {
       return;
     }
@@ -2477,7 +3708,7 @@ void Ros2GripperCommandBackend::advance_gripper_command(
                                              static_cast<double>(duration_ns));
 
     if (runtime->executing && runtime->controller_done) {
-      // GRP-2: the controller is done; complete once duration_s elapsed.
+      // The controller is done; complete once duration_s elapsed.
       if (elapsed_ns >= duration_ns) {
         runtime->state = "completed";
         runtime->executing = false;
@@ -2487,8 +3718,14 @@ void Ros2GripperCommandBackend::advance_gripper_command(
       }
     } else if (runtime->executing && runtime->deadline_at_ns.has_value() &&
         now_ns >= *runtime->deadline_at_ns) {
+      // Order timeout against failure while the exact command is locked.
+      if (runtime_config.transport_kind == "ros_gripper_command" &&
+          old_effect_owner_retired(*runtime))
+        return;
       goal_handle = runtime->active_goal_handle;
-      action_client = runtime->action_client;
+      cancel_slot = runtime->goal_late_cancel_slot;
+      ros = goal_handle ? runtime->goal_ros : runtime->ros;
+      if (ros) action_client = ros->action_client;
       runtime->active_goal_handle.reset();
       runtime->state = "failed";
       runtime->executing = false;
@@ -2499,6 +3736,8 @@ void Ros2GripperCommandBackend::advance_gripper_command(
     } else if (runtime->executing &&
                runtime_config.transport_kind == "isaac_joint_state_effort" &&
                (runtime->duration_s <= 0.0 || elapsed_ns >= duration_ns)) {
+      if (old_effect_owner_retired(*runtime))
+        return;
       runtime->state = "completed";
       runtime->executing = false;
       runtime->goal_accepted = false;
@@ -2569,15 +3808,11 @@ void Ros2GripperCommandBackend::advance_gripper_command(
       ++runtime->revision;
     }
   }
-  if (action_client && goal_handle) {
-    try {
-      (void)action_client->async_cancel_goal(goal_handle);
-    } catch (const std::exception &exc) {
-      RCLCPP_WARN(node_->get_logger(),
-                  "Failed to cancel timed-out gripper action goal: %s",
-                  exc.what());
-    }
-  }
+  if (ros && ros->action_graph_observer)
+    (void)ros->action_graph_observer->request_refresh();
+  if (action_client && goal_handle)
+    dispatch_disable_cancel(runtime, ros, goal_handle, command_id,
+                            generation, cancel_slot, false);
   if (schedule_next) {
     (void)schedule_gripper_lifecycle(runtime, command_id, generation,
                                      next_deadline_ns);

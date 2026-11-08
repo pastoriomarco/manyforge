@@ -5,9 +5,9 @@
 # Usage (from /workspace):
 #   ./scripts/test-all.sh retained # current reduced aggregate
 #   ./scripts/test-all.sh cpp      # retained C++ only
-#   ./scripts/test-all.sh headless # qualified I5/H0 owner and client surfaces
+#   ./scripts/test-all.sh headless # headless owner and client surfaces
 #   ./scripts/test-all.sh python   # retained Python only
-#   ./scripts/test-all.sh bindings # ROS-free I2 compiler bindings
+#   ./scripts/test-all.sh bindings # ROS-free core compiler bindings
 
 set -euo pipefail
 
@@ -162,6 +162,18 @@ build_manyforge_scene() {
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
 }
 
+# The images put the cmeel Pinocchio/Coal prefix on CMAKE_PREFIX_PATH.
+build_manyforge_collision() {
+    local build="$1"
+    local build_testing="$2"
+    mkdir -p "$build"
+    cd "$build"
+    cmake "$WORKSPACE/manyforge_collision" -G "$BUILD_GENERATOR" -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING="$build_testing" \
+        -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
+    cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
+}
+
 configure_manyforge_deployment() {
     local build="$1"
     local build_testing="$2"
@@ -280,6 +292,18 @@ run_cpp_tests() {
     build_manyforge_scene "$scene_build" ON
     cd "$scene_build"
     if ! require_ctest_tests "manyforge_scene"; then
+        FAIL=$((FAIL + 1))
+    elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+
+    section "C++ manyforge_collision tests"
+    local collision_build="$BUILD_DIR/collision"
+    build_manyforge_collision "$collision_build" ON
+    cd "$collision_build"
+    if ! require_ctest_tests "manyforge_collision"; then
         FAIL=$((FAIL + 1))
     elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
         PASS=$((PASS + 1))
@@ -425,7 +449,7 @@ require_headless_runtime_packages() {
     local package_metadata
     for package_metadata in \
         "$build/manager-apply-test-fixture/metadata.json" \
-        "$build/manager-apply-o1-4g-replacement-fixture/metadata.json" \
+        "$build/manager-apply-replacement-fixture/metadata.json" \
         "$build/assistant-native-test-fixture/metadata.json"; do
         if [[ ! -f "$package_metadata" ]]; then
             echo -e "${RED}  FAIL: Headless runtime package was not generated: ${package_metadata}${NC}"
@@ -435,19 +459,19 @@ require_headless_runtime_packages() {
     return 0
 }
 
-prepare_ui6i_cell_bootstrap() {
+prepare_dual_robot_cell_bootstrap() {
     local build="$BUILD_DIR/deployment"
     configure_manyforge_deployment "$build" ON
     set_build_keep_going_args "$build" || return 1
     if ! cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" \
-        --target manyforge_ui6i_cell_bootstrap manyforge_prepare_activation -- "${BUILD_KEEP_GOING_ARGS[@]}"; then
-        echo -e "${RED}  FAIL: UI6-I cell bootstrap generation failed${NC}"
+        --target manyforge_dual_robot_cell_bootstrap manyforge_prepare_activation -- "${BUILD_KEEP_GOING_ARGS[@]}"; then
+        echo -e "${RED}  FAIL: dual-robot cell bootstrap generation failed${NC}"
         return 1
     fi
-    local package="$build/ui6i-dual-scenario-fixture/retained-package"
-    local admission="$package/canonical-empty-admission.ui6i_ur5e_lite6_wall_cell.json"
+    local package="$build/dual-robot-scenario-fixture/retained-package"
+    local admission="$package/canonical-empty-admission.dual_robot_wall_cell.json"
     if [[ ! -d "$package" || ! -f "$admission" ]]; then
-        echo -e "${RED}  FAIL: UI6-I cell bootstrap is incomplete${NC}"
+        echo -e "${RED}  FAIL: dual-robot cell bootstrap is incomplete${NC}"
         return 1
     fi
 }
@@ -470,7 +494,7 @@ run_roboplan_tests() {
     fi
     cd "$build"
     # The execution host loads its adapter families from the build tree's
-    # ament prefix (CONTRACTS §6).
+    # ament prefix.
     if ! require_ctest_tests "manyforge_roboplan"; then
         FAIL=$((FAIL + 1))
     elif AMENT_PREFIX_PATH="$build/ament_cmake_index:${AMENT_PREFIX_PATH:-}" \
@@ -483,7 +507,7 @@ run_roboplan_tests() {
 }
 
 run_headless_cpp_tests() {
-    section "C++ I5/H0 headless owner tests"
+    section "C++ headless owner tests"
     local build="$BUILD_DIR/headless"
     local ros_execution_host="$BUILD_DIR/roboplan/manyforge_ros2_control_execution_host"
     build_headless_roboplan_producer_closure
@@ -505,9 +529,9 @@ run_headless_cpp_tests() {
 }
 
 run_headless_python_tests() {
-    section "Python I5/H0 API, CLI, and process-boundary tests"
+    section "Python headless API, CLI, and process-boundary tests"
     local build="$BUILD_DIR/headless"
-    if ! prepare_ui6i_cell_bootstrap; then
+    if ! prepare_dual_robot_cell_bootstrap; then
         FAIL=$((FAIL + 1))
         return
     fi
@@ -521,11 +545,11 @@ run_headless_python_tests() {
         uvicorn \
         manyforge_headless_py \
         manyforge_program_runner; then
-        echo -e "${RED}  FAIL: missing I5/H0 Python or native binding dependencies${NC}"
+        echo -e "${RED}  FAIL: missing headless Python or native binding dependencies${NC}"
         FAIL=$((FAIL + 1))
         return
     fi
-    # The UI6-I cell is a ros2_control mock cell: its process tests need the
+    # The dual-robot cell is a ros2_control mock cell: its process tests need the
     # ROS image and run in the `ros-e2e` suite, never here.
     if AMENT_PREFIX_PATH="$BUILD_DIR/roboplan/ament_cmake_index:${AMENT_PREFIX_PATH:-}" \
         MANYFORGE_MANAGER_DAEMON="$build/manyforge_manager_daemon" \
@@ -536,7 +560,7 @@ run_headless_python_tests() {
         MANYFORGE_ROBOTIQ_POSITION_METADATA="$build/robotiq-position-manager-test-fixture/metadata.json" \
         MANYFORGE_MANAGER_APPLY_PACKAGE_ROOT="$build/manager-apply-test-fixture/retained-package" \
         MANYFORGE_MANAGER_APPLY_METADATA="$build/manager-apply-test-fixture/metadata.json" \
-        MANYFORGE_UI6I_CELL_BOOTSTRAP_ROOT="$BUILD_DIR/deployment/ui6i-dual-scenario-fixture/retained-package" \
+        MANYFORGE_DUAL_ROBOT_CELL_BOOTSTRAP_ROOT="$BUILD_DIR/deployment/dual-robot-scenario-fixture/retained-package" \
         MANYFORGE_ACTIVATION_PREPARER="$BUILD_DIR/deployment/manyforge_prepare_activation" \
         MANYFORGE_EXAMPLE_SCENARIO_ROOT="$WORKSPACE/examples" \
         MANYFORGE_ROS2_CONTROL_EXECUTION_HOST="$BUILD_DIR/roboplan/manyforge_ros2_control_execution_host" \
@@ -546,7 +570,7 @@ run_headless_python_tests() {
             manyforge_headless_api/tests/ \
             manyforge_headless_api/process_tests/ \
             manyforge_program_runner/tests/ \
-            "${UI6I_ROS_PROCESS_TESTS[@]/#/--ignore=}" \
+            "${MOCK_CELL_ROS_PROCESS_TESTS[@]/#/--ignore=}" \
             -p no:cacheprovider \
             -p no:launch_testing -p no:launch_ros \
             -v; then
@@ -599,12 +623,10 @@ run_python_tests() {
     if pytest \
         manyforge_behavior/tests/ \
         manyforge_operator/tests/ \
-        scripts/qualification/tests/ \
-        tests/composable_cell_i4/ \
+        tests/test_source_identity.py \
         tests/test_benchmark.py \
         tests/test_public_contract_entrypoint_reconciliation.py \
         tests/test_regen.py \
-        tests/test_qualification_wrapper_entrypoints.py \
         tests/test_ros_qualification_helpers.py \
         tests/test_grouped_gtest_runner.py \
         tests/test_release_golden_workflow.py \
@@ -639,7 +661,7 @@ run_integration_tests() {
 }
 
 run_bridge_tests() {
-    section "Assistant H0 read client and retained protocol tests"
+    section "Assistant read client and retained protocol tests"
     cd "$WORKSPACE"
     setup_pythonpath
     if ! python_has_modules fastapi httpx; then
@@ -719,15 +741,10 @@ run_composer_frontend_tests() {
     fi
 }
 
-run_qualification_tests() {
-    section "Scenario qualification"
-    manyforge_fail_composable_cell_runtime_unavailable
-}
-
 run_deployment_composition_tests() {
     section "Deployment Stop-plan composition"
-    local build="$BUILD_DIR/ua7wl-deployment-qualification"
-    cmake -S "$WORKSPACE/verification/ua7wl_deployment" -B "$build" \
+    local build="$BUILD_DIR/deployment-stop-plan-composition"
+    cmake -S "$WORKSPACE/tests/deployment_stop_plan_composition" -B "$build" \
         -G "$BUILD_GENERATOR" -DCMAKE_BUILD_TYPE=Release \
         -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S"
     cmake --build "$build" \
@@ -745,12 +762,7 @@ run_deployment_composition_tests() {
     fi
 }
 
-run_qualification_soak_tests() {
-    section "Soak qualification"
-    manyforge_fail_composable_cell_runtime_unavailable
-}
-
-# The ROS image's environment the Q9 build helper selects: ROS, the pinned
+# The ROS image's environment the ROS build helper selects: ROS, the pinned
 # stock topic_based_ros2_control install, the xarm_description data overlay and
 # the application venv. Re-entering a configured tree needs the same one.
 ROS_INTEGRATION_TOPIC_INSTALL=/opt/manyforge/topic_based_ros2_control/install
@@ -771,7 +783,7 @@ source_ros_integration_environment() {
     set -u
 }
 
-# Q9: one ROS integration graph (Core, deployment, the JTC adapter and gripper,
+# One ROS integration graph (Core, deployment, the JTC adapter and gripper,
 # the ROS execution host) built by the ROS image's helper, then its CTest.
 run_ros_tests() {
     section "ROS integration graph (Core, deployment, JTC adapter, ROS host)"
@@ -816,17 +828,17 @@ run_ros_tests() {
     fi
 }
 
-# UI6-I process tests whose cell is the ros2_control mock lane. They need the
+# Process tests whose cell is the ros2_control mock lane. They need the
 # ROS image: Manager beside the real ROS execution host, which starts its
 # Manager-owned mock controller launches from the sourced bringup overlay.
-UI6I_ROS_PROCESS_TESTS=(
-    manyforge_headless_api/process_tests/test_ui6i_grouped_execution.py
+MOCK_CELL_ROS_PROCESS_TESTS=(
+    manyforge_headless_api/process_tests/test_dual_robot_grouped_execution.py
     manyforge_headless_api/process_tests/test_operator_alarm_motion_attention.py
     manyforge_headless_api/process_tests/test_interrupt_signal_nodes_process.py
 )
 
 run_ros_e2e_tests() {
-    section "UI6-I mock cell: Manager, ROS execution host, mock ros2_control"
+    section "Dual-robot mock cell: Manager, ROS execution host, mock ros2_control"
     local build_root="$BUILD_DIR/ros-e2e"
     local ros_build="$build_root/roboplan"
     local overlay="$build_root/ros-overlay/install/setup.bash"
@@ -858,13 +870,14 @@ run_ros_e2e_tests() {
             -DMANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL=ON \
                 -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON -Dpybind11_DIR="$pybind11_cmake_dir" \
             -DMANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="$ros_build/manyforge_ros2_control_execution_host" \
+            -DMANYFORGE_HEADLESS_TEST_ROS_SETUP="$overlay" \
             -DMANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" \
         || ! cmake --build "$headless" --parallel "$BUILD_PARALLEL_LEVEL"; then
         echo -e "${RED}  FAIL: Headless build failed${NC}"
         FAIL=$((FAIL + 1))
         return
     fi
-    if ! prepare_ui6i_cell_bootstrap; then
+    if ! prepare_dual_robot_cell_bootstrap; then
         FAIL=$((FAIL + 1))
         return
     fi
@@ -901,13 +914,13 @@ if record["launch_sha256"] != record["source_sha256"]:
 PY_LAUNCH
          export MANYFORGE_MANAGER_ROS_LAUNCH_EVIDENCE="$evidence/controller-launch-input.json"
          # The execution host loads its adapter families from the build
-         # tree's ament prefix (CONTRACTS §6).
+         # tree's ament prefix.
          export AMENT_PREFIX_PATH="$ros_build/ament_cmake_index:${AMENT_PREFIX_PATH:-}"
          setup_pythonpath
          export PYTHONPATH="$headless:$PYTHONPATH"
          export MANYFORGE_MANAGER_DAEMON="$headless/manyforge_manager_daemon" \
          MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT="$headless/canonical-empty-test-package" \
-         MANYFORGE_UI6I_CELL_BOOTSTRAP_ROOT="$BUILD_DIR/deployment/ui6i-dual-scenario-fixture/retained-package" \
+         MANYFORGE_DUAL_ROBOT_CELL_BOOTSTRAP_ROOT="$BUILD_DIR/deployment/dual-robot-scenario-fixture/retained-package" \
          MANYFORGE_ACTIVATION_PREPARER="$BUILD_DIR/deployment/manyforge_prepare_activation" \
          MANYFORGE_EXAMPLE_SCENARIO_ROOT="$WORKSPACE/examples" \
          MANYFORGE_ROBOPLAN_CANDIDATE_WORKER="$ros_build/manyforge_roboplan_candidate_worker" \
@@ -920,10 +933,10 @@ PY_LAUNCH
              > "$evidence/empty-ros-apply-ctest.log" 2>&1 || manager_apply_status=$?
          cat "$evidence/empty-ros-apply-ctest.log"
          printf '%s\n' "$manager_apply_status" > "$evidence/empty-ros-apply-ctest.status"
-         # The run gets its own ROS domain (Fast DDS #6599, N16).
+         # The run gets its own ROS domain (Fast DDS #6599).
          ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
              "/opt/ros/${ROS_DISTRO:-lyrical}/lib/rmw_test_fixture_implementation/run_rmw_isolated" \
-             pytest "${UI6I_ROS_PROCESS_TESTS[@]}" -p no:cacheprovider -v ); then
+             pytest "${MOCK_CELL_ROS_PROCESS_TESTS[@]}" -p no:cacheprovider -v ); then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -965,21 +978,11 @@ case "$FILTER" in
     deployment-composition)
         run_deployment_composition_tests
         ;;
-    qualification)
-        run_qualification_tests
-        ;;
-    qualification-soak)
-        run_qualification_soak_tests
-        ;;
     ros)
         run_ros_tests
         ;;
     ros-e2e)
         run_ros_e2e_tests
-        ;;
-    qualification-all)
-        run_qualification_tests
-        run_qualification_soak_tests
         ;;
     integration)
         run_integration_tests
@@ -998,7 +1001,7 @@ case "$FILTER" in
         run_composer_frontend_tests
         ;;
     *)
-        echo "Usage: $0 [retained|cpp|headless|roboplan|bindings|python|composer|bridge|deployment-composition|qualification|qualification-soak|qualification-all|integration|ros|ros-e2e]"
+        echo "Usage: $0 [retained|cpp|headless|roboplan|bindings|python|composer|bridge|deployment-composition|integration|ros|ros-e2e]"
         exit 1
         ;;
 esac

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <manyforge_roboplan/component_stream_sample_bridge.hpp>
+#include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 
 #include <charconv>
 #include <cstdint>
@@ -78,14 +79,36 @@ void Receive(core::ComponentStreamHealth &health, std::unique_ptr<Status> messag
 
 std::shared_ptr<void>
 InstallComponentStreamSampleBridge(const std::shared_ptr<rclcpp::Node> &node,
-                                   std::shared_ptr<core::ComponentStreamHealth> health) {
+                                   std::shared_ptr<core::ComponentStreamHealth> health,
+                                   std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner,
+                                   std::shared_ptr<std::atomic<bool>> active) {
   if (!node || !health)
     return nullptr;
-  return node->create_subscription<Status>(
-      kSamplesTopic, rclcpp::QoS(rclcpp::KeepLast(kSamplesDepth)).reliable(),
-      [health = std::move(health)](std::unique_ptr<Status> message) {
-        Receive(*health, std::move(message));
-      });
+  if (!owner)
+    return node->create_subscription<Status>(
+        kSamplesTopic, rclcpp::QoS(rclcpp::KeepLast(kSamplesDepth)).reliable(),
+        [health = std::move(health), active](std::unique_ptr<Status> message) {
+          if (!active || active->load(std::memory_order_acquire))
+            Receive(*health, std::move(message));
+        });
+  struct Entities final {
+    rclcpp::Node::SharedPtr node;
+    rclcpp::Subscription<Status>::SharedPtr subscription;
+  };
+  std::shared_ptr<Entities> entities;
+  auto create = [&] {
+    auto prepared = std::make_shared<Entities>();
+    prepared->node = node;
+    prepared->subscription = node->create_subscription<Status>(
+        kSamplesTopic, rclcpp::QoS(rclcpp::KeepLast(kSamplesDepth)).reliable(),
+        [health = std::move(health), active](std::unique_ptr<Status> message) {
+          if (!active || active->load(std::memory_order_acquire))
+            Receive(*health, std::move(message));
+        });
+    entities = owner->retain_entity(std::move(prepared));
+  };
+  owner->invoke_creation(create);
+  return entities;
 }
 
 } // namespace manyforge::roboplan_backend

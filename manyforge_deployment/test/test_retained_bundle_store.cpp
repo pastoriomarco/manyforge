@@ -41,6 +41,7 @@
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
+#include <manyforge_deployment/program_reference_facts.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
@@ -320,11 +321,11 @@ class ScopedTrustedRoot final {
     std::string_view cell_id) {
   const std::string document =
       "{\"api_version\":\"manyforge.deployment.v1\","
-      "\"deployment_artifact_id\":\"i3_durable_store_fixture\","
+      "\"deployment_artifact_id\":\"durable_store_fixture\","
       "\"deployment_revision\":\"" +
       std::string(kZeroDigest) + "\",\"cell_id\":\"" +
       std::string(cell_id) +
-      "\",\"name\":\"I3 durable store fixture\","
+      "\",\"name\":\"Durable store fixture\","
       "\"catalogs\":{\"records\":[]},\"graph\":" +
       empty_graph() +
       ",\"desired_control_configurations\":[],"
@@ -375,8 +376,10 @@ struct DurableControllableLite6Fixture final {
 
 [[nodiscard]] DurableControllableLite6Fixture
 materialize_durable_controllable_lite6_bundle(
-    const std::filesystem::path& root) {
-  auto input = test::make_lite6_ros2_control_observed_consumer_retention_fixture();
+    const std::filesystem::path& root,
+    std::string_view flange_frame_alias = "flange") {
+  auto input = test::make_lite6_ros2_control_observed_consumer_retention_fixture(
+      false, false, flange_frame_alias);
   const test::Lite6ControllableCompilerInputArtifactSource input_source(
       input);
   FilesystemBuildManifestRepository manifest_repository(root);
@@ -1493,6 +1496,28 @@ TEST(FilesystemVerifiedRetainedProductArtifactSourceTest,
 }
 
 TEST(FilesystemVerifiedRetainedModelMapSourceTest,
+     ComponentAliasAndModelFrameIdResolveToTheSameQualifiedFrame) {
+  // A motion target's robot TCP is the literal `flange` frame role. Two frame
+  // roles may not alias one model source, so the robot flange is not renamed.
+  ScopedTrustedRoot root;
+  const auto materialized =
+      materialize_durable_controllable_lite6_bundle(root.path());
+  const auto& symbols = materialized.bundle->value().compiled_products.symbol_role_maps;
+  ASSERT_EQ(symbols.size(), 1U);
+  const FilesystemVerifiedRetainedModelMapSource source(root.path());
+  const auto model = source.get_verified(
+      {materialized.bundle->retained_bundle_id(), symbols.front().product_id});
+  ASSERT_TRUE(model.has_value());
+  const core::ControllableComponentId component{std::string(test::kLite6ControllableComponentId)};
+  const auto model_id = find_program_frame_matches(
+      {component, core::FrameRoleId("flange")}, *model);
+  ASSERT_EQ(model_id.size(), 1U);
+  const auto names = program_component_frame_names({component}, *model);
+  EXPECT_TRUE(names.contains({component, core::FrameRoleId("flange")}));
+  EXPECT_TRUE(program_component_frame_names({}, *model).empty());
+}
+
+TEST(FilesystemVerifiedRetainedModelMapSourceTest,
      ControllableLite6SurvivesDurablePlanningAndTypedModelMapPointReads) {
   ScopedTrustedRoot root;
   const auto materialized =
@@ -1588,6 +1613,59 @@ TEST(FilesystemVerifiedRetainedModelMapSourceTest,
   EXPECT_EQ(model_map->model_collision_bodies()[1]
                 .compiled_link_names.size(),
             3U);
+  std::size_t tested_frame_aliases = 0;
+  std::size_t tested_body_aliases = 0;
+  for (const auto &target : model_map->targets()) {
+    for (const auto &alias : target.frames) {
+      const auto *physical = std::get_if<CompositionComponentModelFrame>(&alias.frame);
+      if (!physical || physical->controllable_component_id != target.controllable_component_id)
+        continue;
+      const core::ProgramFrameReferenceDTO reference{target.controllable_component_id, alias.frame_role_id};
+      const auto matches = find_program_frame_matches(reference, *model_map);
+      EXPECT_TRUE(std::any_of(matches.begin(), matches.end(), [&](const auto &row) {
+        return row.model_instance_id == physical->model_instance_id &&
+               row.model_revision == physical->model_revision &&
+               row.compiled_frame_name == physical->compiled_frame_name;
+      }));
+      ++tested_frame_aliases;
+    }
+    for (const auto &alias : target.collision_bodies) {
+      const core::ProgramCollisionBodyReferenceDTO reference{
+          target.controllable_component_id, alias.collision_body_role_id};
+      const auto matches = find_program_collision_body_matches(reference, *model_map);
+      EXPECT_TRUE(std::any_of(matches.begin(), matches.end(), [&](const auto &row) {
+        return row.model_instance_id == alias.model_instance_id &&
+               row.compiled_collision_body_names == alias.compiled_link_names;
+      }));
+      ++tested_body_aliases;
+    }
+  }
+  EXPECT_GT(tested_frame_aliases, 0U);
+  EXPECT_GT(tested_body_aliases, 0U);
+  std::size_t tested_model_frames = 0;
+  for (const auto &path : model_map->frame_paths()) {
+    const auto *frame = std::get_if<CompositionComponentModelFrame>(&path.terminal_frame);
+    if (!frame) continue;
+    const core::ProgramFrameReferenceDTO reference{frame->controllable_component_id, frame->frame_role_id};
+    const auto matches = find_program_frame_matches(reference, *model_map);
+    EXPECT_TRUE(std::any_of(matches.begin(), matches.end(), [&](const auto &row) {
+      return row.model_instance_id == frame->model_instance_id &&
+             row.model_revision == frame->model_revision &&
+             row.compiled_frame_name == frame->compiled_frame_name;
+    }));
+    ++tested_model_frames;
+  }
+  EXPECT_GT(tested_model_frames, 0U);
+  for (const auto &body : model_map->model_collision_bodies()) {
+    ASSERT_TRUE(body.owner_component_id);
+    const core::ProgramCollisionBodyReferenceDTO reference{*body.owner_component_id, body.collision_body_role_id};
+    const auto matches = find_program_collision_body_matches(reference, *model_map);
+    EXPECT_TRUE(std::any_of(matches.begin(), matches.end(), [&](const auto &row) {
+      return row.model_instance_id == body.model_instance_id &&
+             row.model_revision == body.model_revision &&
+             row.compiled_collision_body_names == body.compiled_link_names;
+    }));
+  }
   EXPECT_FALSE(model_map->symbols().empty());
   EXPECT_FALSE(model_map->references().empty());
   EXPECT_FALSE(model_map->coordinates().empty());
@@ -1604,9 +1682,9 @@ TEST(FilesystemVerifiedRetainedModelMapSourceTest,
   EXPECT_TRUE(cell_path.segments.empty());
   EXPECT_EQ(kinematic_index.find_frame_path(cell_path.terminal_frame),
             &cell_path);
-  // M7 U2 on a real verified map: every path is found as itself (the paths
+  // The kinematic index on a real verified map: every path is found as itself (the paths
   // are unique), every model frame path is stamped with the graph owner
-  // (the R16 invariant), and the graph owner of every occurrence is the
+  // (the owner-stamping invariant), and the graph owner of every occurrence is the
   // map's occurrence owner.
   for (const auto& path : kinematic_index.frame_paths()) {
     EXPECT_EQ(kinematic_index.find_frame_path(path.terminal_frame), &path);
@@ -2902,7 +2980,6 @@ TEST(FilesystemRetentionStoreTest,
 [[nodiscard]] CanonicalValue logic_only_program(std::string_view content_version) {
   test::ProgramOptions options;
   options.catalog_content_version = std::string(content_version);
-  options.logic_only = true;
   return test::with_program_revision(test::make_program_root(options));
 }
 
@@ -2936,7 +3013,7 @@ TEST(RetainedBundleStore, EmptyCellCarriesTheEmptyModelMapOnlyWhenRetained) {
   EXPECT_EQ(reloaded->canonical_bytes(), bundle->canonical_bytes());
 }
 
-TEST(RetainedBundleStore, ZeroRoleProgramBindsAgainstTheEmptyModelMap) {
+TEST(RetainedBundleStore, ZeroReferenceProgramBindsAgainstTheEmptyModelMap) {
   ScopedTrustedRoot root;
   const auto bundle = materialize_durable_bundle(root.path(), "logic_bind", true);
   ASSERT_NE(bundle, nullptr);
@@ -2947,41 +3024,51 @@ TEST(RetainedBundleStore, ZeroRoleProgramBindsAgainstTheEmptyModelMap) {
       RetainedModelMapQuery{bundle->retained_bundle_id(), product.product_id});
   ASSERT_TRUE(map.has_value());
 
+  detail::RejectingCatalogArtifactStore catalogs;
   const auto contract = verify_program_binding_contract(
       canonical_json(logic_only_program(
           bundle->value().catalogs.node_environment.content_version)),
-      *bundle);
+      *bundle, map, catalogs);
   ASSERT_NE(contract, nullptr);
-  EXPECT_TRUE(contract->value().component_roles.empty());
-  EXPECT_TRUE(contract->value().target_roles.empty());
+  EXPECT_TRUE(contract->value().target_requirements.empty());
+  EXPECT_TRUE(contract->value().frame_requirements.empty());
+  EXPECT_TRUE(contract->value().signal_requirements.empty());
+  EXPECT_TRUE(contract->value().collision_body_requirements.empty());
 
-  detail::RejectingCatalogArtifactStore catalogs;
   const auto outcome =
-      compile_program_binding_outcome(*contract, {}, *bundle, *map, catalogs);
+      compile_program_binding_outcome(*contract, *bundle, *map, catalogs);
   ASSERT_NE(outcome.binding, nullptr);
   EXPECT_FALSE(outcome.non_executable.has_value());
-  EXPECT_TRUE(outcome.binding->value().component_role_bindings.empty());
-  EXPECT_TRUE(outcome.binding->value().target_role_bindings.empty());
+  EXPECT_TRUE(outcome.binding->value().component_bindings.empty());
+  EXPECT_TRUE(outcome.binding->value().target_bindings.empty());
+  EXPECT_TRUE(outcome.binding->value().frame_bindings.empty());
+  EXPECT_TRUE(outcome.binding->value().signal_bindings.empty());
+  EXPECT_TRUE(outcome.binding->value().collision_body_bindings.empty());
 
   // Both the envelope validator and its decode twin accept the empty tables.
+  const FilesystemVerifiedCatalogArtifactSource verified_catalog_source(
+      root.path());
   const auto reloaded = reload_verified_program_binding(
-      outcome.binding->canonical_bytes(), *bundle, *map);
+      outcome.binding->canonical_bytes(), *bundle, *map,
+      verified_catalog_source);
   ASSERT_NE(reloaded, nullptr);
   EXPECT_EQ(reloaded->program_binding_id(), outcome.binding->program_binding_id());
   EXPECT_TRUE(verify_program_binding_identity(*reloaded));
 
   ScopedTrustedRoot binding_root;
   FilesystemProgramBindingRepository repository(binding_root.path());
-  EXPECT_TRUE(repository.put_if_absent(outcome.binding, *bundle, *map));
+  EXPECT_TRUE(repository.put_if_absent(
+      outcome.binding, *bundle, *map, verified_catalog_source));
   const auto stored = repository.get_verified(
-      outcome.binding->program_binding_id(), *bundle, *map);
+      outcome.binding->program_binding_id(), *bundle, *map,
+      verified_catalog_source);
   ASSERT_NE(stored, nullptr);
   EXPECT_EQ(stored->canonical_bytes(), outcome.binding->canonical_bytes());
 }
 
-TEST(RetainedBundleStore, ZeroRoleProgramHasNoBindingWithoutAModelMap) {
+TEST(RetainedBundleStore, ZeroReferenceProgramHasNoBindingWithoutAModelMap) {
   // A cell whose candidate carries no map (the pre-existing shape) still has
-  // no executable binding for a zero-role Program.
+  // no executable binding for a zero-reference Program.
   ScopedTrustedRoot root;
   const auto bundle = materialize_durable_bundle(root.path(), "logic_no_map");
   ASSERT_NE(bundle, nullptr);
@@ -2989,15 +3076,15 @@ TEST(RetainedBundleStore, ZeroRoleProgramHasNoBindingWithoutAModelMap) {
   const auto contract = verify_program_binding_contract(
       canonical_json(logic_only_program(
           bundle->value().catalogs.node_environment.content_version)),
-      *bundle);
+      *bundle, std::nullopt, FilesystemCatalogArtifactStore(root.path()));
   ASSERT_NE(contract, nullptr);
   detail::RejectingCatalogArtifactStore catalogs;
   EXPECT_THROW(static_cast<void>(compile_program_binding_outcome(
-                   *contract, {}, *bundle, std::nullopt, catalogs)),
+                   *contract, *bundle, std::nullopt, catalogs)),
                ProgramBindingCompilerError);
 
   // The sealed canonical-empty package has no map and keeps refusing every
-  // Program (Q125); its zero-role Program is refused the same way.
+  // Program; its zero-role Program is refused the same way.
   ScopedTrustedRoot package;
   const auto admission = detail::generate_ros_empty_package(
       package.path(), core::CellId("sealed_logic_cell"),
@@ -3007,11 +3094,11 @@ TEST(RetainedBundleStore, ZeroRoleProgramHasNoBindingWithoutAModelMap) {
   const auto sealed_contract = verify_program_binding_contract(
       canonical_json(logic_only_program(
           sealed.value().catalogs.node_environment.content_version)),
-      sealed);
+      sealed, std::nullopt, FilesystemVerifiedCatalogArtifactSource(package.path()));
   ASSERT_NE(sealed_contract, nullptr);
   const FilesystemVerifiedCatalogArtifactSource sealed_catalogs(package.path());
   EXPECT_THROW(static_cast<void>(compile_program_binding_outcome(
-                   *sealed_contract, {}, sealed, std::nullopt, sealed_catalogs)),
+                   *sealed_contract, sealed, std::nullopt, sealed_catalogs)),
                ProgramBindingCompilerError);
 }
 

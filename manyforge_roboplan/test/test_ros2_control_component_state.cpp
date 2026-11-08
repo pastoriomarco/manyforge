@@ -56,7 +56,7 @@ TEST(Ros2ControlComponentState, AStaleOwnStreamIsAFaultExceptInASimulator) {
   EXPECT_EQ(simulated.reason->code, "simulation_not_playing");
 }
 
-// SIM-1: a simulation that isn't playing keeps the lifecycle the controller
+// A simulation that isn't playing keeps the lifecycle the controller
 // reports (an enabled robot stays enabled) with the reason; playing again
 // drops the reason.
 TEST(Ros2ControlComponentState, ASimulatorNotPlayingKeepsTheControllersLifecycleWithTheReason) {
@@ -100,6 +100,17 @@ TEST(Ros2ControlComponentState, ActivityTrustsTheControllersOwnReport) {
   Ros2ControlObservation lost;
   lost.goal_running = true;
   EXPECT_EQ(ros2_control_component_state(lost, 1).activity, Activity::kUnknown);
+}
+
+TEST(Ros2ControlComponentState, UnissuedLateCancelIsFaultAndUnknown) {
+  auto observation = Prepared();
+  observation.controller_active = true;
+  observation.guard_fault = "A required late goal cancel could not be scheduled";
+  observation.goal_outcome_unknown = true;
+  const auto state = ros2_control_component_state(observation, 1);
+  ASSERT_TRUE(state.fault);
+  EXPECT_EQ(state.fault->code, core::FaultCode::kCommunication);
+  EXPECT_EQ(state.activity, Activity::kUnknown);
 }
 
 // An open goal (the Stop's braking goal included) whose result hasn't come

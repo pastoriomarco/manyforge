@@ -1,4 +1,4 @@
-// The Mock lane adapter family `mock` (CONTRACTS §6, §12): one library,
+// The Mock lane adapter family `mock`: one library,
 // registered in the ament resource index `manyforge_component_adapters`. A
 // Mock component runs the ros2_control lane on stock mock hardware; its
 // settings and their reasons: manyforge_ros2_control_execution/lane/.

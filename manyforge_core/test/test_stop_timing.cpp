@@ -19,7 +19,7 @@ TEST(StopTimingTest, AuthoredDecimalDurationsUseOneNanosecondRoundingPolicy) {
 }
 
 TEST(StopTimingTest, ControlledStopDeadlineIsMainsDecelerationPlusCompletionTolerance) {
-  // Q28 (as `main`): one deadline per Stop, computed at Stop time from its
+  // As `main`: one deadline per Stop, computed at Stop time from its
   // profile: deceleration time (or its default) plus 500 ms.
   MotionInterruptStopProfileDTO profile;
   profile.deceleration_time_s = 1.5;
@@ -33,7 +33,7 @@ TEST(StopTimingTest, ControlledStopDeadlineIsMainsDecelerationPlusCompletionTole
 }
 
 TEST(StopTimingTest, SentStopTrajectoryUsesTheNormalMotionNoReportBound) {
-  // Maintainer M6: a normal motion's watchdog, max(10 s, minimum,
+  // A normal motion's watchdog, max(10 s, minimum,
   // 1.5 x duration + 2 s), is also a sent Stop trajectory's no-report bound.
   EXPECT_DOUBLE_EQ(trajectory_execution_budget_s(1.0), 10.0);
   EXPECT_DOUBLE_EQ(trajectory_execution_budget_s(1.0, 12.0), 12.0);
@@ -48,7 +48,7 @@ TEST(StopTimingTest, SentStopTrajectoryUsesTheNormalMotionNoReportBound) {
 }
 
 TEST(StopTimingTest, ExplicitMaxStopTimeIsTheRobotsOwnControlledDeadline) {
-  // Q51 (as `main`'s per-profile override): `max_stop_time_s`, when set, is
+  // As `main`'s per-profile override, `max_stop_time_s`, when set, is
   // the deadline itself, measured from the Stop request; no tolerance is
   // added and nothing outside the profile shortens or extends it.
   MotionInterruptStopProfileDTO profile;

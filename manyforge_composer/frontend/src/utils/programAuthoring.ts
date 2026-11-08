@@ -21,7 +21,7 @@ import { hasSourcesWithin } from './valuePaths';
 
 /**
  * Motion nodes that retry automatically, and the parameters that tune it. The
- * parameters are literal-only (contract item 12). Mirrors the backend's
+ * parameters are literal-only. Mirrors the backend's
  * AUTOMATIC_RETRY_NODE_IDS and AUTOMATIC_RETRY_LITERAL_PARAMETERS.
  */
 export const AUTOMATIC_RETRY = {
@@ -29,15 +29,15 @@ export const AUTOMATIC_RETRY = {
   parameterIds: ['automatic_retries', 'automatic_retry_delay_s'],
 } as const;
 
-/** The two motion nodes with a per-node interrupt rule (contract 63). */
+/** The two motion nodes with a per-node interrupt rule. */
 export const INTERRUPT_MOTION_NODE_IDS = ['motion.move_until_signal', 'motion.probe_search'] as const;
 
 /**
  * The keys a Draft's nodes may read: its declared keys plus the system-owned
  * outcome key `node_outcome.<instance_id>` of every motion node (the plain
- * motion nodes and the two interrupt nodes; contract items 42, 46(f)) and the
- * read-only `interrupt_state.<rule_id>` key of every known global rule
- * (contracts 63, 64). All are declared by the Program validator, never
+ * motion nodes and the two interrupt nodes) and the
+ * read-only `interrupt_state.<rule_id>` key of every known global rule.
+ * All are declared by the Program validator, never
  * authored.
  */
 export function programBlackboardKeys(
@@ -76,7 +76,7 @@ export function programBlackboardKeys(
 
 const RELATIVE_RETRY_REASON = 'Not retried automatically: relative to the robot\'s own position.';
 
-// Literal-only parameters: no value-source binding is offered (contract items 12, 33).
+// Literal-only parameters: no value-source binding is offered.
 const FORBIDDEN_DYNAMIC_PARAMETERS = new Set<string>([
   ...AUTOMATIC_RETRY.parameterIds,
   'preemption_priority',
@@ -84,7 +84,7 @@ const FORBIDDEN_DYNAMIC_PARAMETERS = new Set<string>([
   'contact_policy_id',
   'model_endpoint_alias',
   'prompt_template_id',
-  // Interrupt rule fields of the two interrupt motion nodes (schema04 §2).
+  // Interrupt rule fields of the two interrupt motion nodes.
   'interrupt_condition',
   'stop_mode',
   'activation_mode',
@@ -93,7 +93,7 @@ const FORBIDDEN_DYNAMIC_PARAMETERS = new Set<string>([
   'priority',
   'stop_entry_stage_id',
   'success_through_stage_id',
-  // Node Mock simulation rows are literal-only (contract 133).
+  // Node Mock simulation rows are literal-only.
   'mock_simulation',
   // The attach node's grasp-lost policy is a literal object.
   'on_grasp_lost',
@@ -184,7 +184,6 @@ export interface ProgramSemanticChoice {
 export type ProgramSemanticCreateTarget =
   | 'blackboard_key'
   | 'program_parameter'
-  | 'program_requirements'
   | 'scene_resource';
 
 /**
@@ -337,16 +336,6 @@ export function programMotionDefaultRoles(
   return roles;
 }
 
-function jsonRecord(value: JsonValue | undefined): Record<string, JsonValue> | null {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? value
-    : null;
-}
-
-function jsonArray(value: JsonValue | undefined): JsonValue[] {
-  return Array.isArray(value) ? value : [];
-}
-
 function compatibleBlackboardKeys(
   entry: CatalogEntry,
   parameterId: string,
@@ -378,7 +367,7 @@ function compatibleBlackboardKeys(
  */
 export function programSemanticChoices(
   schema: CatalogJsonSchema,
-  node: ProgramTreeNode,
+  _node: ProgramTreeNode,
   entry: CatalogEntry,
   parameterId: string,
   program: ProgramAuthoringDocument,
@@ -409,39 +398,6 @@ export function programSemanticChoices(
         group: 'Scene resources',
       });
     }
-  } else if (semanticType === 'component_role') {
-    for (const role of Object.keys(program.component_roles)) {
-      choices.push({ value: role, label: role, group: 'Component roles' });
-    }
-  } else if (semanticType === 'target_role') {
-    for (const role of Object.keys(program.target_roles)) {
-      choices.push({ value: role, label: role, group: 'Target roles' });
-    }
-  } else {
-    const roleField = {
-      frame_role: 'required_frame_roles',
-      resource_role: 'required_resource_roles',
-      collision_body_role: 'required_collision_body_roles',
-      model_role: 'required_model_roles',
-    }[semanticType ?? ''];
-    if (roleField) {
-      const scopeParameter = schema['x-manyforge-semantic-scope-parameter'];
-      const selectedScope = scopeParameter === undefined
-        ? null
-        : node.parameters[scopeParameter]
-          ?? entry.parameters.find((parameter) => parameter.id === scopeParameter)?.default;
-      for (const [targetId, rawTarget] of Object.entries(program.target_roles)) {
-        if (typeof selectedScope === 'string' && targetId !== selectedScope) continue;
-        const target = jsonRecord(rawTarget);
-        const values = target?.[roleField];
-        if (!Array.isArray(values)) continue;
-        for (const role of values) {
-          if (typeof role === 'string') {
-            choices.push({ value: role, label: role, group: targetId });
-          }
-        }
-      }
-    }
   }
   // Keys keep their namespace order: root first, node outcomes last.
   if (semanticType === 'blackboard_key') return choices;
@@ -457,9 +413,6 @@ export function programSemanticCreateTarget(
   if (semanticType === 'blackboard_key') return 'blackboard_key';
   if (semanticType === 'parameter_ref') return 'program_parameter';
   if (semanticType === 'scene_resource') return 'scene_resource';
-  if (semanticType === 'component_role' || semanticType === 'target_role') {
-    return 'program_requirements';
-  }
   return null;
 }
 
@@ -741,65 +694,14 @@ export function collectBlackboardUsages(
   );
 }
 
-/**
- * Every Draft reference that keeps each component role, one label per use. A
- * role with no label is free to remove. Counts what the backend validator
- * counts: node parameters of the component_role semantic type, target roles,
- * scene component frames, and contact policy component_model_body selectors.
- */
-export function collectComponentRoleUsages(
-  program: ProgramAuthoringDocument,
-  catalogEntries: CatalogEntry[],
-): Map<string, string[]> {
-  const usages = new Map<string, Set<string>>();
-  const add = (role: JsonValue | undefined, label: string) => {
-    if (typeof role !== 'string') return;
-    usages.set(role, (usages.get(role) ?? new Set<string>()).add(label));
-  };
-  const catalog = new Map(catalogEntries.map((entry) => [entry.id, entry]));
-  for (const { node } of flattenProgramForest(program.forest)) {
-    const entry = catalog.get(node.node_id);
-    for (const field of entry?.parameters ?? []) {
-      if (field.schema['x-manyforge-semantic-type'] === 'component_role') {
-        add(node.parameters[field.id], `node ${node.instance_id}`);
-      }
-    }
-  }
-  for (const [targetId, target] of Object.entries(program.target_roles)) {
-    add(jsonRecord(target)?.component_role, `target role ${targetId}`);
-  }
-  for (const resource of program.scene ?? []) {
-    const frame = resource.pose.frame_ref;
-    if (frame.kind === 'component_frame') {
-      add(frame.component_role, `scene frame ${resource.scene_resource_id}`);
-    }
-  }
-  for (const policy of program.contact_policies ?? []) {
-    const record = jsonRecord(policy);
-    const policyId = typeof record?.policy_id === 'string' ? record.policy_id : 'unnamed';
-    const label = `contact policy ${policyId}`;
-    for (const zone of jsonArray(record?.zones)) {
-      for (const pair of jsonArray(jsonRecord(zone)?.body_pairs)) {
-        for (const side of ['body_a', 'body_b']) {
-          const body = jsonRecord(jsonRecord(pair)?.[side]);
-          if (body?.kind === 'component_model_body') {
-            add(body.component_role_id, label);
-          }
-        }
-      }
-    }
-  }
-  return new Map([...usages].map(([role, labels]) => [role, [...labels]]));
-}
-
 /** The title of a Remove button guarded by its usages: the usages it would break, or the plain action when free. */
 export function removeGuardTitle(usages: readonly string[], freeTitle: string): string {
   return usages.length > 0 ? usages.join(', ') : freeTitle;
 }
 
 /**
- * Why a motion node's automatic-retry field is locked, or null (contract items
- * 7 and 13). A literal relative joint move is never retried; a relative pose or
+ * Why a motion node's automatic-retry field is locked, or null.
+ * A literal relative joint move is never retried; a relative pose or
  * path is not retried unless it names a target_reference, literal or bound. A
  * bound target_mode is resolved per attempt by the runner, so nothing locks.
  */

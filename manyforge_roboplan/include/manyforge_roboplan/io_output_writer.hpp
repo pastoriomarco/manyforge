@@ -9,7 +9,7 @@
 
 namespace manyforge::roboplan_backend {
 
-/// CONTRACTS §7 `SetOutputResult`: `unknown` when the write's effect is
+/// `SetOutputResult`: `unknown` when the write's effect is
 /// unknown (never resent); `error` present unless it succeeded.
 struct SetOutputResult final {
   core::ActionOutcome outcome{core::ActionOutcome::kFailed};
@@ -18,7 +18,7 @@ struct SetOutputResult final {
   friend bool operator==(const SetOutputResult &, const SetOutputResult &) = default;
 };
 
-/// CONTRACTS §6, §7: the small I/O provider interface a component adapter may
+/// The small I/O provider interface a component adapter may
 /// also implement (capability `io_manual_write`). The one write path for every
 /// output write, manual or Program (`set_io_output`): the host admits the
 /// write in the Kernel (`admit_output_write`) and then calls it. ROS-free.

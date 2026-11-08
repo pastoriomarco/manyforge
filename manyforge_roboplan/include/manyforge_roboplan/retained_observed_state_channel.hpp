@@ -110,7 +110,7 @@ struct RetainedBoundRenderState final {
   std::vector<double> positions_si;
   std::uint64_t render_incarnation;
   std::uint64_t render_generation;
-  /// M6: the latest coordinates came from `update_render_positions` (display
+  /// The latest coordinates came from `update_render_positions` (display
   /// input), not from an addressed-state publication.
   bool display_only;
 };
@@ -239,7 +239,8 @@ public:
   RetainedObservedStateChannel(
       core::RuntimeParticipantBinding binding,
       std::shared_ptr<RetainedKinematicStateProjector> projector,
-      RetainedObservedStateChannelConfig config, core::IClock *clock = nullptr,
+      RetainedObservedStateChannelConfig config,
+      std::shared_ptr<core::IClock> clock = {},
       std::shared_ptr<RetainedObservationWake> render_wake = nullptr);
 
   RetainedObservedStateChannel(const RetainedObservedStateChannel &) = delete;
@@ -326,7 +327,7 @@ public:
   [[nodiscard]] core::Result<RetainedBoundObservedState>
   current_bound_state(std::int64_t now_ns) const;
   /// Viewer input only: a pneumatic gripper's named actual finger feedback
-  /// or expected position after admission, or (M6) a measured Real arm's
+  /// or expected position after admission, or a measured Real arm's
   /// vendor joint states. Every coordinate must match this exact binding's
   /// compiled resource names. This never publishes authoritative state or
   /// projects the planning scene; the next addressed-state publication
@@ -335,24 +336,24 @@ public:
       const core::RuntimeParticipantBinding &expected_binding,
       std::span<const std::string> compiled_joint_names,
       std::span<const double> positions_si);
-  /// M6: a display-led channel (a Real arm's display follows its vendor
+  /// A display-led channel (a Real arm's display follows its vendor
   /// joint topic). Once display input arrived, only `update_render_positions`
   /// moves the render coordinates: addressed-state publications still update
   /// the authoritative state, but neither replace nor hide the last display
   /// input. Before it, they render as usual.
   void follow_display_input();
-  /// M6 (approval list 2, item 34): the owner marks whether its latest
+  /// The owner marks whether its latest
   /// display input leads planning previews (the robot reports a move from
   /// its own interface, or ManyForge's own re-arm is in progress).
   void set_display_input_leads(bool leads);
-  /// M6 (item 34): a jog/Move-to preview's start state on a display-led
+  /// A jog/Move-to preview's start state on a display-led
   /// channel: the latest display input, while it leads or while the
   /// addressed state is stale (`observation_stale`). Empty otherwise: the
   /// preview starts from `current_state`, as before. Never read for
   /// planning an admitted motion, readiness or arrival.
   [[nodiscard]] std::optional<RetainedBoundRenderState>
   live_preview_start(std::int64_t now_ns) const;
-  /// M6 (items 23/34): the host's presentation reads (control state,
+  /// The host's presentation reads (control state,
   /// observation). Under the same rule as `live_preview_start`, the latest
   /// addressed snapshot's identity with the live display positions, complete
   /// and without velocities, even while the addressed state is stale.
@@ -427,7 +428,7 @@ private:
   mutable std::shared_mutex projection_mutex_;
   std::shared_ptr<const KinematicProjection> projection_;
   RetainedObservedStateChannelConfig config_;
-  core::IClock *clock_{};
+  std::shared_ptr<core::IClock> clock_;
   core::AddressedObservedStatePublication publication_;
   core::ObservedStateQueryContextDTO projection_context_;
   mutable std::mutex route_rebind_mutex_;

@@ -1,4 +1,4 @@
-// Chunk 7 unit tests for ParallelCollisionValidationWorkerPool:
+// Unit tests for ParallelCollisionValidationWorkerPool:
 // deterministic stateless and ordered-contact merge, named serial fallbacks,
 // equivalence with the serial coordinator, timeout ownership, and telemetry.
 
@@ -1560,6 +1560,7 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   EXPECT_GE(status.abandoned_jobs_total, 1u);
 
   engine_a->release_blocked();
+  pool.detach();
 }
 
 TEST(ParallelCollisionValidationWorkerPoolTest,

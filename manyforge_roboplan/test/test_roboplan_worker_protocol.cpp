@@ -188,7 +188,7 @@ TEST(RoboPlanWorkerProtocolTest,
   // And the Deployment Cartesian timing.
   EXPECT_EQ(decoded.candidate_config.cartesian_timing,
             CartesianSpeedModeDTO::kTimeOptimal);
-  // And the robot's motion timing (N12 / RP-3b; the default is smooth).
+  // And the robot's motion timing (the default is smooth).
   EXPECT_EQ(decoded.candidate_config.motion_timing, MotionTimingDTO::kFast);
 }
 
@@ -300,6 +300,56 @@ TEST(RoboPlanWorkerProtocolTest, PlanAndIkRequestsCarryContactAllowedPairs) {
     EXPECT_THROW(static_cast<void>(decode_ik_request(encode_ik_request(ik))),
                  std::invalid_argument);
   }
+}
+
+TEST(RoboPlanWorkerProtocolTest, DiagnosticV13RoundTripsQualifiedTargetAndDeadline) {
+  EXPECT_EQ(kProtocolVersion, 13U);
+  auto input = candidate_request();
+  input.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
+  input.diagnostic_qualified_target = state();
+  input.diagnostic_deadline_ns = 123456789;
+  auto decoded = decode_candidate_request(encode_candidate_request(input));
+  EXPECT_EQ(decoded.collision_mode, input.collision_mode);
+  EXPECT_EQ(decoded.diagnostic_qualified_target, input.diagnostic_qualified_target);
+  EXPECT_EQ(decoded.diagnostic_deadline_ns, input.diagnostic_deadline_ns);
+
+  WorkerIkRequestDTO ik{{{0.4, 0.5, 0.6}, {0.0, 0.0, 0.0, 1.0}},
+                        binding().permitted_frames[0], binding().permitted_frames[1],
+                        state(), 2.0, {}};
+  ik.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
+  ik.diagnostic_deadline_ns = 123456789;
+  ik.diagnostic_tolerances = TolerancesDTO{0.01, 0.02, 0.03};
+  const auto solved = decode_ik_request(encode_ik_request(ik));
+  EXPECT_EQ(solved.collision_mode, ik.collision_mode);
+  EXPECT_EQ(solved.diagnostic_deadline_ns, ik.diagnostic_deadline_ns);
+  ASSERT_TRUE(solved.diagnostic_tolerances);
+  EXPECT_DOUBLE_EQ(solved.diagnostic_tolerances->translation_tol_m, 0.02);
+
+  const ErrorDTO failure{"planning_failed", "no path", {{"reason", "native_rrt_failed"}}};
+  std::optional<ControlledStateDTO> target;
+  const auto result = decode_trajectory_result(
+      encode_trajectory_result(Result<TrajectoryDTO>::Err(failure), state()), &target);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details, failure.details);
+  ASSERT_TRUE(target);
+  EXPECT_EQ(*target, state());
+  input.diagnostic_deadline_ns = -1;
+  EXPECT_THROW(static_cast<void>(encode_candidate_request(input)), std::invalid_argument);
+}
+
+TEST(RoboPlanWorkerProtocolTest, CartesianDiagnosticNeedsDeadlineButNoJointTarget) {
+  auto request = candidate_request();
+  request.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
+  request.diagnostic_deadline_ns = 123456789;
+  request.diagnostic_qualified_target.reset();
+  const auto decoded = decode_candidate_request(encode_candidate_request(request));
+  EXPECT_EQ(decoded.motion, request.motion);
+  EXPECT_EQ(decoded.diagnostic_deadline_ns, request.diagnostic_deadline_ns);
+  EXPECT_FALSE(decoded.diagnostic_qualified_target);
+  request.motion = ResolvedJointGoalDTO{request.resources, {"joint_a", "joint_b"}, {0.1, 0.2}};
+  EXPECT_ANY_THROW(encode_candidate_request(request));
+  request.diagnostic_deadline_ns.reset();
+  EXPECT_ANY_THROW(encode_candidate_request(request));
 }
 
 TEST(RoboPlanWorkerProtocolTest,

@@ -7,11 +7,27 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <memory>
 #include <string>
 #include <thread>
 
 namespace manyforge::core {
 namespace {
+
+TEST(RuntimeCollisionMonitorTest, DetachedMonitorMayOutliveScheduler) {
+  FakeClock clock;
+  auto scheduler = std::make_unique<ManualScheduler>();
+  auto monitor = std::make_unique<RuntimeCollisionMonitor>(
+      clock, *scheduler, RuntimeCollisionMonitor::Config{10'000'000},
+      [] { return Result<void>::Ok(); }, [] { return true; });
+  monitor->start();
+  ASSERT_TRUE(monitor->detach().ok());
+  scheduler.reset();
+  monitor->start();
+  monitor->stop(true);
+  ASSERT_TRUE(monitor->detach().ok());
+  monitor.reset();
+}
 
 TEST(RuntimeCollisionMonitorTest, StartSchedulesTickAndReschedulesWhileActive) {
   FakeClock clock;
@@ -131,6 +147,26 @@ TEST(RuntimeCollisionMonitorTest, StopDrainWaitsForInFlightCallback) {
   stop_thread.join();
   scheduler_thread.join();
   EXPECT_TRUE(stop_returned.load(std::memory_order_acquire));
+}
+
+TEST(RuntimeCollisionMonitorTest, DetachFromOwnCallbackRefusesBeforeClosing) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  RuntimeCollisionMonitor* monitor_ptr = nullptr;
+  bool refused = false;
+  RuntimeCollisionMonitor monitor{
+      clock, scheduler, RuntimeCollisionMonitor::Config{10'000'000},
+      [&] {
+        const auto result = monitor_ptr->detach();
+        refused = !result.ok() && result.error().details.at("reason") == "scheduler_not_ready";
+        return Result<void>::Ok();
+      }, [] { return true; }};
+  monitor_ptr = &monitor;
+  monitor.start();
+  clock.advance(10'000'000);
+  scheduler.advance_to(clock.now());
+  EXPECT_TRUE(refused);
+  EXPECT_TRUE(monitor.detach().ok());
 }
 
 TEST(RuntimeCollisionMonitorTest, StopFromInsideCallbackDoesNotDeadlock) {

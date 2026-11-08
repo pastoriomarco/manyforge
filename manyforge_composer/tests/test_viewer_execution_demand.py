@@ -42,7 +42,7 @@ class Client:
 
 
 def execution(sequence, position):
-    return {"api_version": "manyforge.execution_command_response.v1", "command": "observation", "ok": True,
+    return {"api_version": "manyforge.execution_command_response.v4", "command": "observation", "ok": True,
             "observation": {"schema_version": "manyforge.execution_observation.v4", "owner_epoch": "owner",
                 "cell_id": "cell", "retained_bundle_id": "bundle", "graph_revision": "graph",
                 "source_epoch": "execution", "source_sequence": sequence, "measured_targets": [],

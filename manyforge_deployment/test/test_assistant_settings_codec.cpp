@@ -307,7 +307,7 @@ TEST(AssistantSettingsCodec,
       draft_mutations.push_back(tool.tool_id);
       break;
     case core::AssistantToolEffect::kRuntimeMutating:
-      FAIL() << "N6-b2 must not restore runtime-mutating assistant tools";
+      FAIL() << "the settings codec must not restore runtime-mutating assistant tools";
     }
   }
   EXPECT_LT(total_canonical_schema_bytes, 512U * 1024U);

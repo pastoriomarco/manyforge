@@ -28,7 +28,7 @@ catalog_schemas:
     qualification: qualified
   - record_kind: contact_policy
     schema_id: manyforge.contact_policy.v1
-    schema_revision: sha256:c7ad633867abbe4583dee2eda51dca5b33bd8e8827777a8ac9ab86b2aba20490
+    schema_revision: sha256:f7adb173ef71d9de9011c85a19224cace5e721918fb1659fcada6ab93901ad33
     relative_path: catalog/manyforge.contact_policy.v1.yaml
     qualification: qualified
   - record_kind: control_interface_contract

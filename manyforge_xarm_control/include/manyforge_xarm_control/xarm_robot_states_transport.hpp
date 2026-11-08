@@ -15,6 +15,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -24,6 +25,7 @@
 
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_xarm_control/contract.hpp>
+#include <manyforge_xarm_control/xarm_ros_owner.hpp>
 
 namespace manyforge::xarm_control {
 
@@ -41,7 +43,7 @@ class XArmRobotStatesTransport final : public IXArmStatusSource {
 public:
   /// `clock` outlives every callback of the subscription.
   XArmRobotStatesTransport(rclcpp::Node &node, std::string_view driver_namespace,
-                           core::IClock &clock);
+                           core::IClock &clock, const XArmRosOwner *ros_owner = nullptr);
 
   [[nodiscard]] XArmObservedState observe() const override;
 
@@ -50,10 +52,14 @@ public:
 
   [[nodiscard]] const std::string &topic() const noexcept { return topic_; }
 
+  /// Swap only ROS/cache state; the status-source object remains installed.
+  void SwapRosState(XArmRobotStatesTransport &replacement) noexcept;
+
 private:
   struct Cache;
 
   std::string topic_;
+  mutable std::mutex state_mutex_;
   std::shared_ptr<Cache> cache_;
   rclcpp::Subscription<xarm_msgs::msg::RobotMsg>::SharedPtr subscription_;
 };

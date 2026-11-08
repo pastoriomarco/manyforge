@@ -300,7 +300,7 @@ Result<void> ResourceAddressedExecutionKernel::ProcessIoRuleEvidence() {
   std::size_t work_bound{};
   {
     std::lock_guard lock(state_mutex_);
-    // R1: interrupt evaluation is paused while the cell is latched.
+    // Interrupt evaluation is paused while the cell is latched.
     if (cell_latched_locked()) return Result<void>::Ok();
     if (!has_active_io_rules_locked() &&
         (!global_io_rule_catalog_ || global_io_rules_.empty())) return Result<void>::Ok();
@@ -370,7 +370,7 @@ ResourceAddressedExecutionKernel::io_rule_response_owner_locked(
 
 Result<void> ResourceAddressedExecutionKernel::process_io_rule_evidence_locked(
     StopWorkHandoff& handoff, const OperationId* selected_operation) {
-  // R1: interrupt evaluation is paused while the cell is latched.
+  // Interrupt evaluation is paused while the cell is latched.
   if (cell_latched_locked()) return Result<void>::Ok();
   for (auto& [id, operation] : active_operations_) {
     if (selected_operation && id != *selected_operation) continue;
@@ -448,7 +448,7 @@ Result<void> ResourceAddressedExecutionKernel::process_io_rule_evidence_locked(
                            : arm_boundary ? OperationStateKind::kExecuting
                            : unselected_global_sibling ? actual_row->state
                                                        : operation->state.state;
-        // D2 source failure is not a desired trip and cannot be muted merely
+        // A source failure is not a desired trip and cannot be muted merely
         // because another Stop already owns containment.
         if (!source_failure && !semantics.affected_phases.contains(phase)) continue;
         const InterruptStopSelection* active_winner = nullptr;
@@ -882,7 +882,7 @@ void ResourceAddressedExecutionKernel::finalize_io_rule_stop_locked(
               kErrorMotionInterruptBackendStopFailed, "io_rule_nominal_stop_not_proved"));
         }
       }
-      // Spec 260 §2.8.4: a Stop the Program's own configuration requested
+      // A Stop the Program's own configuration requested
       // (carried object lost), settled at its first stage, is the Program's
       // ordinary failure. The row keeps its actual Stopped outcome; an
       // escalated, joined or uncertain Stop is relabelled Failed and held.
@@ -895,7 +895,7 @@ void ResourceAddressedExecutionKernel::finalize_io_rule_stop_locked(
           row->state == OperationStateKind::kStopped && row->terminal_fact &&
           row->terminal_fact->kind == ParticipantExecutionFactKind::kPreemptedByAddressedStop &&
           row->terminal_fact->effect == ParticipantEffectKnowledge::kEffectSettled;
-      // A global rule's Stop (CONTRACTS §8): with `fail_node` the interrupted
+      // A global rule's Stop: with `fail_node` the interrupted
       // motion node fails with `interrupt_fault` and the tree handles it. Its
       // ordinary Stop (the Program's own, settled at its first stage) keeps
       // the row Stopped with that typed cause, as the carried-object-lost Stop
@@ -903,7 +903,7 @@ void ResourceAddressedExecutionKernel::finalize_io_rule_stop_locked(
       // tree's next motion on that robot is admitted. An escalated, joined or
       // uncertain one is relabelled Failed and held. `hold` (and a rule that
       // can't watch) is the operator's Stop and keeps the row Stopped for
-      // Resume, its fact naming the rule (§9 `stopped_by: rule`).
+      // Resume, its fact naming the rule (`stopped_by: rule`).
       if (global_fault_winner && row->state == OperationStateKind::kStopped) {
         if (global_winner->fail_node) {
           if (!ordinary_program_stop) row->state = OperationStateKind::kFailed;

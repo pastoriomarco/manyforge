@@ -291,8 +291,8 @@ XArmIoComponent::SetOutput(const std::string_view name,
   std::lock_guard lock(mutex_);
   --writes_in_flight_;
   auto &track = tracks_[static_cast<std::size_t>(signal - config_.signals.data())];
-  // `ret=1`: a controller error is present and the write still takes effect
-  // (XARM_CONTROLLER_FACTS); the error is the owner's fault.
+  // `ret=1`: a controller error is present and the write still takes effect;
+  // the error is the owner's fault.
   if (call.outcome == XArmServiceCallOutcome::kSucceeded || call.vendor_return == 1) {
     // Trust the controller: the reported value is the written one at once.
     track.reported = value;

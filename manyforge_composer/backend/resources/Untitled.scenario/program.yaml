@@ -1,10 +1,9 @@
 {
-  "api_version": "manyforge.program.v2",
+  "api_version": "manyforge.program.v3",
   "catalog": {
-    "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.9.0"
+    "api_version": "manyforge.node_catalog.v3",
+    "content_version": "3.0.0"
   },
-  "component_roles": {},
   "forest": [],
   "name": "Untitled",
   "parameters": [
@@ -50,6 +49,5 @@
   "positions": {},
   "program_id": "program-untitled",
   "program_profile": "composable-cell-v1",
-  "schema_version": "manyforge.composer_authoring_forest.v1",
-  "target_roles": {}
+  "schema_version": "manyforge.composer_authoring_forest.v2"
 }

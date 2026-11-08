@@ -327,7 +327,7 @@ void add_geometry(roboplan::Scene& scene,
 }
 
 [[nodiscard]] std::shared_ptr<roboplan::Scene> make_scene(
-    const RoboPlanWorkerModelDTO& model) {
+    const RoboPlanWorkerModelDTO& model, std::string* retained_srdf) {
   if (model.native_scene_name.empty() || !model.urdf_path.is_absolute() ||
       !model.srdf_path.is_absolute() ||
       !std::filesystem::is_regular_file(model.urdf_path) ||
@@ -340,9 +340,10 @@ void add_geometry(roboplan::Scene& scene,
       fail("retained package path is invalid");
     }
   }
+  const auto urdf_xml = roboplan::loadTextFile(model.urdf_path);
+  *retained_srdf = roboplan::loadTextFile(model.srdf_path);
   auto scene = make_roboplan_scene(RoboPlanSceneInput{
-      model.native_scene_name, roboplan::loadTextFile(model.urdf_path),
-      roboplan::loadTextFile(model.srdf_path), model.package_paths,
+      model.native_scene_name, urdf_xml, *retained_srdf, model.package_paths,
       model.joint_limits});
   std::string staging_frame;
   if (!model.geometries.empty()) {
@@ -477,9 +478,9 @@ int run_worker(int descriptor) {
     fail("first message is not initialization");
   }
   auto input = worker_protocol::decode_initialization(initialize.payload);
-  auto scene = make_scene(input.model);
-  RoboPlanCandidateComputer computer(scene, std::move(input.binding),
-                                     input.candidate_config);
+  std::string srdf_xml;
+  auto scene = make_scene(input.model, &srdf_xml);
+  RoboPlanCandidateComputer computer(scene, input.binding, input.candidate_config);
   std::vector<RoboPlanPairMarginDTO> applied_margins;
   std::vector<std::pair<std::string, std::string>> applied_contact_pairs;
   send_frame(descriptor, MessageType::kReady, {});
@@ -491,10 +492,32 @@ int run_worker(int descriptor) {
         std::optional<std::int64_t> planning_deadline_ns;
         auto candidate =
             worker_protocol::decode_candidate_request(request.payload, &planning_deadline_ns);
-        apply_pair_margins(*scene, candidate.collision_pair_margins, applied_margins);
-        apply_contact_pairs(*scene, candidate.contact_allowed_pairs,
-                            applied_contact_pairs);
         RoboPlanCandidateControl control;
+        std::unique_ptr<RoboPlanCandidateComputer> diagnostic_computer;
+        std::shared_ptr<roboplan::Scene> diagnostic_scene;
+        if (candidate.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled) {
+          const bool cartesian = std::holds_alternative<core::CartesianPathDTO>(candidate.motion);
+          if (!candidate.diagnostic_deadline_ns ||
+              (!cartesian && !candidate.diagnostic_qualified_target) ||
+              candidate.moving_replacement) fail("invalid diagnostic plan request");
+          const auto deadline = std::chrono::steady_clock::time_point(
+              std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                  std::chrono::nanoseconds(*candidate.diagnostic_deadline_ns)));
+          control.deadline_expired = [deadline] { return std::chrono::steady_clock::now() >= deadline; };
+          if (!control.deadline_expired()) {
+            diagnostic_scene = make_collision_disabled_scene(*scene, input.model.native_scene_name,
+                input.model.joint_limits, srdf_xml);
+            diagnostic_computer = std::make_unique<RoboPlanCandidateComputer>(
+                diagnostic_scene, input.binding, input.candidate_config);
+          }
+          candidate.planning_timeout_s = std::chrono::duration<double>(
+              deadline - std::chrono::steady_clock::now()).count();
+        } else {
+          if (candidate.diagnostic_deadline_ns || candidate.diagnostic_qualified_target)
+            fail("diagnostic data on enforced plan");
+          apply_pair_margins(*scene, candidate.collision_pair_margins, applied_margins);
+          apply_contact_pairs(*scene, candidate.contact_allowed_pairs, applied_contact_pairs);
+        }
         if (planning_deadline_ns) {
           const auto deadline = std::chrono::steady_clock::time_point(
               std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -530,10 +553,17 @@ int run_worker(int descriptor) {
             return std::chrono::steady_clock::now() >= deadline;
           };
         }
-        auto result = computer.compute(candidate, control);
+        std::optional<core::ControlledStateDTO> qualified_target;
+        auto result = (candidate.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled &&
+                       (!diagnostic_computer || control.deadline_expired()))
+            ? core::Result<core::TrajectoryDTO>::Err(core::ErrorDTO{
+                  "planning_timeout", "Diagnostic planning timed out", {{"reason", "planning_timeout"}}})
+            : (diagnostic_computer ? diagnostic_computer.get() : &computer)->compute(
+                  candidate, control, &qualified_target);
         if (control.deadline_expired && control.deadline_expired()) {
           core::ErrorDTO error{"planning_timeout",
-                               "Moving replacement preparation timed out", {}};
+              candidate.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled
+                  ? "Diagnostic planning timed out" : "Moving replacement preparation timed out", {}};
           if (!result.ok()) {
             const auto &underlying = result.error();
             error.details = underlying.details;
@@ -548,17 +578,42 @@ int run_worker(int descriptor) {
           result = core::Result<core::TrajectoryDTO>::Err(std::move(error));
         }
         send_frame(descriptor, MessageType::kPlanResult,
-                   worker_protocol::encode_trajectory_result(result));
+                   worker_protocol::encode_trajectory_result(result, qualified_target));
         break;
       }
       case MessageType::kIk: {
         auto candidate = worker_protocol::decode_ik_request(request.payload);
-        apply_pair_margins(*scene, {}, applied_margins);
-        apply_contact_pairs(*scene, candidate.contact_allowed_pairs,
-                            applied_contact_pairs);
-        auto result = computer.solve_ik(
-            candidate.goal, candidate.base_frame, candidate.tcp_frame,
-            candidate.seed_state, candidate.timeout_s);
+        std::unique_ptr<RoboPlanCandidateComputer> diagnostic_computer;
+        std::shared_ptr<roboplan::Scene> diagnostic_scene;
+        RoboPlanCandidateControl control;
+        if (candidate.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled) {
+          if (!candidate.diagnostic_deadline_ns) fail("diagnostic IK deadline missing");
+          const auto deadline = std::chrono::steady_clock::time_point(
+              std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                  std::chrono::nanoseconds(*candidate.diagnostic_deadline_ns)));
+          control.deadline_expired = [deadline] { return std::chrono::steady_clock::now() >= deadline; };
+          if (!control.deadline_expired()) {
+            diagnostic_scene = make_collision_disabled_scene(*scene, input.model.native_scene_name,
+                input.model.joint_limits, srdf_xml);
+            diagnostic_computer = std::make_unique<RoboPlanCandidateComputer>(
+                diagnostic_scene, input.binding, input.candidate_config);
+          }
+          candidate.timeout_s = std::chrono::duration<double>(
+              deadline - std::chrono::steady_clock::now()).count();
+        } else {
+          if (candidate.diagnostic_deadline_ns || candidate.diagnostic_tolerances)
+            fail("diagnostic data on enforced IK");
+          apply_pair_margins(*scene, {}, applied_margins);
+          apply_contact_pairs(*scene, candidate.contact_allowed_pairs, applied_contact_pairs);
+        }
+        auto result = (candidate.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled &&
+                       (!diagnostic_computer || control.deadline_expired()))
+            ? core::Result<std::vector<double>>::Err(core::ErrorDTO{
+                  "planning_timeout", "Diagnostic IK timed out", {{"reason", "planning_timeout"}}})
+            : (diagnostic_computer ? diagnostic_computer.get() : &computer)->solve_ik(
+                  candidate.goal, candidate.base_frame, candidate.tcp_frame,
+                  candidate.seed_state, candidate.timeout_s, control,
+                  candidate.diagnostic_tolerances ? &*candidate.diagnostic_tolerances : nullptr);
         send_frame(descriptor, MessageType::kIkResult,
                    worker_protocol::encode_ik_result(result));
         break;

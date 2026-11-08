@@ -1,4 +1,4 @@
-"""Tests for the RT-6 realtime qualification evidence probe."""
+"""Tests for the realtime qualification evidence probe."""
 from __future__ import annotations
 
 import importlib.util

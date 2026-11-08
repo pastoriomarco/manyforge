@@ -5,7 +5,6 @@ import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorksp
 import type { JsonValue } from '../types/api';
 import type { ComponentCatalog, ComponentCatalogEntry } from '../types/componentCatalog';
 import { reactPropsHost, type MountedProps } from '../test/reactPropsHost';
-import { roleFeedback, componentManagerRows } from '../utils/componentManager';
 import { AddComponentPanel } from './AddComponentPanel';
 
 const robotRow = {
@@ -118,7 +117,6 @@ afterEach(() => vi.unstubAllGlobals());
 
 async function mount(components: JsonValue[], {
   apiVersion = 'manyforge.deployment_intent.v2',
-  assignment = null as Record<string, JsonValue> | null,
   attachments = [] as JsonValue[],
 } = {}) {
   const document = {
@@ -136,17 +134,12 @@ async function mount(components: JsonValue[], {
     busy: false,
     addComponents: vi.fn().mockResolvedValue({}),
   } as unknown as DeploymentWorkspaceController;
-  const rows = componentManagerRows(document, null, catalog.componentProfiles);
-  const feedback = roleFeedback(
-    { robot: { required_component_type_tags: ['articulated-arm'] } },
-    assignment, rows, catalog.componentProfiles,
-  );
   const onAdded = vi.fn();
   const { host, find, all } = reactPropsHost();
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(host as unknown as Element);
   await act(() => root.render(<AddComponentPanel controller={controller} catalog={catalog}
-    catalogError={null} feedback={feedback} onAdded={onAdded} />));
+    catalogError={null} onAdded={onAdded} />));
   const control = (label: string) => find((props) => props['aria-label'] === label);
   return {
     controller, control, all, find, onAdded,
@@ -256,18 +249,6 @@ describe('Add component', () => {
       const [rows] = vi.mocked(mounted.controller.addComponents).mock.calls[0];
       expect(rows[0].component_id).toBe('lite6_robot_2');
       expect(JSON.stringify(rows[0])).not.toContain('"lite6_robot"');
-    } finally { await mounted.unmount(); }
-  });
-
-  it('proposes the id an open Program role is assigned to', async () => {
-    const mounted = await mount([], {
-      assignment: { component_roles: [{ component_role_id: 'robot', controllable_component_id: 'arm_a' }] },
-    });
-    try {
-      await mounted.click('Add component');
-      expect(String(mounted.find((props) => props.role === 'option').title)).toBe('Mock Lite6');
-      await mounted.pick();
-      expect(mounted.control('Component id for lite6_robot').value).toBe('arm_a');
     } finally { await mounted.unmount(); }
   });
 

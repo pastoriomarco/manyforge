@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -3447,6 +3448,119 @@ struct SceneProductAdoptionFixture final {
   }
 };
 
+TEST(CanonicalEmptySceneOwner, MaintenanceStatementsResetAndRebind) {
+  sqlite3 *database = nullptr;
+  ASSERT_EQ(sqlite3_open(":memory:", &database), SQLITE_OK);
+  logical_scene_owner_detail::PersistentStatementCache statements;
+  {
+    logical_scene_owner_detail::Statement query(database, "SELECT ?", &statements);
+    query.Bind(1, std::int64_t{7});
+    ASSERT_TRUE(query.Step());
+    EXPECT_EQ(query.Integer(0), 7);
+  }
+  {
+    logical_scene_owner_detail::Statement query(database, "SELECT ?", &statements);
+    query.Bind(1, std::int64_t{9});
+    ASSERT_TRUE(query.Step());
+    EXPECT_EQ(query.Integer(0), 9);
+    EXPECT_FALSE(query.Step());
+  }
+  statements.Clear();
+  EXPECT_EQ(sqlite3_close(database), SQLITE_OK);
+}
+
+TEST(CanonicalEmptySceneOwner, MaintenanceSnapshotCacheDropsOnRollback) {
+  SceneProductAdoptionFixture fixture;
+  const auto snapshot = *fixture.owner->LogicalSnapshot();
+  logical_scene_owner_detail::MaintenanceSnapshotCache cache;
+  cache.Store(1, false, "exact bytes", snapshot);
+  ASSERT_NE(cache.Find(1, false, "exact bytes"), nullptr);
+  EXPECT_EQ(cache.Find(1, false, "changed bytes"), nullptr);
+  sqlite3 *database = nullptr;
+  ASSERT_EQ(sqlite3_open(":memory:", &database), SQLITE_OK);
+  {
+    logical_scene_owner_detail::Transaction transaction(database, "BEGIN", &cache);
+    transaction.Commit();
+  }
+  ASSERT_NE(cache.Find(1, false, "exact bytes"), nullptr);
+  {
+    logical_scene_owner_detail::Transaction transaction(database, "BEGIN", &cache);
+  }
+  EXPECT_EQ(cache.Find(1, false, "exact bytes"), nullptr);
+  EXPECT_EQ(sqlite3_close(database), SQLITE_OK);
+}
+
+TEST(CanonicalEmptySceneOwner, MaintenanceSnapshotCacheReparsesChangedRowBytes) {
+  SceneProductAdoptionFixture fixture;
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  ASSERT_EQ(fixture.Begin(request).state,
+            core::ProjectionMaintenanceInitializationState::kInitialized);
+  const core::ProjectionMaintenanceInitializationQueryDTO query{
+      request.parent_authority.parent.owner.apply_id,
+      request.parent_authority.parent.owner.apply_generation};
+  ASSERT_TRUE(fixture.owner->ReadMaintenanceInitialization(query).has_value());
+  ASSERT_TRUE(fixture.owner->ReadMaintenanceInitialization(query).has_value());
+  ExecuteSql(fixture.database_path,
+      "DROP TRIGGER logical_scene_maintenance_initialization_intents_no_update;"
+      "UPDATE logical_scene_maintenance_initialization_intents "
+      "SET authoritative_snapshot_json='{}' "
+      "WHERE apply_id='apply-private-adoption';"
+      "CREATE TRIGGER logical_scene_maintenance_initialization_intents_no_update "
+      "BEFORE UPDATE ON logical_scene_maintenance_initialization_intents BEGIN "
+      "SELECT RAISE(ABORT, 'logical_scene maintenance intents are immutable'); END;");
+  EXPECT_THROW(fixture.owner->ReadMaintenanceInitialization(query),
+               std::invalid_argument);
+}
+
+TEST(CanonicalEmptySceneOwner, MaintenanceStatementsPreserveSchemaErrorType) {
+  SceneProductAdoptionFixture fixture;
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  ASSERT_EQ(fixture.Begin(request).state,
+            core::ProjectionMaintenanceInitializationState::kInitialized);
+  const core::ProjectionMaintenanceInitializationQueryDTO query{
+      request.parent_authority.parent.owner.apply_id,
+      request.parent_authority.parent.owner.apply_generation};
+  ASSERT_TRUE(fixture.owner->ReadMaintenanceInitialization(query).has_value());
+  ExecuteSql(fixture.database_path,
+             "DROP TABLE logical_scene_maintenance_initialization_bindings;");
+  try {
+    static_cast<void>(fixture.owner->ReadMaintenanceInitialization(query));
+    FAIL() << "missing bindings table was not reported";
+  } catch (const LogicalSceneOwnerError &error) {
+    EXPECT_EQ(typeid(error), typeid(LogicalSceneOwnerError));
+    EXPECT_NE(std::string(error.what()).find("no such table"), std::string::npos);
+  }
+}
+
+TEST(CanonicalEmptySceneOwner, MaintenanceSnapshotCacheObservesOtherOwnerCommit) {
+  SceneProductAdoptionFixture fixture;
+  LogicalSceneOwner second(fixture.database_path, fixture.admission,
+                           fixture.publication_reader, fixture.bundle_source,
+                           fixture.resolver, fixture.cell_admission);
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  const core::ProjectionMaintenanceInitializationQueryDTO query{
+      request.parent_authority.parent.owner.apply_id,
+      request.parent_authority.parent.owner.apply_generation};
+  EXPECT_FALSE(second.ReadMaintenanceInitialization(query).has_value());
+  ASSERT_EQ(fixture.Begin(request).state,
+            core::ProjectionMaintenanceInitializationState::kInitialized);
+  const auto observed = second.ReadMaintenanceInitialization(query);
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->state,
+            core::ProjectionMaintenanceInitializationState::kInitialized);
+  const auto publication = fixture.Publication(request);
+  fixture.publication_reader.SetCurrent(publication);
+  ASSERT_EQ(fixture.Complete(request, publication).state,
+            core::ProjectionMaintenanceInitializationState::kCompleted);
+  const auto completed = second.ReadMaintenanceInitialization(query);
+  ASSERT_TRUE(completed.has_value());
+  EXPECT_EQ(completed->state,
+            core::ProjectionMaintenanceInitializationState::kCompleted);
+}
+
 #ifdef MANYFORGE_SCENE_TEST_MANAGED_INTERLOCK
 TEST(CanonicalEmptySceneOwner, ActualManagedFenceIssuesBorrowedAdoptionViewWithoutRecursiveQuery) {
   namespace manager = manyforge::component_manager;
@@ -4222,7 +4336,7 @@ TEST(CanonicalEmptySceneOwner,
   }
 }
 
-// D-M4-3: Close (canonical-empty Apply) and a Load of the same product both
+// Close (canonical-empty Apply) and a Load of the same product both
 // preserve the Scene revision, so the composite returns to the exact prior
 // head (A -> B -> A). Replay must still order both completions before the
 // next committed edit instead of stranding them behind it.
@@ -7973,6 +8087,32 @@ TEST(CanonicalEmptySceneOwner,
           database_path, admission.cell_id(), legacy_claim, legacy_release);
   ASSERT_TRUE(legacy_validation.ok()) << legacy_validation.error().code << ": "
                                       << legacy_validation.error().message;
+
+  // Every settlement read closes its connection, also when the evidence does
+  // not match. A leaked read-only connection kept two descriptors per
+  // settlement until the execution host could no longer accept clients.
+  const auto open_descriptors = [] {
+    return std::distance(std::filesystem::directory_iterator("/proc/self/fd"),
+                         std::filesystem::directory_iterator{});
+  };
+  auto mismatched_release = legacy_release;
+  mismatched_release.settlement.settlement_kind =
+      core::CellAdmissionSettlementKindDTO::kProvenNoEffect;
+  const auto descriptors_before_settlements = open_descriptors();
+  for (int settlement = 0; settlement < 64; ++settlement) {
+    ASSERT_TRUE(ValidateAuthoredSceneCellAdmissionSettlementReadOnly(
+                    database_path, admission.cell_id(), legacy_claim,
+                    legacy_release)
+                    .ok());
+    const auto mismatched =
+        ValidateAuthoredSceneCellAdmissionSettlementReadOnly(
+            database_path, admission.cell_id(), legacy_claim,
+            mismatched_release);
+    ASSERT_FALSE(mismatched.ok());
+    ASSERT_EQ(mismatched.error().details.at("reason"),
+              "authored_scene_terminal_evidence_mismatch");
+  }
+  EXPECT_EQ(open_descriptors(), descriptors_before_settlements);
 
   SceneAdmissionClock legacy_clock;
   SceneAdmissionJournal legacy_journal;

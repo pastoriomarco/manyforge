@@ -29,7 +29,7 @@ namespace {
 
 [[nodiscard]] ResolvedStopBasePlanDTO BasePlan() {
   const auto path =
-      std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
+      std::filesystem::path(MANYFORGE_CORE_TEST_GOLDEN_DIR) / "resolved_stop_base_plan.v1.json";
   std::ifstream stream(path, std::ios::binary);
   std::string bytes{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
   if (bytes.ends_with('\n')) bytes.pop_back();
@@ -100,8 +100,6 @@ namespace {
       ProgramBindingId(Digest('2')),
       base.retained_bundle_id,
       base.graph_revision,
-      ComponentRoleId("robot"),
-      TargetRoleId("arm"),
       ControllableComponentId("robot.1"),
       ComponentTypeId("robot.type"),
       ComponentTypeRevision("robot.type.revision"),
@@ -117,9 +115,9 @@ namespace {
                                    ModelInstanceId("robot.model"),
                                    "arm_group",
                                    {"joint_1", "joint_2"}}},
-      {ProgramFrameRoleBindingDTO{FrameRoleId("base"), ModelInstanceId("robot.model"),
+      {ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("base")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision"), "robot_base"},
-       ProgramFrameRoleBindingDTO{FrameRoleId("tcp"), ModelInstanceId("robot.model"),
+       ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("tcp")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision"), "robot_tcp"}},
       {RuntimeResourceBindingDTO{ResourceRoleId("joint.1"), ResourceId("joint.1"),
                                  std::string("joint_1"), "joint_1", CoordinateKind::kAngular},
@@ -618,8 +616,6 @@ TEST(PreparedOperationParticipantCodecTest,
   physical_value.program_id = ProgramId("direct-control.product-owner");
   physical_value.program_revision = ProgramRevision(Digest('e'));
   physical_value.program_binding_id = ProgramBindingId(Digest('f'));
-  physical_value.component_role_id = ComponentRoleId("direct_control_component");
-  physical_value.target_role_id = TargetRoleId("direct_control_target");
   auto physical = verify_runtime_participant_binding(std::move(physical_value));
   ASSERT_TRUE(physical.ok()) << physical.error().message;
 
@@ -637,7 +633,7 @@ TEST(PreparedOperationParticipantCodecTest,
   auto shared_value = physical.value().value();
   ASSERT_FALSE(shared_value.frame_bindings.empty());
   auto shared_frame = shared_value.frame_bindings.back();
-  shared_frame.frame_role_id = FrameRoleId("shared_frame_role");
+  shared_frame.reference.frame_id = FrameRoleId("shared_frame_role");
   shared_value.frame_bindings.push_back(std::move(shared_frame));
   auto shared = verify_runtime_participant_binding(std::move(shared_value));
   ASSERT_TRUE(shared.ok()) << shared.error().message;
@@ -1011,9 +1007,8 @@ TEST(PreparedOperationParticipantCodecTest, CapturesQualifiedTcpAndRejectsCrosse
   auto inputs = Inputs(base, false);
   auto value = inputs.binding.value();
   value.motion_endpoint =
-      RuntimeMotionEndpointBindingDTO{TargetRoleId("tool"),
-                                      CommandTargetId("gripper"),
-                                      {FrameRoleId("fingertip"), ModelInstanceId("robot.model"),
+      RuntimeMotionEndpointBindingDTO{{ControllableComponentId("robot.1"), CommandTargetId("arm")},
+                                      {{ControllableComponentId("gripper.component"), FrameRoleId("fingertip")}, ModelInstanceId("robot.model"),
                                        ModelRevision("model.revision"), "robot_fingertip"},
                                       {}};
   auto selected = verify_runtime_participant_binding(value);
@@ -1021,8 +1016,8 @@ TEST(PreparedOperationParticipantCodecTest, CapturesQualifiedTcpAndRejectsCrosse
   inputs.binding = std::move(selected.value());
   auto payload = MotionPayload(inputs);
   payload.plan_request.tcp_frame = ResolvedComponentModelFrameDTO{
-      value.controllable_component_id, value.motion_endpoint->frame.model_instance_id,
-      value.motion_endpoint->frame.frame_role_id, value.motion_endpoint->frame.compiled_frame_name,
+      value.motion_endpoint->frame.reference.component_id, value.motion_endpoint->frame.model_instance_id,
+      value.motion_endpoint->frame.reference.frame_id, value.motion_endpoint->frame.compiled_frame_name,
       value.motion_endpoint->frame.model_revision};
   auto prepared = MakePreparedOperationParticipant(
       Candidate(inputs.binding, inputs.readiness, payload), inputs.binding, inputs.readiness,
@@ -1035,7 +1030,7 @@ TEST(PreparedOperationParticipantCodecTest, CapturesQualifiedTcpAndRejectsCrosse
   ASSERT_TRUE(bytes.ok()) << bytes.error().message;
   EXPECT_NE(bytes.value().find("\"motion_endpoint\""), std::string::npos);
   auto crossed = prepared.value();
-  crossed.motion_endpoint->target_role_id = TargetRoleId("other_tool");
+  crossed.motion_endpoint->target.component_id = ControllableComponentId("other_robot");
   EXPECT_FALSE(VerifyPreparedOperationParticipant(crossed, inputs.binding, inputs.readiness,
                                                   DefaultLimits(),
                                                   MotionInterruptNodeCategory::kGeneric)
@@ -1048,22 +1043,19 @@ TEST(PreparedOperationParticipantCodecTest, CapturesQualifiedTcpAndRejectsCrosse
                    Candidate(inputs.binding, inputs.readiness, wrong_frame), inputs.binding,
                    inputs.readiness, DefaultLimits(), MotionInterruptNodeCategory::kGeneric)
                    .ok());
-  // B7: the TCP frame carries its owner, here a tool mounted on the motion
-  // component; the endpoint is compared by its frame key, never the stamp.
-  auto tool_owned = payload;
-  std::get<ResolvedComponentModelFrameDTO>(tool_owned.plan_request.tcp_frame)
-      .controllable_component_id = ControllableComponentId("gripper.component");
-  const auto owner_stamped = MakePreparedOperationParticipant(
-      Candidate(inputs.binding, inputs.readiness, tool_owned), inputs.binding, inputs.readiness,
+  // A restamped frame owner cannot replace the exact captured entry owner.
+  auto owner_stamped = payload;
+  std::get<ResolvedComponentModelFrameDTO>(owner_stamped.plan_request.tcp_frame)
+      .controllable_component_id = ControllableComponentId("other_tool");
+  const auto restamped = MakePreparedOperationParticipant(
+      Candidate(inputs.binding, inputs.readiness, owner_stamped), inputs.binding, inputs.readiness,
       DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
-  ASSERT_TRUE(owner_stamped.ok()) << owner_stamped.error().details.at("reason");
-  // Active TCP (M7): the lane's TCP step reads the entry from the stamp.
-  EXPECT_EQ(prepared_motion_tcp_entry(owner_stamped.value()),
-            std::optional(TcpEntryDTO{ControllableComponentId("gripper.component"),
-                                      CommandTargetId("gripper"), FrameRoleId("fingertip")}));
+  ASSERT_FALSE(restamped.ok());
+  EXPECT_EQ(restamped.error().details.at("reason"), "prepared_motion_endpoint_frame_mismatch");
   EXPECT_EQ(prepared_motion_tcp_entry(prepared.value()),
-            std::optional(TcpEntryDTO{value.controllable_component_id, CommandTargetId("gripper"),
-                                      FrameRoleId("fingertip")}));
+            std::optional(TcpEntryReferenceDTO{
+                {ControllableComponentId("robot.1"), CommandTargetId("arm")},
+                {ControllableComponentId("gripper.component"), FrameRoleId("fingertip")}}));
 }
 
 }  // namespace manyforge::core

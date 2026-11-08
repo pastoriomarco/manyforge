@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -21,7 +22,7 @@ namespace manyforge::core {
 
 /// Telemetry payload produced by one parallel-validation run. The kernel /
 /// observer surface can copy this into `manyforge.validation.collision_parallel_*`
-/// events as described by TRAJECTORY_VALIDATION_PARALLELISM_PLAN §"Observability".
+/// events.
 ///
 /// All fields are populated unconditionally except `serial_reference_wall_ns`,
 /// which is opt-in (qualification / shadow runs only, see
@@ -63,8 +64,8 @@ struct ParallelValidationTelemetry {
   bool ordered_contact_summary_used = false;
 
   /// Collision geometry count sourced from `CollisionWorldSnapshot`
-  /// metadata when available; 0 means "not sourced" (Phase 2 not yet
-  /// landed) — callers MUST NOT interpret 0 as "no geometry". This field
+  /// metadata when available; 0 means "not sourced" — callers MUST NOT
+  /// interpret 0 as "no geometry". This field
   /// MUST be populated from snapshot metadata only; the pool MUST NOT
   /// scan the scene to compute it (per the telemetry-overhead avoidance
   /// rule).
@@ -110,8 +111,7 @@ struct ParallelValidationPoolStatus {
   std::uint64_t abandoned_jobs_total = 0;
 };
 
-/// ParallelCollisionValidationWorkerPool (spec COLLISION_CHECKING_OWNERSHIP_PLAN
-/// Chunk 7, TRAJECTORY_VALIDATION_PARALLELISM_PLAN Chunks 1-3).
+/// ParallelCollisionValidationWorkerPool.
 ///
 /// Splits a trajectory into contiguous waypoint chunks, runs each chunk on a
 /// dedicated worker with its own `ICollisionQueryEngine` against a shared
@@ -207,6 +207,9 @@ class ParallelCollisionValidationWorkerPool {
 
   explicit ParallelCollisionValidationWorkerPool(Config config);
   ~ParallelCollisionValidationWorkerPool();
+
+  // Close admission and join all workers before the scheduler is released.
+  void detach();
 
   ParallelCollisionValidationWorkerPool(
       const ParallelCollisionValidationWorkerPool&) = delete;
@@ -307,6 +310,7 @@ class ParallelCollisionValidationWorkerPool {
   ParallelValidationTelemetry last_telemetry_{};
   std::shared_ptr<PoolCounters> counters_;
   std::unordered_map<std::string, TimePoint> last_fallback_log_at_;
+  std::atomic<bool> closing_{false};
   mutable std::mutex validation_call_mutex_;
   std::mutex worker_slots_mutex_;
   std::vector<std::shared_ptr<WorkerSlot>> worker_slots_;

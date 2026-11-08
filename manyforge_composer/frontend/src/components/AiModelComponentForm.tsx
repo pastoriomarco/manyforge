@@ -250,7 +250,7 @@ function AssistantModelAliases({ controller, profileId, components }: {
  */
 export function AiModelComponentSection({ controller, effective = null, scope = 'all' }: {
   controller: DeploymentWorkspaceController;
-  /** `GET /api/deployment/effective` (CONTRACTS §11), read once by the editor. */
+  /** `GET /api/deployment/effective`, read once by the editor. */
   effective?: EffectiveValues | null;
   scope?: FocusedEditorScope;
 }) {

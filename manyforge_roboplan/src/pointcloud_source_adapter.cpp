@@ -145,7 +145,7 @@ core::ActionResult PointCloudSourceAdapter::Run(const core::ComponentAction acti
   switch (action) {
     case core::ComponentAction::kPrepare:
     case core::ComponentAction::kRecover: {
-      std::unique_ptr<IComponentProcess> previous;
+      std::shared_ptr<IComponentProcess> previous;
       {
         const std::lock_guard lock(mutex_);
         previous = std::move(process_);
@@ -163,20 +163,41 @@ core::ActionResult PointCloudSourceAdapter::Run(const core::ComponentAction acti
       }
       break;
     }
-    case core::ComponentAction::kEnable: {
-      const std::lock_guard lock(mutex_);
-      if (!process_ || process_->exited()) {
-        fail("component_not_prepared", "Prepare the point-cloud source before enabling it.");
-        break;
-      }
-      forwarding_ = true;
-      link_->SetForwarding(true);
-      break;
-    }
+    case core::ComponentAction::kEnable:
     case core::ComponentAction::kDisable: {
-      const std::lock_guard lock(mutex_);
-      forwarding_ = false;
-      link_->SetForwarding(false);
+      const bool forwarding = action == core::ComponentAction::kEnable;
+      std::shared_ptr<IComponentProcess> process;
+      {
+        const std::lock_guard lock(mutex_);
+        process = process_;
+        if (forwarding && (!process || process->exited())) {
+          fail("component_not_prepared", "Prepare the point-cloud source before enabling it.");
+          break;
+        }
+      }
+      // State keeps the last completed forwarding value while middleware runs.
+      // The process pin prevents a replaced bridge from being destroyed here.
+      try {
+        link_->SetForwarding(forwarding);
+      } catch (...) {
+        // Preserve the old action's state on a publish exception, but never
+        // update a newer bridge that replaced the pinned process.
+        const std::lock_guard lock(mutex_);
+        if (process_ == process) forwarding_ = forwarding;
+        throw;
+      }
+      {
+        const std::lock_guard lock(mutex_);
+        if (process_ != process) {
+          result.outcome = core::ActionOutcome::kUnknown;
+          result.error = core::ActionError{
+              "component_action_outcome_unknown",
+              "The point-cloud bridge changed while forwarding was being set",
+              std::nullopt, std::nullopt};
+        } else {
+          forwarding_ = forwarding;
+        }
+      }
       break;
     }
     default:

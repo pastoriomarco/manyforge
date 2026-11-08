@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <optional>
@@ -183,7 +184,7 @@ std::size_t replace_all(std::string &text, const std::string_view token,
   return count;
 }
 
-/// The instance values of CONTRACTS §12 in one contribution string.
+/// The instance values of a launch contribution in one contribution string.
 [[nodiscard]] std::string with_instance(std::string text,
                                         const std::string &runtime_namespace,
                                         const std::string_view address) {
@@ -207,12 +208,25 @@ std::size_t replace_all(std::string &text, const std::string_view token,
 
 constexpr std::string_view kTemplateManagerSelector = "/**/controller_manager:";
 
-/// The controllers template of CONTRACTS §12 with the row's and the
+/// OD-59: under the strict real-time resource profile (its one source of
+/// truth, `MANYFORGE_RT_RESOURCE_PROFILE`, also read by the scheduler) every
+/// lane's controller manager locks its memory (stock `lock_memory`, which
+/// upstream only warns about when it fails; the resource probe checks VmLck).
+[[nodiscard]] bool strict_rt_resource_profile() {
+  const char *profile = std::getenv("MANYFORGE_RT_RESOURCE_PROFILE");
+  if (profile == nullptr) return false;
+  std::string value(profile);
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return value == "strict";
+}
+
+/// The controllers template with the row's and the
 /// instance's values (see `LaunchContribution`).
 [[nodiscard]] std::string
 expand_controllers(const ModelLaneRow &row, const std::string &controllers,
                    const LaunchInstance &instance,
-                   const std::string &runtime_namespace) {
+                   const std::string &runtime_namespace, const bool lock_memory) {
   // The joints an arm controller moves: none with the arm deactivated.
   const auto &arm = instance.arm_deactivated ? std::vector<std::string>{}
                                              : instance.arm_joint_names;
@@ -226,6 +240,7 @@ expand_controllers(const ModelLaneRow &row, const std::string &controllers,
   std::size_t joint_lists = 0U;
   std::size_t constraint_lines = 0U;
   std::size_t goal_times = 0U;
+  bool in_manager = false;
   for (const auto &line : lines_of(controllers)) {
     if (is_comment(line)) continue;
     const auto content = trimmed(line);
@@ -233,7 +248,18 @@ expand_controllers(const ModelLaneRow &row, const std::string &controllers,
       expanded.push_back(runtime_namespace + "/" +
                          std::string(kControllerManagerNodeName) + ":");
       ++managers;
+      in_manager = true;
       continue;
+    }
+    if (!line.empty() && line.front() != ' ') in_manager = false;
+    if (lock_memory && in_manager) {
+      // The lane's own `lock_memory` is replaced by the strict profile's.
+      if (content.starts_with("lock_memory:")) continue;
+      if (content == "ros__parameters:") {
+        expanded.push_back(line);
+        expanded.push_back(indentation(line) + "  lock_memory: true");
+        continue;
+      }
     }
     if (content == "joints: [__joint__]") {
       if (arm.empty()) fail("the controllers list arm joints for a component without an arm");
@@ -416,6 +442,67 @@ controller_lane_rates(const std::string_view controllers_yaml) {
   return ControllerLaneRates{*update, *state, *monitor};
 }
 
+std::vector<std::string>
+controller_command_interfaces(const std::string_view controllers_yaml) {
+  constexpr std::string_view key = "command_interfaces:";
+  const auto lines = lines_of(controllers_yaml);
+  std::vector<std::string> claimed;
+  bool found = false;
+  const auto unquoted = [](std::string text) {
+    while (!text.empty() && (text.back() == ' ' || text.back() == ',')) text.pop_back();
+    if (text.size() >= 2U && (text.front() == '"' || text.front() == '\'') &&
+        text.back() == text.front())
+      text = text.substr(1U, text.size() - 2U);
+    return text;
+  };
+  for (std::size_t index = 0U; index < lines.size(); ++index) {
+    if (is_comment(lines[index])) continue;
+    const auto content = trimmed(lines[index]);
+    if (!content.starts_with(key)) continue;
+    if (found) fail("the controllers repeat 'command_interfaces'");
+    found = true;
+    const auto rest = trimmed(content.substr(key.size()));
+    if (!rest.empty()) {
+      if (rest.front() != '[' || rest.find(']') == std::string::npos)
+        fail("the controllers' 'command_interfaces' is not a list");
+      const auto inner = rest.substr(1U, rest.find(']') - 1U);
+      std::size_t cursor = 0U;
+      while (cursor <= inner.size()) {
+        const auto comma = inner.find(',', cursor);
+        auto item = unquoted(trimmed(inner.substr(cursor, comma == std::string::npos
+                                                               ? std::string::npos
+                                                               : comma - cursor)));
+        if (!item.empty()) claimed.push_back(std::move(item));
+        if (comma == std::string::npos) break;
+        cursor = comma + 1U;
+      }
+      continue;
+    }
+    const auto depth = lines[index].find_first_not_of(' ');
+    while (index + 1U < lines.size()) {
+      const auto &next = lines[index + 1U];
+      const auto next_content = trimmed(next);
+      if (next_content.empty() || is_comment(next)) {
+        ++index;
+        continue;
+      }
+      if (!next_content.starts_with("-") || next.find_first_not_of(' ') < depth) break;
+      claimed.push_back(unquoted(trimmed(next_content.substr(1U))));
+      ++index;
+    }
+  }
+  return claimed;
+}
+
+bool jtc_accepts_speed_scaling(const std::vector<std::string> &command_interfaces) {
+  const auto claims = [&](const std::string_view name) {
+    return std::find(command_interfaces.begin(), command_interfaces.end(), name) !=
+           command_interfaces.end();
+  };
+  return claims("position") && !claims("velocity") && !claims("acceleration") &&
+         !claims("effort");
+}
+
 std::string
 controller_runtime_namespace(const std::string_view controllable_component_id) {
   require_token(controllable_component_id, "controllable component id");
@@ -478,7 +565,8 @@ ControllerLaunchArtifacts write_launch_artifacts(const ModelLaneRow &row,
   }
 
   auto controllers = with_instance(
-      expand_controllers(row, contribution.controllers_yaml, instance, runtime_namespace),
+      expand_controllers(row, contribution.controllers_yaml, instance, runtime_namespace,
+                         strict_rt_resource_profile()),
       runtime_namespace, instance.address);
   if (controllers.find("__command_interfaces__") != std::string::npos) {
     std::string interfaces;
@@ -522,6 +610,7 @@ ControllerLaunchArtifacts write_launch_artifacts(const ModelLaneRow &row,
     result.gripper_controller_name = row.controller;
   }
   result.rates = controller_lane_rates(controllers);
+  if (arm) result.arm_command_interfaces = controller_command_interfaces(controllers);
 
   result.directory = instance.artifacts_root / instance.controllable_component_id;
   std::error_code error;

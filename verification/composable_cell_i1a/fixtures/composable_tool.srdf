@@ -1,6 +1,0 @@
-<?xml version="1.0"?>
-<robot name="composable_tool">
-  <group name="gripper">
-    <joint name="finger_joint"/>
-  </group>
-</robot>

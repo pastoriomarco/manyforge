@@ -44,7 +44,7 @@ def _reader(requests: list[httpx.Request]) -> tuple[HeadlessReadClient, httpx.Cl
     ), raw
 
 
-def test_read_client_exposes_only_the_closed_h0_observation_set() -> None:
+def test_read_client_exposes_only_the_closed_observation_set() -> None:
     requests: list[httpx.Request] = []
     reader, raw = _reader(requests)
     try:

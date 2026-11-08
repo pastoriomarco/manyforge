@@ -88,7 +88,7 @@ def test_owner_captures_values_before_later_writes_without_changing_status_wire(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     admission = _admission_for_program(
         admission, Program.from_dict(document, admission.environment.catalog), []
@@ -109,7 +109,9 @@ def test_owner_captures_values_before_later_writes_without_changing_status_wire(
     record = owner.take_diagnostic(run_id)
     # The motion node's system-owned outcome key is captured like any key.
     assert record["blackboard"] == {
-        "active_tcp.arm": {"component_id": "robot.1", "target_id": "arm.command", "frame_role_id": "tcp"},
+        "active_tcp/ur5_robot/arm": {
+            "target": {"component_id": "ur5_robot", "command_target_id": "arm"},
+            "frame": {"component_id": "ur5_robot", "frame_id": "tcp"}},
         "node_outcome.move_to_pick": "completed",
         "recorded_value": True,
     }
@@ -405,7 +407,7 @@ class _ScopePort:
         self.held = False
         self.ready = False
         self.selection_release_block_reason: str | None = None
-        # AUD-6: the rule whose `hold` holds the run (Kernel scope field).
+        # The rule whose `hold` holds the run (Kernel scope field).
         self.stopped_by_rule_id: str | None = None
         self.attention_refusal: ProgramSelectionReleaseRejectedError | None = None
         # Kernel stand-in for the per-node resource test: a node is refused
@@ -586,10 +588,11 @@ class _FixtureProgramRunOwner(ProgramRunOwner):
         snapshot = super().start(admission, program_run_id=program_run_id)
         # The Runner normally registers the store and seeds it from the
         # Kernel's ordered Active TCP baseline before ticking the run.
-        for row in admission.program_binding.get("target_role_bindings", ()):
+        for row in admission.program_binding.get("target_bindings", ()):
             if row.get("robot_tcps"):
+                target = row["target"]
                 self.value_store(snapshot.capture.program_run_id).write_active_tcp(
-                    row["target_role_id"],
+                    target["component_id"], target["command_target_id"],
                     row["robot_tcps"][0]["entry"],
                 )
         return snapshot
@@ -653,15 +656,12 @@ def _fixture(
             "retained_bundle_id": _DIGEST_B,
             "graph_revision": _DIGEST_C,
             "node_policies": [],
-            "target_role_bindings": [{
-                "target_role_id": "arm",
-                "component_role_id": "robot",
-                "controllable_component_id": "robot.1",
-                "command_target_id": "arm.command",
-                "robot_tcps": [{"entry": {"component_id": "robot.1",
-                                          "target_id": "arm.command",
-                                          "frame_role_id": "tcp"},
-                                "end_effector": True}],
+            "target_bindings": [{
+                "target": {"component_id": "ur5_robot", "command_target_id": "arm"},
+                "robot_tcps": [{"entry": {
+                    "target": {"component_id": "ur5_robot", "command_target_id": "arm"},
+                    "frame": {"component_id": "ur5_robot", "frame_id": "tcp"}},
+                    "end_effector": True}],
             }],
         },
         readiness=_readiness(_DIGEST_A),
@@ -701,7 +701,7 @@ def _program_with_policies(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, admission.environment.catalog)
 
@@ -1225,7 +1225,7 @@ def test_terminal_reset_uncontained_stop_accepts_only_current_zero_sample(stop_s
 
 
 def test_program_run_owner_and_native_port_reset_partial_stop_with_intervention_operation():
-    from .test_production_ports import _motion_test_port
+    from .test_production_ports import _motion_test_port, _motion_inputs, _context, _thawed
 
     class ResetTransport:
         def __init__(self) -> None:
@@ -1347,19 +1347,9 @@ def test_program_run_owner_and_native_port_reset_partial_stop_with_intervention_
         initial_task_state=OwnerTaskState.FAILED
     )
     binding = deepcopy(dict(admission.program_binding))
-    binding["target_role_bindings"] = [
-        {
-            "target_role_id": "arm",
-            "component_role_id": "robot",
-            "controllable_component_id": "robot.1",
-            "command_target_id": "arm.command",
-            "capability_bindings": [
-                {"capability_id": "execution.trajectory.execute", "command_schema": None},
-                {"capability_id": "model.kinematics.fk", "command_schema": None},
-                {"capability_id": "state.observed.current", "command_schema": None},
-            ],
-        }
-    ]
+    motion_binding = _context().program_binding
+    for key in ("target_bindings", "frame_bindings", "signal_bindings", "collision_body_bindings"):
+        binding[key] = _thawed(motion_binding[key])
     admission = replace(
         admission,
         program_binding=binding,
@@ -1387,34 +1377,7 @@ def test_program_run_owner_and_native_port_reset_partial_stop_with_intervention_
     native_task = native.operations.start(
         "motion.move_to_pose",
         NodeAttemptIdentity(run_id, "held-motion", "attempt.1"),
-        OwnerNodeInputs(
-            {
-                "target_role": "arm",
-                "base_frame_role": "base",
-                "tcp_endpoint": {"kind": "entry", "target_role": "arm", "frame_role": "tcp"},
-                "goal": {
-                    "position_m": [0.0, 0.0, 0.1],
-                    "orientation": {"rpy_deg": [180.0, 0.0, 0.0]},
-                },
-                "target_mode": "relative",
-                "target_reference": {
-                    "type": "scene_resource",
-                    "scene_resource_id": "graspable",
-                },
-                "offset_reference": {"type": "frame_role", "frame_role_id": "base"},
-                "velocity_scale": 0.4,
-                "acceleration_scale": 0.4,
-                "max_tcp_linear_speed_mps": None,
-                "per_joint_dynamics_limits": {},
-                "joint_position_tol_rad": 0.05,
-                "translation_tol_m": 0.005,
-                "rotation_tol_rad": 0.05,
-                "planning_timeout_s": 2.0,
-                "execution_timeout_s": 10.0,
-                "cache_mode": "default",
-                "contact_policy_id": None,
-            }
-        ),
+        _motion_inputs(),
     )
     operation_id = native_task.metadata["operation_id"]
     transport.operations[operation_id]["state"] = "intervention_required"
@@ -1645,7 +1608,7 @@ def test_failure_pause_stops_all_program_motion_once() -> None:
 
 class _SimulationPausedTaskPort(_TaskPort):
     """The Kernel refuses the first `refusals` starts: the simulation isn't
-    playing (SIM-1); later starts succeed."""
+    playing; later starts succeed."""
 
     def __init__(self, events: list[str], refusals: int) -> None:
         super().__init__(events, OwnerTaskState.SUCCEEDED)
@@ -1664,7 +1627,7 @@ class _SimulationPausedTaskPort(_TaskPort):
 
 
 def test_a_simulation_not_playing_refusal_is_the_operator_stop_until_run() -> None:
-    """SIM-1 (N4b): the refused node never fails. The owner sends the
+    """The refused node never fails. The owner sends the
     operator's Stop on its groups once; the node waits for Run; a Run while
     the simulation still isn't playing is refused and held again; a Run after
     it plays proceeds."""
@@ -1819,7 +1782,7 @@ def test_failure_pause_stays_dormant_whatever_the_owner_deadline(deadline_ns) ->
 
 
 def test_press_time_failure_refresh_reads_the_owner_and_keeps_the_acknowledgement() -> None:
-    """SX-648/655: a manual-result press freshly re-reads the held task's
+    """A manual-result press freshly re-reads the held task's
     owner assessment (offers do not expire), not its cached observation; the
     Program's non-moving acknowledgement stays."""
     interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
@@ -2163,7 +2126,7 @@ def test_motion_stop_holds_the_current_node_and_resume_hands_off_its_exact_fence
             document,
             own_field="program_revision",
             identity_domain="program-revision",
-            api_version="manyforge.program.v2",
+            api_version="manyforge.program.v3",
         )
         admission = _admission_for_program(
             admission, Program.from_dict(document, admission.environment.catalog), []
@@ -2709,22 +2672,17 @@ def test_execution_selection_names_the_exact_resources_its_release_reserves():
     )
     binding = deepcopy(dict(admission.program_binding))
 
-    def target(role: str, resources: list[str]) -> dict[str, Any]:
+    def bound_target(component: str, resources: list[str]) -> dict[str, Any]:
         return {
-            "target_role_id": role,
-            "resource_role_bindings": [
-                {
-                    "resource_role_id": f"{role}_joints",
-                    "resource_ids": resources,
-                    "compiled_resource_names": resources,
-                }
-            ],
+            "target": {"component_id": component, "command_target_id": "arm"},
+            "resource_role_bindings": [{"resource_role_id": "joints",
+                                        "resource_ids": resources,
+                                        "compiled_resource_names": resources}],
         }
 
-    binding["target_role_bindings"] = [
-        target("arm", ["robot.joint_2", "robot.joint_1"]),
-        # A bound role no selected node addresses effectfully is not reserved.
-        target("spare", ["spare.joint_1"]),
+    binding["target_bindings"] = [
+        bound_target("ur5_robot", ["robot.joint_2", "robot.joint_1"]),
+        bound_target("spare", ["spare.joint_1"]),
     ]
     scope.ready = True
     scope.node_count = 3
@@ -3276,7 +3234,7 @@ def test_rejected_resume_does_not_publish_unrevisioned_settlement():
 
 
 def test_resume_crossed_by_a_run_revision_change_is_still_admitted():
-    """N8: Run/Resume is fenced on the selection, not on the run revision."""
+    """Run/Resume is fenced on the selection, not on the run revision."""
     owner, admission, task, scope, _events = _fixture(
         initial_task_state=OwnerTaskState.ACTIVE
     )
@@ -3630,7 +3588,7 @@ def test_parallel_stop_records_both_attempts_before_full_stop_recovery() -> None
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     program = Program.from_dict(document, admission.environment.catalog)
     admission = _admission_for_program(admission, program, [])
@@ -3690,7 +3648,7 @@ def test_selected_resume_refreshes_siblings_and_retains_partial_cleanup(policy) 
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     program = Program.from_dict(document, admission.environment.catalog)
     admission = _admission_for_program(
@@ -3801,7 +3759,7 @@ def _timed_admission(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     program = Program.from_dict(document, admission.environment.catalog)
     return _admission_for_program(
@@ -4387,7 +4345,7 @@ def test_program_run_snapshot_is_a_closed_serializable_owner_projection() -> Non
         "run_end",
     }
     assert value["operation_failures"] == []
-    assert value["schema_version"] == "manyforge.program_run_status.v3"
+    assert value["schema_version"] == "manyforge.program_run_status.v4"
     assert value["details"] is None and value["origin"] is None
     assert value["node_status_revision"] == 1
     assert value["node_statuses"]
@@ -4398,7 +4356,7 @@ def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
     program = admission.program
     environment = admission.environment
     return {
-        "schema_version": "manyforge.program_run_input.v2",
+        "schema_version": "manyforge.program_run_input.v3",
         "applied_record_digest": admission.applied_record_digest,
         "scenario_id": admission.scenario_id,
         "project_path": admission.project_path,
@@ -4422,6 +4380,16 @@ def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
             }
         ],
         "program": program.to_dict(),
+        "program_frame_facts": {
+            "applied_record_digest": admission.applied_record_digest,
+            "program_binding_id": admission.program_binding_id,
+            "program_revision": program.program_revision,
+            "retained_bundle_id": admission.retained_bundle_id,
+            "graph_revision": admission.graph_revision,
+            "components": ["ur5_robot"],
+            "frames": [{"reference": {"component_id": "ur5_robot", "frame_id": "base"},
+                        "match_count": 1}],
+        },
         "program_binding": {
             "program_binding_id": admission.program_binding_id,
             "program_id": program.program_id,
@@ -4437,6 +4405,26 @@ def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
             },
         },
     }
+
+
+@pytest.mark.parametrize("field", [
+    "applied_record_digest", "program_binding_id", "program_revision",
+    "retained_bundle_id", "graph_revision",
+])
+def test_run_admission_refuses_stale_frame_facts(field: str) -> None:
+    _owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    selection = _scenario_selection(admission)
+    selection["program_frame_facts"][field] = "sha256:" + "f" * 64
+    with pytest.raises(ProgramRunOwnerError, match="scenario frame facts are invalid"):
+        build_program_run_admission(
+            selection,
+            expected_scenario_id=admission.scenario_id,
+            expected_source_document_digest=admission.source_document_digest,
+            environment=admission.environment,
+            owner_availability=admission.readiness.owner_by_port,
+        )
 
 
 def test_native_selection_join_rejects_a_catalog_change_before_construction() -> None:
@@ -4553,9 +4541,9 @@ def test_applied_selection_keeps_strict_nested_program_identity() -> None:
     assert authored.program_revision == admission.program.program_revision
 
 
-def test_applied_selection_refuses_an_older_catalog_selector() -> None:
+def test_applied_selection_refuses_an_older_catalog_selector(monkeypatch) -> None:
     """An internally consistent Program under an older catalog minor is refused
-    at the Runner boundary (M3); opened for authoring it is normalized."""
+    at the Runner boundary; opened for authoring it is normalized."""
 
     from manyforge_behavior.canonical_artifact import compute_content_identity
     from manyforge_behavior.program import ProgramValidationError
@@ -4565,19 +4553,21 @@ def test_applied_selection_refuses_an_older_catalog_selector() -> None:
     )
     selection = _scenario_selection(admission)
     catalog = admission.environment.catalog
-    major, minor, _patch = catalog.content_version.split(".")
+    # The shipped catalog is 3.0.0; emulate a later compatible minor so this
+    # still exercises an older same-major selector instead of inventing 3.-1.0.
+    monkeypatch.setattr(type(catalog), "content_version", property(lambda _: "3.1.0"))
     older = selection["program"]
-    older["catalog"]["content_version"] = f"{major}.{int(minor) - 1}.0"
+    older["catalog"]["content_version"] = "3.0.0"
     older["program_revision"] = compute_content_identity(
         older,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     selection["program_revision"] = older["program_revision"]
     selection["program_binding"]["program_revision"] = older["program_revision"]
 
-    with pytest.raises(ProgramValidationError, match="exact active v2 catalog"):
+    with pytest.raises(ProgramValidationError, match="exact active v3 catalog"):
         build_program_run_admission(
             selection,
             expected_scenario_id=admission.scenario_id,
@@ -4589,7 +4579,7 @@ def test_applied_selection_refuses_an_older_catalog_selector() -> None:
     authored = Program.from_dict(older, catalog, authoring_load=True)
     assert authored.load_diagnostics == ()
     assert authored.to_dict()["catalog"]["content_version"] == catalog.content_version
-    assert authored.program_revision == admission.program.program_revision
+    assert authored.program_revision != older["program_revision"]
 
 
 def test_applied_program_publication_is_complete_run_input() -> None:
@@ -4608,10 +4598,10 @@ def test_applied_program_publication_is_complete_run_input() -> None:
     }
     applied.update(
         {
-            "schema_version": "manyforge.applied_program_selection.v3",
+            "schema_version": "manyforge.applied_program_selection.v4",
             "baseline_program_binding_id": admission.program_binding_id,
             "preparation_digest": _DIGEST_C,
-            "source": {"record_digest": _DIGEST_B},
+            "source": {"record_digest": admission.applied_record_digest},
             "simulation_scene": {
                 "cell_frame_id": "universe",
                 "scene_entities": [
@@ -4638,6 +4628,7 @@ def test_applied_program_publication_is_complete_run_input() -> None:
     assert scene["cell_frame_id"] == "universe"
     assert scene["scene_entities"][0]["entity"] == "/World/box"
     applied["graph_revision"] = _DIGEST_A
+    applied["program_frame_facts"]["graph_revision"] = _DIGEST_A
     try:
         build_applied_program_run_admission(
             applied,
@@ -4681,7 +4672,7 @@ def test_applied_publication_with_removed_parameter_overrides_is_refused() -> No
             environment=admission.environment,
             owner_availability=admission.readiness.owner_by_port,
         )
-    applied["schema_version"] = "manyforge.applied_program_selection.v3"
+    applied["schema_version"] = "manyforge.applied_program_selection.v4"
     with pytest.raises(ProgramRunOwnerError, match="wrong fields"):
         build_applied_program_run_admission(
             applied,
@@ -4730,7 +4721,7 @@ def _timer_with_sourced_duration_admission(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     program = Program.from_dict(document, admission.environment.catalog)
     return _admission_for_program(
@@ -4810,9 +4801,9 @@ def test_timer_input_failure_pauses_and_operator_retry_re_resolves_inputs() -> N
 
 _OWNER_REFUSAL_DETAILS = {
     "reason": "observed_state_unavailable",
-    "reference_type": "frame",
+    "reference_type": "component_frame",
     "reference_id": "tool0",
-    "target_role_id": "arm.left",
+    "component_id": "arm.left",
     "retryable": False,
     # Bounded away: an over-long value, a nested value, an unregistered key.
     "path": "p" * 257,
@@ -4821,14 +4812,14 @@ _OWNER_REFUSAL_DETAILS = {
 }
 _OWNER_REFUSAL_PROJECTED = {
     "reason": "observed_state_unavailable",
-    "reference_type": "frame",
+    "reference_type": "component_frame",
     "reference_id": "tool0",
-    "target_role_id": "arm.left",
+    "component_id": "arm.left",
     "retryable": False,
 }
 _OWNER_REFUSAL_MESSAGE = (
     "addressed observed state is unavailable (observed_state_unavailable; "
-    "reference frame 'tool0' of target role 'arm.left')"
+    "reference component_frame 'tool0' of component 'arm.left')"
 )
 
 
@@ -4873,7 +4864,7 @@ def _pausing_move(admission: ProgramRunAdmission) -> ProgramRunAdmission:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     program = Program.from_dict(document, admission.environment.catalog)
     return _admission_for_program(
@@ -4902,11 +4893,11 @@ def test_input_failure_reaches_status_diagnostic_and_offer_exactly() -> None:
     }
     origin = {"kind": "program_node", "node_instance_id": "wait", "owner_api": None}
     status = paused.to_dict()
-    assert status["schema_version"] == "manyforge.program_run_status.v3"
+    assert status["schema_version"] == "manyforge.program_run_status.v4"
     assert status["reason_code"] == "node_input_unavailable"
     assert (status["details"], status["origin"]) == (details, origin)
     diagnostic = owner.take_diagnostic(run_id)
-    assert diagnostic["schema_version"] == "manyforge.program_diagnostic.v3"
+    assert diagnostic["schema_version"] == "manyforge.program_diagnostic.v4"
     assert diagnostic["reason_code"] == "node_input_unavailable"
     assert diagnostic["message"] == status["message"]
     assert (diagnostic["details"], diagnostic["origin"]) == (details, origin)
@@ -5059,17 +5050,10 @@ def test_run_status_refuses_unbounded_or_orphan_failure_fields() -> None:
 
 def _program_dwell_admission(admission, policy="hold"):
     document = admission.program.to_dict()
-    document["target_roles"]["gripper"] = {
-        "component_role": "robot",
-        "required_capabilities": [
-            {"capability_id": capability, "parameters": {}, "disposition": "required"}
-            for capability in ("tool.gripper.command", "tool.gripper.feedback")
-        ],
-    }
     document["tree"] = {"node_id":"gripper.command_position","instance_id":"command",
-        "parameters":{"target_role":"gripper","position":{"kind":"linear_m","value_m":0.008}},"operator_stop_policy":policy,"children":[]}
+        "parameters":{"target":{"component_id":"tool.1","command_target_id":"gripper.command"},"position":{"kind":"linear_m","value_m":0.008}},"operator_stop_policy":policy,"children":[]}
     document["program_revision"] = compute_content_identity(document,own_field="program_revision",
-        identity_domain="program-revision",api_version="manyforge.program.v2")
+        identity_domain="program-revision",api_version="manyforge.program.v3")
     program = Program.from_dict(document,admission.environment.catalog)
     return _admission_for_program(admission,program,[row.to_dict() for row in program_node_policies(program)])
 
@@ -5323,7 +5307,7 @@ def test_f6a_program_requested_stop_runs_the_fallback_recovery_motion() -> None:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     admission = _admission_for_program(
         admission, Program.from_dict(document, admission.environment.catalog), []
@@ -5416,7 +5400,7 @@ def test_run_stopped_during_an_automatic_retry_wait_leaves_nothing_resident() ->
     assert stopped.state is ProgramRunState.STOPPED
 
 
-# --- R5: per-node failure holds, Stop scope, Continue, operation failures ---
+# --- Per-node failure holds, Stop scope, Continue, operation failures ---
 
 _OPERATION_FACT = {
     "operation": {"source_owner_epoch": "kernel.epoch.1", "operation_id": "op", "operation_revision": 2},
@@ -5488,7 +5472,7 @@ def _two_group_holds(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     program = Program.from_dict(document, admission.environment.catalog)
     rows = [row.to_dict() for row in program_node_policies(program)]
@@ -5585,7 +5569,7 @@ def test_own_groups_scope_stops_and_releases_only_the_held_nodes_groups() -> Non
 
 def _release_for(held: str, others: Sequence[str], *, scope: str = "all"):
     """`_failure_hold_release` over named groups arm/tools/spare; `free` is
-    the node in no named group (contract item 43)."""
+    the node in no named group."""
     groups = {"arm_move": ("arm",), "tool_move": ("tools",), "free_move": ("all",)}
     policy = SimpleNamespace(recovery_policy={"intervention_stop_scope": scope})
     run = SimpleNamespace(
@@ -5639,7 +5623,7 @@ def test_a_hold_in_no_named_group_releases_only_its_own_node(operation) -> None:
             reason=None,
         )
     # arm_move's hold owns arm (the only named group): free_move releases
-    # itself by node_instance_id (SX-2020), never another hold's group.
+    # itself by node_instance_id, never another hold's group.
     assert scope.release_requests == releases + 1
     assert scope.last_selection_release["group_ids"] == []
     assert scope.last_selection_release["node_instance_id"] == "free_move"
@@ -5738,7 +5722,7 @@ def test_a_run_without_operation_failures_publishes_an_empty_list() -> None:
 
 
 def test_the_run_end_says_why_the_run_ended() -> None:
-    """CONTRACTS §9 `ProgramRunEnd`: a failure that reaches the root ends the
+    """`ProgramRunEnd`: a failure that reaches the root ends the
     run `failed` (never "finished"), naming the node and its error; a
     succeeded root is `completed`; a running run has no end yet."""
 
@@ -5766,7 +5750,7 @@ def test_the_run_end_says_why_the_run_ended() -> None:
 
 
 def test_a_rule_hold_in_the_kernel_scope_reaches_the_run_snapshot() -> None:
-    """AUD-6: the run reads the scope's stopped_by: rule; a run the operator
+    """The run reads the scope's stopped_by: rule; a run the operator
     then ends names the rule. Resume (scope without it) clears it."""
 
     owner, admission, _task, scope, _events = _fixture(initial_task_state=OwnerTaskState.ACTIVE)
@@ -5788,7 +5772,7 @@ def test_a_rule_hold_in_the_kernel_scope_reaches_the_run_snapshot() -> None:
             None,
             {"stopped_by": "rule", "rule_id": "door"},
         ),
-        # AUD-6: a rule's `hold` held the run with nothing moving (the Kernel
+        # A rule's `hold` held the run with nothing moving (the Kernel
         # scope's stopped_by: rule), then the operator ended it.
         ((), "door", {"stopped_by": "rule", "rule_id": "door"}),
     ],
@@ -5803,7 +5787,7 @@ def test_a_stopped_run_names_who_stopped_it(facts, held_by_rule, expected) -> No
 
 
 class _MockRunRecorder:
-    """Decision 135: the Run-wide Mock pause notifications the owner sends."""
+    """The Run-wide Mock pause notifications the owner sends."""
 
     def __init__(self, events: list[str] | None = None) -> None:
         self.calls: list[tuple[Any, ...]] = []
@@ -5853,7 +5837,7 @@ def test_mock_run_pause_follows_run_start_halt_and_resume_but_not_teardown():
 
 
 def test_a_run_without_a_mock_port_runs_through_halt_resume_and_stop():
-    """SX-2416: no Mock nodes, no Mock port, no I/O service: no Mock call."""
+    """No Mock nodes, no Mock port, no I/O service: no Mock call."""
     owner, admission, _task, scope, _events = _fixture(
         initial_task_state=OwnerTaskState.ACTIVE
     )
@@ -5871,7 +5855,7 @@ def test_a_run_without_a_mock_port_runs_through_halt_resume_and_stop():
 
 
 def test_an_unconfirmed_mock_end_holds_the_run_short_of_terminal_until_unbind_succeeds():
-    """SX-2433/2434: the native unbind fails while a Mock END is unanswered.
+    """The native unbind fails while a Mock END is unanswered.
     The Run stays FINALIZING (not terminal: no terminal record, readiness or
     claim release can follow), and the finalizing tick re-enters unbind."""
     from manyforge_behavior.production_ports import ProductionPortError

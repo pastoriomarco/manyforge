@@ -1,5 +1,5 @@
 """Program pneumatic sequence: valve writes through the one write path
-(CONTRACTS §7), then the ordinary watch, read and operation ports."""
+then the ordinary watch, read and operation ports."""
 
 from types import SimpleNamespace
 
@@ -162,7 +162,7 @@ def test_input_wait_zero_has_no_deadline_positive_expires(dwell):
 
 @pytest.mark.parametrize("result,code", [
     # failed and unknown write results, and an admission refusal, all carry
-    # the host's code (CONTRACTS §7).
+    # the host's code.
     (OwnerInvocationResult(False, reason_code="io_output_write_failed", message="refused"),
      "io_output_write_failed"),
     (OwnerInvocationResult(False, reason_code="io_output_acceptance_unknown", message="unknown"),

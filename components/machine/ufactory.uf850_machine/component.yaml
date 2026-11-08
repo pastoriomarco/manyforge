@@ -11,7 +11,7 @@ title: UFACTORY UF850 (controller, arm, control-box I/O, tool I/O)
 license: BSD-3-Clause
 provenance:
   source: https://github.com/pastoriomarco/xarm_ros2
-  notes: XARM_CONTROLLER_FACTS (manyforge_specs)
+  notes: recorded UFACTORY controller facts
 default_owner_id: uf850             # the owner's id when added; members <owner_id>_<role>
 members:
   - {role: arm, model: ufactory.uf850}

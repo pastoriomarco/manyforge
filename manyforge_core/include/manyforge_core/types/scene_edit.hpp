@@ -9,14 +9,14 @@
 
 namespace manyforge::core {
 
-/// Box shape (spec §3.9)
+/// Box shape
 struct BoxShapeDTO {
   Vector3DTO dimensions_m;  // full dimensions, matching URDF/ROS conventions
 
   friend bool operator==(const BoxShapeDTO&, const BoxShapeDTO&) = default;
 };
 
-/// Sphere shape (spec §3.9)
+/// Sphere shape
 struct SphereShapeDTO {
   double radius_m;  // > 0
 
@@ -24,7 +24,7 @@ struct SphereShapeDTO {
       default;
 };
 
-/// Cylinder shape (spec §3.9)
+/// Cylinder shape
 struct CylinderShapeDTO {
   double radius_m;   // > 0
   double height_m;   // > 0
@@ -33,7 +33,7 @@ struct CylinderShapeDTO {
       default;
 };
 
-/// Mesh shape (spec §3.9)
+/// Mesh shape
 struct MeshShapeDTO {
   std::string resource_uri;
   Vector3DTO scale;  // default {1,1,1}
@@ -41,7 +41,7 @@ struct MeshShapeDTO {
   friend bool operator==(const MeshShapeDTO&, const MeshShapeDTO&) = default;
 };
 
-/// Collision shape as a tagged union (spec §3.9)
+/// Collision shape as a tagged union
 using CollisionShapeDTO = std::variant<BoxShapeDTO, SphereShapeDTO, CylinderShapeDTO, MeshShapeDTO>;
 
 /// Declared support contact for an authored scene object.

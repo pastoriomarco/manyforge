@@ -1,19 +1,17 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Mock Lite6 signal moves: search_trip scripts probe_contact false then true after 1000 ms -> signal_trip/success; search_no_trip scripts edge_sensor false with no change and completes without trip -> no_signal_trip (default success); probe_no_trip descends slowly (TCP up to 10 mm/s, endpoint gripper/tcp) to a requested goal 1 mm past the probe_block top, so the fingertips touch the block; probe_contact_policy allows contact only for the endpoint bodies against probe_block in the last 20% of the motion (up to 2 mm); it scripts edge_sensor false with no change and completes without a trip (on_no_signal success) -> no_signal_trip. end_rest withdraws from the probe_block contact under withdrawal_contact_policy (same endpoint/block pair, 2 mm initial cap, decreasing penetration, separation required, no recontact). The node_outcome keys are checked.",
   "members": {
-    "assignment.yaml": "sha256:de588e86970c3ca6ab42824aa3916549c34064dbf1c4c97ba3fe06984a28d6a0",
     "deployment.yaml": "sha256:cc8b34714357931af21fe57d1b4cef628c30435cd85cd47b841b51a3dbac28ae",
-    "program.yaml": "sha256:f8ef49a816561eb15f2c6b888c364164f49da3afa79865499da3d94ad92f7a20"
+    "program.yaml": "sha256:4ba2386c9d0303f32f778f9af44c3816089802a0a90001247242b4a9099528b2"
   },
   "name": "mock_lite6_signal_moves",
   "saved_status": {
-    "checked_content_digest": "sha256:3b9f46223d50a9c7d87271c57f0392fe901e29dedef12487eb792f8338f23b2c",
+    "checked_content_digest": "sha256:ee0952103da94462f4d612afbb0b23df6d359c7f42106d9a91eafa0c528c4e12",
     "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },

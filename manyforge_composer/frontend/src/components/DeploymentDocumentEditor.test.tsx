@@ -45,6 +45,8 @@ function controller(): DeploymentWorkspaceController {
       savedScenarioCandidates: [],
       unavailableReasons: [],
     },
+    deploymentDraftInputResetEpoch: 0,
+    scenarioDraftInputResetEpoch: 0,
     loading: false,
     busy: false,
     applying: false,
@@ -98,9 +100,10 @@ const settledProgram = {
 } as unknown as ProgramWorkspaceController;
 const runtime = { state: { currentScenario: null } } as unknown as ProgramRuntimeController;
 
-function scenarioActions(deployment: DeploymentWorkspaceController) {
+function scenarioActions(deployment: DeploymentWorkspaceController, authoringAdmissionAllowed?: boolean | null) {
   return renderToStaticMarkup(
-    <ScenarioActionControls program={settledProgram} deployment={deployment} runtime={runtime} />,
+    <ScenarioActionControls program={settledProgram} deployment={deployment} runtime={runtime}
+      authoringAdmissionAllowed={authoringAdmissionAllowed} />,
   );
 }
 
@@ -191,7 +194,57 @@ describe('DeploymentDocumentEditor', () => {
     );
   });
 
-  it('shows the Preview\'s per-component impact in the Apply confirmation (CONTRACTS §11)', () => {
+  it('gates Scenario Apply and Revert on false admission, including open confirmations', () => {
+    const pendingDeployment = () => {
+      const value = controller();
+      if (value.workspace === null) throw new Error('Deployment workspace fixture missing');
+      value.workspace = {
+        ...value.workspace,
+        draft: { ...value.workspace.draft, deploymentRevision: `sha256:${'2'.repeat(64)}`, differsFromSaved: true },
+        saved: { ...value.workspace.saved, deploymentRevision: `sha256:${'0'.repeat(64)}` },
+        managerApplied: { ...value.workspace.managerApplied, deploymentRevision: `sha256:${'1'.repeat(64)}`, scenarioId: 'cell-a' },
+      };
+      return value;
+    };
+    const ready = renderToStaticMarkup(
+      <ScenarioActionControls program={settledProgram} deployment={pendingDeployment()} runtime={runtime}
+        authoringAdmissionAllowed={true} />,
+    );
+    expect(ready).toContain('title="Restore Draft and Applied to Saved: the Deployment and the Program."');
+    expect(ready).toContain('title="Apply the Deployment and the Program."');
+    expect(ready).toContain('title="Discard unapplied Draft changes and return to Applied."');
+
+    const blockedDeployment = pendingDeployment();
+    blockedDeployment.applyConfirmationOpen = true;
+    blockedDeployment.applyPreview = applyPreviewFixture([
+      { component_id: 'lite6_robot', disposition: 'replace', reasons: ['mount'], restarts: true },
+    ]);
+    const blocked = renderToStaticMarkup(
+      <ScenarioActionControls program={settledProgram} deployment={blockedDeployment} runtime={runtime}
+        authoringAdmissionAllowed={false} />,
+    );
+    const tooltip = 'The cell is finishing a background step; this is available again in a moment.';
+    expect(blocked).toContain(`<button type="button" disabled="" title="${tooltip}">Revert</button>`);
+    expect(blocked).toContain(`<button type="button" class="primary-action" disabled="" title="${tooltip}">Apply</button>`);
+    expect(blocked).toContain('title="Discard unapplied Draft changes and return to Applied."');
+    expect(blocked).toContain(`<button type="button" class="primary-action" disabled="" title="${tooltip}">Confirm apply</button>`);
+    expect(blocked).toContain(tooltip);
+
+    const blockedRevert = pendingDeployment();
+    blockedRevert.applyConfirmationOpen = true;
+    blockedRevert.applyPreviewKind = 'revert';
+    blockedRevert.applyPreview = applyPreviewFixture([
+      { component_id: 'lite6_robot', disposition: 'retain', reasons: [], restarts: false },
+    ]);
+    const blockedRevertMarkup = renderToStaticMarkup(
+      <ScenarioActionControls program={settledProgram} deployment={blockedRevert} runtime={runtime}
+        authoringAdmissionAllowed={false} />,
+    );
+    expect(blockedRevertMarkup).toContain('Revert Deployment to saved?');
+    expect(blockedRevertMarkup).toContain(`<button type="button" class="primary-action" disabled="" title="${tooltip}">Confirm revert</button>`);
+  });
+
+  it('shows the Preview\'s per-component impact in the Apply confirmation', () => {
     const previewed = controller();
     previewed.applyConfirmationOpen = true;
     previewed.applyPreview = applyPreviewFixture([
@@ -207,7 +260,7 @@ describe('DeploymentDocumentEditor', () => {
     expect(markup).not.toContain('Deactivate');
   });
 
-  it('offers Reset run and Apply when a stopped or held run blocks the Deployment Apply (AUD-4)', () => {
+  it('offers Reset run and Apply when a stopped or held run blocks the Deployment Apply', () => {
     const previewed = controller();
     previewed.applyConfirmationOpen = true;
     previewed.applyPreview = applyPreviewFixture([
@@ -230,20 +283,21 @@ describe('DeploymentDocumentEditor', () => {
     expect(finished).toContain('Confirm apply');
   });
 
-  it('confirms a Deployment Revert through its Preview, with the Program warning (CONTRACTS §11)', () => {
+  it('confirms a Deployment Revert through its Preview, with the Program warning', () => {
     const previewed = controller();
     previewed.applyConfirmationOpen = true;
     previewed.applyPreviewKind = 'revert';
     previewed.applyPreview = applyPreviewFixture([
       { component_id: 'lite6_robot', disposition: 'remove', reasons: [], restarts: false },
     ], { program: { executable: false, program_id: 'pick', unresolved_references: [{
-      component_role_id: 'arm', target_role_id: null, controllable_component_id: 'lite6_robot',
-      command_target_id: null, reason: 'component_removed', detail: '' }],
+      target: { component_id: 'lite6_robot', command_target_id: 'arm' },
+      reason: 'component_missing', detail: '' }],
     affected_nodes: [], affected_execution_groups: [] } });
     const markup = scenarioActions(previewed);
     expect(markup).toContain('Revert Deployment to saved?');
     expect(markup).toContain('Removes lite6_robot.');
     expect(markup).toContain('will not be executable after this Apply');
+    expect(markup).toContain('<code>lite6_robot/arm</code>: the component is not in the Deployment');
     expect(markup).toContain('Confirm revert');
   });
 

@@ -411,6 +411,8 @@ if(BUILD_TESTING)
 
   add_executable(test_manager_runtime_convergence_coordinator
     test/test_manager_runtime_convergence_coordinator.cpp)
+  target_include_directories(test_manager_runtime_convergence_coordinator PRIVATE
+    "${MANYFORGE_CORE_INCLUDE_DIR}/../test_support/include")
   # The native-host continuity regression uses a real retained Lite6 product.
   # Prepare its model through the same importer as Deployment/RoboPlan tests.
   find_package(Python3 REQUIRED COMPONENTS Interpreter)

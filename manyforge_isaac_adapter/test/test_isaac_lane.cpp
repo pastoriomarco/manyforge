@@ -74,7 +74,7 @@ TEST(IsaacLaunchContribution, IsTheTopicBasedHardwareAndTheControllersTemplate) 
   EXPECT_FALSE(contribution.command_echo_topic.has_value());
 }
 
-// RP-1b: an Isaac arm declares `reset_position` with Mock's stock writer;
+// An Isaac arm declares `reset_position` with Mock's stock writer;
 // its write is acknowledged on the hardware's joint commands topic.
 TEST(IsaacLaunchContribution, AnArmCarriesTheResetPositionWriter) {
   roboplan_backend::ModelLaneRow row;

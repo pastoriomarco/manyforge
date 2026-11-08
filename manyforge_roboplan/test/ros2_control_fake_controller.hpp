@@ -415,7 +415,7 @@ public:
           }
           response->ok = true;
         });
-    // R7 package 4: a Real arm's hardware is (de)activated by name.
+    // A Real arm's hardware is (de)activated by name.
     hardware_state_ = node()->create_service<
         controller_manager_msgs::srv::SetHardwareComponentState>(
         manager + "/set_hardware_component_state",
@@ -505,7 +505,7 @@ public:
     Publish();
   }
 
-  /// R7 package 4: list the joint state broadcaster in the activity (absent
+  /// List the joint state broadcaster in the activity (absent
   /// unless set, as for the Mock tests).
   void SetBroadcasterActive(bool active) {
     broadcaster_listed_ = true;
@@ -522,7 +522,7 @@ public:
 
   void SetHardwareRefused(bool refused) { hardware_refused_ = refused; }
 
-  /// M6 XADAPT: the stock manager's state queries (served from the start).
+  /// The stock manager's state queries (served from the start).
   void ServeListServices() {
     // Their own group: a held switch reply does not hold the state queries.
     if (!list_group_)
@@ -563,7 +563,7 @@ public:
             },
             rclcpp::ServicesQoS(), list_group_);
   }
-  /// M6 XADAPT: the state queries are gone (not discovered).
+  /// The state queries are gone (not discovered).
   void DropListServices() {
     list_controllers_.reset();
     list_hardware_.reset();
@@ -571,7 +571,7 @@ public:
     // wake it so they are destroyed (and leave the graph) now.
     node()->get_node_base_interface()->trigger_notify_guard_condition();
   }
-  /// M6 XADAPT: a received state query is not answered until released (a
+  /// A received state query is not answered until released (a
   /// manager alive but unresponsive).
   void SetListRepliesPaused(bool paused) {
     {

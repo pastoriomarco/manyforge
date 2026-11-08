@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -62,11 +63,11 @@ struct XArmArmAdapterPorts final {
   /// the vendor plugin arms the robot (`clean_error`, `clean_warn`,
   /// `motion_enable`, `set_mode(1)`, `set_state(0)`), and the joint state
   /// broadcaster is switched on with it; on deactivation it selects position
-  /// mode (XARM_CONTROLLER_FACTS, "Arming sequence").
+  /// mode.
   std::function<core::ActionResult(bool active, std::stop_token)> hardware;
   /// The controller manager reports the arm's hardware component active.
   std::function<bool()> hardware_active;
-  /// Between reads of a wait (production: 20 ms, as M7).
+  /// Between reads of a wait (production: 20 ms).
   std::function<void()> pause;
   /// The joint state broadcaster's latest fresh positions in axis order
   /// (the lane's measured joints); none without a fresh sample.
@@ -75,18 +76,21 @@ struct XArmArmAdapterPorts final {
   /// The controller manager's latest activity shows the joint state
   /// broadcaster active (none: not checked).
   std::function<bool()> broadcaster_active{};
+  /// The observed controller-manager activity explicitly shows both the
+  /// trajectory controller and broadcaster loaded and inactive.
+  std::function<bool()> controllers_inactive{};
 };
 
-/// The arm member of an xArm machine (CONTRACTS §16; xArm 5/6/7, Lite 6,
+/// The arm member of an xArm machine (xArm 5/6/7, Lite 6,
 /// UF850). It runs around the ros2_control lane adapter and reads the
 /// controller's report through its owner; the controller's error register,
 /// `clean_error` and the power actions are the owner's.
 ///
-/// XPW-1: the motors are switched on only by Enable.
+/// The motors are switched on only by Enable.
 /// - `prepare` / `recover`: the lane's prepare / recover (the arm controller
 ///   loaded and off), then the hardware off (already off on a fresh
 ///   process), then a fresh status report within the lifecycle timeout. The
-///   owner, prepared first (CONTRACTS §16), connected the driver and cleared
+///   owner, prepared first, connected the driver and cleared
 ///   the controller's error and warning; nothing calls `motion_enable`.
 ///   While prepared the driver's own joint topic is the measured stream
 ///   (`JointSampleUse`).
@@ -95,7 +99,7 @@ struct XArmArmAdapterPorts final {
 ///   (the plugin's arming sequence, with the joint state broadcaster), then
 ///   joint states stamped after it; then the Enable gate, then the lane's
 ///   enable.
-/// - `disable`: the lane's disable, then the hardware off (as M7).
+/// - `disable`: the lane's disable, then the hardware off.
 ///
 /// State: the lane's; with the hardware off after its own Prepare, Recover
 /// or Disable it is `prepared` (Enable arms), and all motors off
@@ -120,17 +124,21 @@ class XArmArmAdapter final : public core::IComponentAdapter {
 public:
   XArmArmAdapter(XArmArmAdapterConfig config, XArmArmAdapterPorts ports);
 
+  /// Record an owner-reported emergency stop only while this arm is armed.
+  void ObserveOwnerEstop() const;
+  /// The installed transport owner was replaced; prior presentation is stale.
+  void ForgetOwnerEstop() noexcept;
+
   [[nodiscard]] core::ComponentState State(std::int64_t now_ns) const override;
   [[nodiscard]] core::ActionResult Run(core::ComponentAction action,
                                        std::stop_token stop) override;
   [[nodiscard]] std::vector<core::Capability> capabilities() const override;
 
-  /// The vendor joint-sample gate (XARM_CONTROLLER_FACTS, "The vendor joint
-  /// topic").
+  /// The vendor joint-sample gate.
   [[nodiscard]] XArmJointSampleUse JointSampleUse(std::int64_t now_ns,
                                                   const std::vector<double> &positions) const;
 
-  /// M7's rule: while ManyForge has the arm armed, outside its own
+  /// The rule: while ManyForge has the arm armed, outside its own
   /// operations and once the last one settled (`kXArmOwnOperationSettleNs`),
   /// a fresh error-free report out of joint-servo mode or out of the moving
   /// and ready states (paused 3, stopped 4, not ready 5, stop requested 6) is
@@ -143,7 +151,7 @@ public:
   /// longer counted armed; its next Enable re-arms it.
   void ReleaseExternalControl(std::int64_t now_ns);
 
-  /// Active TCP (M7, event driven): the TCP offset (with the re-arm the
+  /// Active TCP (event driven): the TCP offset (with the re-arm the
   /// controller needs after it and the post-send check) and the total
   /// payload; see `XArmToolContextSender`. True when an offset was sent and
   /// the robot re-armed. The offset's own state 5 is never external control.
@@ -184,6 +192,9 @@ private:
   /// waiting at most one freshness window) that accepts commands, and every
   /// measured joint within the tolerance of the reported angle. A trajectory
   /// controller activated on stale or zero joints would drive there.
+  /// Enable's typed refusal when an e-stop error (C1-C3) stays after its
+  /// activation cleared: the e-stop is still pressed.
+  [[nodiscard]] std::optional<core::ActionResult> EstopStillActive() const;
   [[nodiscard]] std::optional<core::ActionResult> CheckEnableGate(
       std::optional<std::int64_t> since_ns, std::stop_token stop);
   /// The lane's action, reported as `action`; a successful enable arms the
@@ -210,6 +221,7 @@ private:
   /// enable; cleared by prepare, recover, disable, a controller error or the
   /// owner's release).
   mutable bool armed_{false};
+  mutable std::atomic<bool> stopped_by_estop_{false};
   /// Its own Prepare, Recover or Disable left the hardware off (cleared by
   /// Enable's arming, and when the lane reports its process offline or
   /// exited: a fresh process starts not prepared).

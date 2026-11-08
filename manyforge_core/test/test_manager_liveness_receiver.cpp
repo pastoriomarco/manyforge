@@ -150,6 +150,45 @@ ManagerLivenessReconciliationAck Ack(
           Digest('c')};
 }
 
+TEST(ManagerLivenessReceiver, ObservationMayDetachReentrantly) {
+  class DetachingObservations final : public IManagerLivenessObservationPort {
+   public:
+    ManagerLivenessReceiver* receiver{};
+    bool detached{};
+    Result<void> Publish(const ManagerLivenessObservationDTO&) override {
+      if (receiver) detached = receiver->DetachSchedulerUntil(
+          std::chrono::steady_clock::now() + std::chrono::seconds(1));
+      return Result<void>::Ok();
+    }
+  } observations;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FailSafes fail_safe;
+  ManagerLivenessReceiver receiver(Config(), clock, scheduler,
+                                    [] { return Digest('b'); },
+                                    fail_safe, observations);
+  observations.receiver = &receiver;
+  ASSERT_TRUE(receiver.Renew(Heartbeat()).ok());
+  EXPECT_TRUE(observations.detached);
+}
+
+TEST(ManagerLivenessReceiver, DetachedReceiverMayOutliveSchedulerAndClock) {
+  auto clock = std::make_unique<FakeClock>();
+  auto scheduler = std::make_unique<ManualScheduler>();
+  Observations observations;
+  FailSafes fail_safe;
+  auto receiver = std::make_unique<ManagerLivenessReceiver>(
+      Config(), *clock, *scheduler, [] { return Digest('b'); },
+      fail_safe, observations);
+  ASSERT_TRUE(receiver->Renew(Heartbeat()).ok());
+  receiver->DetachScheduler();
+  scheduler.reset();
+  clock.reset();
+  EXPECT_FALSE(receiver->Renew(Heartbeat(2U)).ok());
+  EXPECT_NO_THROW(static_cast<void>(receiver->observation()));
+  EXPECT_NO_THROW(receiver.reset());
+}
+
 TEST(ManagerLivenessReceiver, StrictRenewalAndExactDeadlineAreLocalAndLatched) {
   FakeClock clock;
   ManualScheduler scheduler;

@@ -82,11 +82,6 @@ the row for the full payload. Filter with `event_types=component_action_finished
 or `components=<component id>`. These events share the History's existing
 retention limits.
 
-### What is **not** a runtime log
-
-- `verification/` — qualification fixtures used by the
-  `scripts/qualification/` entrypoints, not runtime output.
-
 ## Observability REST endpoints
 
 All paths are HTTP routes on the Composer API, `http://127.0.0.1:9020` in the

@@ -529,9 +529,9 @@ template <typename ProviderPath>
 
 [[nodiscard]] Result<void> validate_budget(const ResolvedParticipantStopStageDTO& stage,
                                            const RemainingStopBudgetDTO& budget) {
-  // Q51: only this robot's own Stop-time values; a controlled deadline only
-  // for a controlled-Stop command (hard stages are bounded by the lane, Q57;
-  // gripper cancels are fire-and-forget, Q58).
+  // Only this robot's own Stop-time values; a controlled deadline only
+  // for a controlled-Stop command (hard stages are bounded by the lane;
+  // gripper cancels are fire-and-forget).
   const auto* command = selected_command(stage);
   if (command == nullptr || budget.stop_id != stage.stop_id ||
       budget.stop_generation != stage.stop_generation || budget.elapsed_since_stop_ns < 0 ||

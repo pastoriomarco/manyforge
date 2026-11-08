@@ -7,6 +7,7 @@
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
 #include <memory>
+#include <chrono>
 
 namespace manyforge::core {
 
@@ -51,6 +52,9 @@ class ManagerLivenessReceiver final : public IManagerHeartbeatSink {
                           IManagerLivenessFailSafePort& fail_safe_port,
                           IManagerLivenessObservationPort& observation_port);
   ~ManagerLivenessReceiver();
+  /// Retire the watchdog before its borrowed scheduler and clock are destroyed.
+  void DetachScheduler() noexcept;
+  [[nodiscard]] bool DetachSchedulerUntil(std::chrono::steady_clock::time_point deadline) noexcept;
 
   ManagerLivenessReceiver(const ManagerLivenessReceiver&) = delete;
   ManagerLivenessReceiver& operator=(const ManagerLivenessReceiver&) = delete;

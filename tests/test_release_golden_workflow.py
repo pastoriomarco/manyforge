@@ -11,12 +11,7 @@ import pytest
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_TOOL_PATH = (
-    _REPO_ROOT
-    / "scripts"
-    / "qualification"
-    / "review_canonical_empty_release_golden.py"
-)
+_TOOL_PATH = _REPO_ROOT / "scripts" / "review_canonical_empty_release_golden.py"
 _SPEC = importlib.util.spec_from_file_location("release_golden_workflow", _TOOL_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 workflow = importlib.util.module_from_spec(_SPEC)

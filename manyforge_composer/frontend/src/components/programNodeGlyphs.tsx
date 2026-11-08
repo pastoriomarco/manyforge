@@ -1,7 +1,7 @@
 import { Fragment, type ReactNode } from 'react';
 import { programCategoryFamily } from '../styles/tokens';
 
-// UI6-I-VC D3 Program node glyphs. Reference drawings and the fitting rule:
+// Program node glyphs. Reference drawings and the fitting rule:
 // frontend/design/program-node-design.html. Each category icon is drawn on a
 // 16-unit grid; its transform (precomputed from the drawing's bounding box)
 // scales and centres it so its longer side fills 12 units, so every icon is

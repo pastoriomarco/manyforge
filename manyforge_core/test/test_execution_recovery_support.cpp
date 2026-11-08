@@ -691,6 +691,41 @@ TEST(RecoveryAssessmentTest, GeneralCloseUsesTerminalEffectAndCleanupRatherThanR
   }
 }
 
+TEST(RecoveryAssessmentTest, OwnerRebuildRestPermitsOnlyUncertainExactExecutionClosure) {
+  RecoveryAuthorityCapture capture;
+  capture.execution_id = 17U;
+  capture.execution_state = ExecutionState::kInterventionRequired;
+  capture.terminal_effect = ParticipantEffectKnowledge::kEffectUncertain;
+  capture.terminal_cleanup_complete = true;
+  capture.observed_state_qualified = true;
+  EXPECT_FALSE(build_recovery_assessment(capture, 0U).eligible_close);
+
+  capture.owner_rebuild_pending = true;
+  capture.observed_state_qualified = false;
+  auto pending = build_recovery_assessment(capture, 0U);
+  EXPECT_EQ(pending.reason_code, kOwnerRebuildObservationPending);
+  EXPECT_FALSE(pending.eligible_close);
+
+  capture.observed_state_qualified = true;
+  capture.owner_rebuild_rest_qualified = true;
+  const auto ready = build_recovery_assessment(capture, 0U);
+  EXPECT_EQ(ready.reason_code, kOwnerRebuildObservedAtRest);
+  EXPECT_TRUE(ready.eligible_close);
+  EXPECT_EQ(ready.execution_state, ExecutionState::kInterventionRequired);
+  capture.observed_state_qualified = false;
+  EXPECT_TRUE(build_recovery_assessment(capture, ready.assessment_revision).eligible_close);
+  auto request = make_bound_request(ready);
+  request.action = RecoveryAction::kCloseOperation;
+  EXPECT_TRUE(evaluate_recovery_admission(request, capture, ready).admitted);
+  ++request.expected_execution_id;
+  EXPECT_FALSE(evaluate_recovery_admission(request, capture, ready).admitted);
+  capture.operator_stop_active = true;
+  EXPECT_FALSE(build_recovery_assessment(capture, 0U).eligible_close);
+  capture.operator_stop_active = false;
+  capture.terminal_cleanup_complete = false;
+  EXPECT_FALSE(build_recovery_assessment(capture, 0U).eligible_close);
+}
+
 TEST(RecoveryAssessmentTest, GeneralCloseWaitsForCleanupAndRetainsEveryAuthorityFence) {
   RecoveryAuthorityCapture capture;
   capture.execution_id = 19U;

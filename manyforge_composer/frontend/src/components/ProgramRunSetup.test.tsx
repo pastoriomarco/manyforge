@@ -6,10 +6,10 @@ import type { DirectControlMotionStatus } from '../types/robotControl';
 import { parseProgramRunAdmittedSpeeds } from '../api/parsers';
 import { ProgramRunSetup } from './ProgramRunSetup';
 
-const motion = (id: string, role: string) => ({
+const motion = (id: string, component: string, commandTarget = 'arm') => ({
   node_id: 'motion.move_to_joint_target',
   instance_id: id,
-  parameters: { target_role: role },
+  parameters: { target: { component_id: component, command_target_id: commandTarget } },
   value_sources: {
     max_tcp_linear_speed_mps: { kind: 'program_parameter', reference: 'max_tcp_linear_speed_mps' },
   },
@@ -24,14 +24,13 @@ const applied = {
     parameters: [{ parameter_id: 'max_tcp_linear_speed_mps', type: 'float64', default: 0.15 }],
     tree: {
       node_id: 'parallel', instance_id: 'root', parameters: {},
-      children: [motion('a', 'lite6_arm'), motion('b', 'ur5e_arm')],
+      children: [motion('a', 'lite6_robot'), motion('b', 'ur5e_robot')],
     },
   },
   programBinding: {
-    // Exact rows; the generic component role alone cannot tell robots apart.
-    target_role_bindings: [
-      { target_role_id: 'lite6_arm', component_role_id: 'controlled_component', controllable_component_id: 'lite6_robot', command_target_id: 'arm' },
-      { target_role_id: 'ur5e_arm', component_role_id: 'controlled_component', controllable_component_id: 'ur5e_robot', command_target_id: 'arm' },
+    target_bindings: [
+      { target: { component_id: 'lite6_robot', command_target_id: 'arm' } },
+      { target: { component_id: 'ur5e_robot', command_target_id: 'arm' } },
     ],
   },
 } as unknown as AppliedProgramSelection;
@@ -39,8 +38,6 @@ const applied = {
 const target = (component: string, maximum: number, commandTarget = 'arm') => ({
   controllableComponentId: component,
   commandTargetId: commandTarget,
-  componentRoleId: 'controlled_component',
-  targetRoleId: 'command_target',
   targetDescriptor: { operationalLimit: { maximumTcpLinearSpeedMps: maximum } },
 }) as unknown as DirectControlMotionStatus;
 
@@ -54,7 +51,8 @@ describe('ProgramRunSetup', () => {
         admitted={{ kind: 'no_run' }}
       />,
     );
-    expect(markup).toContain('<h6>lite6_arm<span class="program-run-setup-component">lite6_robot</span></h6>');
+    expect(markup).toContain('<h6>lite6_robot<span class="program-run-setup-component">arm</span></h6>');
+    expect(markup).toContain('<h6>ur5e_robot<span class="program-run-setup-component">arm</span></h6>');
     expect(markup).toContain('<span class="program-run-setup-stat-label">Deployment max</span><span class="program-run-setup-stat-value">0.25 m/s</span><span class="program-run-setup-stat-note">TCP speed limit</span>');
     expect(markup).toContain('<div class="program-run-setup-stat" title="No Program run, so no motion has been admitted.">');
     expect(markup).toContain('<span class="program-run-setup-stat-label">Program request</span><span class="program-run-setup-stat-value">0.15 m/s</span><span class="program-run-setup-stat-note">default of max_tcp_linear_speed_mps</span>');
@@ -62,12 +60,20 @@ describe('ProgramRunSetup', () => {
   });
 
   it('matches exact command targets, not just the component', () => {
+    // Both targets share one component; only the exact command target tells them apart.
+    const right = { ...motion('b', 'cell', 'right'), parameters: {
+      target: { component_id: 'cell', command_target_id: 'right' }, max_tcp_linear_speed_mps: 0.2,
+    }, value_sources: {} };
     const twoTargets = {
       ...applied,
+      program: {
+        ...applied.program,
+        tree: { ...applied.program.tree, children: [motion('a', 'cell', 'left'), right] },
+      },
       programBinding: {
-        target_role_bindings: [
-          { target_role_id: 'lite6_arm', component_role_id: 'controlled_component', controllable_component_id: 'cell', command_target_id: 'left' },
-          { target_role_id: 'ur5e_arm', component_role_id: 'controlled_component', controllable_component_id: 'cell', command_target_id: 'right' },
+        target_bindings: [
+          { target: { component_id: 'cell', command_target_id: 'left' } },
+          { target: { component_id: 'cell', command_target_id: 'right' } },
         ],
       },
     } as unknown as AppliedProgramSelection;
@@ -79,8 +85,13 @@ describe('ProgramRunSetup', () => {
         admitted={{ kind: 'loading' }}
       />,
     );
-    expect(markup).toContain('<h6>lite6_arm<span class="program-run-setup-component">cell</span></h6>');
-    expect(markup).toContain('<h6>ur5e_arm<span class="program-run-setup-component">cell</span></h6>');
+    expect(markup).toContain('<h6>cell<span class="program-run-setup-component">left</span></h6>');
+    expect(markup).toContain('<h6>cell<span class="program-run-setup-component">right</span></h6>');
+    const robots = markup.split('<div class="program-run-setup-robot">');
+    expect(robots[1]).toContain('Program request</span><span class="program-run-setup-stat-value">0.15 m/s</span>');
+    expect(robots[1]).not.toContain('0.2 m/s');
+    expect(robots[2]).toContain('Program request</span><span class="program-run-setup-stat-value">0.2 m/s</span>');
+    expect(robots[2]).not.toContain('0.15 m/s');
   });
 
   it('shows only the owner-admitted speed per exact robot, with a reason when absent', () => {

@@ -101,20 +101,16 @@ protected:
                std::optional<std::string> success_through = {},
                std::optional<V> condition = {}) {
     auto value = d::parse_strict_json_model_yaml(R"({
-      "api_version":"manyforge.program.v2","program_id":"node_stop_fixture",
+      "api_version":"manyforge.program.v3","program_id":"node_stop_fixture",
       "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "program_profile":"composable-cell-v1","name":"Node Stop fixture",
-      "catalog":{"api_version":"manyforge.node_catalog.v2","content_version":"0.0.0"},
-      "component_roles":{"robot":{}},
-      "target_roles":{"arm":{"component_role":"robot","required_capabilities":[],
-        "required_frame_roles":["base"],"required_resource_roles":["arm_joints"],
-        "required_model_roles":["arm_model"],"required_collision_body_roles":["arm_collision"]}},
+      "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
       "blackboard":{"namespaces":[],"keys":[{"key":"ready","type":"bool","access":"read_write","persistence":"run","initial":false}]},
       "tree":{"node_id":"motion.move_until_signal","instance_id":"move","children":[],
-        "parameters":{"target_role":"arm","tcp_endpoint":{"kind":"current"},"stop_mode":"soft_on_path","priority":7,
+        "parameters":{"target":{"component_id":"lite6_robot","command_target_id":"arm"},"base_frame":{"component_id":"lite6_robot","frame_id":"base"},"tcp_endpoint":{"kind":"current"},"stop_mode":"soft_on_path","priority":7,
           "activation_mode":"require_inactive_at_arm",
           "on_signal":"success","on_no_signal":"failure",
-          "goal":{"frame_ref":{"kind":"target_frame","target_role":"arm","frame_role":"base"},
+          "goal":{"frame_ref":{"kind":"target_frame","frame":{"component_id":"lite6_robot","frame_id":"base"}},
             "position_m":[0.1,0.1,0.1],"orientation":{"xyzw":[0,0,0,1]}},
           "interrupt_condition":{"compare":{"operand":{"key":"ready"},"op":"==","value":true}}}}})")
                      .root();
@@ -122,21 +118,6 @@ protected:
         value, "catalog",
         replace(*value.find_object_member("catalog"), "content_version",
                 V(bundle->value().catalogs.node_environment.content_version)));
-    auto targets = *value.find_object_member("target_roles");
-    auto arm = *targets.find_object_member("arm");
-    V::Array capabilities;
-    for (const auto *id :
-         {"execution.feedback.phase_events", "execution.trajectory.execute",
-          "planning.motion.pose_goal",
-          "planning.trajectory.time_parameterized", "state.observed.current",
-          "validation.trajectory.non_collision"})
-      capabilities.emplace_back(V::Object{{"capability_id", V(id)},
-                                          {"parameters", V(V::Object{})},
-                                          {"disposition", V("required")}});
-    value = replace(
-        value, "target_roles",
-        replace(targets, "arm",
-                replace(arm, "required_capabilities", V(capabilities))));
     auto tree = *value.find_object_member("tree");
     auto parameters =
         replace(*tree.find_object_member("parameters"), "stop_mode", V(mode));
@@ -150,25 +131,17 @@ protected:
     value = d::normalize_program_authoring(value);
     const auto revision = d::detail::compute_content_identity(
         value,
-        {"program-revision", "manyforge.program.v2", "program_revision"});
+        {"program-revision", "manyforge.program.v3", "program_revision"});
     value = replace(value, "program_revision", V(revision));
+    d::FilesystemCatalogArtifactStore catalog(package_root);
     return d::verify_program_binding_contract(d::canonical_json(value),
-                                              *bundle);
+                                              *bundle, *map, catalog);
   }
   auto Binding(const d::ProgramBindingContract &program) {
     d::FilesystemCatalogArtifactStore catalog(package_root);
-    return d::compile_program_binding(
-        program,
-        {{{c::ComponentRoleId("robot"),
-           c::ControllableComponentId("lite6_robot")}},
-         {{c::TargetRoleId("arm"), c::CommandTargetId("arm")}}},
-        *bundle, *map, catalog);
+    return d::compile_program_binding(program, *bundle, *map, catalog);
   }
   d::PreparedActivationInput Prepare(const d::ProgramBindingContract &program) {
-    const auto roles = d::parse_strict_json_model_yaml(R"({
-      "component_roles":[{"component_role_id":"robot","controllable_component_id":"lite6_robot"}],
-      "target_roles":[{"target_role_id":"arm","command_target_id":"arm"}]})")
-                           .root();
     d::FilesystemCatalogArtifactStore catalog(package_root);
     d::FilesystemRawArtifactStore raw(package_root);
     return d::assemble_prepared_activation(
@@ -177,7 +150,7 @@ protected:
              c::ContentDigest("sha256:" + std::string(64U, 'a')),
              "/fixtures/condition-apply.scenario"},
          c::ContentDigest("sha256:" + std::string(64U, 'b')), "optional"},
-        *bundle, *map, program, roles, catalog, raw);
+        *bundle, *map, program, catalog, raw);
   }
   const std::filesystem::path package_root{
       MANYFORGE_PROGRAM_CAPTURE_PACKAGE_ROOT};
@@ -319,7 +292,8 @@ TEST_F(ProgramIoStopResponseTest,
   ASSERT_EQ(rules.value().program_node_conditions.size(), 1U);
   const auto &node = rules.value().program_node_conditions.front();
   ASSERT_TRUE(node.node_rule);
-  EXPECT_EQ(node.node_rule->target_role_id, c::TargetRoleId("arm"));
+  EXPECT_EQ(node.node_rule->target,
+            (c::ProgramTargetReferenceDTO{c::ControllableComponentId("lite6_robot"), c::CommandTargetId("arm")}));
   EXPECT_EQ(node.node_rule->priority, 7);
   EXPECT_EQ(node.node_rule->stop_entry_stage_id,
             c::StopEscalationStageId(first));

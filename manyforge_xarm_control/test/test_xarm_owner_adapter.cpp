@@ -103,15 +103,16 @@ struct World final {
   std::vector<std::pair<std::string, std::size_t>> sunk;
 };
 
-TEST(XArmOwnerAdapter, PrepareClearsTheErrorRecoverClearsItAndThereIsNoEnable) {
+// 2026-11-08 (maintainer): Prepare (and the Load that runs it) only
+// connects; clearing a controller error is the explicit Recover.
+TEST(XArmOwnerAdapter, PrepareOnlyConnectsRecoverClearsAndThereIsNoEnable) {
   World world;
   EXPECT_EQ(world.owner->State(world.clock.now()).lifecycle, ComponentLifecycle::kNotPrepared);
   EXPECT_EQ(world.Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
   EXPECT_EQ(world.restarts, 0);
   EXPECT_EQ(world.owner->State(world.clock.now()).lifecycle, ComponentLifecycle::kPrepared);
   EXPECT_EQ(world.Run(ComponentAction::kRecover).outcome, ActionOutcome::kSucceeded);
-  EXPECT_EQ(world.driver->Calls(), (Ids{"clean_error", "get_err_warn_code", "clean_error",
-                                        "get_err_warn_code"}));
+  EXPECT_EQ(world.driver->Calls(), (Ids{"clean_error", "get_err_warn_code"}));
   EXPECT_TRUE(world.lane->actions.empty());
   EXPECT_EQ(world.Run(ComponentAction::kEnable).error->code, "component_action_unsupported");
   EXPECT_EQ(world.Run(ComponentAction::kDisable).error->code, "component_action_unsupported");
@@ -125,7 +126,7 @@ TEST(XArmOwnerAdapter, PrepareRestartsTheProcessWhenNotConnectedThenWaitsForItsR
   world.clock.advance(kXArmStatusFreshnessNs + 1);
   EXPECT_EQ(world.Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
   EXPECT_EQ(world.restarts, 1);
-  EXPECT_EQ(world.driver->Calls(), (Ids{"clean_error", "get_err_warn_code"}));
+  EXPECT_TRUE(world.driver->Calls().empty());
 }
 
 // The restarted process's first report is awaited for the machine's
@@ -182,8 +183,37 @@ TEST(XArmOwnerAdapter, PrepareAwaitsAStartingLaunchsFirstReportAndRestartsOnlyAn
         std::chrono::seconds(10), [&] { return starting; }});
     EXPECT_EQ(owner->Run(ComponentAction::kPrepare, {}).outcome, ActionOutcome::kSucceeded);
     EXPECT_EQ(restarts, starting ? 0 : 1) << "starting=" << starting;
-    EXPECT_EQ(world.driver->Calls(), (Ids{"clean_error", "get_err_warn_code"}));
+    EXPECT_TRUE(world.driver->Calls().empty());
   }
+}
+
+// Live 2026-11-08 (Real Lite 6): the driver reported before its controller
+// manager answered, and Load failed "result not observed". Prepare waits for
+// the lane within the lifecycle command time, and fails typed after it.
+TEST(XArmOwnerAdapter, PrepareEndsOnceTheControllerManagerAnswers) {
+  World world;
+  world.lane->state.lifecycle = ComponentLifecycle::kOffline;
+  int pauses = 0;
+  auto owner = std::make_shared<XArmOwnerAdapter>(XArmOwnerAdapterPorts{
+      world.status, world.driver, world.lane, world.restart, [] { return true; },
+      [&](const std::chrono::nanoseconds duration) {
+        world.clock.advance(duration.count());
+        auto next = world.status->observe();
+        next.received_timestamp_ns = world.clock.now();
+        world.status->Set(next);
+        if (++pauses == 3) world.lane->state.lifecycle = ComponentLifecycle::kPrepared;
+      },
+      &world.clock, {}, std::chrono::seconds(10), std::chrono::milliseconds(200),
+      std::chrono::seconds(10), {}});
+  EXPECT_EQ(owner->Run(ComponentAction::kPrepare, {}).outcome, ActionOutcome::kSucceeded);
+  EXPECT_EQ(pauses, 3);
+  EXPECT_EQ(owner->State(world.clock.now()).lifecycle, ComponentLifecycle::kPrepared);
+
+  World silent;
+  silent.lane->state.lifecycle = ComponentLifecycle::kOffline;
+  const auto failed = silent.Run(ComponentAction::kPrepare);
+  EXPECT_EQ(failed.outcome, ActionOutcome::kFailed);
+  EXPECT_EQ(failed.error->code, "controller_manager_unavailable");
 }
 
 TEST(XArmOwnerAdapter, AnEstopStillPressedOrNoAnswerOrAServoErrorFailsTyped) {
@@ -198,14 +228,14 @@ TEST(XArmOwnerAdapter, AnEstopStillPressedOrNoAnswerOrAServoErrorFailsTyped) {
             "Couldn't clear the robot error. If the e-stop is pressed, release it, then "
             "Recover the machine and Enable the arm.");
   EXPECT_EQ(failed.error->vendor_code, "C2");
-  // As M7: three reads, 150 ms apart.
+  // Three reads, 150 ms apart.
   EXPECT_EQ(world.driver->Calls(), (Ids{"clean_error", "get_err_warn_code", "get_err_warn_code",
                                         "get_err_warn_code"}));
   EXPECT_EQ(world.waited, std::chrono::milliseconds(300));
 
   World unanswered;
   unanswered.driver->clean_error = {XArmServiceCallOutcome::kUnknown, "xarm_service_timeout", {}};
-  failed = unanswered.Run(ComponentAction::kPrepare);
+  failed = unanswered.Run(ComponentAction::kRecover);
   EXPECT_EQ(failed.outcome, ActionOutcome::kUnknown);
   EXPECT_EQ(failed.error->code, "robot_controller_unresponsive");
   EXPECT_EQ(unanswered.owner->State(unanswered.clock.now()).lifecycle,
@@ -219,16 +249,31 @@ TEST(XArmOwnerAdapter, AnEstopStillPressedOrNoAnswerOrAServoErrorFailsTyped) {
   EXPECT_TRUE(servo.driver->Calls().empty());
 }
 
-// Live 2026-11-02 (Real Lite 6, Load): the driver started with the C2 left
-// after an e-stop; Prepare's read showed it cleared while `robot_states`
-// (5 Hz) still carried C2, so the members' Prepare right after was refused
-// `owner_not_prepared`. Prepare and Recover end once the report shows the
-// error gone; a report that keeps it until the lifecycle time fails typed.
-TEST(XArmOwnerAdapter, PrepareAndRecoverEndOnceTheReportShowsTheErrorGone) {
-  for (const auto action : {ComponentAction::kPrepare, ComponentAction::kRecover}) {
+// 2026-11-08 (maintainer): an e-stop is a normal event: Load (Prepare)
+// works with it pressed and never clears. The C2 stays a stop (gating
+// motion), never a fault, and the owner is prepared.
+TEST(XArmOwnerAdapter, PrepareSucceedsWithTheEstopPressedAndLeavesTheErrorLatched) {
+  World world;
+  world.status->Set(report(world.clock.now(), 2));
+  EXPECT_EQ(world.Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
+  EXPECT_TRUE(world.driver->Calls().empty());
+  const auto state = world.owner->State(world.clock.now());
+  EXPECT_EQ(state.lifecycle, ComponentLifecycle::kPrepared);
+  ASSERT_TRUE(state.stop);
+  EXPECT_EQ(state.stop->code, core::StopCode::kEstop);
+  EXPECT_FALSE(state.fault);
+}
+
+// Live 2026-11-02 (Real Lite 6): the read showed C2 cleared while
+// `robot_states` (5 Hz) still carried it, so the members' Prepare right
+// after was refused `owner_not_prepared`. Recover ends once the report
+// shows the error gone; a report that keeps it until the lifecycle time
+// fails typed.
+TEST(XArmOwnerAdapter, RecoverEndsOnceTheReportShowsTheErrorGone) {
+  for (const auto action : {ComponentAction::kRecover}) {
     World world;
     world.status->Set(report(world.clock.now(), 2));
-    ASSERT_EQ(world.owner->State(world.clock.now()).lifecycle, ComponentLifecycle::kFault);
+    ASSERT_TRUE(world.owner->State(world.clock.now()).stop);
     int pauses = 0;
     auto owner = std::make_shared<XArmOwnerAdapter>(XArmOwnerAdapterPorts{
         world.status, world.driver, world.lane, world.restart, [] { return true; },
@@ -242,10 +287,7 @@ TEST(XArmOwnerAdapter, PrepareAndRecoverEndOnceTheReportShowsTheErrorGone) {
         std::chrono::seconds(10), {}});
     EXPECT_EQ(owner->Run(action, {}).outcome, ActionOutcome::kSucceeded);
     EXPECT_EQ(pauses, 2);
-    EXPECT_NE(owner->State(world.clock.now()).lifecycle, ComponentLifecycle::kFault);
-    if (action == ComponentAction::kPrepare) {
-      EXPECT_EQ(owner->State(world.clock.now()).lifecycle, ComponentLifecycle::kPrepared);
-    }
+    EXPECT_EQ(owner->State(world.clock.now()).lifecycle, ComponentLifecycle::kPrepared);
     EXPECT_EQ(world.driver->Calls(), (Ids{"clean_error", "get_err_warn_code"}));
   }
 
@@ -253,28 +295,34 @@ TEST(XArmOwnerAdapter, PrepareAndRecoverEndOnceTheReportShowsTheErrorGone) {
   World stays;
   stays.status->Set(report(stays.clock.now(), 2));
   const auto started = stays.clock.now();
-  const auto failed = stays.Run(ComponentAction::kPrepare);
+  const auto failed = stays.Run(ComponentAction::kRecover);
   EXPECT_EQ(failed.outcome, ActionOutcome::kFailed);
   EXPECT_EQ(failed.error->code, "robot_error_not_cleared");
   EXPECT_EQ(failed.error->vendor_code, "C2");
   EXPECT_GE(stays.clock.now() - started, 10'000'000'000LL);
-  EXPECT_EQ(stays.owner->State(stays.clock.now()).lifecycle, ComponentLifecycle::kFault);
+  EXPECT_TRUE(stays.owner->State(stays.clock.now()).stop);
 }
 
-// Review 2026-11-02: Prepare and Recover end on the owner's own state, not
-// the report's error alone: a GPIO module error left after the clear keeps
-// them waiting, and fails them typed at the lifecycle time.
-TEST(XArmOwnerAdapter, PrepareEndsOnlyOnceTheOwnersStateShowsNoFault) {
+// Review 2026-11-02: Recover ends on the owner's own state, not the
+// report's error alone: a GPIO module error left after the clear keeps it
+// waiting, and fails it typed at the lifecycle time. Prepare only connects:
+// the module's error stays the owner's fault.
+TEST(XArmOwnerAdapter, RecoverEndsOnlyOnceTheOwnersStateShowsNoFault) {
+  World connected;
+  connected.owner->OnGpioModuleStatus({6, 0, {}});
+  EXPECT_EQ(connected.Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
+  EXPECT_EQ(connected.owner->State(connected.clock.now()).lifecycle, ComponentLifecycle::kFault);
+
   World world;
   world.owner->OnGpioModuleStatus({6, 0, {}});
   const auto started = world.clock.now();
-  const auto failed = world.Run(ComponentAction::kPrepare);
+  const auto failed = world.Run(ComponentAction::kRecover);
   EXPECT_EQ(failed.outcome, ActionOutcome::kFailed);
   EXPECT_EQ(failed.error->code, "fault_communication");
   EXPECT_EQ(failed.error->vendor_code, "gpio state=6 code=0");
   EXPECT_GE(world.clock.now() - started, 10'000'000'000LL);
 
-  // The module recovers during the wait: the Prepare succeeds.
+  // The module recovers during the wait: the Recover succeeds.
   World recovers;
   recovers.owner->OnGpioModuleStatus({6, 0, {}});
   int pauses = 0;
@@ -291,13 +339,38 @@ TEST(XArmOwnerAdapter, PrepareEndsOnlyOnceTheOwnersStateShowsNoFault) {
       &recovers.clock, {}, std::chrono::seconds(10), std::chrono::milliseconds(200),
       std::chrono::seconds(10), {}});
   owner->OnGpioModuleStatus({6, 0, {}});
-  EXPECT_EQ(owner->Run(ComponentAction::kPrepare, {}).outcome, ActionOutcome::kSucceeded);
+  EXPECT_EQ(owner->Run(ComponentAction::kRecover, {}).outcome, ActionOutcome::kSucceeded);
   EXPECT_EQ(pauses, 3);
   EXPECT_EQ(owner->State(recovers.clock.now()).lifecycle, ComponentLifecycle::kPrepared);
 }
 
 // Review 2026-11-02: 5 Hz best-effort reports keep-last-1: a report is
 // fresh for five periods (1 s).
+TEST(XArmOwnerAdapter, EmergencyStopRemainsUntilFreshControllerReportClearsIt) {
+  World world;
+  ASSERT_EQ(world.Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
+  const auto first_seen = world.clock.now();
+  for (int code : {1, 2, 3}) {
+    world.status->Set(report(world.clock.now(), code));
+    const auto state = world.owner->State(world.clock.now());
+    ASSERT_TRUE(state.stop);
+    EXPECT_EQ(state.stop->code, core::StopCode::kEstop);
+    EXPECT_EQ(state.stop->vendor_code, "C" + std::to_string(code));
+    EXPECT_EQ(state.stop->since_ns, first_seen);
+    EXPECT_FALSE(state.fault);
+    world.clock.advance(100'000'000);
+  }
+  world.clock.advance(kXArmStatusFreshnessNs + 1);
+  const auto stale = world.owner->State(world.clock.now());
+  ASSERT_TRUE(stale.stop);
+  ASSERT_TRUE(stale.fault);
+  EXPECT_EQ(stale.fault->code, core::FaultCode::kCommunication);
+  world.status->Set(report(world.clock.now()));
+  const auto cleared = world.owner->State(world.clock.now());
+  EXPECT_FALSE(cleared.stop);
+  EXPECT_EQ(cleared.lifecycle, ComponentLifecycle::kPrepared);
+}
+
 TEST(XArmOwnerAdapter, AReportIsFreshForFivePeriods) {
   EXPECT_EQ(kXArmStatusFreshnessNs, 5 * kXArmReportPeriodNs);
   World world;
@@ -321,11 +394,8 @@ TEST(XArmOwnerAdapter, ControllerFaultsAreTheOwnersAndNameTheMembersTheyConcern)
   EXPECT_EQ(fault_of(19).concerns, Ids{"lite6_robot_tool_io"});
   EXPECT_EQ(fault_of(22).concerns, Ids{"lite6_robot"});
   EXPECT_EQ(fault_of(22).code, core::FaultCode::kSelfCollision);
-  const auto estop = fault_of(2);
-  EXPECT_EQ(estop.code, core::FaultCode::kEstop);
-  EXPECT_EQ(estop.operator_action, core::FaultOperatorAction::kRecover);
+  EXPECT_EQ(fault_of(31).code, core::FaultCode::kProtectiveStop);
   const Ids all{"lite6_robot", "lite6_robot_controller_io", "lite6_robot_tool_io"};
-  EXPECT_EQ(estop.concerns, all);
   EXPECT_EQ(fault_of(26).concerns, all);
   world.clock.advance(100'000'000);
   EXPECT_EQ(fault_of(26).since_ns, world.clock.now() - 100'000'000);
@@ -356,7 +426,7 @@ TEST(XArmOwnerAdapter, ARebuiltMemberReplacesItsRegistrationAndARemovedOneIsNoCo
   World world;
   auto rebuilt = std::make_shared<FakeLane>();
   world.owner->AddMember({"arm", "lite6_robot", rebuilt, {}, {}});
-  world.status->Set(report(world.clock.now(), 2));
+  world.status->Set(report(world.clock.now(), 26));
   const Ids all{"lite6_robot", "lite6_robot_controller_io", "lite6_robot_tool_io"};
   EXPECT_EQ(world.owner->State(world.clock.now()).fault->concerns, all);
   // The tool I/O left the cell (its adapter is gone): not concerned.
@@ -373,16 +443,20 @@ TEST(XArmOwnerAdapter, TheClearReadsBackUntilTheErrorIsGoneAndClearsAWarning) {
             (Ids{"clean_error", "get_err_warn_code", "get_err_warn_code", "clean_warn"}));
   EXPECT_EQ(world.waited, std::chrono::milliseconds(150));
 
-  // XPW-1: Prepare clears a warning too (the arm's hardware, whose
-  // activation also clears it, stays off until Enable); never motion_enable.
+  // Recover clears a warning too (the arm's hardware, whose activation
+  // also clears it, stays off until Enable); never motion_enable.
+  World recovered;
+  recovered.driver->err_warn = {FakeDriver::ok, 0, 7};
+  EXPECT_EQ(recovered.Run(ComponentAction::kRecover).outcome, ActionOutcome::kSucceeded);
+  EXPECT_EQ(recovered.driver->Calls(), (Ids{"clean_error", "get_err_warn_code", "clean_warn"}));
+  // Without a warning left, none; Prepare clears nothing.
+  World clean;
+  EXPECT_EQ(clean.Run(ComponentAction::kRecover).outcome, ActionOutcome::kSucceeded);
+  EXPECT_EQ(clean.driver->Calls(), (Ids{"clean_error", "get_err_warn_code"}));
   World prepared;
   prepared.driver->err_warn = {FakeDriver::ok, 0, 7};
   EXPECT_EQ(prepared.Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
-  EXPECT_EQ(prepared.driver->Calls(), (Ids{"clean_error", "get_err_warn_code", "clean_warn"}));
-  // Without a warning left, none.
-  World clean;
-  EXPECT_EQ(clean.Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
-  EXPECT_EQ(clean.driver->Calls(), (Ids{"clean_error", "get_err_warn_code"}));
+  EXPECT_TRUE(prepared.driver->Calls().empty());
 
   // A clean_warn without an answer is unknown, never resent.
   World unanswered;
@@ -439,7 +513,7 @@ TEST(XArmOwnerAdapter, ExternalControlOfTheArmIsTheOwnersFaultAndRecoverReleases
                           },
                           &world.clock});
   world.owner->AddMember({"arm", "lite6_robot_arm", arm, {}, arm});
-  // XPW-1: only an Enabled arm (motors on) is armed.
+  // Only an Enabled arm (motors on) is armed.
   ASSERT_EQ(arm->Run(ComponentAction::kEnable, {}).outcome, ActionOutcome::kSucceeded);
   world.clock.advance(kXArmOwnOperationSettleNs + 1);
   // A Studio pause in joint-servo mode.
@@ -480,8 +554,7 @@ TEST(XArmOwnerAdapter, PowerOffIsOfflineNotAFault) {
   EXPECT_EQ(off.outcome, ActionOutcome::kSucceeded);
   // The core disables the members before the owner's power action.
   EXPECT_TRUE(world.arm->actions.empty());
-  EXPECT_EQ(world.driver->Calls(),
-            (Ids{"clean_error", "get_err_warn_code", "system_control(1)"}));
+  EXPECT_EQ(world.driver->Calls(), (Ids{"system_control(1)"}));
   // The driver loses the controller: still offline with the reason.
   world.clock.advance(kXArmStatusFreshnessNs * 4);
   const auto state = world.owner->State(world.clock.now());
@@ -502,8 +575,8 @@ TEST(XArmOwnerAdapter, RebootWaitsThenRestartsAndPrepares) {
   EXPECT_EQ(rebooted.outcome, ActionOutcome::kSucceeded);
   EXPECT_EQ(rebooted.action, ComponentAction::kReboot);
   EXPECT_TRUE(world.arm->actions.empty());
-  EXPECT_EQ(world.driver->Calls(),
-            (Ids{"system_control(2)", "clean_error", "get_err_warn_code"}));
+  // After the reboot it reconnects (a Prepare: no clear).
+  EXPECT_EQ(world.driver->Calls(), (Ids{"system_control(2)"}));
   EXPECT_EQ(world.restarts, 1);
   EXPECT_GE(world.probes, 3);
   EXPECT_EQ(world.owner->State(world.clock.now()).lifecycle, ComponentLifecycle::kPrepared);

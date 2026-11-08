@@ -1,19 +1,17 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Mock UR10e with a Robotiq 2F-140 gripper and the assistant's scene-authoring tools enabled. Ask the assistant to inspect or change the scene to see which tools each assistant mode offers.",
   "members": {
-    "assignment.yaml": "sha256:17d2165fd613f8ed9ede8781fe6fa737e1fcc5f12281669d2e599903709c6c97",
     "deployment.yaml": "sha256:77883fb76b19e34d42701f8d0e9a7ba249de40eea7253df76d8d33b28451f1fe",
-    "program.yaml": "sha256:a67330852aa2954d9db6ef7ca096311b3b12030eedf2fb3a884d0dd4681221cc"
+    "program.yaml": "sha256:be5ae87ece2a239c48fad23d90713f00467ce4821de06b3c824fbaae9f61e987"
   },
   "name": "mock_ur10e_assistant_scene_authoring",
   "saved_status": {
-    "checked_content_digest": "sha256:b19cd73e98a31a7c704e7d083a8f254c71cd2f565ecbcee14ca4f8815b1d9af9",
+    "checked_content_digest": "sha256:083a64867803ada36c860b3fa01fa41a17988aaee8c06cb413403c6823a2dee1",
     "last_known_status": "ready",
     "manyforge_version": "0.2.0"
   },

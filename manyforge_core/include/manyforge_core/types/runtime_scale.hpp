@@ -10,6 +10,21 @@
 
 namespace manyforge::core {
 
+/// Whether a participant's execution mechanism can apply a runtime scale now.
+/// A lane that cannot scale (`kLaneUnsupported`, e.g. a stock JTC claiming a
+/// velocity command interface) is treated exactly like an unqualified route.
+/// A capable lane whose controller is not listening for scale input right
+/// now (`kControllerNotListening`, no matched subscriber) refuses runtime
+/// scale and motion admission until the controller listens again.
+enum class RuntimeScaleMechanismAvailability : std::uint8_t {
+  kAvailable = 0,
+  kLaneUnsupported,
+  kControllerNotListening,
+};
+
+inline constexpr const char* kRuntimeScaleControllerNotListening =
+    "runtime_scale_controller_not_listening";
+
 enum class RuntimeScaleApplicationState {
   kPending,
   kApplied,
@@ -18,20 +33,20 @@ enum class RuntimeScaleApplicationState {
 };
 
 struct RuntimeScaleControlTargetDTO final {
-  ComponentRoleId component_role_id;
-  TargetRoleId target_role_id;
+  ControllableComponentId component_id;
+  CommandTargetId command_target_id;
   friend bool operator==(const RuntimeScaleControlTargetDTO&,
                          const RuntimeScaleControlTargetDTO&) = default;
 };
 
 /// Public selector for one operator runtime-velocity setting. The Kernel joins
-/// these portable Program identities to the current exact control/scaling
+/// these direct component and target identities to the current exact control/scaling
 /// domain; callers never supply controller or route identities.
 struct RuntimeScaleControlSelectorDTO final {
   ProgramBindingId program_binding_id;
-  ComponentRoleId component_role_id;
-  TargetRoleId target_role_id;
-  /// Alternative to the singular roles: the complete execution-group target
+  ControllableComponentId component_id;
+  CommandTargetId command_target_id;
+  /// Alternative to the singular target: the complete execution-group target
   /// set published by the Kernel. This selects control scopes, not Program
   /// membership or Run authority, and does not imply synchronized timing.
   std::vector<RuntimeScaleControlTargetDTO> group_targets{};
@@ -224,6 +239,9 @@ struct ResolvedRuntimeScaleCommandDTO final {
   RuntimeScaleGeneration expected_runtime_scale_generation;
   RuntimeScaleGeneration requested_runtime_scale_generation;
   double requested_scale{1.0};
+  /// OD-72: the process-wide order of accepted speed values (latest value
+  /// wins at the participant's ramp target); 0 is unordered (applied as is).
+  std::uint64_t value_sequence{0U};
 
   friend bool operator==(const ResolvedRuntimeScaleCommandDTO&,
                          const ResolvedRuntimeScaleCommandDTO&) = default;

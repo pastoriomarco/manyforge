@@ -1,7 +1,5 @@
 import type {
   AppliedProgramSelection,
-  JsonValue,
-  ProgramBindingDocument,
   ProgramExecutionSelectionControls,
   ProgramTreeNode,
 } from '../types/api';
@@ -62,10 +60,10 @@ export interface ExecutionGroupScope {
   nodeIds: string[];
   /** Members that act on hardware (see `HARDWARE_ACTING_NODE_IDS`). */
   hardwareNodeIds: string[];
-  /** Target roles of the hardware-acting members. */
-  targetRoleIds: string[];
-  /** Target roles of motion members only: runtime velocity scaling. */
-  motionTargetRoleIds: string[];
+  /** Direct target keys of the hardware-acting members. */
+  targetKeys: string[];
+  /** Direct target keys of motion members only: runtime velocity scaling. */
+  motionTargetKeys: string[];
 }
 
 /** Presentation-only membership shared by Draft settings and Applied controls. */
@@ -77,8 +75,8 @@ export function executionGroupScopes(
     groupId,
     nodeIds: [] as string[],
     hardwareNodeIds: [] as string[],
-    targetRoleIds: new Set<string>(),
-    motionTargetRoleIds: new Set<string>(),
+    targetKeys: new Set<string>(),
+    motionTargetKeys: new Set<string>(),
   }]));
   const pending = roots.map((node) => ({ node, inherited: [] as string[] }));
   while (pending.length > 0) {
@@ -86,19 +84,22 @@ export function executionGroupScopes(
     const groups = node.execution_groups === 'all' ? []
       : Array.isArray(node.execution_groups) ? node.execution_groups : inherited;
     const hardware = isHardwareActingNode(node.node_id);
-    const target = node.parameters.target_role;
-    const targetRole = hardware && typeof target === 'string' && target.length > 0 ? target : null;
+    const target = node.parameters.target;
+    const targetKey = hardware && target !== null && typeof target === 'object' && !Array.isArray(target)
+      && typeof target.component_id === 'string' && target.component_id.length > 0
+      && typeof target.command_target_id === 'string' && target.command_target_id.length > 0
+      ? `${target.component_id}/${target.command_target_id}` : null;
     for (const groupId of ['all', ...groups]) {
       const scope = scopes.get(groupId);
       if (scope === undefined) continue; // Undeclared Draft memberships remain backend diagnostics.
       scope.nodeIds.push(node.instance_id);
       if (!hardware) continue;
       scope.hardwareNodeIds.push(node.instance_id);
-      if (targetRole === null) continue;
-      scope.targetRoleIds.add(targetRole);
+      if (targetKey === null) continue;
+      scope.targetKeys.add(targetKey);
       // Set TCP changes controller state but does not move the robot.
       if (node.node_id.startsWith('motion.') && node.node_id !== 'motion.set_tcp') {
-        scope.motionTargetRoleIds.add(targetRole);
+        scope.motionTargetKeys.add(targetKey);
       }
     }
     for (const child of node.children) pending.push({ node: child, inherited: groups });
@@ -106,8 +107,8 @@ export function executionGroupScopes(
   return [...scopes.values()].sort((a, b) => compareIds(a.groupId, b.groupId))
     .map((scope) => ({
       ...scope,
-      targetRoleIds: [...scope.targetRoleIds].sort(compareIds),
-      motionTargetRoleIds: [...scope.motionTargetRoleIds].sort(compareIds),
+      targetKeys: [...scope.targetKeys].sort(compareIds),
+      motionTargetKeys: [...scope.motionTargetKeys].sort(compareIds),
     }));
 }
 
@@ -126,40 +127,21 @@ export function executionGroupVisibilityUnavailableReason(
     ? 'Show All, or another covering group, before hiding this group.' : null;
 }
 
-/**
- * Label each target role with its robot/component only from an authoritative
- * binding: pass the Applied binding only when it binds exactly this Program
- * revision. Otherwise the Program's own component-role declaration is shown.
- */
-export function executionGroupTargetLabels(
-  targetRoles: Record<string, JsonValue> | undefined,
-  binding: ProgramBindingDocument | null,
-): Record<string, string> {
-  const bound = new Map((binding?.target_role_bindings ?? []).map((row) => [row.target_role_id, row]));
-  return Object.fromEntries(Object.entries(targetRoles ?? {}).map(([role, declaration]) => {
-    const row = bound.get(role);
-    if (row !== undefined) return [role, `${role} (${row.controllable_component_id})`];
-    const component = declaration !== null && typeof declaration === 'object'
-      && !Array.isArray(declaration) ? declaration.component_role : null;
-    return [role, typeof component === 'string' ? `${role} (component role: ${component})` : role];
-  }));
-}
-
 function runtimeScaleSelector(
   applied: AppliedProgramSelection,
-  targetRoles: Set<string>,
+  targetKeys: Set<string>,
 ): { selector: RuntimeScaleControlSelector | null; reason: string | null } {
-  if (targetRoles.size === 0) {
+  if (targetKeys.size === 0) {
     return { selector: null, reason: 'selection_has_no_motion_targets' };
   }
-  const bindings = new Map(applied.programBinding.target_role_bindings.map((binding) => (
-    [binding.target_role_id, binding]
+  const bindings = new Map(applied.programBinding.target_bindings.map((binding) => (
+    [`${binding.target.component_id}/${binding.target.command_target_id}`, binding.target]
   )));
-  const targets = [...targetRoles].sort().map((targetRoleId) => {
-    const binding = bindings.get(targetRoleId);
+  const targets = [...targetKeys].sort().map((targetKey) => {
+    const binding = bindings.get(targetKey);
     return binding === undefined ? null : {
-      componentRoleId: binding.component_role_id,
-      targetRoleId,
+      componentId: binding.component_id,
+      commandTargetId: binding.command_target_id,
     };
   });
   if (targets.some((target) => target === null)) {
@@ -192,8 +174,8 @@ export function appliedExecutionSelectionRows(
 ): ProgramExecutionSelectionRow[] {
   if (applied === null) return [];
   return executionGroupScopes([applied.program.tree], Object.keys(applied.program.execution_groups ?? {}))
-    .map(({ groupId, nodeIds, motionTargetRoleIds }) => {
-      const scale = runtimeScaleSelector(applied, new Set(motionTargetRoleIds));
+    .map(({ groupId, nodeIds, motionTargetKeys }) => {
+      const scale = runtimeScaleSelector(applied, new Set(motionTargetKeys));
       return {
         groupId,
         nodeCount: nodeIds.length,

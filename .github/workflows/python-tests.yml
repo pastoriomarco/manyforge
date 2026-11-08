@@ -28,10 +28,8 @@ on:
       - "manyforge_ros/tests/test_diagnostics_bridge.py"
       - "manyforge_medkit_adapter/manyforge_medkit_adapter/**"
       - "manyforge_medkit_adapter/tests/test_forwarder.py"
-      - "scripts/qualification/**"
       - "scripts/lib/**"
       - "tests/**"
-      - "verification/composable_cell_i4/**"
       - "pytest.ini"
       - ".github/workflows/python-tests.yml"
   push:
@@ -56,10 +54,8 @@ on:
       - "manyforge_ros/tests/test_diagnostics_bridge.py"
       - "manyforge_medkit_adapter/manyforge_medkit_adapter/**"
       - "manyforge_medkit_adapter/tests/test_forwarder.py"
-      - "scripts/qualification/**"
       - "scripts/lib/**"
       - "tests/**"
-      - "verification/composable_cell_i4/**"
       - "pytest.ini"
       - ".github/workflows/python-tests.yml"
   schedule:
@@ -74,8 +70,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dev-changed:
+    uses: ./.github/workflows/nightly-dev-changed.yml
+    permissions:
+      contents: read
+      actions: read
+
   python-tests:
     name: Python ${{ matrix.suite }}
+    needs: dev-changed
+    if: needs.dev-changed.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -103,9 +107,9 @@ jobs:
             binding: true
             pytest: >-
               -c pytest.ini --rootdir .
-              manyforge_operator/tests scripts/qualification/tests tests/composable_cell_i4
+              manyforge_operator/tests tests/test_source_identity.py
               tests/test_benchmark.py tests/test_public_contract_entrypoint_reconciliation.py
-              tests/test_regen.py tests/test_qualification_wrapper_entrypoints.py
+              tests/test_regen.py
               tests/test_ros_qualification_helpers.py tests/test_grouped_gtest_runner.py
               tests/test_release_golden_workflow.py tests/test_test_all_script_contract.py
     env:
@@ -140,6 +144,11 @@ jobs:
             trimesh==4.11.5 yourdfpy==0.0.60 fastapi==0.135.3 \
             "uvicorn[standard]==0.44.0" httpx==0.28.1 httpx2==2.12.0 \
             websockets==16.0 mcp==1.27.0
+      # The repository examples load the RoboPlan example models from the
+      # git-ignored .docker/roboplan (test_scenario_artifacts.py).
+      - name: Prepare pinned RoboPlan Docker context
+        if: matrix.suite == 'composer'
+        run: ./scripts/setup-docker.sh --prepare-only
       # One cache for the expression binding: every job restores it, the
       # behavior job saves it on push and on the nightly run.
       - name: Restore ccache
@@ -149,12 +158,15 @@ jobs:
           path: .ccache
           key: ccache-headless-py-${{ github.run_id }}
           restore-keys: ccache-headless-py-
-      # Same configuration as setup_expression_binding in scripts/test-all.sh.
+      # Same configuration as setup_expression_binding in scripts/test-all.sh,
+      # minus the C++ unit tests: the binding target does not need GTest,
+      # which the runner (unlike the development image) does not have.
       - name: Build the expression binding (manyforge_headless_py)
         if: matrix.binding
         run: |
           cmake -S manyforge_headless -B "$HEADLESS_BUILD" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
             -DMANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL=ON \
             -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
             -Dpybind11_DIR="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')"

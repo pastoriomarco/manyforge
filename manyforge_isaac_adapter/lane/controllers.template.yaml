@@ -1,4 +1,4 @@
-# Isaac lane controllers template (CONTRACTS §12; expanded by the generic
+# Isaac lane controllers template (expanded by the generic
 # generator, see manyforge_roboplan/launch_contribution.hpp) of an arm without
 # a vendor adapter (UR10e); a vendor's model (`vendor` in its row) runs the
 # vendor's controllers instead. The values are the Isaac files that ran live

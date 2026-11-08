@@ -1,4 +1,4 @@
-"""io.set_output: one write through the one write path (CONTRACTS §7).
+"""io.set_output: one write through the one write path.
 
 The node makes the same host call as a manual write (`set_io_output` by
 signal id), once: `succeeded` → success; `failed`/`unknown` → failure with
@@ -30,6 +30,8 @@ from manyforge_behavior.production_ports import (
     ProductionPortError,
 )
 
+from .v3_fixtures import signal, target, target_binding
+
 _A = "sha256:" + "a" * 64
 _B = "sha256:" + "b" * 64
 _C = "sha256:" + "c" * 64
@@ -37,10 +39,10 @@ _D = "sha256:" + "d" * 64
 _E = "sha256:" + "e" * 64
 
 
-def _signal(role: str, name: str, direction: str) -> dict[str, str]:
+def _signal_row(name: str, direction: str) -> dict[str, Any]:
     return {
-        "resource_role_id": role,
-        "signal_name": name,
+        "reference": signal("io.1", name),
+        "target": target("io.1", "io.command"),
         "value_type": "bool",
         "direction": direction,
         "transition_capability": "sampled_only",
@@ -49,20 +51,10 @@ def _signal(role: str, name: str, direction: str) -> dict[str, str]:
 
 
 def _context(*, tree: Mapping[str, Any] | None = None):
-    target = {
-        "target_role_id": "cell_io",
-        "component_role_id": "io_module",
-        "controllable_component_id": "io.1",
-        "command_target_id": "io.command",
-        "capability_bindings": [
-            {"capability_id": "io.gpio.get_input", "command_schema": None},
-            {"capability_id": "io.gpio.set_output", "command_schema": None},
-        ],
-        "signal_role_bindings": [
-            _signal("part_present", "di_0", "input"),
-            _signal("valve", "do_0", "output"),
-        ],
-    }
+    io_target = target_binding("io.1", "io.command", [
+        {"capability_id": "io.gpio.get_input", "command_schema": None},
+        {"capability_id": "io.gpio.set_output", "command_schema": None},
+    ])
     return ProgramRunPortContext(
         program_run_id="run.1",
         applied_record_digest=_D,
@@ -80,7 +72,11 @@ def _context(*, tree: Mapping[str, Any] | None = None):
             "program_revision": _A,
             "retained_bundle_id": _B,
             "graph_revision": _C,
-            "target_role_bindings": [target],
+            "target_bindings": [io_target],
+            "signal_bindings": [
+                _signal_row("di_0", "input"),
+                _signal_row("do_0", "output"),
+            ],
         },
         program=(
             {} if tree is None
@@ -127,8 +123,8 @@ def _identity(instance: str = "set-valve") -> NodeAttemptIdentity:
     return NodeAttemptIdentity("run.1", instance, f"attempt:{instance}")
 
 
-def _inputs(value: Any = True, role: str = "valve") -> OwnerNodeInputs:
-    return OwnerNodeInputs({"target_role": "cell_io", "resource_role": role, "value": value})
+def _inputs(value: Any = True, signal_name: str = "do_0") -> OwnerNodeInputs:
+    return OwnerNodeInputs({"signal": signal("io.1", signal_name), "value": value})
 
 
 def _port(transport: _Transport | None = None, context: ProgramRunPortContext | None = None):
@@ -192,21 +188,21 @@ def test_non_boolean_value_is_refused_before_any_write(inputs, error) -> None:
     assert transport.writes == []
 
 
-@pytest.mark.parametrize("role,code", [
-    ("part_present", "io_signal_direction_mismatch"),
+@pytest.mark.parametrize("signal_name,code", [
+    ("di_0", "io_signal_direction_mismatch"),
     ("unknown", "io_signal_unbound"),
 ])
-def test_unwritable_signal_fails_before_any_write(role: str, code: str) -> None:
+def test_unwritable_signal_fails_before_any_write(signal_name: str, code: str) -> None:
     port, transport = _port()
-    result = port.queries.invoke("io.set_output", _identity(), _inputs(role=role))
+    result = port.queries.invoke("io.set_output", _identity(), _inputs(signal_name=signal_name))
     assert not result.succeeded and result.reason_code == code
     assert transport.writes == []
 
 
-def test_run_preparation_refuses_a_literal_input_role_for_an_output() -> None:
+def test_run_preparation_refuses_a_literal_input_signal_for_an_output() -> None:
     tree = {
         "node_id": "io.set_output", "instance_id": "out", "children": [],
-        "parameters": {"target_role": "cell_io", "resource_role": "part_present", "value": True},
+        "parameters": {"signal": signal("io.1", "di_0"), "value": True},
     }
     with pytest.raises(IoSignalRefusedError, match="not an output") as refused:
         _port(context=_context(tree=tree))

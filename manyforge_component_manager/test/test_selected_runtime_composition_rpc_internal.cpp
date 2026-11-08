@@ -150,24 +150,49 @@ TEST(SelectedRuntimeCompositionRpcInternal, HostApplyTimeoutSumsBudgetsOfInstall
   const std::map<std::string, std::int64_t, std::less<>> budgets{
       {"arm.1", 50'000'000'000LL}, {"gripper.1", 3'000'000'000LL}};
   constexpr auto kDefaultMs = kDefaultComponentInstallBudgetNs / 1'000'000;
+  constexpr auto kGraceMs = manyforge::core::kControllerLaunchStopGrace.count();
   // arm.1 is retained; gripper.1 uses its budget, io.1 the default, and the
-  // removed camera.1 (absent from the candidate's budgets) the default.
+  // removed camera.1 (absent from the candidate's budgets) the default; each
+  // of the three adds the host's stop grace.
   EXPECT_EQ(HostApplyTimeout(request, budgets),
-            std::chrono::milliseconds(3'000 + 2 * kDefaultMs));
+            std::chrono::milliseconds(3'000 + 2 * kDefaultMs + 3 * kGraceMs));
   // A remove-only Apply waits for every removed component's stop.
   auto remove_only = request;
   remove_only.components = {ControllableComponentId("arm.1")};
   remove_only.removed_components = {ControllableComponentId("camera.1"),
                                     ControllableComponentId("camera.2")};
   ASSERT_TRUE(remove_only.valid());
-  EXPECT_EQ(HostApplyTimeout(remove_only, budgets), std::chrono::milliseconds(2 * kDefaultMs));
+  EXPECT_EQ(HostApplyTimeout(remove_only, budgets),
+            std::chrono::milliseconds(2 * (kDefaultMs + kGraceMs)));
   // An Apply that installs and removes nothing waits one default budget.
   auto retain_only = remove_only;
   retain_only.removed_components.clear();
   EXPECT_EQ(HostApplyTimeout(retain_only, budgets), std::chrono::milliseconds(kDefaultMs));
 }
 
-// CONTRACTS §11: a component whose launch processes are all drained process
+TEST(SelectedRuntimeCompositionRpcInternal, HostApplyTimeoutCoversALoneHungComponentsRetirement) {
+  // New after a one-arm Scenario whose arm node hangs. The host waits
+  // the stop grace, then SIGKILLs and reaps the group: the bound must exceed
+  // that, or the Manager shuts the execution host down mid-Apply.
+  auto request = HostRequest();
+  request.components = {};
+  request.retained_components = {};
+  request.removed_components = {ControllableComponentId("arm.1")};
+  ASSERT_TRUE(request.valid());
+  const auto bound = HostApplyTimeout(request, {});
+  // Grace, then a kill and reap of a few ms; one default budget of margin.
+  EXPECT_GE(bound, manyforge::core::kControllerLaunchStopGrace +
+                       std::chrono::nanoseconds(kDefaultComponentInstallBudgetNs));
+  // The same for a lone replaced arm (its predecessor launch retires first).
+  auto replace = HostRequest();
+  replace.components = {ControllableComponentId("arm.1")};
+  replace.retained_components = {};
+  replace.removed_components = {};
+  ASSERT_TRUE(replace.valid());
+  EXPECT_GT(HostApplyTimeout(replace, {}), manyforge::core::kControllerLaunchStopGrace);
+}
+
+// A component whose launch processes are all drained process
 // groups (cleanup-proven) is gone and is removed or replaced without a clean
 // Disable. No occurrence, an exited-but-not-drained leader, a live member or a
 // local owner is not gone.

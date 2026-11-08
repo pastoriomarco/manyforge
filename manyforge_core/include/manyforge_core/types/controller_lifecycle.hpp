@@ -194,7 +194,7 @@ struct ControllerLifecycleExpectedBindingDTO final {
          std::tie(rhs.control_binding_id, rhs.control_binding_revision);
 }
 
-/// DX791: selected strict pneumatic none has no physical ROS controller.
+/// Selected strict pneumatic none has no physical ROS controller.
 /// Deployment seals that source case; this is never inferred from empty rows.
 enum class ControllerLifecyclePhysicalExpectation : std::uint8_t {
   kRequired,

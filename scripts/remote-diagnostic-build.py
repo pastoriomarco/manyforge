@@ -80,7 +80,7 @@ def git(source: Path, *args: str) -> bytes:
 
 
 def identity(source: Path) -> dict:
-    helper = Path(__file__).parent / "qualification/source_identity.py"
+    helper = Path(__file__).parent / "lib/source_identity.py"
     result = subprocess.run([sys.executable, str(helper), "--repo-root", str(source)],
                             capture_output=True, text=True)
     if result.returncode:
@@ -411,9 +411,9 @@ def main() -> int:
         tooling = output / Path(__file__).name
         tooling.write_bytes(Path(__file__).read_bytes())
         wrapper_hash = digest(tooling.read_bytes())
-        helper_hash = digest((Path(__file__).parent / "qualification/source_identity.py").read_bytes())
+        helper_hash = digest((Path(__file__).parent / "lib/source_identity.py").read_bytes())
         manifest = snapshot(source, output, args.include_ignored)
-        if digest(Path(__file__).read_bytes()) != wrapper_hash or digest((Path(__file__).parent / "qualification/source_identity.py").read_bytes()) != helper_hash:
+        if digest(Path(__file__).read_bytes()) != wrapper_hash or digest((Path(__file__).parent / "lib/source_identity.py").read_bytes()) != helper_hash:
             raise SnapshotError("Local tooling changed during snapshot")
         worktree_id = source.name + "-" + digest(os.fsencode(source))[:12]
         request = {"remote_root": args.remote_root, "worktree_id": worktree_id, "image": args.image,

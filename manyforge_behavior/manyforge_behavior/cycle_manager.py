@@ -10,7 +10,7 @@ The old singleton cycle-state enum is also absent: its exact historical source
 is blob ``34b644322e6a0a6a8fdd51857a787c4afceb561d`` and its display/test input
 is blob ``4ceccc78f0aaf37347ea72ff583915b8acfbcf59``.  Future state must be an
 owner-issued, resource-addressed projection, not a Python compatibility enum.
-Only spec-460 recovery authoring vocabulary, bounded fault presentation, and
+Only recovery authoring vocabulary, bounded fault presentation, and
 the immediate typed gate remain here.
 """
 
@@ -28,7 +28,6 @@ from manyforge_behavior.fault_taxonomy import (
 CYCLE_MANAGER_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_cycle_manager_unavailable"
 )
-CYCLE_MANAGER_RESTORATION_GATES: Final = ("I6", "N", "I8", "P5")
 
 
 class CycleManagerUnavailableError(RuntimeError):
@@ -36,7 +35,7 @@ class CycleManagerUnavailableError(RuntimeError):
 
 
 class RecoveryTrigger(Enum):
-    """Canonical spec/460 recovery-trigger authoring vocabulary."""
+    """Canonical recovery-trigger authoring vocabulary."""
 
     PLANNING_FAILED = "planning_failed"
     VALIDATION_FAILED = "validation_failed"
@@ -97,13 +96,12 @@ class CycleManager:
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         raise CycleManagerUnavailableError(
             f"{CYCLE_MANAGER_UNAVAILABLE_REASON_CODE}: native cycle requests "
-            "return at I6/N and the single Kernel Stop owner at I8/P5"
+            "are not available"
         )
 
 
 __all__ = [
     "BackendFaultClass",
-    "CYCLE_MANAGER_RESTORATION_GATES",
     "CYCLE_MANAGER_UNAVAILABLE_REASON_CODE",
     "CycleManager",
     "CycleManagerUnavailableError",

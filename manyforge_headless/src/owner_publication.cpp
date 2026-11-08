@@ -880,7 +880,7 @@ CanonicalValue BuildManagerSourcePayload(
        CanonicalValue(CanonicalValue::Object{
            {"canonical_empty", CanonicalValue(canonical_empty)},
            {"cell_graph", *graph},
-           // CP8 step 1: the simulator each ROS-hosted component depends on,
+           // The simulator each ROS-hosted component depends on,
            // derived from the verified bundle (never part of its identity).
            {"component_simulator_dependencies",
             manyforge::deployment::ros2_control_execution_runtime_contract::

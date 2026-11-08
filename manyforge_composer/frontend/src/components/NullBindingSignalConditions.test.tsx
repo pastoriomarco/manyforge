@@ -4,12 +4,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { reactPropsHost } from '../test/reactPropsHost';
 import {
-  TRIAL_E_CONDITION, trialEAssignment, trialEDeployment, trialEProgram,
+  TRIAL_E_CONDITION, trialEDeployment, trialEProgram,
 } from '../testFixtures/mockLite6SignalMoves';
 import type {
   CatalogEntry, DeploymentWorkspaceResponse, JsonValue, ProgramTreeNode,
 } from '../types/api';
-import type { CarriedObjectLostSignalChoice } from '../utils/systemSignalAuthoring';
+import type { ReferenceSelectorFacts } from '../utils/referenceValidation';
 import { ProgramPropertyEditor } from './ProgramPropertyEditor';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -23,8 +23,8 @@ const base: Omit<CatalogEntry, 'id' | 'parameters'> = {
   ownerContext: null, outcomes: {}, eventFamily: null,
 };
 const targetRole = {
-  id: 'target_role', required: true,
-  schema: { type: 'string', 'x-manyforge-semantic-type': 'target_role' },
+  id: 'target', required: true,
+  schema: { type: 'object', 'x-manyforge-semantic-type': 'target_reference' },
   schemaHash: 'sha256:t', hasDefault: false,
 };
 const until: CatalogEntry = { ...base, id: 'motion.move_until_signal', parameters: [
@@ -47,10 +47,42 @@ const workspace = (document: Record<string, JsonValue>) => (
 
 const searchTrip: ProgramTreeNode = {
   node_id: 'motion.move_until_signal', instance_id: 'search_trip', children: [],
-  parameters: { target_role: 'arm', interrupt_condition: TRIAL_E_CONDITION },
+  parameters: {
+    target: { component_id: 'lite6_robot', command_target_id: 'arm' },
+    interrupt_condition: TRIAL_E_CONDITION,
+  },
 };
 
-async function mountSearchTrip(assignment: Record<string, JsonValue> | null) {
+type SignalFact = ReferenceSelectorFacts['signals'][number];
+
+const inputFact = (componentId: string, signalName: string, commandTargetId: string): SignalFact => ({
+  reference: { component_id: componentId, signal_name: signalName }, ambiguous: false,
+  target: { component_id: componentId, command_target_id: commandTargetId },
+  value_type: 'bool', direction: 'input', transition_capability: 'sampled_only',
+  update_mode: 'change_only', liveness: null, provider_profile: 'mock',
+});
+
+type TargetFact = ReferenceSelectorFacts['targets'][number];
+
+const targetFact = (componentId: string, commandTargetId: string): TargetFact => ({
+  target: { component_id: componentId, command_target_id: commandTargetId },
+  capabilities: [], source_joint_names: [], tcp_entries: [], default_tcp: null, stop_routes: [],
+});
+
+/** The qualified Draft candidate's facts for the Trial E Deployment Draft (no binding). */
+const trialEFacts = (extra: SignalFact[] = [], extraTargets: TargetFact[] = []): ReferenceSelectorFacts => ({
+  components: [{ component_id: 'lite6_robot' }, { component_id: 'station_io' }],
+  targets: [targetFact('lite6_robot', 'arm'), targetFact('station_io', 'io'), ...extraTargets],
+  frames: [], bodies: [],
+  signals: [
+    inputFact('station_io', 'curtain_blocked', 'io'),
+    inputFact('station_io', 'edge_sensor', 'io'),
+    inputFact('station_io', 'probe_contact', 'io'),
+    ...extra,
+  ],
+});
+
+async function mountSearchTrip(facts: ReferenceSelectorFacts | null) {
   const { host, find, all } = reactPropsHost();
   // Card panel layout: no frame is ever run and no observer fires here.
   class Observer { observe() {} disconnect() {} }
@@ -64,7 +96,7 @@ async function mountSearchTrip(assignment: Record<string, JsonValue> | null) {
   await act(() => root.render(<ProgramPropertyEditor
     roots={[searchTrip]} selectedId="search_trip" catalogEntries={[until]}
     program={trialEProgram([searchTrip])} deploymentWorkspace={workspace(trialEDeployment())}
-    programRoleAssignment={assignment} busy={false} onMutate={vi.fn()}
+    selectorFacts={facts} busy={false} onMutate={vi.fn()}
     onUpdateNodePolicies={vi.fn()} onInvalidEditChange={onInvalidEditChange}
   />));
   return { find, all, onInvalidEditChange, unmount: () => act(() => root.unmount()) };
@@ -72,84 +104,78 @@ async function mountSearchTrip(assignment: Record<string, JsonValue> | null) {
 
 describe('interrupt conditions with binding null', () => {
   it('resolves the signal from the Draft facts: no invalid edit, operand listed', async () => {
-    const mounted = await mountSearchTrip(trialEAssignment);
+    const mounted = await mountSearchTrip(trialEFacts());
     try {
       expect(mounted.onInvalidEditChange).not.toHaveBeenCalledWith(true);
       expect(mounted.all((props) => props.role === 'alert')).toEqual([]);
       const operand = mounted.find((props) => props['aria-label'] === 'condition operand');
       expect(operand.value).toBe(JSON.stringify(
-        { signal: { resource_role: 'probe_contact', target_role: 'station' } },
+        { signal: { component_id: 'station_io', signal_name: 'probe_contact' } },
       ));
     } finally { await mounted.unmount(); }
     const markup = renderToStaticMarkup(<ProgramPropertyEditor
       roots={[searchTrip]} selectedId="search_trip" catalogEntries={[until]}
       program={trialEProgram([searchTrip])} deploymentWorkspace={workspace(trialEDeployment())}
-      programRoleAssignment={trialEAssignment} busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()}
+      selectorFacts={trialEFacts()} busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()}
     />);
-    expect(markup).toContain('station · probe_contact (probe_contact, input)');
-    expect(markup).not.toContain('is not a bound input signal');
+    expect(markup).toContain('station_io · probe_contact (input)');
+    expect(markup).not.toContain('is not a candidate signal');
   });
 
-  it('keeps the current refusal without a role assignment', async () => {
+  it('keeps the current refusal without qualified Draft facts', async () => {
     const mounted = await mountSearchTrip(null);
     try {
       expect(mounted.onInvalidEditChange).toHaveBeenLastCalledWith(true);
     } finally { await mounted.unmount(); }
   });
 
-  it('lists the generated system input for an assigned required role before Apply', () => {
+  it('lists the generated system input of the qualified Draft candidate before Apply', () => {
+    const operand = { signal: { component_id: 'robot', signal_name: 'carried_object_lost.gripper' } };
     const node: ProgramTreeNode = {
       node_id: 'motion.move_until_signal', instance_id: 'watch_loss', children: [],
-      parameters: { target_role: 'gripper', interrupt_condition: {
-        compare: { operand: { signal: { target_role: 'gripper', resource_role: 'carried_object_lost' } },
-          op: '==', value: true },
-      } },
+      parameters: {
+        target: { component_id: 'robot', command_target_id: 'gripper' },
+        interrupt_condition: { compare: { operand, op: '==', value: true } },
+      },
     };
-    const program = {
-      ...trialEProgram([node]),
-      target_roles: { gripper: { component_role: 'tool', required_resource_roles: ['carried_object_lost'] } },
-    };
-    const assignment = {
-      component_roles: [{ component_role_id: 'tool', controllable_component_id: 'robot' }],
-      target_roles: [{ target_role_id: 'gripper', command_target_id: 'gripper' }],
-    } as unknown as Record<string, JsonValue>;
-    const systemSignal: CarriedObjectLostSignalChoice = {
-      controllableComponentId: 'robot', commandTargetId: 'gripper',
-      signalName: 'carried_object_lost.gripper', resourceRoleId: 'carried_object_lost',
-      direction: 'input', valueType: 'bool', provenance: 'last_apply',
-    };
+    const facts = trialEFacts([inputFact('robot', 'carried_object_lost.gripper', 'gripper')],
+      [targetFact('robot', 'gripper')]);
     const markup = renderToStaticMarkup(<ProgramPropertyEditor
-      roots={[node]} selectedId="watch_loss" catalogEntries={[until]} program={program}
-      deploymentWorkspace={workspace(trialEDeployment())} programRoleAssignment={assignment}
-      systemSignalChoices={[systemSignal]} busy={false} onMutate={vi.fn()}
-      onUpdateNodePolicies={vi.fn()} />);
+      roots={[node]} selectedId="watch_loss" catalogEntries={[until]} program={trialEProgram([node])}
+      deploymentWorkspace={workspace(trialEDeployment())} selectorFacts={facts}
+      busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />);
 
-    expect(markup).toContain('gripper · carried_object_lost (carried_object_lost.gripper, input) · from last Apply');
-    expect(markup).not.toContain('is not a bound input signal');
+    expect(markup).toContain(`<option value="${JSON.stringify(operand).replaceAll('"', '&quot;')}" selected="">`
+      + 'robot · carried_object_lost.gripper (input)</option>');
+    expect(markup).not.toContain('is not a candidate signal');
   });
 
-  it('tells the user to Apply when the current Draft has no deterministic signal table', () => {
-    const markup = renderToStaticMarkup(<ProgramPropertyEditor
+  it('tells the user when the current Draft has no qualified signal table', () => {
+    const render = (facts: ReferenceSelectorFacts | null) => renderToStaticMarkup(<ProgramPropertyEditor
       roots={[searchTrip]} selectedId="search_trip" catalogEntries={[until]}
       program={trialEProgram([searchTrip])} deploymentWorkspace={workspace(trialEDeployment())}
-      programRoleAssignment={trialEAssignment} systemSignalsNeedApply busy={false}
-      onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />);
+      selectorFacts={facts} systemSignalsNeedApply={facts === null}
+      busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />);
 
-    expect(markup).toContain('Apply to list system signals.');
+    expect(render(null)).toContain('Qualified Draft system signals are unavailable.');
+    expect(render(trialEFacts())).not.toContain('Qualified Draft system signals are unavailable.');
   });
 
   it('shows the probe Stop warning through the same resolver', () => {
     const probe: ProgramTreeNode = {
       node_id: 'motion.probe_search', instance_id: 'probe', children: [],
-      parameters: { target_role: 'arm', stop_mode: 'soft_on_path' },
+      parameters: { target: { component_id: 'lite6_robot', command_target_id: 'arm' }, stop_mode: 'soft_on_path' },
     };
-    const render = (assignment: Record<string, JsonValue> | null) => renderToStaticMarkup(<ProgramPropertyEditor
-      roots={[probe]} selectedId="probe" catalogEntries={[probeEntry]} program={trialEProgram([probe])}
-      deploymentWorkspace={workspace(trialEDeployment(true))} programRoleAssignment={assignment}
+    const render = (node: ProgramTreeNode) => renderToStaticMarkup(<ProgramPropertyEditor
+      roots={[node]} selectedId="probe" catalogEntries={[probeEntry]} program={trialEProgram([node])}
+      deploymentWorkspace={workspace(trialEDeployment(true))}
       busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()}
     />);
-    expect(render(trialEAssignment))
+    expect(render(probe))
       .toContain('This probe may finish a short remaining path instead of stopping on contact.');
-    expect(render(null)).not.toContain('This probe may finish a short remaining path');
+    // A target the Deployment Draft does not have resolves no Stop settings.
+    const unresolved = { ...probe, parameters: {
+      ...probe.parameters, target: { component_id: 'other_robot', command_target_id: 'arm' } } };
+    expect(render(unresolved)).not.toContain('This probe may finish a short remaining path');
   });
 });

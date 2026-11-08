@@ -38,7 +38,7 @@ _DIGEST_C = "sha256:" + "c" * 64
 
 def _snapshot(*, state: str = "running") -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.program_run_status.v3",
+        "schema_version": "manyforge.program_run_status.v4",
         "owner_id": "program-runner.cell-a",
         "owner_epoch": "program-runner.epoch.1",
         "run_revision": 1,
@@ -143,7 +143,7 @@ class FakeRuntime:
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]:
         self.calls.append(("runs", (active_only, limit)))
         return {
-            "schema_version": "manyforge.program_run_index.v1",
+            "schema_version": "manyforge.program_run_index.v2",
             "owner_id": "program-runner.cell-a",
             "owner_epoch": "program-runner.epoch.1",
             "active_only": active_only,

@@ -17,7 +17,7 @@ std::unique_ptr<Composition> View(const std::string &component) {
       std::nullopt, std::nullopt);
 }
 
-// H1 (night 2026-11-02): an armed machine's owner has no view of its own; it
+// An armed machine's owner has no view of its own; it
 // rides on its arm member's view, which retains it on a retained Apply.
 TEST(MemberCarriedOwnerIdsTest, NamesOwnersCarriedByAnArmMemberOnly) {
   auto cell = View("uf850_robot");

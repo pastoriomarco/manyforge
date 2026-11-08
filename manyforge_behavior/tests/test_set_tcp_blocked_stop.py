@@ -13,6 +13,18 @@ from manyforge_behavior.production_ports import NativeKernelProgramPort
 
 from .test_executable_node_runtime import _leaf_node, _set_tcp_stop_run
 from .test_production_ports import _context, _Transport
+from .v3_fixtures import frame, target, target_binding
+
+
+def _ur5_context():
+    """The shared port context, rebound to the target the Set TCP run authors."""
+    context = _context()
+    binding = dict(context.program_binding)
+    binding["target_bindings"] = [target_binding("ur5_robot", "arm", [
+        {"capability_id": "execution.trajectory.execute", "command_schema": None},
+    ])]
+    binding["frame_bindings"] = [{"reference": frame("ur5_robot", "tcp")}]
+    return replace(context, program_run_id="run.test", program_binding=binding)
 
 
 @pytest.mark.parametrize("policy", ["hold", "continue"])
@@ -20,8 +32,8 @@ def test_stop_during_blocked_set_tcp_submit_settles_then_obeys_policy(policy):
     entered = Event()
     release = Event()
     confirmed = []
-    rows = [{"component_id": "robot.1", "entry": {
-        "component_id": "robot.1", "target_id": "arm.command", "frame_role_id": "tcp"},
+    rows = [{"component_id": "ur5_robot", "entry": {
+        "target": target("ur5_robot", "arm"), "frame": frame("ur5_robot", "tcp")},
         "owner_epoch": "kernel.epoch.7", "registration_generation": 1, "sequence": 1}]
 
     class BlockingSubmit(_Transport):
@@ -41,7 +53,7 @@ def test_stop_during_blocked_set_tcp_submit_settles_then_obeys_policy(policy):
         KernelClient(transport),
         active_tcp_result=lambda run, robot, value: confirmed.append((run, robot, deepcopy(value))),
     )
-    port.bind(replace(_context(), program_run_id="run.test"))
+    port.bind(_ur5_context())
     run = _set_tcp_stop_run(policy=policy, task=port.operations)
     outcomes = []
     errors = []
@@ -68,7 +80,7 @@ def test_stop_during_blocked_set_tcp_submit_settles_then_obeys_policy(policy):
         worker.join(5)
     assert not worker.is_alive()
     assert errors == []
-    assert confirmed[0] == ("run.test", "robot.1", rows)
+    assert confirmed[0] == ("run.test", "ur5_robot", rows)
     assert _leaf_node(run, "first").status is py_trees.common.Status.SUCCESS
     assert transport.controls == []
     if policy == "hold":

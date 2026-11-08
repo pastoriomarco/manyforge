@@ -7,6 +7,7 @@ import type { JsonValue, SourceModelProjection } from '../types/api';
 import type { ManualControlGripperDescriptor } from '../types/robotControl';
 import { api } from '../api/client';
 import { DeploymentFocusedEditor, geometricContactRobotOptions } from './DeploymentFocusedEditor';
+import { DraftInputResetProvider } from './common/DraftInputs';
 import { statusFixture } from '../testFixtures/robotControl';
 
 const digest = `sha256:${'1'.repeat(64)}`;
@@ -103,6 +104,8 @@ function controller(
       savedScenarioCandidates: [],
       unavailableReasons: [],
     },
+    deploymentDraftInputResetEpoch: 0,
+    scenarioDraftInputResetEpoch: 0,
     loading: false,
     busy: false,
     applying: false,
@@ -165,6 +168,7 @@ function rosGripperController(
 type FakeNode = Record<string, unknown>;
 type Props = Record<string, unknown> & {
   onChange?: (event: unknown) => void;
+  onBlur?: (event: unknown) => void;
   onClick?: () => void;
 };
 function mountedHost() {
@@ -181,6 +185,8 @@ function mountedHost() {
       addEventListener: () => undefined, removeEventListener: () => undefined,
       appendChild: () => undefined, insertBefore: () => undefined, removeChild: () => undefined,
       setAttribute: () => undefined, removeAttribute: () => undefined,
+      focus: () => { document.activeElement = element; },
+      blur: () => { document.activeElement = null; },
     };
     elements.push(element);
     return element;
@@ -192,14 +198,23 @@ function mountedHost() {
   vi.stubGlobal('window', window);
   vi.stubGlobal('document', document);
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
-  const find = (match: (props: Props) => boolean) => {
-    const found = elements.map((element) => element[
-      Object.keys(element).find((key) => key.startsWith('__reactProps$'))!
-    ] as Props | undefined).find((props) => props !== undefined && match(props));
+  const propsFor = (element: FakeNode): Props | undefined => element[
+    Object.keys(element).find((key) => key.startsWith('__reactProps$'))!
+  ] as Props | undefined;
+  const findElement = (match: (props: Props) => boolean) => {
+    const found = elements.find((element) => {
+      const props = propsFor(element);
+      return props !== undefined && match(props);
+    });
     if (found === undefined) throw new Error('Mounted control not found');
     return found;
   };
-  return { host: node('div'), find };
+  const find = (match: (props: Props) => boolean) => {
+    const found = propsFor(findElement(match));
+    if (found === undefined) throw new Error('Mounted control not found');
+    return found;
+  };
+  return { host: node('div'), find, findElement };
 }
 
 async function mountGripper(
@@ -207,7 +222,11 @@ async function mountGripper(
   outputMode: 'commanded' | 'none' = 'commanded',
   timeoutSource?: JsonValue,
   pneumaticIo?: JsonValue,
-  { scenarioTool = false, graspConfirmation }: { scenarioTool?: boolean; graspConfirmation?: JsonValue } = {},
+  { scenarioTool = false, graspConfirmation, stopFinishTolerance }: {
+    scenarioTool?: boolean;
+    graspConfirmation?: JsonValue;
+    stopFinishTolerance?: number;
+  } = {},
 ) {
   const value = rosGripperController(actuationKind, outputMode);
   const graph = value.workspace!.draft.document!.graph as Record<string, JsonValue>;
@@ -217,6 +236,7 @@ async function mountGripper(
   if (timeoutSource !== undefined) sourceRow.delivery_result_timeout_s = timeoutSource;
   if (pneumaticIo !== undefined) sourceRow.pneumatic_io = pneumaticIo;
   if (graspConfirmation !== undefined) sourceRow.grasp_confirmation = graspConfirmation;
+  if (stopFinishTolerance !== undefined) sourceRow.stop_finish_tolerance = stopFinishTolerance;
   if (scenarioTool) {
     // A Scenario Draft: the gripper row sits on a tool component mounted on
     // the robot flange, nested under runtime_configuration.
@@ -251,25 +271,42 @@ async function mountGripper(
       { name: 'open', masterPosition: 0.04, coordinates: [] },
     ],
   };
-  const { host, find } = mountedHost();
+  const { host, find, findElement } = mountedHost();
+  const resetKeys = { scenario: 0, program: 0, deployment: 0 };
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(host as unknown as Element);
-  await act(() => root.render(<DeploymentFocusedEditor controller={value}
-    sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[descriptor]} />));
+  const render = () => root.render(
+    <DraftInputResetProvider scope="scenario" resetKey={resetKeys.scenario}>
+      <DraftInputResetProvider scope="program" resetKey={resetKeys.program}><span /></DraftInputResetProvider>
+      <DraftInputResetProvider scope="deployment" resetKey={resetKeys.deployment}>
+        <DeploymentFocusedEditor controller={value}
+          sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[descriptor]} />
+      </DraftInputResetProvider>
+    </DraftInputResetProvider>,
+  );
+  await act(() => render());
   const field = (label: string) => {
     const row = find((props) => props.className === 'deployment-focused-field' && Array.isArray(props.children)
       && (props.children[0] as { props?: Props })?.props?.children === label);
     return (row.children as Array<{ props: Props }>)[1].props;
   };
-  const duration = () => (field(field('Actuation kind').value === 'pneumatic'
-    ? 'Program dwell' : 'Motion time').children as Array<{ props: Props }>)[0].props;
-  const setDuration = (durationS: number) => act(() => duration().onChange?.({
-    target: { value: String(durationS) },
-  }));
-  const update = () => act(() => {
-    find((props) => props.children === 'Update gripper Draft').onClick?.();
+  const duration = () => find((props) => props['aria-label'] === (
+    field('Actuation kind').value === 'pneumatic' ? 'Program dwell' : 'Motion time'
+  ));
+  const setDuration = (durationS: number) => act(() => {
+    const input = duration();
+    (input.onFocus as ((event: unknown) => void) | undefined)?.({ target: { value: String(durationS) } });
+    input.onChange?.({ target: { value: String(durationS) } });
   });
-  return { value, sourceRow, find, field, duration, setDuration, update,
+  const update = () => act(() => (
+    (duration().onBlur as (() => void) | undefined)?.()
+  ));
+  const reset = (scope: keyof typeof resetKeys) => act(() => {
+    resetKeys[scope] += 1;
+    render();
+  });
+  return { value, sourceRow, find, findElement, field, duration, setDuration, update, reset,
+    rerender: () => act(() => render()),
     unmount: () => act(() => root.unmount()) };
 }
 
@@ -322,7 +359,6 @@ describe('DeploymentFocusedEditor', () => {
       expect(find((props) => [props.children].flat().join('') === 'old_robot (not currently listed)')).toBeDefined();
       expect(find((props) => props.value === 'robot')).toBeDefined();
       await act(() => robot.onChange?.({ target: { value: 'robot' } }));
-      await act(() => find((props) => props.children === 'Update I/O Draft').onClick?.());
       expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
         ['graph', 'runtime_units', 0, 'configuration', 'io_signals'], 'set',
         [expect.objectContaining({ provider: expect.objectContaining({ robot_component_id: 'robot' }) })],
@@ -339,8 +375,8 @@ describe('DeploymentFocusedEditor', () => {
       await mounted.setDuration(0.25);
       await mounted.update();
       expect(mounted.value.mutate).toHaveBeenLastCalledWith(
-        ['components', 1, 'configuration', 'runtime_configuration', 'gripper_target_configurations', 0],
-        'set', { ...mounted.sourceRow, command_duration_s: 0.25 },
+        ['components', 1, 'configuration', 'runtime_configuration', 'gripper_target_configurations', 0, 'command_duration_s'],
+        'set', 0.25,
       );
       expect(mounted.sourceRow.controllable_component_id).toBe('lite_gripper');
     } finally { await mounted.unmount(); }
@@ -356,15 +392,15 @@ describe('DeploymentFocusedEditor', () => {
         await mounted.setDuration(0.25);
         await mounted.update();
         expect(mounted.value.mutate).toHaveBeenLastCalledWith(
-          ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
-          'set', { ...mounted.sourceRow, command_duration_s: 0.25 },
+          ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0, 'command_duration_s'],
+          'set', 0.25,
         );
         const otherMode = mode === 'none' ? 'commanded' : 'none';
         await act(() => mounted.field('Output').onChange?.({ target: { value: otherMode } }));
         await mounted.update();
         expect(mounted.value.mutate).toHaveBeenLastCalledWith(
-          ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
-          'set', { ...mounted.sourceRow, output_mode: otherMode, command_duration_s: 0.25 },
+          ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0, 'output_mode'],
+          'set', otherMode,
         );
       } finally { await mounted.unmount(); }
     },
@@ -385,8 +421,8 @@ describe('DeploymentFocusedEditor', () => {
       await mounted.setDuration(0.25);
       await mounted.update();
       expect(mounted.value.mutate).toHaveBeenLastCalledWith(
-        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
-        'set', { ...mounted.sourceRow, command_duration_s: 0.25 },
+        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0, 'command_duration_s'],
+        'set', 0.25,
       );
     } finally { await mounted.unmount(); }
   });
@@ -399,8 +435,8 @@ describe('DeploymentFocusedEditor', () => {
         await mounted.setDuration(0.25);
         await mounted.update();
         expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
-          ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
-          'set', { ...mounted.sourceRow, command_duration_s: 0.25 },
+          ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0, 'command_duration_s'],
+          'set', 0.25,
         );
       } finally { await mounted.unmount(); }
     },
@@ -410,8 +446,6 @@ describe('DeploymentFocusedEditor', () => {
     const mounted = await mountGripper('pneumatic', 'commanded', 2.5);
     try {
       await act(() => mounted.field('Actuation kind').onChange?.({ target: { value: 'position_commanded' } }));
-      expect(mounted.field('Motion time')).toBeDefined();
-      await mounted.update();
       const positionRow = { ...mounted.sourceRow };
       delete positionRow.delivery_result_timeout_s;
       expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
@@ -441,45 +475,28 @@ describe('DeploymentFocusedEditor', () => {
     } finally { await mounted.unmount(); }
   });
 
-  it.each([0, 0.8])('writes explicit pneumatic no-output with dwell %s', async (duration) => {
+  it.each([0, 0.7])('writes pneumatic no-output and dwell %s as separate valid fields', async (duration) => {
     const mounted = await mountGripper('pneumatic');
     try {
       expect(mounted.field('Output').value).toBe('commanded');
       await act(() => mounted.field('Output').onChange?.({ target: { value: 'none' } }));
       await mounted.setDuration(duration);
       await mounted.update();
-      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
-        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
-        'set', expect.objectContaining({ output_mode: 'none', actuation_kind: 'pneumatic',
-          command_duration_s: duration, open_state_ref: 'open', closed_state_ref: 'closed',
-          mount_frame: 'tool0', tcp_frame: 'tool0' }),
-      );
-      await act(() => mounted.field('Output').onChange?.({ target: { value: 'commanded' } }));
-      // Keep the duration changed from the owner's row so the Draft write is requested.
-      await mounted.setDuration(0.1);
-      await mounted.update();
-      expect(mounted.value.mutate).toHaveBeenLastCalledWith(
-        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
-        'set', expect.objectContaining({ output_mode: 'commanded', command_duration_s: 0.1 }),
-      );
+      expect(mounted.value.mutate).toHaveBeenNthCalledWith(1,
+        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0, 'output_mode'], 'set', 'none');
+      expect(mounted.value.mutate).toHaveBeenNthCalledWith(2,
+        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0, 'command_duration_s'], 'set', duration);
     } finally { await mounted.unmount(); }
   });
 
-  it('requires explicit commanded output after changing pneumatic-none to position', async () => {
+  it('rejects a position switch while pneumatic output is still none', async () => {
     const mounted = await mountGripper('pneumatic', 'none');
     try {
       await act(() => mounted.field('Actuation kind').onChange?.({ target: { value: 'position_commanded' } }));
       expect(mounted.field('Output').value).toBe('none');
-      await mounted.update();
       expect(mounted.value.mutate).not.toHaveBeenCalled();
       expect(mounted.find((props) => props.role === 'alert').children)
         .toBe('No output is available only for pneumatic grippers.');
-      await act(() => mounted.field('Output').onChange?.({ target: { value: 'commanded' } }));
-      await mounted.update();
-      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
-        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
-        'set', expect.objectContaining({ output_mode: 'commanded', actuation_kind: 'position_commanded' }),
-      );
     } finally { await mounted.unmount(); }
   });
 
@@ -506,40 +523,91 @@ describe('DeploymentFocusedEditor', () => {
   ] as const)('validates %s duration %s before Draft mutation', async (kind, duration, valid) => {
     const mounted = await mountGripper(kind);
     try {
-      expect(mounted.duration().min).toBe(kind === 'pneumatic' ? '0' : '0.000001');
-      expect(mounted.duration().max).toBe('60');
+      expect(mounted.duration().min).toBe(kind === 'pneumatic' ? 0 : 0.000001);
+      expect(mounted.duration().max).toBe(60);
       await mounted.setDuration(duration);
       await mounted.update();
       if (valid) {
-        expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
-          ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
-          'set',
-          expect.objectContaining({ actuation_kind: kind, command_duration_s: duration }),
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
+          ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0, 'command_duration_s'],
+          'set', duration,
         );
       } else {
         expect(mounted.value.mutate).not.toHaveBeenCalled();
         expect(mounted.find((props) => props.role === 'alert').children).toContain(
-          kind === 'pneumatic' ? 'from 0 to 60 s' : 'above 0 and at most 60 s',
+          Number.isFinite(duration)
+            ? kind === 'pneumatic' ? 'from 0 to 60 s' : 'above 0 and at most 60 s'
+            : 'Enter a valid motion time.',
         );
       }
     } finally { await mounted.unmount(); }
   });
 
-  it('revalidates zero dwell when the authored actuation kind changes', async () => {
+  it('keeps zero pneumatic dwell when a position switch would make it invalid', async () => {
     const mounted = await mountGripper('pneumatic');
     try {
       await mounted.setDuration(0);
-      await act(() => mounted.field('Actuation kind').onChange?.({ target: { value: 'position_commanded' } }));
-      expect(mounted.duration().min).toBe('0.000001');
-      await mounted.update();
-      expect(mounted.value.mutate).not.toHaveBeenCalled();
-      await act(() => mounted.field('Actuation kind').onChange?.({ target: { value: 'pneumatic' } }));
-      expect(mounted.duration().min).toBe('0');
       await mounted.update();
       expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
-        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
-        'set', expect.objectContaining({ actuation_kind: 'pneumatic', command_duration_s: 0 }),
+        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0, 'command_duration_s'],
+        'set', 0,
       );
+      const nextDocument = JSON.parse(JSON.stringify(mounted.value.workspace!.draft.document)) as JsonValue;
+      const graph = (nextDocument as Record<string, JsonValue>).graph as Record<string, JsonValue>;
+      const runtime = (graph.runtime_units as Array<Record<string, JsonValue>>)[0];
+      const configuration = runtime.configuration as Record<string, JsonValue>;
+      const row = (configuration.gripper_target_configurations as Array<Record<string, JsonValue>>)[0];
+      row.command_duration_s = 0;
+      mounted.value.workspace!.draft.document = nextDocument as Record<string, JsonValue>;
+      await mounted.rerender();
+      await act(() => mounted.field('Actuation kind').onChange?.({ target: { value: 'position_commanded' } }));
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0, 'command_duration_s'],
+        'set', 0,
+      );
+      expect(mounted.duration().min).toBe(0);
+      expect(mounted.find((props) => props.role === 'alert').children)
+        .toContain('motion time above 0');
+    } finally { await mounted.unmount(); }
+  });
+
+  it('clears Stop finish tolerance text and validation on its scoped reset without blurring', async () => {
+    const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+      { stopFinishTolerance: 0.018 });
+    const stopInput = () => (
+      (mounted.field('Stop finish tolerance').children as Array<{ props: Props }>)[0].props
+    );
+    try {
+      const input = stopInput();
+      const element = mounted.findElement((props) => props === input);
+      (element.focus as () => void)();
+      await act(() => stopInput().onChange?.({ target: { value: '-1' } }));
+      await act(() => stopInput().onBlur?.({}));
+      expect(stopInput().value).toBe('-1');
+      expect(stopInput()['aria-invalid']).toBe(true);
+      expect(mounted.find((props) => props.role === 'alert').children)
+        .toBe('Stop finish tolerance must be a number of 0 or more.');
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
+
+      // A no-op/failed reset and a Program-scoped reset do not clear this Deployment edit.
+      await mounted.rerender();
+      await mounted.reset('program');
+      expect(stopInput().value).toBe('-1');
+      expect(stopInput()['aria-invalid']).toBe(true);
+      expect(mounted.find((props) => props.role === 'alert').children)
+        .toBe('Stop finish tolerance must be a number of 0 or more.');
+      expect(mounted.findElement((props) => props === stopInput())).toBe(element);
+      expect((element.ownerDocument as FakeNode).activeElement).toBe(element);
+
+      // The Deployment reset epoch clears the invalid draft even though its
+      // Stop finish tolerance backing value remains 0.018.
+      await mounted.reset('deployment');
+      expect(stopInput().value).toBe('0.018');
+      expect(stopInput()['aria-invalid']).not.toBe(true);
+      expect(() => mounted.find((props) => props.role === 'alert')).toThrow('Mounted control not found');
+      expect(mounted.findElement((props) => props === stopInput())).toBe(element);
+      expect((element.ownerDocument as FakeNode).activeElement).toBe(element);
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
     } finally { await mounted.unmount(); }
   });
 
@@ -627,7 +695,7 @@ describe('DeploymentFocusedEditor', () => {
     } finally { await act(() => root.unmount()); }
   });
 
-  // CONTRACTS §11: fields show the backend's effective value and default;
+  // Fields show the backend's effective value and default;
   // writing adds the field, Reset to default removes it. The GUI holds no default.
   function robotDocument(configuration: Record<string, JsonValue>): Record<string, JsonValue> {
     return {
@@ -795,7 +863,7 @@ describe('DeploymentFocusedEditor', () => {
     try {
       const select = () => unset.find((props) => props['aria-label'] === 'Motion timing');
       expect(select().value).toBe('smooth');
-      expect(unset.find((props) => props.children === 'Smooth (slower, M8-style)').value).toBe('smooth');
+      expect(unset.find((props) => props.children === 'Smooth (slower)').value).toBe('smooth');
       expect(unset.find((props) => props.children === 'Fast (near the TCP speed limit)').value).toBe('fast');
       expect(() => unset.find((props) => props['aria-label'] === 'Reset Motion timing to default')).toThrow();
       await act(() => select().onChange?.({ target: { value: 'fast' } }));
@@ -1011,7 +1079,7 @@ describe('DeploymentFocusedEditor', () => {
     expect(markup).toContain('Execution host configuration');
     expect(markup).not.toContain('TF frame prefix');
     expect(markup).not.toContain('Applying a change restarts this robot holding.');
-    // Effective-value fields wait for the backend's values (CONTRACTS §11).
+    // Effective-value fields wait for the backend's values.
     expect(markup).not.toContain('Execution cadence');
     expect(markup).toContain('Controlled Stop jerk limits');
     // The target is described and has a limit, but a Scenario component's
@@ -1176,8 +1244,8 @@ describe('DeploymentFocusedEditor', () => {
     let markup = render();
     expect(markup).toContain('robot · arm');
     expect(markup.match(/>robot · arm<\/option>/g)).toHaveLength(1);
-    // Q51: absent, the robot's own deadline to start braking is its
-    // deceleration time + 0.5 s; the Stop then finishes like a motion (M6).
+    // Absent, the robot's own deadline to start braking is its
+    // deceleration time + 0.5 s; the Stop then finishes like a motion.
     expect(markup).toContain('Explicit maximum Stop time');
     expect(markup).toContain(
       'Automatic: 1.5 s (deceleration time + 0.5 s) to start braking; the Stop then finishes like a normal motion, when the controller reports it.',
@@ -1250,7 +1318,7 @@ describe('DeploymentFocusedEditor', () => {
         controller={controller()}
         sourceModel={{ status: 'loading' }}
         motionDescriptors={[{
-          schemaVersion: 'manyforge.manual_control_motion_descriptor.v6',
+          schemaVersion: 'manyforge.manual_control_motion_descriptor.v8',
           ordinaryJerk: { enabled: false, presetReferenceTimeS: 1, jointLimits: [{
             sourceJointName: 'joint1', source: 'off', maximumRadS3: null,
             presetRadS3: 12,
@@ -1258,8 +1326,6 @@ describe('DeploymentFocusedEditor', () => {
           controllableComponentId: 'robot',
           endEffectorComponentId: null,
           commandTargetId: 'arm',
-          componentRoleId: 'robot',
-          targetRoleId: 'arm',
           frames: [],
           tcps: [],
           joints: [{
@@ -1337,9 +1403,8 @@ describe('DeploymentFocusedEditor', () => {
         sourceModel={{ status: 'loading' }}
         motionDescriptors={[]}
         gripperDescriptors={[{
-          schemaVersion: 'manyforge.manual_control_gripper_descriptor.v3',
+          schemaVersion: 'manyforge.manual_control_gripper_descriptor.v5',
           controllableComponentId: 'robot', commandTargetId: 'gripper',
-          componentRoleId: 'robot', targetRoleId: 'gripper',
           description: 'Native test gripper', commandKind: 'gripper_position',
           actuationKind: 'position_commanded', transportKind: 'resolved_binding',
           outputMode: 'commanded',
@@ -1371,9 +1436,9 @@ describe('DeploymentFocusedEditor', () => {
     expect(markup).toContain('Native test gripper');
     expect(markup).toContain('goal fenced target reached');
     expect(markup).toContain('binding feedback required');
-    expect(markup).toContain('Update gripper Draft');
+    expect(markup).not.toContain('Update gripper Draft');
     expect(markup).toContain('finger_link');
-    // Streams show their freshness budget only (CONTRACTS §7: no severity or recovery).
+    // Streams show their freshness budget only (no severity or recovery).
     expect(markup).toContain('<legend>Gripper feedback</legend><p class="muted">Default: 1000 ms</p>');
   });
 });
@@ -1381,13 +1446,17 @@ describe('DeploymentFocusedEditor', () => {
 describe('Grasp confirmation on the gripper settings', () => {
   const rowPath = ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0];
   const graspPath = [...rowPath, 'grasp_confirmation'];
-  type InputProps = Props & { onBlur?: () => void; onKeyDown?: (event: unknown) => void };
+  type InputProps = Props & { onFocus?: (event: unknown) => void; onBlur?: () => void; onKeyDown?: (event: unknown) => void };
   const windowInput = (mounted: Awaited<ReturnType<typeof mountGripper>>, label: string) => (
-    mounted.field(label).children as Array<{ props: InputProps }>
-  )[0].props;
+    (mounted.field(label).children as Array<{ props: InputProps }>)[0].props
+  );
   // Types one limit, then leaves the field (blur commits, as in NumberDraft).
   const typeLimit = async (mounted: Awaited<ReturnType<typeof mountGripper>>, label: string, value: string) => {
-    await act(() => windowInput(mounted, label).onChange?.({ target: { value } }));
+    await act(() => {
+      const input = windowInput(mounted, label);
+      input.onFocus?.({ target: { value } });
+      input.onChange?.({ target: { value } });
+    });
     await act(() => windowInput(mounted, label).onBlur?.());
   };
   const setWindow = async (mounted: Awaited<ReturnType<typeof mountGripper>>, min: string, max: string) => {
@@ -1411,6 +1480,40 @@ describe('Grasp confirmation on the gripper settings', () => {
         .toThrow('Mounted control not found');
       expect(() => mounted.find((props) => props.children === 'Discard grasp confirmation edits'))
         .toThrow('Mounted control not found');
+    } finally { await mounted.unmount(); }
+  });
+
+  it('clears an invalid stall window on its scoped reset without blurring', async () => {
+    const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
+    const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+      { graspConfirmation: authored });
+    try {
+      const input = windowInput(mounted, 'Stall window min');
+      const element = mounted.findElement((props) => props === input);
+      (element.focus as () => void)();
+      await act(() => windowInput(mounted, 'Stall window min').onChange?.({ target: { value: '0.04' } }));
+      await act(() => windowInput(mounted, 'Stall window min').onBlur?.({}));
+      expect(windowInput(mounted, 'Stall window min').value).toBe('0.04');
+      expect(windowInput(mounted, 'Stall window min')['aria-invalid']).toBe(true);
+      expect(alert(mounted)).toBe('The stall window minimum must not exceed its maximum.');
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
+
+      // A no-op/failed reset and a Program-scoped reset leave the Deployment
+      // form and its validation alone while the backing value is unchanged.
+      await mounted.rerender();
+      await mounted.reset('program');
+      expect(windowInput(mounted, 'Stall window min').value).toBe('0.04');
+      expect(alert(mounted)).toBe('The stall window minimum must not exceed its maximum.');
+      expect(mounted.findElement((props) => props === windowInput(mounted, 'Stall window min'))).toBe(element);
+      expect((element.ownerDocument as FakeNode).activeElement).toBe(element);
+
+      await mounted.reset('deployment');
+      expect(windowInput(mounted, 'Stall window min').value).toBe('0.005');
+      expect(windowInput(mounted, 'Stall window min')['aria-invalid']).not.toBe(true);
+      noAlert(mounted);
+      expect(mounted.findElement((props) => props === windowInput(mounted, 'Stall window min'))).toBe(element);
+      expect((element.ownerDocument as FakeNode).activeElement).toBe(element);
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
     } finally { await mounted.unmount(); }
   });
 
@@ -1438,7 +1541,11 @@ describe('Grasp confirmation on the gripper settings', () => {
     const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
       { graspConfirmation: authored });
     try {
-      await act(() => windowInput(mounted, 'Stall window max').onChange?.({ target: { value: '0.02' } }));
+      await act(() => {
+        const input = windowInput(mounted, 'Stall window max');
+        input.onFocus?.({ target: { value: '0.02' } });
+        input.onChange?.({ target: { value: '0.02' } });
+      });
       expect(mounted.value.mutate).not.toHaveBeenCalled();
       const blur = vi.fn(() => windowInput(mounted, 'Stall window max').onBlur?.());
       await act(() => windowInput(mounted, 'Stall window max').onKeyDown?.({ key: 'Enter', currentTarget: { blur } }));
@@ -1454,7 +1561,11 @@ describe('Grasp confirmation on the gripper settings', () => {
     const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
       { graspConfirmation: authored });
     try {
-      await act(() => windowInput(mounted, 'Stall window min').onChange?.({ target: { value: '' } }));
+      await act(() => {
+        const input = windowInput(mounted, 'Stall window min');
+        input.onFocus?.({ target: { value: '' } });
+        input.onChange?.({ target: { value: '' } });
+      });
       await act(() => windowInput(mounted, 'Stall window min').onKeyDown?.({ key: 'Escape', currentTarget: { blur: vi.fn() } }));
       expect(windowInput(mounted, 'Stall window min').value).toBe('0.005');
       await act(() => windowInput(mounted, 'Stall window min').onBlur?.());
@@ -1495,7 +1606,7 @@ describe('Grasp confirmation on the gripper settings', () => {
     } finally { await mounted.unmount(); }
   });
 
-  it('selecting Off always writes Off, dropping an incomplete or invalid window (SX-607)', async () => {
+  it('selecting Off always writes Off, dropping an incomplete or invalid window', async () => {
     const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
     for (const [min, max] of [['', '0.03'], ['0.04', '0.005']]) {
       const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
@@ -1589,7 +1700,7 @@ describe('Grasp confirmation on the gripper settings', () => {
     } finally { await mounted.unmount(); }
   });
 
-  it('carries the authored field through an unrelated gripper edit', async () => {
+  it('writes a valid gripper field directly without resubmitting the row', async () => {
     const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
     const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
       { graspConfirmation: authored });
@@ -1597,7 +1708,7 @@ describe('Grasp confirmation on the gripper settings', () => {
       await mounted.setDuration(0.25);
       await mounted.update();
       expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
-        rowPath, 'set', { ...mounted.sourceRow, command_duration_s: 0.25, grasp_confirmation: authored },
+        [...rowPath, 'command_duration_s'], 'set', 0.25,
       );
     } finally { await mounted.unmount(); }
   });

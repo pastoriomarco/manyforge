@@ -416,8 +416,8 @@ def test_client_accepts_unchanged_sample_with_unchanged_projection(
 def test_client_rejects_noncanonical_and_duplicate_responses(tmp_path: Path) -> None:
     for index, response in enumerate(
         (
-            b'{"api_version": "manyforge.manager_command_response.v1","ok":true}',
-            b'{"api_version":"manyforge.manager_command_response.v1",'
+            b'{"api_version": "manyforge.manager_command_response.v2","ok":true}',
+            b'{"api_version":"manyforge.manager_command_response.v2",'
             b'"ok":true,"ok":true}',
         )
     ):
@@ -597,3 +597,50 @@ def test_observation_intent_and_sequence_are_strict_and_bounded(
             intent=intent,
         )
     server.close()
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_manager_scene_runtime_validates_optional_reference_payload(
+    tmp_path: Path, malformed: bool
+) -> None:
+    socket_path = tmp_path / "manager-command.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    server.bind(str(socket_path))
+    os.chmod(socket_path, 0o600)
+    server.listen(1)
+    error = {
+        "code": "program_reference_validation_failed",
+        "message": "Invalid references",
+        "reference_validation": {
+            "diagnostics": [{"code": "missing_reference", "location": {
+                "document": "program", "path": "/nodes/0",
+                "node_instance_id": "node.1", "parameter": "robot",
+            }, "payload": {"component_id": "missing.1"}}],
+            "total_count": 1,
+            "truncated": malformed,
+        },
+    }
+
+    def serve() -> None:
+        connection, _ = server.accept()
+        with connection:
+            connection.recv(4096)
+            connection.send(rfc8785.dumps({
+                "api_version": "manyforge.manager_command_response.v2",
+                "error": error,
+                "ok": False,
+            }))
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    try:
+        with pytest.raises(SceneRuntimeManagerError) as raised:
+            ManagerSceneRuntimeClient(tmp_path).read_owner()
+        assert raised.value.code == (
+            "manager_scene_runtime_response_invalid" if malformed
+            else "program_reference_validation_failed"
+        )
+    finally:
+        server.close()
+        worker.join(timeout=2)
+    assert not worker.is_alive()

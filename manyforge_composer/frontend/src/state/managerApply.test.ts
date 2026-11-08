@@ -18,7 +18,7 @@ function status(
 ): ManagerApplyStatus {
   const failed = state === 'failed' || state === 'unknown_effect';
   return {
-    apiVersion: 'manyforge.manager_command_response.v1',
+    apiVersion: 'manyforge.manager_command_response.v2',
     applyGeneration: 2,
     applyId: 'apply-2',
     candidateProjectionRevision: state === 'succeeded' ? {

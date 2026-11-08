@@ -1,5 +1,7 @@
 #pragma once
 
+#include <manyforge_core/types/program_reference.hpp>
+
 #include <manyforge_core/types/geometry.hpp>
 #include <manyforge_core/types/planner_settings.hpp>
 #include <manyforge_core/types/robot_defaults.generated.hpp>
@@ -20,7 +22,7 @@ enum class MotionTargetModeDTO {
   kRelative,
 };
 
-/// Joint goal for motion planning (spec §4.1)
+/// Joint goal for motion planning
 struct JointGoalDTO {
   /// Exact source-local URDF joint names, scoped by the enclosing target role.
   /// These are authoring semantics, not generated runtime names.
@@ -39,98 +41,66 @@ struct ResolvedJointGoalDTO {
   friend bool operator==(const ResolvedJointGoalDTO&, const ResolvedJointGoalDTO&) = default;
 };
 
-/// Pose goal for motion planning (spec §4.2)
+/// Pose goal for motion planning
 struct PoseGoalDTO {
   Pose3DTO goal;  // expressed in base_frame
   friend bool operator==(const PoseGoalDTO&, const PoseGoalDTO&) = default;
 };
 
-/// Named target reference (spec §4.3)
+/// Named target reference
 struct NamedTargetDTO {
   std::string name;
   friend bool operator==(const NamedTargetDTO&, const NamedTargetDTO&) = default;
 };
 
-using ReferenceIdentityDTO = std::variant<std::monostate, FrameRoleId, CollisionBodyRoleId,
+using ReferenceIdentityDTO = std::variant<std::monostate, ProgramFrameReferenceDTO,
+                                          ProgramCollisionBodyReferenceDTO,
                                           SceneResourceId, RuntimeObjectId>;
 
-/// Exact robot qualifier for a frame-role reference. The portable target role
-/// is the Program authoring identity; the controllable component and command
-/// target are its exact Program-Binding resolution, verified by the owner that
-/// admits the reference. Absence means the moving participant's own target, so
-/// an own-robot frame never aliases an identically named frame on another robot.
-struct ReferenceTargetDTO {
-  TargetRoleId target_role_id;
-  ControllableComponentId controllable_component_id;
-  CommandTargetId command_target_id;
-
-  [[nodiscard]] bool complete() const noexcept {
-    return !target_role_id.empty() && !controllable_component_id.empty() &&
-           !command_target_id.empty();
-  }
-
-  friend bool operator==(const ReferenceTargetDTO&, const ReferenceTargetDTO&) = default;
-};
-
-/// Portable, target-scoped reference or inline base-frame pose (spec §4.4).
-/// The enum and strong identity are deliberately redundant so malformed wire
-/// values cannot reinterpret a frame role as a scene resource.
+/// A direct component reference, Scene identity or inline pose.
 struct ReferenceDTO {
   enum class Type {
-    kFrameRole,
-    kComponentBodyRole,
+    kComponentFrame,
+    kComponentBody,
     kSceneResource,
     kRuntimeObject,
     kPose,
-    /// The retained cell frame. Carries no identity and no pose.
     kCellFrame,
   };
   Type type{Type::kPose};
   ReferenceIdentityDTO id;
   std::optional<Pose3DTO> pose;
-  /// Only valid for `kFrameRole`: names the robot that owns the frame role.
-  std::optional<ReferenceTargetDTO> target;
 
   ReferenceDTO() = default;
   ReferenceDTO(Type selected_type, std::string selected_id) : type(selected_type) {
     switch (type) {
-      case Type::kFrameRole:
-        id = FrameRoleId(std::move(selected_id));
-        break;
-      case Type::kComponentBodyRole:
-        id = CollisionBodyRoleId(std::move(selected_id));
-        break;
-      case Type::kSceneResource:
-        id = SceneResourceId(std::move(selected_id));
-        break;
-      case Type::kRuntimeObject:
-        id = RuntimeObjectId(std::move(selected_id));
-        break;
+      case Type::kSceneResource: id = SceneResourceId(std::move(selected_id)); break;
+      case Type::kRuntimeObject: id = RuntimeObjectId(std::move(selected_id)); break;
+      case Type::kComponentFrame:
+      case Type::kComponentBody:
       case Type::kPose:
-      case Type::kCellFrame:
-        id = std::monostate{};
-        break;
+      case Type::kCellFrame: id = std::monostate{}; break;
     }
   }
-  ReferenceDTO(FrameRoleId frame_role_id, ReferenceTargetDTO robot)
-      : type(Type::kFrameRole), id(std::move(frame_role_id)), target(std::move(robot)) {}
+  explicit ReferenceDTO(ProgramFrameReferenceDTO frame)
+      : type(Type::kComponentFrame), id(std::move(frame)) {}
+  explicit ReferenceDTO(ProgramCollisionBodyReferenceDTO body)
+      : type(Type::kComponentBody), id(std::move(body)) {}
   explicit ReferenceDTO(Pose3DTO inline_pose)
       : type(Type::kPose), id(std::monostate{}), pose(std::move(inline_pose)) {}
   friend bool operator==(const ReferenceDTO&, const ReferenceDTO&) = default;
 };
 
 [[nodiscard]] inline bool reference_identity_matches_type(const ReferenceDTO& reference) noexcept {
-  if (reference.target.has_value() &&
-      (reference.type != ReferenceDTO::Type::kFrameRole || !reference.target->complete())) {
-    return false;
-  }
   switch (reference.type) {
-    case ReferenceDTO::Type::kFrameRole:
-      return std::holds_alternative<FrameRoleId>(reference.id) &&
-             !std::get<FrameRoleId>(reference.id).empty();
-    case ReferenceDTO::Type::kComponentBodyRole:
-      return std::holds_alternative<CollisionBodyRoleId>(reference.id) &&
-             !std::get<CollisionBodyRoleId>(reference.id).empty();
+    case ReferenceDTO::Type::kComponentFrame: {
+      const auto* frame = std::get_if<ProgramFrameReferenceDTO>(&reference.id);
+      return frame && !frame->component_id.empty() && !frame->frame_id.empty();
+    }
+    case ReferenceDTO::Type::kComponentBody: {
+      const auto* body = std::get_if<ProgramCollisionBodyReferenceDTO>(&reference.id);
+      return body && !body->component_id.empty() && !body->collision_body_id.empty();
+    }
     case ReferenceDTO::Type::kSceneResource:
       return std::holds_alternative<SceneResourceId>(reference.id) &&
              !std::get<SceneResourceId>(reference.id).empty();
@@ -149,23 +119,21 @@ struct ReferenceDTO {
   return std::visit(
       [](const auto& value) -> std::string_view {
         using Value = std::remove_cvref_t<decltype(value)>;
-        if constexpr (std::is_same_v<Value, std::monostate>) {
-          return {};
-        } else {
-          return value.value();
-        }
-      },
-      reference.id);
+        if constexpr (std::is_same_v<Value, std::monostate>) return {};
+        else if constexpr (std::is_same_v<Value, ProgramFrameReferenceDTO>) return value.frame_id.value();
+        else if constexpr (std::is_same_v<Value, ProgramCollisionBodyReferenceDTO>) return value.collision_body_id.value();
+        else return value.value();
+      }, reference.id);
 }
 
-/// Cartesian path goal (spec §4.5)
+/// Cartesian path goal
 /// Cartesian timing (Program `cartesian_timing`, Deployment default).
 enum class CartesianSpeedModeDTO {
   /// RoboPlan Bounded: accelerate, hold the TCP speed limit, decelerate per
   /// smooth run; stops at corners sharper than its corner tolerance.
   kConstantSpeed,
   /// RoboPlan TimeOptimal: TOPP-RA within the joint limits, the TCP speed
-  /// limit held on its grid (RP-3).
+  /// limit held on its grid.
   kTimeOptimal,
 };
 
@@ -186,12 +154,12 @@ inline constexpr CartesianSpeedModeDTO kDefaultCartesianTiming =
     parse_cartesian_speed_mode(kDefaultCartesianTimingName).value();
 
 /// Joint-space timing of joint and pose goals (Deployment `motion_timing`
-/// per robot, N12 / RP-3b). Cartesian paths follow `cartesian_timing`.
+/// per robot). Cartesian paths follow `cartesian_timing`.
 enum class MotionTimingDTO {
   /// TOPP-RA within the joint limits, then one uniform stretch until the
-  /// active TCP stays at 0.98 of its speed limit at the samples (M8).
+  /// active TCP stays at 0.98 of its speed limit at the samples.
   kSmooth,
-  /// RP-3: the TCP speed limit held at 0.98 inside TOPP-RA on its grid.
+  /// The TCP speed limit held at 0.98 inside TOPP-RA on its grid.
   kFast,
 };
 
@@ -234,11 +202,11 @@ struct CartesianPathDTO {
   friend bool operator==(const CartesianPathDTO&, const CartesianPathDTO&) = default;
 };
 
-/// Motion specification as a tagged union (spec §4)
+/// Motion specification as a tagged union
 using MotionSpecDTO = std::variant<JointGoalDTO, PoseGoalDTO, NamedTargetDTO, CartesianPathDTO>;
 
 /// Internal absolute/resolution-bound motion consumed by planning. Named
-/// targets remain in this transitional union until the I6 program-target map
+/// targets remain in this transitional union until the program-target map
 /// is connected; the addressed boundary never copies an unresolved name.
 using ResolvedMotionSpecDTO =
     std::variant<ResolvedJointGoalDTO, PoseGoalDTO, NamedTargetDTO, CartesianPathDTO>;

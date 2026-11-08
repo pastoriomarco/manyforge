@@ -53,17 +53,15 @@ const runtime = {
 } as unknown as ProgramRuntimeController;
 
 const program: ProgramAuthoringDocument = {
-  api_version: 'manyforge.program.v2',
+  api_version: 'manyforge.program.v3',
   program_id: 'role_removal',
   program_profile: 'composable-cell-v1',
   name: 'Role removal',
   catalog: {
-    api_version: 'manyforge.node_catalog.v2',
-    content_version: '2.4.0',
+    api_version: 'manyforge.node_catalog.v3',
+    content_version: '3.0.0',
   },
-  component_roles: { robot: {}, spare: {} },
-  target_roles: { arm: { component_role: 'robot', required_capabilities: [] } },
-  schema_version: 'manyforge.composer_authoring_forest.v1',
+  schema_version: 'manyforge.composer_authoring_forest.v2',
   forest: [],
   positions: {},
 };
@@ -86,50 +84,10 @@ async function mountSettings(draft: ProgramAuthoringDocument, catalogEntries: Ca
   return { onMutate, find, unmount: () => act(() => root.unmount()) };
 }
 
-it('removes only an unused component role through the existing role replacement', async () => {
-  const mounted = await mountSettings(program);
-  try {
-    const robot = mounted.find((p) => p['aria-label'] === 'Remove component role robot');
-    const spare = mounted.find((p) => p['aria-label'] === 'Remove component role spare');
-    expect(robot.disabled).toBe(true);
-    expect(robot.title).toBe('target role arm');
-    expect(spare.disabled).toBe(false);
-    await act(() => spare.onClick?.());
-    expect(mounted.onMutate).toHaveBeenCalledOnce();
-    expect(mounted.onMutate).toHaveBeenCalledWith('program_draft_replace_roles', {
-      component_roles: { robot: {} },
-      target_roles: program.target_roles,
-    });
-  } finally { await mounted.unmount(); }
-});
-
-it('keeps a component role that a contact policy still names', async () => {
-  const mounted = await mountSettings({
-    ...program,
-    contact_policies: [{
-      api_version: 'manyforge.contact_policy.v1',
-      policy_id: 'grasp',
-      mode: 'contact_grasp',
-      zones: [{
-        zone_id: 'pad',
-        body_pairs: [{
-          body_a: { kind: 'component_model_body', component_role_id: 'spare', collision_body_role_id: 'pad' },
-          body_b: { kind: 'runtime_object', runtime_object_id: 'cube' },
-        }],
-      }],
-    }],
-  });
-  try {
-    const spare = mounted.find((p) => p['aria-label'] === 'Remove component role spare');
-    expect(spare.disabled).toBe(true);
-    expect(spare.title).toBe('contact policy grasp');
-  } finally { await mounted.unmount(); }
-});
-
-it('starts a logic-only Program with no component role and still offers role creation', () => {
+it('edits a direct-reference Program without obsolete role declarations', () => {
   const markup = renderToStaticMarkup(
     <ProgramSettingsEditor
-      program={{ ...program, component_roles: {}, target_roles: {} }}
+      program={program}
       catalogEntries={[]}
       candidateRevision={null}
       busy={false}
@@ -138,9 +96,11 @@ it('starts a logic-only Program with no component role and still offers role cre
     />,
   );
 
-  expect(markup).toContain('Create component role');
+  expect(markup).not.toContain('Create component role');
   expect(markup).not.toContain('Remove component role');
-  expect(markup).toContain('Select component role');
+  expect(markup).not.toContain('Select component role');
+  expect(markup).toContain('Identity');
+  expect(markup).toContain('Current Binding');
 });
 
 it('validates the Program corner blend radius as a non-negative distance', async () => {

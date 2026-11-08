@@ -31,6 +31,7 @@ from manyforge_behavior.program import (
     MAX_RECOVERY_POLICY_RETRIES,
     Program,
     ProgramValidationError,
+    _program_direct_reference,
     merge_param_patch,
     motion_tcp_selection,
     parse_execution_groups,
@@ -81,7 +82,6 @@ SUPPORTED_DRAFT_MUTATIONS = (
 OPERATOR_DRAFT_MUTATIONS = (
     "program_draft_expand_authoring_macro",
     "program_draft_remove_contact_policies",
-    "program_draft_replace_roles",
     "program_draft_update_motion_defaults",
     "program_draft_replace_support_contacts",
     "program_draft_store_observed_move",
@@ -124,7 +124,7 @@ def _contact_grasp_envelope_valid(zone: dict[str, Any], common: set[str]) -> boo
     )
 
 
-# Spec 250 §3.2 release envelope fields; signed defaults and binary neutral values.
+# Release envelope fields; signed defaults and binary neutral values.
 _RELEASE_METRICS = ("max_start_penetration_m", "min_release_progress_m", "release_tolerance_m")
 _RELEASE_FLAGS = (
     "enforce_max_start_penetration",
@@ -142,7 +142,7 @@ _RELEASE_BINARY_NEUTRAL: dict[str, Any] = {
 
 
 def _contact_release_envelope_valid(zone: dict[str, Any], common: set[str]) -> bool:
-    """Spec 250 §3.2 release envelope; omitted fields take their defaults.
+    """Release envelope; omitted fields take their defaults.
 
     A ``binary_contact`` zone may only carry the neutral metric values.
     """
@@ -184,28 +184,6 @@ def _prefill_motion_endpoint(
         and "tcp_endpoint" not in node.get("value_sources", {})
     ):
         parameters["tcp_endpoint"] = {"kind": "current"}
-
-
-def _declare_motion_endpoint(
-    document: dict[str, Any], parameters: dict[str, Any]
-) -> None:
-    """Declare the frame of an explicit entry on its portable target role."""
-    for parameter_id in ("tcp_endpoint", "tcp"):
-        endpoint = parameters.get(parameter_id)
-        if (
-            not isinstance(endpoint, dict)
-            or set(endpoint) != {"kind", "target_role", "frame_role"}
-            or endpoint.get("kind") != "entry"
-            or not _is_portable_id(endpoint.get("target_role"))
-        ):
-            continue
-        target = document.get("target_roles", {}).get(endpoint["target_role"])
-        frame_role = endpoint["frame_role"]
-        if not isinstance(target, dict) or not _is_portable_id(frame_role):
-            continue
-        frames = list(target.get("required_frame_roles", []))
-        if frame_role not in frames:
-            target["required_frame_roles"] = sorted([*frames, frame_role])
 
 
 _RECOVERY_POLICY_FIELDS = frozenset({"allow_intervention", "max_retries"})
@@ -1234,7 +1212,7 @@ class ComposerDraftSession:
                 expected_revision=expected_revision,
             )
 
-    # -- prepared Draft replacements (UA2D.3) -----------------------------
+    # -- prepared Draft replacements ------------------------------------
 
     @staticmethod
     def _program_document(program: Program | None) -> dict[str, Any] | None:
@@ -1887,7 +1865,6 @@ class ComposerDraftSession:
             "tree_draft_wrap_node": self._tree_wrap,
             "program_draft_upsert_parameters": self._parameters_upsert,
             "program_draft_remove_parameters": self._parameters_remove,
-            "program_draft_replace_roles": self._program_roles_replace,
             "program_draft_update_motion_defaults": self._program_motion_defaults_update,
             "program_draft_update_settings": self._program_settings_update,
             _NODE_POLICY_MUTATION: self._node_policies_update,
@@ -2003,26 +1980,15 @@ class ComposerDraftSession:
                     "contact pair must join one component body or motion endpoint "
                     "to one runtime object",
                 )
-            component_valid = component is not None and (
-                frozenset(component)
-                in {
-                    frozenset(
-                        {"kind", "component_role_id", "collision_body_role_id"}
-                    ),
-                    frozenset(
-                        {
-                            "kind",
-                            "component_role_id",
-                            "model_role_id",
-                            "collision_body_role_id",
-                        }
-                    ),
-                }
-                and all(
-                    _is_portable_id(component.get(field))
-                    for field in set(component) - {"kind"}
-                )
-            )
+            component_valid = False
+            if component is not None and set(component) == {"kind", "body"}:
+                try:
+                    _program_direct_reference(
+                        component["body"], path="contact.body", member="collision_body_id"
+                    )
+                    component_valid = True
+                except ProgramValidationError:
+                    pass
             endpoint_valid = endpoint is not None and set(endpoint) == {"kind"}
             if (
                 not (component_valid or endpoint_valid)
@@ -2115,10 +2081,10 @@ class ComposerDraftSession:
         common = {
             "macro_id",
             "scene_resource_id",
-            "target_role",
-            "tool_target_role",
-            "base_frame_role",
-            "carrier_frame_role",
+            "target",
+            "tool_target",
+            "base_frame",
+            "carrier_frame_ref",
             "tool_position",
             "blackboard_namespace_id",
             "blackboard_key",
@@ -2139,7 +2105,7 @@ class ComposerDraftSession:
         macro_id = arguments.get("macro_id")
         if macro_id == "pick_subtree":
             operation = "pick"
-            specific = {"contact_policy_id", "touch_body_roles"}
+            specific = {"contact_policy_id", "touch_bodies"}
         elif macro_id == "place_subtree":
             operation = "place"
             specific = {"place_pose", "approach_offset_m"}
@@ -2160,10 +2126,6 @@ class ComposerDraftSession:
             )
         identifier_fields = {
             "scene_resource_id",
-            "target_role",
-            "tool_target_role",
-            "base_frame_role",
-            "carrier_frame_role",
             "blackboard_namespace_id",
             "blackboard_key",
             "instance_prefix",
@@ -2175,44 +2137,24 @@ class ComposerDraftSession:
                 "draft_arguments_invalid",
                 "authoring macro identities must be portable lower-case IDs",
             )
-        if operation == "pick" and (
-            type(arguments["touch_body_roles"]) is not list
-            or not arguments["touch_body_roles"]
-            or any(not _is_portable_id(role) for role in arguments["touch_body_roles"])
-            or arguments["touch_body_roles"]
-            != sorted(set(arguments["touch_body_roles"]))
-        ):
-            _error(
-                "draft_arguments_invalid",
-                "touch_body_roles must be a non-empty canonical ID array",
-            )
         try:
-            endpoint = motion_tcp_selection(arguments)["tcp_endpoint"]
+            for field, member in (("target", "command_target_id"),
+                                  ("tool_target", "command_target_id"),
+                                  ("base_frame", "frame_id"),
+                                  ("carrier_frame_ref", "frame_id")):
+                _program_direct_reference(arguments[field], path=field, member=member)
+            if operation == "pick":
+                bodies = arguments["touch_bodies"]
+                if type(bodies) is not list or not bodies:
+                    raise ProgramValidationError("touch_bodies must be a non-empty array")
+                for body in bodies:
+                    _program_direct_reference(body, path="touch_bodies", member="collision_body_id")
+                keys = [(body["component_id"], body["collision_body_id"]) for body in bodies]
+                if keys != sorted(set(keys)):
+                    raise ProgramValidationError("touch_bodies must be a canonical set")
+            endpoint = motion_tcp_selection(arguments, direct_references=True)["tcp_endpoint"]
         except ProgramValidationError as exc:
             _error("draft_arguments_invalid", str(exc))
-        role = (
-            endpoint.get("role")
-            if endpoint["kind"] == "default_of_role"
-            else endpoint.get("target_role")
-        )
-        if role is not None:
-            endpoint_target = document.get("target_roles", {}).get(role)
-            if not isinstance(endpoint_target, dict):
-                _error(
-                    "draft_target_role_not_found",
-                    f"{operation} authoring TCP target role {role!r} is not declared",
-                    status_code=404,
-                )
-            if (
-                endpoint["kind"] == "entry"
-                and endpoint["frame_role"]
-                not in endpoint_target.get("required_frame_roles", [])
-            ):
-                _error(
-                    "draft_arguments_invalid",
-                    f"{operation} authoring TCP target role {role!r} "
-                    f"does not declare frame role {endpoint['frame_role']!r}",
-                )
         scene_ids = {row.get("scene_resource_id") for row in self._scene(document)}
         if arguments["scene_resource_id"] not in scene_ids:
             _error(
@@ -2220,13 +2162,6 @@ class ComposerDraftSession:
                 f"{operation} authoring requires an existing Program scene resource",
                 status_code=404,
             )
-        for role_field in ("target_role", "tool_target_role"):
-            if arguments[role_field] not in document.get("target_roles", {}):
-                _error(
-                    "draft_target_role_not_found",
-                    f"{operation} authoring {role_field} is not declared",
-                    status_code=404,
-                )
         if operation == "pick" and arguments["contact_policy_id"] not in {
             row.get("policy_id") for row in self._contact_policy_rows(document)
         }:
@@ -2301,10 +2236,10 @@ class ComposerDraftSession:
             suffix += 1
 
         template_parameters = {
-            "target_role": arguments["target_role"],
-            "tool_target_role": arguments["tool_target_role"],
-            "base_frame_role": arguments["base_frame_role"],
-            "carrier_frame_role": arguments["carrier_frame_role"],
+            "target": deepcopy(arguments["target"]),
+            "tool_target": deepcopy(arguments["tool_target"]),
+            "base_frame": deepcopy(arguments["base_frame"]),
+            "carrier_frame_ref": deepcopy(arguments["carrier_frame_ref"]),
             "selected_object_id": arguments["scene_resource_id"],
             "tcp_endpoint": deepcopy(endpoint),
             "tool_position": deepcopy(arguments["tool_position"]),
@@ -2334,8 +2269,8 @@ class ComposerDraftSession:
                 parameters=template_parameters,
                 value_sources={},
                 result_key=key_id,
-                touch_body_roles=(
-                    arguments["touch_body_roles"] if operation == "pick" else ()
+                touch_bodies=(
+                    arguments["touch_bodies"] if operation == "pick" else ()
                 ),
             )
         except PickPlaceTemplateError as exc:
@@ -2519,35 +2454,6 @@ class ComposerDraftSession:
         return {
             "scene_resource_id": arguments["scene_resource_id"],
             "support_contact_count": len(contacts),
-        }
-
-    @staticmethod
-    def _program_roles_replace(
-        document: dict[str, Any],
-        arguments: dict[str, Any],
-        _catalog: NodeCatalog,
-    ) -> dict[str, Any]:
-        if set(arguments) != {"component_roles", "target_roles"}:
-            _error(
-                "draft_arguments_invalid",
-                "program_draft_replace_roles requires exactly component_roles and target_roles",
-            )
-        component_roles = arguments["component_roles"]
-        target_roles = arguments["target_roles"]
-        if type(component_roles) is not dict or type(target_roles) is not dict:
-            _error(
-                "draft_arguments_invalid",
-                "Program component_roles and target_roles must be objects",
-            )
-        document["component_roles"] = {
-            key: deepcopy(component_roles[key]) for key in sorted(component_roles)
-        }
-        document["target_roles"] = {
-            key: deepcopy(target_roles[key]) for key in sorted(target_roles)
-        }
-        return {
-            "component_role_count": len(component_roles),
-            "target_role_count": len(target_roles),
         }
 
     @staticmethod
@@ -2990,7 +2896,7 @@ class ComposerDraftSession:
     ) -> dict[str, Any]:
         """Set the editor-only "show collapsed by default" flag in node metadata.
 
-        Node metadata is non-authoritative presentation data (spec 420), but it is
+        Node metadata is non-authoritative presentation data, but it is
         part of the Program, so the change is an ordinary Draft edit.
         """
         if set(arguments) != {"instance_id", "collapsed_by_default"}:
@@ -3201,7 +3107,6 @@ class ComposerDraftSession:
         _prefill_motion_endpoint(
             document, node, {parameter.id for parameter in entry.parameters}
         )
-        _declare_motion_endpoint(document, node.get("parameters", {}))
         if _tree_ref(tree, node["instance_id"]) is not None:
             _error(
                 "draft_node_exists",
@@ -3282,7 +3187,6 @@ class ComposerDraftSession:
                     scene=self._scene(document),
                 )
         node["parameters"] = parameters
-        _declare_motion_endpoint(document, parameters)
         if value_sources:
             # Object member order carries no meaning; the Program keeps paths sorted.
             node["value_sources"] = dict(sorted(value_sources.items()))

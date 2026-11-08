@@ -60,7 +60,7 @@ TEST(RoboPlanCompatibilityOptionsTest,
 
 TEST(RoboPlanCompatibilityOptionsTest,
      ConfiguredCollisionCheckStepDrivesTheFirstAttemptAndBoundsRetries) {
-  // M6 decision 18: the step is settable (Deployment collision_check_step_rad)
+  // The step is settable (Deployment collision_check_step_rad)
   // and validation uses the same value. Retries keep the finer of it and 0.01.
   EXPECT_DOUBLE_EQ(kDefaultCollisionCheckStepRad, 0.05);
   const auto coarse = production_rrt_options("arm", 2.5, 0U, step_settings(0.08));
@@ -86,7 +86,7 @@ TEST(RoboPlanCompatibilityOptionsTest,
 
 TEST(RoboPlanCompatibilityOptionsTest,
      FirstValidationRetryShortcutsAndLaterRetriesKeepTheDetour) {
-  // M6 clearance: validation with the clearance margin rejects a shortcut
+  // Clearance: validation with the clearance margin rejects a shortcut
   // that skims an obstacle at a checked sample, so the first retry (attempt
   // 1) shortcuts its 0.01-step detour; only a retry after that keeps the raw
   // detour.

@@ -1,6 +1,6 @@
 """Run one ros2_control component's generated artifacts under Manager ownership.
 
-The one launch of every ros2_control component, on every lane (CONTRACTS §12).
+The one launch of every ros2_control component, on every lane.
 The generated artifacts own the differences as data: the hardware plugin the
 description must name, an optional driver parameters file and remappings for
 `ros2_control_node`, and an optional parent frame of `<prefix>world`.
@@ -48,7 +48,7 @@ def _remappings(text: str) -> list[tuple[str, str]]:
 
 
 def launch_setup(context, *args, **kwargs):
-    keep_sigint_out_of_tasks(context)  # Q116: before any Node action exists.
+    keep_sigint_out_of_tasks(context)  # Before any Node action exists.
     description_path = _artifact(context, "robot_description_file")
     controllers_path = _artifact(context, "controllers_file")
     description = description_path.read_text(encoding="utf-8")
@@ -70,7 +70,7 @@ def launch_setup(context, *args, **kwargs):
     reset_position_name = LaunchConfiguration("reset_position_controller_name").perform(context)
     gripper_name = LaunchConfiguration("gripper_controller_name").perform(context)
     frame_prefix = LaunchConfiguration("frame_prefix").perform(context)
-    # A deactivated arm (CONTRACTS §16) is not in the cell: its frames go to
+    # A deactivated arm is not in the cell: its frames go to
     # the component's own namespace, not the cell's TF.
     publish_tf = LaunchConfiguration("publish_tf").perform(context) == "true"
     manager_path = f"{namespace.rstrip('/')}/{manager_name}"

@@ -416,6 +416,10 @@ class _ToolCall:
     descriptor: dict[str, Any]
 
 
+def _projection_content(projection: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in projection.items() if key != "source"}
+
+
 def _composer_callback_request_id(
     request: ProviderRequest,
     *,
@@ -501,7 +505,12 @@ class BridgeService:
                 active_raw, expected_mode=request.assistant_mode
             )
             self._join_node_environment(active, node_environment)
-            if request.mode_projection != active:
+            # ``source`` is the observation envelope (ages, generations and
+            # the Manager section digest move on every Manager tick); the
+            # projection content outside it is what must match.
+            if _projection_content(request.mode_projection) != _projection_content(
+                active
+            ):
                 raise BridgeRunError(
                     "assistant_projection_stale",
                     "forwarded mode projection is not the active headless projection",

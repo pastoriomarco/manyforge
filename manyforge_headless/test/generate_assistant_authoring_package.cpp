@@ -72,56 +72,20 @@ ProgramBytes(const deployment::RetainedBundle &bundle,
   constexpr std::string_view kZeroDigest =
       "sha256:0000000000000000000000000000000000000000000000000000000000000000";
   deployment::CanonicalValue root(deployment::CanonicalValue::Object{
-      {"api_version", deployment::CanonicalValue("manyforge.program.v2")},
+      {"api_version", deployment::CanonicalValue("manyforge.program.v3")},
       {"catalog",
        deployment::CanonicalValue(deployment::CanonicalValue::Object{
            {"api_version",
-            deployment::CanonicalValue("manyforge.node_catalog.v2")},
+            deployment::CanonicalValue("manyforge.node_catalog.v3")},
            {"content_version",
             deployment::CanonicalValue(
                 bundle.value().catalogs.node_environment.content_version)},
-       })},
-      {"component_roles",
-       deployment::CanonicalValue(deployment::CanonicalValue::Object{
-           {"robot",
-            deployment::CanonicalValue(deployment::CanonicalValue::Object{})},
        })},
       {"name", deployment::CanonicalValue(std::string(name))},
       {"program_id", deployment::CanonicalValue("program_apply_fixture")},
       {"program_profile", deployment::CanonicalValue("composable-cell-v1")},
       {"program_revision",
        deployment::CanonicalValue(std::string(kZeroDigest))},
-      {"target_roles",
-       deployment::CanonicalValue(deployment::CanonicalValue::Object{
-           {"arm",
-            deployment::CanonicalValue(deployment::CanonicalValue::Object{
-                {"component_role", deployment::CanonicalValue("robot")},
-                {"required_capabilities",
-                 deployment::CanonicalValue(deployment::CanonicalValue::Array{
-                     deployment::CanonicalValue(
-                         deployment::CanonicalValue::Object{
-                             {"capability_id", deployment::CanonicalValue(
-                                                   "execution.trajectory.execute")},
-                             {"disposition",
-                              deployment::CanonicalValue("required")},
-                             {"parameters",
-                              deployment::CanonicalValue(
-                                  deployment::CanonicalValue::Object{})},
-                         })})},
-                {"required_collision_body_roles",
-                 deployment::CanonicalValue(deployment::CanonicalValue::Array{
-                     deployment::CanonicalValue("arm_collision")})},
-                {"required_frame_roles",
-                 deployment::CanonicalValue(deployment::CanonicalValue::Array{
-                     deployment::CanonicalValue("tcp")})},
-                {"required_model_roles",
-                 deployment::CanonicalValue(deployment::CanonicalValue::Array{
-                     deployment::CanonicalValue("arm_model")})},
-                {"required_resource_roles",
-                 deployment::CanonicalValue(deployment::CanonicalValue::Array{
-                     deployment::CanonicalValue("joints")})},
-            })},
-       })},
       {"tree",
        deployment::CanonicalValue(deployment::CanonicalValue::Object{
            {"children",
@@ -148,7 +112,7 @@ ProgramBytes(const deployment::RetainedBundle &bundle,
   const auto revision = deployment::detail::compute_content_identity(
       root, deployment::detail::ContentIdentitySpec{
                 .identity_domain = "program-revision",
-                .api_version = "manyforge.program.v2",
+                .api_version = "manyforge.program.v3",
                 .own_field = "program_revision",
             });
   auto members = root.as_object();
@@ -178,26 +142,16 @@ void PublishProgramScenario(
   if (!model_map.has_value()) {
     throw std::logic_error("Program Apply fixture model map did not reopen");
   }
-  const auto program = deployment::verify_program_binding_contract(
-      ProgramBytes(*bundle), *bundle);
   deployment::FilesystemCatalogArtifactStore catalogs(package_root);
+  const auto program = deployment::verify_program_binding_contract(
+      ProgramBytes(*bundle), *bundle, model_map, catalogs);
   const auto binding = deployment::compile_program_binding(
-      *program,
-      core::ProgramRoleAssignmentDTO{
-          {core::ProgramComponentRoleAssignmentDTO{
-              core::ComponentRoleId("robot"),
-              core::ControllableComponentId(std::string(
-                  deployment::test::kLite6ControllableComponentId))}},
-          {core::ProgramTargetRoleAssignmentDTO{
-              core::TargetRoleId("arm"),
-              core::CommandTargetId(
-                  std::string(deployment::test::kLite6ArmTargetId))}},
-      },
-      *bundle, *model_map, catalogs);
+      *program, *bundle, *model_map, catalogs);
   deployment::FilesystemProgramRepository programs(package_root);
   deployment::FilesystemProgramBindingRepository bindings(package_root);
   static_cast<void>(programs.put_if_absent(program, *bundle));
-  static_cast<void>(bindings.put_if_absent(binding, *bundle, *model_map));
+  static_cast<void>(bindings.put_if_absent(
+      binding, *bundle, *model_map, catalogs));
 }
 
 } // namespace

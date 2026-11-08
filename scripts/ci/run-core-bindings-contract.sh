@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate and, unless requested otherwise, verify the I2 binding API contract.
+# Generate and, unless requested otherwise, verify the core binding API contract.
 set -euo pipefail
 umask 022
 export LANG=C.UTF-8
@@ -9,12 +9,12 @@ export PYTHONDONTWRITEBYTECODE=1
 export TZ=UTC
 unset PYTHONPATH PYTHONHOME 2>/dev/null || true
 
-PYTHON_EXECUTABLE="${MANYFORGE_I2_PYTHON_EXECUTABLE:-$(command -v python3 || true)}"
+PYTHON_EXECUTABLE="${MANYFORGE_CORE_BINDINGS_PYTHON_EXECUTABLE:-$(command -v python3 || true)}"
 if [[ -z "${PYTHON_EXECUTABLE}" || ! -x "${PYTHON_EXECUTABLE}" ]]; then
-  echo "a CPython 3.12 interpreter is required (set MANYFORGE_I2_PYTHON_EXECUTABLE)" >&2
+  echo "a CPython 3.12 interpreter is required (set MANYFORGE_CORE_BINDINGS_PYTHON_EXECUTABLE)" >&2
   exit 2
 fi
-export MANYFORGE_I2_PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE}"
+export MANYFORGE_CORE_BINDINGS_PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE}"
 
 usage() {
   echo "usage: $0 generated-api --extension <path> --generated-output-root <path> [--prepare-only]" >&2
@@ -55,11 +55,11 @@ require_plain_file "${EXTENSION}" "candidate extension"
 EXPECTED_SUFFIX="$("${PYTHON_EXECUTABLE}" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 case "${EXPECTED_SUFFIX}" in
   .cpython-312-x86_64-linux-gnu.so|.cpython-312-aarch64-linux-gnu.so) ;;
-  *) echo "active CPython extension suffix differs from the supported I2 ABI" >&2; exit 2 ;;
+  *) echo "active CPython extension suffix differs from the supported core binding ABI" >&2; exit 2 ;;
 esac
 EXPECTED_EXTENSION="manyforge_core_py${EXPECTED_SUFFIX}"
 if [[ "${EXTENSION##*/}" != "${EXPECTED_EXTENSION}" ]]; then
-  echo "candidate extension differs from the frozen I2 CPython ABI" >&2
+  echo "candidate extension differs from the frozen core binding CPython ABI" >&2
   exit 2
 fi
 if [[ "${GENERATED_ROOT}" != /* || "${GENERATED_ROOT}" == "/" || \
@@ -114,14 +114,14 @@ export PYTHONNOUSERSITE=1
 export PYTHONDONTWRITEBYTECODE=1
 export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
 export PYTHONPATH="$(dirname "${EXTENSION}")"
-export MANYFORGE_I2_BINDING_EXTENSION="${EXTENSION}"
-export MANYFORGE_I2_BINDING_EVIDENCE_ROOT="${TEST_ROOT}/evidence"
-export MANYFORGE_I2_BINDING_STAGED_ROOT="$(dirname "${EXTENSION}")"
-export MANYFORGE_I2_BINDING_GENERATED_ROOT="${GENERATED_ROOT}"
-export MANYFORGE_I2_BINDING_SOURCE_ROOT="${REPO_ROOT}"
-export MANYFORGE_I2_BINDING_EXECUTABLE="${PYTHON_EXECUTABLE}"
+export MANYFORGE_CORE_BINDING_EXTENSION="${EXTENSION}"
+export MANYFORGE_CORE_BINDING_EVIDENCE_ROOT="${TEST_ROOT}/evidence"
+export MANYFORGE_CORE_BINDING_STAGED_ROOT="$(dirname "${EXTENSION}")"
+export MANYFORGE_CORE_BINDING_GENERATED_ROOT="${GENERATED_ROOT}"
+export MANYFORGE_CORE_BINDING_SOURCE_ROOT="${REPO_ROOT}"
+export MANYFORGE_CORE_BINDING_EXECUTABLE="${PYTHON_EXECUTABLE}"
 
 cd "${REPO_ROOT}"
 "${PYTHON_EXECUTABLE}" -m pytest -p no:cacheprovider -q \
-  verification/composable_cell_i2/binding_contract_tests.py::test_generated_stub_inventory_and_documentation_parity \
-  verification/composable_cell_i2/binding_contract_tests.py::test_complete_forbidden_surface_absence
+  manyforge_core/python/tests/binding_contract_tests.py::test_generated_stub_inventory_and_documentation_parity \
+  manyforge_core/python/tests/binding_contract_tests.py::test_complete_forbidden_surface_absence

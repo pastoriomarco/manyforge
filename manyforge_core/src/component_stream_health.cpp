@@ -6,6 +6,7 @@
 #include <mutex>
 #include <queue>
 #include <set>
+#include <stdexcept>
 #include <utility>
 
 namespace manyforge::core {
@@ -95,7 +96,7 @@ struct StreamRecorder::Slot final {
   ControllableComponentId component;
   StreamDeclarationDTO defaults;
   std::uint64_t serial{};
-  IClock* clock{};
+  std::shared_ptr<IClock> clock;
   std::weak_ptr<ComponentStreamHealth::Shared> owner;
 
   // Hot path (adapter receive threads).
@@ -117,7 +118,7 @@ struct StreamRecorder::Slot final {
 };
 
 struct ComponentStreamHealth::Shared final {
-  Shared(IClock& clock_in, IScheduler& scheduler_in) : clock(clock_in), scheduler(scheduler_in) {}
+  Shared(std::shared_ptr<IClock> clock_in, IScheduler& scheduler_in) : clock(std::move(clock_in)), scheduler(scheduler_in) {}
 
   struct Deadline final {
     std::int64_t at_ns{};
@@ -126,7 +127,7 @@ struct ComponentStreamHealth::Shared final {
     bool operator>(const Deadline& other) const noexcept { return at_ns > other.at_ns; }
   };
 
-  IClock& clock;
+  std::shared_ptr<IClock> clock;
   IScheduler& scheduler;
 
   mutable std::mutex mutex;
@@ -139,6 +140,8 @@ struct ComponentStreamHealth::Shared final {
   std::optional<ScheduleHandle> timer;
   std::int64_t timer_at_ns{};
   bool evaluation_scheduled{};
+  std::atomic<bool> detached{false};
+  std::mutex detach_mutex;
   std::uint64_t next_serial{1U};
   std::function<void(const std::string&)> log;
 
@@ -148,11 +151,12 @@ struct ComponentStreamHealth::Shared final {
   std::uint64_t listener_token{};
 
   void ScheduleEvaluationLocked(const std::shared_ptr<Shared>& self) {
+    if (detached.load()) return;
     if (evaluation_scheduled) return;
     evaluation_scheduled = true;
     std::weak_ptr<Shared> weak = self;
     scheduler.schedule(
-        clock.now(),
+        clock->now(),
         [weak] {
           if (const auto shared = weak.lock()) Evaluate(shared);
         },
@@ -236,7 +240,8 @@ struct ComponentStreamHealth::Shared final {
     {
       std::lock_guard lock(self->mutex);
       self->evaluation_scheduled = false;
-      const std::int64_t now = self->clock.now();
+      if (self->detached.load()) return;
+      const std::int64_t now = self->clock->now();
       // Samples that arrived while a stream was not live.
       for (const auto& weak : self->fresh) {
         const auto slot = weak.lock();
@@ -325,6 +330,7 @@ struct ComponentStreamHealth::Shared final {
     }
     if (changes.empty()) return;
     std::lock_guard listener_lock(self->listener_mutex);
+    if (self->detached.load()) return;
     for (const auto& [component, verdict] : changes) {
       if (self->log) {
         try {
@@ -376,6 +382,7 @@ void Advance(const std::shared_ptr<StreamRecorder::Slot>& slot) noexcept {
   if (!owner) return;
   try {
     std::lock_guard lock(owner->mutex);
+    if (owner->detached.load()) return;
     owner->fresh.push_back(slot);
     owner->ScheduleEvaluationLocked(owner);
   } catch (...) {
@@ -425,13 +432,35 @@ void StreamRecorder::ReportFault(const std::string_view code, const std::string_
   ReportSlotFault(slot_, code, detail);
 }
 
-ComponentStreamHealth::ComponentStreamHealth(IClock& clock, IScheduler& scheduler)
-    : shared_(std::make_shared<Shared>(clock, scheduler)) {}
+ComponentStreamHealth::ComponentStreamHealth(std::shared_ptr<IClock> clock, IScheduler& scheduler)
+    : shared_(std::make_shared<Shared>(std::move(clock), scheduler)) {
+  if (!shared_->clock) throw std::invalid_argument("component stream health requires a clock");
+}
 
 ComponentStreamHealth::~ComponentStreamHealth() {
-  std::lock_guard lock(shared_->mutex);
-  if (shared_->timer) shared_->scheduler.cancel(*shared_->timer);
-  shared_->timer.reset();
+  DetachScheduler();
+}
+
+void ComponentStreamHealth::DetachScheduler() noexcept {
+  static_cast<void>(DetachSchedulerUntil(std::chrono::steady_clock::time_point::max()));
+}
+
+bool ComponentStreamHealth::DetachSchedulerUntil(
+    std::chrono::steady_clock::time_point deadline) noexcept {
+  std::lock_guard detach_lock(shared_->detach_mutex);
+  std::optional<ScheduleHandle> handle;
+  {
+    std::lock_guard lock(shared_->mutex);
+    shared_->detached.store(true);
+    handle = shared_->timer;
+  }
+  if (handle) {
+    try { shared_->scheduler.cancel(*handle); } catch (...) { return false; }
+    std::lock_guard lock(shared_->mutex);
+    shared_->timer.reset();
+  }
+  (void)deadline;
+  return true;
 }
 
 Result<std::unique_ptr<StreamRecorder>> ComponentStreamHealth::Declare(
@@ -443,12 +472,16 @@ Result<std::unique_ptr<StreamRecorder>> ComponentStreamHealth::Declare(
   }
   auto slot = std::make_shared<StreamRecorder::Slot>(component);
   slot->defaults = std::move(defaults);
-  slot->clock = &shared_->clock;
+  slot->clock = shared_->clock;
   slot->owner = shared_;
   std::unique_ptr<StreamRecorder> recorder(new StreamRecorder(slot));
   std::lock_guard lock(shared_->mutex);
+  if (shared_->detached.load())
+    return Result<std::unique_ptr<StreamRecorder>>::Err(
+        {"component_stream_declaration_invalid", "the stream declaration is invalid",
+         {{"reason", "stream_health_detached"}}});
   slot->serial = shared_->next_serial++;
-  slot->declared_at_ns = shared_->clock.now();
+  slot->declared_at_ns = shared_->clock->now();
   shared_->ApplyEffectiveLocked(*slot);
   shared_->slots.insert_or_assign({component, slot->defaults.stream_id}, slot);
   shared_->PushDeadlineLocked(slot, slot->declared_at_ns + slot->effective.budget_ns);
@@ -497,9 +530,12 @@ Result<void> ComponentStreamHealth::SetOverrides(std::vector<StreamParameterOver
     }
   }
   std::lock_guard lock(shared_->mutex);
+  if (shared_->detached.load())
+    return Result<void>::Err({"component_stream_override_invalid",
+                              "component stream health is detached", {}});
   if (table == shared_->overrides) return Result<void>::Ok();
   shared_->overrides = std::move(table);
-  const auto now = shared_->clock.now();
+  const auto now = shared_->clock->now();
   for (const auto& [key, slot] : shared_->slots) {
     const auto before = slot->effective;
     shared_->ApplyEffectiveLocked(*slot);
@@ -521,7 +557,7 @@ Result<void> ComponentStreamHealth::SetOverrides(std::vector<StreamParameterOver
 std::vector<StreamHealthDTO> ComponentStreamHealth::Read(const ControllableComponentId& component) const {
   std::vector<StreamHealthDTO> result;
   std::lock_guard lock(shared_->mutex);
-  const auto now = shared_->clock.now();
+  const auto now = shared_->clock->now();
   for (auto it = shared_->slots.lower_bound({component, std::string()});
        it != shared_->slots.end() && it->first.first == component; ++it) {
     const auto& slot = *it->second;

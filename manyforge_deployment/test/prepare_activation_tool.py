@@ -79,7 +79,6 @@ def _request(
     member_digests = {
         name: raw_sha256_digest((scenario_path / name).read_bytes())
         for name in (
-            "assignment.yaml",
             "deployment.yaml",
             "program.yaml",
         )
@@ -105,10 +104,9 @@ def _request(
             document["deployment_draft"], project_root=scenario_path
         ),
         "program": program,
-        "program_role_assignment": document["program_role_assignment"],
     }
     request = {
-        "schema_version": "manyforge.activation_preparation_request.v3",
+        "schema_version": "manyforge.activation_preparation_request.v4",
         "runtime_cell_id": "activation_test_runtime",
         **captured,
         "captured_input_digest": raw_sha256_digest(canonical_json_bytes(captured)),
@@ -132,12 +130,11 @@ def _scenario_request(
             scenario_path / "deployment.yaml"
         ),
         "program_draft": load_strict_json_yaml(scenario_path / "program.yaml"),
-        "program_role_assignment": load_strict_json_yaml(
-            scenario_path / "assignment.yaml"
-        ),
     }
-    if manifest.get("api_version") != "manyforge.scenario.project.v2":
-        raise AssertionError("test input is not a Scenario project")
+    if manifest.get("api_version") != "manyforge.scenario.project.v3":
+        raise AssertionError("test input is not a v3 Scenario project; re-author it with direct references")
+    if (scenario_path / "assignment.yaml").exists():
+        raise AssertionError("Scenario assignment is unsupported; re-author it with direct references")
     return scenario_path, document, _request(
         scenario_path, document, _program(workspace, document["program_draft"])
     )
@@ -149,7 +146,7 @@ def _native_host_identity(prepared: dict[str, object]) -> str:
     if len(runtime_units) != 1:
         raise AssertionError("prepared Deployment does not have one execution host")
     runtime = runtime_units[0]
-    # Q63-Q66: offline Scenarios run on the mock ROS lane.
+    # Offline Scenarios run on the mock ROS lane.
     if runtime["runtime_profile_id"] != "manyforge.ros2_control_execution_runtime":
         raise AssertionError("prepared Deployment selected an unknown runtime")
     return runtime["runtime_unit_id"]
@@ -250,7 +247,7 @@ def _require_canonical_empty_configuration(
         raise AssertionError("execution host configuration is not an object")
     if candidate_host["runtime_profile_id"] == "manyforge.ros2_control_execution_runtime":
         # The retained host keeps its identity and launch product; its
-        # configuration is component data and differs by design (R7-2).
+        # configuration is component data and differs by design.
         assert {key: value for key, value in empty_host.items() if key != "configuration"} == {
             key: value for key, value in candidate_host.items() if key != "configuration"
         }
@@ -283,6 +280,7 @@ def _run(
     root: Path,
     *,
     expect_error: str | None = None,
+    expect_diagnostic: str | None = None,
     expected_program_outcome_kind: str = "bound",
     publish_canonical_empty: bool = False,
     reuse_root: bool = False,
@@ -301,6 +299,15 @@ def _run(
     if publish_canonical_empty:
         command.append("--publish-canonical-empty")
     result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if expect_diagnostic is not None:
+        if result.returncode != 2:
+            raise AssertionError(f"expected typed reference refusal; return={result.returncode}, stderr={result.stderr!r}")
+        refusal = json.loads(result.stdout)
+        if refusal.get("code") != "program_reference_validation_failed" or not any(
+            row.get("code") == expect_diagnostic for row in refusal.get("diagnostics", [])
+        ):
+            raise AssertionError(f"missing reference diagnostic {expect_diagnostic!r}: {refusal!r}")
+        return None
     if expect_error is not None:
         if result.returncode == 0 or expect_error not in result.stderr:
             raise AssertionError(
@@ -318,8 +325,8 @@ def _run(
         raise AssertionError("preparer changed the source-document identity")
     if value["captured_input_digest"] != request["captured_input_digest"]:
         raise AssertionError("preparer changed the captured-input identity")
-    if value.get("schema_version") != "manyforge.prepared_activation_input.v6":
-        raise AssertionError("preparer did not return the v6 prepared activation")
+    if value.get("schema_version") != "manyforge.prepared_activation_input.v7":
+        raise AssertionError("preparer did not return the v7 prepared activation")
     program_outcome = value.get("program_outcome")
     if (
         not isinstance(program_outcome, dict)
@@ -329,24 +336,11 @@ def _run(
             "preparer returned an unexpected Program outcome: "
             f"{program_outcome!r}"
         )
-    if expected_program_outcome_kind == "non_executable":
-        outcome = program_outcome.get("outcome")
-        unresolved = outcome.get("unresolved_roles") if isinstance(outcome, dict) else None
-        if not isinstance(unresolved, list) or not any(
-            isinstance(row, dict)
-            and row.get("command_target_id") == "foreign_target"
-            and row.get("reason") == "target_missing"
-            for row in unresolved
-        ):
-            raise AssertionError(
-                "non-executable outcome did not name the missing target"
-            )
     payload = value.get("activation_payload")
     if not isinstance(payload, dict) or set(payload) != {
         "catalog_artifacts",
         "program",
         "program_binding",
-        "program_role_assignment",
         "raw_artifacts",
         "retained_bundle",
     }:
@@ -463,7 +457,7 @@ def _lane_row(workspace: Path, component: dict[str, object], lane: str | None = 
 
 
 def _joints(workspace: Path, component: dict[str, object]) -> dict[str, object]:
-    """N17: a controller profile's compiled joints: an arm's `arm_joints` in
+    """A controller profile's compiled joints: an arm's `arm_joints` in
     controller order, a tool's one gripper joint (`fingers`)."""
     family = _component_model(workspace, component["component_profile_id"])[0]
     roles = {
@@ -497,7 +491,7 @@ def _robot(deployment: dict[str, object]) -> dict[str, object]:
 
 
 def _lane(deployment: dict[str, object], component: dict[str, object]) -> str:
-    """A component's lane; a machine member runs on its owner's (CONTRACTS §16)."""
+    """A component's lane; a machine member runs on its owner's."""
     owner = component.get("owner")
     return component["lane"] if owner is None else _row(deployment, owner)["lane"]
 
@@ -507,7 +501,7 @@ def _arm_source_joints(workspace: Path, component: dict[str, object]) -> list[st
 
 
 def _arm_stop_cancel(component: dict[str, object]) -> dict[str, object]:
-    """Q48: the `max_deceleration_on_cancel_rad_s2` member an arm's controller
+    """The `max_deceleration_on_cancel_rad_s2` member an arm's controller
     profile row carries (its authored operator Stop decelerations, sorted by
     source joint); nothing for a tool."""
     arm = component.get("target_settings", {}).get("arm")
@@ -523,7 +517,7 @@ def _arm_stop_cancel(component: dict[str, object]) -> dict[str, object]:
 def _require_launched_stop_decelerations(
     workspace: Path, deployment: dict[str, object], prepared: dict[str, object]
 ) -> None:
-    """Q48: every arm's controller profile row carries its authored operator
+    """Every arm's controller profile row carries its authored operator
     Stop decelerations, and they are its compiled Stop rows' values (the JTC
     bound and the Kernel's Stop plan are one profile)."""
     compiled = _compiled_stop_limits(prepared)
@@ -745,10 +739,9 @@ def _rehash_request(request: dict[str, object]) -> None:
 
 
 def _unmounted_ids(deployment: dict[str, object]) -> list[str]:
-    """Merge 6: the components that are not a tool mounted through an
+    """The components that are not a tool mounted through an
     `attachments` row (robots and model-free components). A machine counts
-    once, as its arm member: its owner and I/O member rows are left out
-    (CONTRACTS §16)."""
+    once, as its arm member: its owner and I/O member rows are left out."""
     mounted = {row["child"]["component_id"] for row in deployment.get("attachments", [])}
     owners = {row["owner"] for row in deployment["components"] if "owner" in row}
     return [row["component_id"] for row in deployment["components"]
@@ -774,7 +767,7 @@ def _require_gripper_delivery_timeout_semantics(
         assert row["command_target_id"] == "gripper"
         return row
 
-    # Merge 6: each robot's tool owns its gripper row.
+    # Each robot's tool owns its gripper row.
     pneumatic = target(request, "lite_gripper")
     position = target(request, "robotiq_2f_85")
     assert pneumatic["actuation_kind"] == "pneumatic" and len(pneumatic) == 14
@@ -829,8 +822,8 @@ def _require_gripper_delivery_timeout_semantics(
 def _check_two_ros_robots(
     args: argparse.Namespace, request: dict[str, object], root: Path
 ) -> None:
-    """Q68: two ROS robots with catalog controller profiles compose (merge 6:
-    the first keeps its mounted Isaac tool)."""
+    """Two ROS robots with catalog controller profiles compose (the first
+    keeps its mounted Isaac tool)."""
     prepared = _run(args, request, root)
     assert prepared is not None
     graph = prepared["activation_payload"]["retained_bundle"]["cell_graph"]
@@ -844,7 +837,7 @@ def _check_two_ros_robots(
     runtime = graph["runtime_units"][0]
     assert runtime["runtime_profile_id"] == "manyforge.ros2_control_execution_runtime"
     configuration = runtime["configuration"]
-    # Q68: each component carries its own controller profile: its lane and
+    # Each component carries its own controller profile: its lane and
     # model family.
     lanes = {
         "isaac_ur10e_light_robot": ("isaac", "ur10e"),
@@ -881,13 +874,13 @@ def _check_two_ros_robots(
         for row in configuration["default_fault_stop_profiles"]
     ] == robots
     assert "direct_control_joint_limits" not in configuration
-    # Q68: each component keeps its own authored gripper target rows.
+    # Each component keeps its own authored gripper target rows.
     assert configuration["gripper_target_configurations"] == sorted(
         (row for component in authored
          for row in component.get("gripper_target_configurations", [])),
         key=lambda row: (row["controllable_component_id"], row["command_target_id"]),
     )
-    # CP9: each component keeps its own stream defaults.
+    # Each component keeps its own stream defaults.
     assert configuration["component_streams"] == sorted(
         (row for component in authored for row in component["component_streams"]),
         key=lambda row: (row["controllable_component_id"], row["stream_id"]),
@@ -924,7 +917,7 @@ def _check_tool_split(
     assert tool["component_type_id"] == "lite_gripper.fixed_scale.component"
     assert [row["model_role_id"] for row in tool["model_role_bindings"]] == ["tool_model"]
     # The robot no longer owns a gripper; the tool owns `gripper` only, as a
-    # commanded display without its own controller (D4).
+    # commanded display without its own controller.
     targets = {
         (row["controllable_component_id"], row["command_target_id"])
         for row in graph["control_bindings"]
@@ -945,10 +938,11 @@ def _check_tool_split(
             for row in configuration["component_streams"]] == [("lite6_robot", "measured_joints")]
     # B-DEP: the mounted tool's TCP is one of the arm's robot TCPs (no `tcp` alias).
     binding = prepared["activation_payload"]["program_binding"]
-    (arm,) = [row for row in binding["target_role_bindings"] if row["command_target_id"] == "arm"]
+    (arm,) = [row for row in binding["target_bindings"]
+              if row["target"] == {"component_id": "lite6_robot", "command_target_id": "arm"}]
     (tcp,) = [row for row in arm["robot_tcps"]
-              if row["entry"]["component_id"] == "lite_gripper"
-              and row["entry"]["frame_role_id"] == "tcp"]
+              if row["entry"]["target"]["component_id"] == "lite_gripper"
+              and row["entry"]["frame"]["frame_id"] == "tcp"]
     assert tcp["frame"]["model_instance_id"] == "lite_gripper.model"
 
     def refused(name: str, edit, expected: str) -> None:
@@ -1027,7 +1021,7 @@ def _without_pose_sources(value: dict[str, object], key: str) -> dict[str, objec
 def _check_pose_source_preparation(
     args: argparse.Namespace, request: dict[str, object], root: Path
 ) -> None:
-    """CP9: the scenario's model-free pose source compiles beside the robot."""
+    """The scenario's model-free pose source compiles beside the robot."""
     sources = [
         component for component in request["deployment"]["components"]
         if component.get("configuration", {}).get("runtime_kind") == "pose_source"
@@ -1095,7 +1089,7 @@ def _check_ros_preparation(
     prepared = _run(args, request, root / "ros-valid")
     assert prepared is not None
     bundle = prepared["activation_payload"]["retained_bundle"]
-    # Q87: older authored projects remain valid; omission materializes the
+    # Older authored projects remain valid; omission materializes the
     # same empty prefix as current explicit authoring before sealing.
     old_authored = copy.deepcopy(request)
     for component in old_authored["deployment"]["components"]:
@@ -1118,7 +1112,7 @@ def _check_ros_preparation(
     assert request["deployment"]["components"][0]["target_settings"]["arm"][
         "maximum_tcp_linear_speed_mps"
     ] == 0.5
-    # Merge 6: the robot's mounted tool (components[1]) adds its own
+    # The robot's mounted tool (components[1]) adds its own
     # controller profile, gripper target rows and streams to the one unit.
     tool_component = request["deployment"]["components"][1]
     tool_id = tool_component["component_id"]
@@ -1133,12 +1127,12 @@ def _check_ros_preparation(
         "controllable_component_id": component_id,
         "command_target_id": "arm",
         "maximum_tcp_linear_speed_mps": 0.5,
-        # V2-9: omission compiles the ordinary-jerk switch off.
+        # Omission compiles the ordinary-jerk switch off.
         "ordinary_motion_jerk": {
             "enabled": False, "joint_limits": [], "preset_reference_time_s": 1.0,
         },
     }]
-    # Q68: the authored lane and the profile's model family become the
+    # The authored lane and the profile's model family become the
     # component's controller profile row inside the one ROS runtime unit.
     expected_configuration["controller_profiles"] = [{
         "controllable_component_id": component_id,
@@ -1163,7 +1157,7 @@ def _check_ros_preparation(
     expected_configuration["component_streams"] = sorted(
         expected_configuration["component_streams"] + tool_configuration["component_streams"],
         key=lambda row: (row["controllable_component_id"], row["stream_id"]))
-    # Q37: the authored fault Stop profile is carried unchanged (its joint map
+    # The authored fault Stop profile is carried unchanged (its joint map
     # as canonical-sorted rows) for the arm target.
     authored_fault = copy.deepcopy(request["deployment"]["components"][0][
         "configuration"
@@ -1179,11 +1173,11 @@ def _check_ros_preparation(
         "command_target_id": "arm",
         **authored_fault,
     }]
-    # CT-1: the omitted Cartesian timing compiles to its schema default.
+    # The omitted Cartesian timing compiles to its schema default.
     expected_configuration["cartesian_timing"] = "constant_speed"
     assert {**runtime["configuration"], "controller_profiles": _without_descriptions(
         runtime["configuration"]["controller_profiles"])} == expected_configuration
-    # CP8 step 1: the cell-wide `mode` lane flag is deleted.
+    # The cell-wide `mode` lane flag is deleted.
     assert "mode" not in runtime["configuration"]
     assert [row["component_type_id"] for row in graph["controllable_components"]] == [
         "ur10e.fixed_scale.component", "robotiq_2f_140.fixed_scale.component"]
@@ -1191,7 +1185,7 @@ def _check_ros_preparation(
         "ros2_control_execution_status"
     }
     bindings = graph["control_bindings"]
-    # Merge 6: the robot owns `arm`, its mounted tool `gripper`.
+    # The robot owns `arm`, its mounted tool `gripper`.
     owners = {"arm": component_id, "gripper": tool_id}
     assert {
         (row["controllable_component_id"], row["command_target_id"]) for row in bindings
@@ -1329,7 +1323,7 @@ def _check_ros_preparation(
     _rehash_request(foreign_limit)
     _run(args, foreign_limit, root / "ros-foreign-motion-limit",
          expect_error="requires exactly one TCP-speed maximum")
-    # V2-9: authored ordinary jerk compiles into the ROS motion limit row.
+    # Authored ordinary jerk compiles into the ROS motion limit row.
     authored_jerk = copy.deepcopy(request)
     jerk_settings = {
         "enabled": True,
@@ -1348,14 +1342,14 @@ def _check_ros_preparation(
                  "ordinary_motion_jerk": jerk_settings}])
 
     for scenario, expected_error in (
-        # Q68 + Q63-Q66: the offline Lite 6 is a mock ROS component now; the
+        # The offline Lite 6 is a mock ROS component now; the
         # pair is refused only by the existing shared runtime-unit cadence
         # agreement (50 ms vs the UR10e light scene's 100 ms).
         (
             "examples/mock_lite6_pick_and_place.scenario",
             "disagree on collision_monitor_period_ms",
         ),
-        # Q68: two ROS robots pass the composition rule; this pair is refused
+        # Two ROS robots pass the composition rule; this pair is refused
         # only by the existing shared runtime-unit cadence agreement.
         (
             "examples/sim_lite6_pick_and_place.scenario",
@@ -1368,7 +1362,7 @@ def _check_ros_preparation(
         unsupported["deployment_draft"]["components"].extend(
             additional["deployment_draft"]["components"]
         )
-        # Merge 6: the added robot brings its mounted tool's attachment.
+        # The added robot brings its mounted tool's attachment.
         unsupported["deployment_draft"]["attachments"].extend(
             additional["deployment_draft"]["attachments"]
         )
@@ -1400,13 +1394,13 @@ def _check_ros_preparation(
     bad_prefix["deployment"]["components"][0]["frame_prefix"] = 1
     _rehash_request(bad_prefix)
     _run(args, bad_prefix, root / "ros-invalid-prefix", expect_error="frame_prefix must be a string")
-    # Q68: any number of ROS components with catalog controller profiles is
+    # Any number of ROS components with catalog controller profiles is
     # accepted by the compiler (no hard-coded single-UR10e rule).
     two_robots = copy.deepcopy(document)
     second_robot = copy.deepcopy(two_robots["deployment_draft"]["components"][0])
     second_robot["component_id"] = "isaac_ur10e_second_robot"
-    # CP9: the copy declares the same measured_joints stream row as the
-    # maintained robot profile (merge 6: the copy carries no tool).
+    # The copy declares the same measured_joints stream row as the
+    # maintained robot profile (the copy carries no tool).
     second_runtime = second_robot["configuration"]["runtime_configuration"]
     assert "gripper_target_configurations" not in second_runtime
     for row in second_runtime["component_streams"]:
@@ -1434,14 +1428,14 @@ def _check_ros_preparation(
         args, _request(scenario_path, two_robots, request["program"]),
         root / "ros-two-robots",
     )
-    # Q68: one ROS runtime unit hosts robots with different controller
+    # One ROS runtime unit hosts robots with different controller
     # profiles (Lite 6 + UR10e) when the cell-wide cadence agrees; each
     # component carries its own profile.
     _, lite6_document, _ = _scenario_request(
         args.workspace, "examples/sim_lite6_pick_and_place.scenario"
     )
     lite6_document = _without_pose_sources(lite6_document, "deployment_draft")
-    # AUD-5: the Lite 6 comes as its machine (owner, arm, deactivated I/O).
+    # The Lite 6 comes as its machine (owner, arm, deactivated I/O).
     lite6_robot = copy.deepcopy(_row(lite6_document["deployment_draft"], "isaac_lite6_robot"))
     lite6_machine = [copy.deepcopy(row) for row in lite6_document["deployment_draft"]["components"]
                      if row["component_id"] == "isaac_lite6"
@@ -1455,7 +1449,7 @@ def _check_ros_preparation(
     two_profiles = copy.deepcopy(document)
     ur10e_mock = two_profiles["deployment_draft"]["components"][0]
     ur10e_mock["lane"] = "mock"
-    # Merge 6: the UR10e's mounted tool moves to Mock with it.
+    # The UR10e's mounted tool moves to Mock with it.
     tool_mock = two_profiles["deployment_draft"]["components"][1]
     assert tool_mock["component_id"] == "robotiq_2f_140"
     tool_mock["lane"] = "mock"
@@ -1535,7 +1529,7 @@ def _check_ros_preparation(
     assert all(component.get("frame_prefix", "") == ""
                for component in repeated_world_request["deployment"]["components"])
     for source in repeated_world_request["model_source_closure"]["components"]:
-        # Mounted tools (M6 tool split) carry no world link of their own.
+        # Mounted tools carry no world link of their own.
         if source["component_id"] not in {"lite6_robot", "ur5e_robot"}:
             continue
         urdf = decode_model_source_artifact(source["entrypoints"]["urdf"],
@@ -1559,7 +1553,7 @@ def _check_ros_preparation(
         invalid_namespace["deployment_draft"]["components"][0]["component_id"] = (
             f"isaac{separator}ur10e"
         )
-        # Merge 6: the mounted tool's attachment follows the renamed robot.
+        # The mounted tool's attachment follows the renamed robot.
         for attachment in invalid_namespace["deployment_draft"]["attachments"]:
             if attachment["parent"]["component_id"] == component_id:
                 attachment["parent"]["component_id"] = f"isaac{separator}ur10e"
@@ -1572,7 +1566,7 @@ def _write_manager_ros_apply_fixture(
     args: argparse.Namespace, request: dict[str, object], *, isaac: bool = False
 ) -> None:
     """Materialize one real ROS Scenario through the production tool."""
-    # Merge 6: one robot, plus the tool mounted on it.
+    # One robot, plus the tool mounted on it.
     components = [
         row for row in request["deployment"]["components"]
         if row["component_id"] in _unmounted_ids(request["deployment"])
@@ -1656,11 +1650,17 @@ def _write_manager_ros_apply_fixture(
 
 
 def _observe_manager_ros() -> int:
-    """Read actual CM/JSB facts for the existing Manager process fixture."""
+    """Read actual CM/JSB facts for the existing Manager process fixture.
+
+    Component model v2: the arm and the gripper mounted on it are separate
+    components, each with its own Mock ros2_control launch (namespace
+    `/manyforge/<component_id>`). The arm's launch is recorded as a
+    controller launch artifact; the gripper's controller manager is read in
+    its own namespace.
+    """
     import math
     import socket
     import time
-    import yaml
     import rclpy
     from controller_manager_msgs.srv import ListControllers
     from sensor_msgs.msg import JointState
@@ -1669,6 +1669,7 @@ def _observe_manager_ros() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--execution-root", required=True, type=Path)
     parser.add_argument("--component", required=True)
+    parser.add_argument("--gripper-component", required=True)
     parser.add_argument("--state", choices=("inactive", "active"), required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--output", required=True, type=Path)
@@ -1676,17 +1677,16 @@ def _observe_manager_ros() -> int:
     records = [json.loads(p.read_bytes()) for p in
                (args.execution_root / "controller-launch-artifacts").rglob("controller_launch_artifacts.json")]
     records = [row for row in records if row["controllable_component_id"] == args.component]
-    if len(records) != 1 or records[0]["lane"] != "mock":
-        raise AssertionError("Expected exactly one actual Mock launch artifact")
+    if len(records) != 1:
+        raise AssertionError("Expected exactly one actual arm launch artifact")
     artifact = records[0]
     launch = dict(value.split(":=", 1) for value in artifact["launch_arguments"])
-    namespace = launch["runtime_namespace"].rstrip("/")
-    arm, gripper = launch["arm_controller_name"], launch["gripper_controller_name"]
-    yaml_bytes = Path(artifact["controllers_file"]).read_bytes()
-    if raw_sha256_digest(yaml_bytes) != artifact["controllers_sha256"]:
+    arm_namespace = launch["runtime_namespace"].rstrip("/")
+    arm = launch["arm_controller_name"]
+    if raw_sha256_digest(Path(artifact["controllers_file"]).read_bytes()) != artifact["controllers_sha256"]:
         raise AssertionError("Actual controllers YAML does not match its writing receipt")
-    configuration = yaml.safe_load(yaml_bytes)
-    joint = configuration[f"/**/{gripper}"]["ros__parameters"]["joint"]
+    gripper_namespace = "/manyforge/" + args.gripper_component
+    controller_manager = launch["controller_manager_name"]
 
     def command(payload: dict[str, object], *, allow_refusal: bool = False) -> dict[str, object]:
         with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
@@ -1702,17 +1702,17 @@ def _observe_manager_ros() -> int:
         return response
 
     # This is the actual installed compiled target, including model source name.
-    status = command({"api_version": "manyforge.execution_command.v1", "command": "targets"})
-    components = [row for row in status["targets"]["components"]
-                  if row["controllable_component_id"] == args.component]
-    if len(components) != 1:
-        raise AssertionError("Installed target component differs from launch artifact")
-    targets = [row for row in components[0]["targets"] if row["presentation"] == "gripper"]
+    status = command({"api_version": "manyforge.execution_command.v3", "command": "targets"})
+    components = {row["controllable_component_id"]: row for row in status["targets"]["components"]}
+    if args.component not in components or args.gripper_component not in components:
+        raise AssertionError("Installed target components differ from the observed ones")
+    targets = [row for row in components[args.gripper_component]["targets"] if row["presentation"] == "gripper"]
     if len(targets) != 1:
         raise AssertionError("Expected one actual installed model-backed gripper target")
     target, direct = targets[0], targets[0]["command"]
-    if direct["resource"]["source_kind"] != "model_role" or direct["resource"]["source_coordinate_name"] != joint:
-        raise AssertionError("Generated gripper joint differs from actual retained model binding")
+    if direct["resource"]["source_kind"] != "model_role":
+        raise AssertionError("Gripper target is not bound to its model joint")
+    joint = direct["resource"]["source_coordinate_name"]
 
     rclpy.init()
     node = rclpy.create_node("manyforge_manager_fixture_observation")
@@ -1720,32 +1720,53 @@ def _observe_manager_ros() -> int:
     sample = None
     topic = None
     subscription = None
-    rows = None
+    arm_rows = gripper_rows = None
+    gripper = None
+
+    def pause() -> None:
+        rclpy.spin_once(node, timeout_sec=0.05)
+        # spin_once may return immediately; failed observations need a real pause.
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    def list_controllers(client) -> dict[str, dict[str, str]] | None:
+        if not client.wait_for_service(timeout_sec=min(0.1, max(0.0, deadline - time.monotonic()))):
+            return None
+        future = client.call_async(ListControllers.Request())
+        rclpy.spin_until_future_complete(node, future, timeout_sec=max(0.0, deadline - time.monotonic()))
+        if not future.done() or future.result() is None:
+            return None
+        return {row.name: {"state": row.state, "type": row.type} for row in future.result().controller}
+
+    def broadcasters(rows) -> list[str]:
+        return [name for name, row in (rows or {}).items()
+                if row["type"] == "joint_state_broadcaster/JointStateBroadcaster" and row["state"] == "active"]
+
+    def settled() -> bool:
+        return (arm_rows is not None and gripper_rows is not None and gripper is not None
+                and arm_rows.get(arm, {}).get("state") == args.state
+                and gripper_rows[gripper]["state"] == args.state
+                and len(broadcasters(arm_rows)) == 1 and len(broadcasters(gripper_rows)) == 1)
+
     try:
-        client = node.create_client(ListControllers, namespace + "/" + launch["controller_manager_name"] + "/list_controllers")
+        arm_client = node.create_client(ListControllers, arm_namespace + "/" + controller_manager + "/list_controllers")
+        gripper_client = node.create_client(ListControllers, gripper_namespace + "/" + controller_manager + "/list_controllers")
         while time.monotonic() < deadline:
-            if not client.wait_for_service(timeout_sec=min(0.1, max(0.0, deadline - time.monotonic()))):
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-                continue
-            future = client.call_async(ListControllers.Request())
-            rclpy.spin_until_future_complete(node, future, timeout_sec=max(0.0, deadline - time.monotonic()))
-            if not future.done() or future.result() is None:
-                break
-            rows = {row.name: {"state": row.state, "type": row.type} for row in future.result().controller}
-            broadcasters = [name for name, row in rows.items() if row["type"] == "joint_state_broadcaster/JointStateBroadcaster" and row["state"] == "active"]
-            if rows.get(arm, {}).get("state") != args.state or rows.get(gripper, {}).get("state") != args.state or len(broadcasters) != 1:
-                rclpy.spin_once(node, timeout_sec=0.05)
-                # spin_once may return immediately; failed observations need a real pause.
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            arm_rows = list_controllers(arm_client)
+            gripper_rows = list_controllers(gripper_client)
+            grippers = [name for name, row in (gripper_rows or {}).items()
+                        if row["type"] == "parallel_gripper_action_controller/GripperActionController"]
+            gripper = grippers[0] if len(grippers) == 1 else None
+            if not settled():
+                pause()
                 continue
             if subscription is None:
+                jsb = broadcasters(gripper_rows)[0]
                 topics = [name for name, types in node.get_topic_names_and_types()
                           if "sensor_msgs/msg/JointState" in types and any(
-                              info.node_name == broadcasters[0] and info.node_namespace.rstrip("/") == namespace
+                              info.node_name == jsb and info.node_namespace.rstrip("/") == gripper_namespace
                               for info in node.get_publishers_info_by_topic(name))]
                 if len(topics) != 1:
-                    rclpy.spin_once(node, timeout_sec=0.05)
-                    time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                    pause()
                     continue
                 topic = topics[0]
                 started_ns = node.get_clock().now().nanoseconds
@@ -1763,10 +1784,17 @@ def _observe_manager_ros() -> int:
             if sample is not None and node.get_clock().now().nanoseconds - sample["stamp_ns"] <= 1_000_000_000:
                 break
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-        if rows is None or rows.get(arm, {}).get("state") != args.state or rows.get(gripper, {}).get("state") != args.state or len(broadcasters) != 1 or sample is None or not 0 <= node.get_clock().now().nanoseconds - sample["stamp_ns"] <= 1_000_000_000:
-            raise AssertionError({"expected_state": args.state, "controllers": rows, "topic": topic, "fresh_gripper_sample": sample})
-        evidence = {"label": args.label, "controller_manager": namespace + "/" + launch["controller_manager_name"],
-                    "arm_controller": arm, "gripper_controller": gripper, "controllers": rows,
+        if not settled() or sample is None or not 0 <= node.get_clock().now().nanoseconds - sample["stamp_ns"] <= 1_000_000_000:
+            raise AssertionError({"expected_state": args.state, "arm_controllers": arm_rows,
+                                  "gripper_controllers": gripper_rows, "topic": topic, "fresh_gripper_sample": sample})
+        evidence = {"label": args.label,
+                    "controller_manager": arm_namespace + "/" + controller_manager,
+                    "gripper_controller_manager": gripper_namespace + "/" + controller_manager,
+                    "arm_controller": arm, "gripper_controller": gripper,
+                    # Arm and gripper controller names are distinct; both sets
+                    # are kept whole beside the merged lookup.
+                    "controllers": {**arm_rows, **{gripper: gripper_rows[gripper]}},
+                    "arm_controllers": arm_rows, "gripper_controllers": gripper_rows,
                     "joint_state_topic": topic, "fresh_gripper_sample": {**sample, "stamp_ns": str(sample["stamp_ns"]), "received_ns": str(sample["received_ns"])},
                     "controllers_sha256": artifact["controllers_sha256"]}
         if args.state == "inactive":
@@ -1776,17 +1804,18 @@ def _observe_manager_ros() -> int:
             position = {"kind": kind, "value_rad" if kind == "angular_rad" else "value_m": sample["position"]}
             operation = {"request_context": {"request_id": "empty-ros-one-mock." + args.label + ".gripper", "request_owner_epoch": identity["owner_epoch"], "source_label": "manager_ros_apply_fixture", "correlation_id": None},
                          **{key: manual[key] for key in ("program_id", "program_revision", "program_binding_id", "program_run_id")},
-                         "expected_graph_revision": identity["graph_revision"], "expected_retained_bundle_id": identity["retained_bundle_id"], "expected_scene_revision": identity["scene_revision"],
-                         "participants": [{"component_role_id": direct["component_role_id"], "target_role_id": direct["target_role_id"], "required_capability_id": target["operation_capability_id"], "action_span": None,
+                         "expected_graph_revision": identity["graph_revision"], "expected_retained_bundle_id": identity["retained_bundle_id"], "expected_scene_revision": None,
+                         "participants": [{"target": direct["target"], "required_capability_id": target["operation_capability_id"], "action_span": None,
                                            "payload": {"kind": "capability_command", "command_schema_id": direct["command_schema_id"], "command_schema_revision": direct["command_schema_revision"],
                                                        "command_value": {"kind": "gripper_position", "position": position, "max_effort": None}, "completion_timeout_s": 2.0,
                                                        "caller_options": [{"option_id": "command_duration_s", "value_s": 0.5}]}}], "coordination_policy": "independent"}
-            envelope = {"api_version": "manyforge.execution_command.v1", "command": "submit", "operation": operation,
+            envelope = {"api_version": "manyforge.execution_command.v3", "command": "submit", "operation": operation,
                         "attribution": {"assurance": "unverified", "principal_id": None, "transport": "http"}}
             refusal = command(envelope, allow_refusal=True)
             # Existing Kernel checks route publication/readback before component eligibility.
-            # Declared/no-W and Disabled must refuse through one of those actual gates.
-            closed_admission_reasons = {"runtime_route_publication_required", "runtime_route_configuration_not_ready", "component_command_not_eligible"}
+            # Declared/no-W and Disabled must refuse through one of those actual gates;
+            # a prepared (not enabled) v2 component refuses with component_not_enabled.
+            closed_admission_reasons = {"runtime_route_publication_required", "runtime_route_configuration_not_ready", "component_command_not_eligible", "component_not_enabled"}
             if refusal["ok"] or refusal["error"]["details"].get("reason") not in closed_admission_reasons:
                 raise AssertionError(refusal)
             evidence["gripper_submit_refusal"] = refusal
@@ -1796,6 +1825,7 @@ def _observe_manager_ros() -> int:
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--observe-manager-ros":
@@ -1850,7 +1880,7 @@ def main() -> int:
             return 0
         if args.real_measured:
             # The maintained Real scenario mounts Mock's lane-free pneumatic
-            # tool with no output (display only). Merge 6: without that tool,
+            # tool with no output (display only). Without that tool,
             # the robot alone is the arm-only component.
             scenario_request = request
             (attachment,) = document["deployment_draft"]["attachments"]
@@ -1871,7 +1901,7 @@ def main() -> int:
             ]
             arm_only["deployment_draft"]["attachments"] = []
             request = _request(scenario_path, arm_only, scenario_request["program"])
-            # CP8 step 1: a Real component compiles to measured authority with
+            # A Real component compiles to measured authority with
             # its own authority ID, an arm-only type, its site-settings address
             # reference and no cell-wide `mode`.
             prepared = _run(args, request, temporary / "real")
@@ -1884,7 +1914,7 @@ def main() -> int:
                 assert row["state_authority_class"] == "measured"
                 assert row["state_authority_id"] == f"{component}.arm.measured_state"
                 # Every lane uses the shared provider; the vendor adapter comes
-                # from the model's lane row (CONTRACTS §12).
+                # from the model's lane row.
                 assert row["provider_manifest_id"] == "manyforge.provider.ros2_control"
             bundle = prepared["activation_payload"]["retained_bundle"]
             assert {
@@ -1892,7 +1922,7 @@ def main() -> int:
                 for row in bundle["capability_provider_bindings"]
                 if row["scope"] == "target_binding"
             } == {"manyforge.provider.ros2_control"}
-            # AUD-5: the arm is its machine's member; the owner is a
+            # The arm is its machine's member; the owner is a
             # target-less component of the graph.
             owner_id = scenario_row(scenario_request, robot_id)["owner"]
             assert sorted(row["controllable_component_id"]
@@ -1900,7 +1930,7 @@ def main() -> int:
                 [owner_id, robot_id])
             (component,) = [row for row in graph["controllable_components"]
                             if row["controllable_component_id"] == robot_id]
-            # Merge 6: the split arm model has no fingers; its type is arm-only.
+            # The split arm model has no fingers; its type is arm-only.
             assert component["component_type_id"] == "lite6.fixed_scale.component"
             (unit,) = graph["runtime_units"]
             configuration = unit["configuration"]
@@ -1960,7 +1990,7 @@ def main() -> int:
                 for row in new_graph["control_bindings"]
                 if row["command_target_id"] == "arm"
             )
-            # Merge 6: the gripper domain is the lane-free tool's own (shared
+            # The gripper domain is the lane-free tool's own (shared
             # ROS provider, its own instance).
             for row in [
                 *new_graph["control_bindings"],
@@ -1986,7 +2016,7 @@ def main() -> int:
                 for row in new_unit["configuration"]["component_streams"]
             ] == [(robot_id, "measured_joints")]
             # The tool declares no nonexistent feedback, and its pneumatic row
-            # is refused as a lane-free tool's (merge 6: the tool, not the
+            # is refused as a lane-free tool's (the tool, not the
             # Real robot, owns it).
             false_feedback = copy.deepcopy(with_gripper)
             scenario_row(false_feedback, tool_id)["configuration"][
@@ -2024,7 +2054,7 @@ def main() -> int:
                  expect_error="runtime_configuration.tool_payload moved: a tool's "
                  "payload comes from its model")
             # Lane real carries a site-settings address reference, on the
-            # machine's owner (CONTRACTS §16); a lane without one refuses it.
+            # machine's owner; a lane without one refuses it.
             no_address = copy.deepcopy(request)
             del scenario_row(no_address, owner_id)["configuration"]["device_address_ref"]
             _rehash_request(no_address)
@@ -2032,7 +2062,7 @@ def main() -> int:
                  expect_error="lane real requires a device_address_ref")
             # One robot is driven by one component: a second Real component
             # naming the same site device reference is refused at compile.
-            # AUD-5: the twin is a second machine (owner and every member)
+            # The twin is a second machine (owner and every member)
             # with the same address reference.
             twin_id = robot_id + "_twin"
             twin_owner_id = owner_id + "_twin"
@@ -2069,9 +2099,6 @@ def main() -> int:
             return 0
         if args.no_program:
             request["program"] = None
-            request["program_role_assignment"] = {
-                "component_roles": [], "target_roles": []
-            }
             _rehash_request(request)
             _run(args, request, temporary / "keep", expected_program_outcome_kind="no_program")
             request["deployment"]["components"] = []
@@ -2098,7 +2125,7 @@ def main() -> int:
                 args,
                 removed_overrides,
                 temporary / "removed-parameter-overrides",
-                expect_error="typed_parameter_overrides were removed",
+                expect_error="unsupported activation preparation request version",
             )
 
             unsupported_version = copy.deepcopy(request)
@@ -2276,7 +2303,7 @@ def main() -> int:
                  expect_error="missing runtime_cell_id")
             return 0
         if not args.negative_matrix:
-            # Merge 6: a robot counts with the tool mounted on it.
+            # A robot counts with the tool mounted on it.
             if len(_unmounted_ids(request["deployment"])) == 1:
                 dual_path = "examples/mock_dual_arm_shared_group.scenario"
                 _, _, dual_request = _scenario_request(workspace, dual_path)
@@ -2308,7 +2335,7 @@ def main() -> int:
                     )
                 # The native host product was infrastructure-only and stayed
                 # identical across membership; the ROS runtime product embeds
-                # the unit's component configuration (Q68), so only its
+                # the unit's component configuration, so only its
                 # identity, profile and revision stay stable.
                 single_product = _native_host_products(prepared)
                 dual_product = _native_host_products(dual_prepared)
@@ -2331,29 +2358,25 @@ def main() -> int:
             return 0
 
         missing = copy.deepcopy(request)
-        del missing["program_role_assignment"]
+        del missing["program"]
         _run(
             args,
             missing,
             temporary / "missing",
-            expect_error="program_role_assignment",
+            expect_error="request is missing program",
         )
 
-        duplicate = copy.deepcopy(request)
-        rows = duplicate["program_role_assignment"]["component_roles"]
-        if len(rows) < 2:
-            raise AssertionError("negative matrix requires two component roles")
-        rows[1]["component_role_id"] = rows[0]["component_role_id"]
-        _rehash_request(duplicate)
+        legacy = copy.deepcopy(request)
+        legacy["program_role_assignment"] = {"component_roles": [], "target_roles": []}
         _run(
             args,
-            duplicate,
-            temporary / "duplicate",
-            expect_error="duplicate component role assignment",
+            legacy,
+            temporary / "legacy-assignment",
+            expect_error="request has unexpected field program_role_assignment",
         )
 
         mispartitioned_initial_state = copy.deepcopy(request)
-        # Merge 6: the two robots; their mounted tools have no arm.
+        # The two robots; their mounted tools have no arm.
         robot_ids = _unmounted_ids(mispartitioned_initial_state["deployment"])
         components = [
             row for row in mispartitioned_initial_state["deployment"]["components"]
@@ -2389,15 +2412,27 @@ def main() -> int:
         )
 
         foreign = copy.deepcopy(request)
-        foreign["program_role_assignment"]["target_roles"][0][
-            "command_target_id"
-        ] = "foreign_target"
+        def replace_target(value: object) -> bool:
+            if isinstance(value, dict):
+                if set(value) == {"component_id", "command_target_id"}:
+                    value["command_target_id"] = "foreign_target"
+                    return True
+                return any(replace_target(child) for child in value.values())
+            if isinstance(value, list):
+                return any(replace_target(child) for child in value)
+            return False
+        program = foreign["program"]
+        if not isinstance(program, dict) or not replace_target(program["tree"]):
+            raise AssertionError("negative matrix needs an authored direct target")
+        program["program_revision"] = compute_content_identity(
+            program, own_field="program_revision", identity_domain="program-revision",
+            api_version="manyforge.program.v3")
         _rehash_request(foreign)
         _run(
             args,
             foreign,
             temporary / "foreign",
-            expected_program_outcome_kind="non_executable",
+            expect_diagnostic="command_target_missing",
         )
     return 0
 

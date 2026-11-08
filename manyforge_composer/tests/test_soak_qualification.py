@@ -3,8 +3,7 @@
 Historical blob ``d574829042bf0be7e6f624754a0f1ab1049db728`` at
 ``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`` contains six cases.
 The two structural URDF/GLB cache cases remain valid and are ported below.
-Dynamic viewer/gripper and Composer-owned historian/archive soak return only
-at their named gates.
+Dynamic viewer/gripper and Composer-owned historian/archive soak are deferred.
 """
 
 from __future__ import annotations
@@ -27,14 +26,14 @@ HISTORICAL_CASE_FAMILIES: Final = (
         "dynamic_scene_batch_fk",
         "historical line 238",
         1,
-        ("I9", "I"),
+        ("deferred",),
         "one batched visual FK operation per source observation",
     ),
     (
         "addressed_gripper_visual_state",
         "historical line 259",
         1,
-        ("I6", "N", "I9", "I"),
+        ("deferred",),
         "model limits resolve once per response and no command mutation occurs",
     ),
     (
@@ -48,7 +47,7 @@ HISTORICAL_CASE_FAMILIES: Final = (
         "historian_page_and_archive_retention",
         "historical lines 380-415",
         2,
-        ("I5", "H0"),
+        ("deferred",),
         "bounded history pages and byte-bounded failure evidence retention",
     ),
 )

@@ -12,9 +12,7 @@
 
 namespace manyforge::core {
 
-/// Bounded ring buffer of CollisionFailureArchiveEntry values (spec
-/// COLLISION_CHECKING_OWNERSHIP_PLAN §"Failure archive groundwork",
-/// added by the kernel-architecture sprint C-arch chunk).
+/// Bounded ring buffer of CollisionFailureArchiveEntry values.
 ///
 /// The archive is the in-process v0 of a failure-triage surface. The
 /// `CollisionValidationCoordinator` (or any caller wrapping it) pushes
@@ -22,8 +20,7 @@ namespace manyforge::core {
 ///   - inspect the most-recent N entries for operator-facing diagnostics
 ///   - drain via the optional sink callback to a long-retention store
 ///     (JSONL file, telemetry bus, qualification harness) — the
-///     persistence format is deliberately not decided yet (defer-until-
-///     data per the sprint plan).
+///     persistence format is deliberately not decided yet).
 ///
 /// Thread-safety: `push`/`recent`/`clear` are all safe from any thread.
 /// The optional sink callback is copied under the archive lock and then

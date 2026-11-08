@@ -85,6 +85,62 @@ TEST(RoboPlanSceneGenerationTest,
   EXPECT_EQ(group->joint_names, std::vector<std::string>{"joint1"});
 }
 
+TEST(RoboPlanSceneGenerationTest, DiagnosticCopyKeepsLimitsGroupsAndGeometryIndependent) {
+  const auto input = bounded_input();
+  auto source = make_roboplan_scene(input);
+  Eigen::Matrix4d pose = Eigen::Matrix4d::Identity();
+  pose(0, 3) = 0.4;
+  const auto added = source->addSphereGeometry(
+      "dynamic", "tip", roboplan::Sphere(0.05), pose,
+      Eigen::Vector4d(0.2, 0.4, 0.8, 1.0));
+  ASSERT_TRUE(added.has_value()) << added.error();
+  const auto world = source->addSphereGeometry(
+      "world", "universe", roboplan::Sphere(0.05), pose,
+      Eigen::Vector4d(0.2, 0.4, 0.8, 1.0));
+  ASSERT_TRUE(world.has_value()) << world.error();
+  Eigen::VectorXd positions(1);
+  positions << 0.1;
+  source->setJointPositions(positions);
+  const auto source_pairs = source->getCollisionModel().collisionPairs;
+  ASSERT_FALSE(source_pairs.empty());
+  ASSERT_TRUE(source->hasCollisions(positions));
+  auto diagnostic = manyforge::roboplan_backend::make_collision_disabled_scene(
+      *source, "diagnostic", input.joint_limits, input.srdf_xml);
+  ASSERT_NE(source.get(), diagnostic.get());
+  EXPECT_TRUE(diagnostic->getCollisionModel().collisionPairs.empty());
+  EXPECT_FALSE(diagnostic->hasCollisions(positions));
+  EXPECT_TRUE(source->hasCollisions(positions));
+  EXPECT_EQ(source->getCollisionModel().collisionPairs, source_pairs);
+  EXPECT_TRUE(diagnostic->getCurrentJointPositions().isApprox(positions));
+  const auto source_group = source->getJointGroupInfo("arm");
+  const auto diagnostic_group = diagnostic->getJointGroupInfo("arm");
+  ASSERT_TRUE(source_group.has_value());
+  ASSERT_TRUE(diagnostic_group.has_value());
+  EXPECT_EQ(source_group->joint_names, diagnostic_group->joint_names);
+  EXPECT_TRUE(source_group->q_indices.isApprox(diagnostic_group->q_indices));
+  const auto source_joint = source->getJointInfo("joint1");
+  const auto diagnostic_joint = diagnostic->getJointInfo("joint1");
+  ASSERT_TRUE(source_joint.has_value());
+  ASSERT_TRUE(diagnostic_joint.has_value());
+  EXPECT_TRUE(source_joint->limits.min_position.isApprox(diagnostic_joint->limits.min_position));
+  EXPECT_TRUE(source_joint->limits.max_position.isApprox(diagnostic_joint->limits.max_position));
+  EXPECT_TRUE(source_joint->limits.max_velocity.isApprox(diagnostic_joint->limits.max_velocity));
+  EXPECT_TRUE(source_joint->limits.max_acceleration.isApprox(diagnostic_joint->limits.max_acceleration));
+  const auto &original_geometry = source->getCollisionModel().geometryObjects;
+  const auto &copied_geometry = diagnostic->getCollisionModel().geometryObjects;
+  ASSERT_EQ(original_geometry.size(), copied_geometry.size());
+  for (std::size_t i = 0; i < original_geometry.size(); ++i) {
+    EXPECT_EQ(original_geometry[i].name, copied_geometry[i].name);
+    EXPECT_EQ(original_geometry[i].parentJoint, copied_geometry[i].parentJoint);
+    EXPECT_EQ(original_geometry[i].parentFrame, copied_geometry[i].parentFrame);
+    EXPECT_TRUE(original_geometry[i].placement.isApprox(copied_geometry[i].placement));
+    EXPECT_EQ(original_geometry[i].geometry, copied_geometry[i].geometry);
+  }
+  diagnostic->setJointPositions(Eigen::VectorXd::Zero(1));
+  EXPECT_TRUE(source->getCurrentJointPositions().isApprox(positions));
+  EXPECT_EQ(source->getCollisionModel().collisionPairs, source_pairs);
+}
+
 TEST(RoboPlanSceneGenerationTest,
      SharedFactoryRejectsIncompleteDuplicateAndForeignLimitRows) {
   auto missing = bounded_input();

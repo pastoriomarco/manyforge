@@ -57,11 +57,11 @@ public:
                 (!sources.empty() || !system_rows.empty() || !adapter_rows.empty() ||
                  compiled_blackboard_key_capacity > 0U),
             "I/O installation has no compiled source/time authority");
-    // A machine's I/O member signals (CONTRACTS §16, profile
+    // A machine's I/O member signals (profile
     // `component_adapter`): one in-process source per signal
     // (`<member>.<signal>`), fed by the family's I/O update sink; no driver.
     // Mock outputs (`mock_output`) are in-process sources too: each accepted
-    // write is published back as their sample (CONTRACTS §7, D2).
+    // write is published back as their sample.
     std::map<core::InterruptSourceId,
              std::vector<deployment::RetainedIoSignalConfiguration>>
         adapter_sources;
@@ -80,7 +80,7 @@ public:
       rows.push_back(row);
     }
     // Compiled system signals: one in-process source with no driver or
-    // lifecycle; the host owns it (contract §2).
+    // lifecycle; the host owns it.
     std::optional<core::InterruptSourceId> system_source;
     for (const auto &row : system_rows) {
       Require(row.provider.profile == deployment::kSystemCarriedObjectProfile &&
@@ -148,7 +148,7 @@ public:
                                           compiled_blackboard_key_capacity,
             "I/O key capacity arithmetic overflow");
     // Each core-held `<output>.changed_outside` signal has its own core
-    // source (CONTRACTS §7) and counts against both bounds.
+    // source and counts against both bounds.
     const auto changed_outside = static_cast<std::size_t>(
         std::count_if(catalog.signals.begin(), catalog.signals.end(),
                       [](const auto &descriptor) { return core::HoldsChangedOutside(descriptor); }));
@@ -254,16 +254,7 @@ public:
       // The record alone installs the real initially paused leaf under its
       // delivery barrier. Runtime creation/Start never fabricates Enable.
     }
-    std::sort(
-        result->drivers_.begin(), result->drivers_.end(),
-        [](const auto &left, const auto &right) {
-          if (left->domain().control_domain_id !=
-              right->domain().control_domain_id)
-            return left->domain().control_domain_id <
-                   right->domain().control_domain_id;
-          return std::owner_less<std::shared_ptr<IoProviderDriverRecord>>{}(
-              left, right);
-        });
+    std::sort(result->drivers_.begin(), result->drivers_.end(), DeliveryLockOrder);
     return result;
   }
 
@@ -276,7 +267,7 @@ public:
   }
 
   /// A Mock output whose accepted writes are published as its sample with
-  /// source `manyforge_write` (CONTRACTS §7, D2).
+  /// source `manyforge_write`.
   void AddMockOutput(std::shared_ptr<MockBooleanOutputProvider> output,
                      const core::IoSignalId &signal) {
     Require(!started_ && output && adapter_signal_sources_.contains(signal),
@@ -633,8 +624,8 @@ public:
     std::optional<std::pair<std::string, std::string>> previous_selector;
     for (std::size_t index = 0; index < request.signals.size(); ++index) {
       const auto &row = request.signals[index];
-      const auto selector = std::make_pair(row.target_role_id.value(),
-                                           row.resource_role_id.value());
+      const auto selector = std::make_pair(row.signal.component_id.value(),
+                                           row.signal.signal_name);
       if (selector.first.empty() || selector.second.empty() ||
           (previous_selector && selector <= *previous_selector))
         return Reply::Err(
@@ -693,7 +684,7 @@ public:
             SimulationError("io_source_unavailable",
                             "Mock input has no current actual reading"));
       acknowledgement.signals.push_back(
-          {row.target_role_id, row.resource_role_id,
+          {row.signal,
            mock ? core::ProgramMockSimulationSignalDisposition::kApplied
                 : core::ProgramMockSimulationSignalDisposition::kInactive});
       const auto [actual, inserted] =
@@ -1102,9 +1093,9 @@ public:
           });
     // The system source has no DriverRecord: its levels outlive compositions
     // in the host store. Starting (also as an Apply candidate) only replays
-    // the recorded `true` levels, serialized with every Publish (SX-189); the
+    // the recorded `true` levels, serialized with every Publish; the
     // store's sink moves here when this composition is committed
-    // (`AdoptCarriedObjectLostSignals`, SX-206).
+    // (`AdoptCarriedObjectLostSignals`).
     if (system_provider_)
       host_carried_object_lost_signals().Seed(
           [this](const std::vector<core::IoSignalId> &lost) {
@@ -1174,7 +1165,7 @@ public:
     return changed.value().publication_error;
   }
 
-  /// CONTRACTS §6 I/O update sink: one acquisition of an adapter family's
+  /// I/O update sink: one acquisition of an adapter family's
   /// component, stamped at receipt by the family. Updates of a component
   /// whose signals this catalog doesn't hold are not this runtime's.
   void PublishAdapterUpdates(const std::string &component_id,
@@ -1668,8 +1659,8 @@ private:
         }, core::SchedulerPriority::RuntimeSafety);
   }
   // A fresh sample turns stale with no new acquisition: refresh the published
-  // samples at that moment so the event stream sends the change (CONTRACTS
-  // §7). One deadline at a time, the earliest; no periodic re-read.
+  // samples at that moment so the event stream sends the change.
+  // One deadline at a time, the earliest; no periodic re-read.
   void ScheduleSampleExpiryLocked() {
     if (!active_)
       return;

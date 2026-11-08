@@ -20,10 +20,10 @@ export function reactPropsHost() {
     addEventListener: () => undefined, removeEventListener: () => undefined,
     createTextNode: (text: string) => ({ nodeType: 3, nodeValue: text, ownerDocument: document }),
   };
-  const node = (tag: string): FakeNode => {
+  const node = (tag: string, namespaceURI = 'http://www.w3.org/1999/xhtml'): FakeNode => {
     const element = {
       nodeType: 1, nodeName: tag.toUpperCase(), tagName: tag.toUpperCase(),
-      namespaceURI: 'http://www.w3.org/1999/xhtml', ownerDocument: document, options: [],
+      namespaceURI, ownerDocument: document, options: [],
       // React writes CSS custom properties (`--name`) through setProperty.
       style: { setProperty: () => undefined },
       addEventListener: () => undefined, removeEventListener: () => undefined,
@@ -33,7 +33,9 @@ export function reactPropsHost() {
     elements.push(element);
     return element;
   };
-  document.createElement = node;
+  document.createElement = (tag: string) => node(tag);
+  // Inline icons (svg, path) are created in the SVG namespace.
+  document.createElementNS = (namespaceURI: string, tag: string) => node(tag, namespaceURI);
   document.documentElement = node('html');
   const window = { document, HTMLIFrameElement: class {} };
   document.defaultView = window;

@@ -1774,11 +1774,22 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   ASSERT_TRUE(session.status().permit_pending);
   session.revoke_clear_permits();
   session.revoke_clear_permits();
+  std::atomic<bool> detach_started{false};
+  std::atomic<bool> detach_finished{false};
+  std::thread detacher([&] {
+    detach_started.store(true, std::memory_order_release);
+    session.detach();
+    detach_finished.store(true, std::memory_order_release);
+  });
+  while (!detach_started.load(std::memory_order_acquire)) std::this_thread::yield();
+  EXPECT_FALSE(detach_finished.load(std::memory_order_acquire));
   {
     std::lock_guard<std::mutex> lock(gate_mutex);
     release = true;
   }
   gate_cv.notify_all();
+  detacher.join();
+  EXPECT_TRUE(detach_finished.load(std::memory_order_acquire));
 
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::seconds(2);
@@ -1792,6 +1803,27 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   EXPECT_EQ(session.status().jobs_started_total, 1u);
   EXPECT_EQ(session.status().clear_permits_invalidated_total, 1u);
   EXPECT_EQ(callbacks.load(std::memory_order_relaxed), 0u);
+  session.detach();
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest, DetachClosesIdleSessionAndIsIdempotent) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  ExecutionProgressPublication progress(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  auto engine = std::make_shared<TestLookaheadEngine>("detach-idle");
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult) {},
+      accept_test_authority());
+  session.detach();
+  session.detach();
+  EXPECT_THROW(session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), ""),
+               std::logic_error);
 }
 
 TEST(RuntimeCollisionLookaheadSessionTest,

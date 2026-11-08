@@ -1,4 +1,4 @@
-"""Backend-owned Deployment defaults and effective values (CONTRACTS §11)."""
+"""Backend-owned Deployment defaults and effective values."""
 
 from manyforge_composer.backend.deployment_defaults import effective_fields, with_defaults
 
@@ -68,7 +68,7 @@ def test_effective_values_name_value_default_and_whether_set() -> None:
     assert fields[f"{runtime}.cartesian_timing"] == {
         "value": "constant_speed", "default": "constant_speed", "set": False,
     }
-    # N12 / RP-3b: joint and pose goals are timed smooth unless the robot says fast.
+    # Joint and pose goals are timed smooth unless the robot says fast.
     assert fields[f"{runtime}.motion_timing"] == {
         "value": "smooth", "default": "smooth", "set": False,
     }

@@ -6,9 +6,8 @@ Its retained CLI is available only through the explicit ``static-artifacts``
 mode; the historical command shape is a typed unavailable boundary.
 The historical version mixed reusable static artifact checks with the removed
 ``manyforge.deployment.v0`` ``robot_config``/``adapters`` schema and the old
-Python RobotModelAuthority owner.  Those portions return through I3/I6 and the
-I9/I, I10/R, and I11/T product gates; no replacement catalog, identifier, or
-runtime contract is invented here.  JSON output is an unversioned diagnostic,
+Python RobotModelAuthority owner.  Those portions are not retained; no
+replacement catalog, identifier, or runtime contract is invented here.  JSON output is an unversioned diagnostic,
 not durable qualification evidence.
 
 Retained checks are limited to facts present in the supplied artifacts:
@@ -21,8 +20,8 @@ Retained checks are limited to facts present in the supplied artifacts:
 Exact historical source: ManyForge
 ``08222188293df8e12f90dc72e204c21f22f92ea1``, blob
 ``b228171c782c0b9a81c9d3683ab5edf6fbd5fd92``.  Historical lines 107-236
-and 289-367 are assigned to I3/I6, I9/I, I10/R, and I11/T; the static
-ros2_control and bridge assertions are retained below.
+and 289-367 are not retained; the static ros2_control and bridge assertions
+are retained below.
 """
 
 from __future__ import annotations
@@ -71,8 +70,8 @@ def validate_legacy_deployment_authority(
 
     raise LegacyDeploymentAuthorityUnavailableError(
         f"{LEGACY_DEPLOYMENT_AUTHORITY_UNAVAILABLE_REASON_CODE}: "
-        "compiler-owned model products and resource addresses return at "
-        "I3/I6; real-Lite6 product validation returns at I10/R"
+        "compiler-owned model products, resource addresses and real-Lite6 "
+        "product validation are not available yet"
     )
 
 

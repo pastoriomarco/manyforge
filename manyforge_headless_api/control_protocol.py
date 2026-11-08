@@ -1,4 +1,4 @@
-"""Strict UI6-G execution-control protocol and freshness authority.
+"""Strict execution-control protocol and freshness authority.
 
 The DTOs in this module are ROS-free and transport-neutral.  HTTP, WebSocket,
 and in-process adapters decode into the same request and call the same ingress;

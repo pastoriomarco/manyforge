@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-11-02 10:29:59 CET
+  Last regenerated: 2026-11-03 23:00:47 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -5295,7 +5295,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       "ServerApplyRequest": {
         "additionalProperties": false,
-        "description": "CONTRACTS \u00a711: Preview takes an empty body.",
+        "description": "Preview takes an empty body.",
         "properties": {},
         "title": "ServerApplyRequest",
         "type": "object"
@@ -5864,7 +5864,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
     "$defs": {
       "ScenarioEmptyRequest": {
         "additionalProperties": false,
-        "description": "CONTRACTS \u00a711 `POST /api/scenario/new` body: refused with\nan unsaved Draft unless the caller confirms `discard_unsaved`.",
+        "description": "`POST /api/scenario/new` body: refused with\nan unsaved Draft unless the caller confirms `discard_unsaved`.",
         "properties": {
           "discard_unsaved": {
             "default": false,
@@ -5877,7 +5877,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       "ScenarioLoadRequest": {
         "additionalProperties": false,
-        "description": "CONTRACTS \u00a711 `POST /api/scenario/load` body. With an unsaved Draft the\nLoad is refused unless the caller confirms `discard_unsaved`.",
+        "description": "`POST /api/scenario/load` body. With an unsaved Draft the\nLoad is refused unless the caller confirms `discard_unsaved`.",
         "properties": {
           "discard_unsaved": {
             "default": false,
@@ -5959,7 +5959,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
     "$defs": {
       "ComponentActionRequest": {
         "additionalProperties": false,
-        "description": "CONTRACTS \u00a72 `POST /api/components/{component_id}/actions`.",
+        "description": "`POST /api/components/{component_id}/actions` body.",
         "properties": {
           "action": {
             "enum": [
@@ -5984,7 +5984,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       "ComponentGroupActionRequest": {
         "additionalProperties": false,
-        "description": "CONTRACTS \u00a72 `POST /api/components/actions` (Enable all and groups):\nthe caller names the components (Enable all = every `prepared` member and\nowner-less component; owners have no Enable, \u00a716).",
+        "description": "`POST /api/components/actions` body (Enable all and groups):\nthe caller names the components (Enable all = every `prepared` member and\nowner-less component; owners have no Enable).",
         "properties": {
           "action": {
             "enum": [
@@ -6138,7 +6138,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
     "$defs": {
       "SetOutputRequest": {
         "additionalProperties": false,
-        "description": "CONTRACTS \u00a77 `POST /api/io/{signal_id}/set` body.",
+        "description": "`POST /api/io/{signal_id}/set` body.",
         "properties": {
           "value": {
             "anyOf": [
@@ -7486,7 +7486,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       "OperationResetRequest": {
         "additionalProperties": false,
-        "description": "Targeted operation Reset (contract 66).",
+        "description": "Targeted operation Reset.",
         "properties": {
           "expected_operation_revision": {
             "maximum": 9007199254740991.0,

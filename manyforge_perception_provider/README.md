@@ -75,7 +75,7 @@ the model immediately and does not prove GPU idle. A single pending client
 cancel terminal is drained on the next callback after the framework enters
 canceling; it cannot delay admission of the next valid goal.
 
-`phase1_orin.launch.py` constructs the seven-node encoder, YOLO inference and
+`orin_perception.launch.py` constructs the seven-node encoder, YOLO inference and
 decoder, full/refinement TensorRT components, FoundationPose and one-shot
 tracking, then the sequencer, in one container. The existing scheduling timer
 checks service discovery every 100 ms without a terminal deadline; it then

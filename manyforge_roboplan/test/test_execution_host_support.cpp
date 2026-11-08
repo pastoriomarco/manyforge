@@ -20,12 +20,76 @@
 #include <utility>
 #include <vector>
 
+#include <cstdlib>
+
 #ifdef __linux__
 #include <sched.h>
+#include <sys/resource.h>
+#include <unistd.h>
 #endif
 
 using namespace manyforge::roboplan_backend;
 using namespace manyforge::core;
+
+namespace {
+
+// Lane-isolation tests first park the blocking roles and only then schedule
+// the lane under test, so "fires while blocked" holds by construction rather
+// than by a 10 ms head start that a loaded machine can overrun.
+template <typename Predicate>
+bool wait_until_true(Predicate predicate,
+                     std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (!predicate()) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+
+// Releases parked callbacks on every exit path (including a failed ASSERT)
+// so the scheduler's worker threads can be joined.
+struct ReleaseOnExit {
+  std::atomic<bool>& release;
+  ~ReleaseOnExit() { release.store(true); }
+};
+
+}  // namespace
+
+TEST(NativeSchedulerTest, CloseAdmissionDiscardsQueuedWorkAndRejectsNewWork) {
+  SimpleScheduler scheduler;
+  std::atomic<bool> fired{false};
+  const auto future = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      (std::chrono::steady_clock::now() + std::chrono::hours(1)).time_since_epoch()).count();
+  scheduler.schedule(future, [&] { fired.store(true); });
+  scheduler.close_admission_and_discard();
+  EXPECT_TRUE(scheduler.drain_all_for(std::chrono::milliseconds(100)));
+  EXPECT_FALSE(fired.load());
+  EXPECT_THROW(scheduler.schedule(future, [] {}), std::runtime_error);
+}
+
+TEST(NativeSchedulerTest, CancelReleasesCapturedOwnerOutsideWorkerLock) {
+  SimpleScheduler scheduler;
+  const auto future = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      (std::chrono::steady_clock::now() + std::chrono::hours(1)).time_since_epoch()).count();
+  bool released = false;
+  struct Owner {
+    std::function<void()> on_destroy;
+    ~Owner() { on_destroy(); }
+  };
+  auto owner = std::make_shared<Owner>();
+  owner->on_destroy = [&] {
+    scheduler.schedule(future, [] {});
+    released = true;
+  };
+  const auto handle = scheduler.schedule(future, [owner] {});
+  owner.reset();
+  EXPECT_TRUE(scheduler.cancel_before_dequeue(handle));
+  EXPECT_TRUE(released);
+  scheduler.close_admission_and_discard();
+}
 
 TEST(NativeSchedulerTest, SimpleSchedulerHonorsFutureDeadline) {
   SimpleScheduler scheduler;
@@ -61,6 +125,7 @@ TEST(NativeSchedulerTest, MonitoringLaneFiresWhileRuntimeSafetyLaneIsBlocked) {
   std::atomic<bool> runtime_safety_can_exit{false};
   std::atomic<bool> runtime_safety_running{false};
   std::atomic<bool> monitoring_fired{false};
+  ReleaseOnExit release_on_exit{runtime_safety_can_exit};
 
   const auto schedule_at = [&](int64_t offset_ns) {
     const auto now_ns =
@@ -82,9 +147,12 @@ TEST(NativeSchedulerTest, MonitoringLaneFiresWhileRuntimeSafetyLaneIsBlocked) {
       },
       SchedulerPriority::RuntimeSafety);
 
+  ASSERT_TRUE(wait_until_true([&]() { return runtime_safety_running.load(); }))
+      << "Runtime-safety callback did not reach its parking loop";
+
   // Monitoring callback must fire even while Safety is parked.
   scheduler.schedule(
-      schedule_at(20'000'000LL),
+      schedule_at(10'000'000LL),
       [&]() { monitoring_fired.store(true); },
       SchedulerPriority::Monitoring);
 
@@ -96,8 +164,6 @@ TEST(NativeSchedulerTest, MonitoringLaneFiresWhileRuntimeSafetyLaneIsBlocked) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
 
-  EXPECT_TRUE(runtime_safety_running.load())
-      << "Runtime-safety callback did not reach its parking loop";
   EXPECT_TRUE(monitoring_fired.load())
       << "Monitoring watchdog did not fire while runtime-safety lane was blocked";
 
@@ -112,6 +178,7 @@ TEST(NativeSchedulerTest, ControllerCommandLaneFiresWhileOtherRolesAreBlocked) {
   std::atomic<bool> release_blocked_roles{false};
   std::atomic<int> blocked_roles_running{0};
   std::atomic<bool> controller_fired{false};
+  ReleaseOnExit release_on_exit{release_blocked_roles};
 
   const auto schedule_at = [&](int64_t offset_ns) {
     const auto now_ns =
@@ -138,9 +205,11 @@ TEST(NativeSchedulerTest, ControllerCommandLaneFiresWhileOtherRolesAreBlocked) {
   block_role(SchedulerPriority::Lifecycle);
   block_role(SchedulerPriority::Monitoring);
   block_role(SchedulerPriority::Background);
+  ASSERT_TRUE(wait_until_true([&]() { return blocked_roles_running.load() == 5; }))
+      << "only " << blocked_roles_running.load() << " of 5 blocking roles parked";
 
   scheduler.schedule(
-      schedule_at(20'000'000LL),
+      schedule_at(10'000'000LL),
       [&]() { controller_fired.store(true); },
       SchedulerPriority::ControllerCommand);
 
@@ -151,7 +220,6 @@ TEST(NativeSchedulerTest, ControllerCommandLaneFiresWhileOtherRolesAreBlocked) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
 
-  EXPECT_EQ(blocked_roles_running.load(), 5);
   EXPECT_TRUE(controller_fired.load())
       << "Controller-command lane was starved by blocked lower-priority roles";
 
@@ -164,6 +232,7 @@ TEST(NativeSchedulerTest, RuntimeSafetyLaneFiresWhileLifecycleLaneIsBlocked) {
   std::atomic<bool> release_lifecycle{false};
   std::atomic<bool> lifecycle_running{false};
   std::atomic<bool> runtime_safety_fired{false};
+  ReleaseOnExit release_on_exit{release_lifecycle};
 
   const auto schedule_at = [&](int64_t offset_ns) {
     const auto now_ns =
@@ -182,8 +251,10 @@ TEST(NativeSchedulerTest, RuntimeSafetyLaneFiresWhileLifecycleLaneIsBlocked) {
         }
       },
       SchedulerPriority::Lifecycle);
+  ASSERT_TRUE(wait_until_true([&]() { return lifecycle_running.load(); }))
+      << "Lifecycle callback did not reach its parking loop";
   scheduler.schedule(
-      schedule_at(20'000'000LL),
+      schedule_at(10'000'000LL),
       [&]() { runtime_safety_fired.store(true); },
       SchedulerPriority::RuntimeSafety);
 
@@ -194,7 +265,6 @@ TEST(NativeSchedulerTest, RuntimeSafetyLaneFiresWhileLifecycleLaneIsBlocked) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
 
-  EXPECT_TRUE(lifecycle_running.load());
   EXPECT_TRUE(runtime_safety_fired.load())
       << "Runtime-safety lane was starved by blocked lifecycle work";
 
@@ -207,6 +277,7 @@ TEST(NativeSchedulerTest, StopControlLaneFiresWhileLowerRolesAreBlocked) {
   std::atomic<bool> release_blocked_roles{false};
   std::atomic<int> blocked_roles_running{0};
   std::atomic<bool> stop_control_fired{false};
+  ReleaseOnExit release_on_exit{release_blocked_roles};
 
   const auto schedule_at = [&](int64_t offset_ns) {
     const auto now_ns =
@@ -230,9 +301,11 @@ TEST(NativeSchedulerTest, StopControlLaneFiresWhileLowerRolesAreBlocked) {
   block_role(SchedulerPriority::Lifecycle);
   block_role(SchedulerPriority::Monitoring);
   block_role(SchedulerPriority::Background);
+  ASSERT_TRUE(wait_until_true([&]() { return blocked_roles_running.load() == 3; }))
+      << "only " << blocked_roles_running.load() << " of 3 blocking roles parked";
 
   scheduler.schedule(
-      schedule_at(20'000'000LL),
+      schedule_at(10'000'000LL),
       [&]() { stop_control_fired.store(true); },
       SchedulerPriority::StopControl);
 
@@ -243,7 +316,6 @@ TEST(NativeSchedulerTest, StopControlLaneFiresWhileLowerRolesAreBlocked) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
 
-  EXPECT_EQ(blocked_roles_running.load(), 3);
   EXPECT_TRUE(stop_control_fired.load())
       << "Stop-control lane was starved by blocked lower-priority roles";
 
@@ -260,7 +332,7 @@ TEST(NativeSchedulerTest, StrictEnvironmentProfileIsExplicitAndOrdered) {
       {"MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY", "4"},
       {"MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY", "40"},
       {"MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY", "5-6"},
-      {"MANYFORGE_RT_STOP_CONTROL_PRIORITY", "35"},
+      {"MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY", "7"},
   };
 
   const auto config = SimpleSchedulerConfig::from_environment(environment);
@@ -278,10 +350,19 @@ TEST(NativeSchedulerTest, StrictEnvironmentProfileIsExplicitAndOrdered) {
   EXPECT_TRUE(controller.required);
   EXPECT_EQ(safety.priority, 40);
   EXPECT_EQ(safety.cpu_affinity, std::vector<int>({5, 6}));
-  EXPECT_EQ(stop.priority, 35);
-  EXPECT_EQ(stop.cpu_affinity, controller.cpu_affinity)
-      << "StopControl deliberately shares the controller-command reservation "
-         "unless deployment selects a separate CPU";
+  // OD-58: StopControl is the highest lane by default, on its own CPUs.
+  EXPECT_EQ(stop.priority, 48);
+  EXPECT_GT(stop.priority, controller.priority);
+  EXPECT_EQ(stop.cpu_affinity, std::vector<int>({7}));
+  // OD-59: the strict profile locks the process memory and pre-faults the
+  // three priority workers' stacks.
+  EXPECT_TRUE(config.lock_memory);
+  EXPECT_TRUE(controller.prefault_stack);
+  EXPECT_TRUE(safety.prefault_stack);
+  EXPECT_TRUE(stop.prefault_stack);
+  EXPECT_FALSE(
+      config.workers[scheduler_priority_index(SchedulerPriority::Lifecycle)].prefault_stack);
+  EXPECT_FALSE(SimpleSchedulerConfig::from_environment({}).lock_memory);
   EXPECT_FALSE(
       config.workers[scheduler_priority_index(SchedulerPriority::Lifecycle)]
           .requested());
@@ -327,11 +408,61 @@ TEST(NativeSchedulerTest, StrictEnvironmentProfileRejectsInvertedPriorities) {
       {"MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY", "4"},
       {"MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY", "45"},
       {"MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY", "5"},
-      {"MANYFORGE_RT_STOP_CONTROL_PRIORITY", "35"},
+      {"MANYFORGE_RT_STOP_CONTROL_PRIORITY", "48"},
+      {"MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY", "6"},
   };
   EXPECT_THROW(
       (void)SimpleSchedulerConfig::from_environment(environment),
       std::invalid_argument);
+#else
+  GTEST_SKIP() << "strict scheduler profiles are Linux-only";
+#endif
+}
+
+// OD-58: StopControl gets no ControllerCommand CPUs by default (its CPUs
+// are required), and a StopControl priority at or below ControllerCommand
+// is refused.
+TEST(NativeSchedulerTest, StrictEnvironmentProfileNeedsAHighestPriorityStopLaneWithItsOwnCpus) {
+#ifdef __linux__
+  std::map<std::string, std::string> environment = {
+      {"MANYFORGE_RT_RESOURCE_PROFILE", "strict"},
+      {"MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY", "4"},
+      {"MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY", "5"},
+  };
+  EXPECT_THROW((void)SimpleSchedulerConfig::from_environment(environment),
+               std::invalid_argument);
+  environment["MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY"] = "6";
+  EXPECT_NO_THROW((void)SimpleSchedulerConfig::from_environment(environment));
+  environment["MANYFORGE_RT_STOP_CONTROL_PRIORITY"] = "45";
+  EXPECT_THROW((void)SimpleSchedulerConfig::from_environment(environment),
+               std::invalid_argument);
+#else
+  GTEST_SKIP() << "strict scheduler profiles are Linux-only";
+#endif
+}
+
+// OD-59: a memory lock the OS refuses (here a zero memlock limit) refuses
+// the strict scheduler's construction with its error, like a rejected
+// worker profile; nothing crashes. Run in a child so the test process keeps
+// its own limits and memory unlocked.
+TEST(NativeSchedulerDeathTest, StrictMemoryLockRefusalRefusesConstruction) {
+#ifdef __linux__
+  if (::geteuid() == 0) GTEST_SKIP() << "root may lock memory past RLIMIT_MEMLOCK";
+  EXPECT_EXIT(
+      {
+        rlimit none{};  // both limits zero (no comma: EXPECT_EXIT is a macro)
+        if (::setrlimit(RLIMIT_MEMLOCK, &none) != 0) std::_Exit(2);
+        SimpleSchedulerConfig config;
+        config.lock_memory = true;
+        try {
+          SimpleScheduler scheduler(std::move(config));
+        } catch (const std::runtime_error& error) {
+          const std::string text = error.what();
+          std::_Exit(text.find("rejected its memory lock") != std::string::npos ? 3 : 4);
+        }
+        std::_Exit(0);
+      },
+      ::testing::ExitedWithCode(3), "");
 #else
   GTEST_SKIP() << "strict scheduler profiles are Linux-only";
 #endif
@@ -343,6 +474,7 @@ TEST(NativeSchedulerTest, StrictEnvironmentProfileRejectsSafetyCpuOverlap) {
       {"MANYFORGE_RT_RESOURCE_PROFILE", "strict"},
       {"MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY", "4"},
       {"MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY", "4"},
+      {"MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY", "6"},
   };
   EXPECT_THROW(
       (void)SimpleSchedulerConfig::from_environment(environment),
@@ -594,6 +726,40 @@ TEST(NativeSchedulerTest, DrainForTimesOutWhileRuntimeSafetyCallbackIsBlocked) {
   EXPECT_TRUE(
       scheduler.drain_for(SchedulerPriority::RuntimeSafety,
                           std::chrono::seconds(1)));
+}
+
+TEST(NativeSchedulerTest, DrainAllSharesOneDeadlineAcrossBlockedLanes) {
+  SimpleScheduler scheduler;
+  std::promise<void> release;
+  const auto gate = release.get_future().share();
+  std::promise<void> first_entered;
+  std::promise<void> second_entered;
+  auto first_ready = first_entered.get_future();
+  auto second_ready = second_entered.get_future();
+  const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  scheduler.schedule(now_ns, [&] { first_entered.set_value(); gate.wait(); },
+                     SchedulerPriority::RuntimeSafety);
+  scheduler.schedule(now_ns, [&] { second_entered.set_value(); gate.wait(); },
+                     SchedulerPriority::StopControl);
+  const bool first_started = first_ready.wait_for(std::chrono::seconds(2)) ==
+                             std::future_status::ready;
+  const bool second_started = second_ready.wait_for(std::chrono::seconds(2)) ==
+                              std::future_status::ready;
+  auto drain = std::async(std::launch::async, [&] {
+    return scheduler.drain_all_for(std::chrono::milliseconds(250));
+  });
+  // Two blocked lanes used to consume a full timeout each. Always release
+  // before assertions so a failed timing check cannot strand worker threads.
+  const bool completed_in_shared_budget =
+      drain.wait_for(std::chrono::milliseconds(450)) == std::future_status::ready;
+  release.set_value();
+  const bool drained = drain.get();
+  EXPECT_TRUE(first_started);
+  EXPECT_TRUE(second_started);
+  EXPECT_TRUE(completed_in_shared_budget);
+  EXPECT_FALSE(drained);
+  EXPECT_TRUE(scheduler.drain_all_for(std::chrono::seconds(1)));
 }
 
 TEST(WriterPreferringSharedGateTest, WaitingWriterBlocksNewReadersAndIsBounded) {

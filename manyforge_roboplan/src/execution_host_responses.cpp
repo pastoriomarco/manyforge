@@ -10,6 +10,8 @@
 #include <iostream>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <mutex>
+#include <set>
+#include <cmath>
 #include <stdexcept>
 #include <type_traits>
 
@@ -100,14 +102,140 @@ SceneRevisionValue(const core::SceneRevision &value) {
   });
 }
 
+[[nodiscard]] CanonicalValue MotionPathPreviewValue(
+    const core::MotionPathPreview &path,
+    const core::RuntimeParticipantBindingDTO &binding,
+    const std::string *diagnostic_reason) {
+  Require(!path.joint_names.empty() && path.joint_names.size() <= 256U &&
+              path.joint_names.size() == binding.resources.size() &&
+              path.pairs.size() <= 64U && !path.samples.empty() &&
+              path.samples.size() <= 32U,
+          "motion path preview exceeds its shape limits");
+  CanonicalValue::Array source_names;
+  std::set<std::string> compiled_names, local_names;
+  for (std::size_t i = 0; i < path.joint_names.size(); ++i) {
+    const auto &resource = binding.resources[i];
+    Require(resource.source_joint_name.has_value() &&
+                !resource.source_joint_name->empty() &&
+                path.joint_names[i] == resource.compiled_resource_name &&
+                compiled_names.insert(path.joint_names[i]).second &&
+                local_names.insert(*resource.source_joint_name).second,
+            "motion path preview crosses its source-local binding");
+    source_names.emplace_back(*resource.source_joint_name);
+  }
+  CanonicalValue::Array pairs;
+  std::optional<std::pair<std::string, std::string>> previous_pair;
+  for (const auto &pair : path.pairs) {
+    const auto pair_id = std::make_pair(pair.body_a, pair.body_b);
+    Require(!pair.body_a.empty() && !pair.body_b.empty() &&
+                pair.body_a < pair.body_b &&
+                (!previous_pair.has_value() || *previous_pair < pair_id),
+            "motion path preview contains an invalid pair");
+    previous_pair = pair_id;
+    pairs.emplace_back(CanonicalValue::Object{
+        {"body_a", CanonicalValue(pair.body_a)},
+        {"body_b", CanonicalValue(pair.body_b)}});
+  }
+  CanonicalValue::Array samples;
+  double previous_time = -1.0;
+  for (const auto &sample : path.samples) {
+    Require(std::isfinite(sample.time_from_start_s) &&
+                sample.time_from_start_s >= 0.0 &&
+                sample.time_from_start_s > previous_time &&
+                sample.positions_rad.size() == path.joint_names.size(),
+            "motion path preview contains an invalid sample");
+    previous_time = sample.time_from_start_s;
+    CanonicalValue::Array positions, contacts;
+    for (const double position : sample.positions_rad) {
+      Require(std::isfinite(position), "motion path preview contains a nonfinite position");
+      positions.emplace_back(position);
+    }
+    std::set<std::size_t> seen;
+    for (const auto &contact : sample.contacts) {
+      Require(contact.pair_index < path.pairs.size() &&
+                  seen.insert(contact.pair_index).second,
+              "motion path preview contains an invalid contact");
+      const char *disposition = nullptr;
+      switch (contact.disposition) {
+        case core::MotionPreviewContactDisposition::kAllowed: disposition = "allowed"; break;
+        case core::MotionPreviewContactDisposition::kRefused: disposition = "refused"; break;
+        case core::MotionPreviewContactDisposition::kUnknown: disposition = "unknown"; break;
+      }
+      Require(disposition != nullptr, "motion path preview contains an invalid disposition");
+      contacts.emplace_back(CanonicalValue::Object{
+          {"pair_index", CanonicalValue(static_cast<double>(contact.pair_index))},
+          {"disposition", CanonicalValue(disposition)}});
+    }
+    const char *status = nullptr;
+    switch (sample.status) {
+      case core::MotionPreviewSampleStatus::kChecked: status = "checked"; break;
+      case core::MotionPreviewSampleStatus::kUnknown: status = "unknown"; break;
+    }
+    Require(status != nullptr, "motion path preview contains an invalid status");
+    CanonicalValue::Object sample_value{
+        {"time_from_start_s", CanonicalValue(sample.time_from_start_s)},
+        {"positions_rad", CanonicalValue(std::move(positions))},
+        {"contacts", CanonicalValue(std::move(contacts))},
+        {"status", CanonicalValue(status)}};
+    if (diagnostic_reason != nullptr) {
+      CanonicalValue::Array violations;
+      std::set<std::size_t> seen_violations;
+      for (const auto &violation : sample.clearance_violations) {
+        Require(violation.pair_index < path.pairs.size() &&
+                    seen_violations.insert(violation.pair_index).second &&
+                    std::isfinite(violation.distance_m) &&
+                    std::isfinite(violation.required_clearance_m) &&
+                    violation.distance_m > 0.0 &&
+                    violation.distance_m < violation.required_clearance_m,
+                "motion path preview contains an invalid clearance violation");
+        violations.emplace_back(CanonicalValue::Object{
+            {"pair_index", CanonicalValue(static_cast<double>(violation.pair_index))},
+            {"distance_m", CanonicalValue(violation.distance_m)},
+            {"required_clearance_m", CanonicalValue(violation.required_clearance_m)}});
+      }
+      sample_value.emplace_back("clearance_violations", CanonicalValue(std::move(violations)));
+    }
+    samples.emplace_back(std::move(sample_value));
+  }
+  CanonicalValue::Object value{
+      {"source_joint_names", CanonicalValue(std::move(source_names))},
+      {"pairs", CanonicalValue(std::move(pairs))},
+      {"samples", CanonicalValue(std::move(samples))}};
+  if (diagnostic_reason != nullptr) {
+    Require(!diagnostic_reason->empty() &&
+                (path.diagnostic_kind == "validated_path" ||
+                 path.diagnostic_kind == "collision_disabled_path" ||
+                 path.diagnostic_kind == "collision_disabled_ik_pose" ||
+                 path.diagnostic_kind == "collision_disabled_ik_path"),
+            "motion path preview contains an invalid diagnostic identity");
+    Require(path.diagnostic_kind != "collision_disabled_ik_pose" || path.samples.size() == 1U,
+            "motion IK diagnostic must contain exactly one sample");
+    Require(path.diagnostic_kind != "collision_disabled_ik_path" || path.samples.size() >= 2U,
+            "motion IK path diagnostic must contain at least two samples");
+    value.emplace_back("schema_version", CanonicalValue("manyforge.motion_preview_diagnostic.v2"));
+    value.emplace_back("kind", CanonicalValue(path.diagnostic_kind));
+    value.emplace_back("reason", CanonicalValue(*diagnostic_reason));
+  }
+  return CanonicalValue(std::move(value));
+}
+
 [[nodiscard]] CanonicalValue MotionPreviewReceiptValue(
     const core::MotionPreviewResultDTO &preview,
     const core::OperationIntentDTO &intent,
     const core::ContentDigest &intent_digest,
     const core::RuntimeParticipantBindingDTO &direct_control_binding,
-    const core::RequestOwnerEpoch &owner_epoch) {
+    const core::RequestOwnerEpoch &owner_epoch,
+    const CanonicalValue &path_preview) {
   const auto &binding = direct_control_binding;
   const auto &final_state = preview.final_controlled_state;
+  Require(preview.resolved_tcp.has_value(),
+          "motion preview has no exact Active TCP capture");
+  const auto &tcp = *preview.resolved_tcp;
+  constexpr std::uint64_t kMaxExactJsonInteger = 9007199254740991ULL;
+  Require(tcp.registration_generation > 0U &&
+              tcp.registration_generation <= kMaxExactJsonInteger &&
+              tcp.sequence <= kMaxExactJsonInteger,
+          "motion preview Active TCP capture is not representable");
   Require(
       final_state.resources.size() == binding.resources.size() &&
           final_state.joint_names.size() == binding.resources.size() &&
@@ -149,7 +277,6 @@ SceneRevisionValue(const core::SceneRevision &value) {
                                preview.collision_world_revision.revision_id))},
        })},
       {"commit_eligible", CanonicalValue(true)},
-      {"component_role_id", CanonicalValue(binding.component_role_id.value())},
       {"final_positions_rad", CanonicalValue(std::move(final_positions))},
       {"final_tcp_pose", PoseValue(preview.final_tcp_pose)},
       {"graph_revision", CanonicalValue(binding.graph_revision.value())},
@@ -170,10 +297,27 @@ SceneRevisionValue(const core::SceneRevision &value) {
        SceneRevisionValue(
            preview.projection_binding.projection_revision.scene_revision)},
       {"schema_version",
-       CanonicalValue("manyforge.direct_control_motion_preview.v1")},
+       CanonicalValue("manyforge.direct_control_motion_preview.v4")},
+      {"resolved_tcp", CanonicalValue(CanonicalValue::Object{
+          {"entry", CanonicalValue(CanonicalValue::Object{
+              {"target", CanonicalValue(CanonicalValue::Object{
+                  {"component_id", CanonicalValue(tcp.entry.target.component_id.value())},
+                  {"command_target_id", CanonicalValue(tcp.entry.target.command_target_id.value())}})},
+              {"frame", CanonicalValue(CanonicalValue::Object{
+                  {"component_id", CanonicalValue(tcp.entry.frame.component_id.value())},
+                  {"frame_id", CanonicalValue(tcp.entry.frame.frame_id.value())}})}})},
+          {"source", CanonicalValue(
+              tcp.source == core::PreviewTcpCaptureSource::kJointFlangeFallback ? "joint_flange_fallback" :
+              tcp.source == core::PreviewTcpCaptureSource::kExplicitEntry ? "explicit_entry" : "active_tcp")},
+          {"owner_epoch", CanonicalValue(owner_epoch.value())},
+          {"registration_generation", CanonicalValue(static_cast<double>(tcp.registration_generation))},
+          {"sequence", CanonicalValue(static_cast<double>(tcp.sequence))}})},
+      {"path_preview", path_preview},
       {"source_joint_names", CanonicalValue(std::move(source_joint_names))},
       {"start_positions_rad", CanonicalValue(std::move(start_positions))},
-      {"target_role_id", CanonicalValue(binding.target_role_id.value())},
+      {"target", CanonicalValue(CanonicalValue::Object{
+          {"component_id", CanonicalValue(binding.controllable_component_id.value())},
+          {"command_target_id", CanonicalValue(binding.command_target_id.value())}})},
   };
   const core::ContentDigest receipt_digest(content_identity::sha256_digest(
       content_identity::canonical_json(CanonicalValue(receipt))));
@@ -222,7 +366,6 @@ SceneRevisionValue(const core::SceneRevision &value) {
       {"command_schema_revision",
        CanonicalValue(binding.command_schema->command_schema_revision.value())},
       {"commit_eligible", CanonicalValue(true)},
-      {"component_role_id", CanonicalValue(binding.component_role_id.value())},
       {"coordinate_kind", CanonicalValue(coordinate_kind)},
       {"graph_revision", CanonicalValue(binding.graph_revision.value())},
       {"intent_digest", CanonicalValue(intent_digest.value())},
@@ -246,13 +389,15 @@ SceneRevisionValue(const core::SceneRevision &value) {
        CanonicalValue(binding.retained_bundle_id.value())},
       {"schema_version",
        CanonicalValue(
-           "manyforge.direct_control_capability_command_preview.v1")},
+           "manyforge.direct_control_capability_command_preview.v2")},
       {"source_coordinate_name", CanonicalValue(source_coordinate_name)},
       {"source_kind",
        CanonicalValue(model_backed ? "model_role" : "component_local")},
       {"target_position",
        CanonicalValue(preview.command_request.target_position)},
-      {"target_role_id", CanonicalValue(binding.target_role_id.value())},
+      {"target", CanonicalValue(CanonicalValue::Object{
+          {"component_id", CanonicalValue(binding.controllable_component_id.value())},
+          {"command_target_id", CanonicalValue(binding.command_target_id.value())}})},
   };
   const core::ContentDigest receipt_digest(content_identity::sha256_digest(
       content_identity::canonical_json(CanonicalValue(receipt))));
@@ -748,7 +893,7 @@ ProgramExecutionScopeValue(const core::ProgramExecutionScopeStateDTO &value) {
                  core::program_selection_release_block_reason_token(
                      *value.selection_release_block_reason)))
            : CanonicalValue(nullptr)},
-      // AUD-6: a rule's `hold` held the run (stopped_by: rule).
+      // A rule's `hold` held the run (stopped_by: rule).
       {"stopped_by", value.stopped_by_rule_id ? CanonicalValue("rule") : CanonicalValue(nullptr)},
       {"rule_id", value.stopped_by_rule_id ? CanonicalValue(*value.stopped_by_rule_id)
                                            : CanonicalValue(nullptr)}});
@@ -1756,18 +1901,18 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
     const core::RuntimeScaleControlSelectorDTO &value) {
   if (value.group_targets.empty()) {
     return CanonicalValue(CanonicalValue::Object{
-        {"component_role_id", CanonicalValue(value.component_role_id.value())},
+        {"component_id", CanonicalValue(value.component_id.value())},
         {"program_binding_id",
          CanonicalValue(value.program_binding_id.value())},
-        {"target_role_id", CanonicalValue(value.target_role_id.value())},
+        {"command_target_id", CanonicalValue(value.command_target_id.value())},
     });
   }
   CanonicalValue::Array targets;
   targets.reserve(value.group_targets.size());
   for (const auto &target : value.group_targets) {
     targets.emplace_back(CanonicalValue::Object{
-        {"component_role_id", CanonicalValue(target.component_role_id.value())},
-        {"target_role_id", CanonicalValue(target.target_role_id.value())},
+        {"component_id", CanonicalValue(target.component_id.value())},
+        {"command_target_id", CanonicalValue(target.command_target_id.value())},
     });
   }
   return CanonicalValue(CanonicalValue::Object{
@@ -1824,10 +1969,10 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
         {"control_domain_revision",
          CanonicalValue(member.control_domain_revision.value())},
         {"scaling_domain_id", CanonicalValue(member.scaling_domain_id.value())},
-        {"component_role_id",
-         CanonicalValue(member.target.component_role_id.value())},
-        {"target_role_id",
-         CanonicalValue(member.target.target_role_id.value())},
+        {"component_id",
+         CanonicalValue(member.target.component_id.value())},
+        {"command_target_id",
+         CanonicalValue(member.target.command_target_id.value())},
     });
   }
   CanonicalValue::Object object{
@@ -2186,7 +2331,7 @@ OperationEventPageValue(const core::OperationJournalEventPageDTO &page) {
       {"next_after_sequence",
        CanonicalValue(static_cast<double>(page.next_after_sequence))},
       {"owner_epoch", CanonicalValue(page.owner_epoch.value())},
-      {"schema_version", CanonicalValue("manyforge.execution_event_page.v1")},
+      {"schema_version", CanonicalValue("manyforge.execution_event_page.v2")},
   });
 }
 
@@ -2520,7 +2665,7 @@ CanonicalValue Text(const std::string_view value) { return CanonicalValue(std::s
 CanonicalValue Nanoseconds(const std::int64_t value) {
   return content_identity::nonnegative_int64_value(std::max<std::int64_t>(value, 0));
 }
-/// Optional contract fields are omitted when absent (CONTRACTS §1 `?`).
+/// Optional contract fields are omitted when absent.
 void OptionalText(CanonicalValue::Object &object, const char *name,
                   const std::optional<std::string> &value) {
   if (value) object.emplace_back(name, CanonicalValue(*value));
@@ -2569,9 +2714,34 @@ CanonicalValue ActionResultValue(const core::ActionResult &result) {
     OptionalText(error, "vendor_text", result.error->vendor_text);
     object.emplace_back("error", CanonicalValue(std::move(error)));
   }
+  if (!result.phases.empty()) {
+    CanonicalValue::Array phases;
+    for (const auto &phase : result.phases) {
+      CanonicalValue::Object item{{"component_id", CanonicalValue(phase.component_id)},
+                                  {"action", Text(core::to_string(phase.action))},
+                                  {"outcome", Text(core::to_string(phase.outcome))}};
+      if (phase.error) {
+        CanonicalValue::Object error{{"code", CanonicalValue(phase.error->code)},
+                                     {"message", CanonicalValue(phase.error->message)}};
+        OptionalText(error, "vendor_code", phase.error->vendor_code);
+        OptionalText(error, "vendor_text", phase.error->vendor_text);
+        item.emplace_back("error", CanonicalValue(std::move(error)));
+      }
+      phases.emplace_back(std::move(item));
+    }
+    object.emplace_back("phases", CanonicalValue(std::move(phases)));
+  }
   return CanonicalValue(std::move(object));
 }
 
+CanonicalValue ComponentStopValue(const core::ComponentStop &stop) {
+  CanonicalValue::Object object{{"code", Text(core::to_string(stop.code))},
+                                {"message", CanonicalValue(stop.message)},
+                                {"since_ns", Nanoseconds(stop.since_ns)}};
+  OptionalText(object, "vendor_code", stop.vendor_code);
+  OptionalText(object, "vendor_text", stop.vendor_text);
+  return CanonicalValue(std::move(object));
+}
 CanonicalValue ComponentStateValue(const core::ComponentState &state) {
   CanonicalValue::Array streams;
   for (const auto &stream : state.streams) {
@@ -2602,6 +2772,7 @@ CanonicalValue ComponentStateValue(const core::ComponentState &state) {
                                       {"action", Text(core::to_string(state.action->action))},
                                       {"started_at_ns", Nanoseconds(state.action->started_at_ns)}}));
   if (state.fault) object.emplace_back("fault", FaultValue(*state.fault));
+  if (state.stop) object.emplace_back("stop", ComponentStopValue(*state.stop));
   OptionalText(object, "owner_id", state.owner_id);
   OptionalText(object, "role", state.role);
   if (state.last_action) object.emplace_back("last_action", ActionResultValue(*state.last_action));
@@ -2618,6 +2789,7 @@ CanonicalValue CellLatchValue(const core::CellLatch &latch) {
     CanonicalValue::Object row{{"component_id", CanonicalValue(cause.component_id)},
                                {"kind", Text(core::to_string(cause.kind))}};
     if (cause.fault) row.emplace_back("fault", FaultValue(*cause.fault));
+    if (cause.stop) row.emplace_back("stop", ComponentStopValue(*cause.stop));
     causes.emplace_back(std::move(row));
   }
   return CanonicalValue(CanonicalValue::Object{{"causes", CanonicalValue(std::move(causes))},
@@ -2647,8 +2819,8 @@ CanonicalValue SignalSampleValue(const core::SignalSample &sample,
         return "manyforge_write";
       case core::IoSignalSampleSource::kOutside:
         return "outside";
-      case core::IoSignalSampleSource::kLastWrite:
-        return "last_write";
+      case core::IoSignalSampleSource::kNotReadable:
+        return "not_readable";
     }
     return "device";
   }();

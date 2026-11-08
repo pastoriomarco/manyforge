@@ -448,7 +448,7 @@ std::string ros2_control_execution_runtime_profile_revision() {
 void require_no_exclusive_ros_controller_topic_collision(
     const CanonicalValue::Array &controller_profiles,
     const CanonicalValue::Array &motion_target_limits) {
-  // Every Isaac arm uses these global command/state topics. Merge 6: only an
+  // Every Isaac arm uses these global command/state topics. Only an
   // arm owns them; a tool (no motion target) declares its own joints from
   // the robot's shared Isaac joint states.
   std::set<std::string> arms;
@@ -951,7 +951,7 @@ bool require_ros2_control_execution_runtime_required_rows(
     const core::CellGraphDTO &graph, const core::RuntimeUnitDTO &unit) {
   // This hook also runs while compiling/verifying a Draft, immediately after
   // schema normalization. Keep position-positive validation at that boundary
-  // while allowing DX777's zero pneumatic dwell, without imposing unrelated
+  // while allowing a zero pneumatic dwell, without imposing unrelated
   // retained-decoder requirements on authoring.
   std::vector<PneumaticIo> pneumatic_configs;
   if (const auto found = unit.configuration.find("gripper_target_configurations");
@@ -1720,7 +1720,7 @@ require_configuration(const RetainedBundle &retained_bundle,
         return limits != nullptr ? limits->as_array() : none;
       }());
   Configuration result;
-  // Q68: one controller profile per hosted component, one lane each.
+  // One controller profile per hosted component, one lane each.
   for (const auto &row : *profiles) {
     const auto *object = std::get_if<core::JsonObjectDTO>(&row.value);
     const auto text = [&](const std::string_view name)
@@ -1762,12 +1762,12 @@ require_configuration(const RetainedBundle &retained_bundle,
         throw RetainedBundleError(
             "ros2_control controller profile has an invalid lane_row");
     }
-    // CP8 step 1: a Real row's site-settings address reference.
+    // A Real row's site-settings address reference.
     auto device_address_ref = text("device_address_ref");
     const auto anchor_text = text("stop_lead_in_anchor");
     const auto stop_lead_in_anchor =
         detail::decode_ros2_control_stop_lead_in_anchor(anchor_text);
-    // M6b: optional, a boolean when present (absent: on).
+    // Optional, a boolean when present (absent: on).
     const core::JsonValueDTO *tcp_offset_sync = nullptr;
     if (object != nullptr) {
       if (const auto found = object->find("controller_tcp_offset_sync"); found != object->end())
@@ -1778,7 +1778,7 @@ require_configuration(const RetainedBundle &retained_bundle,
     const bool real = lane == std::optional<std::string>("real");
     auto owner_component_id = text("owner_component_id");
     auto member_role = text("member_role");
-    // N17: the launched description, and an arm's joints or a tool's
+    // The launched description, and an arm's joints or a tool's
     // gripper joint (exactly one).
     auto description = text("description");
     auto gripper_joint_name = text("gripper_joint_name");
@@ -1795,7 +1795,7 @@ require_configuration(const RetainedBundle &retained_bundle,
               "ros2_control controller profile has an invalid joint name");
         joint_names.push_back(*joint);
       }
-    // Q48: an arm row's operator Stop decelerations (the closed schema proved
+    // An arm row's operator Stop decelerations (the closed schema proved
     // the rows: keyed by source joint, each positive).
     const auto field = [](const core::JsonObjectDTO *row,
                           std::string_view name) -> const core::JsonValueDTO * {
@@ -1858,7 +1858,7 @@ require_configuration(const RetainedBundle &retained_bundle,
               return left.controllable_component_id <
                      right.controllable_component_id;
             });
-  // CONTRACTS §16: the machine owners (the closed schema proved each row).
+  // The machine owners (the closed schema proved each row).
   if (const auto found = unit.configuration.find("machines");
       found != unit.configuration.end()) {
     const auto *rows = std::get_if<core::JsonValueDTO::Array>(&found->second.value);
@@ -1998,7 +1998,7 @@ require_configuration(const RetainedBundle &retained_bundle,
       throw RetainedBundleError(
           "ros2_control runtime repeats a component controller profile");
     }
-    // Q48: exactly an arm's row carries its operator Stop decelerations.
+    // Exactly an arm's row carries its operator Stop decelerations.
     const bool arm = std::any_of(expected.begin(), expected.end(), [&](const auto &target) {
       return target.first == profile.controllable_component_id;
     });
@@ -2038,7 +2038,7 @@ require_configuration(const RetainedBundle &retained_bundle,
       }
     }
   }
-  // D4: a lane-free pneumatic tool selects no controller profile. It hosts
+  // A lane-free pneumatic tool selects no controller profile. It hosts
   // no motion target, and each of its gripper targets is pneumatic with its
   // lane in referenced I/O (`pneumatic_io`) or no output at all.
   for (const auto &component : hosted_components) {

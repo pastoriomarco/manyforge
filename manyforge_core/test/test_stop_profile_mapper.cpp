@@ -59,7 +59,7 @@ TEST(StopProfileMapper, ExplicitJerkActivationResolvesOnceWithMatchingUnits) {
   ASSERT_TRUE(frozen.ok()) << frozen.error().message;
   EXPECT_DOUBLE_EQ(
       std::get<AngularJerkDTO>(frozen.value().per_joint_max_jerk.at("joint_1")).value_rad_s3, 12.0);
-  // Q36: only the authored value is frozen; the missing one is derived per
+  // Only the authored value is frozen; the missing one is derived per
   // Stop phase at Stop time, where the lane's lead-in is known.
   EXPECT_FALSE(frozen.value().per_joint_max_jerk.contains("axis_z"));
   EXPECT_EQ(frozen.value().per_joint_max_jerk.size(), 1U);
@@ -182,7 +182,7 @@ TEST(StopProfileMapper, JerkRejectsUnknownWrongUnitNonFiniteAndHardProfiles) {
 }
 
 TEST(StopProfileMapper, LoadFreezesNoDefaultJerkForEitherMode) {
-  // Q36: the per-phase default depends on the lane's lead-in, so it is not
+  // The per-phase default depends on the lane's lead-in, so it is not
   // frozen at load for any mode; authored values are kept verbatim.
   auto profile = soft_profile();
   profile.jerk_limits_enabled = true;
@@ -199,7 +199,7 @@ TEST(StopProfileMapper, LoadFreezesNoDefaultJerkForEitherMode) {
 }
 
 TEST(StopProfileMapper, SpringDecelerationTimeDefaultIsFilledOnceAtLoad) {
-  // Item 24: an unset spring-back deceleration time takes main's 1.0 s
+  // An unset spring-back deceleration time takes main's 1.0 s
   // default when the profile is loaded; the planner never substitutes it.
   auto profile = soft_profile();
   profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
@@ -213,7 +213,7 @@ TEST(StopProfileMapper, SpringDecelerationTimeDefaultIsFilledOnceAtLoad) {
     ASSERT_TRUE(frozen.value().deceleration_time_s.has_value());
     EXPECT_DOUBLE_EQ(*frozen.value().deceleration_time_s, kDefaultDecelerationTimeS);
     EXPECT_EQ(resolve_motion_interrupt_stop_jerk_limits(frozen.value()).value(), frozen.value());
-    // Q36: no default jerk is frozen at load.
+    // No default jerk is frozen at load.
     EXPECT_TRUE(frozen.value().per_joint_max_jerk.empty());
   }
   // An authored value is kept, and the 2.0 s ceiling still refuses.

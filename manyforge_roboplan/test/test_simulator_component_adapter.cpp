@@ -1,4 +1,4 @@
-// CONTRACTS §14: the generic simulator component's state and actions.
+// The generic simulator component's state and actions.
 #include <gtest/gtest.h>
 
 #include <manyforge_roboplan/simulator_component_adapter.hpp>
@@ -40,7 +40,7 @@ class FakeSimulation final : public ISimulationControl {
 };
 
 TEST(SimulatorComponentState, PlayingIsEnabled) {
-  const auto state = SimulatorComponentState(SimulationState::kPlaying, false, 7);
+  const auto state = SimulatorComponentState(SimulationState::kPlaying, 7);
   EXPECT_EQ(state.lifecycle, core::ComponentLifecycle::kEnabled);
   EXPECT_FALSE(state.reason.has_value());
   EXPECT_FALSE(state.fault.has_value());
@@ -49,24 +49,24 @@ TEST(SimulatorComponentState, PlayingIsEnabled) {
 }
 
 TEST(SimulatorComponentState, PausedAndStoppedArePreparedWithReasonNeverFault) {
-  const auto paused = SimulatorComponentState(SimulationState::kPaused, false, 0);
+  const auto paused = SimulatorComponentState(SimulationState::kPaused, 0);
   EXPECT_EQ(paused.lifecycle, core::ComponentLifecycle::kPrepared);
   ASSERT_TRUE(paused.reason.has_value());
   EXPECT_EQ(paused.reason->code, kSimulationPausedReason);
   EXPECT_FALSE(paused.fault.has_value());
-  const auto stopped = SimulatorComponentState(SimulationState::kStopped, false, 0);
+  const auto stopped = SimulatorComponentState(SimulationState::kStopped, 0);
   EXPECT_EQ(stopped.lifecycle, core::ComponentLifecycle::kPrepared);
   ASSERT_TRUE(stopped.reason.has_value());
   EXPECT_EQ(stopped.reason->code, kSimulationStoppedReason);
 }
 
 TEST(SimulatorComponentState, UnreachableIsOffline) {
-  const auto state = SimulatorComponentState(std::nullopt, false, 0);
+  const auto state = SimulatorComponentState(std::nullopt, 0);
   EXPECT_EQ(state.lifecycle, core::ComponentLifecycle::kOffline);
   ASSERT_TRUE(state.reason.has_value());
   EXPECT_EQ(state.reason->code, kSimulatorUnreachableReason);
-  EXPECT_EQ(SimulatorComponentState(SimulationState::kPlaying, true, 0).activity,
-            core::ComponentActivity::kUnknown);
+  EXPECT_EQ(SimulatorComponentState(SimulationState::kPlaying, 0).activity,
+            core::ComponentActivity::kIdle);
 }
 
 TEST(SimulatorComponentAdapter, ActionsDriveTheSimulator) {
@@ -103,31 +103,49 @@ TEST(SimulatorComponentAdapter, RefusalIsATypedFailure) {
             "component_action_unsupported");
 }
 
-TEST(SimulatorComponentAdapter, UnansweredPlayIsUnknownUntilObserved) {
+TEST(SimulatorComponentAdapter, UnansweredPlayIsOnlyAnUnknownActionResultAndIsNotResent) {
   auto simulation = std::make_shared<FakeSimulation>();
   simulation->observed = SimulationState::kPaused;
   simulation->next = core::ActionOutcome::kUnknown;
   SimulatorComponentAdapter adapter(simulation);
   EXPECT_EQ(adapter.Run(core::ComponentAction::kEnable, {}).outcome,
             core::ActionOutcome::kUnknown);
-  EXPECT_EQ(adapter.State(0).activity, core::ComponentActivity::kUnknown);
+  EXPECT_EQ(adapter.State(0).activity, core::ComponentActivity::kIdle);
   EXPECT_EQ(simulation->set.size(), 1U);  // never resent
   simulation->observed = SimulationState::kPlaying;
   EXPECT_EQ(adapter.State(0).activity, core::ComponentActivity::kIdle);
+  EXPECT_EQ(adapter.State(0).lifecycle, core::ComponentLifecycle::kEnabled);
 }
 
-TEST(SimulatorComponentAdapter, UnansweredResetIsUnknownUntilTheSimulatorAnswers) {
+TEST(SimulatorComponentAdapter, UnansweredResetIsOnlyAnUnknownActionResult) {
   auto simulation = std::make_shared<FakeSimulation>();
   simulation->observed = SimulationState::kPlaying;
   simulation->next = core::ActionOutcome::kUnknown;
   SimulatorComponentAdapter adapter(simulation);
   EXPECT_EQ(adapter.Run(core::ComponentAction::kSimReset, {}).outcome,
             core::ActionOutcome::kUnknown);
-  EXPECT_EQ(adapter.State(0).activity, core::ComponentActivity::kUnknown);
+  EXPECT_EQ(adapter.State(0).activity, core::ComponentActivity::kIdle);
   simulation->next = core::ActionOutcome::kSucceeded;
   EXPECT_EQ(adapter.Run(core::ComponentAction::kRecover, {}).outcome,
             core::ActionOutcome::kSucceeded);
   EXPECT_EQ(adapter.State(0).activity, core::ComponentActivity::kIdle);
+}
+
+TEST(SimulatorComponentAdapter, FailedRecoverDoesNotInventAnUnknownState) {
+  auto simulation = std::make_shared<FakeSimulation>();
+  simulation->observed = SimulationState::kPlaying;
+  simulation->next = core::ActionOutcome::kUnknown;
+  SimulatorComponentAdapter adapter(simulation);
+  ASSERT_EQ(adapter.Run(core::ComponentAction::kSimReset, {}).outcome,
+            core::ActionOutcome::kUnknown);
+  ASSERT_EQ(adapter.State(0).activity, core::ComponentActivity::kIdle);
+  simulation->next = core::ActionOutcome::kFailed;
+  EXPECT_EQ(adapter.Run(core::ComponentAction::kRecover, {}).outcome,
+            core::ActionOutcome::kFailed);
+  EXPECT_EQ(adapter.State(0).activity, core::ComponentActivity::kIdle);
+  EXPECT_EQ(adapter.State(0).lifecycle, core::ComponentLifecycle::kEnabled);
+  EXPECT_EQ(simulation->resets, 1);
+  EXPECT_TRUE(simulation->set.empty());
 }
 
 }  // namespace

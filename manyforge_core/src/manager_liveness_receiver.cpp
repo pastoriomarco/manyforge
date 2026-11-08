@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <condition_variable>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/manager_liveness_receiver.hpp>
 #include <limits>
@@ -74,6 +75,27 @@ struct ManagerLivenessReceiver::State final {
   IManagerLivenessFailSafePort* fail_safe_port{};
   IManagerLivenessObservationPort* observation_port{};
   mutable std::mutex mutex;
+  std::mutex detach_mutex;
+  std::condition_variable scheduler_drained;
+  std::size_t scheduler_borrows{};
+  bool scheduler_cancelled{};  // Protected by detach_mutex.
+
+  struct SchedulerBorrow final {
+    State* state;
+    explicit SchedulerBorrow(State* value) : state(value) {
+      std::lock_guard lock(state->mutex);
+      if (state->destroyed) state = nullptr;
+      else ++state->scheduler_borrows;
+    }
+    ~SchedulerBorrow() { release(); }
+    void release() {
+      if (!state) return;
+      std::lock_guard lock(state->mutex);
+      if (--state->scheduler_borrows == 0) state->scheduler_drained.notify_all();
+      state = nullptr;
+    }
+    explicit operator bool() const noexcept { return state != nullptr; }
+  };
   ManagerLivenessStatusDTO status;
   std::uint64_t schedule_generation{};
   ScheduleHandle schedule_handle{};
@@ -85,7 +107,7 @@ struct ManagerLivenessReceiver::State final {
 
   ManagerLivenessObservationDTO ObservationLocked() const {
     auto projected = status;
-    if (has_receipt) {
+    if (has_receipt && !destroyed) {
       const auto now = clock->now();
       projected.local_receipt_age_ns =
           now >= last_receipt_time ? now - last_receipt_time : 0;
@@ -253,23 +275,42 @@ ManagerLivenessReceiver::ManagerLivenessReceiver(
           fail_safe_port, observation_port) {}
 
 ManagerLivenessReceiver::~ManagerLivenessReceiver() {
+  DetachScheduler();
+}
+
+void ManagerLivenessReceiver::DetachScheduler() noexcept {
+  static_cast<void>(DetachSchedulerUntil(std::chrono::steady_clock::time_point::max()));
+}
+
+bool ManagerLivenessReceiver::DetachSchedulerUntil(
+    std::chrono::steady_clock::time_point deadline) noexcept {
+  std::lock_guard detach_lock(state_->detach_mutex);
   ScheduleHandle handle{};
   {
-    std::lock_guard lock(state_->mutex);
-    state_->destroyed = true;
-    ++state_->schedule_generation;
-    handle = state_->schedule_handle;
+    std::unique_lock lock(state_->mutex);
+    if (!state_->destroyed) {
+      state_->destroyed = true;
+      ++state_->schedule_generation;
+    }
+    if (!state_->scheduler_drained.wait_until(
+            lock, deadline, [this] { return state_->scheduler_borrows == 0; })) return false;
+    if (!state_->scheduler_cancelled) handle = state_->schedule_handle;
   }
   if (handle != 0U) {
     try {
       state_->scheduler->cancel(handle);
     } catch (...) {
+      return false;
     }
   }
-  state_.reset();
+  state_->scheduler_cancelled = true;
+  return true;
 }
 
 Result<void> ManagerLivenessReceiver::Renew(const ManagerHeartbeatDTO& heartbeat) {
+  const auto state = state_;
+  State::SchedulerBorrow scheduler_borrow(state.get());
+  if (!scheduler_borrow) return Rejected("receiver_destroyed");
   if (!ValidateManagerHeartbeat(heartbeat).ok()) {
     return Rejected("heartbeat_invalid");
   }
@@ -322,7 +363,8 @@ Result<void> ManagerLivenessReceiver::Renew(const ManagerHeartbeatDTO& heartbeat
     try {
       state_->scheduler->cancel(old_handle);
     } catch (...) {
-      State::FailClosedForWatchdogFailure(state_, generation);
+      scheduler_borrow.release();
+      State::FailClosedForWatchdogFailure(state, generation);
       return WatchdogUnavailable();
     }
   }
@@ -333,7 +375,8 @@ Result<void> ManagerLivenessReceiver::Renew(const ManagerHeartbeatDTO& heartbeat
         deadline, [weak, generation] { State::Expire(weak, generation); },
         SchedulerPriority::RuntimeSafety);
   } catch (...) {
-    State::FailClosedForWatchdogFailure(state_, generation);
+    scheduler_borrow.release();
+    State::FailClosedForWatchdogFailure(state, generation);
     return WatchdogUnavailable();
   }
   {
@@ -348,12 +391,16 @@ Result<void> ManagerLivenessReceiver::Renew(const ManagerHeartbeatDTO& heartbeat
       }
     }
   }
-  return state_->observation_port->Publish(*observation);
+  scheduler_borrow.release();
+  return state->observation_port->Publish(*observation);
 }
 
 Result<void> ManagerLivenessReceiver::BeginManagerEpochReplacement(
     RuntimeUnitId manager_runtime_unit_id, RuntimeEpoch manager_runtime_epoch,
     RequestOwnerEpoch manager_owner_epoch) {
+  const auto state = state_;
+  State::SchedulerBorrow scheduler_borrow(state.get());
+  if (!scheduler_borrow) return Rejected("receiver_destroyed");
   if (manager_runtime_unit_id.empty() || manager_runtime_epoch.empty() ||
       manager_owner_epoch.empty()) {
     return Rejected("replacement_identity_invalid");
@@ -399,10 +446,13 @@ Result<void> ManagerLivenessReceiver::BeginManagerEpochReplacement(
     ++state_->reconciliation_generation;
     state_->reconciliation_in_progress = false;
   }
-  state_->SafeAndContain(*loss);
+  scheduler_borrow.release();
+  state->SafeAndContain(*loss);
   if (old_handle != 0U) {
+    State::SchedulerBorrow cancel_borrow(state.get());
+    if (!cancel_borrow) return Result<void>::Ok();
     try {
-      state_->scheduler->cancel(old_handle);
+      state->scheduler->cancel(old_handle);
     } catch (...) {
       return WatchdogUnavailable();
     }
@@ -413,6 +463,8 @@ Result<void> ManagerLivenessReceiver::BeginManagerEpochReplacement(
 Result<void> ManagerLivenessReceiver::RebindRequiredSet(
     RetainedBundleId active_bundle_id,
     ContentDigest required_runtime_set_digest) {
+  State::SchedulerBorrow scheduler_borrow(state_.get());
+  if (!scheduler_borrow) return Rejected("receiver_destroyed");
   if (active_bundle_id.empty() ||
       !content_identity::is_sha256_digest(required_runtime_set_digest.value())) {
     return Rejected("required_set_rebind_identity_invalid");
@@ -457,6 +509,7 @@ Result<void> ManagerLivenessReceiver::RebindRequiredSet(
       cancellation_failed = true;
     }
   }
+  scheduler_borrow.release();
   auto published = state_->observation_port->Publish(*observation);
   if (cancellation_failed) {
     return WatchdogUnavailable();

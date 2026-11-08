@@ -78,7 +78,7 @@ describe('ComponentStreamsSection', () => {
     expect(markup).toContain('Default: 10000 ms');
     expect(markup).not.toContain('severity');
     expect(markup).not.toContain('Recovery');
-    // CONTRACTS §7: what a stale stream means is the component kind's.
+    // What a stale stream means is the component kind's.
     expect(markup).toContain('own stream going stale is a fault');
     expect(markup).toContain('In a simulator lane');
   });

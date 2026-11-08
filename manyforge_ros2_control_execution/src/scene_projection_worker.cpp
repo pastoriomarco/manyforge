@@ -71,10 +71,7 @@ SceneProjectionWorker::SceneProjectionWorker(
 }
 
 SceneProjectionWorker::~SceneProjectionWorker() {
-  if (worker_.joinable()) {
-    worker_.request_stop();
-    worker_.join();
-  }
+  static_cast<void>(stop_and_join_for(std::chrono::nanoseconds::max()));
 }
 
 SceneProjectionSlotId SceneProjectionWorker::register_joint_slot(
@@ -85,7 +82,7 @@ SceneProjectionSlotId SceneProjectionWorker::register_joint_slot(
     throw std::invalid_argument(
         "joint scene projection slot requires group and joint names");
   }
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   for (std::size_t index = 1; index < slots_.size(); ++index) {
     auto& slot = slots_[index];
     if (slot.target_kind == TargetKind::kJoint &&
@@ -148,7 +145,7 @@ bool SceneProjectionWorker::submit_group(
   if (positions_rad.empty()) {
     return false;
   }
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   return submit_locked(
       0,
       Request{
@@ -171,7 +168,7 @@ bool SceneProjectionWorker::submit_joint(
   if (!std::isfinite(position_rad)) {
     return false;
   }
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   if (slot_id >= slots_.size() ||
       slots_[slot_id].target_kind != TargetKind::kJoint) {
     return false;
@@ -193,7 +190,7 @@ bool SceneProjectionWorker::submit_joint(
 bool SceneProjectionWorker::submit_locked(
     SceneProjectionSlotId slot_id,
     Request request) {
-  if (exited_ || worker_.get_stop_token().stop_requested()) {
+  if (stopping_ || exited_ || worker_.get_stop_token().stop_requested()) {
     return false;
   }
   if (suspension_count_ > 0) {
@@ -213,7 +210,7 @@ bool SceneProjectionWorker::submit_locked(
 }
 
 SceneProjectionWorker::Suspension SceneProjectionWorker::suspend() {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   ++suspension_count_;
   if (suspension_count_ == 1) {
     for (auto& slot : slots_) {
@@ -229,12 +226,12 @@ SceneProjectionWorker::Suspension SceneProjectionWorker::suspend() {
 }
 
 SceneProjectionWorkerMetrics SceneProjectionWorker::metrics() const {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   return metrics_;
 }
 
 bool SceneProjectionWorker::drain_for(std::chrono::nanoseconds timeout) {
-  std::unique_lock<std::mutex> lock(mutex_);
+  std::unique_lock lock(mutex_);
   return drain_cv_.wait_for(lock, timeout, [this]() {
     return !has_pending_locked() && !in_flight_;
   });
@@ -242,17 +239,39 @@ bool SceneProjectionWorker::drain_for(std::chrono::nanoseconds timeout) {
 
 bool SceneProjectionWorker::stop_and_join_for(
     std::chrono::nanoseconds timeout) noexcept {
-  if (!worker_.joinable()) {
-    return true;
-  }
-  worker_.request_stop();
+  const auto now = std::chrono::steady_clock::now();
+  const auto remaining = std::chrono::steady_clock::time_point::max() - now;
+  const auto deadline = timeout >= remaining
+                            ? std::chrono::steady_clock::time_point::max()
+                            : now + timeout;
   {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (!drain_cv_.wait_for(lock, timeout, [this]() { return exited_; })) {
+    // Serialize the stop boundary with admission before waiting or taking
+    // the separate thread-lifecycle lock.
+    std::lock_guard lock(mutex_);
+    stopping_ = true;
+  }
+  {
+    std::lock_guard stop_lock(stop_mutex_);
+    if (worker_.joinable()) worker_.request_stop();
+  }
+  {
+    std::unique_lock lock(mutex_);
+    if (!drain_cv_.wait_until(lock, deadline, [this]() { return exited_; })) {
       return false;
     }
+    if (joined_) return true;
+    if (joining_) return drain_cv_.wait_until(lock, deadline, [this]() { return joined_; });
+    joining_ = true;
   }
-  worker_.join();
+  {
+    std::lock_guard stop_lock(stop_mutex_);
+    if (worker_.joinable()) worker_.join();
+  }
+  {
+    std::lock_guard lock(mutex_);
+    joined_ = true;
+  }
+  drain_cv_.notify_all();
   return true;
 }
 
@@ -302,7 +321,7 @@ void SceneProjectionWorker::run(std::stop_token stop_token) noexcept {
   while (!stop_token.stop_requested()) {
     WorkItem item;
     {
-      std::unique_lock<std::mutex> lock(mutex_);
+      std::unique_lock lock(mutex_);
       work_cv_.wait(lock, stop_token, [this]() {
         return suspension_count_ == 0 && has_pending_locked();
       });
@@ -385,14 +404,14 @@ void SceneProjectionWorker::run(std::stop_token stop_token) noexcept {
     }
 
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+      std::lock_guard lock(mutex_);
       in_flight_ = false;
     }
     drain_cv_.notify_all();
   }
 
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard lock(mutex_);
     for (auto& slot : slots_) {
       slot.pending.reset();
     }
@@ -406,7 +425,7 @@ bool SceneProjectionWorker::wait_before_terminal_retry(
     std::stop_token stop_token,
     SceneProjectionSlotId slot_id,
     std::uint64_t request_sequence) {
-  std::unique_lock<std::mutex> lock(mutex_);
+  std::unique_lock lock(mutex_);
   const bool interrupted = work_cv_.wait_for(
       lock, stop_token, kTerminalRetryDelay,
       [this, slot_id, request_sequence]() {
@@ -421,7 +440,7 @@ void SceneProjectionWorker::record_attempt(
     std::uint64_t apply_duration_ns,
     std::uint64_t queue_lag_ns,
     std::size_t attempt) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   metrics_.apply_duration_max_ns =
       std::max(metrics_.apply_duration_max_ns, apply_duration_ns);
   metrics_.queue_lag_max_ns =
@@ -448,7 +467,7 @@ void SceneProjectionWorker::record_attempt(
 }
 
 void SceneProjectionWorker::record_retry_exhausted() {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   ++metrics_.terminal_retry_exhausted_total;
 }
 
@@ -464,14 +483,14 @@ void SceneProjectionWorker::invoke_completion(
     // Projection status is diagnostic/control admission state. A callback bug
     // must not kill the process or strand the worker; the next status read stays
     // conservatively pending and reset remains the recovery boundary.
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard lock(mutex_);
     ++metrics_.completion_callback_exceptions_total;
   }
 }
 
 void SceneProjectionWorker::resume_one_suspension() noexcept {
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard lock(mutex_);
     if (suspension_count_ == 0) {
       return;
     }

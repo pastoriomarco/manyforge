@@ -1,19 +1,17 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Mock UR5 pick and place with the smallest set of Program nodes. Load and Execute it to watch a single pick and place.",
   "members": {
-    "assignment.yaml": "sha256:10e42acc3e46a6f842fc6fd5e2bb3eef41f005fb4ea03423f340ac4c2b34eee6",
     "deployment.yaml": "sha256:509deedf444cc0fe3429414735df1dbba73199451d2cd776ea1f0516f8ec6390",
-    "program.yaml": "sha256:d3cecd047dfb0514745a1809545fe1f7c2e0f20700fcf911dc332617fbeff07a"
+    "program.yaml": "sha256:58bf79936532c8a4eb60c360889f7dbac0518a2b6585ea2cc8a93076867eff5c"
   },
   "name": "mock_ur5_pick_and_place_minimal",
   "saved_status": {
-    "checked_content_digest": "sha256:e9ab5e4b2813cb74a3c5473c96cceb76e812b6e02ba9522658511bc8c53c6a6f",
+    "checked_content_digest": "sha256:e3fd992ae8c76c3b88b1082ff4b9fc4e4c4365ca5339e7072078fc5863cd1e2f",
     "last_known_status": "ready",
     "manyforge_version": "0.2.0"
   },

@@ -103,5 +103,5 @@ python3 scripts/regen.py --check  --build-dir <build>/ros-integration --require-
 - The vendor and lane driver commits and the RoboPlan pin: change them
   together with the image build (`driver.yaml`, `Dockerfile.ros-lyrical-full`,
   `scripts/setup-docker.sh`), then rebuild the image.
-- The release golden (`scripts/qualification/review_canonical_empty_release_golden.py`),
+- The release golden (`scripts/review_canonical_empty_release_golden.py`),
   which is updated only when publishing a new frozen candidate.

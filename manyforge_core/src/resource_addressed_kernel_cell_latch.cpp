@@ -2,10 +2,10 @@
 
 namespace manyforge::core {
 
-// Cell latch (CONTRACTS §5, plan R1-R3). A latch condition is armed when a
-// Stop is accepted, or when a component turns `fault`/`offline` while anything
-// executes. While armed, the cell is latched exactly when some component still
-// in the cell is in `fault` or `offline`, or reports `activity: unknown` (a
+// Cell latch. A latch condition is armed when a
+// Stop is accepted, or when a component becomes unhealthy while anything
+// executes. While armed, the cell is latched when a non-exempt component has
+// a stop, is in `fault` or `offline`, or reports `activity: unknown` (a
 // member shown offline through its owner is its owner's cause). The
 // arm clears when every component in the cell is healthy and idle. A
 // component offline by the operator's own power action, or a member offline
@@ -19,7 +19,7 @@ void ResourceAddressedExecutionKernel::observe_component_states(
     std::lock_guard state_lock(state_mutex_);
     const bool was_latched = cell_latched_locked();
     observe_component_states_locked(std::move(states));
-    // R1, §8: interrupt evaluation resumes when the latch ends. A rule whose
+    // Interrupt evaluation resumes when the latch ends. A rule whose
     // condition became true meanwhile trips now (the level, not a lost edge),
     // without waiting for its next sample.
     if (was_latched && !cell_latched_locked()) {
@@ -43,11 +43,18 @@ void ResourceAddressedExecutionKernel::observe_component_states_locked(
       if (previous == component_states_.end() || component_healthy(*previous)) arm = true;
     }
   }
-  // CONTRACTS §7: a component that becomes `prepared` starts its outputs'
+  // A component that becomes `prepared` starts its outputs'
   // core-held `changed_outside` signals false.
   if (io_signal_service_) {
     for (const auto& state : states) {
       if (state.lifecycle != ComponentLifecycle::kPrepared) continue;
+      // The stopped-owner presentation shows members as Prepared/Disabled;
+      // it is not a Prepare action and must not reset output change flags.
+      if (state.owner_id && state.reason &&
+          state.reason->code == kStoppedByEstopReason &&
+          std::any_of(states.begin(), states.end(), [&](const auto& owner) {
+            return owner.component_id == *state.owner_id && owner.stop.has_value();
+          })) continue;
       const auto previous =
           std::find_if(component_states_.begin(), component_states_.end(),
                        [&](const auto& row) { return row.component_id == state.component_id; });
@@ -61,7 +68,7 @@ void ResourceAddressedExecutionKernel::observe_component_states_locked(
   component_states_ = std::move(states);
   refresh_cell_latch_locked(arm);
   // A restart's unclosed predecessor ends here: every component reports
-  // healthy and idle, so its orphan resources are free again (R2).
+  // healthy and idle, so its orphan resources are free again.
   if (motion_admission_unreconciled_ && cell_settled_locked()) {
     const auto snapshot = resource_slots_->coherent_snapshot();
     std::vector<ResourceId> orphans;
@@ -97,7 +104,7 @@ std::vector<ErrorDTO> ResourceAddressedExecutionKernel::ReadExecutionBlocks() co
                       {}});
   // A restart's unclosed predecessor with no latch cause: before the first
   // component report one row for the restart, then one row per component
-  // still busy, never blocking invisibly (R4).
+  // still busy, never blocking invisibly.
   if (motion_admission_unreconciled_ && component_states_.empty())
     blocks.push_back({"execution_host_restart_awaiting_components",
                       "After the execution host restart, motion waits for the first "
@@ -135,7 +142,7 @@ void ResourceAddressedExecutionKernel::refresh_cell_latch_locked(const bool arm)
 
 bool ResourceAddressedExecutionKernel::cell_latched_locked() const {
   // The same causes `get_cell_latch` lists: a member offline through its
-  // owner counts as its owner (CONTRACTS §5, §16).
+  // owner counts as its owner.
   // A restart's unclosed predecessor counts as a Stop until it ends.
   return (cell_latch_armed_ || motion_admission_unreconciled_) &&
          !cell_latch_causes(component_states_).empty();

@@ -1,4 +1,4 @@
-"""Focused N7-a5.3c Program model-request and selection contracts."""
+"""Focused Program model-request and selection contracts."""
 
 from __future__ import annotations
 
@@ -323,6 +323,14 @@ class _SceneTransport:
                 "content_hash": _DIGEST_E,
             }
         return response
+
+    def lookup_component_frame(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        # Every component frame named by these fixtures exists in the retained model.
+        return {
+            **request,
+            "schema_version": "manyforge.component_frame_lookup_result.v1",
+            "exists": True,
+        }
 
 
 class _ModelTransport:
@@ -685,8 +693,7 @@ def test_snapshot_image_program_query_carries_owner_attributed_inline_image() ->
     pose = {
         "frame_ref": {
             "kind": "target_frame",
-            "target_role": "arm",
-            "frame_role": "base",
+            "frame": {"component_id": "ur5_robot", "frame_id": "base"},
         },
         "position_m": [0.4, -0.14, 0.2],
         "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
@@ -840,8 +847,7 @@ def test_model_pose_output_rejects_a_non_unit_quaternion_before_blackboard() -> 
         return {
             "frame_ref": {
                 "kind": "target_frame",
-                "target_role": "arm",
-                "frame_role": "base",
+                "frame": {"component_id": "ur5_robot", "frame_id": "base"},
             },
             "position_m": [0.4, 0.0, 0.2],
             "orientation": {"xyzw": quaternion},

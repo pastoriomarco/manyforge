@@ -1,14 +1,14 @@
-api_version: manyforge.program.v2
+api_version: manyforge.program.v3
 program_id: isaac_manipulator_scene_light_collision
-program_revision: sha256:2ac7519878a608f72a21387efe72b8c9ab1612e772c2841a8c5ff41223a2318e
+program_revision: sha256:344c6818f6a32e44260f31be9128f0c1833efaed1cdd71a0277dddeacd65642d
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light_collision
 description: Retained Isaac UR10e runtime-collision scenario. It starts from the exact light-scene geometry,
   removes the declared probe wall before planning, then re-inserts that wall concurrently with command
   execution so the Manager-owned collision and Stop path can be observed without a supervisor fallback.
 catalog:
-  api_version: manyforge.node_catalog.v2
-  content_version: 2.9.0
+  api_version: manyforge.node_catalog.v3
+  content_version: 3.0.0
 compatibility:
   lanes:
   - isaac-sim
@@ -21,65 +21,6 @@ compatibility:
   - robotiq
   - runtime-collision
   - ur10e
-component_roles:
-  robot:
-    required_component_type_tags:
-    - articulated-arm
-    required_model_roles:
-    - arm_model
-  tool:
-    required_component_type_tags:
-    - gripper
-target_roles:
-  arm:
-    component_role: robot
-    required_capabilities:
-    - capability_id: execution.feedback.phase_events
-      parameters: {}
-      disposition: required
-    - capability_id: execution.trajectory.execute
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.joint_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.trajectory.time_parameterized
-      parameters: {}
-      disposition: required
-    - capability_id: state.observed.current
-      parameters: {}
-      disposition: required
-    - capability_id: validation.trajectory.non_collision
-      parameters: {}
-      disposition: required
-    required_frame_roles:
-    - base
-    required_resource_roles:
-    - arm_joints
-    required_collision_body_roles:
-    - arm_collision
-    required_model_roles:
-    - arm_model
-  gripper:
-    component_role: tool
-    required_capabilities:
-    - capability_id: model.kinematics.fk
-      parameters: {}
-      disposition: required
-    - capability_id: tool.gripper.command
-      parameters: {}
-      disposition: required
-    - capability_id: tool.gripper.feedback
-      parameters: {}
-      disposition: required
-    required_frame_roles: []
-    required_resource_roles:
-    - fingers
-    required_collision_body_roles:
-    - gripper_collision
 scene:
 - scene_resource_id: isaac_cheese_box
   shape:
@@ -296,7 +237,9 @@ tree:
       - node_id: gripper.command_position
         instance_id: open_gripper_start
         parameters:
-          target_role: gripper
+          target:
+            component_id: robotiq_2f_140
+            command_target_id: gripper
           position:
             kind: angular_rad
             value_rad: 0.0
@@ -308,8 +251,12 @@ tree:
       - node_id: motion.move_to_pose
         instance_id: move_to_pick_approach
         parameters:
-          target_role: arm
-          base_frame_role: base
+          target:
+            component_id: isaac_ur10e_collision_robot
+            command_target_id: arm
+          base_frame:
+            component_id: isaac_ur10e_collision_robot
+            frame_id: base
           tcp_endpoint:
             kind: current
           target_mode: relative
@@ -317,8 +264,10 @@ tree:
             type: scene_resource
             scene_resource_id: isaac_cheese_box
           offset_reference:
-            type: frame_role
-            frame_role_id: base
+            type: component_frame
+            frame:
+              component_id: isaac_ur10e_collision_robot
+              frame_id: base
           goal:
             position_m:
             - 0.0
@@ -340,8 +289,12 @@ tree:
       - node_id: motion.move_to_pose
         instance_id: move_to_pick
         parameters:
-          target_role: arm
-          base_frame_role: base
+          target:
+            component_id: isaac_ur10e_collision_robot
+            command_target_id: arm
+          base_frame:
+            component_id: isaac_ur10e_collision_robot
+            frame_id: base
           tcp_endpoint:
             kind: current
           target_mode: relative
@@ -349,8 +302,10 @@ tree:
             type: scene_resource
             scene_resource_id: isaac_cheese_box
           offset_reference:
-            type: frame_role
-            frame_role_id: base
+            type: component_frame
+            frame:
+              component_id: isaac_ur10e_collision_robot
+              frame_id: base
           goal:
             position_m:
             - 0.0

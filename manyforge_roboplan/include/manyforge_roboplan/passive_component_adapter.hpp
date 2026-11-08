@@ -10,7 +10,7 @@
 
 namespace manyforge::roboplan_backend {
 
-/// CONTRACTS §6 "Components without a lane": the execution host's small
+/// The execution host's small
 /// generic adapter of a component with no lane and no device of its own (a
 /// passive tool, an I/O-driven gripper). `prepare`, `enable`, `disable` and
 /// `recover` succeed at once; it has no streams and no capabilities. Its

@@ -6,7 +6,7 @@
 
 #include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
 
-// spec/260 §5.6: the ros2_control adapter's motion-interrupt stop
+// The ros2_control adapter's motion-interrupt stop
 // capability is computed by a pure package helper that inspects the
 // deployment's Ros2ControlExecutionBackendConfig. The helper is callable
 // without a running controller so deployments can audit which stop modes a
@@ -252,7 +252,7 @@ TEST(Ros2CapabilityTest,
       compute_ros2_control_motion_interrupt_stop_capability(cfg);
   EXPECT_TRUE(cap.supported_stop_modes.contains(
       MotionInterruptStopMode::kSpringBackHold));
-  // Q130: the fast spring-back shares the same (absent) preconditions.
+  // The fast spring-back shares the same (absent) preconditions.
   EXPECT_TRUE(cap.supported_stop_modes.contains(
       MotionInterruptStopMode::kSpringBackFast));
   EXPECT_FALSE(cap.supported_stop_modes.contains(
@@ -327,7 +327,7 @@ TEST(Ros2CapabilityTest,
 }
 
 TEST(Ros2CapabilityTest,
-     FaultReasonTokensCoverPhase6ATaxonomy) {
+     FaultReasonTokensCoverTheFaultTaxonomy) {
   struct Case {
     const char* reason_code;
     ErrorCode top_level_code;

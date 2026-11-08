@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from manyforge_assistant_bridge.headless import (
-    ASSISTANT_H0_READ_OPERATIONS,
+    ASSISTANT_READ_OPERATIONS,
     AssistantHeadlessReadClient,
     AssistantHeadlessReadError,
 )
@@ -26,8 +26,8 @@ def test_assistant_reads_owner_facts_without_callback_or_mutation() -> None:
 
     assert client.observe("runtime")["schema_version"].endswith("snapshot.v1")
     assert reader.calls == [("runtime", None)]
-    assert "node_environment" in ASSISTANT_H0_READ_OPERATIONS
-    assert "source_model" in ASSISTANT_H0_READ_OPERATIONS
+    assert "node_environment" in ASSISTANT_READ_OPERATIONS
+    assert "source_model" in ASSISTANT_READ_OPERATIONS
 
 
 @pytest.mark.parametrize(

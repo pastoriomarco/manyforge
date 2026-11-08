@@ -308,7 +308,7 @@ describe('io_signals configuration', () => {
     expect(validateIoSignalRows([output({ profile: 'ros2_control_gpio', topic: '/gpio', group: 'g', interfaceName: 'a\0' })])).toContain('NUL');
   });
 
-  it('reads the declared liveness of raw rows (contract 81)', () => {
+  it('reads the declared liveness of raw rows', () => {
     expect(rowInputLiveness(mockRow as Record<string, JsonValue>)).toBe('in_process');
     expect(rowInputLiveness(rosRow as Record<string, JsonValue>)).toBe('periodic');
     expect(rowInputLiveness({ ...rosRow, provider: { profile: 'ros_bool', topic: '/t', liveness: { mode: 'change_only' } } } as Record<string, JsonValue>))
@@ -406,6 +406,15 @@ describe('io_signals configuration', () => {
     });
   });
 
+  it('joins declared input sources by signal identity even when the resource role differs', () => {
+    const configuration = { runtime_kind: 'ros2_control', runtime_configuration: {
+      io_signals: [{ ...mockRow, resource_role_id: 'sensor_role', signal_name: 'door_signal' }],
+    } };
+    const sources = declaredIoSources({ components: [{ configuration }] } as Record<string, JsonValue>);
+    expect(sources.get(ioSourceKey('station', 'io', 'door_signal'))?.sourceId).toBe('station_mock');
+    expect(sources.has(ioSourceKey('station', 'io', 'sensor_role'))).toBe(false);
+  });
+
   it('round-trips a Mock output (profile + channel) exactly', () => {
     const mockOutput = { ...setBoolRow, resource_role_id: 'lamp', signal_name: 'lamp', source_id: 'lamp_mock',
       provider: { profile: 'mock_output', channel: 'lamp' } };
@@ -479,7 +488,7 @@ describe('I/O device component', () => {
     expect(validateIoSignalRows([], 'station')).toContain('at least one signal');
     expect(validateIoSignalRows([input({})], 'station')).toBeNull();
     expect(validateIoSignalRows([input({ componentId: 'arm' })], 'station')).toContain('must belong to station');
-    // Contract 84: ros2_control GPIO signals live on the device.
+    // ros2_control GPIO signals live on the device.
     expect(validateIoSignalRows([input({ profile: 'ros2_control_gpio', topic: '/gpio/states', group: 'g', interfaceName: 'i', maximumAgeMs: '50' })], 'station')).toBeNull();
   });
 
@@ -501,7 +510,7 @@ describe('I/O device component', () => {
       .toMatchObject({ timeoutS: 10, exact: false });
   });
 
-  it('reads the output acknowledgement timeout and detects ROS SetBool outputs (contract 68)', () => {
+  it('reads the output acknowledgement timeout and detects ROS SetBool outputs', () => {
     expect(ioProviderDeviceTimeout({ io_provider_devices: [{
       controllable_component_id: 'd', lifecycle_command_timeout_s: 12, output_source_ack_timeout_s: 0.8,
     }] }, 'd')).toEqual({ timeoutS: 12, authored: true, exact: true, outputAckTimeoutS: 0.8 });

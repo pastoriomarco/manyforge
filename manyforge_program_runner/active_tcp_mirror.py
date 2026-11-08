@@ -12,7 +12,7 @@ class ActiveTcpWireError(ValueError):
     """An Active TCP reading or event is malformed."""
 
 
-def _reading(row: Any) -> tuple[str, str, int, int, dict[str, str] | None]:
+def _reading(row: Any) -> tuple[str, str, int, int, dict[str, Any] | None]:
     if not isinstance(row, Mapping):
         raise ActiveTcpWireError("Active TCP reading is not an object")
     if not {"component_id", "owner_epoch", "registration_generation", "sequence", "entry"} <= set(row):
@@ -29,17 +29,18 @@ def _reading(row: Any) -> tuple[str, str, int, int, dict[str, str] | None]:
     ):
         raise ActiveTcpWireError("Active TCP reading identity is invalid")
     if entry is not None:
-        fields = {"component_id", "target_id", "frame_role_id"}
-        if (
-            not isinstance(entry, Mapping) or set(entry) != fields
-            or any(type(entry[field]) is not str or not entry[field] for field in fields)
-        ):
+        if not isinstance(entry, Mapping) or set(entry) != {"target", "frame"}:
             raise ActiveTcpWireError("Active TCP entry is invalid")
-        entry = dict(entry)
+        target, frame = entry["target"], entry["frame"]
+        if (not isinstance(target, Mapping) or set(target) != {"component_id", "command_target_id"}
+            or not isinstance(frame, Mapping) or set(frame) != {"component_id", "frame_id"}
+            or any(type(value) is not str or not value for value in (*target.values(), *frame.values()))):
+            raise ActiveTcpWireError("Active TCP entry is invalid")
+        entry = {"target": dict(target), "frame": dict(frame)}
     return robot, owner, generation, sequence, entry
 
 
-def decode_active_tcp_rows(rows: Any) -> tuple[tuple[str, str, int, int, dict[str, str] | None], ...]:
+def decode_active_tcp_rows(rows: Any) -> tuple[tuple[str, str, int, int, dict[str, Any] | None], ...]:
     """Decode the rows shared by baseline, read, reset, submit and read replies."""
 
     if not isinstance(rows, list):
@@ -217,7 +218,7 @@ class ActiveTcpMirror:
         if event.get("record_kind") != "active_tcp_changed":
             return None
         payload = event.get("payload")
-        if not isinstance(payload, Mapping) or payload.get("api_version") != "manyforge.active_tcp_change.v1":
+        if not isinstance(payload, Mapping) or payload.get("api_version") != "manyforge.active_tcp_change.v2":
             raise ActiveTcpWireError("Active TCP event payload is invalid")
         robot, owner, generation, sequence, entry = _reading(payload)
         if owner != owner_epoch:

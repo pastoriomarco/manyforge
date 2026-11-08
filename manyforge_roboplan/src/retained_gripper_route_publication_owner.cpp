@@ -26,10 +26,13 @@ template <typename Value>
 RetainedGripperRoutePublicationOwner::
     RetainedGripperRoutePublicationOwner(
         std::shared_ptr<RetainedGripperRuntime> gripper,
-        core::IClock& clock, core::ResourceAddressedExecutionKernel& kernel,
+        std::shared_ptr<core::IClock> clock,
+        core::ResourceAddressedExecutionKernel& kernel,
         CellKernelCandidateBuilder cell_candidate_builder, RetainedCellRuntime* cell_owner)
-    : gripper_(std::move(gripper)), clock_(clock), kernel_(kernel),
+    : gripper_(std::move(gripper)), clock_(std::move(clock)), kernel_(kernel),
       cell_candidate_builder_(std::move(cell_candidate_builder)), cell_owner_(cell_owner) {
+  if (!clock_)
+    throw std::invalid_argument("native gripper route publication requires its shared clock");
   if (cell_owner_ && &cell_owner_->addressed_kernel() != &kernel_)
     throw std::invalid_argument("gripper route seam names another stable cell Kernel");
   if (gripper_ == nullptr || gripper_->participant_engine() == nullptr) {
@@ -57,7 +60,8 @@ void RetainedGripperRoutePublicationOwner::BindParticipantPeers(
   const auto own = gripper_->binding();
   for (const auto& [domain, peer] : peers) {
     if (!peer || peer.get() == this || &peer->kernel_ != &kernel_ ||
-        &peer->clock_ != &clock_ || peer->cell_owner_ != cell_owner_ ||
+        peer->clock_.get() != clock_.get() ||
+        peer->cell_owner_ != cell_owner_ ||
         !peer->participant_peers_.empty() || peer->transition_mutex_ != &peer->mutex_)
       throw std::invalid_argument("scalar route peer map has a foreign or cyclic owner");
     const auto binding = peer->gripper_->binding();
@@ -398,7 +402,7 @@ RetainedGripperRoutePublicationOwner::
       -> core::Result<void> {
     if (channel_rebound) {
       const auto channel_rollback =
-          concrete_channel->RebindRoute(old_binding, clock_.now());
+          concrete_channel->RebindRoute(old_binding, clock_->now());
       if (!channel_rollback.ok()) {
         return channel_rollback;
       }
@@ -426,7 +430,7 @@ RetainedGripperRoutePublicationOwner::
     return core::Result<void>::Ok();
   };
 
-  const auto transition_time_ns = clock_.now();
+  const auto transition_time_ns = clock_->now();
   const auto channel_rebind =
       concrete_channel->RebindRoute(candidate_binding, transition_time_ns);
   if (!channel_rebind.ok()) {
@@ -721,12 +725,12 @@ RetainedGripperRoutePublicationOwner::
                        {{"reason", prepared_registrations.error().code}}});
 
   const auto rollback = [&]() -> core::Result<void> {
-    auto reverted_channel = concrete_channel->RebindRoute(old_binding, clock_.now());
+    auto reverted_channel = concrete_channel->RebindRoute(old_binding, clock_->now());
     if (!reverted_channel.ok()) return reverted_channel;
     return gripper_->RebindRoute(old_binding, channel, old_readiness);
   };
   auto rebound_channel =
-      concrete_channel->RebindRoute(predecessor.value(), clock_.now());
+      concrete_channel->RebindRoute(predecessor.value(), clock_->now());
   if (!rebound_channel.ok()) {
     return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
         rebound_channel.error());

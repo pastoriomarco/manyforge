@@ -5,6 +5,8 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_roboplan/pointcloud_source_adapter.hpp>
 
+#include <chrono>
+#include <future>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -97,6 +99,63 @@ TEST(PointCloudSourceAdapter, EnableAndDisableSwitchForwarding) {
   const auto unsupported = f.adapter.Run(core::ComponentAction::kResetPosition, {});
   EXPECT_EQ(unsupported.outcome, core::ActionOutcome::kFailed);
   EXPECT_EQ(unsupported.error->code, "component_action_unsupported");
+}
+
+TEST(PointCloudSourceAdapter, StateDoesNotWaitForForwardingPublish) {
+  class BlockingLink final : public IPointCloudBridgeLink {
+   public:
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::shared_future<void> gate{release.get_future().share()};
+    void SetForwarding(bool value) override {
+      if (!value) return;
+      entered.set_value();
+      gate.wait();
+    }
+    PointCloudBridgeObservation Observed() const override { return {}; }
+  };
+  auto log = std::make_shared<ProcessLog>();
+  auto link = std::make_shared<BlockingLink>();
+  PointCloudSourceAdapter adapter{
+      Settings(), "/manyforge/components/cloud", "cell",
+      [log](const ComponentProcessCommand &) -> std::unique_ptr<IComponentProcess> {
+        return std::make_unique<FakeProcess>(log);
+      }, link};
+  ASSERT_EQ(adapter.Run(core::ComponentAction::kPrepare, {}).outcome,
+            core::ActionOutcome::kSucceeded);
+  auto action = std::async(std::launch::async, [&] {
+    return adapter.Run(core::ComponentAction::kEnable, {});
+  });
+  link->entered.get_future().wait();
+  auto observation = std::async(std::launch::async, [&] { return adapter.State(0); });
+  const auto readiness = observation.wait_for(std::chrono::milliseconds(500));
+  link->release.set_value();
+  const auto state = observation.get();
+  EXPECT_EQ(readiness, std::future_status::ready);
+  EXPECT_EQ(state.lifecycle, core::ComponentLifecycle::kPrepared);
+  EXPECT_EQ(action.get().outcome, core::ActionOutcome::kSucceeded);
+  EXPECT_EQ(adapter.State(0).lifecycle, core::ComponentLifecycle::kEnabled);
+}
+
+TEST(PointCloudSourceAdapter, PublishExceptionPreservesExistingForwardingOutcome) {
+  class ThrowingLink final : public IPointCloudBridgeLink {
+   public:
+    void SetForwarding(bool value) override {
+      if (value) throw std::runtime_error("publish failed");
+    }
+    PointCloudBridgeObservation Observed() const override { return {}; }
+  };
+  auto log = std::make_shared<ProcessLog>();
+  PointCloudSourceAdapter adapter{
+      Settings(), "/manyforge/components/cloud", "cell",
+      [log](const ComponentProcessCommand &) -> std::unique_ptr<IComponentProcess> {
+        return std::make_unique<FakeProcess>(log);
+      }, std::make_shared<ThrowingLink>()};
+  ASSERT_EQ(adapter.Run(core::ComponentAction::kPrepare, {}).outcome,
+            core::ActionOutcome::kSucceeded);
+  EXPECT_THROW(static_cast<void>(adapter.Run(core::ComponentAction::kEnable, {})),
+               std::runtime_error);
+  EXPECT_EQ(adapter.State(0).lifecycle, core::ComponentLifecycle::kEnabled);
 }
 
 TEST(PointCloudSourceAdapter, StaleStreamIsFreshnessOnlyNeverAFault) {

@@ -154,10 +154,10 @@ ManyForge (the robot controller enforces its own limit at that TCP).
 
   | Value | Timing |
   | --- | --- |
-  | `smooth` | TOPP-RA times the path within the full joint limits, without the TCP bound; the final uniform stretch below then slows the whole move until the active TCP is at 0.98 of its linear speed limit at the samples (the M8 timing). Gentle starts and stops; slower. |
-  | `fast` | TOPP-RA times the path within the nominal acceleration share, with a per-grid-point path-speed bound that holds the active TCP at 0.98 of its linear speed limit (`kTcpSpeedTargetFraction`, patch 0016, RP-3). Only the stretches near the limit slow down; the acceleration switches abruptly there (Lite 6 peak joint jerk in the hundreds to thousands of rad/s³ without jerk limits). |
+  | `smooth` | TOPP-RA times the path within the full joint limits, without the TCP bound; the final uniform stretch below then slows the whole move until the active TCP is at 0.98 of its linear speed limit at the samples. Gentle starts and stops; slower. |
+  | `fast` | TOPP-RA times the path within the nominal acceleration share, with a per-grid-point path-speed bound that holds the active TCP at 0.98 of its linear speed limit (`kTcpSpeedTargetFraction`, patch 0016). Only the stretches near the limit slow down; the acceleration switches abruptly there (Lite 6 peak joint jerk in the hundreds to thousands of rad/s³ without jerk limits). |
 
-- **`time_optimal` Cartesian paths:** the RP-3 bound on TOPP-RA's grid, for
+- **`time_optimal` Cartesian paths:** the `fast` bound on TOPP-RA's grid, for
   both the linear and the angular TCP limit (patch 0018). Cartesian paths
   follow `cartesian_timing` only; `motion_timing` does not apply to them.
 - **Check:** for joint and pose goals and `time_optimal` paths, the TCP speed

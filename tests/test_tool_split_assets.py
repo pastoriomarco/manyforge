@@ -427,7 +427,7 @@ def test_mock_lane_rows_split_arm_and_gripper_controllers() -> None:
         }
         assert types["__controller__"] == (
             "joint_trajectory_controller/JointTrajectoryController" if name in ARMS
-            else "position_controllers/GripperActionController")
+            else "parallel_gripper_action_controller/GripperActionController")
 
 
 @pytest.mark.parametrize("name", ARMS + TOOLS)
@@ -457,7 +457,7 @@ def test_uf850_mock_scenario_uses_the_split_robot_and_tool() -> None:
         {"component_id": "xarm_gripper", "interface": "mount"},
     )
     components = {row["component_id"]: row for row in deployment["components"]}
-    # AUD-5: the UF850 is a machine on Mock; its arm keeps the robot's id and
+    # The UF850 is a machine on Mock; its arm keeps the robot's id and
     # its I/O members are deactivated.
     assert set(components) == {"uf850", "uf850_robot", "uf850_robot_controller_io",
                                "uf850_robot_tool_io", "xarm_gripper"}

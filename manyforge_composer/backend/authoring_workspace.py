@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     from .draft_session import ComposerDraftSession
 
 
-SNAPSHOT_API_VERSION = "manyforge.composer_authoring_workspace_snapshot.v2"
+SNAPSHOT_API_VERSION = "manyforge.composer_authoring_workspace_snapshot.v3"
 
 # One JavaScript-safe integer ceiling (2**53 - 1), shared with the Program
 # Draft revision. Exhaustion fails closed; it never wraps and never restarts
@@ -75,7 +75,6 @@ _PROJECT_FACT_FIELDS = (
     "document_description",
     "source_diagnostics",
     "source_document_digest",
-    "program_role_assignment",
     "source_program_digest",
     "source_deployment_digest",
 )
@@ -162,7 +161,6 @@ def scenario_project_facts(
             "document_description": None,
             "source_diagnostics": [],
             "source_document_digest": None,
-            "program_role_assignment": None,
             "source_program_digest": None,
             "source_deployment_digest": None,
         }
@@ -175,7 +173,6 @@ def scenario_project_facts(
         "document_description": document.get("description"),
         "source_diagnostics": deepcopy(source_diagnostics or []),
         "source_document_digest": source_document_digest,
-        "program_role_assignment": deepcopy(document.get("program_role_assignment")),
         "source_program_digest": canonical_digest(
             {"value": document.get("program_draft")}
         ),
@@ -352,7 +349,6 @@ class AuthoringWorkspace:
         self._document_description: str | None = None
         self._source_diagnostics: list[dict[str, str]] = []
         self._source_document_digest: str | None = None
-        self._program_role_assignment: dict[str, Any] | None = None
         self._source_program_digest: str | None = None
         self._source_deployment_digest: str | None = None
 
@@ -931,7 +927,6 @@ class AuthoringWorkspace:
             "document_description": self._document_description,
             "source_diagnostics": deepcopy(self._source_diagnostics),
             "source_document_digest": self._source_document_digest,
-            "program_role_assignment": deepcopy(self._program_role_assignment),
             "source_program_digest": self._source_program_digest,
             "source_deployment_digest": self._source_deployment_digest,
         }
@@ -970,7 +965,6 @@ class AuthoringWorkspace:
         self._document_description = facts["document_description"]
         self._source_diagnostics = deepcopy(facts["source_diagnostics"])
         self._source_document_digest = facts["source_document_digest"]
-        self._program_role_assignment = deepcopy(facts["program_role_assignment"])
         self._source_program_digest = facts["source_program_digest"]
         self._source_deployment_digest = facts["source_deployment_digest"]
 

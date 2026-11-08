@@ -311,10 +311,10 @@ function parseStartupScenarioNotice(value: unknown): StartupScenarioNotice {
 export function parseCatalogResponse(value: unknown): CatalogResponse {
   const record = objectAt(value, 'catalog');
   const apiVersion = stringAt(record.apiVersion, 'catalog.apiVersion');
-  if (apiVersion !== 'manyforge.node_catalog.v2') {
+  if (apiVersion !== 'manyforge.node_catalog.v3') {
     return fail(
       'catalog.apiVersion',
-      'the literal "manyforge.node_catalog.v2"',
+      'the literal "manyforge.node_catalog.v3"',
     );
   }
   return {
@@ -583,17 +583,15 @@ function parseProgramSceneFrameRef(
     return { kind };
   }
   if (kind === 'component_frame') {
-    exactKeysAt(
-      record,
-      ['kind', 'component_role', 'model_role', 'frame_role'],
-      path,
-    );
-    return {
-      kind,
-      component_role: stringAt(record.component_role, `${path}.component_role`),
-      model_role: stringAt(record.model_role, `${path}.model_role`),
-      frame_role: stringAt(record.frame_role, `${path}.frame_role`),
-    };
+    exactKeysAt(record, ['kind', 'frame'], path);
+    const framePath = `${path}.frame`;
+    const frame = objectAt(record.frame, framePath);
+    exactKeysAt(frame, ['component_id', 'frame_id'], framePath);
+    const componentId = stringAt(frame.component_id, `${framePath}.component_id`);
+    const frameId = stringAt(frame.frame_id, `${framePath}.frame_id`);
+    if (!/^[a-z][a-z0-9_.-]{0,127}$/.test(componentId)) return fail(`${framePath}.component_id`, 'a Deployment component ID');
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(frameId)) return fail(`${framePath}.frame_id`, 'a catalog frame ID');
+    return { kind, frame: { component_id: componentId, frame_id: frameId } };
   }
   return fail(`${path}.kind`, 'cell_frame or component_frame');
 }
@@ -677,9 +675,10 @@ function parseProgramViewerMetadata(
     record,
     [],
     [
-      'frame_role_visibility',
       'frame_gizmo_size_m',
-      'resource_role_visibility',
+      'frame_visibility',
+      'cell_frame_visible',
+      'scene_resource_visibility',
       'scene_resource_axes_visibility',
       'object_axes_gizmo_size_m',
       'hidden_execution_groups',
@@ -687,28 +686,42 @@ function parseProgramViewerMetadata(
     path,
   );
   const viewer: ProgramViewerMetadata = {};
+  if (record.frame_visibility !== undefined) {
+    let previous: [string, string] | null = null;
+    viewer.frame_visibility = boundedArrayAt(record.frame_visibility, `${path}.frame_visibility`, 100_000)
+      .map((value, index) => {
+        const entryPath = `${path}.frame_visibility[${index}]`;
+        const entry = objectAt(value, entryPath);
+        exactKeysAt(entry, ['frame', 'visible'], entryPath);
+        const frame = objectAt(entry.frame, `${entryPath}.frame`);
+        exactKeysAt(frame, ['component_id', 'frame_id'], `${entryPath}.frame`);
+        const componentId = stringAt(frame.component_id, `${entryPath}.frame.component_id`);
+        const frameId = stringAt(frame.frame_id, `${entryPath}.frame.frame_id`);
+        if (!/^[a-z][a-z0-9_.-]{0,127}$/.test(componentId)) return fail(`${entryPath}.frame.component_id`, 'a Deployment component ID');
+        if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(frameId)) return fail(`${entryPath}.frame.frame_id`, 'a catalog frame ID');
+        if (previous !== null && (componentId < previous[0] || (componentId === previous[0] && frameId <= previous[1]))) {
+          return fail(`${path}.frame_visibility`, 'frames sorted and unique by component and frame ID');
+        }
+        previous = [componentId, frameId];
+        return { frame: { component_id: componentId, frame_id: frameId }, visible: booleanAt(entry.visible, `${entryPath}.visible`) };
+      });
+  }
+  if (record.cell_frame_visible !== undefined) {
+    viewer.cell_frame_visible = booleanAt(record.cell_frame_visible, `${path}.cell_frame_visible`);
+  }
+  if (record.scene_resource_visibility !== undefined) {
+    viewer.scene_resource_visibility = booleanRecordAt(record.scene_resource_visibility, `${path}.scene_resource_visibility`);
+  }
   if (record.hidden_execution_groups !== undefined) {
     viewer.hidden_execution_groups = canonicalStringArrayAt(
       record.hidden_execution_groups,
       `${path}.hidden_execution_groups`,
     );
   }
-  if (record.frame_role_visibility !== undefined) {
-    viewer.frame_role_visibility = booleanRecordAt(
-      record.frame_role_visibility,
-      `${path}.frame_role_visibility`,
-    );
-  }
   if (record.frame_gizmo_size_m !== undefined) {
     viewer.frame_gizmo_size_m = positiveNumberAt(
       record.frame_gizmo_size_m,
       `${path}.frame_gizmo_size_m`,
-    );
-  }
-  if (record.resource_role_visibility !== undefined) {
-    viewer.resource_role_visibility = booleanRecordAt(
-      record.resource_role_visibility,
-      `${path}.resource_role_visibility`,
     );
   }
   if (record.scene_resource_axes_visibility !== undefined) {
@@ -728,6 +741,10 @@ function parseProgramViewerMetadata(
 
 export function parseProgramDocument(value: unknown, path = 'program'): ProgramDocument {
   const record = objectAt(value, path);
+  const apiVersion = stringAt(record.api_version, `${path}.api_version`);
+  if (apiVersion !== 'manyforge.program.v3') {
+    return fail(`${path}.api_version`, 'the literal "manyforge.program.v3"');
+  }
   allowedKeysAt(
     record,
     [
@@ -737,8 +754,6 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
       'program_profile',
       'name',
       'catalog',
-      'component_roles',
-      'target_roles',
       'tree',
     ],
     [
@@ -753,10 +768,6 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
     ],
     path,
   );
-  const apiVersion = stringAt(record.api_version, `${path}.api_version`);
-  if (apiVersion !== 'manyforge.program.v2') {
-    return fail(`${path}.api_version`, 'the literal "manyforge.program.v2"');
-  }
   const programProfile = stringAt(record.program_profile, `${path}.program_profile`);
   if (programProfile !== 'composable-cell-v1') {
     return fail(`${path}.program_profile`, 'the literal "composable-cell-v1"');
@@ -764,10 +775,10 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
   const catalog = objectAt(record.catalog, `${path}.catalog`);
   exactKeysAt(catalog, ['api_version', 'content_version'], `${path}.catalog`);
   const catalogApiVersion = stringAt(catalog.api_version, `${path}.catalog.api_version`);
-  if (catalogApiVersion !== 'manyforge.node_catalog.v2') {
+  if (catalogApiVersion !== 'manyforge.node_catalog.v3') {
     return fail(
       `${path}.catalog.api_version`,
-      'the literal "manyforge.node_catalog.v2"',
+      'the literal "manyforge.node_catalog.v3"',
     );
   }
   const result: ProgramDocument = {
@@ -780,8 +791,6 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
       api_version: catalogApiVersion,
       content_version: stringAt(catalog.content_version, `${path}.catalog.content_version`),
     },
-    component_roles: jsonRecordAt(record.component_roles, `${path}.component_roles`),
-    target_roles: jsonRecordAt(record.target_roles, `${path}.target_roles`),
     tree: parseProgramTreeNode(record.tree, `${path}.tree`),
   };
   if (record.description !== undefined) {
@@ -935,61 +944,14 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
       return [name, { execution_policy: policy as NonNullable<ProgramDocument['execution_groups']>[string]['execution_policy'] }];
     }));
   }
-  const declaredFrameRoles = new Set<string>();
-  const declaredResourceRoles = new Set<string>();
-  for (const target of Object.values(result.target_roles)) {
-    if (target === null || typeof target !== 'object' || Array.isArray(target)) continue;
-    for (const [field, destination] of [
-      ['required_frame_roles', declaredFrameRoles],
-      ['required_resource_roles', declaredResourceRoles],
-    ] as const) {
-      const roles = target[field];
-      if (!Array.isArray(roles)) continue;
-      for (const role of roles) if (typeof role === 'string') destination.add(role);
-    }
-  }
-  for (const resource of result.scene ?? []) {
-    for (const role of resource.resource_roles ?? []) declaredResourceRoles.add(role);
-    if (resource.pose.frame_ref.kind !== 'component_frame') continue;
-    const component = result.component_roles[resource.pose.frame_ref.component_role];
-    if (component === null || typeof component !== 'object' || Array.isArray(component)) {
-      return fail(
-        `${path}.scene.${resource.scene_resource_id}.pose.frame_ref.component_role`,
-        'a declared component role',
-      );
-    }
-    const modelRoles = component.required_model_roles;
-    if (
-      Array.isArray(modelRoles)
-      && !modelRoles.includes(resource.pose.frame_ref.model_role)
-    ) {
-      return fail(
-        `${path}.scene.${resource.scene_resource_id}.pose.frame_ref.model_role`,
-        'a model role required by the component role',
-      );
-    }
-  }
-  for (const [field, declared] of [
-    ['frame_role_visibility', declaredFrameRoles],
-    ['resource_role_visibility', declaredResourceRoles],
-  ] as const) {
-    for (const role of Object.keys(result.viewer?.[field] ?? {})) {
-      if (!declared.has(role)) {
-        return fail(`${path}.viewer.${field}.${role}`, 'a declared Program role');
-      }
-    }
-  }
   const declaredSceneResources = new Set(
     (result.scene ?? []).map((resource) => resource.scene_resource_id),
   );
-  for (const sceneResourceId of Object.keys(
-    result.viewer?.scene_resource_axes_visibility ?? {},
-  )) {
-    if (!declaredSceneResources.has(sceneResourceId)) {
-      return fail(
-        `${path}.viewer.scene_resource_axes_visibility.${sceneResourceId}`,
-        'a declared Program scene resource',
-      );
+  for (const field of ['scene_resource_axes_visibility', 'scene_resource_visibility'] as const) {
+    for (const sceneResourceId of Object.keys(result.viewer?.[field] ?? {})) {
+      if (!declaredSceneResources.has(sceneResourceId)) {
+        return fail(`${path}.viewer.${field}.${sceneResourceId}`, 'a declared Program scene resource');
+      }
     }
   }
   return result;
@@ -1009,8 +971,6 @@ export function parseProgramAuthoringDocument(
       'program_profile',
       'name',
       'catalog',
-      'component_roles',
-      'target_roles',
       'forest',
       'positions',
     ],
@@ -1027,8 +987,8 @@ export function parseProgramAuthoringDocument(
     path,
   );
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.composer_authoring_forest.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.composer_authoring_forest.v1');
+  if (schemaVersion !== 'manyforge.composer_authoring_forest.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.composer_authoring_forest.v2');
   }
   const forest = boundedArrayAt(record.forest, `${path}.forest`, 100_000).map(
     (node, index) => parseProgramTreeNode(node, `${path}.forest[${index}]`),

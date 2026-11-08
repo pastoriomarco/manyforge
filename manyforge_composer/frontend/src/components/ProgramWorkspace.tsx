@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
+import type { ReferenceValidationState } from '../hooks/useReferenceValidation';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
+import type { ManualPreviewToNodeController } from '../hooks/useRobotControl';
 import type { StructuralResourceState } from '../state/structuralResource';
 import type {
   CatalogResponse,
@@ -14,9 +16,8 @@ import type {
 } from '../types/api';
 import type { ManualControlMotionDescriptor } from '../types/robotControl';
 import type { NodePresentationStatus } from '../store/composerStore';
-import { resolvedTargetRoles, type ResolvedTargetRole } from '../utils/targetRoleResolution';
-import { globalRuleIds, interruptConditionKeyUses, type TargetStopChain } from '../utils/interruptAuthoring';
-import type { CarriedObjectLostSignalChoice } from '../utils/systemSignalAuthoring';
+import { globalRuleIds, interruptConditionKeyUses } from '../utils/interruptAuthoring';
+import { programFrameScopeFromSelectorFacts } from '../utils/programReferenceChoices';
 import {
   deriveProgramMotionConfiguration,
   flattenProgramForest,
@@ -49,7 +50,6 @@ import { useComposerSettings } from '../hooks/useComposerSettings';
 import { PROGRAM_TOOLS_WIDTH_PX } from '../state/composerSettings';
 
 const EMPTY_MOTION_DESCRIPTORS: ManualControlMotionDescriptor[] = [];
-const EMPTY_BOUND_TARGETS: ResolvedTargetRole[] = [];
 const EMPTY_NODE_STATUSES: Record<string, NodePresentationStatus> = {};
 
 const PROGRAM_TOOL_MIN = PROGRAM_TOOLS_WIDTH_PX.min;
@@ -75,24 +75,24 @@ export function mergeProgramNotice(
 }
 
 interface ProgramWorkspaceProps {
+  selectedNodeId?: string | null;
+  onSelectedNodeIdChange?: (id: string | null) => void;
   controller: ProgramWorkspaceController;
+  referenceValidation?: ReferenceValidationState;
   runtime: ProgramRuntimeController;
+  manualPreviewController?: ManualPreviewToNodeController | null;
   /** The advisory preview of a held failed node's Draft edits: one status
    * line in that node's Properties editor (the viewer shows its ghost). */
   heldNodePreview?: { nodeInstanceId: string | null; statusText: string | null } | null;
+  onHeldPreviewVisibilityChange?: (visible: boolean) => void;
   catalog: StructuralResourceState<CatalogResponse>;
   environment: StructuralResourceState<NodeEnvironmentResponse>;
   sourceModel: StructuralResourceState<SourceModelProjection>;
   deploymentWorkspace?: DeploymentWorkspaceResponse | null;
-  systemSignalChoices?: readonly CarriedObjectLostSignalChoice[];
   /** Outputs holding a core-held `changed outside` signal (`<component>/<signal>`). */
   changedOutsideOutputs?: ReadonlySet<string>;
   systemSignalsNeedApply?: boolean;
-  /** The scenario's Program role assignment (authoring workspace project facts). */
-  programRoleAssignment?: Record<string, JsonValue> | null;
   motionDescriptors?: ManualControlMotionDescriptor[];
-  /** Published motion targets' qualified Stop chains (SX-2167). */
-  stopChains?: TargetStopChain[];
   onRetryCatalog: () => void;
   onRetryEnvironment: () => void;
   onInvalidEditChange?: (invalid: boolean) => void;
@@ -106,28 +106,23 @@ interface ProgramWorkspaceProps {
     title: string;
     readOnlyReason: string | null;
   }) => void;
-  programRequirementCreated?: {
-    sequence: number;
-    id: string;
-    kind: 'component_role' | 'target_role';
-  } | null;
-  onProgramRequirementCreated?: (kind: 'component_role' | 'target_role', id: string) => void;
+
 }
 
 export function ProgramWorkspace({
+  selectedNodeId: controlledSelectedNodeId,
+  onSelectedNodeIdChange,
   controller,
+  referenceValidation = { referenceAttention: null, referenceUnavailable: false, selectorFacts: null },
   runtime,
+  manualPreviewController = null,
   heldNodePreview = null,
+  onHeldPreviewVisibilityChange,
   catalog,
   environment,
-  sourceModel,
   deploymentWorkspace = null,
-  systemSignalChoices = [],
-  changedOutsideOutputs,
   systemSignalsNeedApply = false,
-  programRoleAssignment = null,
   motionDescriptors = EMPTY_MOTION_DESCRIPTORS,
-  stopChains,
   onRetryCatalog,
   onRetryEnvironment,
   onInvalidEditChange,
@@ -137,8 +132,6 @@ export function ProgramWorkspace({
   onInspectorMinimizedChange,
   onInspectorMaximize,
   onInspectorStateChange,
-  programRequirementCreated = null,
-  onProgramRequirementCreated,
 }: ProgramWorkspaceProps) {
   const {
     state,
@@ -149,7 +142,12 @@ export function ProgramWorkspace({
     updateNodePolicies,
     updateNodePresentation,
   } = controller;
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [internalSelectedNodeId, setInternalSelectedNodeId] = useState<string | null>(null);
+  const selectedNodeId = controlledSelectedNodeId === undefined ? internalSelectedNodeId : controlledSelectedNodeId;
+  const setSelectedNodeId = useCallback((id: string | null) => {
+    if (onSelectedNodeIdChange) onSelectedNodeIdChange(id);
+    else setInternalSelectedNodeId(id);
+  }, [onSelectedNodeIdChange]);
   const deploymentDraftDocument = deploymentWorkspace?.draft?.document ?? null;
   const draftGlobalRuleIds = useMemo(
     () => globalRuleIds(deploymentDraftDocument as Record<string, JsonValue> | null),
@@ -171,13 +169,19 @@ export function ProgramWorkspace({
   const [paletteCollapsed, setPaletteCollapsed] = useState(false);
   const collapsePalette = useCallback(() => setPaletteCollapsed(true), []);
   const [toolView, setToolView] = useState<'nodes' | 'params'>('nodes');
+  useLayoutEffect(() => {
+    const visible = !inspectorMinimized && toolView === 'nodes' && !settingsOpen
+      && selectedNodeId !== null && selectedNodeId === heldNodePreview?.nodeInstanceId;
+    onHeldPreviewVisibilityChange?.(visible);
+    return () => onHeldPreviewVisibilityChange?.(false);
+  }, [inspectorMinimized, toolView, settingsOpen, selectedNodeId, heldNodePreview?.nodeInstanceId, onHeldPreviewVisibilityChange]);
   const [declarationSelection, setDeclarationSelection] = useState<ProgramDeclarationSelection | null>(null);
   const [declarationPrefill, setDeclarationPrefill] = useState<{
     expectedType: string | null;
     expectedAccess: 'read' | 'write' | 'read_write' | null;
   } | null>(null);
   const [pendingReference, setPendingReference] = useState<ProgramReferenceSource & {
-    target: 'blackboard_key' | 'program_parameter' | 'program_requirements';
+    target: 'blackboard_key' | 'program_parameter';
     createdId: string | null;
     applying: boolean;
   } | null>(null);
@@ -191,7 +195,6 @@ export function ProgramWorkspace({
   const noticeSequence = useRef(0);
   const noticeIdsByKey = useRef(new Map<string, string>());
   const noticeTimeouts = useRef(new Map<string, number>());
-  const observedRequirementSequence = useRef(0);
   const authoringGrid = useRef<HTMLDivElement>(null);
   const settingsPanel = useCardPanelLayout();
   useEffect(() => {
@@ -257,17 +260,9 @@ export function ProgramWorkspace({
   }, []);
   const workspace = state.workspace;
   const authoring = workspace?.draft.authoring ?? null;
-  const boundTargets = useMemo(() => programRoleAssignment == null
-    ? deploymentWorkspace?.binding?.target_role_bindings ?? EMPTY_BOUND_TARGETS
-    : authoring === null ? EMPTY_BOUND_TARGETS : resolvedTargetRoles(authoring, programRoleAssignment),
-  [authoring, deploymentWorkspace?.binding?.target_role_bindings, programRoleAssignment]);
-  // Descriptors arrive in runtime snapshots as JSON. Retain the original values
-  // while their complete serialized content is unchanged, including every field
-  // used by the authoring template.
-  const descriptorContent = JSON.stringify(motionDescriptors);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const paletteMotionDescriptors = useMemo(() => motionDescriptors, [descriptorContent]);
-  // Contract 87: keys read by node or global interrupt rules must declare `initial:`.
+  const { referenceAttention, referenceUnavailable } = referenceValidation;
+  const [attentionOpen, setAttentionOpen] = useState(false);
+  // Keys read by node or global interrupt rules must declare `initial:`.
   const interruptKeyUses = useMemo(() => interruptConditionKeyUses(
     authoring?.forest ?? [], deploymentDraftDocument as Record<string, JsonValue> | null,
   ), [authoring?.forest, deploymentDraftDocument]);
@@ -304,7 +299,7 @@ export function ProgramWorkspace({
     if (invalidLocalEdit && instanceId !== selectedNodeId) return;
     setSelectedNodeId(instanceId);
     if (instanceId !== null) onInspectorMinimizedChange?.(false);
-  }, [invalidLocalEdit, onInspectorMinimizedChange, selectedNodeId]);
+  }, [invalidLocalEdit, onInspectorMinimizedChange, selectedNodeId, setSelectedNodeId]);
   const changeToolView = useCallback((view: 'nodes' | 'params') => {
     if (invalidLocalEdit && view !== toolView) return;
     setToolView(view);
@@ -342,7 +337,7 @@ export function ProgramWorkspace({
     if (selectedNodeId && !validNodeIds.has(selectedNodeId)) {
       setSelectedNodeId(null);
     }
-  }, [authoring, selectedNodeId, validNodeIds]);
+  }, [authoring, selectedNodeId, setSelectedNodeId, validNodeIds]);
   useEffect(() => {
     if (!authoring || declarationSelection === null) return;
     const exists = declarationSelection.kind === 'parameter'
@@ -360,17 +355,6 @@ export function ProgramWorkspace({
   }, [authoring, declarationSelection]);
   useEffect(() => {
     if (
-      programRequirementCreated === null
-      || programRequirementCreated.sequence === observedRequirementSequence.current
-    ) return;
-    observedRequirementSequence.current = programRequirementCreated.sequence;
-    setPendingReference((current) => current?.target === 'program_requirements'
-      && current.semanticType === programRequirementCreated.kind
-      ? { ...current, createdId: programRequirementCreated.id, applying: false }
-      : current);
-  }, [programRequirementCreated]);
-  useEffect(() => {
-    if (
       pendingReference === null
       || pendingReference.createdId === null
       || pendingReference.applying
@@ -386,9 +370,7 @@ export function ProgramWorkspace({
         ? (authoring.parameters ?? []).some(
           (row) => row.parameter_id === pendingReference.createdId,
         )
-        : pendingReference.semanticType === 'component_role'
-          ? authoring.component_roles[pendingReference.createdId] !== undefined
-          : authoring.target_roles[pendingReference.createdId] !== undefined;
+        : false;
     if (!node || !declarationExists) return;
     const request = buildProgramParameterMutation(node, pendingReference.parameterId, {
       kind: 'literal',
@@ -408,7 +390,7 @@ export function ProgramWorkspace({
       setPendingReference(null);
       setDeclarationPrefill(null);
     });
-  }, [authoring, mutate, mutationAvailable, onInspectorMinimizedChange, pendingReference]);
+  }, [authoring, mutate, mutationAvailable, onInspectorMinimizedChange, pendingReference, setSelectedNodeId]);
   useEffect(() => {
     if (paletteCollapsed) paletteRail.current?.focus();
     else if (previousPaletteCollapsed.current) paletteCollapseButton.current?.focus();
@@ -502,6 +484,48 @@ export function ProgramWorkspace({
 
   return (
     <section className="panel program-workspace" aria-label="Program authoring workspace">
+      {authoring !== null && (
+        <div className="program-reference-attention">
+          <button type="button" aria-expanded={attentionOpen}
+            onClick={() => setAttentionOpen((open) => !open)}>
+            Needs attention {referenceAttention === null ? '' : `(${referenceAttention.total})`}
+          </button>
+          {attentionOpen && (
+            <div role="region" aria-label="Program references needing attention">
+              {referenceUnavailable && <p>Reference validation is unavailable.</p>}
+              {!referenceUnavailable && referenceAttention === null && <p>Checking references…</p>}
+              {referenceAttention?.total === 0 && <p>No reference issues.</p>}
+              {referenceAttention !== null && referenceAttention.total > 0 && (
+                <ul>{referenceAttention.issues.map((issue, index) => (
+                  <li key={`${issue.code}:${issue.location.path}:${index}`}>
+                    <button type="button" disabled={invalidLocalEdit || (issue.location.node_instance_id === null
+                      && !(issue.location.path.startsWith('/scene') && onOpenScene))}
+                      onClick={() => {
+                        const node = issue.location.node_instance_id;
+                        if (node === null) {
+                          if (issue.location.path.startsWith('/scene')) onOpenScene?.();
+                          return;
+                        }
+                        setSettingsOpen(false);
+                        setToolView('nodes');
+                        selectNode(node);
+                        const parameter = issue.location.parameter;
+                        if (parameter !== null) window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+                          const field = document.getElementById(`property-${node}-${parameter}-value`);
+                          field?.scrollIntoView({ block: 'center' });
+                          field?.focus();
+                        }));
+                      }}>
+                      {issue.code.replaceAll('_', ' ')} — {issue.location.path}
+                    </button>
+                  </li>
+                ))}</ul>
+              )}
+              {referenceAttention?.truncated && <p>Showing {referenceAttention.issues.length} of {referenceAttention.total} issues.</p>}
+            </div>
+          )}
+        </div>
+      )}
       <div className="program-workspace-notices">
         {state.status === 'loading' && workspace === null && (
           <div className="program-workspace-notice notice severity-info notice-floating" role="status">
@@ -560,8 +584,7 @@ export function ProgramWorkspace({
           <ProgramNodePalette
             roots={authoring.forest}
             program={authoring}
-            boundTargets={boundTargets}
-            motionDescriptors={paletteMotionDescriptors}
+            selectorFacts={referenceValidation.selectorFacts}
             catalogEntries={catalogEntries}
             catalogIdentity={catalogIdentity}
             environment={nodeEnvironment}
@@ -724,7 +747,6 @@ export function ProgramWorkspace({
                       runtime={runtime}
                       onMutate={mutate}
                       onInvalidChange={setSettingsInvalid}
-                      onRoleCreated={onProgramRequirementCreated}
                       diagnostics={workspace?.draft.diagnostics ?? []}
                     />
                   ) : (
@@ -754,19 +776,10 @@ export function ProgramWorkspace({
                   catalogEntries={catalogEntries}
                   program={authoring}
                   appliedProgram={runtime.state.applied}
-                  sourceModel={sourceModel.status === 'ready' ? sourceModel.data : null}
-                  sourceModelUnavailableReason={sourceModel.status === 'loading'
-                    ? 'Reading commandable joints from the active source model.'
-                    : sourceModel.status === 'ready'
-                      ? null
-                      : sourceModel.message}
+                  manualPreviewController={manualPreviewController}
                   deploymentWorkspace={deploymentWorkspace}
-                  systemSignalChoices={systemSignalChoices}
-                  changedOutsideOutputs={changedOutsideOutputs}
                   systemSignalsNeedApply={systemSignalsNeedApply}
-                  programRoleAssignment={programRoleAssignment}
                   motionDescriptors={motionDescriptors}
-                  stopChains={stopChains}
                   busy={authoringBusy}
                   onMutate={mutate}
                   onCreateGroup={() => {
@@ -776,14 +789,6 @@ export function ProgramWorkspace({
                   onCreateReference={(target, expectedType, expectedAccess, source) => {
                     if (target === 'scene_resource') {
                       onOpenScene?.();
-                    } else if (target === 'program_requirements') {
-                      setPendingReference({
-                        ...source,
-                        target,
-                        createdId: null,
-                        applying: false,
-                      });
-                      setSettingsOpen(true);
                     } else {
                       setPendingReference({
                         ...source,
@@ -807,6 +812,8 @@ export function ProgramWorkspace({
                   onUpdateNodePresentation={updateNodePresentation}
                   onInvalidEditChange={setInvalidLocalEdit}
                   diagnostics={diagnostics}
+                  referenceIssues={referenceAttention?.issues}
+                  selectorFacts={referenceValidation.selectorFacts}
                 />
                 </>
               ) : (
@@ -836,7 +843,7 @@ export function ProgramWorkspace({
                   }}
                   onInvalidEditChange={setInvalidLocalEdit}
                   diagnostics={diagnostics}
-                  frameProgram={authoring}
+                  frameScope={programFrameScopeFromSelectorFacts(authoring, referenceValidation.selectorFacts)}
                 />
               )}
               </div>

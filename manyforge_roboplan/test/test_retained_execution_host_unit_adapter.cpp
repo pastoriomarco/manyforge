@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "../src/host_shutdown_watchdog.hpp"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -21,6 +22,7 @@
 #include <iterator>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
+#include <manyforge_component_manager/execution_host_exit.hpp>
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
 #include <manyforge_component_manager/execution_host_unit_admission.hpp>
 #include <manyforge_component_manager/retained_execution_host_unit_adapter.hpp>
@@ -74,6 +76,29 @@ constexpr std::string_view kIntentDigest =
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
+TEST(HostShutdownWatchdogTest, BlockedSurfaceWorkExitsWithStructuredStage) {
+  EXPECT_EXIT({
+    host_detail::HostShutdownWatchdog watchdog;
+    watchdog.phase.store("surface_drain", std::memory_order_release);
+    watchdog.Start(std::chrono::steady_clock::now() + std::chrono::milliseconds(50));
+    std::promise<void> blocked;
+    blocked.get_future().wait();
+    std::_Exit(99);
+  }, ::testing::ExitedWithCode(component_manager::kExecutionHostShutdownIncompleteExitStatus),
+      "\"code\":\"execution_host_shutdown_incomplete\",\"phase\":\"surface_drain\"");
+}
+
+TEST(HostShutdownWatchdogTest, FinishedWorkReturnsWithoutIncompleteDiagnostic) {
+  EXPECT_EXIT({
+    {
+      host_detail::HostShutdownWatchdog watchdog;
+      watchdog.phase.store("surface_drain", std::memory_order_release);
+      watchdog.Start(std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    }
+    std::_Exit(0);
+  }, ::testing::ExitedWithCode(0), "^$");
+}
+
 TEST(ManagedRuntimeDrainTest, MissedDrainRefusesRenewalButShutdownOnlyDoesNot) {
   namespace rpc = component_manager::detail;
   const char *observed_drain = nullptr;
@@ -121,6 +146,19 @@ TEST(ManagedRuntimeDrainTest, MissedDrainRefusesRenewalButShutdownOnlyDoesNot) {
                                                    renew, refuse),
             "renewed");
   EXPECT_EQ(renewed, 2U);
+}
+
+TEST(RetainedExecutionHostExit,
+     ShutdownIncompleteStatusUsesDedicatedCatalogReasonOnly) {
+  EXPECT_EQ(component_manager::execution_host_child_exit_reason(
+                component_manager::kExecutionHostShutdownIncompleteExitStatus),
+            "execution_host_shutdown_incomplete");
+  EXPECT_EQ(component_manager::execution_host_child_exit_reason(0),
+            "execution_host_child_exited");
+  EXPECT_EQ(component_manager::execution_host_child_exit_reason(1),
+            "execution_host_child_exited");
+  EXPECT_EQ(component_manager::execution_host_child_exit_reason(std::nullopt),
+            "execution_host_child_exited");
 }
 
 // The prepare builder stores a construction throw as the typed refusal. The
@@ -198,7 +236,23 @@ TEST(ManagedRuntimeCompositionRefusal, BuilderThrowRefusesApplyKeepsRuntimeAndCa
   EXPECT_TRUE(generic.details.empty());
 }
 
-// H1: a host Apply failure caught before anything installed changed is a
+TEST(ManagedRuntimeCompositionRefusal, DirectControlTargetCodesSurviveRpcCodec) {
+  namespace rpc = component_manager::detail;
+  for (const std::string code : {"direct_control_primary_target_missing",
+                                 "direct_control_primary_target_ambiguous"}) {
+    const core::TypedError failure(code, "direct-control target unavailable");
+    const auto mapped = host_detail::SelectedRuntimeCompositionRpcError(failure);
+    const auto decoded = rpc::DecodeSelectedRuntimeCompositionRpcResponse(
+        rpc::EncodeSelectedRuntimeCompositionRpcResponse(
+            rpc::SelectedRuntimeCompositionRpcFailure{mapped}));
+    const auto &error = std::get<rpc::SelectedRuntimeCompositionRpcFailure>(decoded).error;
+    EXPECT_EQ(error.code, "selected_runtime_composition_request_failed");
+    ASSERT_TRUE(error.details.contains("code"));
+    EXPECT_EQ(error.details.at("code"), code);
+  }
+}
+
+// A host Apply failure caught before anything installed changed is a
 // failed result that says `effect: none` over the actual codec, so the
 // Manager releases the Apply (the predecessor is still installed).
 TEST(ManagedRuntimeCompositionRefusal, FailureBeforeEffectSaysEffectNoneOverTheCodec) {
@@ -220,7 +274,7 @@ TEST(ManagedRuntimeCompositionRefusal, FailureBeforeEffectSaysEffectNoneOverTheC
   EXPECT_EQ(unknown.details.at("effect"), "none");
 }
 
-// N28: a leaving component still enabled because its Disable failed is
+// A leaving component still enabled because its Disable failed is
 // accepted (its process is stopped like a dead one); an enabled one without
 // a failed Disable, or one whose action runs or that moves, is still refused.
 TEST(ManagedRuntimeCompositionRefusal, LeavingComponentWithAFailedDisableDoesNotRefuseTheApply) {
@@ -421,7 +475,8 @@ TextMember(const deployment::CanonicalValue &root,
            const std::string_view name) {
   const auto *member = root.find_object_member(name);
   if (member == nullptr) {
-    throw std::runtime_error("native adapter fixture manifest is incomplete");
+    throw std::runtime_error("native adapter fixture is missing text member '" +
+                             std::string(name) + "'");
   }
   const auto *text = std::get_if<std::string>(&member->storage());
   if (text == nullptr || text->empty()) {
@@ -433,7 +488,7 @@ TextMember(const deployment::CanonicalValue &root,
 
 struct NativeFixture final {
   explicit NativeFixture(
-      std::filesystem::path fixture_root = MANYFORGE_I6_NATIVE_FIXTURE_ROOT)
+      std::filesystem::path fixture_root = MANYFORGE_NATIVE_EXECUTION_FIXTURE_ROOT)
       : root(std::move(fixture_root)), bundle_source(root / "retained-package"),
         artifact_source(root / "retained-package") {
     const auto manifest = deployment::parse_strict_json_model_yaml(
@@ -659,7 +714,7 @@ public:
     response_ = content_identity::canonical_json(CanonicalValue(
         CanonicalValue::Object{
             {"api_version",
-             CanonicalValue("manyforge.manager_command_response.v1")},
+             CanonicalValue("manyforge.manager_command_response.v2")},
             {"logical_scene",
              content_identity::parse_canonical_json(
                  scene::EncodeLogicalSceneSnapshot(scene_snapshot))},
@@ -1311,7 +1366,7 @@ TEST(ExecutionHostUnitAdmission,
 }
 
 // The host Apply of one delta: every non-removed component, the retained
-// subset, the removed ones (CONTRACTS §15).
+// subset, the removed ones.
 [[nodiscard]] component_manager::HostApplyRequest
 HostApplyOf(const deployment::ApplyComponentDeltaDTO &delta) {
   component_manager::HostApplyRequest request{
@@ -1333,12 +1388,13 @@ HostApplyOf(const deployment::ApplyComponentDeltaDTO &delta) {
   return request;
 }
 
-// F-5 / budget: the runtime-composition exchange waits for the sum of the
+// Budget: the runtime-composition exchange waits for the sum of the
 // lifecycle time budgets of the added or replaced components (authored, else
 // the 10 s default; Manager passes one for every component) plus one default
-// stop budget per removed component. An exchange that installs and removes
-// nothing (finalize, retain-only) waits one default budget. Retained rows
-// count nothing.
+// stop budget per removed component, and the host's stop grace for each of
+// them (a launch it retires may hang until the group SIGKILL). An
+// exchange that installs and removes nothing (finalize, retain-only) waits
+// one default budget. Retained rows count nothing.
 TEST(RetainedExecutionHostUnitAdapter,
      CompositionTimeoutGrowsWithComposedComponents) {
   using deployment::ApplyComponentDisposition;
@@ -1351,19 +1407,20 @@ TEST(RetainedExecutionHostUnitAdapter,
   const auto timeout = [](const deployment::ApplyComponentDeltaDTO &delta) {
     return component_manager::detail::HostApplyTimeout(HostApplyOf(delta), {});
   };
+  constexpr auto kGrace = core::kControllerLaunchStopGrace;
   deployment::ApplyComponentDeltaDTO delta;
   EXPECT_EQ(timeout(delta), std::chrono::seconds(10));
   delta.components = {row("arm.2", ApplyComponentDisposition::kRetain),
                       row("arm.3", ApplyComponentDisposition::kRemove)};
-  EXPECT_EQ(timeout(delta), std::chrono::seconds(10));
+  EXPECT_EQ(timeout(delta), std::chrono::seconds(10) + kGrace);
   delta.components.push_back(row("arm.1", ApplyComponentDisposition::kAdd));
-  EXPECT_EQ(timeout(delta), std::chrono::seconds(20));
+  EXPECT_EQ(timeout(delta), std::chrono::seconds(20) + 2 * kGrace);
   delta.components.push_back(
       row("gripper.1", ApplyComponentDisposition::kReplace));
-  EXPECT_EQ(timeout(delta), std::chrono::seconds(30));
+  EXPECT_EQ(timeout(delta), std::chrono::seconds(30) + 3 * kGrace);
   delta.components.push_back(
       row("gripper.2", ApplyComponentDisposition::kAdd));
-  EXPECT_EQ(timeout(delta), std::chrono::seconds(40));
+  EXPECT_EQ(timeout(delta), std::chrono::seconds(40) + 4 * kGrace);
 }
 
 TEST(RetainedExecutionHostUnitAdapter,
@@ -1388,10 +1445,11 @@ TEST(RetainedExecutionHostUnitAdapter,
   const auto timeout = [&](const deployment::ApplyComponentDeltaDTO &delta) {
     return component_manager::detail::HostApplyTimeout(HostApplyOf(delta), budgets);
   };
+  constexpr auto kGrace = core::kControllerLaunchStopGrace;
   deployment::ApplyComponentDeltaDTO delta;
   // A 120 s robot alone: not timed out at 10 or 30 s.
   delta.components = {row("arm", ApplyComponentDisposition::kAdd)};
-  EXPECT_EQ(timeout(delta), std::chrono::seconds(120));
+  EXPECT_EQ(timeout(delta), std::chrono::seconds(120) + kGrace);
   // The sum: 120 + 10 + 10 + 10 s; a retained component's budget does not
   // count.
   delta.components = {row("arm", ApplyComponentDisposition::kReplace),
@@ -1399,13 +1457,13 @@ TEST(RetainedExecutionHostUnitAdapter,
                       row("io", ApplyComponentDisposition::kAdd),
                       row("kept", ApplyComponentDisposition::kRetain),
                       row("mock", ApplyComponentDisposition::kAdd)};
-  EXPECT_EQ(timeout(delta), std::chrono::seconds(150));
+  EXPECT_EQ(timeout(delta), std::chrono::seconds(150) + 4 * kGrace);
   // No floor once something is installed: an authored 2.5 s waits 2.5 s,
-  // and with a default component 12.5 s.
+  // and with a default component 12.5 s (each plus the stop grace).
   delta.components = {row("fast", ApplyComponentDisposition::kAdd)};
-  EXPECT_EQ(timeout(delta), std::chrono::milliseconds(2'500));
+  EXPECT_EQ(timeout(delta), std::chrono::milliseconds(2'500) + kGrace);
   delta.components.push_back(row("io", ApplyComponentDisposition::kAdd));
-  EXPECT_EQ(timeout(delta), std::chrono::milliseconds(12'500));
+  EXPECT_EQ(timeout(delta), std::chrono::milliseconds(12'500) + 2 * kGrace);
 }
 
 TEST(RetainedExecutionHostUnitAdapter,
@@ -1530,7 +1588,7 @@ TEST(RetainedExecutionHostUnitAdapter,
       fixture.execution_run_root.path() / "execution-control.sock";
   const auto identity = ExecutionPacket(
       ordinary,
-      R"({"api_version":"manyforge.execution_command.v1","command":"identity"})");
+      R"({"api_version":"manyforge.execution_command.v3","command":"identity"})");
   const auto *error = identity.find_object_member("error");
   ASSERT_NE(error, nullptr);
   EXPECT_EQ(TextMember(*error, "code"), "execution_owner_not_ready");
@@ -1539,7 +1597,7 @@ TEST(RetainedExecutionHostUnitAdapter,
   const std::string attribution =
       R"("attribution":{"transport":"internal","assurance":"unverified","principal_id":null})";
   const auto packet = [&](std::string_view command, std::string_view request) {
-    return "{\"api_version\":\"manyforge.execution_command.v1\",\"command\":"
+    return "{\"api_version\":\"manyforge.execution_command.v3\",\"command\":"
            "\"" +
            std::string(command) + "\"," + attribution +
            ",\"request\":" + std::string(request) + "}";
@@ -1570,7 +1628,7 @@ TEST(RetainedExecutionHostUnitAdapter,
     ASSERT_NE(reply.find_object_member("accepted"), nullptr) << encoded;
     const auto *accepted = reply.find_object_member("accepted");
     const auto read = ExecutionPacket(
-        priority, "{\"api_version\":\"manyforge.execution_command.v1\","
+        priority, "{\"api_version\":\"manyforge.execution_command.v3\","
                   "\"command\":\"read_stop\",\"stop_id\":\"" +
                       TextMember(*accepted, "stop_id") + "\"," + attribution +
                       "}");
@@ -1583,7 +1641,7 @@ TEST(RetainedExecutionHostUnitAdapter,
             "execution_command_invalid");
   const auto recognized = ExecutionPacket(
       priority,
-      "{\"api_version\":\"manyforge.execution_command.v1\",\"command\":"
+      "{\"api_version\":\"manyforge.execution_command.v3\",\"command\":"
       "\"malformed_stop\",\"request_id\":\"malformed.1\",\"recognized_route\":"
       "\"/api/execution/"
       "stops\",\"reason\":\"recognized_stop_payload_invalid\"," +
@@ -1923,7 +1981,7 @@ TEST(RetainedExecutionHostUnitAdapter,
   const auto command_socket =
       fixture.execution_run_root.path() / "execution-command.sock";
   const auto identity_packet =
-      R"({"api_version":"manyforge.execution_command.v1","command":"identity"})";
+      R"({"api_version":"manyforge.execution_command.v3","command":"identity"})";
   std::optional<content_identity::CanonicalValue> identity_response;
   std::optional<content_identity::CanonicalValue> last_identity_response;
   const auto identity_deadline =
@@ -1958,7 +2016,7 @@ TEST(RetainedExecutionHostUnitAdapter,
   const auto query = [&](const std::string_view command) {
     return ExecutionPacket(
         command_socket,
-        "{\"api_version\":\"manyforge.execution_command.v1\","
+        "{\"api_version\":\"manyforge.execution_command.v3\","
         "\"command\":\"" +
             std::string(command) + "\"}");
   };
@@ -1982,14 +2040,14 @@ TEST(RetainedExecutionHostUnitAdapter,
   const auto *status = status_response.find_object_member("status");
   ASSERT_NE(status, nullptr);
   EXPECT_EQ(TextMember(*status, "schema_version"),
-            "manyforge.execution_status.v2");
+            "manyforge.execution_status.v3");
   const auto *status_identity = status->find_object_member("identity");
   ASSERT_NE(status_identity, nullptr);
   EXPECT_EQ(*status_identity, *identity);
   const auto *status_targets = status->find_object_member("targets");
   ASSERT_NE(status_targets, nullptr);
   EXPECT_EQ(TextMember(*status_targets, "schema_version"),
-            "manyforge.execution_targets.v3");
+            "manyforge.execution_targets.v4");
   const auto *status_components =
       status_targets->find_object_member("components");
   ASSERT_NE(status_components, nullptr);
@@ -2029,7 +2087,7 @@ TEST(RetainedExecutionHostUnitAdapter,
       status->find_object_member("control_state");
   ASSERT_NE(status_control_state, nullptr);
   EXPECT_EQ(TextMember(*status_control_state, "schema_version"),
-            "manyforge.execution_control_state.v6");
+            "manyforge.execution_control_state.v7");
   const auto *status_observed_targets =
       status_control_state->find_object_member("observed_targets");
   ASSERT_NE(status_observed_targets, nullptr);
@@ -2039,7 +2097,7 @@ TEST(RetainedExecutionHostUnitAdapter,
   const auto *targets = targets_response.find_object_member("targets");
   ASSERT_NE(targets, nullptr);
   EXPECT_EQ(TextMember(*targets, "schema_version"),
-            "manyforge.execution_targets.v3");
+            "manyforge.execution_targets.v4");
   ASSERT_EQ(targets->as_object().size(), 2U);
   const auto *components = targets->find_object_member("components");
   ASSERT_NE(components, nullptr);
@@ -2086,7 +2144,8 @@ TEST(RetainedExecutionHostUnitAdapter,
   ASSERT_TRUE(target_command->is_object());
   // Motion targets carry the product-backed Stop metadata projection; an
   // unavailable source would add stop_response_error instead of a value.
-  ASSERT_EQ(target_command->as_object().size(), 10U);
+  // Direct references: one `target` replaces the component and target roles.
+  ASSERT_EQ(target_command->as_object().size(), 9U);
   ASSERT_NE(target_command->find_object_member("stop_response"), nullptr);
   EXPECT_EQ(target_command->find_object_member("stop_response_error"), nullptr);
   EXPECT_EQ(target_command->find_object_member("controllable_component_id"),
@@ -2102,8 +2161,12 @@ TEST(RetainedExecutionHostUnitAdapter,
   const auto *target_descriptor =
       target_command->find_object_member("target_descriptor");
   ASSERT_NE(target_descriptor, nullptr);
-  EXPECT_EQ(TextMember(*target_command, "target_role_id"),
-            TextMember(*target_descriptor, "target_role_id"));
+  EXPECT_EQ(TextMember(*target_descriptor, "schema_version"),
+            "manyforge.manual_control_motion_descriptor.v8");
+  ASSERT_NE(target_command->find_object_member("target"), nullptr);
+  ASSERT_NE(target_descriptor->find_object_member("target"), nullptr);
+  EXPECT_EQ(*target_command->find_object_member("target"),
+            *target_descriptor->find_object_member("target"));
   EXPECT_EQ(TextMember(*target_descriptor, "controllable_component_id"),
             TextMember(component, "controllable_component_id"));
   EXPECT_EQ(TextMember(*target_descriptor, "command_target_id"),
@@ -2117,7 +2180,7 @@ TEST(RetainedExecutionHostUnitAdapter,
       control_state_response.find_object_member("control_state");
   ASSERT_NE(control_state, nullptr);
   EXPECT_EQ(TextMember(*control_state, "schema_version"),
-            "manyforge.execution_control_state.v6");
+            "manyforge.execution_control_state.v7");
   EXPECT_EQ(control_state->find_object_member("observed_motion"), nullptr);
   EXPECT_EQ(control_state->find_object_member("observed_gripper"), nullptr);
   const auto *observed_targets =
@@ -2183,7 +2246,7 @@ TEST(RetainedExecutionHostUnitAdapter,
 
 TEST(RetainedExecutionHostUnitAdapter,
      StandaloneRobotiqPositionCompositionNeedsNoArmProjectionAcrossRestart) {
-  NativeFixture fixture(MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT);
+  NativeFixture fixture(MANYFORGE_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT);
   const auto manifest = deployment::parse_strict_json_model_yaml(
       ReadFile(fixture.root / "manifest.json"));
   const auto *gripper_only =
@@ -2361,7 +2424,10 @@ TEST(RetainedExecutionHostUnitAdapter,
     EXPECT_EQ(TextMember(node, "node_id"), "gripper.command_position");
     const auto *parameters = node.find_object_member("parameters");
     ASSERT_NE(parameters, nullptr);
-    EXPECT_EQ(TextMember(*parameters, "target_role"), "gripper");
+    // Direct reference: the Program names the gripper component's target.
+    const auto *target = parameters->find_object_member("target");
+    ASSERT_NE(target, nullptr);
+    EXPECT_EQ(TextMember(*target, "command_target_id"), "gripper");
     const auto *position = parameters->find_object_member("position");
     ASSERT_NE(position, nullptr);
     EXPECT_EQ(TextMember(*position, "kind"), "named_preset");
@@ -2375,7 +2441,7 @@ TEST(RetainedExecutionHostUnitAdapter,
   const auto query = [&](const std::string_view command) {
     return ExecutionPacket(
         socket,
-        "{\"api_version\":\"manyforge.execution_command.v1\","
+        "{\"api_version\":\"manyforge.execution_command.v3\","
         "\"command\":\"" + std::string(command) + "\"}");
   };
   const auto check_status = [&] {
@@ -2406,7 +2472,7 @@ TEST(RetainedExecutionHostUnitAdapter,
     const auto *status = response->find_object_member("status");
     ASSERT_NE(status, nullptr);
     EXPECT_EQ(TextMember(*status, "schema_version"),
-              "manyforge.execution_status.v2");
+              "manyforge.execution_status.v3");
     const auto *identity = status->find_object_member("identity");
     ASSERT_NE(identity, nullptr);
     EXPECT_EQ(TextMember(*identity, "schema_version"),
@@ -2456,7 +2522,13 @@ TEST(RetainedExecutionHostUnitAdapter,
               command_binding.controllable_component_id.value());
     EXPECT_EQ(TextMember(*descriptor, "command_target_id"), command_binding.command_target_id.value());
     EXPECT_EQ(TextMember(*descriptor, "schema_version"),
-              "manyforge.manual_control_gripper_descriptor.v3");
+              "manyforge.manual_control_gripper_descriptor.v5");
+    const auto *descriptor_target = descriptor->find_object_member("target");
+    ASSERT_NE(descriptor_target, nullptr);
+    EXPECT_EQ(TextMember(*descriptor_target, "component_id"),
+              command_binding.controllable_component_id.value());
+    EXPECT_EQ(TextMember(*descriptor_target, "command_target_id"),
+              command_binding.command_target_id.value());
     EXPECT_EQ(TextMember(*descriptor, "actuation_kind"), "position_commanded");
     EXPECT_EQ(TextMember(*descriptor, "output_mode"), "commanded");
     EXPECT_EQ(TextMember(*descriptor, "completion_policy"), "goal_fenced_target_reached");
@@ -2513,8 +2585,27 @@ TEST(RetainedExecutionHostUnitAdapter,
     EXPECT_EQ(TextMember(*coordinate_observation, "kind"), "coordinate");
     EXPECT_EQ(TextMember(*coordinate_observation, "source_coordinate_name"),
               "robotiq_85_left_knuckle_joint");
-    EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
-              component_manager::ProcessPresenceState::kAbsent);
+    // The child inherits stderr. Absence alone also includes fail-closed exit;
+    // check its structured diagnostic while retaining the separate presence test.
+    testing::internal::CaptureStderr();
+    try {
+      const auto stopped = adapter.EnsureStopped(*fixture.query);
+      const auto shutdown_stderr = testing::internal::GetCapturedStderr();
+      EXPECT_EQ(stopped.state(), component_manager::ProcessPresenceState::kAbsent);
+      EXPECT_EQ(shutdown_stderr.find("execution_host_shutdown_incomplete"),
+                std::string::npos) << shutdown_stderr;
+      // This is emitted by the Manager adapter's waitpid/WIFEXITED path,
+      // not by the child or inferred from absence.
+      const auto reaped = shutdown_stderr.find("execution host child exited: pid=");
+      ASSERT_NE(reaped, std::string::npos) << shutdown_stderr;
+      const auto end = shutdown_stderr.find('\n', reaped);
+      ASSERT_NE(end, std::string::npos) << shutdown_stderr;
+      const auto reaped_line = shutdown_stderr.substr(reaped, end - reaped);
+      EXPECT_TRUE(reaped_line.ends_with(" status=0")) << reaped_line;
+    } catch (...) {
+      static_cast<void>(testing::internal::GetCapturedStderr());
+      throw;
+    }
   }
 }
 
@@ -2922,7 +3013,7 @@ TEST(RetainedExecutionHostUnitAdapter,
   // fixture roots untouched. The ordinary verifier admits each exact bundle.
   ScopedTemporaryRoot merged;
   const auto fixture_root = merged.path() / "fixture";
-  std::filesystem::copy(MANYFORGE_I6_NATIVE_FIXTURE_ROOT, fixture_root,
+  std::filesystem::copy(MANYFORGE_NATIVE_EXECUTION_FIXTURE_ROOT, fixture_root,
                         std::filesystem::copy_options::recursive);
   NativeFixture successor(MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT);
   std::filesystem::copy(
@@ -3175,7 +3266,7 @@ TEST(RetainedExecutionHostUnitAdapter,
      FailedSameBindingCandidateHealthNeverReplacesPublishedModel) {
   ScopedTemporaryRoot merged;
   const auto fixture_root = merged.path() / "fixture";
-  std::filesystem::copy(MANYFORGE_I6_NATIVE_FIXTURE_ROOT, fixture_root,
+  std::filesystem::copy(MANYFORGE_NATIVE_EXECUTION_FIXTURE_ROOT, fixture_root,
                         std::filesystem::copy_options::recursive);
   NativeFixture successor(MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT);
   std::filesystem::copy(successor.root / "retained-package",
@@ -3565,7 +3656,7 @@ TEST(RuntimeUnitAdapterRouter,
   EXPECT_EQ(reference.calls, 0U);
 }
 
-// CONTRACTS §15: one Manager Apply on the host; the peer reads its marker
+// One Manager Apply on the host; the peer reads its marker
 // from the Apply id.
 [[nodiscard]] component_manager::HostApplyRequest
 HostApplyAdapterRequest(const NativeFixture &fixture, const std::string &marker) {
@@ -3720,7 +3811,8 @@ int RunShutdownPacketProbe(const int ordinary, const int private_channel,
   }
   std::ofstream(root / "shutdown-probe.final")
       << shutdown_packets << ' ' << shutdown_probe_terms << ' ' << stopping;
-  return 0;
+  return mode == "incomplete"
+      ? component_manager::kExecutionHostShutdownIncompleteExitStatus : 0;
 }
 
 // This is only a packet peer: production admission/codec values are reused,
@@ -4013,6 +4105,38 @@ void CheckShutdownPacketProbe(const std::string &mode,
   EXPECT_EQ(terms, cut_initial_send ? 1 : 0);
   EXPECT_TRUE(stopping);
 }
+// Packet peer only: verifies Manager's actual child reaping and status
+// observation for both exit codes, not a real gripper shutdown.
+TEST(RetainedExecutionHostUnitAdapter, ShutdownReaperDistinguishesCleanAndIncompleteExit) {
+  for (const auto *mode : {"responsive", "incomplete"}) {
+    SCOPED_TRACE(mode);
+    testing::internal::CaptureStderr();
+    std::string output;
+    try {
+      CheckShutdownPacketProbe(mode, false);
+      output = testing::internal::GetCapturedStderr();
+    } catch (...) {
+      static_cast<void>(testing::internal::GetCapturedStderr());
+      throw;
+    }
+    const auto reaped = output.find("execution host child exited: pid=");
+    ASSERT_NE(reaped, std::string::npos) << output;
+    const auto end = output.find('\n', reaped);
+    ASSERT_NE(end, std::string::npos) << output;
+    const auto line = output.substr(reaped, end - reaped);
+    const auto expected = std::string(" status=") +
+        (std::string_view(mode) == "incomplete"
+             ? std::to_string(component_manager::kExecutionHostShutdownIncompleteExitStatus)
+             : "0");
+    EXPECT_TRUE(line.ends_with(expected)) << line;
+    const auto exit_code = std::string_view(mode) == "incomplete"
+        ? component_manager::kExecutionHostShutdownIncompleteExitStatus : 0;
+    EXPECT_EQ(component_manager::execution_host_child_exit_reason(exit_code),
+              std::string_view(mode) == "incomplete"
+                  ? "execution_host_shutdown_incomplete" : "execution_host_child_exited");
+  }
+}
+
 TEST(RetainedExecutionHostUnitAdapter,
      ShutdownWaitsForActualExitWithUnchangedProgress) {
   CheckShutdownPacketProbe("responsive", false);

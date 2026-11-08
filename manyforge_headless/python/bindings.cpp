@@ -253,6 +253,19 @@ public:
     return Invoke([this]() { return core_->AppliedProgramSelection(); });
   }
 
+  std::string LookupComponentFrame(std::string request_json) {
+    py::gil_scoped_release release;
+    return Invoke([this, request_json = std::move(request_json)]() {
+      try {
+        return core_->LookupComponentFrame(deployment::parse_strict_json_model_yaml(request_json).root());
+      } catch (const OperatorAlarmError &) {
+        throw;
+      } catch (const std::exception &) {
+        throw OperatorAlarmError("component_frame_lookup_invalid", "component frame lookup request is invalid");
+      }
+    });
+  }
+
   std::string AppliedProgramStatus() {
     py::gil_scoped_release release;
     return Invoke([this]() { return core_->AppliedProgramStatus(); });
@@ -1043,6 +1056,7 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       .def("source_model_context", &HeadlessApiBridge::SourceModelContext)
       .def("assistant_mode_context", &HeadlessApiBridge::AssistantModeContext,
            py::arg("mode_id"))
+      .def("lookup_component_frame", &HeadlessApiBridge::LookupComponentFrame)
       .def("applied_program_selection",
            &HeadlessApiBridge::AppliedProgramSelection)
       .def("applied_program_status",

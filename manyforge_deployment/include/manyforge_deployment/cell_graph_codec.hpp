@@ -217,7 +217,7 @@ class GraphRevisionVerifiedCellGraph final {
 ///
 /// This does not compute or verify GraphRevision: true graph identity requires
 /// the exact catalog-constrained schemas, validation, and default
-/// materialization introduced at C0.2.
+/// materialization.
 [[nodiscard]] IntrinsicallyValidatedCellGraphCandidate validate_intrinsic_cell_graph_candidate(
     const TypedCellGraphCandidate& candidate);
 

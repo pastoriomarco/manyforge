@@ -34,7 +34,7 @@ export function accumulateJointDrafts(
   };
 }
 
-/** A deterministic local list, intentionally not an I6 command payload. */
+/** A deterministic local list, intentionally not a command payload. */
 export function jointDraftList(
   drafts: JointCoordinateDrafts,
 ): JointCoordinateDraft[] {

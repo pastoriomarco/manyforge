@@ -29,8 +29,8 @@ struct ManagedKernelAdmissionObservation final {
 /// Process-local atomic admission gate shared by the managed execution owner
 /// and its durable Apply-fence owner.
 ///
-/// N7-a3 uses it while the managed command surface remains closed. N7-a4
-/// joins operation admission to this same gate; it must not create a second
+/// It is used while the managed command surface remains closed. Operation
+/// admission joins this same gate; it must not create a second
 /// resource/fence truth.
 using ManagedTerminalApplyFenceValidator =
     std::function<manyforge::core::Result<void>(
@@ -128,7 +128,7 @@ struct ManagedKernelApplyFenceOwnerConfig final {
   std::function<std::int64_t()> now_ns;
 };
 
-/// Durable Kernel-owned Manager Apply fence (CONTRACTS §15): one generation,
+/// Durable Kernel-owned Manager Apply fence: one generation,
 /// request ledger and admission gate.
 class ManagedKernelApplyFenceOwner final
     : public manyforge::core::IManagerKernelApplyFencePort {
@@ -170,7 +170,7 @@ public:
           &expected_predecessor_public_pointer_digest,
       const std::function<void()> &effect) const;
 
-  /// CONTRACTS §15: the exact query of the Apply fence currently held for
+  /// The exact query of the Apply fence currently held for
   /// `apply` (HostApplyRequest carries no fence fields), stamped with the
   /// Manager runtime epoch the caller knows; nullopt when none is held.
   [[nodiscard]] std::optional<manyforge::core::ConfigurationFenceStatusQueryDTO>

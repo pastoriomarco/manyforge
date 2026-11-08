@@ -26,7 +26,7 @@ inline constexpr char kDigestC[] =
 /// historical `recoverable_substitution_mode` key, as a provider schema may.
 [[nodiscard]] ResolvedStopBasePlanDTO BasePlan(const bool legacy_fallback_parameters = false) {
   const auto path =
-      std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
+      std::filesystem::path(MANYFORGE_CORE_TEST_GOLDEN_DIR) / "resolved_stop_base_plan.v1.json";
   std::ifstream stream(path, std::ios::binary);
   std::ostringstream bytes;
   bytes << stream.rdbuf();
@@ -82,8 +82,6 @@ inline constexpr char kDigestC[] =
       ProgramBindingId(kDigestB),
       base.retained_bundle_id,
       base.graph_revision,
-      ComponentRoleId("robot"),
-      TargetRoleId("arm"),
       ControllableComponentId("robot.1"),
       ComponentTypeId("robot.type"),
       ComponentTypeRevision("robot.type.revision"),
@@ -94,7 +92,7 @@ inline constexpr char kDigestC[] =
       {ProgramModelRoleBindingDTO{ModelRoleId("body"), ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision")}},
       {},
-      {ProgramFrameRoleBindingDTO{FrameRoleId("base"), ModelInstanceId("robot.model"),
+      {ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("base")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision"), "robot_base"}},
       {RuntimeResourceBindingDTO{ResourceRoleId("joint.1"), ResourceId("joint.1"),
                                  std::string("joint_1"), "joint_1", CoordinateKind::kAngular},
@@ -520,7 +518,7 @@ TEST(StopJournalProjectionCodecTest, RetainsExplicitOffAndOnJerkProfilesExactly)
 }
 
 TEST(StopJournalProjectionCodecTest, RoundTripsTheFastSpringBackModeAndItsActualProviderMode) {
-  // Q130: the appended mode is read back, as SQLite owner-epoch replay does.
+  // The appended mode is read back, as SQLite owner-epoch replay does.
   MotionInterruptStopProfileDTO profile;
   profile.profile_id = "journal.fast";
   profile.stop_mode = MotionInterruptStopMode::kSpringBackFast;

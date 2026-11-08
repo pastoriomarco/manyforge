@@ -15,6 +15,8 @@ Ros2ControlComponentAdapter::Ros2ControlComponentAdapter(
 
 core::ComponentState Ros2ControlComponentAdapter::State(const std::int64_t now_ns) const {
   auto observation = handle_->ReadObservation(now_ns);
+  if (observation.owner_stalled)
+    return ros2_control_component_state(observation, now_ns);
   if (streams_) observation.streams = streams_(now_ns);
   observation.simulated = simulated_;
   if (goal_result_bound_) observation.goal_result_bound_ns = goal_result_bound_->count();
@@ -25,7 +27,7 @@ core::ActionResult Ros2ControlComponentAdapter::Run(const core::ComponentAction 
                                                     const std::stop_token stop) {
   using Action = core::ComponentAction;
   const bool arm = handle_->motion_domain().has_value();
-  // M7: a just-launched component's controllers are spawned within its
+  // A just-launched component's controllers are spawned within its
   // launch's own bound before its lifecycle command time starts.
   if (action == Action::kPrepare)
     if (auto refused = handle_->WaitForControllerLaunch(stop))

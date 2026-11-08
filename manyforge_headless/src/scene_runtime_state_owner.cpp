@@ -821,7 +821,7 @@ SceneRuntimeStateValue(const SceneRuntimeStateSnapshot &snapshot) {
                {"stop_motion", CanonicalValue(response.stop_motion)}})},
           {"scene_resource_id", CanonicalValue(loss.scene_resource_id)}});
       if (loss.signal_error) {
-        // Only on a failed publication (SX-204).
+        // Only on a failed publication.
         losses.back() = CanonicalValue([&] {
           auto row = losses.back().as_object();
           row.emplace_back("signal_error", CanonicalValue(*loss.signal_error));

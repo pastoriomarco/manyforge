@@ -19,63 +19,63 @@ from pathlib import Path
 
 HISTORICAL_CASE_GATES: dict[str, tuple[str, ...]] = {
     "test_ros2_control_gripper_nonfinite_action_sample_fails_closed": (
-        "I6/N",
-        "I11/T",
+        "addressed-runtime",
+        "tools",
     ),
-    "test_ros2_control_backend_requires_fresh_state_before_planning": ("I6/N",),
+    "test_ros2_control_backend_requires_fresh_state_before_planning": ("addressed-runtime",),
     "test_ros2_control_backend_rejects_sim_tolerance_override_outside_commanded_sim": (
-        "I6/N",
-        "I9/I",
+        "addressed-runtime",
+        "isaac",
     ),
-    "test_ros2_control_backend_rejects_negative_executor_thread_count": ("I6/N",),
+    "test_ros2_control_backend_rejects_negative_executor_thread_count": ("addressed-runtime",),
     "test_ros2_control_commanded_sim_uses_backend_initial_state_without_observed_feed": (
-        "I6/N",
-        "I9/I",
+        "addressed-runtime",
+        "isaac",
     ),
     "test_ros2_control_backend_preserves_fjt_abort_diagnostics": (
-        "I6/N",
-        "I8/P5",
+        "addressed-runtime",
+        "kernel-stop",
     ),
     "test_ros2_control_backend_preserves_monitor_failure_after_late_result": (
-        "I6/N",
-        "I8/P5",
+        "addressed-runtime",
+        "kernel-stop",
     ),
     "test_ros2_control_backend_resyncs_after_fault_before_next_run": (
-        "I6/N",
-        "I8/P5",
+        "addressed-runtime",
+        "kernel-stop",
     ),
     "test_ros2_control_backend_reset_clears_inflight_gripper_command": (
-        "I6/N",
-        "I8/P5",
-        "I11/T",
+        "addressed-runtime",
+        "kernel-stop",
+        "tools",
     ),
     "test_ros2_control_gripper_updates_roboplan_scene_group_state": (
-        "I5/H0",
-        "I6/N",
-        "I11/T",
+        "headless-scene",
+        "addressed-runtime",
+        "tools",
     ),
     "test_ros2_control_gripper_driver_result_accepts_success_without_reached_goal": (
-        "I6/N",
-        "I11/T",
+        "addressed-runtime",
+        "tools",
     ),
     "test_ros2_control_isaac_effort_gripper_publishes_joint_state_and_dwell_completes": (
-        "I6/N",
-        "I9/I",
-        "I11/T",
+        "addressed-runtime",
+        "isaac",
+        "tools",
     ),
     "test_ros2_control_backend_documents_lock_order_contract": ("retained-now",),
     "test_ros2_control_admission_surface_accepts_exact_generic_binding": (
-        "I6/N",
-        "I7/L0",
-        "I10/R",
+        "addressed-runtime",
+        "lifecycle",
+        "real-robot",
     ),
     "test_ros2_control_monitor_exits_promptly_after_stop_confirmation": (
-        "I6/N",
-        "I8/P5",
+        "addressed-runtime",
+        "kernel-stop",
     ),
     "test_ros2_control_stop_observes_cancel_for_held_active_goal": (
-        "I6/N",
-        "I8/P5",
+        "addressed-runtime",
+        "kernel-stop",
     ),
 }
 
@@ -113,13 +113,13 @@ def test_all_historical_ros2_control_case_families_remain_assigned() -> None:
     }
     assert assigned == {
         "retained-now",
-        "I5/H0",
-        "I6/N",
-        "I7/L0",
-        "I8/P5",
-        "I9/I",
-        "I10/R",
-        "I11/T",
+        "headless-scene",
+        "addressed-runtime",
+        "lifecycle",
+        "kernel-stop",
+        "isaac",
+        "real-robot",
+        "tools",
     }
 
 

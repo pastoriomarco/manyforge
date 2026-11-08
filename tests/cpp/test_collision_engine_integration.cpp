@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_collision/scene_asset_root.hpp>
@@ -51,7 +52,7 @@ using manyforge::core::CollisionWorldSnapshot;
 using manyforge::qualification::AcceptanceDisposition;
 
 std::filesystem::path repo_root() {
-  return std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
+  return std::filesystem::path(MANYFORGE_COLLISION_TEST_SOURCE_ROOT);
 }
 
 struct ModelPaths {
@@ -66,23 +67,6 @@ ModelPaths ur10e_model_paths() {
       model_dir / "ur10e_robotiq_2f_140.urdf",
       model_dir / "ur10e_robotiq_2f_140.srdf",
   };
-}
-
-// The maintained Lite 6 with its lite gripper: mesh links and mesh fingers
-// (the F-1 pair is a finger mesh against a wall).
-ModelPaths lite6_model_paths() {
-  const auto model_dir = repo_root() / "manyforge_example_models" / "models" /
-                         "lite6_lite_gripper";
-  return {
-      model_dir / "lite6_lite_gripper.urdf",
-      model_dir / "lite6_lite_gripper.srdf",
-  };
-}
-
-ManyForgeCollisionEngine::SharedModelPtr load_lite6_shared_model() {
-  const auto paths = lite6_model_paths();
-  return ManyForgeCollisionEngine::load_shared_model(
-      "lite6_lite_gripper", paths.urdf, paths.srdf, {repo_root()}, "lite6");
 }
 
 const std::vector<std::string> kLite6ArmJoints{"joint1", "joint2", "joint3",
@@ -137,6 +121,44 @@ struct TemporaryModel {
   }
   ~TemporaryModel() { std::filesystem::remove_all(root); }
 };
+
+std::string read_file(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+void replace_all(std::string& text, const std::string& from, const std::string& to) {
+  for (auto at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size())) {
+    text.replace(at, from.size(), to);
+  }
+}
+
+// The maintained Lite 6 with its lite gripper (mesh links and mesh fingers),
+// in the joint order the product loads. The source file's left_finger_joint
+// mimics right_finger_joint, and urdfdom traverses sibling joints by name, so
+// Pinocchio meets the follower first and refuses the file. The cell compiler
+// names sibling joints with a dependency rank that puts a mimic master first;
+// this copy renames the two finger joints the same way.
+ModelPaths lite6_model_paths(const TemporaryModel& temporary) {
+  const auto model_dir = repo_root() / "manyforge_example_models" / "models" /
+                         "lite6_lite_gripper";
+  const ModelPaths paths{temporary.root / "lite6_lite_gripper.urdf",
+                         temporary.root / "lite6_lite_gripper.srdf"};
+  for (const auto& [source, target] :
+       {std::pair{model_dir / "lite6_lite_gripper.urdf", paths.urdf},
+        std::pair{model_dir / "lite6_lite_gripper.srdf", paths.srdf}}) {
+    auto text = read_file(source);
+    replace_all(text, "\"right_finger_joint\"", "\"rank1_right_finger_joint\"");
+    replace_all(text, "\"left_finger_joint\"", "\"rank2_left_finger_joint\"");
+    std::ofstream(target, std::ios::binary | std::ios::trunc) << text;
+  }
+  return paths;
+}
+
+ManyForgeCollisionEngine::SharedModelPtr load_lite6_shared_model(const ModelPaths& paths) {
+  return ManyForgeCollisionEngine::load_shared_model(
+      "lite6_lite_gripper", paths.urdf, paths.srdf, {repo_root()}, "lite6");
+}
 
 ManyForgeCollisionEngine::SharedModelPtr load_empty_collision_model(
     const TemporaryModel& temporary) {
@@ -486,57 +508,57 @@ TEST(CollisionEngineSelfCoverage, RetainsEverySrdfEnabledSelfPairAndMatchesIndep
 
 constexpr std::array<AcceptanceDisposition, 26>
     kFactoryCoupledAcceptance{{
-        {"FactoryValidationAndLookaheadReuseOnePreparedRevision", "I6/N",
+        {"FactoryValidationAndLookaheadReuseOnePreparedRevision", "removed-factory",
          "addressed validation/lookahead contexts reuse one owner-issued revision"},
-        {"ConcurrentColdContextsPublishOnePreparedRevision", "I6/N",
+        {"ConcurrentColdContextsPublishOnePreparedRevision", "removed-factory",
          "concurrent consumers publish one immutable prepared revision"},
-        {"DedicatedRuntimeSurfacePreparesAndTracksPublishedRevisions", "I6/N+I8/P5",
+        {"DedicatedRuntimeSurfacePreparesAndTracksPublishedRevisions", "removed-factory",
          "runtime preparation, distance modes, counters, and revision tracking"},
-        {"DedicatedRuntimeSurfaceRejectsDuplicateFullConfigurationNames", "I6/N",
+        {"DedicatedRuntimeSurfaceRejectsDuplicateFullConfigurationNames", "removed-factory",
          "resource-addressed state rejects duplicate canonical coordinates"},
-        {"ConcurrentQueriesOnDifferentInstancesComplete", "I6/N",
+        {"ConcurrentQueriesOnDifferentInstancesComplete", "removed-factory",
          "independent owner-issued query contexts make concurrent progress"},
-        {"ConcurrentCollidingSnapshotQueriesDoNotRaceDiagnosticCapture", "I6/N",
+        {"ConcurrentCollidingSnapshotQueriesDoNotRaceDiagnosticCapture", "removed-factory",
          "colliding diagnostics remain isolated across concurrent contexts"},
-        {"AgreesWithDiagnosticComparatorOnFreeJointStateAgainstSameModel", "I6/N",
+        {"AgreesWithDiagnosticComparatorOnFreeJointStateAgainstSameModel", "removed-factory",
          "new diagnostic observer parity without the removed comparator owner"},
-        {"SnapshotPortAcceptsPrimitiveSceneSnapshotWithBodyPairCapability", "I6/N",
+        {"SnapshotPortAcceptsPrimitiveSceneSnapshotWithBodyPairCapability", "removed-factory",
          "headless scene publishes exact primitive body/resource identities"},
-        {"SnapshotPortAppliesTimeoutBudgetToFullCall", "I6/N+I8/P5",
+        {"SnapshotPortAppliesTimeoutBudgetToFullCall", "removed-factory",
          "owner-issued query deadline covers preparation and collision work"},
-        {"ObservedRuntimeMonitorReportsSnapshotSyncSeparately", "I8/P5",
+        {"ObservedRuntimeMonitorReportsSnapshotSyncSeparately", "removed-factory",
          "immediate monitor reports changed-snapshot cost separately"},
-        {"ObservedRuntimeLookaheadExcludesSnapshotSyncFromPerQueryBudget", "I8/P5",
+        {"ObservedRuntimeLookaheadExcludesSnapshotSyncFromPerQueryBudget", "removed-factory",
          "lookahead charges preparation outside each warm query budget"},
-        {"SnapshotPortLoadsTriangleMeshSceneObject", "I6/N",
+        {"SnapshotPortLoadsTriangleMeshSceneObject", "removed-factory",
          "retained mesh identity and bytes load through the headless snapshot"},
-        {"PassiveMeshSceneContactDoesNotEnterMotionEnginePairGraph", "I6/N+I8/P5",
+        {"PassiveMeshSceneContactDoesNotEnterMotionEnginePairGraph", "removed-factory",
          "passive contacts cannot acquire motion-policy authority"},
-        {"IsaacMeshTableCheeseStartContactDoesNotEnterMotionEnginePairGraph", "I9/I+I8/P5",
+        {"IsaacMeshTableCheeseStartContactDoesNotEnterMotionEnginePairGraph", "removed-factory",
          "Isaac observed mesh contacts preserve exact policy classification"},
-        {"AttachedObjectTouchLinksHonorExplicitGripperCollisionEnvelope", "I6/N+I8/P5",
+        {"AttachedObjectTouchLinksHonorExplicitGripperCollisionEnvelope", "removed-factory",
          "attachments and touch links use owner-issued resource identities"},
-        {"RequiredUnsupportedDiagnosticCapabilityFailsClosed", "I6/N",
+        {"RequiredUnsupportedDiagnosticCapabilityFailsClosed", "removed-factory",
          "typed required capabilities fail closed when unavailable"},
-        {"RequiredDistanceCapabilityPopulatesSignedClearance", "I6/N+I8/P5",
+        {"RequiredDistanceCapabilityPopulatesSignedClearance", "removed-factory",
          "signed-clearance evidence is emitted for an explicit distance scope"},
-        {"RequiredDistanceCapabilityWithoutTypedScopeFailsClosed", "I6/N",
+        {"RequiredDistanceCapabilityWithoutTypedScopeFailsClosed", "removed-factory",
          "distance requests require an exact typed scope"},
-        {"SelectedCollidingDistancePreservesFullCollisionCoverage", "I6/N+I8/P5",
+        {"SelectedCollidingDistancePreservesFullCollisionCoverage", "removed-factory",
          "selected distance never narrows collision enumeration"},
-        {"SelectedPenetrationIsExactAcrossIndependentWorkerHistories", "I8/P5",
+        {"SelectedPenetrationIsExactAcrossIndependentWorkerHistories", "removed-factory",
          "worker history cannot alter selected penetration evidence"},
-        {"UnrelatedSelectedPairEvaluatesNoDistance", "I6/N",
+        {"UnrelatedSelectedPairEvaluatesNoDistance", "removed-factory",
          "unknown selected resources perform no distance work"},
-        {"SelectedCollidingDistanceRequiresANonemptySelection", "I6/N",
+        {"SelectedCollidingDistanceRequiresANonemptySelection", "removed-factory",
          "empty selected-distance scope fails closed"},
-        {"AllCollidingDistanceEvaluatesOnlyCollidingGeometryPairs", "I6/N+I8/P5",
+        {"AllCollidingDistanceEvaluatesOnlyCollidingGeometryPairs", "removed-factory",
          "all-colliding mode excludes unrelated distance work"},
-        {"MultipleGeometryPairsReduceToDeepestLogicalPairDistance", "I6/N+I8/P5",
+        {"MultipleGeometryPairsReduceToDeepestLogicalPairDistance", "removed-factory",
          "logical-pair reduction retains the deepest complete finite evidence"},
-        {"QueryProceedsEvenWhilePlannerProjectionIsHeavilyBusy", "I6/N",
+        {"QueryProceedsEvenWhilePlannerProjectionIsHeavilyBusy", "removed-factory",
          "authoritative collision queries are independent of planner projection"},
-        {"CompareModeEmitsMismatchEventWhenEnginesDisagree", "I6/N+I5/H0",
+        {"CompareModeEmitsMismatchEventWhenEnginesDisagree", "removed-factory",
          "source-owned mismatch facts replace the deleted comparator emitter"},
     }};
 
@@ -1008,7 +1030,7 @@ TEST(ManyForgeCollisionEngineTest,
   EXPECT_TRUE(reset.clearance_violations.empty());
 }
 
-// S11 (CLR): the clearance margin also classifies a MESH body (coal's BVH
+// The clearance margin also classifies a MESH body (coal's BVH
 // distance path), not only primitives. A small box is placed just beyond
 // every Lite 6 geometry's bounding sphere along one horizontal direction,
 // next to the left finger: no contact (at least 2 cm away from every robot
@@ -1016,8 +1038,9 @@ TEST(ManyForgeCollisionEngineTest,
 TEST(ManyForgeCollisionEngineTest, ClearanceMarginClassifiesAFingerMeshNearAnObstacle) {
   namespace core = manyforge::core;
   namespace collision = manyforge::collision;
-  const auto paths = lite6_model_paths();
-  const auto shared = load_lite6_shared_model();
+  TemporaryModel temporary;
+  const auto paths = lite6_model_paths(temporary);
+  const auto shared = load_lite6_shared_model(paths);
   ManyForgeCollisionEngine engine(shared,
                                   ManyForgeCollisionEngine::make_shared_scene_cache(shared));
   pinocchio::Model model;

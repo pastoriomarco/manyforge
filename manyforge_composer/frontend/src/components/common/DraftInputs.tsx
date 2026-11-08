@@ -1,9 +1,46 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   InputHTMLAttributes,
   KeyboardEvent,
+  ReactNode,
   TextareaHTMLAttributes,
 } from 'react';
+
+type DraftInputResetKey = string | number;
+type DraftInputResetScope = 'scenario' | 'program' | 'deployment';
+type DraftInputResetKeys = Record<DraftInputResetScope, DraftInputResetKey> & {
+  activeScope: DraftInputResetScope;
+};
+
+const DEFAULT_DRAFT_INPUT_RESET_KEYS: DraftInputResetKeys = {
+  scenario: 0, program: 0, deployment: 0, activeScope: 'scenario',
+};
+const DraftInputResetContext = createContext(DEFAULT_DRAFT_INPUT_RESET_KEYS);
+
+export function useDraftInputResetSignal(): {
+  scenarioResetKey: DraftInputResetKey;
+  scopedResetKey: DraftInputResetKey;
+} {
+  const resetKeys = useContext(DraftInputResetContext);
+  const scenarioResetKey = resetKeys.scenario;
+  const scopedResetKey = resetKeys[resetKeys.activeScope];
+  return useMemo(() => ({ scenarioResetKey, scopedResetKey }), [scenarioResetKey, scopedResetKey]);
+}
+
+/** A successful Draft reset/replacement rebases pending text across the workbench. */
+export function DraftInputResetProvider({ scope = 'scenario', resetKey, children }: {
+  scope?: DraftInputResetScope;
+  resetKey: DraftInputResetKey;
+  children: ReactNode;
+}) {
+  const parent = useContext(DraftInputResetContext);
+  const keys = useMemo(() => ({ ...parent, [scope]: resetKey, activeScope: scope }), [parent, resetKey, scope]);
+  return (
+    <DraftInputResetContext.Provider value={keys}>
+      {children}
+    </DraftInputResetContext.Provider>
+  );
+}
 
 function formatDraftValue(value: string | number | null | undefined): string {
   return value === null || value === undefined ? '' : String(value);
@@ -41,6 +78,7 @@ export function DraftTextInput({
   onKeyDown,
   ...props
 }: DraftTextInputProps) {
+  const { scenarioResetKey, scopedResetKey } = useDraftInputResetSignal();
   const normalizedValue = formatDraftValue(value);
   const [draft, setDraft] = useState(normalizedValue);
   const [focused, setFocused] = useState(false);
@@ -64,21 +102,28 @@ export function DraftTextInput({
 
   const currentValue = useRef(normalizedValue);
   currentValue.current = normalizedValue;
-  const appliedReset = useRef<{ key: typeof resetKey } | null>(null);
+  const appliedReset = useRef<{
+    localKey: typeof resetKey;
+    scenarioKey: typeof scenarioResetKey;
+    scopedKey: typeof scopedResetKey;
+  } | null>(null);
   useEffect(() => {
-    // StrictMode can replay effects when a keyed row moves. Only a new reset
-    // key discards text; an effect replay is not another operator discard.
-    if (appliedReset.current?.key === resetKey && appliedReset.current !== null) return;
-    appliedReset.current = { key: resetKey };
+    // StrictMode can replay effects when a keyed row moves. Either explicit
+    // reset identity can rebase text; an effect replay is not another reset.
+    if (appliedReset.current !== null
+      && appliedReset.current.localKey === resetKey
+      && appliedReset.current.scenarioKey === scenarioResetKey
+      && appliedReset.current.scopedKey === scopedResetKey) return;
+    appliedReset.current = { localKey: resetKey, scenarioKey: scenarioResetKey, scopedKey: scopedResetKey };
     userEdited.current = false;
     setDraft(currentValue.current);
     setInvalidMessage(null);
     onInvalidChange?.(null);
     onPendingChange?.(false);
-    // Only an explicit local rebase resets even an invalid/focused input.
-    // Ordinary owner observations must not overwrite what is being typed.
+    // Only an explicit local or global rebase resets even an invalid/focused
+    // input. Ordinary owner observations must not overwrite what is being typed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [resetKey]);
+  }, [resetKey, scenarioResetKey, scopedResetKey]);
 
   const validateDraft = useCallback(() => {
     const message = validate?.(draft) ?? null;
@@ -265,15 +310,37 @@ export function DraftTextarea({
   onKeyDown,
   ...props
 }: DraftTextareaProps) {
+  const { scenarioResetKey, scopedResetKey } = useDraftInputResetSignal();
   const normalizedValue = formatDraftValue(value);
   const [draft, setDraft] = useState(normalizedValue);
   const [focused, setFocused] = useState(false);
   const [invalidMessage, setInvalidMessage] = useState<string | null>(null);
   const skipNextCommit = useRef(false);
+  const currentValue = useRef(normalizedValue);
+  const currentOnInvalidChange = useRef(onInvalidChange);
+  const appliedReset = useRef<{
+    scenarioKey: typeof scenarioResetKey;
+    scopedKey: typeof scopedResetKey;
+  } | null>(null);
 
   useEffect(() => {
     if (!focused && invalidMessage === null) setDraft(normalizedValue);
   }, [focused, invalidMessage, normalizedValue]);
+
+  useEffect(() => {
+    currentValue.current = normalizedValue;
+    currentOnInvalidChange.current = onInvalidChange;
+  }, [normalizedValue, onInvalidChange]);
+
+  useEffect(() => {
+    if (appliedReset.current !== null
+      && appliedReset.current.scenarioKey === scenarioResetKey
+      && appliedReset.current.scopedKey === scopedResetKey) return;
+    appliedReset.current = { scenarioKey: scenarioResetKey, scopedKey: scopedResetKey };
+    setDraft(currentValue.current);
+    setInvalidMessage(null);
+    currentOnInvalidChange.current?.(null);
+  }, [scenarioResetKey, scopedResetKey]);
 
   const validateDraft = useCallback(() => {
     const message = validate?.(draft) ?? null;

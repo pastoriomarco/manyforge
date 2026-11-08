@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type {
+  ProgramBindingDocument,
   ProgramRunStatus,
   AutomaticRetryAuditEvent,
   TakeoverFallbackAuditEvent,
@@ -18,7 +19,7 @@ import type {
   RuntimeScaleControlStatus,
 } from '../types/robotControl';
 import { statusFixture } from '../testFixtures/robotControl';
-import { executionGroupScopes, executionGroupTargetLabels } from '../state/programExecutionGroups';
+import { executionGroupScopes } from '../state/programExecutionGroups';
 import {
   deriveTransportGuidance,
   MotionControlSettings,
@@ -39,6 +40,20 @@ import { readStyleSource } from '../styles/readStyleSource';
 import { formatStructuredError } from '../state/structuredError';
 import { api } from '../api/client';
 import { initialSceneNotice } from '../state/initialSceneNotice';
+import type { ActivateExecuteController } from '../hooks/useActivateExecute';
+import { ActivateExecuteDialog } from './ActivateExecuteDialog';
+
+/** A minimal Applied binding row for one direct `component/target` reference. */
+function targetBinding(
+  componentId: string,
+  commandTargetId: string,
+): ProgramBindingDocument['target_bindings'][number] {
+  return {
+    target: { component_id: componentId, command_target_id: commandTargetId },
+    frame_references: [], frame_associations: [], collision_body_references: [],
+    signal_references: [], resource_role_bindings: [], capability_bindings: [],
+  };
+}
 
 function ordinaryMotionStopOffer(): CycleRecoveryOffer {
   return {
@@ -116,8 +131,8 @@ function ordinaryMotionStopControls(): NonNullable<
         runtimeScaleSelector: {
           kind: 'singular',
           programBindingId: `sha256:${'c'.repeat(64)}`,
-          componentRoleId: 'robot',
-          targetRoleId: 'arm',
+          componentId: 'robot',
+          commandTargetId: 'arm',
         },
         runtimeScaleUnavailableReason: null,
         resourceIds: ['robot.joint_1'] }],
@@ -180,7 +195,7 @@ function controller(
   return {
     runnerAllows: vi.fn(() => true),
     runnerRefusal: vi.fn(() => null),
-    // As the backend computes it (CONTRACTS §10): Execute only from an idle
+    // As the backend computes it: Execute only from an idle
     // cycle, Resume for a run in progress (a held group or a halted run).
     readiness: cycleState === 'idle_after_reset'
       ? { can_execute: true, can_resume: false, motion_clear: true, blocked_reasons: [] }
@@ -193,7 +208,7 @@ function controller(
     state: {
       currentScenario: null,
       applied: {
-        schemaVersion: 'manyforge.applied_program_selection.v3',
+        schemaVersion: 'manyforge.applied_program_selection.v4',
         scenarioId: 'cell-pick',
         projectPath: '/projects/cell-pick.scenario',
         sourceDocumentDigest: `sha256:${'a'.repeat(64)}`,
@@ -214,17 +229,15 @@ function controller(
           ownerEpoch: 'headless.epoch.1',
         }],
         program: {
-          api_version: 'manyforge.program.v2',
+          api_version: 'manyforge.program.v3',
           program_id: 'next-pick',
           program_revision: `sha256:${'b'.repeat(64)}`,
           program_profile: 'composable-cell-v1',
           name: 'Next pick',
           catalog: {
-            api_version: 'manyforge.node_catalog.v2',
-            content_version: '2.4.0',
+            api_version: 'manyforge.node_catalog.v3',
+            content_version: '3.0.0',
           },
-          component_roles: { component: {} },
-          target_roles: {},
           tree: {
             node_id: 'logic.check_condition',
             instance_id: 'root',
@@ -233,7 +246,7 @@ function controller(
           },
         },
         programBinding: {
-          api_version: 'manyforge.program_binding.v2',
+          api_version: 'manyforge.program_binding.v3',
           program_binding_id: `sha256:${'c'.repeat(64)}`,
           program_id: 'next-pick',
           program_revision: `sha256:${'b'.repeat(64)}`,
@@ -241,24 +254,35 @@ function controller(
           graph_revision: `sha256:${'b'.repeat(64)}`,
           node_environment: {
             catalog_id: 'manyforge.default',
-            content_version: '2.4.0',
+            content_version: '3.0.0',
             catalog_digest: `sha256:${'a'.repeat(64)}`,
             environment_digest: `sha256:${'c'.repeat(64)}`,
           },
-          component_role_bindings: [],
-          target_role_bindings: [],
+          component_bindings: [],
+          target_bindings: [],
+          frame_bindings: [],
+          collision_body_bindings: [],
+          signal_bindings: [],
           node_policies: [],
           contact_grasp_bindings: [],
           provenance: {
             binding_compiler_contract_digest: `sha256:${'a'.repeat(64)}`,
-            role_assignment_digest: `sha256:${'c'.repeat(64)}`,
             source_records: [],
             resolved_output_records: [],
           },
         },
+        programFrameFacts: {
+          appliedRecordDigest: `sha256:${'a'.repeat(64)}`,
+          programBindingId: `sha256:${'c'.repeat(64)}`,
+          programRevision: `sha256:${'b'.repeat(64)}`,
+          retainedBundleId: `sha256:${'a'.repeat(64)}`,
+          graphRevision: `sha256:${'b'.repeat(64)}`,
+          components: [],
+          frames: [],
+        },
       },
       run: {
-        schemaVersion: 'manyforge.program_run_status.v3',
+        schemaVersion: 'manyforge.program_run_status.v4',
         ownerId: 'program-runner.cell-a',
         ownerEpoch: 'program-runner.epoch.1',
         runRevision: 4,
@@ -313,7 +337,7 @@ function controller(
     refresh: vi.fn(),
     dismissError: vi.fn(),
     run: vi.fn(),
-    activation: { available: false, flow: null, states: [], open: vi.fn(), confirm: vi.fn(), cancel: vi.fn() },
+    activation: { available: false, flow: null, recoveryReady: true, states: [], open: vi.fn(), confirm: vi.fn(), cancel: vi.fn() },
     stopMotion: vi.fn(),
     startMotion: vi.fn(),
     resumeMotion: vi.fn(),
@@ -777,14 +801,13 @@ describe('Program runtime projection', () => {
     const changes: string[][] = [];
     const scopes = executionGroupScopes([{
       node_id: 'parallel', instance_id: 'root', parameters: {}, children: [
-        { node_id: 'motion.move_to_pose', instance_id: 'a', parameters: { target_role: 'arm' }, execution_groups: ['robot_a'], children: [] },
+        { node_id: 'motion.move_to_pose', instance_id: 'a', parameters: { target: { component_id: 'robot', command_target_id: 'arm' } }, execution_groups: ['robot_a'], children: [] },
         { node_id: 'motion.move_to_pose', instance_id: 'b', parameters: {}, execution_groups: ['robot_b'], children: [] },
       ],
     }], ['robot_a', 'robot_b']);
     const settings = renderToStaticMarkup(
       <MotionControlSettings groups={{
         scopes,
-        targetLabels: { arm: 'arm (component role: robot)' },
         hidden: undefined,
         pendingApply: true,
         onChange: (hidden) => changes.push(hidden),
@@ -798,7 +821,7 @@ describe('Program runtime projection', () => {
     expect(settings).toMatch(/<input type="checkbox"\/><span title="all">All groups/);
     expect(settings).toContain('Show All, or another covering group, before hiding this group.');
     expect(settings).toContain('disabled="" checked=""/><span title="robot_a"');
-    expect(settings).toContain('arm (component role: robot)');
+    expect(settings).toContain('1 hardware node · robot/arm');
 
     const readOnly = renderToStaticMarkup(
       <MotionControlSettings groups={{
@@ -849,25 +872,20 @@ describe('Program runtime projection', () => {
     const applied = running.state.applied!;
     applied.program.viewer = { hidden_execution_groups: ['all'] };
     applied.program.execution_groups = { robot_a: { execution_policy: 'independent' } };
-    applied.program.target_roles = { arm: { component_role: 'robot' } };
     applied.program.tree = {
-      node_id: 'motion.move_to_pose', instance_id: 'a', parameters: { target_role: 'arm' },
+      node_id: 'motion.move_to_pose', instance_id: 'a',
+      parameters: { target: { component_id: 'ur10e', command_target_id: 'arm' } },
       execution_groups: ['robot_a'], children: [],
     };
-    applied.programBinding.target_role_bindings = [{
-      target_role_id: 'arm', component_role_id: 'robot',
-      controllable_component_id: 'ur10e', command_target_id: 'arm',
-      frame_role_bindings: [], resource_role_bindings: [],
-      collision_body_role_bindings: [], capability_bindings: [],
-    }];
+    applied.programBinding.target_bindings = [targetBinding('ur10e', 'arm')];
     const render = () => renderToStaticMarkup(
       <ProgramTransportControls enabled program={running} robot={robotController()} />,
     );
     const matched = render();
     expect(matched).toContain('robot_a controls');
     expect(matched).not.toContain('all controls');
-    // Robot names only from the Applied binding of the captured revision.
-    expect(matched).toContain('title="robot_a: arm (ur10e)"');
+    // Targets only from the Applied Program of the captured revision.
+    expect(matched).toContain('title="robot_a: ur10e/arm"');
 
     running.state.run!.capture.programRevision = `sha256:${'9'.repeat(64)}`;
     const mismatched = render();
@@ -879,27 +897,16 @@ describe('Program runtime projection', () => {
     expect(applied.program.viewer.hidden_execution_groups).toEqual(['all']);
   });
 
-  it('labels Draft targets with component roles unless an authoritative binding names the robot', () => {
+  it('labels Draft targets with their direct component/target references', () => {
     const scopes = executionGroupScopes([{
-      node_id: 'gripper.command_position', instance_id: 'g', parameters: { target_role: 'gripper' },
+      node_id: 'gripper.command_position', instance_id: 'g',
+      parameters: { target: { component_id: 'robotiq', command_target_id: 'gripper' } },
       execution_groups: ['tool'], children: [],
     }], ['tool']);
-    const targetRoles = { gripper: { component_role: 'hand' } };
     const draft = renderToStaticMarkup(<MotionControlSettings groups={{
-      scopes, targetLabels: executionGroupTargetLabels(targetRoles, null), hidden: undefined, pendingApply: false,
+      scopes, hidden: undefined, pendingApply: false,
     }} />);
-    expect(draft).toContain('1 hardware node · gripper (component role: hand)');
-    const binding = controller().state.applied!.programBinding;
-    binding.target_role_bindings = [{
-      target_role_id: 'gripper', component_role_id: 'hand',
-      controllable_component_id: 'robotiq', command_target_id: 'gripper',
-      frame_role_bindings: [], resource_role_bindings: [],
-      collision_body_role_bindings: [], capability_bindings: [],
-    }];
-    const applied = renderToStaticMarkup(<MotionControlSettings groups={{
-      scopes, targetLabels: executionGroupTargetLabels(targetRoles, binding), hidden: undefined, pendingApply: false,
-    }} />);
-    expect(applied).toContain('gripper (robotiq)');
+    expect(draft).toContain('1 hardware node · robotiq/gripper');
   });
 
   it('shows Retry during a failure pause, disabled until containment is confirmed', () => {
@@ -1013,7 +1020,7 @@ describe('Program runtime projection', () => {
       source.indexOf('const requestProgramHalt'),
     );
     // Not executing: reset at once. Executing: stop motion, then ask.
-    // confirmReset = the preference only: an unknown write shows on its output (CONTRACTS §7).
+    // confirmReset = the preference only: an unknown write shows on its output.
     expect(source).toContain('const confirmReset = preferences.confirmReset;');
     expect(flow).toMatch(/if \(!executionActive\) \{\s*if \(endedReset && confirmReset\) setResetIntent\('confirm'\);\s*else void program\.reset\(\);/);
     expect(flow).toContain("setResetIntent(confirmReset ? 'stopping' : 'automatic');");
@@ -1049,9 +1056,9 @@ describe('Program runtime projection', () => {
     expect(source).toContain('disabled={!positionAvailable}');
     expect(source).toContain('void program.reset(resetSelectionApplied);');
     // An idle Reset with nothing selected would restore nothing.
-    // Never refused for an output with an unknown outcome (CONTRACTS §6).
+    // Never refused for an output with an unknown outcome.
     expect(source).toContain('disabled={!canReset || (!motionSettled && !endedReset && !idleReset)}');
-    // An idle Reset may restore nothing (contract 141).
+    // An idle Reset may restore nothing.
     expect(source).not.toContain('resetNothingSelected');
     // The automatic (unconfirmed) running Reset keeps both options off.
     expect(source).toMatch(/if \(resetIntent === 'automatic' && motionSettled\) \{\s*setResetIntent\(null\);\s*void program\.reset\(\);/);
@@ -1110,6 +1117,58 @@ describe('Program runtime projection', () => {
     expect(markup).toMatch(
       /class="danger-button transport-full-stop transport-unique-control"[^>]*disabled=""[^>]*>Halt<\/button>/,
     );
+  });
+
+  it('gates a new Execute on false admission while preserving unknown and full-stop resume behavior', () => {
+    const idle = controller('succeeded', 'idle_after_reset');
+    idle.state.run = null;
+    idle.state.controls = null;
+    const blocked = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={idle} robot={robotController()}
+        authoringAdmissionAllowed={false} />,
+    );
+    expect(blocked).toMatch(
+      /class="transport-run transport-unique-control" disabled="" title="The cell is finishing a background step; this is available again in a moment\."[^>]*>Execute<\/button>/,
+    );
+
+    const allowed = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={idle} robot={robotController()}
+        authoringAdmissionAllowed={true} />,
+    );
+    expect(allowed).toMatch(
+      /class="transport-run transport-unique-control"(?![^>]*disabled)[^>]*>Execute<\/button>/,
+    );
+    const unknown = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={idle} robot={robotController()} />,
+    );
+    expect(unknown).toMatch(
+      /class="transport-run transport-unique-control"(?![^>]*disabled)[^>]*>Execute<\/button>/,
+    );
+
+    const fullStopped = controller('full_stopped');
+    const resume = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={fullStopped} robot={robotController()}
+        authoringAdmissionAllowed={false} />,
+    );
+    expect(resume).toMatch(
+      /class="transport-run transport-unique-control"(?![^>]*disabled)[^>]*title="Resume the halted Program tree\./,
+    );
+  });
+
+  it('blocks Activate and execute confirmation while admission is false', () => {
+    const activation = {
+      flow: { phase: 'offered', componentIds: ['lite6_robot'], failures: [], recovery: {} },
+      states: [], open: vi.fn(), confirm: vi.fn(), cancel: vi.fn(), available: true, recoveryReady: true,
+    } as unknown as ActivateExecuteController;
+    const tooltip = 'The cell is finishing a background step; this is available again in a moment.';
+    const blocked = renderToStaticMarkup(
+      <ActivateExecuteDialog activation={activation} authoringAdmissionAllowed={false} />,
+    );
+    expect(blocked).toContain(`<button type="button" class="transport-run" disabled="" title="${tooltip}">Activate and execute</button>`);
+    const allowed = renderToStaticMarkup(
+      <ActivateExecuteDialog activation={activation} authoringAdmissionAllowed={true} />,
+    );
+    expect(allowed).toMatch(/class="transport-run"(?![^>]*disabled)[^>]*>Activate and execute<\/button>/);
   });
 
   it('keeps paired commands disabled through Execute and selected-Stop transitions', () => {
@@ -1183,15 +1242,15 @@ describe('Program runtime projection', () => {
       ? {
         kind: 'group', programBindingId: `sha256:${'c'.repeat(64)}`,
         groupTargets: [
-          { componentRoleId: 'left', targetRoleId: 'arm' },
-          { componentRoleId: 'right', targetRoleId: 'arm' },
+          { componentId: 'left', commandTargetId: 'arm' },
+          { componentId: 'right', commandTargetId: 'arm' },
         ],
       }
       : {
         kind: 'singular',
         programBindingId: `sha256:${'c'.repeat(64)}`,
-        componentRoleId: 'controlled_component',
-        targetRoleId: 'command_target',
+        componentId: 'controlled_component',
+        commandTargetId: 'command_target',
       };
     const status = runtimeScaleStatus(selector);
     starting.state.controls.executionSelections.groups[0].runtimeScaleSelector = status.selector;
@@ -1216,21 +1275,15 @@ describe('Program runtime projection', () => {
     idle.state.applied!.program.tree = {
       node_id: 'motion.move_to_joint_target',
       instance_id: 'root-motion',
-      parameters: { target_role: 'arm' },
+      parameters: { target: { component_id: 'robot', command_target_id: 'arm' } },
       children: [],
     };
-    idle.state.applied!.program.target_roles = { arm: {} };
-    idle.state.applied!.programBinding.target_role_bindings = [{
-      target_role_id: 'arm', component_role_id: 'robot',
-      controllable_component_id: 'robot', command_target_id: 'arm',
-      frame_role_bindings: [], resource_role_bindings: [],
-      collision_body_role_bindings: [], capability_bindings: [],
-    }];
+    idle.state.applied!.programBinding.target_bindings = [targetBinding('robot', 'arm')];
     const selector: RuntimeScaleControlSelector = {
       kind: 'singular',
       programBindingId: idle.state.applied!.programBindingId,
-      componentRoleId: 'robot',
-      targetRoleId: 'arm',
+      componentId: 'robot',
+      commandTargetId: 'arm',
     };
     const status = runtimeScaleStatus(selector, 0.35);
     idle.groupRuntimeScales = {
@@ -1241,13 +1294,13 @@ describe('Program runtime projection', () => {
       <ProgramTransportControls enabled program={idle} robot={robotController()} />,
     );
 
-    // The idle Applied group names its robot from the Applied binding.
-    expect(markup).toContain('title="all: arm (robot)"');
+    // The idle Applied group names its robot through the direct target reference.
+    expect(markup).toContain('title="all: robot/arm"');
     expect(markup).toMatch(/type="range"[^>]*value="0.35"/);
     expect(markup).toMatch(/type="range"[^>]*disabled=/);
   });
 
-  it('gates group Resume on RunReadiness alone (CONTRACTS §10)', () => {
+  it('gates group Resume on RunReadiness alone', () => {
     const program = controller();
     program.state.controls = ordinaryMotionStopControls();
     const robot = robotController();
@@ -1260,7 +1313,7 @@ describe('Program runtime projection', () => {
     program.readiness = { can_execute: false, can_resume: true, motion_clear: true, blocked_reasons: [] };
     const released = renderToStaticMarkup(<ProgramTransportControls enabled program={program} robot={robot} />);
     expect(released).toMatch(/class="transport-group-resume"(?![^>]*disabled)/);
-    // §8: a rule hold gates the groups its scope meets, with its message.
+    // A rule hold gates the groups its scope meets, with its message.
     program.readiness = { can_execute: false, can_resume: false, motion_clear: true, blocked_reasons: [
       { code: 'rule_holds', message: 'Rule door holds its scope (its condition holds)', rule_id: 'door',
         scope: 'everything' }] };
@@ -1503,7 +1556,7 @@ describe('Program runtime projection', () => {
     const render = () => renderToStaticMarkup(<ProgramTransportControls
       enabled program={program} robot={robot} />);
     expect(render()).toMatch(/class="transport-run transport-unique-control"(?![^>]*disabled)[^>]*>Execute<\/button>/);
-    // As in M7, the Runner's own Run gate applies too (e.g. a failed scene preparation).
+    // The Runner's own Run gate applies too (e.g. a failed scene preparation).
     program.runnerAllows = vi.fn((kind: string) => kind !== 'program_run');
     program.runnerRefusal = vi.fn(() => 'program_scene_preparation_failed');
     expect(render()).toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""[^>]*title="program scene preparation failed"/);
@@ -1561,7 +1614,7 @@ describe('Program runtime projection', () => {
     program.activation = { ...program.activation, available: true };
     expect(render()).toMatch(/class="transport-run transport-unique-control"(?![^>]*disabled)[^>]*title="Activate the components that are not enabled, then execute the Program once./);
     expect(render()).not.toContain('Activate components and execute?');
-    program.activation = { ...program.activation, flow: { phase: 'offered', componentIds: ['lite6_robot'], failures: [] } };
+    program.activation = { ...program.activation, flow: { phase: 'offered', componentIds: ['lite6_robot'], failures: [], recovery: {} } };
     const open = render();
     expect(open).toContain('Activate components and execute?');
     expect(open).toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""/);
@@ -1599,7 +1652,7 @@ describe('Program runtime projection', () => {
     expect(guidance()).toEqual([expect.objectContaining({
       id: 'program.reset-required', severity: 'info', title: 'Program finished',
     })]);
-    // CONTRACTS §9: the run's end reason names why it ended.
+    // The run's end reason names why it ended.
     const ended = (runEnd: NonNullable<ProgramRunStatus['runEnd']>) => {
       program.state.run!.runEnd = runEnd;
       return guidance()[0];
@@ -1640,7 +1693,7 @@ describe('Program runtime projection', () => {
         reason: {
           code: 'owner_request_failed',
           message: 'Move to pick was refused.',
-          details: { reference_type: 'frame_role', reference_id: 'tool0', target_role_id: 'arm' },
+          details: { reference_type: 'component_frame', reference_id: 'tool0', component_id: 'arm' },
           origin: { kind: 'owner', nodeInstanceId: 'move', ownerApi: 'kernel.operation' },
         },
       },
@@ -1659,12 +1712,12 @@ describe('Program runtime projection', () => {
     });
     expect(recovery).toMatchObject({
       id: 'recovery.program',
-      message: "Move to pick was refused. (Reference: frame_role 'tool0' of target role 'arm'; "
+      message: "Move to pick was refused. (Reference: component_frame 'tool0' of component 'arm'; "
         + "Origin: kernel.operation for node 'move')",
     });
   });
 
-  it('shows the cell latch as one error item with every cause and no recovery action (R1, R2)', () => {
+  it('shows the cell latch as one error item with every cause and no recovery action', () => {
     const robot = robotController();
     robot.currentStatus = statusFixture();
     const program = controller('succeeded', 'idle_after_reset');
@@ -2349,11 +2402,7 @@ describe('Active TCP Resume confirmation', () => {
     group.ordinaryHeldNodeCount = 0;
     program.state.controls = controls;
     const binding = program.state.applied!.programBinding;
-    binding.target_role_bindings.push({
-      target_role_id: 'arm', component_role_id: 'robot', controllable_component_id: 'robot-a',
-      command_target_id: 'arm', frame_role_bindings: [], resource_role_bindings: [],
-      collision_body_role_bindings: [], capability_bindings: [], robot_tcps: [],
-    });
+    binding.target_bindings.push({ ...targetBinding('robot-a', 'arm'), robot_tcps: [] });
     const robot = robotController();
     const status = robot.currentStatus!;
     robot.tcpResumeConnectionLost = false; robot.tcpResumeFresh = true; robot.tcpResumeStatus = status;
@@ -2372,7 +2421,7 @@ describe('Active TCP Resume confirmation', () => {
       await transport.rerender();
       const motion = status.directControlTargets[0];
       motion.activeTcp = { ...motion.activeTcp!, entry: {
-        componentId: 'robot-a', targetId: 'arm', frameRoleId: 'flange',
+        componentId: 'robot-a', targetId: 'arm', frameComponentId: 'robot-a', frameRoleId: 'flange',
       }, display: 'robot-a.flange', sequence: 2 };
       await transport.rerender();
       await transport.press((p) => p.className === 'transport-group-resume');
@@ -2392,11 +2441,7 @@ describe('Active TCP Resume confirmation', () => {
     second.activeTcp!.entry!.componentId = 'robot-b';
     second.activeTcp!.display = 'robot-b.tcp';
     status.directControlTargets.push(second);
-    program.state.applied!.programBinding.target_role_bindings.push({
-      target_role_id: 'arm-b', component_role_id: 'robot-b', controllable_component_id: 'robot-b',
-      command_target_id: 'arm', frame_role_bindings: [], resource_role_bindings: [],
-      collision_body_role_bindings: [], capability_bindings: [], robot_tcps: [],
-    });
+    program.state.applied!.programBinding.target_bindings.push({ ...targetBinding('robot-b', 'arm'), robot_tcps: [] });
     const transport = await mountTransport(program, robot);
     try {
       group.state = 'held'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 1;
@@ -2406,7 +2451,7 @@ describe('Active TCP Resume confirmation', () => {
       await transport.rerender();
       await transport.press((p) => p.className === 'transport-group-resume');
       first.activeTcp = { ...first.activeTcp!, entry: {
-        componentId: 'robot-a', targetId: 'arm', frameRoleId: 'flange',
+        componentId: 'robot-a', targetId: 'arm', frameComponentId: 'robot-a', frameRoleId: 'flange',
       }, display: 'robot-a.flange', sequence: 2 };
       second.activeTcp = { ...second.activeTcp!, entry: null, display: null, sequence: 1 };
       await transport.rerender();
@@ -2434,11 +2479,7 @@ describe('Active TCP Resume confirmation', () => {
     second.activeTcp!.entry!.componentId = 'robot-b';
     second.activeTcp!.display = 'robot-b.tcp';
     status.directControlTargets.push(second);
-    program.state.applied!.programBinding.target_role_bindings.push({
-      target_role_id: 'arm-b', component_role_id: 'robot-b', controllable_component_id: 'robot-b',
-      command_target_id: 'arm', frame_role_bindings: [], resource_role_bindings: [],
-      collision_body_role_bindings: [], capability_bindings: [], robot_tcps: [],
-    });
+    program.state.applied!.programBinding.target_bindings.push({ ...targetBinding('robot-b', 'arm'), robot_tcps: [] });
     const transport = await mountTransport(program, robot);
     try {
       group.state = 'held'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 1;
@@ -2497,6 +2538,25 @@ describe('Active TCP Resume confirmation', () => {
       await transport.rerender();
       await transport.press((p) => p.className === 'transport-group-resume');
       expect(program.resumeMotion).toHaveBeenCalledWith(['all']);
+    } finally { await transport.unmount(); }
+  });
+
+  it('retains a held TCP baseline while the held count is unknown', async () => {
+    const { program, robot, group, status } = setup();
+    const transport = await mountTransport(program, robot);
+    try {
+      group.state = 'held'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 1;
+      await transport.rerender();
+      group.ordinaryHeldNodeCount = null;
+      await transport.rerender();
+      status.directControlTargets[0].activeTcp = {
+        ...status.directControlTargets[0].activeTcp!, entry: null, display: null, sequence: 2,
+      };
+      group.ordinaryHeldNodeCount = 1;
+      await transport.rerender();
+      await transport.press((p) => p.className === 'transport-group-resume');
+      expect(program.resumeMotion).not.toHaveBeenCalled();
+      expect(transport.mounted((p) => p.children === 'Cancel')).toBe(true);
     } finally { await transport.unmount(); }
   });
 
@@ -2560,6 +2620,28 @@ describe('Active TCP Resume confirmation', () => {
     } finally { await transport.unmount(); }
   });
 
+  it('keeps the first hold baseline for a locally pending Run', async () => {
+    const { program, robot, group, status } = setup();
+    const run = program.state.run;
+    program.state.run = null;
+    program.state.pending = 'run';
+    const transport = await mountTransport(program, robot);
+    try {
+      group.state = 'held'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 1;
+      program.state.run = run;
+      program.state.pending = null;
+      await transport.rerender();
+      const motion = status.directControlTargets[0];
+      motion.activeTcp = { ...motion.activeTcp!, entry: {
+        componentId: 'robot-a', targetId: 'arm', frameComponentId: 'robot-a', frameRoleId: 'flange',
+      }, display: 'robot-a.flange', sequence: 2 };
+      await transport.rerender();
+      await transport.press((p) => p.className === 'transport-group-resume');
+      expect(program.resumeMotion).not.toHaveBeenCalled();
+      expect(transport.mounted((p) => p.children === 'Cancel')).toBe(true);
+    } finally { await transport.unmount(); }
+  });
+
   it('does not prompt when the page first observes an already-held run', async () => {
     const { program, robot, group, status } = setup();
     group.state = 'held'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 1;
@@ -2567,7 +2649,7 @@ describe('Active TCP Resume confirmation', () => {
     try {
       const motion = status.directControlTargets[0];
       motion.activeTcp = { ...motion.activeTcp!, entry: {
-        componentId: 'robot-a', targetId: 'arm', frameRoleId: 'flange',
+        componentId: 'robot-a', targetId: 'arm', frameComponentId: 'robot-a', frameRoleId: 'flange',
       }, display: 'robot-a.flange', sequence: 2 };
       await transport.rerender();
       await transport.press((p) => p.className === 'transport-group-resume');
@@ -2579,7 +2661,7 @@ describe('Active TCP Resume confirmation', () => {
 describe('Active TCP confirmation for halted Program and ready group', () => {
   function markHalted(program: ProgramRuntimeController) {
     program.state.run!.state = 'full_stopped';
-    // The backend's readiness for a halted run (CONTRACTS §10).
+    // The backend's readiness for a halted run.
     program.readiness = { can_execute: false, can_resume: true, motion_clear: true, blocked_reasons: [] };
     for (const group of program.state.controls!.executionSelections.groups) {
       group.state = 'unavailable';
@@ -2596,11 +2678,7 @@ describe('Active TCP confirmation for halted Program and ready group', () => {
     controls.executionSelections.groups[0].heldNodeCount = 0;
     controls.executionSelections.groups[0].ordinaryHeldNodeCount = 0;
     program.state.controls = controls;
-    program.state.applied!.programBinding.target_role_bindings.push({
-      target_role_id: 'arm', component_role_id: 'robot', controllable_component_id: 'robot-a',
-      command_target_id: 'arm', frame_role_bindings: [], resource_role_bindings: [],
-      collision_body_role_bindings: [], capability_bindings: [], robot_tcps: [],
-    });
+    program.state.applied!.programBinding.target_bindings.push({ ...targetBinding('robot-a', 'arm'), robot_tcps: [] });
     const robot = robotController();
     const status = robot.currentStatus!;
     robot.tcpResumeConnectionLost = false; robot.tcpResumeFresh = true; robot.tcpResumeStatus = status;
@@ -2638,7 +2716,7 @@ describe('Active TCP confirmation for halted Program and ready group', () => {
       await transport.rerender();
       await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
       motion.activeTcp = { ...motion.activeTcp!, entry: {
-        componentId: 'robot-a', targetId: 'arm', frameRoleId: 'flange',
+        componentId: 'robot-a', targetId: 'arm', frameComponentId: 'robot-a', frameRoleId: 'flange',
       }, display: 'robot-a.flange', sequence: 2 };
       await transport.rerender();
       await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');

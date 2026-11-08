@@ -85,6 +85,7 @@
 #include "gripper_only_retention_fixture.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
 #include "maintained_activation_fixture.hpp"
+#include "catalog_artifact_store_internal.hpp"
 #include "io_retained_fixture.hpp"
 #include "managed_kernel_apply_fence_owner.hpp"
 #include "mf2_joint_name_internal.hpp"
@@ -175,7 +176,7 @@ make_projection_runtime_shadow_snapshot(const core::CellId &cell_id) {
           core::SceneRevision{
               core::logical_scene_identity::MintSceneId({
                   cell_id,
-                  core::BootstrapId("i3_projection_runtime_shadow"),
+                  core::BootstrapId("projection_runtime_shadow"),
                   core::BootstrapGeneration(1U),
               }),
               1U, core::ContentDigest(std::string(kZeroDigest))},
@@ -395,7 +396,7 @@ require_fixture_one(const Range &values, Predicate predicate,
                             group.expanded_compiled_joint_names});
   }
 
-  std::vector<core::ProgramFrameRoleBindingDTO> frame_bindings;
+  std::vector<core::ProgramFrameBindingDTO> frame_bindings;
   for (const auto &resolution : target->frames) {
     std::visit(
         [&](const auto &frame) {
@@ -409,7 +410,7 @@ require_fixture_one(const Range &values, Predicate predicate,
                   "retained fixture target frame ownership differs");
             }
             frame_bindings.push_back(
-                {resolution.frame_role_id, frame.model_instance_id,
+                {{frame.controllable_component_id, frame.frame_role_id}, frame.model_instance_id,
                  frame.model_revision, frame.compiled_frame_name});
           }
         },
@@ -450,10 +451,10 @@ require_fixture_one(const Range &values, Predicate predicate,
                          coordinate.compiled_joint_name, *kind});
   }
 
-  std::vector<core::ProgramCollisionBodyRoleBindingDTO> collision_bodies;
+  std::vector<core::ProgramCollisionBodyBindingDTO> collision_bodies;
   for (const auto &body : target->collision_bodies) {
     collision_bodies.push_back(
-        {body.collision_body_role_id, body.model_instance_id,
+        {{component_id, body.collision_body_role_id}, body.model_instance_id,
          model_instance(body.model_instance_id).model_revision,
          body.compiled_link_names});
   }
@@ -529,13 +530,11 @@ require_fixture_one(const Range &values, Predicate predicate,
   }
 
   core::RuntimeParticipantBindingDTO value{
-      core::ProgramId("i6.aggregate.state.fixture"),
+      core::ProgramId("aggregate.state.fixture"),
       core::ProgramRevision(std::string(kZeroDigest)),
-      core::ProgramBindingId("i6.aggregate.state.binding"),
+      core::ProgramBindingId("aggregate.state.binding"),
       bundle.retained_bundle_id(),
       graph.graph_revision,
-      core::ComponentRoleId("robot"),
-      core::TargetRoleId(target_id.value()),
       component.controllable_component_id,
       component.component_type_id,
       component.component_type_revision,
@@ -591,11 +590,11 @@ require_fixture_one(const Range &values, Predicate predicate,
     const core::RuntimeParticipantBinding &physical,
     const deployment::ProgramBinding &program_binding) {
   const auto &binding = program_binding.value();
-  if (binding.component_role_bindings.size() != 1U ||
-      binding.target_role_bindings.size() != 1U ||
-      binding.component_role_bindings.front().controllable_component_id !=
+  if (binding.component_bindings.size() != 1U ||
+      binding.target_bindings.size() != 1U ||
+      binding.component_bindings.front().component_id !=
           physical.value().controllable_component_id ||
-      binding.target_role_bindings.front().command_target_id !=
+      binding.target_bindings.front().target.command_target_id !=
           physical.value().command_target_id) {
     throw std::logic_error(
         "direct-control Program Binding crosses its physical participant");
@@ -604,11 +603,7 @@ require_fixture_one(const Range &values, Predicate predicate,
   value.program_id = binding.program_id;
   value.program_revision = binding.program_revision;
   value.program_binding_id = program_binding.program_binding_id();
-  value.component_role_id =
-      binding.component_role_bindings.front().component_role_id;
-  value.target_role_id = binding.target_role_bindings.front().target_role_id;
-  value.frame_bindings =
-      binding.target_role_bindings.front().frame_role_bindings;
+  value.frame_bindings = binding.frame_bindings;
   auto sealed = core::verify_runtime_participant_binding(std::move(value));
   if (!sealed.ok()) {
     throw std::logic_error(
@@ -634,13 +629,13 @@ require_fixture_one(const Range &values, Predicate predicate,
   const auto base = require_fixture_one(
       value.frame_bindings,
       [&](const auto &candidate) {
-        return candidate.frame_role_id == base_role;
+        return candidate.reference.frame_id == base_role;
       },
       "base frame binding");
   const auto tcp = require_fixture_one(
       value.frame_bindings,
       [&](const auto &candidate) {
-        return candidate.frame_role_id == tcp_role;
+        return candidate.reference.frame_id == tcp_role;
       },
       "tcp frame binding");
   const auto model_revision = [&](const core::ModelInstanceId &model_id) {
@@ -714,16 +709,18 @@ require_fixture_one(const Range &values, Predicate predicate,
       std::move(resources),
       core::ResolvedComponentModelFrameDTO{
           value.controllable_component_id, base.model_instance_id,
-          base.frame_role_id, base.compiled_frame_name, base.model_revision},
+          base.reference.frame_id, base.compiled_frame_name, base.model_revision},
       core::ResolvedComponentModelFrameDTO{
           value.controllable_component_id, tcp.model_instance_id,
-          tcp.frame_role_id, tcp.compiled_frame_name, tcp.model_revision},
+          tcp.reference.frame_id, tcp.compiled_frame_name, tcp.model_revision},
       {},
       {},
       control.runtime_scale_qualification,
       value.retained_bundle_id,
       value.graph_revision,
-      value.target_role_id,
+      {value.controllable_component_id, value.command_target_id},
+      value.frame_bindings,
+      value.collision_body_bindings,
       value.frame_bindings,
       value.collision_body_bindings};
 }
@@ -812,8 +809,8 @@ make_candidate_binding(const core::RuntimeParticipantBinding &runtime) {
   frames.reserve(value.frame_bindings.size());
   for (const auto &frame : value.frame_bindings) {
     frames.emplace_back(core::ResolvedComponentModelFrameDTO{
-        value.controllable_component_id, frame.model_instance_id,
-        frame.frame_role_id, frame.compiled_frame_name, frame.model_revision});
+        frame.reference.component_id, frame.model_instance_id,
+        frame.reference.frame_id, frame.compiled_frame_name, frame.model_revision});
   }
   return RoboPlanCandidateBindingDTO{
       value.controllable_component_id, value.command_target_id,
@@ -822,18 +819,31 @@ make_candidate_binding(const core::RuntimeParticipantBinding &runtime) {
       std::move(joint_names),          std::move(frames)};
 }
 
-// Active TCP (M7): a fixture robot's runtime owner whose TCP list is its own
+// Active TCP: a fixture robot's runtime owner whose TCP list is its own
 // `tcp` frame, its End-effector TCP and so its Active TCP.
 [[nodiscard]] RobotTcpReader
-fixture_robot_tcps(const core::RuntimeParticipantBinding &binding) {
+fixture_robot_tcps(const core::RuntimeParticipantBinding &binding,
+                   const deployment::ProgramBinding *program = nullptr) {
   const auto &value = binding.value();
   std::vector<RobotTcp> rows;
-  for (const auto &frame : value.frame_bindings)
-    if (frame.frame_role_id == core::FrameRoleId("tcp"))
-      rows.push_back(RobotTcp{{value.controllable_component_id, value.command_target_id,
-                               frame.frame_role_id},
-                              frame, true, false});
-  return [robot = value.controllable_component_id, state = ActiveTcp(std::move(rows))](
+  for (const auto &frame : value.frame_bindings) {
+    if (frame.reference.frame_id != core::FrameRoleId("tcp")) continue;
+    // The TCP's contact bodies are the Program's frame associations, exactly
+    // as the retained target declares them.
+    std::vector<core::CollisionBodyRoleId> contact_bodies;
+    if (program) {
+      for (const auto &target : program->value().target_bindings)
+        for (const auto &association : target.frame_associations)
+          if (association.frame == frame.reference)
+            contact_bodies = association.contact_body_role_ids;
+    }
+    rows.push_back(RobotTcp{{{value.controllable_component_id, value.command_target_id},
+                             frame.reference},
+                            frame, std::move(contact_bodies), true, false});
+  }
+  std::vector<TcpFrameAssociation> associations;
+  for (const auto &row : rows) associations.push_back({row.entry, row.contact_body_role_ids});
+  return [robot = value.controllable_component_id, state = ActiveTcp(std::move(rows), std::move(associations))](
              const core::ControllableComponentId &component) -> std::optional<ActiveTcp> {
     if (component != robot) return std::nullopt;
     return state;
@@ -872,14 +882,14 @@ make_motion_operation(const core::RuntimeParticipantBinding &binding,
       value.retained_bundle_id,
       scene_revision,
       {core::OperationParticipantIntentDTO{
-          value.component_role_id, value.target_role_id, value.capability_id,
+          {value.controllable_component_id, value.command_target_id}, value.capability_id,
           std::nullopt,
           core::MotionParticipantIntentDTO{
               core::MoveId("move.native.retained-projection"),
-              core::FrameRoleId("base"),
-              core::TcpSelectorDTO(core::TcpEntryDTO{value.controllable_component_id,
-                                                     value.command_target_id,
-                                                     core::FrameRoleId("tcp")}),
+              {value.controllable_component_id, core::FrameRoleId("base")},
+              core::TcpSelectorDTO(core::TcpEntryReferenceDTO{
+                  {value.controllable_component_id, value.command_target_id},
+                  {value.controllable_component_id, core::FrameRoleId("tcp")}}),
               core::TolerancesDTO{1.0e-4, 5.0e-3, 1.0e-2},
               core::SpeedProfileDTO{0.5, 0.5, std::nullopt},
               core::TimeoutsDTO{3.0, 5.0},
@@ -2287,7 +2297,7 @@ TEST(
   EXPECT_EQ(rejected_foreign.error().details.at("reason"),
             "candidate_state_binding_unavailable");
   // The predicted state is a request input, not the selected frame: the
-  // failure names no reference (spec 210 §4.4).
+  // failure names no reference.
   EXPECT_EQ(rejected_foreign.error().details.count("reference_type"), 0U);
   EXPECT_EQ(rejected_foreign.error().details.count("reference_id"), 0U);
   auto reference_scene = make_collision_scene_snapshot(
@@ -2300,14 +2310,12 @@ TEST(
        materialized.bundle->value().cell_graph.graph_revision,
        reference_scene.revision},
       core::ProjectionLeaseId("program-reference-resolution-lease")};
-  const core::ReferenceDTO tcp_reference(core::ReferenceDTO::Type::kFrameRole,
-                                         "flange");
-  ASSERT_FALSE(exact_binding.collision_body_role_bindings.empty());
-  const auto &body_role = exact_binding.collision_body_role_bindings.front();
+  const core::ReferenceDTO tcp_reference(core::ProgramFrameReferenceDTO{
+      exact_binding.target.component_id, core::FrameRoleId("flange")});
+  ASSERT_FALSE(exact_binding.collision_body_bindings.empty());
+  const auto &body_role = exact_binding.collision_body_bindings.front();
   ASSERT_GT(body_role.compiled_collision_body_names.size(), 1U);
-  const core::ReferenceDTO body_reference(
-      core::ReferenceDTO::Type::kComponentBodyRole,
-      body_role.collision_body_role_id.value());
+  const core::ReferenceDTO body_reference(body_role.reference);
   const core::ReferenceDTO scene_reference(
       core::ReferenceDTO::Type::kSceneResource, "reference-object");
   const core::ReferenceDTO runtime_reference(
@@ -2427,7 +2435,7 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(std::filesystem::create_directory(package_root));
   ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
 
-  constexpr std::string_view cell_id = "i6_cell_frame_resolver_cell";
+  constexpr std::string_view cell_id = "cell_frame_resolver_cell";
   const auto materialized = deployment::test::
       materialize_two_lite6_same_type_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, cell_id);
@@ -2578,7 +2586,7 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(std::filesystem::create_directory(package_root));
   ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
 
-  constexpr std::string_view cell_id = "i6_peer_reference_cell";
+  constexpr std::string_view cell_id = "peer_reference_cell";
   const auto materialized = deployment::test::
       materialize_two_lite6_same_type_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, cell_id);
@@ -2764,7 +2772,11 @@ TEST(RetainedProductCrossConsumer,
       peer_channel->publish_state(peer_positions, zero_velocities, 20, 20)
           .applied());
 
-  const auto exact_binding = make_fixture_execution_binding(root_binding);
+  auto exact_binding = make_fixture_execution_binding(root_binding);
+  for (const auto &frame : peer_binding.value().frame_bindings) {
+    exact_binding.frame_bindings.push_back(frame);
+    exact_binding.program_frame_bindings.push_back(frame);
+  }
   const auto controlled_start_at = [&](const std::int64_t) {
     auto publication = root_channel->addressed_publication()->publication(
         exact_binding.control_binding_id,
@@ -2788,10 +2800,8 @@ TEST(RetainedProductCrossConsumer,
             snapshot.velocities},
         publication.value()};
   };
-  const core::ReferenceTargetDTO peer_robot{core::TargetRoleId("peer_arm"),
-                                            peer_component_id, arm_target_id};
-  const core::ReferenceDTO peer_tcp(core::FrameRoleId("tcp"), peer_robot);
-  const core::ReferenceDTO own_tcp(core::ReferenceDTO::Type::kFrameRole, "tcp");
+  const core::ReferenceDTO peer_tcp(core::ProgramFrameReferenceDTO{peer_component_id, core::FrameRoleId("tcp")});
+  const core::ReferenceDTO own_tcp(core::ProgramFrameReferenceDTO{root_component_id, core::FrameRoleId("tcp")});
   const core::ReferenceDTO carried(core::ReferenceDTO::Type::kSceneResource,
                                    "peer-carried");
   const core::ReferenceDTO cell(core::ReferenceDTO::Type::kCellFrame, "");
@@ -2895,7 +2905,7 @@ TEST(RetainedProductCrossConsumer,
   const auto not_local = capture_with(*root_only_resolver, {peer_tcp}, 30);
   ASSERT_FALSE(not_local.ok());
   EXPECT_EQ(not_local.error().details.at("reason"),
-            "program_reference_robot_not_local");
+            "kinematic_state_source_unavailable");
   // So is an object carried by such a robot.
   const auto carried_not_local =
       capture_with(*root_only_resolver, {carried}, 30);
@@ -2904,32 +2914,30 @@ TEST(RetainedProductCrossConsumer,
             "program_reference_robot_not_local");
   const auto missing_frame = capture_with(
       *cell_resolver,
-      {core::ReferenceDTO(core::FrameRoleId("no-such-frame"), peer_robot)}, 30);
+      {core::ReferenceDTO(core::ProgramFrameReferenceDTO{peer_component_id, core::FrameRoleId("no-such-frame")})}, 30);
   ASSERT_FALSE(missing_frame.ok());
   EXPECT_EQ(missing_frame.error().details.at("reason"),
-            "program_reference_robot_frame_missing");
+            "program_frame_role_missing");
 
-  // Every missing or ambiguous reference names the reference that failed
-  // (spec 210 §5.3); a robot-qualified frame also keeps its target role.
+  // Every missing or ambiguous reference names the reference that failed;
+  // a robot-qualified frame also keeps its target role.
   const auto expect_named = [](const core::ErrorDTO &error, const char *code,
                                const char *reference_type,
                                const char *reference_id,
-                               const char *target_role_id) {
+                               const char *component_id) {
     EXPECT_EQ(error.code, code);
     EXPECT_EQ(error.details.at("reference_type"), reference_type);
     EXPECT_EQ(error.details.at("reference_id"), reference_id);
-    if (target_role_id == nullptr) {
-      EXPECT_EQ(error.details.count("target_role_id"), 0U);
+    if (component_id == nullptr) {
+      EXPECT_EQ(error.details.count("component_id"), 0U);
     } else {
-      EXPECT_EQ(error.details.at("target_role_id"), target_role_id);
+      EXPECT_EQ(error.details.at("component_id"), component_id);
     }
   };
-  expect_named(not_local.error(), "missing_reference", "frame_role", "tcp",
-               "peer_arm");
   expect_named(carried_not_local.error(), "missing_reference",
                "scene_resource", "peer-carried", nullptr);
-  expect_named(missing_frame.error(), "missing_reference", "frame_role",
-               "no-such-frame", "peer_arm");
+  expect_named(missing_frame.error(), "missing_reference", "component_frame",
+               "no-such-frame", peer_component_id.value().c_str());
   const core::ReferenceDTO absent_resource(
       core::ReferenceDTO::Type::kSceneResource, "no-such-resource");
   const auto missing_resource =
@@ -2948,14 +2956,13 @@ TEST(RetainedProductCrossConsumer,
                "scene_resource", "no-such-resource", nullptr);
   const auto missing_own_role = capture_with(
       *cell_resolver,
-      {core::ReferenceDTO(core::ReferenceDTO::Type::kFrameRole,
-                          "no-such-own-frame")},
+      {core::ReferenceDTO(core::ProgramFrameReferenceDTO{root_component_id, core::FrameRoleId("no-such-own-frame")})},
       30);
   ASSERT_FALSE(missing_own_role.ok());
   EXPECT_EQ(missing_own_role.error().details.at("reason"),
             "program_frame_role_missing");
-  expect_named(missing_own_role.error(), "missing_reference", "frame_role",
-               "no-such-own-frame", nullptr);
+  expect_named(missing_own_role.error(), "missing_reference", "component_frame",
+               "no-such-own-frame", root_component_id.value().c_str());
 
   // An error names exactly one reference. When the moving robot's own base
   // frame fails while another robot's frame is requested, the details name
@@ -2964,8 +2971,8 @@ TEST(RetainedProductCrossConsumer,
   const auto *base_frame = std::get_if<core::ResolvedComponentModelFrameDTO>(
       &exact_binding.base_frame);
   ASSERT_NE(base_frame, nullptr);
-  ASSERT_FALSE(exact_binding.target_role_id.empty());
-  ASSERT_NE(exact_binding.target_role_id.value(), "peer_arm");
+  ASSERT_FALSE(exact_binding.target.component_id.empty());
+  ASSERT_NE(exact_binding.target.component_id, peer_component_id);
   auto without_base = captured.value();
   const auto base_path =
       std::find_if(without_base.kinematic_paths.begin(),
@@ -2985,9 +2992,9 @@ TEST(RetainedProductCrossConsumer,
     ASSERT_FALSE(base_failed.ok());
     EXPECT_EQ(base_failed.error().details.at("reason"),
               "program_reference_frame_view_missing");
-    expect_named(base_failed.error(), "missing_reference", "frame_role",
+    expect_named(base_failed.error(), "missing_reference", "component_frame",
                  base_frame->frame_role_id.value().c_str(),
-                 exact_binding.target_role_id.value().c_str());
+                 exact_binding.target.component_id.value().c_str());
   }
 
   // A failing runtime-object binding of the capture is named by its key.
@@ -3036,7 +3043,7 @@ TEST(RetainedProductCrossConsumer,
   const auto expect_unnamed = [](const core::ErrorDTO &error) {
     EXPECT_EQ(error.details.count("reference_type"), 0U);
     EXPECT_EQ(error.details.count("reference_id"), 0U);
-    EXPECT_EQ(error.details.count("target_role_id"), 0U);
+    EXPECT_EQ(error.details.count("component_id"), 0U);
   };
   auto invalid_context = captured.value();
   invalid_context.captured_at_ns = -1;
@@ -3114,10 +3121,7 @@ TEST(RetainedProductCrossConsumer,
   const auto transform = cell_resolver->ResolveFrameTransform(
       RetainedSceneFrameTransformQuery{
           probe, carried,
-          core::ReferenceDTO(core::FrameRoleId("base"),
-                             core::ReferenceTargetDTO{
-                                 core::TargetRoleId("root_arm"),
-                                 root_component_id, arm_target_id}),
+          core::ReferenceDTO(core::ProgramFrameReferenceDTO{root_component_id, core::FrameRoleId("base")}),
           projection_binding},
       scene_ptr, 30);
   ASSERT_TRUE(transform.ok()) << transform.error().message;
@@ -3140,20 +3144,21 @@ TEST(RetainedProductCrossConsumer,
       RetainedSceneFrameTransformQuery{probe, own_tcp, cell,
                                        projection_binding},
       scene_ptr, 30);
-  ASSERT_FALSE(unqualified.ok());
-  EXPECT_EQ(unqualified.error().details.at("reason"),
-            "frame_transform_reference_unsupported");
-  expect_named(unqualified.error(), "invalid_request", "frame_role", "tcp",
-               nullptr);
+  ASSERT_TRUE(unqualified.ok()) << unqualified.error().message;
+  const auto missing_component_frame = cell_resolver->ResolveFrameTransform(
+      RetainedSceneFrameTransformQuery{
+          probe, core::ReferenceDTO(core::ProgramFrameReferenceDTO{
+              root_component_id, core::FrameRoleId("does_not_exist")}), cell,
+          projection_binding}, scene_ptr, 30);
+  ASSERT_FALSE(missing_component_frame.ok());
+  EXPECT_EQ(missing_component_frame.error().code, "frame_missing");
   const auto transform_not_local = root_only_resolver->ResolveFrameTransform(
       RetainedSceneFrameTransformQuery{probe, peer_tcp, cell,
                                        projection_binding},
       scene_ptr, 30);
   ASSERT_FALSE(transform_not_local.ok());
   EXPECT_EQ(transform_not_local.error().details.at("reason"),
-            "program_reference_robot_not_local");
-  expect_named(transform_not_local.error(), "missing_reference", "frame_role",
-               "tcp", "peer_arm");
+            "kinematic_state_source_unavailable");
   const auto transform_stale = cell_resolver->ResolveFrameTransform(
       RetainedSceneFrameTransformQuery{probe, peer_tcp, cell,
                                        projection_binding},
@@ -3248,9 +3253,7 @@ TEST(RetainedProductCrossConsumer,
   // budget are never composed, at admission or in a frame transform.
   constexpr std::int64_t kSkewBudgetNs = 10'000'000;
   const core::ReferenceDTO root_tcp(
-      core::FrameRoleId("tcp"),
-      core::ReferenceTargetDTO{core::TargetRoleId("root_arm"),
-                               root_component_id, arm_target_id});
+      core::ProgramFrameReferenceDTO{root_component_id, core::FrameRoleId("tcp")});
   const auto publish_pair = [&](const std::int64_t root_at_ns,
                                 const std::int64_t peer_at_ns) {
     ASSERT_TRUE(root_channel
@@ -3385,7 +3388,7 @@ void select_geometric_contact_station(
   std::erase_if(rows, [](const auto &row) {
     const auto *id = row.find_object_member("component_id");
     const auto *owner = row.find_object_member("owner");
-    // The robot's machine stays whole: its owner and every member (§16).
+    // The robot's machine stays whole: its owner and every member.
     return id == nullptr || (id->as_string() != "lite6" && owner == nullptr &&
                              id->as_string() != "lite_gripper" &&
                              id->as_string() != "station_io");
@@ -3518,7 +3521,8 @@ private:
   return [&port_participant](
             const core::RuntimeParticipantBinding &motion,
             const std::shared_ptr<RetainedObservedStateChannel> &motion_channel,
-            core::IClock &clock, core::IScheduler &scheduler) {
+            std::shared_ptr<core::IClock> clock,
+            core::IScheduler &scheduler) {
           auto port = std::make_shared<core::testing::FakeExecutionPort>();
           core::ExecutionLaneFactsDTO facts;
           for (const auto &resource : motion.value().resources)
@@ -3535,7 +3539,7 @@ private:
           config.stop.hard_stop_completion_timeout_ns = 500'000'000;
           config.late_cycle_margin_s = 0.015;
           auto participant = std::make_shared<core::ExecutionPortParticipant>(
-              motion, port, clock, scheduler,
+              motion, port, *clock, scheduler,
               [](core::TimePoint, const std::stop_token &) {},
               core::ExecutionPortParticipantStateAuthority{
                   &motion_channel->publication().numeric_publication(),
@@ -3577,12 +3581,12 @@ fixture_tcp_endpoint_resolver_factory() {
       const auto tcp =
           std::find_if(value.frame_bindings.begin(), value.frame_bindings.end(),
                        [](const auto &row) {
-                         return row.frame_role_id == core::FrameRoleId("tcp");
+                         return row.reference.frame_id == core::FrameRoleId("tcp");
                        });
       if (tcp == value.frame_bindings.end())
         throw std::logic_error("motion fixture has no exact TCP frame");
       value.motion_endpoint = core::RuntimeMotionEndpointBindingDTO{
-          value.target_role_id, value.command_target_id, *tcp, {}};
+          {value.controllable_component_id, value.command_target_id}, *tcp, {}};
       auto captured =
           core::verify_runtime_participant_binding(std::move(value));
       if (!captured.ok())
@@ -3745,19 +3749,20 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
             *materialized.bundle, model_map, artifacts);
     const auto direct_gripper = require_fixture_one(
         direct.gripper,
-        [&](const auto &binding) {
+        [&](const auto &entry) {
+          const auto &binding = entry.binding;
           return binding != nullptr &&
                  std::any_of(
-                     binding->value().target_role_bindings.begin(),
-                     binding->value().target_role_bindings.end(),
+                     binding->value().target_bindings.begin(),
+                     binding->value().target_bindings.end(),
                      [&](const auto &target) {
-                       return target.controllable_component_id == core::ControllableComponentId("lite_gripper") &&
-                              target.command_target_id == gripper_target_id;
+                       return target.target.component_id == core::ControllableComponentId("lite_gripper") &&
+                              target.target.command_target_id == gripper_target_id;
                      });
         },
         "actual direct gripper Program Binding");
     gripper_binding =
-        with_program_binding_identity(*gripper_binding, *direct_gripper);
+        with_program_binding_identity(*gripper_binding, *direct_gripper.binding);
   }
 
   if (check == Lite6MotionCheck::kQualifiedEndpointPlannerFrames) {
@@ -3766,12 +3771,12 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
     const auto legacy = retained_motion_planner_frames(arm_binding);
     const auto frames = retained_motion_planner_frames(arm_binding, &model_map);
     EXPECT_EQ(frames, legacy);
-    // LOADFIX9 oracle: the shared helper equals the M6b loop over the frames.
-    std::vector<std::string> m6b_frame_names;
+    // Oracle: the shared helper equals a plain loop over the frames.
+    std::vector<std::string> looped_frame_names;
     for (const auto &frame : frames)
-      m6b_frame_names.push_back(core::compiled_frame_name(frame));
+      looped_frame_names.push_back(core::compiled_frame_name(frame));
     EXPECT_EQ(retained_motion_planner_frame_names(arm_binding, &model_map),
-              m6b_frame_names);
+              looped_frame_names);
     for (const auto &frame : frames) {
       const auto *model =
           std::get_if<core::ResolvedComponentModelFrameDTO>(&frame);
@@ -3862,7 +3867,7 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
                                  {}},
           candidate_binding, RoboPlanCandidateComputerConfig{.rng_seed = 7U},
           std::move(candidate_config)));
-  const core::RequestOwnerEpoch owner_epoch("i6.native.runtime.epoch.1");
+  const core::RequestOwnerEpoch owner_epoch("native.runtime.epoch.1");
   RetainedExecutionHostConfig runtime_config{
       core::CacheConfig{},
       core::ExecutionKernelConfig{},
@@ -3917,7 +3922,7 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
   }
   runtime_input.deployment_maximum_tcp_linear_speed_mps = 0.15;
   if (ordinary_jerk_check) {
-    // V2-9: the first joint carries a typed value, the others take the
+    // The first joint carries a typed value, the others take the
     // preset. Off keeps the typed value but applies no jerk limit.
     runtime_input.ordinary_motion_jerk =
         deployment::execution_runtime_contract::OrdinaryMotionJerkSettings{
@@ -3949,7 +3954,7 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
     runtime_input.control_binding_representatives =
         {arm_binding, representative.value()};
   }
-  // Q37: a Deployment-authored fault profile (as the ROS host reads it) is
+  // A Deployment-authored fault profile (as the ROS host reads it) is
   // the motion target's fault profile; only its load-time defaults resolve.
   core::MotionInterruptStopProfileDTO authored_fault;
   authored_fault.profile_id = "fault_spring_back_hold";
@@ -4068,7 +4073,7 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
   const auto foreign_frame_binding = [&]() {
     auto dto = arm_binding.value();
     auto frame = dto.frame_bindings.front();
-    frame.frame_role_id = core::FrameRoleId("foreign-frame-role");
+    frame.reference.frame_id = core::FrameRoleId("foreign-frame-role");
     frame.compiled_frame_name = "foreign-frame-not-on-arm";
     dto.frame_bindings.push_back(std::move(frame));
     return core::verify_runtime_participant_binding(std::move(dto));
@@ -4219,9 +4224,9 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
                                              before.value().joint_names.begin())],
                 0.004, 1e-12);
     auto sink = std::make_shared<RetainedExecutionStateSink>(
-        *runtime->clock, std::vector<RetainedExecutionStateSinkBinding>{
+        runtime->clock, std::vector<RetainedExecutionStateSinkBinding>{
                              {group, tool_channel, true}});
-    ros2_control_execution::Ros2TransportResources resources(
+    auto resources = ros2_control_execution::Ros2TransportResources::create(
         "pneumatic_collision_projection", "/", 1U, sink, "arm",
         *runtime->clock);
     ros2_control_execution::Ros2GripperCommandBackend backend(
@@ -4234,7 +4239,7 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
     config.completion_policy = "no_output";
     config.group_id = group;
     config.joint_name = joint;
-    backend.configure_gripper_action("tool", config);
+    backend.configure_gripper_action("tool", config, 1'000'000'000);
     core::GripperCommandRequestDTO request;
     request.gripper_id = "tool";
     request.group_id = group;
@@ -4372,26 +4377,33 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
         *materialized.bundle, model_map, artifacts);
     ASSERT_EQ(direct.motion.size(), 1U);
     const auto &robot_target = require_fixture_one(
-        direct.motion.front()->value().target_role_bindings,
+        direct.motion.front().binding->value().target_bindings,
         [&](const auto &target) {
-          return target.controllable_component_id == component_id &&
-                 target.command_target_id == arm_target_id;
+          return target.target.component_id == component_id &&
+                 target.target.command_target_id == arm_target_id;
         }, "actual direct motion TCP inventory");
     ASSERT_TRUE(robot_target.robot_tcps);
     auto handle = RetainedRos2ControlRuntimeHandle::Create();
-    handle->InstallActiveTcp(component_id, *robot_target.robot_tcps, false,
-                             direct.motion.front()->program_binding_id());
+    std::vector<TcpFrameAssociation> tcp_associations;
+    for (const auto &row : deployment::direct_control_motion_tcps(
+             *direct.motion.front().binding, direct, *materialized.bundle, model_map)) {
+      if (!row.mounted_here) continue;
+      for (const auto &association : row.frame_associations)
+        tcp_associations.push_back({{association.target, association.frame}, association.contact_body_role_ids});
+    }
+    handle->InstallActiveTcp(component_id, *robot_target.robot_tcps, std::move(tcp_associations), false,
+                             direct.motion.front().binding->program_binding_id());
     const auto gripper_tcp = require_fixture_one(
         *robot_target.robot_tcps,
         [&](const auto &row) {
-          return row.entry.component_id == core::ControllableComponentId("lite_gripper") &&
-                 row.entry.target_id == gripper_target_id;
+          return row.entry.target.component_id == core::ControllableComponentId("lite_gripper") &&
+                 row.entry.target.command_target_id == gripper_target_id;
         }, "mounted gripper TCP");
     ASSERT_TRUE(handle->SetActiveTcp(gripper_tcp.entry,
                                      core::ActiveTcpChangeSource::kRobotControl).ok());
 
     auto composition = std::make_unique<host_detail::Composition>(
-        component_id, materialized.bundle, nullptr, nullptr, direct.motion.front(), nullptr,
+        component_id, materialized.bundle, nullptr, nullptr, direct.motion.front().binding, nullptr,
         runtime->motion_binding, std::nullopt, std::nullopt,
         deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
         deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
@@ -4445,7 +4457,7 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
     };
     add_cell_source(runtime->motion_state_channel);
     // A missing model coordinate is an installation error, not a synthetic
-    // neutral value or a runtime-unavailable sample (DX-3080).
+    // neutral value or a runtime-unavailable sample.
     const auto arm_names = runtime->motion_state_channel->addressed_publication()
                                ->numeric_publication().canonical_joint_names();
     ASSERT_FALSE(arm_names.empty());
@@ -4501,7 +4513,7 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
 
     composition->io_signal_runtime->Start();
     composition->io_signal_service = composition->io_signal_runtime->service();
-    // CONTRACTS §6: the generic driver is the I/O component's adapter.
+    // The generic driver is the I/O component's adapter.
     const auto step = [&](const core::ComponentAction action) {
       const auto outcome = driver->Run(action, {});
       ASSERT_EQ(outcome.outcome, core::ActionOutcome::kSucceeded)
@@ -4534,10 +4546,10 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
     const auto robot_tcp = require_fixture_one(
         *robot_target.robot_tcps,
         [&](const auto &row) {
-          return row.entry.component_id == component_id &&
-                 row.entry.frame_role_id == core::FrameRoleId("flange");
+          return row.entry.target.component_id == component_id &&
+                 row.entry.frame.frame_id == core::FrameRoleId("flange");
         }, "robot flange TCP");
-    ASSERT_TRUE(robot_tcp.frame.contact_body_role_ids.empty());
+    ASSERT_TRUE(robot_tcp.contact_body_role_ids.empty());
     ASSERT_TRUE(handle->SetActiveTcp(robot_tcp.entry,
                                      core::ActiveTcpChangeSource::kRobotControl).ok());
     const auto robot_bodies = geometric->read_contact_bodies();
@@ -4958,11 +4970,11 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
                   [](double value) { return std::abs(value - 10.0) < 1e-12; }));
   const auto base_frame = require_fixture_one(
       motion_value.frame_bindings,
-      [](const auto &frame) { return frame.frame_role_id.value() == "base"; },
+      [](const auto &frame) { return frame.reference.frame_id.value() == "base"; },
       "motion base frame");
   const auto tcp_frame = require_fixture_one(
       motion_value.frame_bindings,
-      [](const auto &frame) { return frame.frame_role_id.value() == "tcp"; },
+      [](const auto &frame) { return frame.reference.frame_id.value() == "tcp"; },
       "motion tcp frame");
   const core::RobotStateDTO zero_arm_state{
       joint_names.value(),
@@ -5078,6 +5090,31 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
                      moving_peak);
     EXPECT_EQ(accepted.trajectory_metrics->peak_tcp_linear_speed_frame,
               tcp_frame.compiled_frame_name);
+
+    // The final validator measures endpoint chords even when each waypoint's
+    // instantaneous joint velocities are zero. The same trajectory passes
+    // after the approved uniform stretch to 0.98 of the TCP limit.
+    auto between_samples = measured_trajectory;
+    for (auto &waypoint : between_samples.waypoints) {
+      std::fill(waypoint.velocities_rad_s.begin(), waypoint.velocities_rad_s.end(), 0.0);
+      std::fill(waypoint.accelerations_rad_s2.begin(), waypoint.accelerations_rad_s2.end(), 0.0);
+    }
+    auto chord_limit = moving_tcp;
+    chord_limit.max_tcp_linear_speed_mps = moving_peak * 0.5;
+    const auto too_fast = runtime->kinematic_model->validate_non_collision(
+        between_samples, chord_limit, cancellation);
+    ASSERT_FALSE(too_fast.valid);
+    ASSERT_TRUE(too_fast.error);
+    EXPECT_EQ(too_fast.error->details.at("reason"), "tcp_linear_speed_limit_exceeded");
+    for (auto &waypoint : between_samples.waypoints)
+      waypoint.time_from_start_s *= 2.0 / 0.98;
+    const auto stretched = runtime->kinematic_model->validate_non_collision(
+        between_samples, chord_limit, cancellation);
+    ASSERT_TRUE(stretched.valid) << (stretched.error ? stretched.error->message : "");
+    ASSERT_TRUE(stretched.trajectory_metrics);
+    ASSERT_TRUE(stretched.trajectory_metrics->peak_tcp_linear_speed_mps);
+    EXPECT_NEAR(*stretched.trajectory_metrics->peak_tcp_linear_speed_mps,
+                chord_limit.max_tcp_linear_speed_mps * 0.98, 1e-9);
   }
   if (check == Lite6MotionCheck::kMovingValidation) {
     core::ValidationOptionsDTO moving_options{
@@ -5373,7 +5410,7 @@ void check_refreshed_cell_model(
       core::FkRequestDTO{zero_state, tcp_frame, ""});
   ASSERT_TRUE(world_tcp_before.ok()) << world_tcp_before.error().message;
 
-  // mock_dual_arm_shared_group (TCP-C): a mounted tool's second TCP is an
+  // mock_dual_arm_shared_group: a mounted tool's second TCP is an
   // owner-issued planner frame outside the arm binding. FK of it failed the
   // whole control-state read until the owner passes it to the kinematics.
   {
@@ -5548,19 +5585,21 @@ TEST(RetainedProductCrossConsumer, GeometricContactRefusesARealUnmountedToolTcp)
       robot, arm, *product.bundle, *product.model_map, catalog);
   ASSERT_TRUE(binding);
   const auto &target = require_fixture_one(
-      binding->value().target_role_bindings,
-      [&](const auto &row) { return row.controllable_component_id == robot && row.command_target_id == arm; },
+      binding->value().target_bindings,
+      [&](const auto &row) { return row.target.component_id == robot && row.target.command_target_id == arm; },
       "unmounted fixture robot target");
   ASSERT_TRUE(target.robot_tcps);
   const auto &tcp = require_fixture_one(
       *target.robot_tcps,
-      [&](const auto &row) { return row.entry.component_id == tool &&
-                                     row.entry.frame_role_id == core::FrameRoleId("tcp"); },
+      [&](const auto &row) { return row.entry.target.component_id == tool &&
+                                     row.entry.frame.frame_id == core::FrameRoleId("tcp"); },
       "unmounted fixture tool TCP");
   ProductBackedRuntimeParticipantResolver resolver(
       temporary.path(), product.bundle, *product.model_map,
       std::vector<core::RuntimeParticipantBinding>{physical}, std::vector<core::ProgramBindingId>{});
-  const auto bodies = resolver.ActiveTcpContactBodies(physical, tcp);
+  ActiveTcp selected_tcp({tcp}, {{tcp.entry, tcp.contact_body_role_ids}});
+  ASSERT_TRUE(selected_tcp.commit(tcp.entry));
+  const auto bodies = resolver.ActiveTcpContactBodies(physical, selected_tcp);
   ASSERT_FALSE(bodies.ok());
   EXPECT_EQ(bodies.error().details.at("reason"), "tcp_tool_not_mounted");
 }
@@ -5662,7 +5701,7 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
   ASSERT_TRUE(std::filesystem::create_directory(empty_ambient_root));
 
-  constexpr std::string_view cell_id = "i6_joined_teardown_cell";
+  constexpr std::string_view cell_id = "joined_teardown_cell";
   const auto materialized = deployment::test::
       materialize_two_lite6_same_type_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, cell_id);
@@ -5676,8 +5715,8 @@ TEST(RetainedProductCrossConsumer,
     ASSERT_EQ(component.runtime_unit_ids.size(), 1U);
     EXPECT_EQ(component.runtime_unit_ids.front(), shared_runtime_unit_id);
   }
-  // Q68: both selected ROS components belong to this exact shared host.
-  // Cross-unit isolation remains NOT_RUN/R7 after native simulator retirement.
+  // Both selected ROS components belong to this exact shared host.
+  // Cross-unit isolation remains not run after native simulator retirement.
   const auto &products = bundle.value().compiled_products;
   ASSERT_EQ(products.symbol_role_maps.size(), 1U);
   const auto retained = load_lite6_planning_model(
@@ -5701,12 +5740,13 @@ TEST(RetainedProductCrossConsumer,
   std::set<core::ControllableComponentId> component_ids;
   std::set<core::RuntimeUnitId> runtime_unit_ids;
   std::size_t physical_resource_count = 0U;
-  for (const auto &program_binding : program_inventory.motion) {
+  for (const auto &entry : program_inventory.motion) {
+    const auto &program_binding = entry.binding;
     ASSERT_NE(program_binding, nullptr);
-    ASSERT_EQ(program_binding->value().component_role_bindings.size(), 1U);
+    ASSERT_EQ(program_binding->value().component_bindings.size(), 1U);
     const auto component_id = program_binding->value()
-                                  .component_role_bindings.front()
-                                  .controllable_component_id;
+                                  .component_bindings.front()
+                                  .component_id;
     auto physical = with_program_binding_identity(
         make_fixture_runtime_participant(
             bundle, model_map, component_id,
@@ -5887,7 +5927,7 @@ TEST(RetainedProductCrossConsumer,
   changed_model_registrations.front().binding = changed_model_binding.value();
   ManagedKernelAdmissionGate reseal_gate;
   const core::ConfigurationFenceId reseal_fence_id(
-      "i6.joined.invalid-retained-reseal.apply");
+      "joined.invalid-retained-reseal.apply");
   const core::ConfigurationFenceScopeDTO empty_reseal_scope{};
   reseal_gate.RestoreFence(reseal_fence_id, empty_reseal_scope);
   const auto unchanged_state_binding = primary->motion_state_channel->binding();
@@ -5917,7 +5957,7 @@ TEST(RetainedProductCrossConsumer,
       temporary.path() / "joined-operation-journal.sqlite3",
       primary->participant_registrations,
       core::ResourceAddressedExecutionKernelConfig{
-          core::RequestOwnerEpoch("i6.joined.owner.epoch.1"),
+          core::RequestOwnerEpoch("joined.owner.epoch.1"),
           bundle.value().cell_graph.cell_id, 1024U,
           primary->participant_resolver, nullptr,
           bundle.value().cell_graph.graph_revision}});
@@ -5941,7 +5981,7 @@ TEST(RetainedProductCrossConsumer,
   {
     ManagedKernelAdmissionGate peer_reseal_gate;
     const core::ConfigurationFenceId peer_reseal_fence_id(
-        "i6.joined.peer-reseal.apply");
+        "joined.peer-reseal.apply");
     const core::ConfigurationFenceScopeDTO peer_reseal_scope{};
     peer_reseal_gate.RestoreFence(peer_reseal_fence_id, peer_reseal_scope);
     const auto retained_rebind = peer->rebind_motion_route;
@@ -5980,7 +6020,7 @@ TEST(RetainedProductCrossConsumer,
   const auto rejoin_scope = make_runtime_fence_scope(
       {&primary->motion_binding, &peer->motion_binding});
   const core::ConfigurationFenceId rejoin_fence_id(
-      "i6.joined.root-replacement.apply");
+      "joined.root-replacement.apply");
   rejoin_gate.RestoreFence(rejoin_fence_id, rejoin_scope);
   const auto root_swapped = rejoin_retained_execution_host_participants(
       peer, {primary}, joined_resolver_factory, rejoin_gate, rejoin_fence_id,
@@ -6344,8 +6384,15 @@ TEST(RetainedProductCrossConsumer,
 
   const auto carrier_frame = std::find_if(
       arm_target->frames.begin(), arm_target->frames.end(),
-      [](const deployment::CompositionTargetFrameResolution &frame) {
-        return frame.frame_role_id.value() == "tcp";
+      [&](const deployment::CompositionTargetFrameResolution &frame) {
+        const auto *component_frame =
+            std::get_if<deployment::CompositionComponentModelFrame>(&frame.frame);
+        return component_frame != nullptr &&
+               core::ProgramFrameReferenceDTO{
+                   component_frame->controllable_component_id,
+                   component_frame->frame_role_id} ==
+                   core::ProgramFrameReferenceDTO{component_id,
+                                                  core::FrameRoleId("tcp")};
       });
   ASSERT_NE(carrier_frame, arm_target->frames.end());
   const auto *carrier = std::get_if<deployment::CompositionComponentModelFrame>(
@@ -7177,39 +7224,30 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
   deployment::FilesystemProgramRepository programs(package_root);
   deployment::FilesystemProgramBindingRepository bindings(package_root);
 
-  const auto target_role = deployment::parse_strict_json_model_yaml(R"({
-    "component_role":"robot",
-    "required_capabilities":[
-      {"capability_id":"tool.gripper.feedback","parameters":{},"disposition":"required"}
-    ],
-    "required_frame_roles":["tcp"],
-    "required_resource_roles":["fingers"],
-    "required_collision_body_roles":["gripper_collision"],
-    "required_model_roles":["gripper_model"]
-  })")
-                               .root();
+  const core::ProgramTargetReferenceDTO target_id{
+      core::ControllableComponentId(std::string(deployment::test::kLiteGripperComponentId)),
+      core::CommandTargetId(std::string(deployment::test::kLite6GripperTargetId))};
   std::vector<std::shared_ptr<const deployment::ProgramBinding>> selected;
   for (const auto* program_id : {"observation.memo.a", "observation.memo.b"}) {
     auto root = deployment::normalize_program_authoring(CanonicalValue(CanonicalValue::Object{
-        {"api_version", CanonicalValue("manyforge.program.v2")},
+        {"api_version", CanonicalValue("manyforge.program.v3")},
         {"program_id", CanonicalValue(program_id)},
         {"program_revision", CanonicalValue(std::string(kZeroDigest))},
         {"program_profile", CanonicalValue("composable-cell-v1")},
         {"name", CanonicalValue("Observation memo fixture")},
         {"catalog",
          CanonicalValue(CanonicalValue::Object{
-             {"api_version", CanonicalValue("manyforge.node_catalog.v2")},
+             {"api_version", CanonicalValue("manyforge.node_catalog.v3")},
              {"content_version",
               CanonicalValue(bundle.value().catalogs.node_environment.content_version)}})},
-        {"component_roles", CanonicalValue(CanonicalValue::Object{
-                                {"robot", CanonicalValue(CanonicalValue::Object{})}})},
-        {"target_roles",
-         CanonicalValue(CanonicalValue::Object{{"first", target_role}, {"second", target_role}})},
         {"tree", CanonicalValue(CanonicalValue::Object{
-                     {"node_id", CanonicalValue("timer")},
+                     {"node_id", CanonicalValue("gripper.check_status")},
                      {"instance_id", CanonicalValue("root")},
-                     {"parameters",
-                      CanonicalValue(CanonicalValue::Object{{"duration_s", CanonicalValue(1.0)}})},
+                     {"parameters", CanonicalValue(CanonicalValue::Object{
+                         {"target", CanonicalValue(CanonicalValue::Object{
+                             {"component_id", CanonicalValue(target_id.component_id.value())},
+                             {"command_target_id", CanonicalValue(target_id.command_target_id.value())}})},
+                         {"expected_state", CanonicalValue("idle")}})},
                      {"children", CanonicalValue(CanonicalValue::Array{})}})},
     }));
     if (maximum_program) {
@@ -7245,12 +7283,13 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
       ASSERT_EQ(deployment::canonical_json(root).size(), deployment::kMaxArtifactEncodedBytes);
     }
     const auto revision = deployment::detail::compute_content_identity(
-        root, {"program-revision", "manyforge.program.v2", "program_revision"});
+        root, {"program-revision", "manyforge.program.v3", "program_revision"});
     auto members = root.as_object();
     for (auto& [name, value] : members)
       if (name == "program_revision") value = CanonicalValue(revision);
     const auto canonical_program = deployment::canonical_json(CanonicalValue(std::move(members)));
-    const auto program = deployment::verify_program_binding_contract(canonical_program, bundle);
+    const auto program = deployment::verify_program_binding_contract(
+        canonical_program, bundle, model_map, catalog_store);
     if (maximum_program) {
       if (const auto* output = std::getenv("MANYFORGE_QUALIFY_PROGRAM_OUTPUT")) {
         std::ofstream stream(output);
@@ -7259,23 +7298,15 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
       }
     }
     ASSERT_TRUE(programs.put_if_absent(program, bundle));
-    auto binding = deployment::compile_program_binding(
-        *program,
-        {{{core::ComponentRoleId("robot"), core::ControllableComponentId(std::string(
-                                               deployment::test::kLiteGripperComponentId))}},
-         {{core::TargetRoleId("first"),
-           core::CommandTargetId(std::string(deployment::test::kLite6GripperTargetId))},
-          {core::TargetRoleId("second"),
-           core::CommandTargetId(std::string(deployment::test::kLite6GripperTargetId))}}},
-        bundle, model_map, catalog_store);
-    ASSERT_TRUE(bindings.put_if_absent(binding, bundle, model_map));
+    auto binding = deployment::compile_program_binding(*program, bundle, model_map, catalog_store);
+    ASSERT_TRUE(bindings.put_if_absent(binding, bundle, model_map, catalog_store));
     selected.push_back(std::move(binding));
   }
 
   std::vector<core::RuntimeParticipantBinding> representatives;
   for (const auto* capability : {"tool.gripper.feedback"}) {
     const auto target = deployment::resolve_runtime_program_target(
-        *selected.front(), core::TargetRoleId("first"), core::CapabilityId(capability), bundle,
+        *selected.front(), target_id, core::CapabilityId(capability), bundle,
         model_map);
     ASSERT_TRUE(target.control_binding());
     ASSERT_TRUE(target.control_domain());
@@ -7345,17 +7376,16 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
             binding_id, target_id, capability_id, source, current);
       };
   const auto binding_id = selected.front()->program_binding_id();
-  const core::TargetRoleId target_id("first");
   const core::CapabilityId capability_id("tool.gripper.feedback");
   if (maximum_program) {
     for (const auto* profile : {"cold", "same_key", "alternating_key"}) {
       std::vector<double> samples;
       for (unsigned index = 0; index < (std::string_view(profile) == "cold" ? 1U : 20U); ++index) {
-        const bool alternate = std::string_view(profile) == "alternating_key";
         const auto& representative = representatives.front();
         const auto begun = std::chrono::steady_clock::now();
         const auto result =
-            query(binding_id, alternate && index % 2 ? core::TargetRoleId("second") : target_id,
+            query(std::string_view(profile) == "alternating_key" && index % 2
+                      ? selected.back()->program_binding_id() : binding_id, target_id,
                   representative.value().capability_id, physical, representatives);
         samples.push_back(
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begun)
@@ -7415,27 +7445,25 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
   ASSERT_TRUE(fresh.ok()) << fresh.error().message;
   EXPECT_EQ(fresh.value().observation_binding.value(), newer.front().value());
 
-  const auto check_key = [&](const auto& binding, const char* role, const auto& representative) {
+  const auto check_key = [&](const auto& binding, const auto& representative) {
     const auto& capability = representative.value().capability_id;
-    const auto result = query(binding->program_binding_id(), core::TargetRoleId(role), capability,
+    const auto result = query(binding->program_binding_id(), target_id, capability,
                               physical, representatives);
     ASSERT_TRUE(result.ok()) << result.error().message;
     EXPECT_EQ(result.value().target.program_binding_id(), binding->program_binding_id());
-    EXPECT_EQ(result.value().target.target_role().target_role_id, core::TargetRoleId(role));
+    EXPECT_EQ(result.value().target.target_binding().target, target_id);
     EXPECT_EQ(result.value().target.capability().capability_id, capability);
     EXPECT_EQ(result.value().observation_binding.value(), representative.value());
   };
   // Exercise each key axis independently before racing replacement; returned
   // values must remain pinned even when the capacity-one selection changes.
   for (const auto& binding : selected)
-    for (const auto* role : {"first", "second"})
-      for (const auto& representative : representatives) check_key(binding, role, representative);
+    for (const auto& representative : representatives) check_key(binding, representative);
   std::barrier rendezvous(2);
   const auto concurrent_reads = [&](std::size_t offset) {
     for (std::size_t iteration = 0; iteration < 8U; ++iteration) {
       rendezvous.arrive_and_wait();
       check_key(selected[(iteration + offset) % selected.size()],
-                iteration % 2U == 0U ? "first" : "second",
                 representatives[(iteration / 2U + offset) % representatives.size()]);
     }
   };
@@ -7464,21 +7492,21 @@ TEST(RetainedProductCrossConsumer,
       deployment::compile_direct_control_program_binding_inventory(
           bundle, model_map, catalog_store);
   ASSERT_EQ(inventory.motion.size(), 1U);
-  const auto &program_binding = *inventory.motion.front();
-  const auto &target = program_binding.value().target_role_bindings.front();
+  const auto &program_binding = *inventory.motion.front().binding;
+  const auto &target = program_binding.value().target_bindings.front();
   const auto physical = with_program_binding_identity(
       make_fixture_runtime_participant(
-          bundle, model_map, target.controllable_component_id,
-          target.command_target_id, std::nullopt, std::nullopt, std::nullopt,
+          bundle, model_map, target.target.component_id,
+          target.target.command_target_id, std::nullopt, std::nullopt, std::nullopt,
           core::CapabilityId("execution.trajectory.execute")),
       program_binding);
   const auto tcp =
-      std::find_if(target.frame_role_bindings.begin(),
-                   target.frame_role_bindings.end(), [](const auto &frame) {
-                     return frame.frame_role_id == core::FrameRoleId("tcp");
+      std::find_if(program_binding.value().frame_bindings.begin(),
+                   program_binding.value().frame_bindings.end(), [](const auto &frame) {
+                     return frame.reference.frame_id == core::FrameRoleId("tcp");
                    });
-  ASSERT_NE(tcp, target.frame_role_bindings.end());
-  ASSERT_EQ(tcp->contact_body_role_ids.size(), 1U);
+  ASSERT_NE(tcp, program_binding.value().frame_bindings.end());
+
   ProductBackedRuntimeParticipantResolver resolver(
       package_root, materialized.bundle, model_map, {physical},
       {program_binding.program_binding_id()});
@@ -7487,20 +7515,86 @@ TEST(RetainedProductCrossConsumer,
   const auto operation = make_motion_operation(
       physical, core::RequestOwnerEpoch("kernel.endpoint"),
       scene.shared()->revision);
-  const auto resolved = resolver.Resolve(operation, 0U, fixture_robot_tcps(physical));
+  const auto resolved =
+      resolver.Resolve(operation, 0U, fixture_robot_tcps(physical, &program_binding));
   ASSERT_TRUE(resolved.ok()) << resolved.error().message;
   const auto &endpoint = resolved.value().value().motion_endpoint;
   ASSERT_TRUE(endpoint);
   EXPECT_EQ(endpoint->frame, *tcp);
   ASSERT_EQ(endpoint->contact_body_bindings.size(), 1U);
   const auto &body = endpoint->contact_body_bindings.front();
-  EXPECT_EQ(body.controllable_component_id,
+  EXPECT_EQ(body.body.component_id,
             physical.value().controllable_component_id);
   EXPECT_EQ(body.model_instance_id, tcp->model_instance_id);
   EXPECT_EQ(body.model_revision, tcp->model_revision);
-  EXPECT_EQ(body.collision_body_role_id, tcp->contact_body_role_ids.front());
+  ASSERT_FALSE(endpoint->contact_body_role_ids.empty());
+  EXPECT_EQ(body.body.collision_body_id, endpoint->contact_body_role_ids.front());
   EXPECT_FALSE(body.collision_body_ids.empty());
   EXPECT_EQ(resolved.value().value().resources, physical.value().resources);
+}
+
+TEST(RetainedProductCrossConsumer, RuntimeTcpUsesTheDeclaredTargetFrameAlias) {
+  ScopedTemporaryRoot temporary;
+  const auto package_root = temporary.path() / "retained-package";
+  ASSERT_TRUE(std::filesystem::create_directory(package_root));
+  const auto materialized = deployment::test::materialize_lite6_retained_consumer_fixture_from(
+      package_root, deployment::test::make_lite6_ros2_control_observed_consumer_retention_fixture(
+                        false, false, "flange", true));
+  ASSERT_NE(materialized.bundle, nullptr);
+  const auto &bundle = *materialized.bundle;
+  const auto model_map = load_lite6_model_map(
+      package_root, {bundle.retained_bundle_id(),
+                     bundle.value().compiled_products.symbol_role_maps.front().product_id});
+  deployment::FilesystemCatalogArtifactStore catalog_store(package_root);
+  const auto inventory = deployment::compile_direct_control_program_binding_inventory(
+      bundle, model_map, catalog_store);
+  ASSERT_EQ(inventory.motion.size(), 1U);
+  const auto &program_binding = *inventory.motion.front().binding;
+  const auto &target = program_binding.value().target_bindings.front();
+  const auto *retained_target = model_map.find_target(target.target.component_id,
+                                                       target.target.command_target_id);
+  ASSERT_NE(retained_target, nullptr);
+  const auto declared = std::find_if(retained_target->frames.begin(), retained_target->frames.end(),
+      [](const auto &frame) { return frame.frame_role_id == core::FrameRoleId("flange"); });
+  ASSERT_NE(declared, retained_target->frames.end());
+  const auto *model = std::get_if<deployment::CompositionComponentModelFrame>(&declared->frame);
+  ASSERT_NE(model, nullptr);
+  EXPECT_EQ(model->frame_role_id, core::FrameRoleId("flange"));
+  const auto physical = with_program_binding_identity(
+      make_fixture_runtime_participant(bundle, model_map, target.target.component_id,
+          target.target.command_target_id, std::nullopt, std::nullopt, std::nullopt,
+          core::CapabilityId("execution.trajectory.execute")), program_binding);
+  const auto alias = std::find_if(physical.value().frame_bindings.begin(),
+                                  physical.value().frame_bindings.end(), [](const auto &frame) {
+      return frame.reference.frame_id == core::FrameRoleId("flange");
+  });
+  ASSERT_NE(alias, physical.value().frame_bindings.end());
+  const core::TcpEntryReferenceDTO entry{target.target, alias->reference};
+  const RobotTcp row{entry, *alias, {}, true, false};
+  const ActiveTcp state({row}, {{entry, {}}});
+  const RobotTcpReader read = [component = target.target.component_id, state](const auto &requested)
+      -> std::optional<ActiveTcp> {
+    return requested == component ? std::optional(state) : std::nullopt;
+  };
+  ProductBackedRuntimeParticipantResolver resolver(
+      package_root, materialized.bundle, model_map, {physical},
+      {program_binding.program_binding_id()});
+  const auto scene = make_projection_runtime_shadow_snapshot(bundle.value().cell_graph.cell_id);
+  auto operation = make_motion_operation(physical, core::RequestOwnerEpoch("kernel.alias"),
+                                         scene.shared()->revision);
+  std::get<core::MotionParticipantIntentDTO>(operation.participants.front().payload).tcp_endpoint = entry;
+  const auto resolved = resolver.Resolve(operation, 0U, read);
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+  ASSERT_TRUE(resolved.value().value().motion_endpoint);
+  EXPECT_EQ(resolved.value().value().motion_endpoint->frame.reference, entry.frame);
+
+  // A physical model ID is not a substitute for the declared target alias.
+  // `flange` is now the declared alias itself, so the undeclared probe is the
+  // arm's other TCP role, which the reader does not list.
+  auto undeclared = entry;
+  undeclared.frame.frame_id = core::FrameRoleId("tcp");
+  std::get<core::MotionParticipantIntentDTO>(operation.participants.front().payload).tcp_endpoint = undeclared;
+  EXPECT_FALSE(resolver.Resolve(operation, 0U, read).ok());
 }
 
 TEST(RetainedProductCrossConsumer,
@@ -7510,7 +7604,7 @@ TEST(RetainedProductCrossConsumer,
       temporary.path() / "retained-package";
   ASSERT_TRUE(std::filesystem::create_directory(package_root));
 
-  constexpr std::string_view cell_id = "i6_two_lite6_program_binding_cell";
+  constexpr std::string_view cell_id = "two_lite6_program_binding_cell";
   const auto materialized = deployment::test::
       materialize_two_lite6_same_type_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, cell_id);
@@ -7524,8 +7618,8 @@ TEST(RetainedProductCrossConsumer,
     ASSERT_EQ(component.runtime_unit_ids.size(), 1U);
     EXPECT_EQ(component.runtime_unit_ids.front(), shared_runtime_unit_id);
   }
-  // Q68: both selected ROS components belong to this exact shared host.
-  // Cross-unit isolation remains NOT_RUN/R7 after native simulator retirement.
+  // Both selected ROS components belong to this exact shared host.
+  // Cross-unit isolation remains not run after native simulator retirement.
   ASSERT_EQ(bundle.value().compiled_products.symbol_role_maps.size(), 1U);
   const auto model_map = load_lite6_model_map(
       package_root,
@@ -7547,13 +7641,14 @@ TEST(RetainedProductCrossConsumer,
   std::vector<std::vector<std::string>> source_joint_orders;
   std::vector<core::RuntimeParticipantBinding> physical_bindings;
   physical_bindings.reserve(inventory.motion.size());
-  for (const auto &program_binding : inventory.motion) {
+  for (const auto &entry : inventory.motion) {
+    const auto &program_binding = entry.binding;
     ASSERT_NE(program_binding, nullptr);
-    ASSERT_EQ(program_binding->value().component_role_bindings.size(), 1U);
-    ASSERT_EQ(program_binding->value().target_role_bindings.size(), 1U);
+    ASSERT_EQ(program_binding->value().component_bindings.size(), 1U);
+    ASSERT_EQ(program_binding->value().target_bindings.size(), 1U);
     const auto component_id = program_binding->value()
-                                  .component_role_bindings.front()
-                                  .controllable_component_id;
+                                  .component_bindings.front()
+                                  .component_id;
     EXPECT_TRUE(
         program_binding_ids.insert(program_binding->program_binding_id())
             .second);
@@ -7605,27 +7700,26 @@ TEST(RetainedProductCrossConsumer,
   // The control readmodel qualifies sealed selectors against the actual
   // product and physical prototypes, without a separate alias inventory.
   for (std::size_t index = 0U; index < inventory.motion.size(); ++index) {
-    const auto &selected = *inventory.motion[index];
-    const auto &role = selected.value().target_role_bindings.front();
+    const auto &selected = *inventory.motion[index].binding;
+    const auto &role = selected.value().target_bindings.front();
     const auto bound = resolver.ResolveBoundTarget(
-        selected, role.target_role_id,
+        selected, role.target,
         core::CapabilityId("execution.trajectory.execute"));
     ASSERT_TRUE(bound.ok()) << bound.error().message;
     EXPECT_EQ(bound.value().program_binding_id(), selected.program_binding_id());
-    EXPECT_EQ(bound.value().target_role().component_role_id, role.component_role_id);
-    EXPECT_EQ(bound.value().target_role().target_role_id, role.target_role_id);
+    EXPECT_EQ(bound.value().target_binding().target, role.target);
     EXPECT_EQ(bound.value().component().controllable_component_id,
               physical_bindings[index].value().controllable_component_id);
-    EXPECT_EQ(bound.value().target_role().command_target_id,
+    EXPECT_EQ(bound.value().target_binding().target.command_target_id,
               physical_bindings[index].value().command_target_id);
     EXPECT_NE(bound.value().component().controllable_component_id,
               physical_bindings[(index + 1U) % physical_bindings.size()]
                   .value().controllable_component_id);
     EXPECT_FALSE(resolver.ResolveBoundTarget(
-        selected, core::TargetRoleId("missing.role"),
+        selected, {core::ControllableComponentId("missing.component"), core::CommandTargetId("missing.target")},
         core::CapabilityId("execution.trajectory.execute")).ok());
     EXPECT_FALSE(resolver.ResolveBoundTarget(
-        selected, role.target_role_id,
+        selected, role.target,
         core::CapabilityId("tool.gripper.command")).ok());
   }
   const auto scene = make_projection_runtime_shadow_snapshot(
@@ -7654,11 +7748,11 @@ TEST(RetainedProductCrossConsumer,
               physical_bindings[index].value().resources);
     const auto &endpoint = resolved.value().value().motion_endpoint;
     ASSERT_TRUE(endpoint);
-    EXPECT_EQ(endpoint->target_role_id,
-              physical_bindings[index].value().target_role_id);
-    EXPECT_EQ(endpoint->command_target_id,
+    EXPECT_EQ(endpoint->target.component_id,
+              physical_bindings[index].value().controllable_component_id);
+    EXPECT_EQ(endpoint->target.command_target_id,
               physical_bindings[index].value().command_target_id);
-    EXPECT_EQ(endpoint->frame.frame_role_id, core::FrameRoleId("tcp"));
+    EXPECT_EQ(endpoint->frame.reference.frame_id, core::FrameRoleId("tcp"));
     // Robot control's Current is the robot's Active TCP.
     auto current = operation;
     std::get<core::MotionParticipantIntentDTO>(current.participants.front().payload)
@@ -7666,26 +7760,54 @@ TEST(RetainedProductCrossConsumer,
     const auto at_current = resolver.Resolve(current, 0U, robot_tcps);
     ASSERT_TRUE(at_current.ok()) << at_current.error().message;
     EXPECT_EQ(at_current.value().value().motion_endpoint, endpoint);
-    // B-run-1: with no End-effector TCP (no Active TCP) a joint goal at
+    const RobotTcpReader captured_tcps = [robot_tcps](const auto &robot) {
+      auto state = robot_tcps(robot);
+      if (state) state->set_read_provenance(7U, 11U);
+      return state;
+    };
+    std::optional<core::PreviewTcpCapture> capture;
+    const auto captured = resolver.Resolve(current, 0U, captured_tcps, &capture);
+    ASSERT_TRUE(captured.ok()) << captured.error().message;
+    ASSERT_TRUE(capture);
+    EXPECT_EQ(capture->entry, *captured_tcps(physical_bindings[index].value().controllable_component_id)->reference());
+    EXPECT_EQ(capture->registration_generation, 7U);
+    EXPECT_EQ(capture->sequence, 11U);
+    EXPECT_EQ(capture->source, core::PreviewTcpCaptureSource::kActiveTcp);
+    capture.reset();
+    const auto explicit_capture = resolver.Resolve(operation, 0U, captured_tcps, &capture);
+    ASSERT_TRUE(explicit_capture.ok()) << explicit_capture.error().message;
+    ASSERT_TRUE(capture);
+    EXPECT_EQ(capture->entry, std::get<core::TcpEntryReferenceDTO>(
+        std::get<core::MotionParticipantIntentDTO>(operation.participants.front().payload).tcp_endpoint));
+    EXPECT_EQ(capture->source, core::PreviewTcpCaptureSource::kExplicitEntry);
+    // With no End-effector TCP (no Active TCP) a joint goal at
     // Current runs at the robot's own flange; a Cartesian goal is refused.
     {
       const auto &value = physical_bindings[index].value();
       auto flange_frame = endpoint->frame;
-      flange_frame.frame_role_id = core::FrameRoleId("flange");
-      flange_frame.contact_body_role_ids.clear();
-      const RobotTcp flange{{value.controllable_component_id, value.command_target_id,
-                             core::FrameRoleId("flange")},
-                            flange_frame, false, false};
+      flange_frame.reference.frame_id = core::FrameRoleId("flange");
+
+      const RobotTcp flange{{{value.controllable_component_id, value.command_target_id},
+                             {value.controllable_component_id, core::FrameRoleId("flange")}},
+                            flange_frame, {}, false, false};
+      auto empty_state = ActiveTcp({flange}, {{flange.entry, flange.contact_body_role_ids}});
+      empty_state.set_read_provenance(7U, 12U);
       const RobotTcpReader no_tcp = [robot = value.controllable_component_id,
-                                     state = ActiveTcp({flange})](
+                                     state = std::move(empty_state)](
                                         const core::ControllableComponentId &component)
           -> std::optional<ActiveTcp> {
         if (component != robot) return std::nullopt;
         return state;
       };
-      const auto jog = resolver.Resolve(current, 0U, no_tcp);
+      capture.reset();
+      const auto jog = resolver.Resolve(current, 0U, no_tcp, &capture);
       ASSERT_TRUE(jog.ok()) << jog.error().message;
-      EXPECT_EQ(jog.value().value().motion_endpoint->frame.frame_role_id,
+      ASSERT_TRUE(capture);
+      EXPECT_EQ(capture->entry, flange.entry);
+      EXPECT_EQ(capture->registration_generation, 7U);
+      EXPECT_EQ(capture->sequence, 12U);
+      EXPECT_EQ(capture->source, core::PreviewTcpCaptureSource::kJointFlangeFallback);
+      EXPECT_EQ(jog.value().value().motion_endpoint->frame.reference.frame_id,
                 core::FrameRoleId("flange"));
       auto cartesian = current;
       std::get<core::MotionParticipantIntentDTO>(cartesian.participants.front().payload).motion =
@@ -7694,20 +7816,20 @@ TEST(RetainedProductCrossConsumer,
       ASSERT_FALSE(refused.ok());
       EXPECT_EQ(refused.error().details.at("reason"), "end_effector_tcp_unavailable");
     }
-    // A1-1: an entry outside the robot's list is a typed refusal.
+    // An entry outside the robot's list is a typed refusal.
     auto crossed_endpoint = operation;
-    std::get<core::TcpEntryDTO>(std::get<core::MotionParticipantIntentDTO>(
+    std::get<core::TcpEntryReferenceDTO>(std::get<core::MotionParticipantIntentDTO>(
                                     crossed_endpoint.participants.front().payload)
                                     .tcp_endpoint)
-        .component_id = core::ControllableComponentId("missing.endpoint.owner");
+        .target.component_id = core::ControllableComponentId("missing.endpoint.owner");
     const auto crossed = resolver.Resolve(crossed_endpoint, 0U, robot_tcps);
     ASSERT_FALSE(crossed.ok());
     EXPECT_EQ(crossed.error().details.at("reason"), "active_tcp_unknown");
     crossed_endpoint = operation;
-    std::get<core::TcpEntryDTO>(std::get<core::MotionParticipantIntentDTO>(
+    std::get<core::TcpEntryReferenceDTO>(std::get<core::MotionParticipantIntentDTO>(
                                     crossed_endpoint.participants.front().payload)
                                     .tcp_endpoint)
-        .frame_role_id = core::FrameRoleId("missing.endpoint.frame");
+        .frame.frame_id = core::FrameRoleId("missing.endpoint.frame");
     EXPECT_FALSE(resolver.Resolve(crossed_endpoint, 0U, robot_tcps).ok());
     const auto &physical = physical_bindings[index];
     const auto &control = *physical.value().control_path;
@@ -7789,15 +7911,14 @@ TEST(RetainedProductCrossConsumer,
            changed_sample.control_binding_revision});
     EXPECT_TRUE(target_observation_source_is_current(physical, changed_sample,
                                                      configuration));
-    const auto &frames = inventory.motion[index]
+    const auto &frames = inventory.motion[index].binding
                              ->value()
-                             .target_role_bindings.front()
-                             .frame_role_bindings;
+                             .frame_bindings;
     ASSERT_FALSE(frames.empty());
     for (const auto &frame : frames) {
       EXPECT_TRUE(
           resolver.FrameObservationCovered(frame, physical_bindings[index]));
-      if (frame.frame_role_id.value() == "tcp") {
+      if (frame.reference.frame_id.value() == "tcp") {
         EXPECT_FALSE(resolver.FrameObservationCovered(
             frame, physical_bindings[(index + 1U) % physical_bindings.size()]));
       }
@@ -7825,7 +7946,7 @@ TEST(
   ASSERT_TRUE(std::filesystem::create_directory(package_root));
   ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
 
-  constexpr std::string_view cell_id = "i6_projection_transition_cell";
+  constexpr std::string_view cell_id = "projection_transition_cell";
   const auto predecessor = deployment::test::
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, cell_id);
@@ -7871,9 +7992,9 @@ TEST(
       };
 
   auto [predecessor_projector, predecessor_shared_model] =
-      load_projector(predecessor, "i6_projection_predecessor");
+      load_projector(predecessor, "projection_predecessor");
   auto [candidate_projector, candidate_shared_model] =
-      load_projector(candidate, "i6_projection_candidate");
+      load_projector(candidate, "projection_candidate");
   const auto initial_scene = make_collision_scene_snapshot(
       core::CellId(std::string(cell_id)), 2U,
       core::SceneResourceId("cross-bundle-object"), 2.0, 0.1);
@@ -8202,6 +8323,28 @@ TEST(RetainedProductCrossConsumer,
             latest->world);
 }
 
+template <class Prepared>
+void stage_prepared_activation(const std::filesystem::path &root,
+                               const Prepared &prepared) {
+  deployment::FilesystemCatalogArtifactStore catalogs(root);
+  for (const auto &artifact : prepared.catalog_artifacts) {
+    const auto stored = catalogs.put_if_absent(
+        artifact.content_addressed_store_key, artifact.content_digest, artifact.bytes);
+    if (stored.content_digest != artifact.content_digest ||
+        stored.byte_size != artifact.bytes.size())
+      throw std::logic_error("activation catalog publication changed captured identity");
+  }
+  deployment::FilesystemRawArtifactStore raw(root);
+  for (const auto &artifact : prepared.raw_artifacts) {
+    const auto stored = raw.put_if_absent(artifact.bytes);
+    if (stored.content_addressed_store_key != artifact.content_addressed_store_key ||
+        stored.content_digest != artifact.content_digest)
+      throw std::logic_error("activation raw publication changed captured identity");
+  }
+  deployment::FilesystemRetainedBundleRepository bundles(root);
+  static_cast<void>(bundles.put_if_absent(prepared.bundle));
+}
+
 namespace io_resolver_tests {
 using V = deployment::CanonicalValue;
 V member(V root, std::string_view name, V value) {
@@ -8232,49 +8375,31 @@ public:
           "IO resolver fixture has no real retained model map");
     deployment::FilesystemCatalogArtifactStore catalog(package.path());
     auto root = deployment::parse_strict_json_model_yaml(R"({
-      "api_version":"manyforge.program.v2","program_id":"resolver_io_authored",
+      "api_version":"manyforge.program.v3","program_id":"resolver_io_authored",
       "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "program_profile":"composable-cell-v1","name":"Resolver IO fixture",
-      "catalog":{"api_version":"manyforge.node_catalog.v2","content_version":"0.0.0"},
-      "component_roles":{"device":{}},
-      "target_roles":{"signals":{"component_role":"device","required_capabilities":[],
-        "required_frame_roles":[],"required_resource_roles":[],"required_collision_body_roles":[],"required_model_roles":[]}},
+      "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
       "blackboard":{"namespaces":[],"keys":[]},
-      "tree":{"node_id":"io.check_input","instance_id":"check","parameters":{"target_role":"signals","resource_role":"ready","expected_value":true},"children":[]}
-    })")
-                    .root();
-    root = member(
-        root, "catalog",
-        member(*root.find_object_member("catalog"), "content_version",
-               V(bundle->value().catalogs.node_environment.content_version)));
-    auto roles = *root.find_object_member("target_roles");
-    auto target = *roles.find_object_member("signals");
-    target = member(target, "required_capabilities",
-                    V(V::Array{V(V::Object{
-                        {"capability_id", V("io.gpio.get_input")},
-                        {"parameters", V(V::Object{})},
-                        {"disposition", V("required")}})}));
-    V::Array resources{V("ready")};
-    root = member(root, "target_roles",
-                  member(roles, "signals",
-                         member(target, "required_resource_roles",
-                                V(std::move(resources)))));
+      "tree":{"node_id":"io.check_input","instance_id":"check","parameters":{"signal":{"component_id":"device.io","signal_name":"ready"},"expected_value":true},"children":[]}
+    })").root();
+    root = member(root, "catalog", member(*root.find_object_member("catalog"), "content_version",
+        V(bundle->value().catalogs.node_environment.content_version)));
     root = deployment::normalize_program_authoring(root);
     const auto revision = deployment::detail::compute_content_identity(
-        root, {"program-revision", "manyforge.program.v2", "program_revision"});
+        root, {"program-revision", "manyforge.program.v3", "program_revision"});
     root = member(root, "program_revision", V(revision));
     program = deployment::verify_program_binding_contract(
-        deployment::canonical_json(root), *bundle);
-    authored_binding = deployment::compile_program_binding(
-        *program,
-        {{{core::ComponentRoleId("device"),
-           core::ControllableComponentId("device.io")}},
-         {{core::TargetRoleId("signals"), core::CommandTargetId("gpio")}}},
-        *bundle, *map, catalog);
+        deployment::canonical_json(root), *bundle, *map, catalog);
+    authored_binding = deployment::compile_program_binding(*program, *bundle, *map, catalog);
+    const auto activation = deployment::test::materialize_boolean_io_retained_fixture(
+        artifacts.path(), true, false, false, false);
+    if (activation.bundle->retained_bundle_id() != bundle->retained_bundle_id())
+      throw std::logic_error("IO activation root retained a different bundle");
+    deployment::FilesystemCatalogArtifactStore activation_catalog(artifacts.path());
     deployment::FilesystemProgramRepository programs(artifacts.path());
     deployment::FilesystemProgramBindingRepository bindings(artifacts.path());
     if (!programs.put_if_absent(program, *bundle) ||
-        !bindings.put_if_absent(authored_binding, *bundle, *map))
+        !bindings.put_if_absent(authored_binding, *bundle, *map, activation_catalog))
       throw std::logic_error(
           "IO resolver fixture could not publish exact authored artifacts");
   }
@@ -8309,17 +8434,16 @@ TEST(RetainedProductConsumerTest,
   ASSERT_TRUE(capture.value().table);
   ASSERT_TRUE(capture.value().binding);
   const auto target = resolver.ResolveBoundTarget(
-      *fixture.authored_binding, core::TargetRoleId("signals"),
+      *fixture.authored_binding, {core::ControllableComponentId("device.io"), core::CommandTargetId("gpio")},
       core::CapabilityId("io.gpio.get_input"));
   ASSERT_TRUE(target.ok()) << target.error().message;
   EXPECT_FALSE(target.value().control_binding());
   EXPECT_FALSE(target.value().control_domain());
   const auto selected = resolver.ResolveOperationTarget(
-      value.program_binding_id, core::TargetRoleId("signals"));
+      value.program_binding_id, {core::ControllableComponentId("device.io"), core::CommandTargetId("gpio")});
   ASSERT_TRUE(selected.ok());
-  ASSERT_EQ(selected.value().signal_role_bindings.size(), 1U);
-  EXPECT_EQ(selected.value().signal_role_bindings.front().resource_role_id,
-            core::ResourceRoleId("ready"));
+  ASSERT_EQ(selected.value().signal_references.size(), 1U);
+  EXPECT_EQ(selected.value().signal_references.front().signal_name, "ready");
   auto injected = request;
   injected.binding = capture.value().binding;
   EXPECT_FALSE(resolver.ResolveProgramCapture(std::move(injected)).ok());
@@ -8388,13 +8512,15 @@ TEST(RetainedProductConsumerTest, PneumaticCaptureDeclaresTheBoundIoEffects) {
   ASSERT_TRUE(product.model_map);
   const auto fixture = deployment::test::compile_pneumatic_program_fixture(package.path(), product);
   const auto &binding = fixture.binding->value();
+  stage_prepared_activation(artifacts.path(), product);
+  deployment::FilesystemCatalogArtifactStore activation_catalog(artifacts.path());
   deployment::FilesystemProgramRepository programs(artifacts.path());
   deployment::FilesystemProgramBindingRepository bindings(artifacts.path());
   ASSERT_TRUE(programs.put_if_absent(fixture.program, *product.bundle));
-  ASSERT_TRUE(bindings.put_if_absent(fixture.binding, *product.bundle, *product.model_map));
-  const auto gripper = std::find_if(binding.target_role_bindings.begin(), binding.target_role_bindings.end(),
-      [](const auto &row) { return row.target_role_id.value() == "gripper_0"; });
-  ASSERT_NE(gripper, binding.target_role_bindings.end());
+  ASSERT_TRUE(bindings.put_if_absent(fixture.binding, *product.bundle, *product.model_map, activation_catalog));
+  const auto gripper = std::find_if(binding.target_bindings.begin(), binding.target_bindings.end(),
+      [](const auto &row) { return row.pneumatic_io.has_value(); });
+  ASSERT_NE(gripper, binding.target_bindings.end());
   ASSERT_TRUE(gripper->pneumatic_io);
   const auto &valve = gripper->pneumatic_io->outputs.front();
   const auto &sensor = gripper->pneumatic_io->inputs.front();
@@ -8409,17 +8535,149 @@ TEST(RetainedProductConsumerTest, PneumaticCaptureDeclaresTheBoundIoEffects) {
   const auto node = std::find_if(capture.value().table->nodes.begin(), capture.value().table->nodes.end(),
       [](const auto &row) { return row.instance_id.value() == "close_0"; });
   ASSERT_NE(node, capture.value().table->nodes.end());
-  const auto has_effect = [&](const core::TargetRoleId &role, std::string_view capability, bool effectful) {
+  const auto target_of = [&](const core::ProgramSignalReferenceDTO &reference) {
+    const auto signal = std::find_if(binding.signal_bindings.begin(), binding.signal_bindings.end(),
+        [&](const auto &row) { return row.reference == reference; });
+    if (signal == binding.signal_bindings.end()) throw std::logic_error("missing pneumatic signal binding");
+    return signal->target;
+  };
+  const auto has_effect = [&](const core::ProgramTargetReferenceDTO &target, std::string_view capability, bool effectful) {
     return std::any_of(node->target_effects.begin(), node->target_effects.end(), [&](const auto &effect) {
-      return effect.target_role_id == role && effect.capability_id.value() == capability && effect.effectful == effectful;
+      return effect.target == target && effect.capability_id.value() == capability && effect.effectful == effectful;
     });
   };
-  EXPECT_TRUE(has_effect(valve.target_role_id, "io.gpio.set_output", true));
-  EXPECT_TRUE(has_effect(sensor.target_role_id, "io.gpio.wait_for_input", false));
-  EXPECT_TRUE(has_effect(sensor.target_role_id, "io.gpio.get_input", false));
+  EXPECT_TRUE(has_effect(target_of(valve.signal), "io.gpio.set_output", true));
+  EXPECT_TRUE(has_effect(target_of(sensor.signal), "io.gpio.wait_for_input", false));
+  EXPECT_TRUE(has_effect(target_of(sensor.signal), "io.gpio.get_input", false));
 }
 
-// B7 [C-QB7]: a frame's component is always its owner. On the maintained
+// The installed product and activation artifacts deliberately live under
+// different roots. Catalog lookups must use the captured activation root.
+TEST(RetainedProductConsumerTest, TargetResolutionUsesOnlyExactActivationCatalog) {
+  namespace fixture = deployment::test::maintained_activation_fixture_detail;
+  ScopedTemporaryRoot installed, valid, missing, mismatch;
+  const auto product = deployment::test::MaterializeMaintainedInterruptDeployment(
+      installed.path(),
+      deployment::parse_strict_json_model_yaml(R"({"interrupt_rules":[]})").root());
+  ASSERT_TRUE(product.model_map);
+  const auto &bundle = *product.bundle;
+  const auto &map = *product.model_map;
+  const core::ControllableComponentId component_id("lite_gripper");
+  const core::ProgramTargetReferenceDTO target{component_id, core::CommandTargetId("gripper")};
+
+  auto authored = deployment::parse_strict_json_model_yaml(R"({
+    "api_version":"manyforge.program.v3","program_id":"activation_catalog_fixture",
+    "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "program_profile":"composable-cell-v1","name":"Activation catalog fixture",
+    "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
+    "tree":{"node_id":"gripper.check_status","instance_id":"check",
+      "parameters":{"target":{"component_id":"lite_gripper","command_target_id":"gripper"},
+                    "expected_state":"idle"},"children":[]}
+  })").root();
+  auto catalog_selector = *authored.find_object_member("catalog");
+  catalog_selector = fixture::With(std::move(catalog_selector), "content_version",
+      deployment::CanonicalValue(bundle.value().catalogs.node_environment.content_version));
+  authored = fixture::With(std::move(authored), "catalog", std::move(catalog_selector));
+  authored = deployment::normalize_program_authoring(authored);
+  const auto revision = deployment::detail::compute_content_identity(
+      authored, {"program-revision", "manyforge.program.v3", "program_revision"});
+  authored = fixture::With(std::move(authored), "program_revision", deployment::CanonicalValue(revision));
+  deployment::FilesystemCatalogArtifactStore installed_catalog(installed.path());
+  const auto program = deployment::verify_program_binding_contract(
+      deployment::canonical_json(authored), bundle, map, installed_catalog);
+  const auto binding = deployment::compile_program_binding(*program, bundle, map, installed_catalog);
+  ASSERT_NE(binding, nullptr);
+
+  const auto component = std::find_if(
+      bundle.value().cell_graph.controllable_components.begin(),
+      bundle.value().cell_graph.controllable_components.end(),
+      [&](const auto &row) { return row.controllable_component_id == component_id; });
+  ASSERT_NE(component, bundle.value().cell_graph.controllable_components.end());
+  const core::ComponentTypeCatalogRecordRefDTO *record = nullptr;
+  for (const auto &candidate : bundle.value().catalogs.records) {
+    const auto *typed = std::get_if<core::ComponentTypeCatalogRecordRefDTO>(&candidate);
+    if (typed && typed->record_id == component->component_type_id &&
+        typed->record_revision == component->component_type_revision) {
+      ASSERT_EQ(record, nullptr);
+      record = typed;
+    }
+  }
+  ASSERT_NE(record, nullptr);
+  const auto artifact = std::find_if(product.catalog_artifacts.begin(), product.catalog_artifacts.end(),
+      [&](const auto &row) { return row.content_addressed_store_key == record->content_addressed_store_key &&
+                                    row.content_digest == record->content_digest; });
+  ASSERT_NE(artifact, product.catalog_artifacts.end());
+  ASSERT_FALSE(artifact->bytes.empty());
+  const auto key = record->content_addressed_store_key;
+  const auto digest = record->content_digest;
+  const auto size = static_cast<std::uint64_t>(artifact->bytes.size());
+  const auto package_bytes = installed_catalog.get_verified(key, digest, size);
+  ASSERT_TRUE(package_bytes.has_value());
+  ASSERT_EQ(*package_bytes, artifact->bytes);
+
+  const auto publish = [&](const std::filesystem::path &root) {
+    stage_prepared_activation(root, product);
+    deployment::FilesystemCatalogArtifactStore catalog(root);
+    deployment::FilesystemProgramRepository programs(root);
+    deployment::FilesystemProgramBindingRepository bindings(root);
+    ASSERT_TRUE(programs.put_if_absent(program, bundle));
+    ASSERT_TRUE(bindings.put_if_absent(binding, bundle, map, catalog));
+    ASSERT_EQ(catalog.get_verified(key, digest, size), std::optional(artifact->bytes));
+  };
+  publish(valid.path());
+  publish(missing.path());
+  publish(mismatch.path());
+
+  const auto hex = deployment::detail::catalog_artifact_storage_hex(key.value());
+  ASSERT_TRUE(hex.has_value());
+  const auto path_for = [&](const std::filesystem::path &root) {
+    return root / std::string(deployment::detail::kCatalogArtifactNamespaceDirectory) /
+           std::string(deployment::detail::kCatalogArtifactDataDirectory) /
+           (*hex + std::string(deployment::detail::kCatalogArtifactFileSuffix));
+  };
+  ASSERT_TRUE(std::filesystem::remove(path_for(missing.path())));
+  {
+    const auto path = path_for(mismatch.path());
+    std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(file.good());
+    file.seekg(-1, std::ios::end);
+    char byte = 0;
+    file.get(byte);
+    ASSERT_TRUE(file.good());
+    file.seekp(-1, std::ios::end);
+    file.put(static_cast<char>(byte ^ 1));
+    file.flush();
+    ASSERT_TRUE(file.good());
+  }
+  const deployment::FilesystemVerifiedCatalogArtifactSource missing_catalog(missing.path());
+  const deployment::FilesystemVerifiedCatalogArtifactSource mismatch_catalog(mismatch.path());
+  EXPECT_FALSE(missing_catalog.get_verified(key, digest, size));
+  // A present payload whose bytes do not match the digest is a typed durable-artifact
+  // refusal, not an absent artifact (catalog_artifact_store_internal.hpp).
+  EXPECT_THROW(static_cast<void>(mismatch_catalog.get_verified(key, digest, size)),
+               deployment::RetainedBundleError);
+
+  // The gripper is a composed physical participant of this retained cell, so
+  // the resolver's composition must carry it.
+  const auto gripper = make_fixture_runtime_participant(
+      bundle, map, component_id, core::CommandTargetId("gripper"), std::nullopt,
+      std::nullopt, std::nullopt, core::CapabilityId("tool.gripper.command"));
+  const auto resolve = [&](const std::filesystem::path &root) {
+    ProductBackedRuntimeParticipantResolver resolver(installed.path(), product.bundle, map,
+                                                     {gripper}, {}, root);
+    return resolver.ResolveOperationTarget(binding->program_binding_id(), target);
+  };
+  const auto accepted = resolve(valid.path());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(accepted.value().target, target);
+  for (const auto *root : {&missing, &mismatch}) {
+    const auto rejected = resolve(root->path());
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.error().code, "execution_operation_target_unavailable");
+  }
+}
+
+// A frame's component is always its owner. On the maintained
 // lite6 + lite_gripper product the real planner's inventory holds the
 // gripper's TCP once, gripper-stamped; a Program move at that TCP resolves
 // with the gripper as its endpoint owner (which stamps the Kernel request,
@@ -8438,46 +8696,47 @@ TEST(RetainedProductConsumerTest, ToolTcpMoveIsOwnerStampedThroughTheRealPlanner
   const core::ControllableComponentId arm_id("lite6_robot");
   const core::ControllableComponentId tool_id("lite_gripper");
 
-  // An actual Program over the maintained components: the arm moves, its TCP
-  // endpoint is the gripper's own `tcp` (one name per frame since B2).
-  deployment::test::ProgramOptions options;
-  options.catalog_content_version =
-      bundle.value().catalogs.node_environment.content_version;
-  auto authored = deployment::test::make_program_root(options);
-  authored = fixture::With(std::move(authored), "component_roles",
-                           deployment::parse_strict_json_model_yaml(
-                               R"({"robot":{},"tool":{}})")
-                               .root());
-  authored = fixture::With(std::move(authored), "target_roles",
-                           deployment::parse_strict_json_model_yaml(R"({
-    "arm":{"component_role":"robot",
-      "required_capabilities":[
-        {"capability_id":"execution.trajectory.execute","parameters":{},"disposition":"required"},
-        {"capability_id":"planning.motion.joint_goal","parameters":{},"disposition":"required"}],
-      "required_frame_roles":["base"],"required_resource_roles":["arm_joints"],
-      "required_collision_body_roles":[],"required_model_roles":["arm_model"]},
-    "gripper":{"component_role":"tool",
-      "required_capabilities":[
-        {"capability_id":"tool.gripper.command","parameters":{},"disposition":"required"}],
-      "required_frame_roles":["tcp"],"required_resource_roles":["fingers"],
-      "required_collision_body_roles":[],"required_model_roles":[]}})")
-                               .root());
-  const auto program = deployment::verify_program_binding_contract(
-      deployment::canonical_json(deployment::test::with_program_revision(
-          deployment::normalize_program_authoring(authored))),
-      bundle);
+  // An actual Program over the maintained components: the arm moves to the
+  // mounted gripper's TCP entry. A mounted tool's TCP is not a frame of the
+  // arm's target, so the entry is named under the gripper's own target; that
+  // authored reference gives the gripper target the frame association the
+  // resolver reads. The operation below stamps the same entry at run time.
+  auto authored = deployment::parse_strict_json_model_yaml(R"({
+    "api_version":"manyforge.program.v3","program_id":"tool_tcp_reference_test",
+    "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "program_profile":"composable-cell-v1","name":"Tool TCP reference test",
+    "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
+    "tree":{"node_id":"sequence","instance_id":"root","parameters":{},"children":[
+      {"node_id":"motion.move_to_joint_target","instance_id":"move",
+      "parameters":{"target":{"component_id":"lite6_robot","command_target_id":"arm"},
+        "base_frame":{"component_id":"lite6_robot","frame_id":"base"},
+        "tcp_endpoint":{"kind":"entry",
+          "target":{"component_id":"lite_gripper","command_target_id":"gripper"},
+          "frame":{"component_id":"lite_gripper","frame_id":"tcp"}},
+        "goal":[{"joint_name":"joint1","position_rad":0.0}]},"children":[]},
+      {"node_id":"gripper.check_status","instance_id":"status",
+       "parameters":{"target":{"component_id":"lite_gripper","command_target_id":"gripper"},
+                     "expected_state":"idle"},"children":[]}]}
+  })").root();
+  auto catalog = *authored.find_object_member("catalog");
+  catalog = fixture::With(std::move(catalog), "content_version",
+      deployment::CanonicalValue(bundle.value().catalogs.node_environment.content_version));
+  authored = fixture::With(std::move(authored), "catalog", std::move(catalog));
+  authored = deployment::normalize_program_authoring(authored);
+  const auto revision = deployment::detail::compute_content_identity(
+      authored, {"program-revision", "manyforge.program.v3", "program_revision"});
+  authored = fixture::With(std::move(authored), "program_revision", deployment::CanonicalValue(revision));
   deployment::FilesystemCatalogArtifactStore catalogs(package.path());
-  const auto compiled = deployment::compile_program_binding(
-      *program,
-      {{{core::ComponentRoleId("robot"), arm_id}, {core::ComponentRoleId("tool"), tool_id}},
-       {{core::TargetRoleId("arm"), core::CommandTargetId("arm")},
-        {core::TargetRoleId("gripper"), core::CommandTargetId("gripper")}}},
-      bundle, model_map, catalogs);
+  const auto program = deployment::verify_program_binding_contract(
+      deployment::canonical_json(authored), bundle, model_map, catalogs);
+  const auto compiled = deployment::compile_program_binding(*program, bundle, model_map, catalogs);
   ASSERT_NE(compiled, nullptr);
+  stage_prepared_activation(artifacts.path(), product);
+  deployment::FilesystemCatalogArtifactStore activation_catalog(artifacts.path());
   deployment::FilesystemProgramRepository programs(artifacts.path());
   deployment::FilesystemProgramBindingRepository bindings(artifacts.path());
   ASSERT_TRUE(programs.put_if_absent(program, bundle));
-  ASSERT_TRUE(bindings.put_if_absent(compiled, bundle, model_map));
+  ASSERT_TRUE(bindings.put_if_absent(compiled, bundle, model_map, activation_catalog));
 
   const auto physical = make_fixture_runtime_participant(
       bundle, model_map, arm_id, core::CommandTargetId("arm"), std::nullopt, std::nullopt,
@@ -8491,21 +8750,38 @@ TEST(RetainedProductConsumerTest, ToolTcpMoveIsOwnerStampedThroughTheRealPlanner
   operation.program_revision = compiled->value().program_revision;
   operation.program_binding_id = compiled->value().program_binding_id;
   auto &participant = operation.participants.front();
-  participant.component_role_id = core::ComponentRoleId("robot");
-  participant.target_role_id = core::TargetRoleId("arm");
-  // TCP-A1: the arm role's list carries the mounted gripper's TCP.
+  participant.target = {arm_id, core::CommandTargetId("arm")};
+  // The mounted gripper's TCP is keyed by the gripper's own target: an arm
+  // target's frames never include a mounted tool's TCP (the resolver refuses
+  // that as active_tcp_unknown), while the arm's TCP list carries this row.
   std::get<core::MotionParticipantIntentDTO>(participant.payload).tcp_endpoint =
-      core::TcpEntryDTO{tool_id, core::CommandTargetId("gripper"), core::FrameRoleId("tcp")};
+      core::TcpEntryReferenceDTO{{tool_id, core::CommandTargetId("gripper")},
+                                 {tool_id, core::FrameRoleId("tcp")}};
   const auto resolved = resolver.ResolveExecutionParticipant(operation, 0U);
   ASSERT_TRUE(resolved.ok()) << resolved.error().message;
   const auto &selected = resolved.value().binding.value();
   EXPECT_EQ(selected.controllable_component_id, arm_id);
   ASSERT_TRUE(selected.motion_endpoint);
   EXPECT_EQ(resolved.value().motion_endpoint_owner, std::optional(tool_id));
+  // DX3675: the active frame belongs to the holder, but its selected target
+  // is the arm. The holder request must fail before frame membership.
+  const auto &motion_endpoint = *selected.motion_endpoint;
+  const core::TcpEntryReferenceDTO selected_tcp{{arm_id, core::CommandTargetId("arm")},
+                                                motion_endpoint.frame.reference};
+  const RobotTcp active_row{selected_tcp, motion_endpoint.frame,
+                            motion_endpoint.contact_body_role_ids, true, false};
+  const ActiveTcp active({active_row}, {{selected_tcp, motion_endpoint.contact_body_role_ids}});
+  const auto wrong_holder = resolver.ResolveAttachActiveTcp(
+      compiled->program_binding_id(), {tool_id, core::CommandTargetId("gripper")},
+      [&](const auto &robot) -> std::optional<ActiveTcp> {
+        return robot == arm_id ? std::optional(active) : std::nullopt;
+      });
+  ASSERT_FALSE(wrong_holder.ok());
+  EXPECT_EQ(wrong_holder.error().code, "attach_active_tcp_not_holder");
   const auto &endpoint = selected.motion_endpoint->frame;
   // The Kernel's TCP stamp: the endpoint frame under its owner.
   const core::ResolvedFrameDTO tool_tcp = core::ResolvedComponentModelFrameDTO{
-      tool_id, endpoint.model_instance_id, endpoint.frame_role_id, endpoint.compiled_frame_name,
+      tool_id, endpoint.model_instance_id, endpoint.reference.frame_id, endpoint.compiled_frame_name,
       endpoint.model_revision};
 
   // The owner-issued inventory: every frame stamped with its owner, the
@@ -8580,7 +8856,7 @@ TEST(RetainedProductConsumerTest, ToolTcpMoveIsOwnerStampedThroughTheRealPlanner
   // The moving arm's spelling of the gripper's TCP, and a frame outside the
   // inventory, are refused before transport.
   const core::ResolvedFrameDTO arm_spelled = core::ResolvedComponentModelFrameDTO{
-      arm_id, endpoint.model_instance_id, endpoint.frame_role_id, endpoint.compiled_frame_name,
+      arm_id, endpoint.model_instance_id, endpoint.reference.frame_id, endpoint.compiled_frame_name,
       endpoint.model_revision};
   const core::ResolvedFrameDTO outside = core::ResolvedComponentModelFrameDTO{
       tool_id, endpoint.model_instance_id, core::FrameRoleId("b7_not_in_inventory"),

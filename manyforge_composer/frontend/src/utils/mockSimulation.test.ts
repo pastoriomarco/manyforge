@@ -10,8 +10,8 @@ import {
   serializeMockSimulation,
 } from './mockSimulation';
 
-const door = { target_role: 'cell', resource_role: 'door' };
-const part = { target_role: 'cell', resource_role: 'part' };
+const door = { component_id: 'station', signal_name: 'door' };
+const part = { component_id: 'station', signal_name: 'part' };
 const condition: JsonValue = {
   all: [
     { compare: { operand: { signal: door }, op: '==', value: true } },
@@ -33,11 +33,11 @@ function node(mock: JsonValue | undefined, patch: Partial<ProgramTreeNode> = {})
 describe('mockSimulation', () => {
   it('lists the signals a condition reads, unique and sorted', () => {
     expect(conditionSignals(condition)).toEqual([
-      { targetRole: 'cell', resourceRole: 'door' }, { targetRole: 'cell', resourceRole: 'part' },
+      { component_id: 'station', signal_name: 'door' }, { component_id: 'station', signal_name: 'part' },
     ]);
     expect(nodeMockSignals(node(undefined, { parameters: {} }))).toEqual([]);
-    expect(nodeMockSignals({ node_id: 'io.wait_for_input', parameters: { target_role: 'cell', resource_role: 'door' } }))
-      .toEqual([{ targetRole: 'cell', resourceRole: 'door' }]);
+    expect(nodeMockSignals({ node_id: 'io.wait_for_input', parameters: { signal: door } }))
+      .toEqual([{ component_id: 'station', signal_name: 'door' }]);
     expect(nodeMockSignals({ node_id: 'motion.move_to_pose', parameters: { interrupt_condition: condition } })).toEqual([]);
   });
 
@@ -53,14 +53,14 @@ describe('mockSimulation', () => {
   });
 
   it('refuses a signal the node does not read', () => {
-    const other = { target_role: 'cell', resource_role: 'lamp' };
+    const other = { component_id: 'station', signal_name: 'lamp' };
     expect(mockSimulationProblem(node([{ signal: other, start_value: true }])))
-      .toMatch(/^mock_simulation_signal_unused: signal cell\/lamp/);
+      .toContain('mock_simulation_signal_unused: signal ["station","lamp"]');
   });
 
   it('refuses a second row for one signal', () => {
     expect(mockSimulationProblem(node([{ signal: door, start_value: true }, { signal: door, start_value: false }])))
-      .toMatch(/^mock_simulation_signal_duplicate: signal cell\/door/);
+      .toContain('mock_simulation_signal_duplicate: signal ["station","door"]');
   });
 
   it.each([
@@ -83,22 +83,15 @@ describe('mockSimulation', () => {
     }
   });
 
-  it('finds each signal’s declared source profile through the binding', () => {
-    const io = (resource: string, profile: string, extra: Record<string, JsonValue>) => ({
-      controllable_component_id: 'station', command_target_id: 'io', resource_role_id: resource,
-      signal_name: resource, source_id: resource, value_type: 'bool', direction: 'input',
-      transition_capability: 'sampled_only', ...extra, provider: { profile, ...(extra.provider as object) },
+  it('uses only exact qualified candidate signal profiles', () => {
+    const facts = [
+      { reference: door, ambiguous: false, value_type: 'bool', direction: 'input' as const, provider_profile: 'mock' },
+      { reference: part, ambiguous: false, value_type: 'bool', direction: 'input' as const, provider_profile: 'ros_bool' },
+    ];
+    expect(Object.fromEntries(mockSignalProfiles(conditionSignals(condition), facts))).toEqual({
+      '["station","door"]': 'mock', '["station","part"]': 'ros_bool',
     });
-    const document = { components: [{ configuration: { io_signals: [
-      io('door', 'mock', { update_mode: 'change_only', freshness: { mode: 'provider_validity' } }),
-      io('part', 'ros_bool', { update_mode: 'sampled', freshness: { mode: 'sample_age', maximum_age_ns: 1 },
-        provider: { topic: '/part', liveness: { mode: 'periodic' } } }),
-    ] } }] } as unknown as Record<string, JsonValue>;
-    const binding = { target_role_bindings: [{
-      target_role_id: 'cell', controllable_component_id: 'station', command_target_id: 'io',
-    }] } as never;
-    const profiles = mockSignalProfiles(conditionSignals(condition), binding, document);
-    expect(Object.fromEntries(profiles)).toEqual({ 'cell/door': 'mock', 'cell/part': 'ros_bool' });
-    expect(mockSignalProfiles(conditionSignals(condition), null, document).size).toBe(0);
+    expect(mockSignalProfiles(conditionSignals(condition), null).size).toBe(0);
+    expect(mockSignalProfiles(conditionSignals(condition), [{ ...facts[0], ambiguous: true }]).size).toBe(0);
   });
 });

@@ -1,8 +1,8 @@
 # Generated extension composition; edit extension entries in their package descriptor.
-api_version: manyforge.node_catalog.v2
-content_version: 2.9.0
+api_version: manyforge.node_catalog.v3
+content_version: 3.0.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:0078bbc926b924bbc3a2d00ba46f00fee2b4deb546b7462383a6a56ae22d9e78
+catalog_digest: sha256:659f9172886b2d524166e3b6defca9791e8b29d04bdb93842fc7b362af675380
 schema_types:
   tcp_selector:
     type: object
@@ -14,25 +14,20 @@ schema_types:
         type: enum
         values:
         - current
-        - default_of_role
+        - default_of_target
         - entry
-      role:
-        type: string
-        semantic_type: target_role
+      target:
+        schema_ref: '#/schema_types/target_reference'
         required_when:
-          kind: default_of_role
+          kind:
+          - default_of_target
+          - entry
         allowed_when:
-          kind: default_of_role
-      target_role:
-        type: string
-        semantic_type: target_role
-        required_when:
-          kind: entry
-        allowed_when:
-          kind: entry
-      frame_role:
-        type: string
-        semantic_type: frame_role
+          kind:
+          - default_of_target
+          - entry
+      frame:
+        schema_ref: '#/schema_types/frame_reference'
         required_when:
           kind: entry
         allowed_when:
@@ -51,17 +46,13 @@ schema_types:
     type: object
     additional_properties: false
     required:
-    - component_id
-    - target_id
-    - frame_role_id
+    - target
+    - frame
     properties:
-      component_id:
-        type: string
-      target_id:
-        type: string
-      frame_role_id:
-        type: string
-        semantic_type: frame_role
+      target:
+        schema_ref: '#/schema_types/target_reference'
+      frame:
+        schema_ref: '#/schema_types/frame_reference'
   coordinate_position:
     type: object
     additional_properties: false
@@ -141,16 +132,8 @@ schema_types:
           source: scene_resource
         allowed_when:
           source: scene_resource
-      target_role:
-        type: string
-        semantic_type: target_role
-        required_when:
-          source: target_frame
-        allowed_when:
-          source: target_frame
-      frame_role:
-        type: string
-        semantic_type: frame_role
+      frame:
+        schema_ref: '#/schema_types/frame_reference'
         required_when:
           source: target_frame
         allowed_when:
@@ -167,20 +150,6 @@ schema_types:
         - cell_frame
         - target_frame
         - scene_resource
-      target_role:
-        type: string
-        semantic_type: target_role
-        required_when:
-          kind: target_frame
-        allowed_when:
-          kind: target_frame
-      frame_role:
-        type: string
-        semantic_type: frame_role
-        required_when:
-          kind: target_frame
-        allowed_when:
-          kind: target_frame
       scene_resource_id:
         type: string
         semantic_type: scene_resource
@@ -188,6 +157,12 @@ schema_types:
           kind: scene_resource
         allowed_when:
           kind: scene_resource
+      frame:
+        schema_ref: '#/schema_types/frame_reference'
+        required_when:
+          kind: target_frame
+        allowed_when:
+          kind: target_frame
   stored_pose:
     type: object
     additional_properties: false
@@ -295,36 +270,12 @@ schema_types:
       type:
         type: enum
         values:
-        - frame_role
-        - component_body_role
+        - component_frame
+        - component_body
         - scene_resource
         - runtime_object
         - pose
         - cell_frame
-      frame_role_id:
-        type: string
-        semantic_type: frame_role
-        semantic_scope_parameter: target_role
-        required_when:
-          type: frame_role
-        allowed_when:
-          type: frame_role
-        description: A frame role of target_role when it is named, otherwise of the
-          moving robot (the node's target_role).
-      target_role:
-        type: string
-        semantic_type: target_role
-        description: The robot that owns frame_role_id; absent means the moving robot.
-          Another robot's frame is sampled once when the motion is admitted.
-        allowed_when:
-          type: frame_role
-      collision_body_role_id:
-        type: string
-        semantic_type: collision_body_role
-        required_when:
-          type: component_body_role
-        allowed_when:
-          type: component_body_role
       scene_resource_id:
         type: string
         semantic_type: scene_resource
@@ -344,6 +295,18 @@ schema_types:
           type: pose
         allowed_when:
           type: pose
+      frame:
+        schema_ref: '#/schema_types/frame_reference'
+        required_when:
+          type: component_frame
+        allowed_when:
+          type: component_frame
+      body:
+        schema_ref: '#/schema_types/collision_body_reference'
+        required_when:
+          type: component_body
+        allowed_when:
+          type: component_body
   pose_authoring_input:
     type: object
     additional_properties: false
@@ -661,18 +624,7 @@ schema_types:
     - start_value
     properties:
       signal:
-        type: object
-        additional_properties: false
-        required:
-        - target_role
-        - resource_role
-        properties:
-          target_role:
-            type: string
-            semantic_type: target_role
-          resource_role:
-            type: string
-            semantic_type: resource_role
+        schema_ref: '#/schema_types/signal_reference'
       start_value:
         type: bool
       change:
@@ -718,6 +670,54 @@ schema_types:
         constraints:
           min_inclusive: 100
           max_inclusive: 1000000
+  target_reference:
+    type: object
+    semantic_type: target_reference
+    additional_properties: false
+    required:
+    - component_id
+    - command_target_id
+    properties:
+      component_id:
+        type: string
+      command_target_id:
+        type: string
+  signal_reference:
+    type: object
+    semantic_type: signal_reference
+    additional_properties: false
+    required:
+    - component_id
+    - signal_name
+    properties:
+      component_id:
+        type: string
+      signal_name:
+        type: string
+  frame_reference:
+    type: object
+    semantic_type: frame_reference
+    additional_properties: false
+    required:
+    - component_id
+    - frame_id
+    properties:
+      component_id:
+        type: string
+      frame_id:
+        type: string
+  collision_body_reference:
+    type: object
+    semantic_type: collision_body_reference
+    additional_properties: false
+    required:
+    - component_id
+    - collision_body_id
+    properties:
+      component_id:
+        type: string
+      collision_body_id:
+        type: string
 entries:
 - id: sequence
   name: Sequence
@@ -960,17 +960,14 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: base_frame
     required: true
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: tcp_endpoint
     required: false
     default:
@@ -1110,25 +1107,25 @@ entries:
   required_capabilities:
   - capability_id: planning.motion.joint_goal
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: validation.trajectory.non_collision
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: collision.query.pre_execution
     scope: cell_global
   - capability_id: execution.trajectory.execute
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   execution:
     blocking: true
     cancellable: true
@@ -1158,17 +1155,14 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: base_frame
     required: true
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: tcp_endpoint
     required: false
     default:
@@ -1314,25 +1308,25 @@ entries:
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: validation.trajectory.non_collision
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: collision.query.pre_execution
     scope: cell_global
   - capability_id: execution.trajectory.execute
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   execution:
     blocking: true
     cancellable: true
@@ -1362,17 +1356,14 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: base_frame
     required: true
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: tcp_endpoint
     required: false
     default:
@@ -1572,25 +1563,25 @@ entries:
   required_capabilities:
   - capability_id: planning.motion.cartesian_path
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: validation.trajectory.non_collision
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: collision.query.pre_execution
     scope: cell_global
   - capability_id: execution.trajectory.execute
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   execution:
     blocking: true
     cancellable: true
@@ -1619,17 +1610,14 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: base_frame
     required: true
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: tcp_endpoint
     required: false
     default:
@@ -1734,7 +1722,7 @@ entries:
   - id: interrupt_condition
     required: true
     schema:
-      type: interrupt_condition
+      type: component_interrupt_condition
   - id: on_signal
     required: false
     schema:
@@ -1774,25 +1762,25 @@ entries:
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: validation.trajectory.non_collision
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: collision.query.pre_execution
     scope: cell_global
   - capability_id: execution.trajectory.execute
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: execution.interrupt.resource_scoped
     scope: cell_global
   execution:
@@ -1824,17 +1812,14 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: base_frame
     required: true
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: tcp_endpoint
     required: false
     default:
@@ -1939,7 +1924,7 @@ entries:
   - id: interrupt_condition
     required: true
     schema:
-      type: interrupt_condition
+      type: component_interrupt_condition
   - id: on_signal
     required: false
     schema:
@@ -1979,25 +1964,25 @@ entries:
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: validation.trajectory.non_collision
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: collision.query.pre_execution
     scope: cell_global
   - capability_id: execution.trajectory.execute
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: execution.interrupt.resource_scoped
     scope: cell_global
   - capability_id: execution.interrupt.contact_policy
@@ -2030,18 +2015,17 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   - id: tcp
     required: true
     schema_ref: '#/schema_types/tcp_selector'
   required_capabilities:
   - capability_id: execution.trajectory.execute
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   execution:
     blocking: true
@@ -2226,7 +2210,8 @@ entries:
 - id: scene.attach_carried_object
   name: Attach object
   category: scene
-  description: Attach a scene resource to a declared carrier target and frame role.
+  description: Attach a scene resource to a selected carrier target and component
+    frame.
   stability: stable
   tags:
   - scene
@@ -2243,30 +2228,25 @@ entries:
     schema:
       type: string
       semantic_type: scene_resource
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: carrier_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: carrier_frame_ref
     required: false
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: carrier_frame
     required: false
     schema_ref: '#/schema_types/active_tcp_carrier_frame'
-  - id: touch_body_roles
+  - id: touch_bodies
     required: true
     schema:
       type: array
       min_items: 1
       max_items: 256
       items:
-        type: string
-        semantic_type: collision_body_role
-        semantic_scope_parameter: target_role
+        schema_ref: '#/schema_types/collision_body_reference'
   - id: grasp_lost_translation_m
     required: false
     default: 0.03
@@ -2307,7 +2287,7 @@ entries:
     scope: cell_global
   - capability_id: model.kinematics.fk
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   execution:
     blocking: true
     cancellable: false
@@ -2340,11 +2320,10 @@ entries:
     schema:
       type: string
       semantic_type: scene_resource
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   required_capabilities:
   - capability_id: scene.edit.attach_detach
     scope: cell_global
@@ -2693,16 +2672,10 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: signal
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: resource_role
-    required: true
-    schema:
-      type: string
-      semantic_type: resource_role
+      schema_ref: '#/schema_types/signal_reference'
   - id: value
     required: true
     schema:
@@ -2710,7 +2683,7 @@ entries:
   required_capabilities:
   - capability_id: io.gpio.set_output
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: signal
     effectful: true
   execution:
     blocking: true
@@ -2739,16 +2712,10 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: signal
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: resource_role
-    required: true
-    schema:
-      type: string
-      semantic_type: resource_role
+      schema_ref: '#/schema_types/signal_reference'
   - id: output_key
     required: true
     schema:
@@ -2763,7 +2730,7 @@ entries:
   required_capabilities:
   - capability_id: io.gpio.get_input
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: signal
   blackboard:
     reads: []
     writes:
@@ -2796,16 +2763,10 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: signal
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: resource_role
-    required: true
-    schema:
-      type: string
-      semantic_type: resource_role
+      schema_ref: '#/schema_types/signal_reference'
   - id: expected_value
     required: true
     schema:
@@ -2819,7 +2780,7 @@ entries:
   required_capabilities:
   - capability_id: io.gpio.get_input
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: signal
   execution:
     blocking: true
     cancellable: false
@@ -2849,16 +2810,10 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: signal
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: resource_role
-    required: true
-    schema:
-      type: string
-      semantic_type: resource_role
+      schema_ref: '#/schema_types/signal_reference'
   - id: expected_value
     required: true
     schema:
@@ -2888,7 +2843,7 @@ entries:
   required_capabilities:
   - capability_id: io.gpio.wait_for_input
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: signal
   execution:
     blocking: true
     cancellable: true
@@ -2917,16 +2872,10 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: signal
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: resource_role
-    required: true
-    schema:
-      type: string
-      semantic_type: resource_role
+      schema_ref: '#/schema_types/signal_reference'
   required_capabilities: []
   execution:
     blocking: false
@@ -2994,11 +2943,10 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   - id: position
     required: true
     schema_ref: '#/schema_types/coordinate_position'
@@ -3056,11 +3004,11 @@ entries:
   required_capabilities:
   - capability_id: tool.gripper.command
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   execution:
     blocking: true
     cancellable: true
@@ -3089,11 +3037,10 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   - id: expected_state
     required: true
     schema:
@@ -3106,25 +3053,25 @@ entries:
   required_capabilities:
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: idle
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: moving
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: reached
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: failed
@@ -3158,11 +3105,10 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   - id: expected_state
     required: true
     schema:
@@ -3190,25 +3136,25 @@ entries:
   required_capabilities:
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: idle
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: moving
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: reached
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: failed
@@ -3228,7 +3174,7 @@ entries:
 - id: model.get_frame_pose
   name: Get frame pose
   category: model
-  description: Resolve one declared frame role from fresh qualified state.
+  description: Resolve one component frame from fresh qualified state.
   stability: stable
   tags:
   - model
@@ -3240,16 +3186,14 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: frame
     required: true
     schema:
-      type: string
-      semantic_type: frame_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: output_key
     required: true
     schema:
@@ -3258,10 +3202,10 @@ entries:
   required_capabilities:
   - capability_id: model.kinematics.fk
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   blackboard:
     reads: []
     writes:
@@ -3460,15 +3404,14 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   required_capabilities:
   - capability_id: execution.stop.soft
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   owner_context:
     kind: current_operation
@@ -3528,15 +3471,14 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   required_capabilities:
   - capability_id: execution.reset
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   owner_context:
     kind: current_operation
@@ -3568,11 +3510,10 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   - id: scale
     required: true
     schema:
@@ -3583,7 +3524,7 @@ entries:
   required_capabilities:
   - capability_id: execution.runtime_scale.operation_scoped
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   owner_context:
     kind: current_operation
@@ -4051,8 +3992,7 @@ entries:
 - id: planning.plan_pick_sequence
   name: Plan pick sequence
   category: motion
-  description: Produce a portable validated pick-sequence candidate for one target
-    role.
+  description: Produce a portable validated pick-sequence candidate for one target.
   stability: stable
   tags:
   - motion
@@ -4065,32 +4005,27 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: tool_target_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: tool_target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: base_frame
     required: true
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: tcp_endpoint
     required: false
     default:
       kind: current
     schema_ref: '#/schema_types/tcp_selector'
-  - id: carrier_frame_role
+  - id: carrier_frame_ref
     required: true
     schema:
-      type: string
-      semantic_type: frame_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: selected_object_id
     required: true
     schema:
@@ -4181,30 +4116,30 @@ entries:
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.motion.cartesian_path
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: validation.trajectory.non_collision
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: collision.query.pre_execution
     scope: cell_global
   - capability_id: model.kinematics.fk
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: tool.gripper.command
     scope: target_binding
-    target_parameter: tool_target_role
+    target_parameter: tool_target
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: tool_target_role
+    target_parameter: tool_target
   - capability_id: scene.edit.attach_detach
     scope: cell_global
   blackboard:
@@ -4241,32 +4176,27 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: tool_target_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: tool_target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: base_frame
     required: true
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: tcp_endpoint
     required: false
     default:
       kind: current
     schema_ref: '#/schema_types/tcp_selector'
-  - id: carrier_frame_role
+  - id: carrier_frame_ref
     required: true
     schema:
-      type: string
-      semantic_type: frame_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: selected_object_id
     required: true
     schema:
@@ -4304,30 +4234,30 @@ entries:
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.motion.cartesian_path
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: validation.trajectory.non_collision
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: collision.query.pre_execution
     scope: cell_global
   - capability_id: model.kinematics.fk
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: tool.gripper.command
     scope: target_binding
-    target_parameter: tool_target_role
+    target_parameter: tool_target
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: tool_target_role
+    target_parameter: tool_target
   - capability_id: scene.edit.attach_detach
     scope: cell_global
   blackboard:
@@ -4362,11 +4292,10 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   - id: recovery_action
     required: true
     schema:
@@ -4408,16 +4337,14 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
     schema:
-      type: string
-      semantic_type: target_role
-  - id: frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: frame
     required: true
     schema:
-      type: string
-      semantic_type: frame_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: minimum_height_m
     required: true
     schema:
@@ -4429,10 +4356,10 @@ entries:
   required_capabilities:
   - capability_id: model.kinematics.fk
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   execution:
     blocking: true
     cancellable: false

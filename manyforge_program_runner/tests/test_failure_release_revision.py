@@ -469,7 +469,7 @@ def test_real_runner_manual_result_advances_once_and_clears_only_its_occurrence(
                 "node_instance_id": "move.1",
                 "node_attempt_id": "attempt.1",
                 "outcome": outcome,
-                # SX-610: a failed result never carries Continue's marker,
+                # A failed result never carries Continue's marker,
                 # even when a caller sends it as output.
                 **({"output": "continue_with_failure"} if outcome == "failed" else {}),
             }
@@ -528,7 +528,7 @@ _AT_REST = {
 def test_manual_result_rechecks_the_owner_at_the_press(
     harness, adapter, fresh, refresh_error, reason
 ) -> None:
-    """SX-648: offers do not expire, so a manual success re-reads the owner's
+    """Offers do not expire, so a manual success re-reads the owner's
     assessment at the press. Old non-moving evidence with a stale, moving or
     unreadable robot state is refused typed, before any release."""
 
@@ -552,7 +552,7 @@ def test_manual_result_rechecks_the_owner_at_the_press(
 
 
 def test_manual_result_with_an_unreadable_owner_deadline_refuses_cleanly(harness, adapter) -> None:
-    """SX-677: an owner deadline the exact scalar parser rejects is the typed
+    """An owner deadline the exact scalar parser rejects is the typed
     unavailable-assessment refusal: no release, no reconciliation, no 500."""
 
     run = harness()

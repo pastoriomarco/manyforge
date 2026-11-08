@@ -65,15 +65,14 @@ def _operation() -> dict[str, Any]:
         },
         "participants": [
             {
-                "component_role_id": "robot",
-                "target_role_id": "arm",
+                "target": {"component_id": "robot.1", "command_target_id": "arm.command"},
                 "required_capability_id": "execution.trajectory.execute",
                 "action_span": None,
                 "payload": {
                     "kind": "motion",
                     "move_id": "preview-move:1",
-                    "base_frame_role_id": "base",
-                    "tcp_endpoint": {"kind": "entry", "entry": {"component_id": "robot", "target_id": "arm", "frame_role_id": "tcp"}},
+                    "base_frame": {"component_id": "robot.1", "frame_id": "base"},
+                    "tcp_endpoint": {"kind": "entry", "target": {"component_id": "robot.1", "command_target_id": "arm.command"}, "frame": {"component_id": "tool.1", "frame_id": "tcp"}},
                     "tolerances": {
                         "joint_position_tol_rad": 0.01,
                         "translation_tol_m": 0.001,
@@ -108,7 +107,7 @@ def _operation() -> dict[str, Any]:
 
 def _built(*, unavailable: dict[str, str] | None = None) -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.program_node_correction_preview_intent.v1",
+        "schema_version": "manyforge.program_node_correction_preview_intent.v2",
         "request_id": "node-preview.1",
         "program_run_id": _RUN,
         "program_runner_owner_epoch": "program-runner.epoch.1",
@@ -123,10 +122,8 @@ def _built(*, unavailable: dict[str, str] | None = None) -> dict[str, Any]:
         "node_id": "motion.move_to_joint_target",
         "proposed_paths": ["goal"],
         "parameters_digest": "sha256:" + "f" * 64,
-        "target": {
-            "target_role_id": "arm",
-            "component_role_id": "robot",
-            "controllable_component_id": "robot.1",
+        "target": None if unavailable is not None else {
+            "component_id": "robot.1",
             "command_target_id": "arm.command",
         },
         "unavailable_reason": unavailable,
@@ -161,11 +158,11 @@ def test_preview_sends_the_runner_intent_through_the_manual_preview_path() -> No
 
     assert response.status_code == 200, response.text
     result = response.json()
-    assert result["schema_version"] == "manyforge.program_node_correction_preview.v1"
+    assert result["schema_version"] == "manyforge.program_node_correction_preview.v2"
     assert result["preview_check"] == "trajectory_planned_and_collision_validated"
     assert result["preview"] == {"ok": True, "command": "preview_motion", "preview_receipt": {}}
     assert result["node_attempt_id"] == "attempt:1"
-    assert result["target"]["controllable_component_id"] == "robot.1"
+    assert result["target"]["component_id"] == "robot.1"
     assert "operation" not in result
     assert runner.calls == [(_RUN, _body())]
     # Exactly one advisory native read, attributed like a manual preview.
@@ -199,10 +196,12 @@ def test_unavailable_preview_names_its_reason_and_skips_the_native_owner() -> No
 @pytest.mark.parametrize(
     "mutate",
     [
+        lambda built: built.update(schema_version="manyforge.program_node_correction_preview_intent.v1"),
         lambda built: built.update(node_attempt_id="attempt:other"),
         lambda built: built.update(program_runner_owner_epoch="program-runner.epoch.2"),
         lambda built: built.update(operation=None),
-        lambda built: built["operation"]["participants"][0].update(target_role_id="other"),
+        lambda built: built["operation"]["participants"][0]["target"].update(command_target_id="other"),
+        lambda built: built["target"].update(target_role_id="old"),
         lambda built: built["operation"].update(program_run_id="program-run.8"),
         lambda built: built["operation"]["participants"][0].update(
             action_span={

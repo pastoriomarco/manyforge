@@ -1,3 +1,8 @@
+#ifdef MANYFORGE_TEST_RETIRED_COMPOSITION
+#include "retired_composition_release.hpp"
+#include <manyforge_core/testing/heap_resource_addressed_kernel.hpp>
+#include <manyforge_core/sqlite_operation_journal.hpp>
+#endif
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_roboplan/controller_launch_process.hpp>
 #include <manyforge_roboplan/execution_host_support.hpp>
@@ -64,7 +69,7 @@ private:
 [[nodiscard]] ControllerLaunchArtifacts
 mock_artifacts(const std::filesystem::path &directory,
                const std::string &description_sha = "sha256:aa",
-               const std::string &component = "ui6i_lite6") {
+               const std::string &component = "dual_lite6") {
   ControllerLaunchArtifacts value;
   value.lane = ControllerLaunchLane::kRos2Control;
   value.controllable_component_id = component;
@@ -143,7 +148,7 @@ TEST(ControllerLaunchCommand, MockCommandIsTheTrack2LaunchWithTheArtifactArgumen
   expected.insert(expected.end(), artifacts.launch_arguments.begin(),
                   artifacts.launch_arguments.end());
   EXPECT_EQ(command.argv, expected);
-  EXPECT_EQ(command.controllable_component_id, "ui6i_lite6");
+  EXPECT_EQ(command.controllable_component_id, "dual_lite6");
   EXPECT_EQ(command.lane, ControllerLaunchLane::kRos2Control);
   EXPECT_EQ(command.controller_profile, artifacts.controller_profile);
   EXPECT_EQ(command.runtime_namespace, artifacts.runtime_namespace);
@@ -169,26 +174,26 @@ TEST(ControllerLaunchCommand, MockIdentityFollowsContentNotTheActivationPaths) {
   EXPECT_NE(a.identity, ros2_control_launch_command(prefixed).identity);
 }
 
-// CP8 step 2a characterization: the exact Mock argv and launch identity,
+// Characterization: the exact Mock argv and launch identity,
 // pinned before Mock and Real share this builder.
 TEST(ControllerLaunchCommand, MockArgvAndIdentityArePinned) {
   TemporaryRoot root;
   const auto artifacts = mock_artifacts(root.path());
   const auto command = ros2_control_launch_command(artifacts);
-  const auto directory = (root.path() / "ui6i_lite6").string();
+  const auto directory = (root.path() / "dual_lite6").string();
   EXPECT_EQ(command.argv,
             (std::vector<std::string>{
                 "ros2", "launch", "manyforge_ros_bringup", "ros2_control.launch.py",
                 "robot_description_file:=" + directory + "/robot_description.urdf",
                 "controllers_file:=" + directory + "/controllers.yaml",
-                "runtime_namespace:=/manyforge/ui6i_lite6",
+                "runtime_namespace:=/manyforge/dual_lite6",
                 "controller_manager_name:=controller_manager",
                 "arm_controller_name:=lite6_traj_controller",
                 "gripper_controller_name:=lite_gripper_controller",
-                "frame_prefix:=ui6i_lite6/"}));
+                "frame_prefix:=dual_lite6/"}));
   EXPECT_EQ(command.identity,
-            "ros2_control\nui6i_lite6\nlite6_lite_gripper\n/manyforge/ui6i_lite6\n"
-            "lite6_traj_controller\nlite_gripper_controller\nui6i_lite6/\n"
+            "ros2_control\ndual_lite6\nlite6_lite_gripper\n/manyforge/dual_lite6\n"
+            "lite6_traj_controller\nlite_gripper_controller\ndual_lite6/\n"
             "sha256:aa\nsha256:bb\n");
 }
 
@@ -222,7 +227,7 @@ real_artifacts(const std::filesystem::path &directory,
   return value;
 }
 
-// CP8 step 2a: Real uses Mock's builder and launch file; its hardware data
+// Real uses Mock's builder and launch file; its hardware data
 // joins the launch identity, never its per-activation paths.
 TEST(ControllerLaunchCommand, RealUsesTheSharedBuilderAndItsHardwareJoinsTheIdentity) {
   TemporaryRoot first;
@@ -276,7 +281,7 @@ TEST(ControllerLaunchCommand, MockCommandFailsClosed) {
 }
 
 
-// Merge 6: an Isaac tool (gripper-only) component runs its own launch: its
+// An Isaac tool (gripper-only) component runs its own launch: its
 // description in its own namespace and, for an action transport, the bridge
 // with its gripper_feedback budget. The description path never joins the
 // identity; the bridge facts and the budget do.
@@ -395,12 +400,12 @@ public:
       throw std::runtime_error("cannot prepare fixture subreaper");
     std::vector<std::string> environment;
     for (auto entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
-      if (!std::string_view(*entry).starts_with("MANYFORGE_Q116_HOST_") &&
+      if (!std::string_view(*entry).starts_with("MANYFORGE_ABRUPT_LAUNCH_HOST_") &&
           !std::string_view(*entry).starts_with("GTEST_OUTPUT="))
         environment.emplace_back(*entry);
     }
-    environment.push_back("MANYFORGE_Q116_HOST_ROOT=" + root.string());
-    environment.push_back("MANYFORGE_Q116_HOST_ROLE=" + role);
+    environment.push_back("MANYFORGE_ABRUPT_LAUNCH_HOST_ROOT=" + root.string());
+    environment.push_back("MANYFORGE_ABRUPT_LAUNCH_HOST_ROLE=" + role);
     std::vector<char *> env;
     for (auto &entry : environment)
       env.push_back(entry.data());
@@ -451,7 +456,7 @@ public:
       const auto wait_errno = errno;
       if (result == pid || (result < 0 && wait_errno != EINTR)) {
         const auto wait_error = result < 0 ? wait_errno : 0;
-        const char *evidence = ::getenv("MANYFORGE_Q116_EVIDENCE_ROOT");
+        const char *evidence = ::getenv("MANYFORGE_ABRUPT_LAUNCH_EVIDENCE_ROOT");
         const auto directory = evidence == nullptr
                                    ? root_
                                    : std::filesystem::path(evidence) / root_.filename();
@@ -471,7 +476,7 @@ public:
                << "}\n";
         record.flush();
         if (error || !record)
-          std::fprintf(stderr, "Q116 raw waitpid status capture failed\n");
+          std::fprintf(stderr, "raw waitpid status capture failed\n");
       }
       // Diagnostic IO must not change the existing waitpid error predicate.
       errno = wait_errno;
@@ -503,9 +508,9 @@ private:
 void check_parent_death(const std::string &role, const std::string &selector,
                         const bool managed_shutdown,
                         const int extra_launch_sigints = 0) {
-  if (const char *root_value = ::getenv("MANYFORGE_Q116_HOST_ROOT")) {
+  if (const char *root_value = ::getenv("MANYFORGE_ABRUPT_LAUNCH_HOST_ROOT")) {
     const std::filesystem::path root(root_value);
-    const std::string host_role(::getenv("MANYFORGE_Q116_HOST_ROLE"));
+    const std::string host_role(::getenv("MANYFORGE_ABRUPT_LAUNCH_HOST_ROLE"));
     ControllerLaunchSupervisor supervisor;
     int pid = -1;
     if (host_role == "sim_plc") {
@@ -538,7 +543,7 @@ void check_parent_death(const std::string &role, const std::string &selector,
   struct EvidenceCapture final {
     std::filesystem::path root;
     ~EvidenceCapture() {
-      const char *evidence = ::getenv("MANYFORGE_Q116_EVIDENCE_ROOT");
+      const char *evidence = ::getenv("MANYFORGE_ABRUPT_LAUNCH_EVIDENCE_ROOT");
       if (evidence == nullptr)
         return;
       std::error_code error;
@@ -550,7 +555,7 @@ void check_parent_death(const std::string &role, const std::string &selector,
                                   std::filesystem::copy_options::skip_symlinks,
                               error);
       if (error)
-        std::fprintf(stderr, "Q116 shutdown artifacts unavailable: %s\n",
+        std::fprintf(stderr, "shutdown artifacts unavailable: %s\n",
                      error.message().c_str());
     }
   } evidence_capture{root};
@@ -792,7 +797,7 @@ TEST(ControllerLaunchSupervisor, StartsKeepsAndRestartsOneLaunchPerComponent) {
   EXPECT_EQ(recorded, std::vector<std::string>(first_command.argv.begin() + 1,
                                                first_command.argv.end()));
 
-  // Q21: same robot and description at the next activation keeps the process
+  // Same robot and description at the next activation keeps the process
   // even though the artifacts were written below another epoch.
   const auto kept = supervisor.ensure(
       ros2_control_launch_command(mock_artifacts(fake.root() / "epoch-2")),
@@ -801,7 +806,7 @@ TEST(ControllerLaunchSupervisor, StartsKeepsAndRestartsOneLaunchPerComponent) {
   EXPECT_EQ(kept.process, first.process);
   EXPECT_TRUE(alive(first.process->pid()));
 
-  // A changed description replaces it: the predecessor ends first (Q66).
+  // A changed description replaces it: the predecessor ends first.
   const auto changed = supervisor.ensure(
       ros2_control_launch_command(
           mock_artifacts(fake.root() / "epoch-3", "sha256:changed")),
@@ -812,12 +817,12 @@ TEST(ControllerLaunchSupervisor, StartsKeepsAndRestartsOneLaunchPerComponent) {
   // An ordered stop is not a component failure.
   EXPECT_FALSE(ControllerLaunchSupervisor::fault_source(first.process)()
                    .has_value());
-  ASSERT_TRUE(supervisor.observe("ui6i_lite6").has_value());
-  EXPECT_TRUE(supervisor.observe("ui6i_lite6")->running);
+  ASSERT_TRUE(supervisor.observe("dual_lite6").has_value());
+  EXPECT_TRUE(supervisor.observe("dual_lite6")->running);
 
   supervisor.stop_all();
   EXPECT_TRUE(changed.process->exited().has_value());
-  EXPECT_FALSE(supervisor.observe("ui6i_lite6").has_value());
+  EXPECT_FALSE(supervisor.observe("dual_lite6").has_value());
 }
 
 
@@ -933,7 +938,7 @@ TEST(ControllerLaunchSupervisor,
 
   const auto peer =
       supervisor.ensure(ros2_control_launch_command(mock_artifacts(
-                            fake.root(), "sha256:aa", "ui6i_ur5e")),
+                            fake.root(), "sha256:aa", "dual_ur5e")),
                         fake.root() / "peer.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(peer.process->pid(), ".args")));
   EXPECT_TRUE(supervisor.discard_candidate(candidate));
@@ -941,7 +946,7 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_TRUE(candidate.process->exited().has_value());
   EXPECT_FALSE(ControllerLaunchSupervisor::fault_source(candidate.process)()
                    .has_value());
-  EXPECT_FALSE(supervisor.observe("ui6i_lite6").has_value());
+  EXPECT_FALSE(supervisor.observe("dual_lite6").has_value());
   EXPECT_TRUE(alive(peer.process->pid()));
 
   // Even a new process with the same launch identity is a different occurrence.
@@ -952,7 +957,7 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_FALSE(supervisor.discard_candidate(candidate));
   EXPECT_TRUE(alive(successor.process->pid()));
   EXPECT_TRUE(alive(peer.process->pid()));
-  EXPECT_TRUE(supervisor.observe("ui6i_lite6")->running);
+  EXPECT_TRUE(supervisor.observe("dual_lite6")->running);
 }
 
 TEST(ControllerLaunchSupervisor,
@@ -970,7 +975,7 @@ TEST(ControllerLaunchSupervisor,
   ASSERT_TRUE(fake.wait_for(fake.out(restarted.process->pid(), ".args")));
   const auto peer =
       supervisor.ensure(ros2_control_launch_command(mock_artifacts(
-                            fake.root(), "sha256:peer", "ui6i_ur5e")),
+                            fake.root(), "sha256:peer", "dual_ur5e")),
                         fake.root() / "failed-replace-peer.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(peer.process->pid(), ".args")));
   EXPECT_FALSE(supervisor.discard_candidate(first));
@@ -983,9 +988,9 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_FALSE(alive(first.process->pid()));
   EXPECT_FALSE(alive(restarted.process->pid()));
   EXPECT_TRUE(alive(peer.process->pid()));
-  EXPECT_FALSE(supervisor.observe("ui6i_lite6").has_value());
-  EXPECT_TRUE(supervisor.component_output_counters("ui6i_lite6").has_value());
-  EXPECT_FALSE(supervisor.observe("ui6i_lite6").has_value());
+  EXPECT_FALSE(supervisor.observe("dual_lite6").has_value());
+  EXPECT_TRUE(supervisor.component_output_counters("dual_lite6").has_value());
+  EXPECT_FALSE(supervisor.observe("dual_lite6").has_value());
   EXPECT_NE(first.process->command().identity,
             restarted.process->command().identity);
   EXPECT_FALSE(
@@ -1005,7 +1010,7 @@ TEST(ControllerLaunchSupervisor, AnExitedLaunchIsAFaultAndIsNeverRestartedByItse
   ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
   EXPECT_FALSE(fault().has_value());
 
-  // The launch dies while the cell is active (Q80).
+  // The launch dies while the cell is active.
   ASSERT_EQ(::kill(-started.process->pid(), SIGKILL), 0);
   std::optional<std::string> reason;
   for (int attempt = 0; attempt < 200 && !reason.has_value(); ++attempt) {
@@ -1016,8 +1021,8 @@ TEST(ControllerLaunchSupervisor, AnExitedLaunchIsAFaultAndIsNeverRestartedByItse
   EXPECT_NE(reason->find("controller_launch_exited"), std::string::npos);
   EXPECT_NE(reason->find("signal 9"), std::string::npos);
   // Nothing restarted it.
-  ASSERT_TRUE(supervisor.observe("ui6i_lite6").has_value());
-  EXPECT_FALSE(supervisor.observe("ui6i_lite6")->running);
+  ASSERT_TRUE(supervisor.observe("dual_lite6").has_value());
+  EXPECT_FALSE(supervisor.observe("dual_lite6")->running);
   EXPECT_TRUE(fault().has_value());
 
   // The next activation of the component starts a new launch.
@@ -1025,7 +1030,7 @@ TEST(ControllerLaunchSupervisor, AnExitedLaunchIsAFaultAndIsNeverRestartedByItse
       supervisor.ensure(command, fake.root() / "launch.artifacts");
   EXPECT_EQ(again.decision, ControllerLaunchDecision::kRestart);
   EXPECT_NE(again.process->pid(), started.process->pid());
-  EXPECT_TRUE(supervisor.observe("ui6i_lite6")->running);
+  EXPECT_TRUE(supervisor.observe("dual_lite6")->running);
 }
 
 TEST(ControllerLaunchSupervisor, StartHeaderBoundsDisplayButRetainsFullLaunchIdentity) {
@@ -1111,7 +1116,7 @@ TEST(ControllerLaunchSupervisor,
   ASSERT_TRUE(reason.has_value());
   EXPECT_LE(reason->size(), 1024U);
   EXPECT_NE(reason->find("signal 9"), std::string::npos);
-  EXPECT_NE(reason->find("component=\"ui6i_lite6\""), std::string::npos);
+  EXPECT_NE(reason->find("component=\"dual_lite6\""), std::string::npos);
   EXPECT_NE(reason->find(log.string()), std::string::npos);
   EXPECT_NE(reason->find("apply_id=apply.7"), std::string::npos);
   EXPECT_EQ(reason->find("last crash detail"), std::string::npos);
@@ -1124,7 +1129,7 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_FALSE(evidence->core_dumped);
   EXPECT_FALSE(evidence->observed_utc.empty());
   EXPECT_EQ(evidence->observed_utc.back(), 'Z');
-  EXPECT_EQ(evidence->controllable_component_id, "ui6i_lite6");
+  EXPECT_EQ(evidence->controllable_component_id, "dual_lite6");
   EXPECT_EQ(evidence->launch_identity, command.identity);
   EXPECT_EQ(evidence->robot_description_sha256,
             command.robot_description_sha256);
@@ -1444,7 +1449,7 @@ TEST(ControllerLaunchSupervisor,
     std::this_thread::sleep_for(10ms);
   }
   EXPECT_NE(
-      forwarded.find("manyforge_controller_output component=\"ui6i_lite6\""),
+      forwarded.find("manyforge_controller_output component=\"dual_lite6\""),
       std::string::npos);
   EXPECT_NE(forwarded.find("manyforge_controller_launch_start"),
             std::string::npos);
@@ -1524,7 +1529,7 @@ TEST(ControllerLaunchSupervisor, PartialSocketSendCountsOnlyUnsentSuffix) {
       "existing.cclc.socket.partial", "apply_id=apply.13",
       std::string(11000U, 'x')));
   const auto queued = started.process->output_snapshot();
-  const auto tag = "manyforge_controller_output component=\"ui6i_lite6\" pid=" +
+  const auto tag = "manyforge_controller_output component=\"dual_lite6\" pid=" +
                    std::to_string(started.process->pid()) + " ";
   const auto attempted = tag.size() + queued.tail.size() - before.tail.size();
   for (int attempt = 0;
@@ -1843,7 +1848,7 @@ TEST(ControllerLaunchSupervisor,
        replacement.process->output_counters().dropped_forward_bytes == 0U;
        ++attempt)
     std::this_thread::sleep_for(10ms);
-  const auto before_late = supervisor.component_output_counters("ui6i_lite6");
+  const auto before_late = supervisor.component_output_counters("dual_lite6");
   ASSERT_TRUE(before_late.has_value());
   EXPECT_GE(before_late->dropped_forward_bytes,
             first_loss.dropped_forward_bytes +
@@ -1853,19 +1858,19 @@ TEST(ControllerLaunchSupervisor,
       "existing.cclc.old.late", "apply_id=apply.16", "late old occurrence"));
   for (int attempt = 0;
        attempt < 200 &&
-       supervisor.component_output_counters("ui6i_lite6")
+       supervisor.component_output_counters("dual_lite6")
                ->dropped_forward_bytes <= before_late->dropped_forward_bytes;
        ++attempt)
     std::this_thread::sleep_for(10ms);
-  const auto after_late = supervisor.component_output_counters("ui6i_lite6");
+  const auto after_late = supervisor.component_output_counters("dual_lite6");
   ASSERT_TRUE(after_late.has_value());
   EXPECT_GT(after_late->dropped_forward_bytes,
             before_late->dropped_forward_bytes);
   EXPECT_TRUE(supervisor.retire_exact(replacement.process));
   first.process.reset();
   replacement.process.reset();
-  EXPECT_FALSE(supervisor.observe("ui6i_lite6").has_value());
-  const auto removed = supervisor.component_output_counters("ui6i_lite6");
+  EXPECT_FALSE(supervisor.observe("dual_lite6").has_value());
+  const auto removed = supervisor.component_output_counters("dual_lite6");
   ASSERT_TRUE(removed.has_value());
   EXPECT_GE(removed->dropped_forward_bytes, after_late->dropped_forward_bytes);
   const auto readded = supervisor.ensure(
@@ -1877,7 +1882,7 @@ TEST(ControllerLaunchSupervisor,
        readded.process->output_counters().dropped_forward_bytes == 0U;
        ++attempt)
     std::this_thread::sleep_for(10ms);
-  const auto after_readd = supervisor.component_output_counters("ui6i_lite6");
+  const auto after_readd = supervisor.component_output_counters("dual_lite6");
   ASSERT_TRUE(after_readd.has_value());
   EXPECT_GE(after_readd->dropped_forward_bytes,
             removed->dropped_forward_bytes +
@@ -1990,7 +1995,7 @@ TEST(ControllerLaunchSupervisor,
   ASSERT_TRUE(fake.wait_for(fake.out(original.process->pid(), ".args")));
   const auto peer =
       supervisor.ensure(ros2_control_launch_command(mock_artifacts(
-                            fake.root(), "sha256:peer", "ui6i_ur5e")),
+                            fake.root(), "sha256:peer", "dual_ur5e")),
                         fake.root() / "unlocked-stop-peer.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(peer.process->pid(), ".args")));
   auto blocker = std::make_unique<GroupChild>(original.process->pid());
@@ -2007,13 +2012,13 @@ TEST(ControllerLaunchSupervisor,
                              fake.root() / "unlocked-stop-second.artifacts");
   });
   auto observation = std::async(
-      std::launch::async, [&] { return supervisor.observe("ui6i_lite6"); });
+      std::launch::async, [&] { return supervisor.observe("dual_lite6"); });
   EXPECT_EQ(first.wait_for(10ms), std::future_status::timeout);
   EXPECT_EQ(second.wait_for(10ms), std::future_status::timeout);
   // Scalar observation remains responsive while the owned group blocks stop.
   const auto observation_ready = observation.wait_for(200ms);
   auto counters = std::async(std::launch::async, [&] {
-    return supervisor.component_output_counters("ui6i_lite6");
+    return supervisor.component_output_counters("dual_lite6");
   });
   const auto ready = counters.wait_for(200ms);
   // Always release the owned blocker before waiting on test futures.
@@ -2035,8 +2040,8 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_FALSE(alive(original.process->pid()));
   EXPECT_TRUE(alive(installed.process->pid()));
   EXPECT_TRUE(alive(peer.process->pid()));
-  ASSERT_TRUE(supervisor.observe("ui6i_lite6").has_value());
-  EXPECT_EQ(supervisor.observe("ui6i_lite6")->identity, command.identity);
+  ASSERT_TRUE(supervisor.observe("dual_lite6").has_value());
+  EXPECT_EQ(supervisor.observe("dual_lite6")->identity, command.identity);
 }
 
 TEST(ControllerLaunchSupervisor,
@@ -2058,11 +2063,11 @@ TEST(ControllerLaunchSupervisor,
   });
   auto peer = std::async(std::launch::async, [&] {
     return supervisor.ensure(ros2_control_launch_command(mock_artifacts(
-                                 fake.root(), "sha256:peer", "ui6i_ur5e")),
+                                 fake.root(), "sha256:peer", "dual_ur5e")),
                              fake.root() / "stop-all-later-peer.artifacts");
   });
   auto counters = std::async(std::launch::async, [&] {
-    return supervisor.component_output_counters("ui6i_lite6");
+    return supervisor.component_output_counters("dual_lite6");
   });
   const auto counter_ready = counters.wait_for(200ms);
   const auto peer_ready = peer.wait_for(200ms);
@@ -2077,9 +2082,9 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_FALSE(alive(original.process->pid()));
   EXPECT_TRUE(alive(installed.process->pid()));
   EXPECT_TRUE(alive(later_peer.process->pid()));
-  ASSERT_TRUE(supervisor.observe("ui6i_lite6").has_value());
-  EXPECT_EQ(supervisor.observe("ui6i_lite6")->identity, command.identity);
-  EXPECT_TRUE(supervisor.observe("ui6i_ur5e")->running);
+  ASSERT_TRUE(supervisor.observe("dual_lite6").has_value());
+  EXPECT_EQ(supervisor.observe("dual_lite6")->identity, command.identity);
+  EXPECT_TRUE(supervisor.observe("dual_ur5e")->running);
 }
 
 TEST(ControllerLaunchSupervisor, PartialForwardWriteCountsOnlyUnsentBytes) {
@@ -2103,7 +2108,7 @@ TEST(ControllerLaunchSupervisor, PartialForwardWriteCountsOnlyUnsentBytes) {
       "existing.cclc.partial", "apply_id=apply.10", std::string(6000U, 'x')));
   const auto queued = started.process->output_snapshot();
   const auto raw_record_bytes = queued.tail.size() - before.tail.size();
-  const auto tag = "manyforge_controller_output component=\"ui6i_lite6\" pid=" +
+  const auto tag = "manyforge_controller_output component=\"dual_lite6\" pid=" +
                    std::to_string(started.process->pid()) + " ";
   for (int attempt = 0;
        attempt < 200 &&
@@ -2246,7 +2251,7 @@ TEST(ControllerLaunchSupervisor,
   GroupChild orphan(crashed.process->pid());
   const auto peer =
       supervisor.ensure(ros2_control_launch_command(mock_artifacts(
-                            fake.root(), "sha256:aa", "ui6i_ur5e")),
+                            fake.root(), "sha256:aa", "dual_ur5e")),
                         fake.root() / "peer.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(peer.process->pid(), ".args")));
 
@@ -2378,7 +2383,7 @@ TEST(ControllerLaunchSupervisor, AMissingLauncherFailsTheActivation) {
                    root.path() / "launch.artifacts")),
                ControllerLaunchProcessError);
   ::setenv("PATH", previous.c_str(), 1);
-  EXPECT_FALSE(supervisor.observe("ui6i_lite6").has_value());
+  EXPECT_FALSE(supervisor.observe("dual_lite6").has_value());
 }
 
 TEST(ControllerLaunchSupervisor,
@@ -2394,7 +2399,7 @@ TEST(ControllerLaunchSupervisor,
       fake.root() / "lite6.artifacts");
   const auto ur5e =
       supervisor.ensure(ros2_control_launch_command(mock_artifacts(
-                            fake.root(), "sha256:aa", "ui6i_ur5e")),
+                            fake.root(), "sha256:aa", "dual_ur5e")),
                         fake.root() / "ur5e.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(lite6.process->pid(), ".fds")));
   std::istringstream fds(read_file(fake.out(lite6.process->pid(), ".fds")));
@@ -2407,9 +2412,9 @@ TEST(ControllerLaunchSupervisor,
 
   EXPECT_TRUE(supervisor.retire_exact(lite6.process));
   EXPECT_TRUE(lite6.process->exited().has_value());
-  EXPECT_FALSE(supervisor.observe("ui6i_lite6").has_value());
+  EXPECT_FALSE(supervisor.observe("dual_lite6").has_value());
   EXPECT_TRUE(alive(ur5e.process->pid()));
-  EXPECT_TRUE(supervisor.observe("ui6i_ur5e")->running);
+  EXPECT_TRUE(supervisor.observe("dual_ur5e")->running);
 }
 
 } // namespace
@@ -2677,8 +2682,8 @@ namespace {
 } // namespace
 
 TEST(SimulatedPlcPlan, OnlyASimulatedUnitGetsASimulatedPlc) {
-  // D6 structural Real-lane guard: a unit hosting a real (measured)
-  // component yields no PLC (CP8 step 1: per-component authority).
+  // Structural Real-lane guard: a unit hosting a real (measured)
+  // component yields no PLC (per-component authority).
   EXPECT_FALSE(
       plan_simulated_plc(false, "plc_io", plc_rows(), "/cfg").has_value());
   const auto plan =
@@ -2887,3 +2892,104 @@ TEST(SimulatedPlcSupervisor, ARebuiltDeviceKeepsItsPlcWhileTheLaunchIdentityHold
   EXPECT_FALSE(simulated_plc_launch_survives(mock.process.get(), plan));
   supervisor.stop_all();
 }
+
+#ifdef MANYFORGE_TEST_RETIRED_COMPOSITION
+TEST(ControllerLaunchSupervisor, RetiredCompositionProtectsPreparedProcessAndRetiresUnique) {
+  namespace host = manyforge::roboplan_backend::host_detail;
+  namespace core = manyforge::core;
+  FakeLaunch fake;
+  ControllerLaunchSupervisor supervisor(2s);
+  const auto protected_process = supervisor.ensure(
+      ros2_control_launch_command(mock_artifacts(fake.root(), "sha256:aa", "protected")),
+      fake.root() / "protected-launch").process;
+  const auto unique_process = supervisor.ensure(
+      ros2_control_launch_command(mock_artifacts(fake.root(), "sha256:bb", "unique")),
+      fake.root() / "unique-launch").process;
+  ASSERT_TRUE(fake.wait_for(fake.out(protected_process->pid(), ".args")));
+  ASSERT_TRUE(fake.wait_for(fake.out(unique_process->pid(), ".args")));
+  const int protected_pid = protected_process->pid();
+  const int unique_pid = unique_process->pid();
+  auto view = [](const std::string &name) {
+    return std::make_unique<host::Composition>(
+        core::ControllableComponentId(name), nullptr, nullptr, nullptr, nullptr, nullptr,
+        std::nullopt, std::nullopt, std::nullopt, host::CanonicalValue(nullptr),
+        host::CanonicalValue(nullptr), nullptr, nullptr, core::ProjectionRevisionDTO{},
+        core::ActiveBundlePublicationGeneration(1U), std::nullopt, std::nullopt);
+  };
+  std::unique_ptr<host::Composition> active, failed;
+  auto prepared = view("prepared");
+  prepared->controller_process = protected_process;
+  auto retired = view("retired");
+  retired->controller_process = protected_process;
+  auto unique = view("unique");
+  unique->controller_process = unique_process;
+  retired->participant_compositions.push_back(std::move(unique));
+  WallClock clock;
+  core::ManualScheduler scheduler;
+  const auto database = fake.root() / "retirement.sqlite";
+  core::SqliteOperationJournal journal(database, core::CellId("retired-process"), 16U);
+  core::ResourceAddressedExecutionKernelConfig kernel_config{
+      core::RequestOwnerEpoch("process-epoch"), core::CellId("retired-process"), 16U};
+  kernel_config.empty_runtime_retained_bundle_id = core::RetainedBundleId("retired-process-bundle");
+  kernel_config.empty_runtime_graph_revision = core::GraphRevision("retired-process-graph");
+  auto kernel = core::testing::make_heap_resource_addressed_kernel(
+      {}, clock, scheduler, journal, kernel_config);
+  std::mutex mutex;
+  std::set<core::IResolvedParticipantExecutionEngine *> engines;
+  const host::Composition *logged = nullptr;
+  std::vector<const ControllerLaunchProcess *> retired_processes;
+  int reclaimed = 0;
+  host::TryReleaseRetiredComposition(
+      mutex, active, prepared, failed, retired, engines, logged, [&] { return kernel.get(); },
+      [](const host::Composition &) { return std::set<core::IResolvedParticipantExecutionEngine *>{}; },
+      [](const host::Composition &root) {
+        std::vector<std::pair<int, const host::Composition *>> result{{0, &root}};
+        for (const auto &child : root.participant_compositions) result.emplace_back(0, child.get());
+        return result;
+      },
+      [&](const auto &process) { retired_processes.push_back(process.get()); return supervisor.retire_exact(process); },
+      [&] { ++reclaimed; },
+      [](bool ok, const char *message) { if (!ok) throw std::runtime_error(message); });
+  EXPECT_FALSE(retired);
+  EXPECT_EQ(reclaimed, 1);
+  ASSERT_EQ(retired_processes.size(), 1U);
+  EXPECT_EQ(retired_processes.front(), unique_process.get());
+  EXPECT_TRUE(alive(protected_pid));
+  EXPECT_FALSE(alive(unique_pid));
+
+  // A different pending entry pins the real process after the prepared root
+  // is removed; this retired tree must not stop it.
+  prepared.reset();
+  retired = view("retired-again");
+  retired->controller_process = protected_process;
+  host::RetainedComponentSnapshot retained{
+      nullptr, nullptr, nullptr,
+      {core::ProductId("fixture-product"), core::RetainedProductKind::kPlanningCollisionModel,
+       core::ProductContractId("fixture-contract"), core::ProductContractRevision("fixture-revision"), {}},
+      std::nullopt, host::CanonicalValue(nullptr), host::CanonicalValue(nullptr), nullptr, protected_process};
+  host::PendingDiscard pending{nullptr, {std::move(retained)}, "pending-process", false};
+  std::vector<host::ProtectedCompositionPins> pending_pins;
+  std::set<core::IResolvedParticipantExecutionEngine *> pending_engines;
+  const auto registrations = [](const host::Composition &) {
+    return std::set<core::IResolvedParticipantExecutionEngine *>{};
+  };
+  host::CollectRetainedPendingProtection(pending, pending_pins, pending_engines, registrations);
+  host::TryReleaseRetiredComposition(
+      mutex, active, prepared, failed, retired, engines, logged, [&] { return kernel.get(); }, registrations,
+      [](const host::Composition &root) {
+        std::vector<std::pair<int, const host::Composition *>> result{{0, &root}};
+        for (const auto &child : root.participant_compositions) result.emplace_back(0, child.get());
+        return result;
+      },
+      [&](const auto &process) { retired_processes.push_back(process.get()); return supervisor.retire_exact(process); },
+      [&] { ++reclaimed; },
+      [](bool ok, const char *message) { if (!ok) throw std::runtime_error(message); },
+      pending_pins, pending_engines);
+  EXPECT_FALSE(retired);
+  EXPECT_EQ(retired_processes.size(), 1U);
+  EXPECT_TRUE(alive(protected_pid));
+  EXPECT_EQ(pending.snapshots.front().controller_process.get(), protected_process.get());
+  kernel.reset();
+  journal.Close();
+}
+#endif

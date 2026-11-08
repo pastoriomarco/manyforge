@@ -6,6 +6,7 @@ from pathlib import Path
 from copy import deepcopy
 import importlib.util
 import sys
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -45,7 +46,11 @@ def test_behavior_motion_endpoint_crosses_the_runner_strict_transport(
         Path(__file__).resolve().parents[2]
         / "manyforge_behavior/tests/test_production_ports.py"
     )
-    name = "_runner_endpoint_production_port_fixture"
+    package_name = "_runner_endpoint_production_port_fixture"
+    package = ModuleType(package_name)
+    package.__path__ = [str(source.parent)]
+    monkeypatch.setitem(sys.modules, package_name, package)
+    name = f"{package_name}.test_production_ports"
     spec = importlib.util.spec_from_file_location(name, source)
     assert spec is not None and spec.loader is not None
     fixture = importlib.util.module_from_spec(spec)
@@ -55,7 +60,13 @@ def test_behavior_motion_endpoint_crosses_the_runner_strict_transport(
     port = fixture.NativeKernelProgramPort(fixture.KernelClient(recorder))
     port.bind(fixture._context())
     parameters = dict(fixture._motion_inputs().parameters)
-    parameters["tcp_endpoint"] = {"kind": "default_of_role", "role": endpoint_owner}
+    selected_target = (
+        {"component_id": "robot.1", "command_target_id": "arm.command"}
+        if endpoint_owner == "arm"
+        else {"component_id": "tool.1", "command_target_id": "gripper.command"}
+    )
+    expected_endpoint = {"kind": "default_of_target", "target": selected_target}
+    parameters["tcp_endpoint"] = expected_endpoint
     port.operations.start(
         "motion.move_to_pose",
         fixture._identity("runner-endpoint"),
@@ -83,14 +94,12 @@ def test_behavior_motion_endpoint_crosses_the_runner_strict_transport(
     assert result["ok"] is True
     assert result["active_tcp"][0]["component_id"] == "robot.1"
     sent = commands[0]["operation"]["participants"][0]
-    assert sent["payload"]["tcp_endpoint"] == {
-        "kind": "default_of_role", "role": endpoint_owner,
-    }
+    assert sent["payload"]["tcp_endpoint"] == expected_endpoint
     assert "tcp_frame_role_id" not in sent["payload"]
     assert sent["execution_scope"] == operation["participants"][0]["execution_scope"]
     legacy = deepcopy(operation)
     payload = legacy["participants"][0]["payload"]
-    payload["tcp_endpoint"] = {"target_role_id": endpoint_owner, "frame_role_id": "tcp"}
+    payload["tcp_endpoint"] = {"kind": "default_of_role", "role": endpoint_owner}
     with pytest.raises(HeadlessApiError) as refused:
         transport.submit(legacy)
     assert refused.value.code == "execution_command_invalid"
@@ -240,7 +249,7 @@ def test_transport_reuses_the_owner_client_with_internal_attribution(
     }
     assert commands[1]["request"] == _stop_body()
     assert commands[3] == {
-        "api_version": "manyforge.execution_command.v1",
+        "api_version": "manyforge.execution_command.v3",
         "attribution": {
             "transport": "internal",
             "assurance": "unverified",
@@ -335,7 +344,7 @@ def test_capture_registration_sends_identities_and_checks_the_returned_claim(
     assert transport.register_program_run_capture(capture) == response
     assert commands == [
         {
-            "api_version": "manyforge.execution_command.v1",
+            "api_version": "manyforge.execution_command.v3",
             "command": "register_program_run_capture",
             "capture": capture,
         }
@@ -399,8 +408,7 @@ def test_program_origin_is_required_privately_and_forbidden_publicly(
         "coordination_policy": "independent",
         "participants": [
             {
-                "component_role_id": "tool",
-                "target_role_id": "gripper",
+                "target": {"component_id": "tool", "command_target_id": "gripper"},
                 "required_capability_id": "tool.gripper.command",
                 "action_span": None,
                 "execution_scope": {
@@ -455,7 +463,7 @@ def test_program_origin_is_required_privately_and_forbidden_publicly(
 
 def _position_capability_response():
     digest = "sha256:" + "a" * 64
-    return {"api_version": "manyforge.execution_command_response.v1", "command": "reset_robot_position_capability",
+    return {"api_version": "manyforge.execution_command_response.v4", "command": "reset_robot_position_capability",
             "ok": True, "reset_robot_position": {"available": True, "reason": None},
             "identity": {"schema_version": "manyforge.execution_identity.v2", "owner_epoch": "kernel.1",
                          "active_publication_generation": 3, "retained_bundle_id": digest, "graph_revision": digest,
@@ -478,7 +486,7 @@ def test_position_capability_response_is_strict_and_pins_deployment(monkeypatch,
     packets = []
     monkeypatch.setattr(transport, "_exchange", lambda packet: packets.append(packet) or response)
     assert transport.reset_robot_position_capability() == response
-    assert packets == [{"api_version": "manyforge.execution_command.v1", "command": "reset_robot_position_capability"}]
+    assert packets == [{"api_version": "manyforge.execution_command.v3", "command": "reset_robot_position_capability"}]
     if mutation == "extra": response["arbitrary"] = True
     elif mutation == "wrong_kind": response["command"] = "identity"
     elif mutation == "boolean_int": response["ok"] = 1
@@ -492,11 +500,11 @@ def test_position_capability_response_is_strict_and_pins_deployment(monkeypatch,
 def test_position_effect_rejects_arbitrary_targets_and_mismatched_success(monkeypatch, tmp_path, mutation):
     transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
     packets = []
-    response = {"api_version": "manyforge.execution_command_response.v1", "command": "reset_robot_position", "ok": True}
+    response = {"api_version": "manyforge.execution_command_response.v4", "command": "reset_robot_position", "ok": True}
     monkeypatch.setattr(transport, "_exchange", lambda packet: packets.append(packet) or response)
     request = _position_request()
     transport.reset_robot_position(request)
-    assert packets[-1] == {"api_version": "manyforge.execution_command.v1", "command": "reset_robot_position", **request}
+    assert packets[-1] == {"api_version": "manyforge.execution_command.v3", "command": "reset_robot_position", **request}
     if mutation == "joints": request["initial_joint_positions_rad"] = [1.0]
     elif mutation == "extra_authority": request["authorization"]["reload_initial_scene"] = True
     elif mutation == "claim_union": request["authorization"]["cycle_claim_generation"] = 9
@@ -512,9 +520,11 @@ def test_position_effect_rejects_arbitrary_targets_and_mismatched_success(monkey
 def test_active_tcp_commands_keep_rows_and_internal_reset_attribution(monkeypatch, tmp_path, command):
     transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1)
     commands = []
-    rows = [{"component_id": "robot", "entry": {"component_id": "tool", "target_id": "gripper", "frame_role_id": "tcp"},
+    rows = [{"component_id": "robot", "entry": {
+                "target": {"component_id": "tool", "command_target_id": "gripper"},
+                "frame": {"component_id": "tool", "frame_id": "tcp"}},
              "owner_epoch": "owner.1", "registration_generation": 2, "sequence": 3}]
-    response = {"api_version": "manyforge.execution_command_response.v1", "command": command,
+    response = {"api_version": "manyforge.execution_command_response.v4", "command": command,
                 "ok": True, "robots": rows}
     def exchange(_client, request, _socket_path):
         commands.append(request)
@@ -533,10 +543,12 @@ def test_active_tcp_commands_keep_rows_and_internal_reset_attribution(monkeypatc
 
 def test_runner_set_tcp_participant_strictly_round_trips():
     from manyforge_program_runner.execution_transport import _ProgramParticipant
-    body = {"component_role_id": "robot", "target_role_id": "arm",
+    body = {"target": {"component_id": "robot", "command_target_id": "arm"},
             "required_capability_id": "execution.trajectory.execute", "action_span": None,
             "execution_scope": {"node_instance_id": "set", "node_attempt_id": "attempt.1"},
-            "payload": {"kind": "set_tcp", "tcp": {"kind": "default_of_role", "role": "tool"}}}
+            "payload": {"kind": "set_tcp", "tcp": {
+                "kind": "default_of_target",
+                "target": {"component_id": "tool", "command_target_id": "gripper"}}}}
     assert _ProgramParticipant.model_validate(body).model_dump(mode="json") == body
     body["payload"]["tcp"] = {"target_role_id": "tool", "frame_role_id": "tcp"}
     with pytest.raises(ValidationError):
@@ -565,7 +577,7 @@ def test_admitted_immediate_failure_preserves_confirmed_active_tcp(monkeypatch, 
 
 @pytest.mark.parametrize("outcome", ["succeeded", "failed", "unknown", "refused"])
 def test_program_output_write_is_the_manual_set_io_output_command(monkeypatch, tmp_path, outcome):
-    """CONTRACTS §7: one write path. The Program sends the same command as a
+    """One write path. The Program sends the same command as a
     manual write, once; refusals and failed/unknown results keep their code."""
 
     from manyforge_behavior.kernel_client import IoOutputWriteFailedError, KernelClient

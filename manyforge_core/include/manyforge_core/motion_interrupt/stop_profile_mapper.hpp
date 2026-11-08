@@ -14,7 +14,7 @@ namespace manyforge::core {
 /// Cold profile resolution at load: requires the explicit jerk choice, fills
 /// the default deceleration time (as main), and freezes only authored jerk
 /// limits. Missing jerk limits are derived per Stop phase at Stop time with
-/// main's formula (decision Q36), where the lane's lead-in is known.
+/// main's formula, where the lane's lead-in is known.
 [[nodiscard]] Result<MotionInterruptStopProfileDTO> resolve_motion_interrupt_stop_jerk_limits(
     const MotionInterruptStopProfileDTO& profile);
 
@@ -47,7 +47,7 @@ map_motion_interrupt_stop_profile_to_contract_parameters(
 /// provider-contract stage. The deployment contract is resource-addressed;
 /// the portable execution contract remains source-joint-addressed, so this is
 /// the one shared inverse projection used by every lane adapter.
-/// Q28/Q51: a robot's controlled-Stop deadline (from the Stop request)
+/// A robot's controlled-Stop deadline (from the Stop request)
 /// computed at Stop time from its exact prepared contract parameters
 /// (`max_stop_time_s`, else deceleration time + 0.5 s); nullopt for a hard
 /// deceleration profile or unusable parameters (no controlled deadline).

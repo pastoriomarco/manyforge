@@ -1,19 +1,17 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Mock Lite6 automatic motion retry after a planning (IK) failure. The goal key starts unreachable; after 1.5 s a parallel branch writes a reachable goal, and a later automatic attempt (automatic_retries 3, delay 1.0 s) re-reads it and succeeds.",
   "members": {
-    "assignment.yaml": "sha256:f4dd3bfffcc14e0cb446f820e79e2405f4477ecbc470ca9fdc127dce17086e06",
     "deployment.yaml": "sha256:784f2d0a0d417c0378b1a3ea7435395a553639895416785ba6ef8c269ea5230f",
-    "program.yaml": "sha256:5ce7968d72c220f066cccbe62feef4a06a9ce3f13911cde17298eea4ed97e959"
+    "program.yaml": "sha256:542cd1a6c758c2a102b15bcca03e0f523dbb4f075a25695e56d4f41b1a7f4ec1"
   },
   "name": "mock_lite6_motion_retry",
   "saved_status": {
-    "checked_content_digest": "sha256:4b2af366cdf2228d05779874ab2951e4a8c92e67e18a37c83f7ad455836bd80d",
+    "checked_content_digest": "sha256:7efaffdfeb45855c772002c2ac92c7fa208af515f4d31849163f79f84720c2e9",
     "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },

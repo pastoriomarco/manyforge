@@ -25,7 +25,7 @@ API, `http://127.0.0.1:9020`.
 | Isaac moves abort with `aborted_path_tolerance` ("State tolerances failed for joint …") although the plan is slow | Isaac runs slower than real time (overloaded host); the arm controller runs on wall-clock time | See [§Isaac slower than real time](#isaac-slower-than-real-time) |
 | Isaac arm stays not prepared or offline | Controller not active, DDS isolation | See [§Isaac controller discovery failing](#isaac-controller-discovery-failing) below |
 | Real machine won't prepare; members show offline with `owner_unavailable` | Robot unreachable, wrong address key, site file not set | See [§Real robot does not connect](#real-robot-does-not-connect) below |
-| Machine fault `fault_estop` with C2 after an e-stop | Normal: the controller keeps the error until it is cleared | See [§Error left after an e-stop](#error-left-after-an-e-stop) below |
+| Machine e-stop with C2, before or after release | Normal: the controller keeps the error until it is cleared; it gates motion only | See [§Error left after an e-stop](#error-left-after-an-e-stop) below |
 | A component process dies with SIGSEGV (exit code -11) or aborts (exit code -6) while it is being stopped | Known Fast DDS 3.6.2 / rclcpp 32.0.x shutdown bugs; harmless to motion | See [§Component process crashes on shutdown](#component-process-crashes-on-shutdown) below |
 | Everything (components, Manager, Program state) goes stale for seconds at once on a Jetson | NVMe SSD lost an I/O completion (kernel waits 30 s) | See [§Everything goes stale for seconds at a time](#everything-goes-stale-for-seconds-at-a-time-jetson-nvme-stalls) below |
 | An I/O device faults with **Every sender of this I/O device's inputs has gone** (`io_device_senders_gone`) | The process publishing its inputs (PLC bridge, ROS I/O node) stopped or left the network | See [§I/O device senders gone](#io-device-senders-gone) below |
@@ -192,6 +192,9 @@ the cell; Enable, Activate and Execute stay available.
 
 **Cause**: ManyForge sees no fresh samples from the simulator. Either the
 simulation is paused or stopped, or the workbench does not reach Isaac at all.
+If the simulator component itself is unreachable, it stays Offline with
+`simulator_unreachable` and a warning; its state never latches the cell or
+blocks Execute. Robot and tool health still follows their own reported states.
 
 **Steps**:
 
@@ -224,16 +227,21 @@ machine. The full table is in
 
 ### Error left after an e-stop
 
-**Symptom**: after an emergency stop is released, the machine shows a fault
-such as `fault_estop` with vendor code C2 (the control box emergency input),
-and **Controller status** shows the error.
+**Symptom**: the machine shows an e-stop with vendor code C2 (the control
+box emergency input) and **Controller status** shows the error, before or
+after the e-stop is released.
 
-**Cause**: normal. The xArm controller keeps an error until it is cleared.
+**Cause**: normal. The xArm controller keeps an e-stop error until it is
+cleared. An e-stop gates motion only: Load, Prepare and Disable still work,
+and nothing is cleared until you ask for it.
 
-**Steps**: release the e-stop, **Recover** the machine (it clears the error
-with the motors off), then **Enable** the arm. If Recover fails with
-`robot_error_not_cleared`, the e-stop is still engaged. Servo errors
-(C10–C17) are not cleared by Recover: power-cycle the robot.
+**Steps**: release the e-stop, then either **Enable all** (it recovers the
+machine first, clearing the error with the motors off, then enables), **Recover
+and enable** the arm, or **Recover** the machine then **Enable**. If the clear
+fails with `robot_error_not_cleared` or `robot_estop_active`, the e-stop is
+still engaged. Enabling a member while its machine still reports the e-stop
+is refused with `owner_estop_active`. Servo errors (C10–C17) are not cleared
+by Recover: power-cycle the robot.
 
 ### Component process crashes on shutdown
 

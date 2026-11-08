@@ -44,7 +44,7 @@ enum class StopEvidenceItemStateDTO : std::uint8_t {
   kInapplicable,
 };
 
-/// Q51/Q53: the per-robot Stop-time values handed with one Stop stage. There
+/// The per-robot Stop-time values handed with one Stop stage. There
 /// is no shared cell-wide budget: each robot is checked against its own
 /// deadlines, computed by the Kernel at Stop time from its own profile.
 /// Durations are relative to the stage dispatch, so receivers translate them
@@ -52,14 +52,14 @@ enum class StopEvidenceItemStateDTO : std::uint8_t {
 struct RemainingStopBudgetDTO final {
   StopId stop_id;
   StopGeneration stop_generation;
-  /// Time since the Stop was accepted (Q28: deadlines run from the Stop
+  /// Time since the Stop was accepted (deadlines run from the Stop
   /// request).
   std::int64_t elapsed_since_stop_ns{};
-  /// Controlled stages only (Q28/Q51): the remaining time of this robot's own
+  /// Controlled stages only: the remaining time of this robot's own
   /// controlled-Stop deadline (`max_stop_time_s`, else deceleration time plus
-  /// `complete_move_on_signal_timeout`). Absent for hard stages (Q57: the
+  /// `complete_move_on_signal_timeout`). Absent for hard stages (the
   /// participant bounds them with its lane's stop-completion timeout) and for
-  /// fire-and-forget gripper cancels (Q58).
+  /// fire-and-forget gripper cancels.
   std::optional<std::int64_t> remaining_controlled_deadline_ns;
   /// Return-target timing only: age of original Kernel Stop ingress, captured
   /// after the executor queue. Relative duration, never a cross-clock stamp.

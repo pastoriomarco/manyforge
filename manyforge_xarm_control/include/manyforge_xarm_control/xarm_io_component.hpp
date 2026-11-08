@@ -99,9 +99,8 @@ struct XArmIoComponentConfig final {
   std::function<void()> pause{};
 };
 
-/// An I/O member of an xArm machine (controller I/O or tool I/O, CONTRACTS
-/// §16), on the pushed `xarm_io_states` stream its owner subscribes to (plan,
-/// "xArm I/O stream"; CONTRACTS §7).
+/// An I/O member of an xArm machine (controller I/O or tool I/O),
+/// on the pushed `xarm_io_states` stream its owner subscribes to.
 ///
 /// - Reading: each stream sample gives the bank's inputs (source `device`).
 /// - Writing, trusting the controller: `ret=0` and `ret=1` (a controller
@@ -117,7 +116,7 @@ struct XArmIoComponentConfig final {
 ///   than the reported one, is an outside change (`outside`).
 /// - A controller output with a controller function is read-only; a write is
 ///   refused before sending (`io_output_controller_owned`).
-/// - Writes come through the output-writer interface (CONTRACTS §6, §7);
+/// - Writes come through the output-writer interface;
 ///   outputs are digital, so a number is refused (`io_signal_type_mismatch`).
 /// - Prepare, Recover, Enable: a fresh stream sample within the lifecycle
 ///   command timeout (the stream starts with the owner's driver), else
@@ -148,7 +147,7 @@ public:
   /// One rich report's pin configuration (controller-owned outputs).
   void OnGpioModuleStatus(const XArmGpioModuleStatus &status);
 
-  /// The observed value of every declared signal (CONTRACTS §7 `SignalSample`).
+  /// The observed value of every declared signal (`SignalSample`).
   [[nodiscard]] std::vector<core::SignalSample> Samples(std::int64_t now_ns) const;
   /// Whether an output is controller-owned now (from the latest pin
   /// configuration); tool outputs never are.

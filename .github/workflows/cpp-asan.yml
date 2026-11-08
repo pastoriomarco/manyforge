@@ -16,8 +16,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dev-changed:
+    uses: ./.github/workflows/nightly-dev-changed.yml
+    permissions:
+      contents: read
+      actions: read
+
   image-cache:
     name: Build development image cache
+    needs: dev-changed
+    if: needs.dev-changed.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:

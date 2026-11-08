@@ -23,8 +23,100 @@ from manyforge_headless_api.models import (
     OperationRecoveryActionRequest,
     ProgramRunStopIntentRequest,
     StopIntentRequest,
+    RecoveryPreflightConfirmation,
 )
 from manyforge_headless_api.native import HeadlessApiError
+
+
+def test_recover_enable_preflight_and_confirmation_forward_exact_native_values(monkeypatch, tmp_path):
+    client = ExecutionCommandClient(tmp_path)
+    commands = []
+    preflight = {"snapshot_id": "native-snapshot", "components": [
+        {"component_id": "machine", "cause": {"code": "estop", "message": "E-stop",
+         "vendor_code": "C2", "clearable": True, "operator_action": "recover", "concerns": ["arm"]},
+         "stop": {"code": "estop", "message": "E-stop", "since_ns": 1, "vendor_code": "C2"}, "eligibility": "recover"},
+        {"component_id": "arm", "owner_id": "machine", "cause": None, "eligibility": "ready"},
+    ]}
+    def exchange(command):
+        commands.append(command)
+        if command["command"] == "component_recovery_preflight":
+            return {"ok": True, "command": command["command"], "preflight": preflight}
+        return {"ok": True, "command": "component_action", "accepted": {"action": "enable"}}
+    monkeypatch.setattr(client, "_exchange_control", exchange)
+    assert client.component_recovery_preflight("arm")["preflight"] == preflight
+    confirmation = {"snapshot_id": "native-snapshot", "confirmed": [
+        {"component_id": "machine", "cause_code": "estop", "vendor_code": "C2", "stop_code": "estop", "stop_vendor_code": "C2", "eligibility": "recover"},
+        {"component_id": "arm", "cause_code": None, "vendor_code": None, "stop_code": None, "stop_vendor_code": None, "eligibility": "ready"},
+    ]}
+    assert RecoveryPreflightConfirmation.model_validate(confirmation).model_dump(mode="json") == confirmation
+    client.component_recover_enable("arm", confirmation)
+    assert commands == [
+        {"api_version": "manyforge.execution_command.v3", "command": "component_recovery_preflight",
+         "request": {"component_id": "arm"}},
+        {"api_version": "manyforge.execution_command.v3", "command": "component_action", "request": {
+            "component_id": "arm", "action": "enable", "recovery_preflight": confirmation}},
+    ]
+
+
+@pytest.mark.parametrize("eligibility", ["blocked", "unknown", "excluded"])
+def test_recover_enable_rejects_non_actionable_confirmations(eligibility):
+    with pytest.raises(ValueError):
+        RecoveryPreflightConfirmation.model_validate({"snapshot_id": "snapshot", "confirmed": [
+            {"component_id": "arm", "cause_code": None, "vendor_code": None, "stop_code": None, "stop_vendor_code": None, "eligibility": eligibility},
+        ]})
+
+
+def test_unknown_member_requires_a_confirmed_recoverable_owner():
+    owner = {"component_id": "machine", "cause_code": "estop", "vendor_code": "C2",
+             "stop_code": "estop", "stop_vendor_code": "C2", "eligibility": "recover"}
+    member = {"component_id": "arm", "cause_code": None, "vendor_code": None,
+              "stop_code": None, "stop_vendor_code": None, "eligibility": "unknown"}
+    assert RecoveryPreflightConfirmation.model_validate({"snapshot_id": "snapshot", "confirmed": [owner, member]})
+    with pytest.raises(ValueError):
+        RecoveryPreflightConfirmation.model_validate({"snapshot_id": "snapshot", "confirmed": [dict(owner, eligibility="ready"), member]})
+
+
+@pytest.mark.parametrize("component", [
+    {"component_id": "other", "cause": None, "eligibility": "ready"},
+    {"component_id": "arm", "cause": None, "eligibility": "invented"},
+    {"component_id": "arm", "cause": None, "eligibility": "ready", "extra": True},
+])
+def test_recovery_preflight_rejects_wrong_or_malformed_native_projection(monkeypatch, tmp_path, component):
+    client = ExecutionCommandClient(tmp_path)
+    monkeypatch.setattr(client, "_exchange_control", lambda command: {
+        "ok": True, "command": "component_recovery_preflight",
+        "preflight": {"snapshot_id": "native-snapshot", "components": [component]},
+    })
+    with pytest.raises(HeadlessApiError) as exc:
+        client.component_recovery_preflight("arm")
+    assert exc.value.code == "execution_command_response_invalid"
+
+
+def test_recovery_preflight_keeps_simultaneous_fault_and_stop(monkeypatch, tmp_path):
+    client = ExecutionCommandClient(tmp_path)
+    row = {"component_id": "arm", "eligibility": "recover", "cause": {
+        "code": "communication", "message": "Fault", "clearable": True,
+        "operator_action": "recover", "concerns": [],
+    }, "stop": {"code": "estop", "message": "Stopped", "since_ns": 3, "vendor_code": "C2"}}
+    monkeypatch.setattr(client, "_exchange_control", lambda _command: {
+        "ok": True, "command": "component_recovery_preflight",
+        "preflight": {"snapshot_id": "native", "components": [row]},
+    })
+    assert client.component_recovery_preflight("arm")["preflight"]["components"] == [row]
+
+
+def test_recovery_preflight_rejects_stop_cause_without_stop_evidence(monkeypatch, tmp_path):
+    client = ExecutionCommandClient(tmp_path)
+    row = {"component_id": "arm", "eligibility": "recover", "cause": {
+        "code": "estop", "message": "Stopped", "clearable": True,
+        "operator_action": "recover", "concerns": [],
+    }}
+    monkeypatch.setattr(client, "_exchange_control", lambda _command: {
+        "ok": True, "command": "component_recovery_preflight",
+        "preflight": {"snapshot_id": "native", "components": [row]},
+    })
+    with pytest.raises(HeadlessApiError):
+        client.component_recovery_preflight("arm")
 
 
 def _event(owner_epoch: str, sequence: int) -> dict[str, Any]:
@@ -202,7 +294,7 @@ def _page(owner_epoch: str, events: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "operation_progress": [],
         "admission_generation": 1,
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "command": "events",
         "owner_epoch": owner_epoch,
         "execution_owner_ready": True,
@@ -216,7 +308,7 @@ def _page(owner_epoch: str, events: list[dict[str, Any]]) -> dict[str, Any]:
             "has_more": False,
             "next_after_sequence": events[-1]["sequence"] if events else 0,
             "owner_epoch": owner_epoch,
-            "schema_version": "manyforge.execution_event_page.v1",
+            "schema_version": "manyforge.execution_event_page.v2",
         },
         "ok": True,
     }
@@ -232,7 +324,7 @@ def test_execution_client_uses_exact_focused_projection_commands(
     def exchange(command: dict[str, Any]) -> dict[str, Any]:
         commands.append(command)
         return {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": command["command"],
             "ok": True,
         }
@@ -252,7 +344,7 @@ def test_execution_client_uses_exact_focused_projection_commands(
     client.diagnostics()
 
     assert commands == [
-        {"api_version": "manyforge.execution_command.v1", "command": command}
+        {"api_version": "manyforge.execution_command.v3", "command": command}
         for command in (
             "identity",
             "targets",
@@ -269,7 +361,7 @@ def test_execution_client_uses_exact_focused_projection_commands(
         client,
         "_exchange",
         lambda _command: {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": "status",
             "ok": True,
         },
@@ -368,7 +460,7 @@ def test_execution_client_requires_backend_residency_projection(
 ) -> None:
     client = ExecutionCommandClient(tmp_path)
     response = {
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "command": "read",
         "ok": True,
         "operation": {"operation_id": "operation.1"},
@@ -412,7 +504,7 @@ def test_execution_client_uses_internal_attribution_for_program_run_stop(
     def exchange(command: dict[str, Any]) -> dict[str, Any]:
         captured.update(command)
         return {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": "stop_program_run",
             "ok": True,
             "accepted": {
@@ -423,7 +515,7 @@ def test_execution_client_uses_internal_attribution_for_program_run_stop(
     monkeypatch.setattr(client, "_exchange_control", exchange)
     assert client.stop_program_run(request)["ok"] is True
     assert captured == {
-        "api_version": "manyforge.execution_command.v1",
+        "api_version": "manyforge.execution_command.v3",
         "attribution": {
             "transport": "internal",
             "assurance": "unverified",
@@ -452,7 +544,7 @@ def test_execution_client_reads_one_exact_internal_stop_status(
     def exchange(command: dict[str, Any]) -> dict[str, Any]:
         captured.update(command)
         return {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": "read_stop",
             "ok": True,
             "stop_status": {
@@ -470,7 +562,7 @@ def test_execution_client_reads_one_exact_internal_stop_status(
     monkeypatch.setattr(client, "_exchange_control", exchange)
     assert client.stop_status("stop.1")["stop_status"]["state"] == "succeeded"
     assert captured == {
-        "api_version": "manyforge.execution_command.v1",
+        "api_version": "manyforge.execution_command.v3",
         "attribution": {
             "transport": "internal",
             "assurance": "unverified",
@@ -480,7 +572,7 @@ def test_execution_client_reads_one_exact_internal_stop_status(
         "stop_id": "stop.1",
     }
 
-    # SX-2226: the additive terminal_projection string, one of three values.
+    # The additive terminal_projection string, one of three values.
     status: dict[str, Any] = {
         "request_id": "program-stop.1",
         "schema_version": "manyforge.execution_stop_status.v1",
@@ -489,7 +581,7 @@ def test_execution_client_reads_one_exact_internal_stop_status(
         "stop_id": "stop.1",
     }
     reply = {
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "command": "read_stop",
         "ok": True,
         "stop_status": status,
@@ -521,7 +613,7 @@ def test_execution_client_releases_one_exact_internal_program_run_fence(
     def exchange(command: dict[str, Any]) -> dict[str, Any]:
         captured.update(command)
         return {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": "release_program_run_stop_fence",
             "ok": True,
         }
@@ -532,7 +624,7 @@ def test_execution_client_releases_one_exact_internal_program_run_fence(
         is True
     )
     assert captured == {
-        "api_version": "manyforge.execution_command.v1",
+        "api_version": "manyforge.execution_command.v3",
         "attribution": {
             "transport": "internal",
             "assurance": "unverified",
@@ -583,7 +675,7 @@ def test_execution_client_projects_scoped_and_full_stop_commands(
         control_commands.append(command)
         malformed = command["command"] == "malformed_stop"
         return {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "accepted": {
                 "request_id": (
                     command["request_id"] if malformed else context["request_id"]
@@ -644,14 +736,14 @@ def _direct_motion_request() -> OperationIntentRequest:
             "expected_scene_revision": None,
             "participants": [
                 {
-                    "component_role_id": "controlled_component",
-                    "target_role_id": "command_target",
+                    "target": {"component_id": "controlled_component",
+                               "command_target_id": "command_target"},
                     "required_capability_id": "execution.trajectory.execute",
                     "action_span": None,
                     "payload": {
                         "kind": "motion",
                         "move_id": "robot-control-preview-request-1",
-                        "base_frame_role_id": "base",
+                        "base_frame": {"component_id": "controlled_component", "frame_id": "base"},
                         "tcp_endpoint": {"kind": "current"},
                         "tolerances": {
                             "joint_position_tol_rad": 0.05,
@@ -695,7 +787,7 @@ def _preview_response(operation: dict[str, Any]) -> dict[str, Any]:
             "revision_id": 4,
         },
         "commit_eligible": True,
-        "component_role_id": "controlled_component",
+        "target": copy.deepcopy(operation["participants"][0]["target"]),
         "final_positions_rad": [0.2],
         "final_tcp_pose": {
             "position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.4},
@@ -718,20 +810,43 @@ def _preview_response(operation: dict[str, Any]) -> dict[str, Any]:
             "revision_id": 3,
             "content_hash": "sha256:" + "2" * 64,
         },
-        "schema_version": "manyforge.direct_control_motion_preview.v1",
+        "schema_version": "manyforge.direct_control_motion_preview.v4",
+        "resolved_tcp": {
+            "entry": {
+                "target": {"component_id": "robot", "command_target_id": "arm"},
+                "frame": {"component_id": "robot", "frame_id": "flange"},
+            },
+            "source": "active_tcp", "owner_epoch": "owner-1",
+            "registration_generation": 1, "sequence": 0,
+        },
+        "path_preview": _bounded_motion_path(),
         "source_joint_names": ["joint1"],
         "start_positions_rad": [0.0],
-        "target_role_id": "command_target",
     }
     receipt["receipt_digest"] = (
         "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
     )
     return {
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "command": "preview_motion",
         "ok": True,
         "preview_receipt": receipt,
     }
+
+
+def test_motion_request_keeps_mounted_tcp_owner_and_direct_frame() -> None:
+    value = _direct_motion_request().model_dump(mode="json")
+    motion = value["participants"][0]["payload"]
+    motion["tcp_endpoint"] = {
+        "kind": "entry",
+        "target": {"component_id": "robot", "command_target_id": "arm"},
+        "frame": {"component_id": "tool", "frame_id": "tcp"},
+    }
+    parsed = OperationIntentRequest.model_validate(value).model_dump(mode="json")
+    assert parsed["participants"][0]["payload"]["tcp_endpoint"] == motion["tcp_endpoint"]
+    from manyforge_headless_api.models import ComponentFrameReferenceRequest
+    frame = {"type": "component_frame", "frame": {"component_id": "tool", "frame_id": "tcp"}}
+    assert ComponentFrameReferenceRequest.model_validate(frame).model_dump() == frame
 
 
 def _direct_command_request() -> OperationIntentRequest:
@@ -763,7 +878,7 @@ def _command_preview_response(operation: dict[str, Any]) -> dict[str, Any]:
         "command_schema_id": "gripper.command_position",
         "command_schema_revision": "sha256:gripper-schema",
         "commit_eligible": True,
-        "component_role_id": "controlled_component",
+        "target": copy.deepcopy(operation["participants"][0]["target"]),
         "coordinate_kind": "linear_m",
         "graph_revision": "sha256:graph",
         "intent_digest": (
@@ -779,17 +894,16 @@ def _command_preview_response(operation: dict[str, Any]) -> dict[str, Any]:
         "request_owner_epoch": "owner-1",
         "required_capability_id": "tool.gripper.command",
         "retained_bundle_id": "sha256:bundle",
-        "schema_version": ("manyforge.direct_control_capability_command_preview.v1"),
+        "schema_version": ("manyforge.direct_control_capability_command_preview.v2"),
         "source_coordinate_name": "finger_joint",
         "source_kind": "model_role",
         "target_position": 0.03,
-        "target_role_id": "command_target",
     }
     receipt["receipt_digest"] = (
         "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
     )
     return {
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "command": "preview_capability_command",
         "ok": True,
         "preview_receipt": receipt,
@@ -823,7 +937,7 @@ def test_manual_handover_query_is_one_bounded_shape_checked_read(
         captured.append(command)
         operation = command["operation"]
         result = {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": "read_manual_handover",
             "ok": True,
             "availability": {
@@ -1041,6 +1155,18 @@ def test_execution_client_verifies_capability_command_preview_receipt(
     assert captured["command"] == "preview_capability_command"
     assert response["preview_receipt"]["target_position"] == 0.03
 
+    def wrong_target(command: dict[str, Any]) -> dict[str, Any]:
+        response = _command_preview_response(command["operation"])
+        receipt = response["preview_receipt"]
+        receipt["target"]["component_id"] = "other"
+        receipt.pop("receipt_digest")
+        receipt["receipt_digest"] = "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
+        return response
+
+    monkeypatch.setattr(client, "_exchange", wrong_target)
+    with pytest.raises(HeadlessApiError):
+        client.preview_capability_command(request, trusted_principal_id=None)
+
     def component_local(command: dict[str, Any]) -> dict[str, Any]:
         response = _command_preview_response(command["operation"])
         receipt = response["preview_receipt"]
@@ -1107,7 +1233,7 @@ class _RecordingCore:
 
 class _PagedExecution:
     def subscribe_events(self, after_cursor: int, owner_epoch: str | None):
-        # The pump reads the subscription only (contract §8.1).
+        # The pump reads the subscription only.
         return paged_subscription(self, after_cursor, owner_epoch)
 
     def __init__(self) -> None:
@@ -1119,7 +1245,7 @@ class _PagedExecution:
 
     def identity(self) -> dict[str, Any]:
         return {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": "identity",
             "ok": True,
             "identity": {"owner_epoch": self.owner_epoch},
@@ -1146,7 +1272,7 @@ class _PagedExecution:
             "has_more": False,
             "next_after_sequence": after_sequence or 1,
             "owner_epoch": owner_epoch,
-            "schema_version": "manyforge.execution_event_page.v1",
+            "schema_version": "manyforge.execution_event_page.v2",
         }
 
 
@@ -1183,13 +1309,13 @@ class _StreamingExecution(_PagedExecution):
             "has_more": len(available) > len(events),
             "next_after_sequence": next_sequence,
             "owner_epoch": owner_epoch,
-            "schema_version": "manyforge.execution_event_page.v1",
+            "schema_version": "manyforge.execution_event_page.v2",
         }
 
 
 class _IdleExecution:
     def subscribe_events(self, after_cursor: int, owner_epoch: str | None):
-        # The pump reads the subscription only (contract §8.1).
+        # The pump reads the subscription only.
         return paged_subscription(self, after_cursor, owner_epoch)
 
     def __init__(
@@ -1208,7 +1334,7 @@ class _IdleExecution:
         details = {"owner_epoch": self.owner_epoch} if self.include_epoch else {}
         return {
             "admission_generation": self.admission_generation,
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": "identity",
             "error": {
                 "code": "execution_owner_not_ready",
@@ -1245,7 +1371,7 @@ class _RetiringExecution(_PagedExecution):
             return super().identity()
         return {
             "admission_generation": self.admission_generation,
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": "identity",
             "error": {
                 "code": "execution_owner_not_ready",
@@ -1317,7 +1443,7 @@ def test_event_pump_wakes_cold_state_when_kernel_admission_advances() -> None:
 
 
 def test_event_pump_wakes_cold_state_when_component_states_change() -> None:
-    # CONTRACTS §1: the host publishes a component state change as a stream
+    # The host publishes a component state change as a stream
     # `state` message without any journal row; it must reach `/ws/control`.
     class _ComponentExecution(_StreamingExecution):
         component_states: list[dict[str, Any]] = [
@@ -1357,7 +1483,7 @@ def test_event_pump_wakes_cold_state_when_component_states_change() -> None:
 
 
 def test_event_pump_wakes_cold_state_on_a_signal_value_not_its_age() -> None:
-    # CONTRACTS §7: I/O changes are pushed on `/ws/control`; the age that
+    # I/O changes are pushed on `/ws/control`; the age that
     # changes on every read wakes nothing.
     class _SignalExecution(_StreamingExecution):
         samples: list[dict[str, Any]] = [{"signal_id": "io/di0", "value": False,
@@ -1410,11 +1536,12 @@ def test_event_pump_wakes_cold_state_for_active_tcp_change() -> None:
     assert changed.wait(timeout=1.0)
     changed.clear()
     payload = {
-        "api_version": "manyforge.active_tcp_change.v1",
+        "api_version": "manyforge.active_tcp_change.v2",
         "owner_epoch": execution.owner_epoch,
         "component_id": "robot-a",
         "previous": None,
-        "entry": {"component_id": "robot-a", "target_id": "arm", "frame_role_id": "tcp"},
+        "entry": {"target": {"component_id": "robot-a", "command_target_id": "arm"},
+                  "frame": {"component_id": "tool-a", "frame_id": "tcp"}},
         "source": "robot_control",
         "offset_sent": True,
         "registration_generation": 1,
@@ -1434,11 +1561,20 @@ def test_event_pump_wakes_cold_state_for_active_tcp_change() -> None:
 def test_event_pump_logs_only_error_transitions(caplog) -> None:
     pump = ExecutionEventPump(_RecordingCore(), _StreamingExecution())
     error = HeadlessApiError("execution_command_unavailable", "host lost")
-    with caplog.at_level("INFO", logger="manyforge_headless_api.execution"):
+    logger = logging.getLogger("manyforge_headless_api.execution")
+    previous_level, previous_propagate = logger.level, logger.propagate
+    logger.addHandler(caplog.handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False  # Capture once regardless of parent logger setup.
+    try:
         assert pump._record_error(error)  # noqa: SLF001
         assert not pump._record_error(error)  # noqa: SLF001
         assert pump._record_error(None)  # noqa: SLF001
         assert not pump._record_error(None)  # noqa: SLF001
+    finally:
+        logger.removeHandler(caplog.handler)
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
     assert len(caplog.records) == 2
     assert "execution_command_unavailable" in caplog.records[0].message
     assert caplog.records[1].message == "Execution event pump recovered"
@@ -1538,7 +1674,7 @@ def test_progress_is_latest_only_bounded_and_quiet_when_unchanged() -> None:
 def test_event_pump_operation_semantic_cache_evicts_at_the_native_resident_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # R3: the change-detection memo is bounded by eviction, never refusal.
+    # The change-detection memo is bounded by eviction, never refusal.
     monkeypatch.setattr(
         "manyforge_headless_api.execution.MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS",
         1,
@@ -1588,7 +1724,7 @@ def test_event_pump_reconciles_typed_idle_owner_through_stable_events() -> None:
 
     assert pump.last_error is None
     # The idle owner is read once by the subscription, never polled; the
-    # pump keeps completing idle snapshots from the stream (contract §8.1).
+    # pump keeps completing idle snapshots from the stream.
     assert execution.status_calls == 1
     assert execution.events_calls >= 1
     assert len(core.completed_calls) >= 4
@@ -1664,7 +1800,7 @@ def test_event_pump_rejects_untyped_idle_owner_response() -> None:
         deadline.wait(0.01)
     pump.shutdown()
 
-    # The owner epoch comes only from the subscription's snapshot (§8.1): an
+    # The owner epoch comes only from the subscription's snapshot: an
     # owner that names none never connects, so nothing completes.
     assert pump.last_error is not None
     assert "execution_owner_unavailable" in pump.last_error
@@ -1722,7 +1858,7 @@ def test_event_pump_marks_a_lost_current_source_unknown() -> None:
     assert core.unknown.wait(timeout=1.0)
     pump.shutdown()
 
-    # A lost source is a lost subscription (§8.1).
+    # A lost source is a lost subscription.
     assert pump.last_error is not None
     assert "execution_owner_unavailable" in pump.last_error
 
@@ -1745,7 +1881,7 @@ def test_operation_settled_classifies_rest_states_and_terminal_stop() -> None:
 
 
 def test_event_pump_keeps_alarm_sources_current_on_every_iteration() -> None:
-    """The pump is the alarm-source refresh cadence (spec 530 §11).
+    """The pump is the alarm-source refresh cadence.
 
     It offers the refresh on every iteration, also while the execution owner
     is failing, and a failing refresh never degrades the operation feed.
@@ -1783,7 +1919,7 @@ def _recovery_response(retry_eligibility: object = "absent") -> dict[str, Any]:
     if retry_eligibility != "absent":
         assessment["retry_eligibility"] = retry_eligibility
     return {
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "command": "get_operation_recovery",
         "ok": True,
         "operation_revision": 3,
@@ -1897,7 +2033,7 @@ def test_recovery_action_request_is_serialized_with_the_native_ten_fields(
         commands.append(command)
         request = command["request"]
         return {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": "apply_operation_recovery",
             "ok": True,
             "result": {
@@ -1999,7 +2135,7 @@ def test_stable_event_readiness_tracks_active_idle_active_same_kernel() -> None:
     finally:
         pump.shutdown()
     assert pump.last_error is None
-    # Readiness follows the stream's state; the owner is read once (§8.1).
+    # Readiness follows the stream's state; the owner is read once.
     assert execution.identities == 1
     assert wakes == [True, False, True]
     assert len(core.ingested) == 1  # The same journal cursor survives mode changes.
@@ -2032,7 +2168,7 @@ def test_page_parse_errors_keep_runtime_fault_context_for_pump(
 
     class FailedExecution(_PagedExecution):
         """Streams the same malformed row with the same runtime fault: the
-        pump's page parse fails with the fault context (§8.1)."""
+        pump's page parse fails with the fault context."""
 
         def __init__(self) -> None:
             super().__init__()
@@ -2263,7 +2399,7 @@ def test_active_tcp_change_and_baseline_survive_events_reply(monkeypatch, tmp_pa
     owner_epoch = "execution-host.epoch.tcp"
     row = _event(owner_epoch, 1)
     row.update(record_kind="active_tcp_changed", operation_id=None, operation_revision=None,
-               request_id=None, payload={"api_version": "manyforge.active_tcp_change.v1",
+               request_id=None, payload={"api_version": "manyforge.active_tcp_change.v2",
                    "owner_epoch": owner_epoch, "component_id": "robot", "previous": None,
                    "entry": None, "source": "reset", "offset_sent": False,
                    "registration_generation": 1, "sequence": 1})
@@ -2283,9 +2419,11 @@ def test_active_tcp_change_and_baseline_survive_events_reply(monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize("payload", [
-    {"kind": "set_tcp", "tcp": {"kind": "entry", "entry": {
-        "component_id": "tool", "target_id": "gripper", "frame_role_id": "tcp"}}},
-    {"kind": "set_tcp", "tcp": {"kind": "default_of_role", "role": "tool"}},
+    {"kind": "set_tcp", "tcp": {"kind": "entry",
+        "target": {"component_id": "robot", "command_target_id": "arm"},
+        "frame": {"component_id": "tool", "frame_id": "tcp"}}},
+    {"kind": "set_tcp", "tcp": {"kind": "default_of_target",
+        "target": {"component_id": "tool", "command_target_id": "gripper"}}},
 ])
 def test_public_execution_submit_forwards_set_tcp_and_attribution(monkeypatch, tmp_path, payload):
     from manyforge_headless_api.tests.test_models import _planning_operation
@@ -2302,3 +2440,302 @@ def test_public_execution_submit_forwards_set_tcp_and_attribution(monkeypatch, t
     assert client.submit(request, trusted_principal_id="operator.1")["active_tcp"] == rows
     assert commands[0]["operation"]["participants"][0]["payload"] == payload
     assert commands[0]["attribution"] == {"transport": "http", "assurance": "externally_authenticated", "principal_id": "operator.1"}
+
+
+def _bounded_motion_path() -> dict[str, Any]:
+    return {
+        "source_joint_names": ["joint1"],
+        "pairs": [{"body_a": "component/arm/model/arm/body/link/collision/0",
+                   "body_b": "scene/wall/shape/0"}],
+        "samples": [
+            {"time_from_start_s": 0.0, "positions_rad": [0.0], "contacts": [], "status": "checked"},
+            {"time_from_start_s": 1.0, "positions_rad": [0.2],
+             "contacts": [{"pair_index": 0, "disposition": "refused"}], "status": "checked"},
+        ],
+    }
+
+
+def _v2_preview_response(operation: dict[str, Any]) -> dict[str, Any]:
+    response = _preview_response(operation)
+    receipt = response["preview_receipt"]
+    receipt["schema_version"] = "manyforge.direct_control_motion_preview.v4"
+    receipt["path_preview"] = _bounded_motion_path()
+    receipt.pop("receipt_digest")
+    receipt["receipt_digest"] = "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
+    return response
+
+
+def test_motion_preview_v4_validates_shape_and_digest(monkeypatch, tmp_path):
+    client = ExecutionCommandClient(tmp_path)
+    request = _direct_motion_request()
+    for factory in (_preview_response, _v2_preview_response):
+        monkeypatch.setattr(client, "_exchange", lambda command: factory(command["operation"]))
+        assert client.preview_motion(request, trusted_principal_id=None)["ok"] is True
+    def tampered(command):
+        response = _v2_preview_response(command["operation"])
+        response["preview_receipt"]["path_preview"]["samples"][1]["positions_rad"] = [0.3]
+        return response
+    monkeypatch.setattr(client, "_exchange", tampered)
+    with pytest.raises(HeadlessApiError, match="digest"):
+        client.preview_motion(request, trusted_principal_id=None)
+
+
+def test_motion_preview_v4_tcp_snapshot_is_closed_and_digest_bound(monkeypatch, tmp_path):
+    client = ExecutionCommandClient(tmp_path)
+    request = _direct_motion_request()
+    def response_with(source):
+        def exchange(command):
+            response = _preview_response(command["operation"])
+            receipt = response["preview_receipt"]
+            receipt["resolved_tcp"]["source"] = source
+            receipt.pop("receipt_digest")
+            receipt["receipt_digest"] = "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
+            return response
+        return exchange
+    for source in ("active_tcp", "joint_flange_fallback"):
+        monkeypatch.setattr(client, "_exchange", response_with(source))
+        assert client.preview_motion(request, trusted_principal_id=None)["preview_receipt"]["resolved_tcp"]["source"] == source
+
+    payload = request.model_dump(mode="json")
+    payload["participants"][0]["payload"]["tcp_endpoint"] = {
+        "kind": "entry",
+        "target": {"component_id": "robot", "command_target_id": "arm"},
+        "frame": {"component_id": "robot", "frame_id": "flange"},
+    }
+    monkeypatch.setattr(client, "_exchange", response_with("explicit_entry"))
+    explicit = client.preview_motion(OperationIntentRequest.model_validate(payload), trusted_principal_id=None)
+    assert explicit["preview_receipt"]["resolved_tcp"]["source"] == "explicit_entry"
+
+    payload["participants"][0]["payload"]["tcp_endpoint"]["frame"]["frame_id"] = "other"
+    with pytest.raises(HeadlessApiError) as mismatch:
+        client.preview_motion(OperationIntentRequest.model_validate(payload), trusted_principal_id=None)
+    assert mismatch.value.code == "execution_command_response_invalid"
+
+    def tampered(command):
+        response = _preview_response(command["operation"])
+        response["preview_receipt"]["resolved_tcp"]["entry"]["frame"]["frame_id"] = "different_tcp"
+        return response
+    monkeypatch.setattr(client, "_exchange", tampered)
+    with pytest.raises(HeadlessApiError, match="digest"):
+        client.preview_motion(request, trusted_principal_id=None)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda tcp: tcp.update(extra=True),
+    lambda tcp: tcp.pop("sequence"),
+    lambda tcp: tcp.update(source="other"),
+    lambda tcp: tcp.update(owner_epoch="other-owner"),
+    lambda tcp: tcp.update(registration_generation=0),
+    lambda tcp: tcp.update(registration_generation=True),
+    lambda tcp: tcp.update(sequence=-1),
+    lambda tcp: tcp.update(sequence=2**53),
+    lambda tcp: tcp["entry"]["frame"].update(extra=True),
+    lambda tcp: tcp["entry"]["target"].update(component_id=""),
+])
+def test_motion_preview_v4_rejects_invalid_tcp_snapshot(monkeypatch, tmp_path, mutation):
+    client = ExecutionCommandClient(tmp_path)
+    def exchange(command):
+        response = _preview_response(command["operation"])
+        receipt = response["preview_receipt"]
+        mutation(receipt["resolved_tcp"])
+        receipt.pop("receipt_digest")
+        try:
+            receipt["receipt_digest"] = "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
+        except rfc8785.CanonicalizationError:
+            # Out-of-domain integers cannot have a canonical digest.
+            receipt["receipt_digest"] = "sha256:" + "0" * 64
+        return response
+    monkeypatch.setattr(client, "_exchange", exchange)
+    with pytest.raises(HeadlessApiError) as error:
+        client.preview_motion(_direct_motion_request(), trusted_principal_id=None)
+    assert error.value.code == "execution_command_response_invalid"
+
+
+def test_motion_preview_v4_rejects_fallback_for_pose(monkeypatch, tmp_path):
+    client = ExecutionCommandClient(tmp_path)
+    payload = _direct_motion_request().model_dump(mode="json")
+    payload["participants"][0]["payload"]["motion"] = {
+        "kind": "pose_goal", "goal": {
+            "position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.4},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        },
+    }
+    request = OperationIntentRequest.model_validate(payload)
+    def exchange(command):
+        response = _preview_response(command["operation"])
+        response["preview_receipt"]["resolved_tcp"]["source"] = "joint_flange_fallback"
+        return response
+    monkeypatch.setattr(client, "_exchange", exchange)
+    with pytest.raises(HeadlessApiError) as error:
+        client.preview_motion(request, trusted_principal_id=None)
+    assert error.value.code == "execution_command_response_invalid"
+
+
+def test_motion_preview_rejects_old_receipt_without_tcp_snapshot(monkeypatch, tmp_path):
+    client = ExecutionCommandClient(tmp_path)
+    def exchange(command):
+        response = _preview_response(command["operation"])
+        receipt = response["preview_receipt"]
+        receipt["schema_version"] = "manyforge.direct_control_motion_preview.v3"
+        del receipt["resolved_tcp"]
+        return response
+    monkeypatch.setattr(client, "_exchange", exchange)
+    with pytest.raises(HeadlessApiError) as error:
+        client.preview_motion(_direct_motion_request(), trusted_principal_id=None)
+    assert error.value.code == "execution_command_response_invalid"
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda p: p.update(extra=True),
+    lambda p: p["samples"][0].update(time_from_start_s=float("nan")),
+    lambda p: p["samples"][1].update(time_from_start_s=0.0),
+    lambda p: p["samples"][0].update(positions_rad=[float("inf")]),
+    lambda p: p["samples"][0].update(positions_rad=[10**400]),
+    lambda p: p["samples"][1]["contacts"][0].update(pair_index=1),
+    lambda p: p["samples"][1]["contacts"][0].update(disposition="clear"),
+    lambda p: p["samples"][1]["contacts"].append(dict(p["samples"][1]["contacts"][0])),
+    lambda p: p["pairs"].append(dict(p["pairs"][0])),
+    lambda p: p["pairs"][0].update(body_a=""),
+    lambda p: p["pairs"][0].update(body_a="\ud800"),
+    lambda p: p.update(source_joint_names=["wrong"]),
+    lambda p: p["samples"].extend([dict(p["samples"][-1])] * 31),
+    lambda p: p["pairs"].extend([dict(p["pairs"][0])] * 64),
+    lambda p: p.update(source_joint_names=[f"j{i}" for i in range(257)]),
+])
+def test_motion_preview_v2_rejects_malformed_path(monkeypatch, tmp_path, mutation):
+    client = ExecutionCommandClient(tmp_path)
+    def exchange(command):
+        response = _v2_preview_response(command["operation"])
+        mutation(response["preview_receipt"]["path_preview"])
+        return response
+    monkeypatch.setattr(client, "_exchange", exchange)
+    with pytest.raises(HeadlessApiError) as error:
+        client.preview_motion(_direct_motion_request(), trusted_principal_id=None)
+    assert error.value.code == "execution_command_response_invalid"
+
+
+def _bounded_diagnostic():
+    path = _bounded_motion_path()
+    path.update(schema_version="manyforge.motion_preview_diagnostic.v2", kind="validated_path", reason="validation_collision")
+    for sample in path["samples"]:
+        sample["clearance_violations"] = []
+    return path
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda p: p.update(schema_version="v3"),
+    lambda p: p.update(kind="other"),
+    lambda p: p.update(reason=""),
+    lambda p: p["samples"][0].pop("clearance_violations"),
+    lambda p: p["samples"][0]["clearance_violations"].append({"pair_index": 1, "distance_m": .001, "required_clearance_m": .002}),
+    lambda p: p["samples"][0]["clearance_violations"].append({"pair_index": 0, "distance_m": .002, "required_clearance_m": .001}),
+    lambda p: p.update(kind="collision_disabled_ik_pose"),
+])
+def test_diagnostic_v2_strictly_rejects_malformed_evidence(mutation):
+    from manyforge_headless_api.execution import _motion_path_preview_valid
+    diagnostic = _bounded_diagnostic()
+    assert _motion_path_preview_valid(diagnostic, diagnostic=True)
+    mutation(diagnostic)
+    assert not _motion_path_preview_valid(diagnostic, diagnostic=True)
+
+
+def test_ik_diagnostic_path_requires_multiple_samples():
+    from manyforge_headless_api.execution import _motion_path_preview_valid
+    diagnostic = _bounded_diagnostic()
+    diagnostic["kind"] = "collision_disabled_ik_path"
+    assert len(diagnostic["samples"]) >= 2
+    assert _motion_path_preview_valid(diagnostic, diagnostic=True)
+    diagnostic["samples"] = diagnostic["samples"][:1]
+    assert not _motion_path_preview_valid(diagnostic, diagnostic=True)
+
+
+def test_failed_motion_preview_diagnostic_is_optional_and_never_a_receipt(monkeypatch, tmp_path):
+    client = ExecutionCommandClient(tmp_path)
+    request = _direct_motion_request()
+    error = {"code": "validation_collision", "message": "collision", "details": {}}
+    response = {"api_version": "manyforge.execution_command_response.v4", "ok": False,
+                "error": error, "diagnostic_preview": _bounded_diagnostic()}
+    monkeypatch.setattr(client, "_exchange", lambda _command: copy.deepcopy(response))
+    assert client.preview_motion(request, trusted_principal_id=None) == response
+    for invalid in (None, {**_bounded_diagnostic(), "receipt_digest": "forged"},
+                    {**_bounded_diagnostic(), "token": "forged"},
+                    {**_bounded_diagnostic(), "padding": "x" * (48 * 1024)}):
+        response["diagnostic_preview"] = invalid
+        result = client.preview_motion(request, trusted_principal_id=None)
+        assert result["ok"] is False and result["error"] == error
+        assert "diagnostic_preview" not in result and "preview_receipt" not in result
+    response["diagnostic_preview"] = _bounded_diagnostic()
+    response["preview_receipt"] = {"commit_eligible": True}
+    result = client.preview_motion(request, trusted_principal_id=None)
+    assert "diagnostic_preview" not in result and "preview_receipt" not in result and result["error"] == error
+
+
+def test_cartesian_diagnostic_failure_details_survive_execution_client(monkeypatch, tmp_path):
+    client = ExecutionCommandClient(tmp_path)
+    failure = {
+        "api_version": "manyforge.execution_command_response.v4",
+        "ok": False,
+        "error": {
+            "code": "cartesian_incomplete",
+            "message": "Cartesian solver failed",
+            "details": {
+                "reason": "cartesian_ik_failure",
+                "cartesian_collision_disabled_diagnostic": "failed",
+                "original_error_code": "cartesian_incomplete",
+            },
+        },
+    }
+    monkeypatch.setattr(client, "_exchange", lambda _command: copy.deepcopy(failure))
+    assert client.preview_motion(_direct_motion_request(), trusted_principal_id=None) == failure
+
+
+def test_motion_preview_path_limits_and_oversized_failure_preserves_error(monkeypatch, tmp_path):
+    from manyforge_headless_api.execution import _motion_path_preview_valid
+
+    names = [f"joint{i}" for i in range(256)]
+    path = {"source_joint_names": names,
+            "pairs": [{"body_a": f"component/arm/model/arm/body/link/collision/{i}",
+                       "body_b": "scene/wall/shape/0"} for i in range(64)],
+            "samples": [{"time_from_start_s": float(i), "positions_rad": [0.0] * 256,
+                         "contacts": [], "status": "unknown"} for i in range(32)]}
+    path["pairs"].sort(key=lambda pair: (pair["body_a"], pair["body_b"]))
+    assert _motion_path_preview_valid(path)
+    client = ExecutionCommandClient(tmp_path)
+    request = _direct_motion_request()
+    diagnostic = _bounded_diagnostic()
+    diagnostic["pairs"][0]["body_b"] = "scene/" + "a" * (48 * 1024) + "/shape/0"
+    failure = {"api_version": "manyforge.execution_command_response.v4", "ok": False,
+               "error": {"code": "validation_collision", "message": "collision", "details": {}},
+               "diagnostic_preview": diagnostic}
+    monkeypatch.setattr(client, "_exchange", lambda _command: copy.deepcopy(failure))
+    result = client.preview_motion(request, trusted_principal_id=None)
+    assert result == {key: value for key, value in failure.items() if key != "diagnostic_preview"}
+
+
+def test_motion_preview_rejects_unsupported_schema_and_oversized_v2(monkeypatch, tmp_path):
+    client = ExecutionCommandClient(tmp_path)
+    request = _direct_motion_request()
+    def exchange(command):
+        response = _v2_preview_response(command["operation"])
+        response["preview_receipt"]["path_preview"]["pairs"][0]["body_b"] = "scene/" + "a" * (48 * 1024) + "/shape/0"
+        return response
+    monkeypatch.setattr(client, "_exchange", exchange)
+    with pytest.raises(HeadlessApiError) as error:
+        client.preview_motion(request, trusted_principal_id=None)
+    assert error.value.code == "execution_command_response_invalid"
+    def unknown(command):
+        response = _preview_response(command["operation"])
+        response["preview_receipt"]["schema_version"] = "manyforge.direct_control_motion_preview.v2"
+        return response
+    monkeypatch.setattr(client, "_exchange", unknown)
+    with pytest.raises(HeadlessApiError) as error:
+        client.preview_motion(request, trusted_principal_id=None)
+    assert error.value.code == "execution_command_response_invalid"
+
+
+def test_motion_preview_accepts_unmapped_raw_body_identity():
+    from manyforge_headless_api.execution import _motion_path_preview_valid
+    path = _bounded_motion_path()
+    path["pairs"][0]["body_a"] = "custom raw body identity"
+    path["samples"][1]["contacts"][0]["disposition"] = "unknown"
+    assert _motion_path_preview_valid(path)

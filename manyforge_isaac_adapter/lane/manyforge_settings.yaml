@@ -1,4 +1,4 @@
-# ManyForge's Isaac lane settings (CONTRACTS §12, §14). Every value carries its
+# ManyForge's Isaac lane settings. Every value carries its
 # reason. Per-robot values are the models' `lanes.isaac` rows; per-scene pose
 # mappings are Scenario data (the pose source component and
 # `scene_pose_sources`).
@@ -24,12 +24,13 @@ hardware:
 # The controller manager's process settings (the values the Isaac lane ran
 # with before v2): no memory locking (a simulator host isn't a real-time
 # machine, and locking fails without the container's memlock limit) and the
-# stock real-time thread priority.
+# stock real-time thread priority. The strict real-time profile replaces
+# `lock_memory` with `true` on every lane (OD-59).
 controller_manager:
   lock_memory: "false"
   thread_priority: "50"
 
-# `reset_position` (RP-1b; the Mock lane's writer): a stock
+# `reset_position` (the Mock lane's writer): a stock
 # ForwardCommandController loaded inactive next to the arm's JTC. Reset
 # switches JTC off and the writer on, publishes the Deployment's initial pose
 # once, waits for the hardware to send it on `joint_commands_topic` (one
@@ -49,7 +50,7 @@ world_parent_frame: universe
 # Gripper transports (the tools' `lanes.isaac` rows pick one):
 # - isaac_joint_state_effort: effort on the row's command topic, no bridge
 #   (the Lite gripper's finger is driven by effort in the scene);
-# - ros_gripper_command: a GripperCommand bridge node in the tool's namespace,
+# - ros_gripper_command: a ParallelGripperCommand bridge node in the tool's namespace,
 #   with the row's `gripper_bridge` file from gripper_bridges/ (the Robotiq
 #   linkage needs mimic completion checks the bridge does).
 gripper:

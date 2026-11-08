@@ -168,11 +168,11 @@ export function draftEditUnavailableReason(
 }
 
 /**
- * Why New, Load or Close (CONTRACTS §11) is unavailable, or ``null``. A
+ * Why New, Load or Close is unavailable, or ``null``. A
  * finished or stopped run doesn't block them: the server Resets a run awaiting
- * Reset first and refuses a run in progress with its typed reason (R3, as M7).
+ * Reset first and refuses a run in progress with its typed reason.
  * A closed Kernel admission (a held claim) doesn't block them either: New
- * always works (R3), so the server decides and names any refusal. Only an
+ * always works, so the server decides and names any refusal. Only an
  * Apply in flight disables them (the caller's Manager gate).
  */
 export function scenarioReplacementUnavailableReason(
@@ -215,7 +215,7 @@ export function authoringUnavailableCause(
 /**
  * Owner-reported faults remain errors independently of the authoring gate.
  * A fault that first appears during a known controlled transition is its
- * expected, related gap (spec 450 §5.3); one present before it began, or one
+ * expected, related gap; one present before it began, or one
  * that outlasts it, stays an error.
  *
  * The functional-alarm component also reports `fault` when the reconciled

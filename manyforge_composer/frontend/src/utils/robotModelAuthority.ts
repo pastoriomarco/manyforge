@@ -4,7 +4,7 @@ const ACTUATED_TYPES = new Set(['revolute', 'prismatic', 'continuous']);
 
 /**
  * Resolve an explicit, qualified target-joint list against structural model
- * data. I6 owns the component/target mapping. Missing names, duplicates, fixed
+ * data. The component/target mapping lives elsewhere. Missing names, duplicates, fixed
  * joints, and implicit group fallbacks fail closed here.
  */
 export function modelJointsForQualifiedTarget(

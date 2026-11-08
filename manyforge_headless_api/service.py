@@ -28,6 +28,7 @@ from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     ActivationPreparationRequest,
+    ProgramReferenceValidationRequest,
     CallerAttributionRequest,
     ApplyOutcomeRequest,
     HistorianReconcileRequest,
@@ -58,6 +59,7 @@ from .models import (
     FullStopIntentRequest,
     OperationControlRequest,
     OperationIntentRequest,
+    ProgramTargetReferenceRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     RuntimeScaleControlRequest,
@@ -99,11 +101,11 @@ from .program_binding_projection import (
 
 RUNTIME_SNAPSHOT_VERSION = "manyforge.headless_runtime_snapshot.v1"
 MANAGER_SOURCE_VERSION = "manyforge.manager_source.v1"
-PROGRAM_RUN_INDEX_VERSION = "manyforge.program_run_index.v1"
+PROGRAM_RUN_INDEX_VERSION = "manyforge.program_run_index.v2"
 PROGRAM_NODE_PREVIEW_INTENT_VERSION = (
-    "manyforge.program_node_correction_preview_intent.v1"
+    "manyforge.program_node_correction_preview_intent.v2"
 )
-PROGRAM_NODE_PREVIEW_VERSION = "manyforge.program_node_correction_preview.v1"
+PROGRAM_NODE_PREVIEW_VERSION = "manyforge.program_node_correction_preview.v2"
 # What the native motion preview evaluates: it plans a trajectory from the
 # current observed start state and collision-validates it against the named
 # scene revision. It is not IK-only, not a reservation, and execution always
@@ -129,7 +131,7 @@ VOLATILE_MOTION_TRACE_MARGIN_BYTES = 1024
 VOLATILE_MOTION_TRACE_MAX_BYTES = 3 * 1024 * 1024
 # Below this remaining budget no useful trace fits; skip the native read.
 VOLATILE_MOTION_TRACE_MIN_ALLOWANCE_BYTES = 4096
-PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v3"
+PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v4"
 PROGRAM_RUN_CAPTURE_VERSION = "manyforge.program_run_capture.v2"
 SOURCE_MODEL_CONTEXT_VERSION = "manyforge.source_model_context.v1"
 ASSISTANT_MODE_CONTEXT_VERSION = "manyforge.assistant_mode_context.v1"
@@ -280,7 +282,7 @@ _RUN_END_DETAIL_FIELDS = frozenset(
 
 
 def _valid_run_end(value: object) -> bool:
-    """CONTRACTS §9 `{end_reason, details}`; absent while the run goes on."""
+    """`{end_reason, details}`; absent while the run goes on."""
 
     if value is None:
         return True
@@ -447,7 +449,7 @@ class HeadlessService:
         self.initial_scene_observer: Callable[[], None] | None = None
         self._node_previews_lock = Lock()
         self._node_previews_in_flight: set[tuple[str, str]] = set()
-        # One group action runs at a time (CONTRACTS §2); held by its thread.
+        # One group action runs at a time; held by its thread.
         self._group_action_lock = Lock()
         # Each Apply Headless forwards is followed to its committed outcome,
         # which wakes the Program runner (see apply_follower).
@@ -799,7 +801,7 @@ class HeadlessService:
             trusted_principal_id=attribution.principal_id,
         )
 
-    # Component model v2 (CONTRACTS §1, §2, §5, §7, §10) ------------------
+    # Component model v2 ------------------
 
     def component_model(self) -> ComponentModel:
         response = self._execution().component_model()
@@ -821,7 +823,7 @@ class HeadlessService:
         return self.component_model().signal_samples
 
     def run_readiness(self) -> dict[str, Any]:
-        """CONTRACTS §10: the one owner of RunReadiness."""
+        """The one owner of RunReadiness."""
 
         model = self.component_model()
         try:
@@ -867,6 +869,148 @@ class HeadlessService:
             raise
         return {"action": action}
 
+    def component_recovery_preflight(self, component_id: str) -> dict[str, Any]:
+        response = self._execution().component_recovery_preflight(component_id)
+        if response.get("ok") is not True:
+            raise self._action_refusal(response)
+        return response["preflight"]
+
+    def component_recover_enable(self, component_id: str, confirmation: dict[str, Any]) -> dict[str, Any]:
+        self._dispatch_recover_enable(component_id, confirmation)
+        return {"action": "enable"}
+
+    def _dispatch_recover_enable(self, component_id: str, confirmation: dict[str, Any]) -> int:
+        try:
+            response = self._execution().component_recover_enable(component_id, confirmation)
+        except HeadlessApiError as error:
+            record_activity(self.core, component_action_record(
+                component_id, "enable", "unknown",
+                {"code": error.code, "message": str(error)},
+            ))
+            raise
+        if response.get("ok") is not True:
+            refusal = self._action_refusal(response)
+            record_activity(self.core, component_action_record(
+                component_id, "enable", "refused", {"code": refusal.code, "message": str(refusal)},
+            ))
+            raise refusal
+        accepted = response.get("accepted")
+        if (not isinstance(accepted, dict) or accepted.get("component_id") != component_id
+                or accepted.get("action") != "enable"
+                or type(accepted.get("started_at_ns")) is not int
+                or accepted["started_at_ns"] < 0):
+            error = HeadlessApiError("execution_command_response_invalid", "recovery acceptance is malformed")
+            record_activity(self.core, component_action_record(
+                component_id, "enable", "unknown", {"code": error.code, "message": str(error)},
+            ))
+            raise error
+        return accepted["started_at_ns"]
+
+    def component_recover_enable_group(self, targets: list[dict[str, Any]]) -> dict[str, Any]:
+        """Use the native composite for each confirmed member; stop on uncertainty."""
+        states = self.component_model().component_states
+        order = group_action_order(states, "enable")
+        by_id = {target["component_id"]: target for target in targets}
+        missing = set(by_id) - set(order)
+        if missing:
+            component_id = sorted(missing)[0]
+            raise HeadlessApiError("component_not_found", f"component {component_id} is not in the cell")
+        selected = [component_id for component_id in order if component_id in by_id]
+        timeouts = lifecycle_timeouts_s(self.manager_graph()["cell_graph"])
+        owner_of = {s["component_id"]: s.get("owner_id") for s in states}
+        stop_generation = self._stop_generation()
+        logger = logging.getLogger(__name__)
+
+        def run() -> None:
+            try:
+                recovered_owners: set[str] = set()
+                for component_id in selected:
+                    if self._stop_generation() != stop_generation:
+                        return
+                    target = by_id[component_id]
+                    confirmed = target["recovery_preflight"]
+                    current = self.component_recovery_preflight(component_id)
+                    actual = [{"component_id": row["component_id"],
+                               "cause_code": (row["cause"] or {}).get("code"),
+                               "vendor_code": (row["cause"] or {}).get("vendor_code"),
+                               "stop_code": (row.get("stop") or {}).get("code"),
+                               "stop_vendor_code": (row.get("stop") or {}).get("vendor_code"),
+                               "eligibility": row["eligibility"]} for row in current["components"]]
+                    original = confirmed["confirmed"]
+                    owner_id = owner_of.get(component_id)
+                    owner_recovered = owner_id in recovered_owners if owner_id else False
+                    fact_keys = ("cause_code", "vendor_code", "stop_code", "stop_vendor_code")
+                    cleared_owner = (
+                        len(original) == 2 and len(actual) == 2 and owner_recovered
+                        and original[0]["component_id"] == owner_id
+                        and actual[0] == {"component_id": owner_id, "cause_code": None,
+                                          "vendor_code": None, "stop_code": None,
+                                          "stop_vendor_code": None, "eligibility": "ready"}
+                        and original[1]["component_id"] == actual[1]["component_id"]
+                        and actual[1]["eligibility"] in ("ready", "recover")
+                        and (all(actual[1][key] == original[1][key] for key in fact_keys)
+                             or all(actual[1][key] is None for key in fact_keys))
+                    )
+                    if (owner_recovered and not cleared_owner) or (not owner_recovered and actual != original):
+                        logger.warning("component_recovery_confirmation_changed", extra={"component_id": component_id})
+                        record_activity(self.core, component_action_record(
+                            component_id, "enable", "refused", {
+                                "code": "component_recovery_confirmation_changed",
+                                "message": "Recovery facts changed; review and confirm them again.",
+                            },
+                        ))
+                        return
+                    dispatched = {"snapshot_id": current["snapshot_id"], "confirmed": actual}
+                    before = next((s for s in self.component_model().component_states
+                                   if s["component_id"] == component_id), None)
+                    if before is None:
+                        return
+                    previous = before.get("last_action")
+                    started = self._dispatch_recover_enable(component_id, dispatched)
+                    if previous is not None and previous.get("started_at_ns") == started:
+                        logger.warning("component_recovery_outcome_unknown", extra={"component_id": component_id})
+                        return
+                    owner = owner_of.get(component_id)
+                    member_timeout = timeouts.get(component_id, DEFAULT_LIFECYCLE_TIMEOUT_S)
+                    owner_timeout = timeouts.get(owner, DEFAULT_LIFECYCLE_TIMEOUT_S) if owner else 0.0
+                    deadline = time.monotonic() + 2 * member_timeout + owner_timeout
+                    while True:
+                        state = next((s for s in self.component_model().component_states
+                                      if s["component_id"] == component_id), None)
+                        if state is None or self._stop_generation() != stop_generation:
+                            return
+                        result = state.get("last_action")
+                        if result and result.get("started_at_ns") == started and "action" not in state:
+                            if result.get("action") != "enable" or result.get("outcome") != "succeeded":
+                                return
+                            expected_phases = [
+                                (row["component_id"], "recover") for row in actual
+                                if row["eligibility"] == "recover"
+                            ] + [(component_id, "enable")]
+                            phases = result.get("phases")
+                            if (not isinstance(phases, list) or
+                                    [(p.get("component_id"), p.get("action")) for p in phases if isinstance(p, dict)] != expected_phases or
+                                    any(not isinstance(p, dict) or p.get("outcome") != "succeeded" for p in phases)):
+                                logger.warning("component_recovery_phases_invalid", extra={"component_id": component_id})
+                                return
+                            if (owner_id and actual[0]["component_id"] == owner_id
+                                    and actual[0]["eligibility"] == "recover"):
+                                recovered_owners.add(owner_id)
+                            break
+                        if time.monotonic() >= deadline:
+                            logger.warning("component_recovery_outcome_unknown", extra={"component_id": component_id})
+                            return
+                        time.sleep(0.1)
+            except HeadlessApiError as error:
+                logger.warning("component_recovery_group_refused", extra={"error_code": error.code})
+            finally:
+                self._group_action_lock.release()
+
+        if not self._group_action_lock.acquire(blocking=False):
+            raise HeadlessApiError("component_action_in_progress", "A group action is still running; wait for it to finish")
+        Thread(target=run, name="component-recover-enable-group", daemon=True).start()
+        return {"action": "enable"}
+
     def _stop_generation(self) -> Any:
         """The cell's Stop generation; it changes with every new Stop."""
 
@@ -875,11 +1019,16 @@ class HeadlessService:
         return stop.get("expected_stop_generation") if isinstance(stop, dict) else None
 
     def component_actions(self, action: str, component_ids: list[str]) -> dict[str, Any]:
-        """One action on the named components, one at a time (CONTRACTS §2).
+        """One action on the named components, one at a time.
 
         Order: `prepare` runs owners before their members, `disable`,
         `power_off` and `reboot` run members before their owner, anything
-        else keeps cell order (`group_action_order`). Each action is
+        else keeps cell order (`group_action_order`). `enable` first prepares
+        a target that isn't prepared (its machine first, when that isn't
+        prepared either) and recovers a target's machine that reports an
+        e-stop (the explicit clear), and a machine's `recover` then prepares its members
+        that aren't prepared, so Enable all after an e-stop or a failed Load
+        brings every component up. Each action is
         dispatched after the previous one finished, bounded as the host bounds
         it (`action_wait_s`): the component's authored lifecycle timeout from
         the active cell graph; a `prepare` of a component with no action since
@@ -909,6 +1058,33 @@ class HeadlessService:
         previous = {
             state["component_id"]: state.get("last_action") for state in states
         }
+        lifecycle = {state["component_id"]: state.get("lifecycle") for state in states}
+        stopped = {state["component_id"] for state in states if state.get("stop") is not None}
+
+        def unprepared(component_id: str) -> bool:
+            return lifecycle.get(component_id) in ("not_prepared", "offline")
+
+        steps: list[tuple[str, str]] = []
+        for component_id in selected:
+            owner = owner_of.get(component_id)
+            if action == "enable" and owner is not None and owner in stopped \
+                    and (owner, "recover") not in steps:
+                # Enable all is the explicit clear of a machine's latched
+                # e-stop error: its Recover first (refused typed while the
+                # e-stop stays, and then its members aren't tried).
+                steps.append((owner, "recover"))
+            if action == "enable" and unprepared(component_id):
+                if owner is not None and unprepared(owner) and (owner, "prepare") not in steps \
+                        and (owner, "recover") not in steps:
+                    steps.append((owner, "prepare"))
+                steps.append((component_id, "prepare"))
+            steps.append((component_id, action))
+            if action == "recover":
+                steps.extend(
+                    (member, "prepare") for member in order
+                    if owner_of.get(member) == component_id and unprepared(member)
+                    and member not in selected
+                )
         timeouts = lifecycle_timeouts_s(self.manager_graph()["cell_graph"])
         launch_bound_s = launch_settle_bound_s(
             timeouts.get(component_id, DEFAULT_LIFECYCLE_TIMEOUT_S) for component_id in order
@@ -927,36 +1103,39 @@ class HeadlessService:
 
         def run_group() -> None:
             failed_owners: set[str] = set()
-            for component_id in selected:
+            for component_id, step_action in steps:
                 if self._stop_generation() != stop_generation:
                     logger.warning(
                         "component_group_action_stopped",
-                        extra={"component_id": component_id, "action": action,
+                        extra={"component_id": component_id, "action": step_action,
                                "error_code": "component_action_interrupted_by_stop"},
                     )
                     return
+                # A target whose own prepare failed isn't enabled either.
+                if component_id in failed_owners and step_action == action:
+                    continue
                 if owner_of.get(component_id) in failed_owners:
                     logger.warning(
                         "component_group_action_step_skipped",
-                        extra={"component_id": component_id, "action": action,
+                        extra={"component_id": component_id, "action": step_action,
                                "error_code": "owner_not_prepared"},
                     )
                     record_activity(self.core, component_action_record(
-                        component_id, action, "refused",
+                        component_id, step_action, "refused",
                         {"code": "owner_not_prepared",
                          "message": f"{component_id} wasn't tried: its machine "
-                         f"{owner_of[component_id]} didn't prepare"},
+                         f"{owner_of[component_id]} didn't prepare or recover"},
                     ))
                     continue
                 try:
-                    self.component_action(component_id, action)
+                    self.component_action(component_id, step_action)
                     result = wait_for_action(
                         read_states,
                         component_id,
-                        action,  # type: ignore[arg-type]
+                        step_action,  # type: ignore[arg-type]
                         previous[component_id],
                         timeout_s=action_wait_s(
-                            action,
+                            step_action,
                             timeouts.get(component_id, DEFAULT_LIFECYCLE_TIMEOUT_S),
                             launch_bound_s,
                             # The host starts a launched component without a
@@ -969,14 +1148,16 @@ class HeadlessService:
                         "component_group_action_step_refused",
                         extra={
                             "component_id": component_id,
-                            "action": action,
+                            "action": step_action,
                             "error_code": error.code,
                         },
                     )
                     result = None
+                if result is not None:
+                    previous[component_id] = result
                 if result is not None and result.get("outcome") == "succeeded":
                     continue
-                if action == "prepare":
+                if step_action in ("prepare", "recover"):
                     failed_owners.add(component_id)
                 error_code = (result or {}).get("error", {}).get("code")
                 if error_code == "component_action_interrupted_by_stop":
@@ -1164,7 +1345,7 @@ class HeadlessService:
             "retained_bundle_id": active.get("retained_bundle_id"),
             "cell_graph": graph,
         }
-        # CP8 step 1: the Manager-derived simulator per ROS-hosted component.
+        # The Manager-derived simulator per ROS-hosted component.
         if "component_simulator_dependencies" in active:
             projection["component_simulator_dependencies"] = active[
                 "component_simulator_dependencies"
@@ -1263,7 +1444,7 @@ class HeadlessService:
         except HeadlessApiError as error:
             # Catalog authoring is independent of an Applied Program. Never
             # join a Runner offer when the local Applied identity is absent.
-            # A non-executable Applied Program (H1a) is not a Runner source
+            # A non-executable Applied Program is not a Runner source
             # either; authoring stays available and joins no Runner offer.
             if error.code in {
                 "program_applied_selection_not_found",
@@ -1787,7 +1968,7 @@ class HeadlessService:
                     return
                 # After submission, even a typed failure may follow partial Scene effects.
                 unknown = dispatched
-                # DX-3300: last confirmed arrival wins. Rare reordered RPC
+                # Last confirmed arrival wins. Rare reordered RPC
                 # replies can temporarily report an older outcome for this Apply.
                 self._initial_scene_failure = {
                     "identity": identity, "state": "unknown" if unknown else "failed",
@@ -1923,6 +2104,10 @@ class HeadlessService:
                       "details": {"reason": proof.get("reason"),
                           "resource_id": proof.get("resource_id"),
                           "refused": proof.get("refused", [])}}
+            if "cause_code" in proof:
+                reason["details"]["cause_code"] = proof["cause_code"]
+                if "cause_details" in proof:
+                    reason["details"]["cause_details"] = proof["cause_details"]
         return {"state": proof["state"], "remaining": proof["last_observed_remaining"],
                 "reason": reason}
 
@@ -2071,7 +2256,7 @@ class HeadlessService:
             calculated_policy_digest = None
         if (
             # `operation_failures` is always present (empty when none);
-            # `run_end` (CONTRACTS §9 ProgramRunEnd) once the run has ended.
+            # `run_end` (ProgramRunEnd) once the run has ended.
             set(projection) - {"run_end"} != expected_fields | {"operation_failures"}
             or not _valid_run_end(projection.get("run_end"))
             or projection.get("schema_version") != PROGRAM_RUN_STATUS_VERSION
@@ -2689,6 +2874,15 @@ class HeadlessService:
                 "program_runner_response_invalid",
                 "Program runner returned an invalid node-correction preview",
             )
+        target = built.get("target")
+        if target is not None:
+            try:
+                ProgramTargetReferenceRequest.model_validate(target)
+            except ValueError as error:
+                raise HeadlessApiError(
+                    "program_runner_response_invalid",
+                    "Program runner returned an invalid preview target",
+                ) from error
         result = {
             **{key: value for key, value in built.items() if key != "operation"},
             "schema_version": PROGRAM_NODE_PREVIEW_VERSION,
@@ -2719,8 +2913,8 @@ class HeadlessService:
             or intent.manual_handover is not None
             or participant.action_span is not None
             or participant.payload.kind != "motion"
-            or participant.target_role_id != target.get("target_role_id")
-            or participant.component_role_id != target.get("component_role_id")
+            or participant.target.component_id != target.get("component_id")
+            or participant.target.command_target_id != target.get("command_target_id")
             or participant.required_capability_id != "execution.trajectory.execute"
         ):
             raise HeadlessApiError(
@@ -2885,8 +3079,8 @@ class HeadlessService:
     def _with_kernel_attention(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         """Add the Kernel-held attention copy to an owner snapshot.
 
-        The owner's `reconciled` reaches the Kernel only up to `P + D` later
-        (spec 530 §11), and the Kernel admits by its held copy alone. The
+        The owner's `reconciled` reaches the Kernel only up to `P + D` later,
+        and the Kernel admits by its held copy alone. The
         `kernel_attention` member names that copy (owner epoch, generation,
         `reconciled`, `active_configuration`) as the Kernel last acknowledged
         it, or null when none is known to be current, so a client can wait
@@ -3194,23 +3388,36 @@ class HeadlessService:
             )
         return self.manager.preview_deployment_candidate(request)
 
+    def validate_program_references(self, request: ProgramReferenceValidationRequest) -> dict[str, Any]:
+        if self.activation_preparer is None:
+            raise HeadlessApiError("activation_preparer_unavailable", "Reference validation is not configured")
+        diagnostics = self.activation_preparer.validate_program_references(
+            deployment=request.deployment, model_source_closure=request.model_source_closure,
+            program=request.program, program_content_digest=request.program_content_digest,
+            draft=request.draft,
+        )
+        result = {"schema_version": "manyforge.program_reference_validation_response.v2",
+                  "workspace_generation": request.workspace_generation.model_dump(mode="json"),
+                  "program_content_digest": request.program_content_digest, **diagnostics}
+        actual_bytes = len(rfc8785.dumps(result))
+        bound_bytes = 16 * 1024 * 1024
+        if actual_bytes > bound_bytes:
+            raise HeadlessApiError("draft_candidate_response_too_large", "Draft candidate response exceeds its bound",
+                                   details={"bound_bytes": bound_bytes, "actual_bytes": actual_bytes})
+        return result
+
     def prepare_activation(self, request: ActivationPreparationRequest) -> dict[str, Any]:
         if self.activation_preparer is None:
             raise HeadlessApiError(
                 "activation_preparer_unavailable",
                 "Activation preparation is not configured",
             )
-        try:
-            admission = self._cell_admission().get()
-        except CellAdmissionError as error:
-            raise self._admission_error(error) from error
         # The request's admission generation is evidence only: preparation
-        # follows the current admission facts.
-        if admission.get("authoring_allowed") is not True:
-            raise HeadlessApiError(
-                "authoring_not_ready",
-                "Activation preparation requires the current idle admission",
-            )
+        # follows the current admission facts. A momentarily closed admission
+        # (a Reset's Idle reaching the Kernel, the committed Apply's initial
+        # Scene placement, a readiness transition) is waited for, within the
+        # floor of every Apply's bound (momentarily busy never fails a Load).
+        self._await_idle_admission()
         return {
             "prepared_activation": self.activation_preparer.prepare(
                 source_document_digest=request.source_document_digest,
@@ -3220,9 +3427,30 @@ class HeadlessService:
                 deployment=request.deployment,
                 model_source_closure=request.model_source_closure,
                 program=request.program,
-                program_role_assignment=request.program_role_assignment,
             )
         }
+
+    # The wait for idle admission: one default lifecycle timeout, the floor of
+    # every Apply's bound, which fits inside the callers' Headless HTTP timeout.
+    _ADMISSION_WAIT_S = DEFAULT_LIFECYCLE_TIMEOUT_S
+    _ADMISSION_POLL_S = 0.1
+
+    def _await_idle_admission(self) -> None:
+        deadline = time.monotonic() + self._ADMISSION_WAIT_S
+        while True:
+            try:
+                admission = self._cell_admission().get()
+            except CellAdmissionError as error:
+                raise self._admission_error(error) from error
+            if admission.get("authoring_allowed") is True:
+                return
+            if time.monotonic() >= deadline:
+                raise HeadlessApiError(
+                    "authoring_not_ready",
+                    "Activation preparation requires the current idle admission; "
+                    f"it didn't open within {self._ADMISSION_WAIT_S:g} s",
+                )
+            time.sleep(self._ADMISSION_POLL_S)
 
     def manager_apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
         response = self.manager.apply(request)

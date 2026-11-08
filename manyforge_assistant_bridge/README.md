@@ -33,7 +33,7 @@ Composer. Environment:
 | `MANYFORGE_COMPOSER_URL` | `http://127.0.0.1:9000` |
 | `MANYFORGE_ASSISTANT_BRIDGE_HOST` | `127.0.0.1` |
 | `MANYFORGE_ASSISTANT_BRIDGE_PORT` | `8100` |
-| `MANYFORGE_ASSISTANT_AUDIT_LOG` | `$XDG_STATE_HOME/manyforge/assistant-bridge-audit.jsonl` (10 MB x 3 files) |
+| `MANYFORGE_ASSISTANT_AUDIT_LOG` | `$XDG_STATE_HOME/manyforge/assistant-bridge-audit.jsonl` (10 MiB per file; active plus 3 backups, up to 4 files / 40 MiB total by default) |
 
 The model URL, model name and token variable come only from the Deployment;
 there is no environment override.

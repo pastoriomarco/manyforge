@@ -35,9 +35,10 @@ function quoted(value: string): string {
   return `'${value}'`;
 }
 
-function detailValue(value: string | number | boolean | null): string {
+function detailValue(value: string | number | boolean | Record<string, string> | null): string {
   if (value === null) return 'none';
   if (typeof value === 'boolean') return value ? 'yes' : 'no';
+  if (typeof value === 'object') return JSON.stringify(value);
   return String(value);
 }
 
@@ -74,9 +75,9 @@ export function structuredErrorRows(
   const referenceType = text('reference_type');
   if (referenceType !== null) {
     const referenceId = text('reference_id');
-    const targetRoleId = text('target_role_id');
+    const componentId = text('component_id');
     const value = `${referenceType}${referenceId === null ? '' : ` ${quoted(referenceId)}`}${
-      targetRoleId === null ? '' : ` of target role ${quoted(targetRoleId)}`}`;
+      componentId === null ? '' : ` of component ${quoted(componentId)}`}`;
     if (!messageNames(message, `reference ${value}`)) rows.push({ label: 'Reference', value });
   }
   const sourceKind = text('source_kind');

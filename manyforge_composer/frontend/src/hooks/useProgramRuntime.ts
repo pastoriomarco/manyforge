@@ -167,7 +167,7 @@ export interface ProgramSelectionPending {
 interface ProgramRuntimeState {
   applied: AppliedProgramSelection | null;
   /** The Applied Program is preserved but not executable in the active
-   * Deployment (H1a); derived on every refresh, never stored as a flag. */
+   * Deployment; derived on every refresh, never stored as a flag. */
   nonExecutable: AppliedProgramStatus | null;
   currentScenario: CurrentScenarioResponse | null;
   run: ProgramRunStatus | null;
@@ -188,9 +188,9 @@ interface ProgramRuntimeState {
 }
 
 /**
- * Runner commands whose per-command allowance the GUI reads (CONTRACTS §10):
+ * Runner commands whose per-command allowance the GUI reads:
  * Stop, Halt, Reset, runtime scale and blackboard writes, and the Runner's own
- * Run gate beside RunReadiness (as in M7).
+ * Run gate beside RunReadiness.
  */
 export type RunnerCommandKind =
   | 'program_run'
@@ -360,7 +360,7 @@ export function programPendingAfterProjection(
 
 /**
  * The Execute request for the Applied Program. Whether Execute is allowed is
- * the backend's `RunReadiness` (CONTRACTS §10); this only names what runs.
+ * the backend's `RunReadiness`; this only names what runs.
  */
 export function buildProgramStartRequest(
   applied: AppliedProgramSelection | null,
@@ -470,14 +470,14 @@ function runtimeScaleSelectorWire(
   return selector.kind === 'singular'
     ? {
       program_binding_id: selector.programBindingId,
-      component_role_id: selector.componentRoleId,
-      target_role_id: selector.targetRoleId,
+      component_id: selector.componentId,
+      command_target_id: selector.commandTargetId,
     }
     : {
       program_binding_id: selector.programBindingId,
       group_targets: selector.groupTargets.map((target) => ({
-        component_role_id: target.componentRoleId,
-        target_role_id: target.targetRoleId,
+        component_id: target.componentId,
+        command_target_id: target.commandTargetId,
       })),
     };
 }
@@ -592,7 +592,7 @@ export function useProgramRuntime(
   deploymentPending = false,
 ) {
   const [state, setState] = useState<ProgramRuntimeState>(INITIAL_STATE);
-  // The backend's run readiness and cell latch (CONTRACTS §5, §10), pushed on /ws/control.
+  // The backend's run readiness and cell latch, pushed on /ws/control.
   const cellState = useSyncExternalStore(
     controlSource?.subscribeCellState ?? subscribeNothing,
     controlSource?.getCellState ?? noCellState,
@@ -1348,8 +1348,8 @@ export function useProgramRuntime(
               error: errorMessage(reason, 'Group velocity could not be updated.'),
             },
         }));
-        // A refusal (e.g. a stale generation after an overlapping scope
-        // changed the same setting) means this row's status is outdated.
+        // A refusal (e.g. the control frozen while a Stop is active) means
+        // this row's status may be outdated.
         setGroupScaleRefreshSequence((current) => current + 1);
       }
     } finally {

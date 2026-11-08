@@ -75,7 +75,7 @@ std::int64_t Count(const CanonicalValue& object, std::string_view name) {
   return manyforge::content_identity::parse_nonnegative_int64(*object.find_object_member(name));
 }
 
-/// Q5 failure-capture soak invariant: every written row is exactly one of
+/// Failure-capture soak invariant: every written row is exactly one of
 /// retained-unprotected, capture-protected or pruned, and the capture budget
 /// and metadata never exceed their limits.
 void RequireCaptureInvariants(const CanonicalValue& retention, std::size_t written) {

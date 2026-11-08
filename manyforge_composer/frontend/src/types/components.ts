@@ -1,6 +1,6 @@
-// Component model v2 wire types (CONTRACTS §1, §2, §4, §5, §7, §9, §10, §11).
+// Component model v2 wire types.
 // Field names are the contract's, unchanged; the backend owns every value and
-// the GUI only presents it (R4).
+// the GUI only presents it.
 
 /** A typed error as it crosses every layer: a catalogue code and a message. */
 export interface CodedError {
@@ -17,22 +17,21 @@ export type ComponentActivity = typeof COMPONENT_ACTIVITIES[number];
 export const STREAM_FRESHNESS = ['fresh', 'stale', 'none'] as const;
 export type StreamFreshness = typeof STREAM_FRESHNESS[number];
 
-/** §3: the capabilities an adapter may declare. */
+/** The capabilities an adapter may declare. */
 export const COMPONENT_CAPABILITIES = [
   'reset_position', 'power_off', 'reboot', 'io_manual_write', 'io_output_readback',
-  // §14: simulator reset (Enable plays, Disable pauses).
+  // Simulator reset (Enable plays, Disable pauses).
   'sim_reset',
 ] as const;
 export type ComponentCapability = string;
 
-/** §2: the four lifecycle actions, offered on every component (Prepare not while enabled). */
+/** The four lifecycle actions, offered on every component (Prepare not while enabled). */
 export const LIFECYCLE_ACTIONS = ['prepare', 'enable', 'disable', 'recover'] as const;
 export type ComponentAction = string;
 
 export const FAULT_OPERATOR_ACTIONS = ['enable', 'recover', 'none'] as const;
 export type FaultOperatorAction = typeof FAULT_OPERATOR_ACTIONS[number];
 
-/** §4. */
 export interface Fault {
   code: string;
   message: string;
@@ -40,9 +39,18 @@ export interface Fault {
   operator_action: FaultOperatorAction;
   vendor_code?: string;
   vendor_text?: string;
-  /** §16: on an owner's fault, the members it concerns. */
+  /** On an owner's fault, the members it concerns. */
   concerns?: string[];
   since_ns: number;
+}
+
+/** An emergency stop the component reports (a stop, not a fault). */
+export interface ComponentStop {
+  code: 'estop';
+  message: string;
+  since_ns: number;
+  vendor_code?: string;
+  vendor_text?: string;
 }
 
 export const ACTION_OUTCOMES = ['succeeded', 'failed', 'unknown'] as const;
@@ -53,13 +61,22 @@ export interface ActionError extends CodedError {
   vendor_text?: string;
 }
 
-/** §2. */
+/** One step of a Recover-and-enable action, in order. */
+export interface ActionPhase {
+  component_id: string;
+  action: 'recover' | 'enable';
+  outcome: ActionOutcome;
+  error?: ActionError;
+}
+
 export interface ActionResult {
   action: ComponentAction;
   outcome: ActionOutcome;
   error?: ActionError;
   started_at_ns: number;
   finished_at_ns: number;
+  /** Present on a Recover-and-enable action. */
+  phases?: ActionPhase[];
 }
 
 export interface ComponentStream {
@@ -68,51 +85,96 @@ export interface ComponentStream {
   age_ns?: number;
 }
 
-/** §1: the one view of a component. */
+/** The one view of a component. */
 export interface ComponentState {
   component_id: string;
-  /** §16: the machine (owner component) this component is a member of. */
+  /** The machine (owner component) this component is a member of. */
   owner_id?: string;
-  /** §16: its member slot (arm, controller_io, tool_io, ...). */
+  /** Its member slot (arm, controller_io, tool_io, ...). */
   role?: string;
   lifecycle: ComponentLifecycle;
   fault?: Fault;
+  stop?: ComponentStop;
   reason?: CodedError;
   activity: ComponentActivity;
   streams: ComponentStream[];
   capabilities: ComponentCapability[];
   action?: { action: ComponentAction; started_at_ns: number };
   last_action?: ActionResult;
-  /** §1: the adapter's read-only status lines (e.g. xArm mode, state, error codes); display only. */
+  /** The adapter's read-only status lines (e.g. xArm mode, state, error codes); display only. */
   details?: ComponentDetail[];
   observed_at_ns: number;
 }
 
-/** §1: one read-only status line an adapter reports. */
+/** One read-only status line an adapter reports. */
 export interface ComponentDetail {
   name: string;
   value: string;
 }
 
-/** §1, §16: a member's reason while its owner isn't usable. */
+/** A member's reason while its owner isn't usable. */
 export const OWNER_UNAVAILABLE = 'owner_unavailable';
-/** §2, §16: a member action refused while its owner isn't prepared. */
+/** A member action refused while its owner isn't prepared. */
 export const OWNER_NOT_PREPARED = 'owner_not_prepared';
+/** A member's reason while its machine reports an e-stop. */
+export const STOPPED_BY_ESTOP = 'stopped_by_estop';
 
-export const LATCH_CAUSE_KINDS = ['fault', 'offline', 'activity_unknown'] as const;
+export const LATCH_CAUSE_KINDS = ['fault', 'offline', 'activity_unknown', 'stop'] as const;
 export type LatchCauseKind = typeof LATCH_CAUSE_KINDS[number];
 
-/** §5. */
 export interface CellLatch {
   latched: boolean;
-  causes: { component_id: string; kind: LatchCauseKind; fault?: Fault }[];
+  causes: { component_id: string; kind: LatchCauseKind; fault?: Fault; stop?: ComponentStop }[];
 }
 
-export const SIGNAL_SOURCES = ['device', 'manyforge_write', 'outside', 'last_write'] as const;
+export const RECOVERY_ELIGIBILITIES = ['ready', 'recover', 'blocked', 'unknown', 'excluded'] as const;
+export type RecoveryEligibility = typeof RECOVERY_ELIGIBILITIES[number];
+
+/** What stands between a component and Enable, as the operator confirms it. */
+export interface RecoveryCause {
+  code: string;
+  message: string;
+  vendor_code: string | null;
+  vendor_text: string | null;
+  clearable: boolean;
+  operator_action: FaultOperatorAction;
+  concerns: string[];
+}
+
+export interface RecoveryComponent {
+  component_id: string;
+  owner_id: string | null;
+  cause: RecoveryCause | null;
+  stop: ComponentStop | null;
+  eligibility: RecoveryEligibility;
+}
+
+/** `GET /api/components/{id}/recover-enable/preflight`: the owner first when it is involved. */
+export interface RecoveryPreflight {
+  snapshot_id: string;
+  components: RecoveryComponent[];
+}
+
+export interface ConfirmedRecoveryComponent {
+  component_id: string;
+  cause_code: string | null;
+  vendor_code: string | null;
+  stop_code: string | null;
+  stop_vendor_code: string | null;
+  eligibility: RecoveryEligibility;
+}
+
+/** The facts the operator confirmed, sent back unchanged. */
+export interface RecoveryConfirmation {
+  snapshot_id: string;
+  confirmed: ConfirmedRecoveryComponent[];
+}
+
+export const SIGNAL_SOURCES = ['device', 'manyforge_write', 'outside', 'not_readable'] as const;
 export type SignalSource = typeof SIGNAL_SOURCES[number];
 
 /**
- * §7. `controller_owned` is the per-output flag of §7 ("Per output"); it is
+ * `controller_owned` is a per-output flag; it is
  * present on outputs only.
  */
 export interface SignalSample {
@@ -124,13 +186,12 @@ export interface SignalSample {
   controller_owned?: boolean;
 }
 
-/** §7. */
 export interface SetOutputResult {
   outcome: ActionOutcome;
   error?: CodedError;
 }
 
-/** §7: the core-held signal derived for every eligible output. */
+/** The core-held signal derived for every eligible output. */
 export const CHANGED_OUTSIDE_SUFFIX = '.changed_outside';
 
 /**
@@ -141,12 +202,11 @@ export function ioSignalId(controllableComponentId: string, signalName: string):
   return `${controllableComponentId}/${signalName}`;
 }
 
-/** §10. */
 export interface RunBlockedReason extends CodedError {
   component_id?: string;
   rule_id?: string;
   signal_id?: string;
-  /** `rule_holds`: the hold's scope (§8): everything, all_motion or execution_groups. */
+  /** `rule_holds`: the hold's scope: everything, all_motion or execution_groups. */
   scope?: string;
   /** `rule_holds` with scope execution_groups: the components it holds. */
   component_ids?: string[];
@@ -163,7 +223,6 @@ export interface RunReadiness {
 export const RUN_END_REASONS = ['completed', 'failed', 'stopped', 'cell_fault'] as const;
 export type RunEndReason = typeof RUN_END_REASONS[number];
 
-/** §9. */
 export interface ProgramRunEnd {
   end_reason: RunEndReason;
   details: {
@@ -178,17 +237,15 @@ export interface ProgramRunEnd {
 export const APPLY_DISPOSITIONS = ['add', 'remove', 'replace', 'retain'] as const;
 export type ApplyDisposition = typeof APPLY_DISPOSITIONS[number];
 
-/** §11: a Program role or target the previewed Deployment no longer resolves. */
+/** A direct Program target the previewed Deployment no longer resolves. */
 export interface ApplyUnresolvedReference {
-  component_role_id: string;
-  target_role_id: string | null;
-  controllable_component_id: string;
-  command_target_id: string | null;
-  reason: string;
+  target: { component_id: string; command_target_id: string };
+  reason: 'component_missing' | 'component_incompatible' | 'target_missing'
+    | 'target_incompatible' | 'capability_unavailable';
   detail: string;
 }
 
-/** §11: `POST /api/deployment/preview` (and the Revert preview). */
+/** `POST /api/deployment/preview` (and the Revert preview). */
 export interface ApplyPreview {
   components: {
     component_id: string;
@@ -211,7 +268,7 @@ export interface ApplyPreview {
   detached_components: string[];
 }
 
-/** §11: Apply, Load and New. */
+/** Apply, Load and New. */
 export interface ApplyResult {
   outcome: 'succeeded' | 'failed';
   components: {
@@ -226,7 +283,7 @@ export interface ApplyResult {
   error?: CodedError;
 }
 
-/** §11: one Deployment field's effective value. */
+/** One Deployment field's effective value. */
 export interface EffectiveField {
   value: unknown;
   default: unknown;
@@ -237,7 +294,6 @@ export interface EffectiveValues {
   fields: Record<string, EffectiveField>;
 }
 
-/** §8. */
 export const RULE_ON_TRIP = ['stop', 'notify'] as const;
 export type RuleOnTrip = typeof RULE_ON_TRIP[number];
 export const RULE_AFTER_STOP = ['hold', 'fail_node'] as const;
@@ -245,7 +301,7 @@ export type RuleAfterStop = typeof RULE_AFTER_STOP[number];
 export const RULE_STATES = ['inactive', 'clear', 'tripped'] as const;
 export type RuleState = typeof RULE_STATES[number];
 
-/** The pushed cell facts of `/ws/control` (§1, §5, §7, §10); null: not read yet. */
+/** The pushed cell facts of `/ws/control`; null: not read yet. */
 export interface CellState {
   components: readonly ComponentState[] | null;
   latch: CellLatch | null;

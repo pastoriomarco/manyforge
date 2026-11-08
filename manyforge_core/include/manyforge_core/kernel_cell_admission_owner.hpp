@@ -135,6 +135,9 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   [[nodiscard]] Result<PreparedProgramResetStatus> PrepareProgramResetStatus(
       ProgramResetJournalReadPurpose purpose, const CellAdmissionClaimIntentDTO& intent,
       const std::optional<CellAdmissionClaimDTO>& claim = std::nullopt) const;
+  /// The exact run in a currently valid Reset admission, for motion-free cleanup.
+  [[nodiscard]] std::optional<ProgramRunId> ProgramResetRunForCleanup(
+      const CellAdmissionClaimIntentDTO& intent, const PreparedProgramResetStatus& proof) const;
   [[nodiscard]] Result<PreparedProgramResetStatus> PrepareProgramResetSceneAuthorization(
       const ProgramResetSceneAuthorizationDTO& authorization) const;
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquirePreparedProgramResetClaim(

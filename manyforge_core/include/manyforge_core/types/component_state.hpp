@@ -8,7 +8,7 @@
 
 namespace manyforge::core {
 
-/// Component model v2 (CONTRACTS §1-§5): the one view of a component.
+/// Component model v2: the one view of a component.
 /// Adapters produce it, the core holds and publishes it, everything else reads
 /// it. Plain values; every enum has a wire name (`to_string`) and a parser.
 
@@ -38,6 +38,7 @@ enum class Capability : std::uint8_t {
   kReboot,
   kIoManualWrite,
   kIoOutputReadback,
+  /// Identifies a simulator; its state never latches the cell or blocks Execute.
   kSimReset,
 };
 
@@ -72,6 +73,7 @@ enum class FaultCode : std::uint8_t {
   kStreamStale,
   kProcessExited,
   kVendorFault,
+  kOwnerStalled,
 };
 
 enum class FaultOperatorAction : std::uint8_t {
@@ -87,12 +89,25 @@ struct Fault final {
   FaultOperatorAction operator_action{FaultOperatorAction::kNone};
   std::optional<std::string> vendor_code;
   std::optional<std::string> vendor_text;
-  /// CONTRACTS §4, §16: on an owner's fault, the members it concerns (e.g.
+  /// On an owner's fault, the members it concerns (e.g.
   /// C33 the controller I/O member; an e-stop every member); empty otherwise.
   std::vector<std::string> concerns;
   std::int64_t since_ns{};
 
   friend bool operator==(const Fault&, const Fault&) = default;
+};
+
+enum class StopCode : std::uint8_t { kEstop = 0 };
+
+/// An observed stop condition, distinct from a component fault.
+struct ComponentStop final {
+  StopCode code{StopCode::kEstop};
+  std::string message;
+  std::optional<std::string> vendor_code;
+  std::optional<std::string> vendor_text;
+  std::int64_t since_ns{};
+
+  friend bool operator==(const ComponentStop&, const ComponentStop&) = default;
 };
 
 /// Why a component is offline or not prepared (e.g. `shutdown_by_operator`).
@@ -128,17 +143,27 @@ struct ActionError final {
   friend bool operator==(const ActionError&, const ActionError&) = default;
 };
 
+struct ActionPhaseResult final {
+  std::string component_id;
+  ComponentAction action{ComponentAction::kRecover};
+  ActionOutcome outcome{ActionOutcome::kUnknown};
+  std::optional<ActionError> error;
+
+  friend bool operator==(const ActionPhaseResult&, const ActionPhaseResult&) = default;
+};
+
 struct ActionResult final {
   ComponentAction action{ComponentAction::kPrepare};
   ActionOutcome outcome{ActionOutcome::kUnknown};
   std::optional<ActionError> error;
   std::int64_t started_at_ns{};
   std::int64_t finished_at_ns{};
+  std::vector<ActionPhaseResult> phases{};
 
   friend bool operator==(const ActionResult&, const ActionResult&) = default;
 };
 
-/// CONTRACTS §1: one adapter-reported fact shown with the component (e.g. the
+/// One adapter-reported fact shown with the component (e.g. the
 /// controller's mode). Display only: no logic reads it.
 struct ComponentDetail final {
   std::string name;
@@ -149,7 +174,7 @@ struct ComponentDetail final {
 
 struct ComponentState final {
   std::string component_id;
-  /// CONTRACTS §16: the machine (owner component) this component is a member
+  /// The machine (owner component) this component is a member
   /// of, and its member slot; both absent for an owner-less component.
   std::optional<std::string> owner_id;
   std::optional<std::string> role;
@@ -162,9 +187,10 @@ struct ComponentState final {
   std::vector<Capability> capabilities;
   std::optional<ComponentActionInProgress> action;
   std::optional<ActionResult> last_action;
-  /// Adapter-reported, display only (CONTRACTS §1); no logic may read it.
+  /// Adapter-reported, display only; no logic may read it.
   std::vector<ComponentDetail> details;
   std::int64_t observed_at_ns{};
+  std::optional<ComponentStop> stop{};
 
   friend bool operator==(const ComponentState&, const ComponentState&) = default;
 };
@@ -173,17 +199,19 @@ enum class CellLatchCauseKind : std::uint8_t {
   kFault = 0,
   kOffline,
   kActivityUnknown,
+  kStop,
 };
 
 struct CellLatchCause final {
   std::string component_id;
   CellLatchCauseKind kind{CellLatchCauseKind::kFault};
   std::optional<Fault> fault;
+  std::optional<ComponentStop> stop{};
 
   friend bool operator==(const CellLatchCause&, const CellLatchCause&) = default;
 };
 
-/// CONTRACTS §5: derived from component states, never stored.
+/// Derived from component states, never stored.
 struct CellLatch final {
   bool latched{};
   std::vector<CellLatchCause> causes;
@@ -191,12 +219,13 @@ struct CellLatch final {
   friend bool operator==(const CellLatch&, const CellLatch&) = default;
 };
 
-/// A component counts as healthy when it is neither in `fault` nor `offline`.
+/// A component is healthy only when it is neither faulted, offline nor stopped.
 [[nodiscard]] bool component_healthy(const ComponentState& state) noexcept;
 
-/// CONTRACTS §1, §16: the reason code of a member shown `offline` while its
+/// The reason code of a member shown `offline` while its
 /// owner isn't usable (`offline`, `not_prepared` or `fault`).
 inline constexpr std::string_view kOwnerUnavailableReason = "owner_unavailable";
+inline constexpr std::string_view kStoppedByEstopReason = "stopped_by_estop";
 
 /// The reason codes of a component `offline` by the operator's own power
 /// action (power off, reboot). Such a component isn't a latch cause.
@@ -204,28 +233,30 @@ inline constexpr std::string_view kShutdownByOperatorReason = "shutdown_by_opera
 inline constexpr std::string_view kComponentRebootingReason = "component_rebooting";
 
 /// Whether an owner in `owner` state leaves its members usable: only a
-/// `prepared` (or `enabled`) owner does.
+/// `prepared` (or `enabled`) owner without a stop does.
 [[nodiscard]] bool owner_usable(const ComponentState& owner) noexcept;
 
-/// CONTRACTS §1, §16: `member` as published while its owner is in `owner`
-/// state: unchanged while the owner is usable, else `offline` with reason
-/// `owner_unavailable` ("through <owner>: <owner's reason>"), without its own
-/// fault, whatever its adapter reports.
+/// `member` as published while its owner is in `owner`
+/// state: unchanged while the owner is usable. A stopped, otherwise available
+/// owner presents a healthy member as Prepared with a stopped reason; an
+/// independent member fault/offline remains visible. Other unavailable owners
+/// present members offline with reason `owner_unavailable`.
 [[nodiscard]] ComponentState presented_member_state(ComponentState member,
                                                     const ComponentState& owner);
 
-/// Whether `state` is outside the latch: `offline` by the operator's own
-/// power action, or a member shown offline through an owner that is
-/// `not_prepared` or offline by the operator's own power action. Such a
-/// component neither latches nor keeps a latch from clearing.
+/// Whether `state` is outside the cell latch: a simulator declaring
+/// `sim_reset`, `offline` by the operator's own power action, or a member
+/// shown offline through an owner that is `not_prepared` or offline by the
+/// operator's own power action. An exempt component neither adds a latch
+/// cause nor keeps a latch from clearing.
 [[nodiscard]] bool latch_exempt(const ComponentState& state,
                                 const std::vector<ComponentState>& states);
 
-/// Every latch condition of `states`, in their order: `fault`, `offline`, or
-/// `activity: unknown` (a component in fault or offline yields one cause).
+/// Every latch condition of `states`, in their order: stop, `fault`, `offline`,
+/// or `activity: unknown`. An independent stop and fault may both be present.
 /// Components exempt by `latch_exempt` are no cause. A member shown offline
-/// through its owner isn't a cause of its own: its owner is, once (CONTRACTS
-/// §5, §16), with the owner's fault, or `offline` when it is unexpectedly
+/// through its owner isn't a cause of its own: its owner is, once, with the
+/// owner's fault, or `offline` when it is unexpectedly
 /// offline.
 [[nodiscard]] std::vector<CellLatchCause> cell_latch_causes(
     const std::vector<ComponentState>& states);
@@ -237,6 +268,7 @@ inline constexpr std::string_view kComponentRebootingReason = "component_rebooti
 [[nodiscard]] std::string_view to_string(ComponentAction value) noexcept;
 [[nodiscard]] std::string_view to_string(ActionOutcome value) noexcept;
 [[nodiscard]] std::string_view to_string(FaultCode value) noexcept;
+[[nodiscard]] std::string_view to_string(StopCode value) noexcept;
 [[nodiscard]] std::string_view to_string(FaultOperatorAction value) noexcept;
 [[nodiscard]] std::string_view to_string(CellLatchCauseKind value) noexcept;
 
@@ -250,6 +282,7 @@ inline constexpr std::string_view kComponentRebootingReason = "component_rebooti
     std::string_view wire) noexcept;
 [[nodiscard]] std::optional<ActionOutcome> parse_action_outcome(std::string_view wire) noexcept;
 [[nodiscard]] std::optional<FaultCode> parse_fault_code(std::string_view wire) noexcept;
+[[nodiscard]] std::optional<StopCode> parse_stop_code(std::string_view wire) noexcept;
 [[nodiscard]] std::optional<FaultOperatorAction> parse_fault_operator_action(
     std::string_view wire) noexcept;
 [[nodiscard]] std::optional<CellLatchCauseKind> parse_cell_latch_cause_kind(

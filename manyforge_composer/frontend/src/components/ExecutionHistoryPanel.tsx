@@ -42,7 +42,7 @@ export interface ExecutionHistoryEventView {
 
 const MAXIMUM_MOUNTED_HISTORY_ROWS = 32;
 
-/** CONTRACTS §9: the run end a Program run's end event carries, if this is one. */
+/** The run end a Program run's end event carries, if this is one. */
 export function historyRunEnd(payload: Record<string, unknown>): RunEndPresentation | null {
   if (payload.run_end === undefined || payload.run_end === null) return null;
   return runEndPresentation(parseProgramRunEnd(payload.run_end, 'history.run_end'));

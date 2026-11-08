@@ -302,7 +302,7 @@ def test_step_count_is_exact_and_bounded(steps: object) -> None:
         client.step(steps=steps)  # type: ignore[arg-type]
 
 
-def test_historical_live_cases_are_replaced_by_active_i9_coverage() -> None:
+def test_historical_live_cases_are_replaced_by_active_simulation_coverage() -> None:
     assert simulation_control.HISTORICAL_SOURCE_BLOB == (
         "769e97215b0df885dd7002ca20ded0e0469b6ef7"
     )

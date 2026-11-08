@@ -87,6 +87,9 @@ struct RoboPlanCandidateRequestDTO final {
   /// allows for this plan; the worker deactivates them on its scene. Filled
   /// by the process client from the selected retained projection.
   std::vector<std::pair<std::string, std::string>> contact_allowed_pairs{};
+  core::PlannerCollisionMode collision_mode{core::PlannerCollisionMode::kEnforced};
+  std::optional<core::ControlledStateDTO> diagnostic_qualified_target{};
+  std::optional<std::int64_t> diagnostic_deadline_ns{};
 };
 
 /// Caller-owned bounded-control hooks. The production wrapper supplies these
@@ -118,9 +121,9 @@ struct RoboPlanCandidateComputerConfig final {
   /// Deployment `cartesian_timing`: a Cartesian request without its own
   /// `speed_mode` uses this.
   core::CartesianSpeedModeDTO cartesian_timing{core::kDefaultCartesianTiming};
-  /// Deployment `motion_timing` (N12 / RP-3b): how joint and pose goals are
+  /// Deployment `motion_timing`: how joint and pose goals are
   /// timed. Smooth: TOPP-RA without the TCP bound, then the final uniform
-  /// stretch to the TCP target. Fast: the RP-3 TCP bound inside TOPP-RA.
+  /// stretch to the TCP target. Fast: the TCP bound inside TOPP-RA.
   core::MotionTimingDTO motion_timing{core::kDefaultMotionTiming};
 
   [[nodiscard]] core::PlannerSettingsDTO planner_defaults() const noexcept {
@@ -148,7 +151,8 @@ class RoboPlanCandidateComputer final {
 
   [[nodiscard]] core::Result<core::TrajectoryDTO> compute(
       const RoboPlanCandidateRequestDTO& request,
-      const RoboPlanCandidateControl& control = {});
+      const RoboPlanCandidateControl& control = {},
+      std::optional<core::ControlledStateDTO>* qualified_target = nullptr);
 
   [[nodiscard]] core::Result<std::vector<double>> solve_ik(
       const core::Pose3DTO& goal,
@@ -156,7 +160,8 @@ class RoboPlanCandidateComputer final {
       const core::ResolvedFrameDTO& tcp_frame,
       const core::ControlledStateDTO& seed_state,
       double timeout_s,
-      const RoboPlanCandidateControl& control = {});
+      const RoboPlanCandidateControl& control = {},
+      const core::TolerancesDTO* tolerances = nullptr);
 
   [[nodiscard]] const RoboPlanCandidateBindingDTO& binding() const noexcept {
     return binding_;

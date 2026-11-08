@@ -11,7 +11,7 @@
 
 namespace manyforge::ros2_control_execution {
 
-/// The publisher count of one lane-owned, exclusive ROS topic (EPC-1): an
+/// The publisher count of one lane-owned, exclusive ROS topic: an
 /// action needs exactly one publisher. 0 is not established, 2+ is
 /// `duplicate_component_instance`. Refresh (NRT, on the existing observation
 /// and admission checkpoints) stores the graph's count; ReadError only reads

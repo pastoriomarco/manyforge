@@ -11,7 +11,10 @@ import uuid
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
-from manyforge_behavior.program import Program, TcpEndpointAliasAmbiguous
+from manyforge_behavior.program import (
+    Program, ProgramFormatUnsupported,
+    require_program_format,
+)
 from manyforge_behavior.canonical_artifact import canonical_json_bytes, raw_sha256_digest
 from manyforge_behavior.model_source_capture import (
     ModelSourceCaptureError,
@@ -37,7 +40,6 @@ from .authoring_forest import (
 from .authoring_identity import canonical_digest
 from .authoring_admission import AuthoringOperationError
 from .authoring_forest import adopt_active_catalog
-from .legacy_attach_migration import migrate_legacy_attach
 from .authoring_workspace import (
     AuthoringWorkspaceError,
     AuthoringWorkspaceIdentity,
@@ -146,7 +148,7 @@ class LoadScenarioDocumentRequest(_ScenarioFence):
 
 
 class ScenarioLoadRequest(BaseModel):
-    """CONTRACTS §11 `POST /api/scenario/load` body. With an unsaved Draft the
+    """`POST /api/scenario/load` body. With an unsaved Draft the
     Load is refused unless the caller confirms `discard_unsaved`."""
 
     model_config = _DTO
@@ -156,7 +158,7 @@ class ScenarioLoadRequest(BaseModel):
 
 
 class ScenarioEmptyRequest(BaseModel):
-    """CONTRACTS §11 `POST /api/scenario/new` body: refused with
+    """`POST /api/scenario/new` body: refused with
     an unsaved Draft unless the caller confirms `discard_unsaved`."""
 
     model_config = _DTO
@@ -424,11 +426,9 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             project = captured_workspace["project"]
             authoring = captured_workspace["program"]["authoring"]
             deployment = captured_workspace["deployment"]["document"]
-            assignment = project["program_role_assignment"]
             complete = (
                 isinstance(authoring, dict)
                 and isinstance(deployment, dict)
-                and isinstance(assignment, dict)
             )
             # Ready only when the saved content is exactly what is Applied:
             # both Applied views read at this captured identity, both Drafts
@@ -451,7 +451,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 description=body.description.strip(),
                 program_draft=authoring,
                 deployment_draft=deployment,
-                program_role_assignment=assignment,
                 manyforge_version=_version(),
                 last_known_status=(
                     "ready" if ready else "unknown" if complete else "incomplete"
@@ -587,13 +586,14 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/scenario/load", response_model=None)
     def load_document(body: ScenarioLoadRequest) -> dict[str, Any] | JSONResponse:
-        """New, then Apply of the file (CONTRACTS §11); returns ApplyResult.
+        """New, then Apply of the file; returns ApplyResult.
 
-        The file is read and checked first, so one that can't be loaded
-        leaves the cell as it is. Then the New (an Apply of the empty cell,
-        with the unsaved-Draft protection) removes every component, and the
-        Apply of the file adds and prepares each one fresh. A failed New is
-        the Load's result.
+        The document is read and its basic structure checked before New; a
+        failure at that stage leaves the cell as it is. New (an Apply of the
+        empty cell, with the unsaved-Draft protection) then removes every
+        component if it succeeds. The requested Scenario is prepared and
+        applied afterward; if that later preparation fails, the cell remains
+        empty. A failed New is the Load's result.
 
         A Load whose workspace install failed contains the workspace: the
         status stays 503 and the body is the failed ApplyResult.
@@ -630,7 +630,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
     @router.post("/api/scenario/new")
     def new_document(body: ScenarioEmptyRequest) -> dict[str, Any]:
         """Apply of the empty cell (the built-in Untitled Scenario); the
-        Scene is initialized. R3: New always works."""
+        Scene is initialized. New always works."""
 
         def run() -> dict[str, Any]:
             with apply_slot():
@@ -667,18 +667,16 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             diagnostics: list[dict[str, str]] = []
             if authoring is not None:
                 try:
-                    selected = authoring.get("catalog")
-                    if (isinstance(selected, dict) and selected.get("content_version") == "2.8.0"
-                            and authoring_catalog.content_version == "2.9.0"):
-                        migrate_legacy_attach(authoring, deployment,
-                                              scenario_document["program_role_assignment"])
+                    require_program_format(authoring, supported_api_version="manyforge.program.v3")
                     adopt_active_catalog(authoring, authoring_catalog)
                     validate_invariants(authoring, authoring_catalog)
                     program, diagnostics = derive_candidate(
                         authoring, authoring_catalog
                     )
-                except TcpEndpointAliasAmbiguous as error:
-                    raise ScenarioArtifactError(error.code, str(error), status_code=400) from error
+                except ProgramFormatUnsupported as error:
+                    raise ScenarioArtifactError(
+                        error.code, str(error), details=error.details
+                    ) from error
                 except AuthoringForestError as error:
                     raise ScenarioArtifactError(
                         "scenario_program_draft_invalid",
@@ -691,7 +689,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             incomplete = (
                 (program is None and not no_program)
                 or deployment is None
-                or scenario_document["program_role_assignment"] is None
             )
             if incomplete or not isinstance(deployment, dict):
                 raise ScenarioArtifactError(
@@ -728,7 +725,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             source_closure = capture_deployment_model_sources(
                 deployment, project_root=Path(source_path)
             )
-            assignment = deepcopy(scenario_document["program_role_assignment"])
             # The project folder scopes the Scenario's persistent values.
             project_path = canonical_project_path(source_path)
             captured_digest = raw_sha256_digest(
@@ -740,7 +736,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         "deployment": deployment,
                         "model_source_closure": source_closure,
                         "program": program.to_dict() if program is not None else None,
-                        "program_role_assignment": assignment,
                     }
                 )
             )
@@ -760,7 +755,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     "model_source_closure": source_closure,
                     "program": program.to_dict() if program is not None else None,
                     "program_authoring": deepcopy(authoring),
-                    "program_role_assignment": assignment,
                     "expected_manager_current": {
                         "retained_bundle_id": bundle,
                         "graph_revision": graph,
@@ -941,7 +935,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             # Unsaved Drafts are refused before any component is touched.
             require_discard_confirmed()
             if path == str(UNTITLED_SCENARIO_PATH):
-                # New always works (R3, N7): a failed Apply that still holds
+                # New always works: a failed Apply that still holds
                 # the cell, whatever it changed, is released; this New then
                 # stops and removes everything the host has.
                 try:
@@ -1010,7 +1004,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 ),
                 program_draft=captured_workspace["program"]["authoring"],
                 deployment_draft=captured_workspace["deployment"]["document"],
-                program_role_assignment=project["program_role_assignment"],
                 manyforge_version=_version(),
                 last_known_status="unknown",
             )
@@ -1092,7 +1085,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
 
 
 def require_empty_cell(state: ComposerState) -> None:
-    """Startup never replaces an applied Scenario (as M7): the Manager's
+    """Startup never replaces an applied Scenario: the Manager's
     current cell must be empty (no model instances, no components)."""
 
     status = state.headless_client.manager_status() if state.headless_client else {}

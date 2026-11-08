@@ -11,13 +11,14 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace manyforge::roboplan_backend::host_detail {
 
-/// The execution host's component runtime (CONTRACTS §1, §2, §5, §6). It owns
+/// The execution host's component runtime. It owns
 /// the core component coordinator for the whole cell, installed once with the
 /// stable Kernel and kept across Apply. Every component state change goes to
 /// the Kernel's cell latch and to the host's publication (event stream state
@@ -38,6 +39,30 @@ class HostComponentRuntime final {
     std::function<core::Result<void>(const std::string &component_id)> open_routes;
     /// The publication changed (wakes the event stream writers).
     std::function<void()> published;
+    /// Pure, nonblocking snapshot of an installed shared transport fault.
+    std::function<std::optional<core::Fault>(const std::string &component_id)>
+        shared_transport_fault;
+    /// Pure, nonblocking capture of the exact shared recovery at action
+    /// acceptance. An empty callback uses ordinary component recovery.
+    std::function<core::IComponentAdapter::PreparedRecovery(const std::string &component_id)>
+        prepare_shared_transport_recovery;
+    /// Pins the host's ordinary-effect admission for an affected component.
+    /// A successful empty pin means the component uses neither shared owner.
+    std::function<core::Result<std::shared_ptr<void>>(const std::string &component_id,
+                                                       bool known_transport_consumer)>
+        enter_transport_effect;
+    std::function<std::optional<core::ErrorDTO>(const std::string &component_id,
+                                                const core::IComponentAdapter *)>
+        transport_effect_fault;
+    /// Re-observe a rebuilt shared owner on the existing host tick, before
+    /// the coordinator publishes component state. No composition lock held.
+    std::function<void()> refresh_shared_transport;
+    /// Pure membership snapshot, published before SetComponents.
+    std::function<bool(const std::string &component_id)> uses_shared_transport;
+    std::function<core::IComponentAdapter::PreparedRecovery(
+        const std::string &, const std::shared_ptr<core::IComponentAdapter> &)>
+        prepare_adapter_transport_recovery;
+    std::function<bool(const std::string &)> uses_adapter_transport;
   };
 
   /// One publication: every component's state in cell order, with a revision
@@ -54,15 +79,21 @@ class HostComponentRuntime final {
 
   /// The components of the cell after an Apply, in cell order. A component
   /// whose adapter is unchanged keeps its action and `last_action`; a removed
-  /// component no longer counts for the latch (R3). Returns the removed
+  /// component no longer counts for the latch. Returns the removed
   /// components' interrupted action threads: destroy them (join) after
   /// releasing the composition lock, which their actions may take.
   [[nodiscard]] std::vector<std::jthread> SetComponents(
       std::vector<core::CoordinatedComponent> components);
 
-  /// CONTRACTS §2: starts `action`; the result arrives in `last_action`.
+  /// Starts `action`; the result arrives in `last_action`.
   [[nodiscard]] core::Result<core::ComponentActionInProgress> Submit(
       const std::string &component_id, core::ComponentAction action);
+
+  [[nodiscard]] core::Result<core::ComponentRecoveryPreflight> RecoveryPreflight(
+      const std::string &component_id) const;
+  [[nodiscard]] core::Result<core::ComponentActionInProgress> SubmitRecoveryEnable(
+      const std::string &component_id, std::vector<core::ComponentRecoveryFact> confirmed,
+      std::function<bool()> current, std::function<bool()> owner_recovered = {});
 
   /// A Stop was accepted: every component action in progress is interrupted.
   void InterruptActions();
@@ -71,12 +102,26 @@ class HostComponentRuntime final {
   void Refresh();
 
   [[nodiscard]] Publication Read() const;
+  [[nodiscard]] std::optional<std::string> ReserveForApply(
+      const std::vector<std::string> &component_ids, std::vector<std::string> &reserved);
+  void ReleaseApplyReservation(const std::vector<std::string> &component_ids) noexcept;
 
   /// The adapter the component runs on (not its route-opening wrapper), or
   /// null when the component isn't in the cell. Used for the adapter's own
-  /// small interfaces, e.g. the output write of CONTRACTS §7.
+  /// small interfaces, e.g. the output write.
   [[nodiscard]] std::shared_ptr<core::IComponentAdapter> Adapter(
       const std::string &component_id) const;
+
+  struct EffectAdapter final {
+    std::shared_ptr<core::IComponentAdapter> adapter;
+    bool uses_shared_transport{};
+    bool uses_adapter_transport{};
+  };
+  [[nodiscard]] EffectAdapter AdapterForEffect(const std::string &component_id) const;
+
+  [[nodiscard]] bool CloseAndDrainActions(std::chrono::steady_clock::time_point deadline) {
+    return coordinator_.CloseAndDrainActions(deadline);
+  }
 
  private:
   class RouteOpeningAdapter;
@@ -93,7 +138,7 @@ class HostComponentRuntime final {
   core::ComponentCoordinator coordinator_;
 };
 
-/// `open_routes` (CONTRACTS §6, §15): whether the bundle compiles a route
+/// `open_routes`: whether the bundle compiles a route
 /// for `component`, i.e. any compiled route names one of its control
 /// bindings. A component without one (sensor, I/O, passive, simulator,
 /// owner) has nothing to open.

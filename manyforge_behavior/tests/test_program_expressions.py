@@ -76,14 +76,25 @@ def _offset_node(
     return node
 
 
+def _base_program_document() -> dict[str, Any]:
+    # Construct the v3 document explicitly: historical role assignments are
+    # deliberately not converted into direct references.
+    return {
+        "api_version": "manyforge.program.v3",
+        "program_id": "expression_fixture",
+        "program_revision": "sha256:" + "0" * 64,
+        "program_profile": "composable-cell-v1",
+        "name": "Expression fixture",
+        "catalog": {"api_version": "manyforge.node_catalog.v3", "content_version": _catalog().content_version},
+        "parameters": [],
+    }
+
+
 def _program(
     *children: dict[str, Any],
     keys: tuple[dict[str, Any], ...] = (),
 ) -> Program:
-    document = Program(
-        _ROOT / "examples/pick_and_place_minimal.program.yaml", _catalog()
-    ).to_dict()
-    document["target_roles"]["arm"]["required_frame_roles"] = ["base", "tcp"]  # TCP migration: arm keeps tcp frame role in this fixture
+    document = _base_program_document()
     document["parameters"] = sorted(
         [*document["parameters"], *deepcopy(_PARAMETERS)],
         key=lambda row: row["parameter_id"],
@@ -110,7 +121,7 @@ def _program(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, _catalog())
 
@@ -389,10 +400,7 @@ def _conformance_program(case: dict[str, Any]) -> Program:
         "value_sources": deepcopy(case["value_sources"]),
         "children": [],
     }
-    document = Program(
-        _ROOT / "examples/pick_and_place_minimal.program.yaml", _catalog()
-    ).to_dict()
-    document["target_roles"]["arm"]["required_frame_roles"] = ["base", "tcp"]  # TCP migration: arm keeps tcp frame role in this fixture
+    document = _base_program_document()
     document["parameters"] = sorted(
         [*document["parameters"], *deepcopy(_SOURCE_CONFORMANCE["parameters"])],
         key=lambda row: row["parameter_id"],
@@ -411,7 +419,7 @@ def _conformance_program(case: dict[str, Any]) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, _catalog())
 
@@ -448,10 +456,7 @@ def _pose_conformance_program(case: dict[str, Any]) -> Program:
     node = deepcopy(_POSE_CONFORMANCE["node"])
     if "value" in case:
         node["parameters"]["value"] = deepcopy(case["value"])
-    document = Program(
-        _ROOT / "examples/pick_and_place_minimal.program.yaml", _catalog()
-    ).to_dict()
-    document["target_roles"]["arm"]["required_frame_roles"] = ["base", "tcp"]  # TCP migration: arm keeps tcp frame role in this fixture
+    document = _base_program_document()
     document["scene"] = deepcopy(_POSE_CONFORMANCE["scene"])
     document["blackboard"] = {
         "namespaces": [],
@@ -470,7 +475,7 @@ def _pose_conformance_program(case: dict[str, Any]) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, _catalog())
 

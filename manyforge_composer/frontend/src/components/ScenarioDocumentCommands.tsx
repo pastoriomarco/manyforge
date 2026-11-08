@@ -26,6 +26,7 @@ import {
 } from '../state/newScenario';
 import { busyLabel, busyReason, type BusyOperation } from '../state/busyOperation';
 import { errorMessage } from '../state/structuralResource';
+import { useAuthoringAdmissionTooltip } from './authoringAdmission';
 
 type ScenarioAction = 'new' | 'save_as' | 'load';
 type SaveAsMode = 'project' | 'portable';
@@ -42,7 +43,11 @@ interface ScenarioDocumentCommandsProps {
   localInvalidEdit?: boolean;
   /** Robots are moving (Program motion not held, or a manual operation). */
   motionActive?: boolean;
-  /** The components now in the cell (CONTRACTS §1); null while not known. */
+  /** Current Headless authoring admission; unknown leaves existing behavior unchanged. */
+  authoringAdmissionAllowed?: boolean | null;
+  /** Admission for New and Load; defaults to `authoringAdmissionAllowed`. */
+  replacementAdmissionAllowed?: boolean | null;
+  /** The components now in the cell; null while not known. */
   cellComponents?: readonly string[] | null;
 }
 
@@ -60,6 +65,7 @@ function ScenarioIconButton({
   disabled,
   operation,
   commands,
+  disabledTooltip,
   onClick,
   children,
 }: {
@@ -68,6 +74,7 @@ function ScenarioIconButton({
   disabled: boolean;
   operation: BusyOperation | null;
   commands: string | readonly string[];
+  disabledTooltip?: string;
   onClick: (event: MouseEvent<HTMLButtonElement>) => void;
   children: ReactNode;
 }) {
@@ -78,7 +85,7 @@ function ScenarioIconButton({
       className="scenario-command"
       aria-label={label}
       aria-busy={busy !== label || undefined}
-      data-tooltip={busy !== label ? busy : disabled && reason ? `${label}: ${reason}` : label}
+      data-tooltip={busy !== label ? busy : disabledTooltip ?? (disabled && reason ? `${label}: ${reason}` : label)}
       disabled={disabled}
       onClick={onClick}
     >
@@ -98,8 +105,11 @@ export function ScenarioDocumentCommands({
   deploymentDirty = false,
   localInvalidEdit = false,
   motionActive = false,
+  authoringAdmissionAllowed = null,
+  replacementAdmissionAllowed = authoringAdmissionAllowed,
   cellComponents = [],
 }: ScenarioDocumentCommandsProps) {
+  const authoringAdmissionTooltip = useAuthoringAdmissionTooltip();
   // Document actions wait while robots move (maintainer, 2026-10-16).
   const motionReason = motionActive ? 'Not available while robots are moving. Stop motion first.' : null;
   const {
@@ -152,20 +162,26 @@ export function ScenarioDocumentCommands({
   const busy = replacementPending || state.status === 'loading'
     || (state.status === 'ready' && state.pendingAction !== null);
   const busyText = busyReason(operation) ?? 'Another operation is in progress.';
+  const authoringAdmissionBlock = authoringAdmissionAllowed === false
+    ? authoringAdmissionTooltip : null;
   const blockReason = localInvalidEdit
     ? 'Review or discard the invalid local field edit first.'
     : busy
       ? busyText
       : documentUnavailableReason;
   // Ordinary document actions require Idle. New and Load are the server's
-  // one Apply path (CONTRACTS §11); the server refuses them during a run.
+  // one Apply path; the server refuses them during a run.
   const blocked = busy || documentUnavailableReason !== null || localInvalidEdit || workspace === null;
-  const replacementEntryReason = localInvalidEdit
+  const projectSaveBlocked = blocked || authoringAdmissionBlock !== null;
+  const projectSaveReason = authoringAdmissionBlock ?? blockReason;
+  const replacementAdmissionBlock = replacementAdmissionAllowed === false
+    ? authoringAdmissionTooltip : null;
+  const replacementEntryReason = replacementAdmissionBlock ?? (localInvalidEdit
     ? 'Review or discard the invalid local field edit first.'
     : busy ? busyText
       : workspace === null ? 'Program workspace is not loaded.'
-        // A finished or stopped run is the server's to decide (R3).
-        : scenarioReplacementUnavailableReason ?? null;
+        // A finished or stopped run is the server's to decide.
+        : scenarioReplacementUnavailableReason ?? null);
   const hasUnsavedChanges = workspace?.hasUnsavedChanges === true || deploymentDirty;
   const draftDiscarded = workspace?.hasUnsavedChanges === true
     || workspace?.hasUnappliedChanges === true
@@ -377,6 +393,7 @@ export function ScenarioDocumentCommands({
           label="New"
           reason={motionReason ?? replacementEntryReason}
           disabled={motionReason !== null || replacementEntryReason !== null}
+          disabledTooltip={replacementAdmissionBlock ?? undefined}
           operation={operation}
           commands="new"
           onClick={(event) => beginAction('new', event)}
@@ -386,9 +403,10 @@ export function ScenarioDocumentCommands({
         </ScenarioIconButton>
         <ScenarioIconButton
           label={saveTarget || readOnly ? 'Save Scenario' : 'Save Scenario (choose a project folder)'}
-          reason={motionReason ?? blockReason
+          reason={motionReason ?? (readOnly ? blockReason : projectSaveReason)
             ?? (readOnly ? 'The Untitled Scenario is read-only. Use Save Scenario as.' : 'Scenario already matches Saved.')}
-          disabled={motionReason !== null || blocked || readOnly || (saveTarget !== null && !hasUnsavedChanges)}
+          disabled={motionReason !== null || projectSaveBlocked || readOnly || (saveTarget !== null && !hasUnsavedChanges)}
+          disabledTooltip={readOnly ? undefined : authoringAdmissionBlock ?? undefined}
           operation={operation}
           commands="save"
           onClick={(event) => {
@@ -419,6 +437,7 @@ export function ScenarioDocumentCommands({
           label="Load Scenario"
           reason={motionReason ?? replacementEntryReason}
           disabled={motionReason !== null || replacementEntryReason !== null}
+          disabledTooltip={replacementAdmissionBlock ?? undefined}
           operation={operation}
           commands="load"
           onClick={(event) => beginAction('load', event)}
@@ -457,6 +476,11 @@ export function ScenarioDocumentCommands({
                 <p className="new-scenario-intro">
                   Save the Program, Scene, Deployment, assignment and overrides as one project folder, and continue working on it.
                 </p>
+                {authoringAdmissionBlock !== null && (
+                  <p className="inline-message severity-info" role="status">
+                    Project Save is unavailable. {authoringAdmissionBlock} Choose Portable copy to export without saving to the project.
+                  </p>
+                )}
                 <section className="dcard" aria-label="Scenario">
                   <h4>Scenario</h4>
                   <label className="stacked">
@@ -517,9 +541,9 @@ export function ScenarioDocumentCommands({
                   <button
                     type="button"
                     className="primary-action"
-                    disabled={blocked || saveDirectory === null || nameError !== null
+                    disabled={projectSaveBlocked || saveDirectory === null || nameError !== null
                       || (saveReplacesOther && !confirmOverwrite)}
-                    title={blockReason ?? nameError ?? undefined}
+                    title={projectSaveReason ?? nameError ?? undefined}
                     onClick={() => {
                       if (saveDirectory === null || nameError !== null) return;
                       complete(() => saveScenarioDocument({
@@ -682,7 +706,10 @@ export function ScenarioDocumentCommands({
           {replaceWarning}
           <div className="dialog-actions">
             <button type="button" onClick={() => { if (confirmation?.kind === 'new') closeAction(); else setConfirmation(null); }}>Cancel</button>
-            <button type="button" className="danger-button" onClick={() => {
+            <button type="button" className="danger-button"
+              disabled={replacementAdmissionBlock !== null}
+              title={replacementAdmissionBlock ?? undefined}
+              onClick={() => {
               if (confirmation !== null) void completeReplacement(confirmation.kind, true);
             }}>{confirmation?.kind === 'new' ? 'Empty the cell and continue' : 'Load Scenario'}</button>
           </div>

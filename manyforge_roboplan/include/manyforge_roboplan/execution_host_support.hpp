@@ -23,7 +23,9 @@
 namespace manyforge::roboplan_backend {
 
 // Cell-wide bounds belong to the native cell owner, not to any particular
-// motion or gripper runtime.
+// motion or gripper runtime. This is the ceiling an Apply may grow the cell
+// to; the Kernel pre-starts Stop-stage attempt workers only for the current
+// cell's Stop-qualified participants and resizes them at each Apply commit.
 inline constexpr std::size_t kNativeMaximumLiveStopParticipants = 64U;
 
 /// Linux scheduling request for one native scheduler role.
@@ -37,6 +39,9 @@ struct SchedulerWorkerOsConfig {
   int priority = 0;
   std::vector<int> cpu_affinity;
   bool required = false;
+  /// OD-59 (strict profile): touch a bounded part of the worker's stack
+  /// before it reports startup, so its pages are resident (and locked).
+  bool prefault_stack = false;
 
   bool requested() const {
     return policy.has_value() || !cpu_affinity.empty();
@@ -45,6 +50,11 @@ struct SchedulerWorkerOsConfig {
 
 struct SimpleSchedulerConfig {
   std::array<SchedulerWorkerOsConfig, core::kSchedulerPriorityCount> workers;
+  /// OD-59 (strict profile): before any worker starts, keep freed heap and
+  /// avoid mmap allocations (`mallopt`), then lock the process memory
+  /// (`mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)`). A failure refuses
+  /// the scheduler's construction like a rejected worker profile.
+  bool lock_memory = false;
 
   static SimpleSchedulerConfig from_environment();
   static SimpleSchedulerConfig from_environment(
@@ -76,6 +86,7 @@ class SimpleScheduler final : public core::IScheduler {
       core::TimePoint deadline, std::function<void()> callback,
       core::SchedulerPriority priority =
           core::SchedulerPriority::Lifecycle) override;
+  // Removes a queued item without waiting for a dequeued callback to finish.
   void cancel(core::ScheduleHandle handle) override;
   bool cancel_before_dequeue(core::ScheduleHandle handle) override;
   void drain(core::SchedulerPriority priority) override;
@@ -83,6 +94,9 @@ class SimpleScheduler final : public core::IScheduler {
                  std::chrono::nanoseconds timeout) override;
   void drain_all() override;
   bool drain_all_for(std::chrono::nanoseconds timeout) override;
+  /// Close scheduling and discard work not yet dequeued. Call only after
+  /// component owners have settled their tracked obligations.
+  void close_admission_and_discard();
 
   /// The host installs its cell containment once its addressed Kernel exists
   /// and clears it (empty sink) before that Kernel is destroyed. Clearing
@@ -132,6 +146,7 @@ class SimpleScheduler final : public core::IScheduler {
   /// Maps handle -> owning worker so cancel() can route correctly
   /// without locking both workers.
   std::mutex registry_mutex_;
+  bool admission_closed_ = false;
   std::map<core::ScheduleHandle, core::SchedulerPriority> handle_to_priority_;
 
   /// Held while the sink runs so clearing it cannot race a containment.

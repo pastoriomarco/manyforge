@@ -14,7 +14,8 @@
 
 namespace manyforge::core {
 
-/// Exact retained compiler template from which CCLC resolved one base plan.
+/// Exact retained compiler template from which the execution host resolved
+/// one base plan.
 struct ResolvedStopTemplateRefDTO final {
   ProductId product_id;
   ProductContractId product_contract_id;
@@ -138,7 +139,7 @@ struct ResolvedStopEscalationStageDTO final {
                          const ResolvedStopEscalationStageDTO&) = default;
 };
 
-/// Content-addressed I7 reconciliation product scoped to one exact active
+/// Content-addressed reconciliation product scoped to one exact active
 /// control configuration. It contains no operation-specific or live evidence.
 struct ResolvedStopBasePlanDTO final {
   ResolvedStopBasePlanId resolved_stop_base_plan_id;

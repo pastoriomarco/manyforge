@@ -1,4 +1,4 @@
-"""Supported O1 split Isaac operator profile.
+"""Supported split Isaac operator profile.
 
 The profile is an outer lifecycle owner only. It attaches to an Isaac Sim run
 on its own simulator host, starts the source-matched ManyForge/ROS composition
@@ -245,7 +245,7 @@ class IsaacLauncherConfig:
         if type(self.ros_domain) is not int or not 0 <= self.ros_domain <= 232:
             raise ValueError("ros_domain must be in [0, 232]")
         if self.rmw != "rmw_fastrtps_cpp" or self.discovery_range != "LOCALHOST":
-            raise ValueError("O1 Isaac requires the recorded Fast DDS LOCALHOST topology")
+            raise ValueError("Isaac requires the recorded Fast DDS LOCALHOST topology")
         peers = tuple(sorted(set(self.static_peers)))
         if peers != self.static_peers or not peers:
             raise ValueError("static_peers must be sorted and unique")
@@ -824,7 +824,7 @@ class IsaacLauncher:
     def _verify_remote_source(self, expected: SourceIdentityV1) -> None:
         remote = self._require_config().remote
         result = self._ssh_json(shlex.join([remote.python_executable,
-            f"{remote.source_root}/scripts/qualification/source_identity.py", "--repo-root", remote.source_root]), timeout=60)
+            f"{remote.source_root}/scripts/lib/source_identity.py", "--repo-root", remote.source_root]), timeout=60)
         try:
             actual = SourceIdentityV1.model_validate_json(json.dumps(result))
         except Exception as error:

@@ -3,9 +3,9 @@
 The effectful historical cohorts remain pinned in source blob
 8c0ecee5ad79b553063c0f171740a3ccf617e8d7: HTTP probes at lines 77-142,
 Composer-v0 reduction/publication at 164-256, and polling/shutdown at 264-304.
-I6/N acceptance must recover endpoint failure, model-identity mismatch,
+A restored supervisor must recover endpoint failure, model-identity mismatch,
 optional proxy selection, readiness transitions, bounded polling, and shutdown
-truth. H0 qualifies only the separate closed read client.
+truth. These tests cover only the separate closed read client.
 """
 
 from __future__ import annotations
@@ -106,7 +106,7 @@ def test_old_status_transport_is_fenced_before_network() -> None:
         )
 
 
-def test_historical_effectful_supervisor_cohorts_remain_assigned_after_h0_reads() -> None:
+def test_historical_effectful_supervisor_cohorts_stay_pinned_in_source() -> None:
     assert supervisor.SUPERVISOR_DISPOSITION == "superseded_by_component_manager"
     source = inspect.getsource(supervisor)
     assert "8c0ecee5ad79b553063c0f171740a3ccf617e8d7" in source

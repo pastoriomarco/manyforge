@@ -1,19 +1,17 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Mock UR5e and Lite6 on a wall-separated bench: two independent joint trajectories in one shared control group, without synchronized timing.",
   "members": {
-    "assignment.yaml": "sha256:f44d0d3f0adf5a93854e73a414393a779a4a5704a910f29b2500a491cf3a3ebe",
     "deployment.yaml": "sha256:27dcf08c5c324a0fbd5fd85567c92d273e21e6039440d4912d58581a24652a36",
-    "program.yaml": "sha256:fa617e5da2ade64f3f467eecc9c34a82562e4d82cbef74217e2ea75bbab07d3b"
+    "program.yaml": "sha256:f94c7a6fbfa07928975d5e4a61fd162cc8ee9f42c822c18c1e90cb688c648ae8"
   },
   "name": "mock_dual_arm_shared_group",
   "saved_status": {
-    "checked_content_digest": "sha256:d332c575642117b941b2683bb68aa45c89441e99be882b3986cccb56ecbbb4cb",
+    "checked_content_digest": "sha256:2190c51b21b06b9fc795ddc7c18658a2836b28998a23a91eaa72e3195f1c7ac7",
     "last_known_status": "ready",
     "manyforge_version": "0.2.0"
   },

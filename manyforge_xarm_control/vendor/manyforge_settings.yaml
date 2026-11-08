@@ -1,4 +1,4 @@
-# ManyForge's additions to the xArm vendor base files (CONTRACTS §12). Every
+# ManyForge's additions to the xArm vendor base files. Every
 # setting says why it is here; everything else is the vendor's. `${address}`
 # and `${namespace}` are instance values the generic generator fills in (the
 # robot's address from the site settings, the component's namespace).
@@ -37,17 +37,17 @@ driver:
     - clean_error        # prepare / recover clear the controller error
     - clean_warn         # recover clears the controller warning
     - get_err_warn_code  # the error left after clean_error (e-stop still pressed)
-    - get_state          # the controller state, read on demand (M7's list)
-    - get_servo_angle    # the joint angles, read on demand (M7's list)
-    - set_mode           # the controller mode, set on demand (M7's list)
+    - get_state          # the controller state, read on demand
+    - get_servo_angle    # the joint angles, read on demand
+    - set_mode           # the controller mode, set on demand
     - set_state          # the re-arm after a TCP offset (the controller drops to state 5)
     - set_tcp_offset     # Active TCP: the controller's TCP offset
     - set_tcp_load       # Active TCP: the total payload
     - set_cgpio_digital  # controller I/O output writes
     - set_tgpio_digital  # tool I/O output writes
-    - system_control     # power actions: 1 = shut down, 2 = reboot (fork, CONTRACTS §13)
+    - system_control     # power actions: 1 = shut down, 2 = reboot (fork)
   io_states:
-    # The fork's port-30000 I/O stream `xarm_io_states` (CONTRACTS §13): both
+    # The fork's port-30000 I/O stream `xarm_io_states`: both
     # I/O components read it.
     enable: true
     # Publish rate (Hz). A value lasting less than about one period (10 ms)
@@ -76,6 +76,13 @@ controllers:
       # 6.10 replacement default written out, and ManyMove's open-loop
       # (`open_loop_control`) behaviour.
       action_monitor_rate: 20.0
+      # The arm claims `position` only (the hardware exports position and
+      # velocity; the driver runs with `velocity_control: 0` and never reads
+      # the velocity command). Stock JTC listens on `~/speed_scaling_input`
+      # only without a velocity, acceleration or effort command interface,
+      # so runtime speed scaling needs this. The generator refuses any other
+      # claim.
+      command_interfaces: [position]
       interpolate_from_desired_state: true
       allow_trajectory_replacement: true
       constraints:

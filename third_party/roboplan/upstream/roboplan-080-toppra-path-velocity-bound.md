@@ -1,10 +1,8 @@
 # RoboPlan 0.8.0 per-grid-point path-velocity bound for TOPP-RA
 
 Status: feature gap confirmed by source inspection; the local patch is written
-against the exact patched 0.8.0 closure but has not yet been built or run
-(M9 build); not yet submitted upstream
-
-ManyForge tracking ID: `RP-UP-080-001` (plan item RP-3)
+against the exact patched 0.8.0 closure but has not yet been built or run;
+not yet submitted upstream
 
 ## Exact upstream source and dependency closure
 
@@ -64,7 +62,7 @@ stretches uniformly only if a sample exceeds the limit.
 
 ## Focused regression and sanitizer evidence
 
-Required before qualification, at the M9 build:
+Required before qualification:
 
 1. the new focused test passes in Release and under ASan/UBSan;
 2. the existing TOPP-RA suite passes unchanged (the hook is unset there);

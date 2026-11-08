@@ -175,7 +175,7 @@ inline void map_robotiq_gripper_only_graph(CanonicalValue::Object &members) {
 make_robotiq_gripper_only_retention_fixture(std::string_view lifecycle_semantic_digest) {
   const auto structural = make_robotiq_gripper_only_structural_retention_fixture();
   return make_lite6_controllable_retention_fixture(
-      false, false, 1U, "i6_robotiq_gripper_only_cell", false, true,
+      false, false, 1U, "robotiq_gripper_only_cell", false, true,
       "resource", true, lifecycle_semantic_digest, lifecycle_semantic_digest, true, true, std::nullopt, kLite6ArmTargetId,
       std::nullopt, std::nullopt, {}, true, {},
       "manyforge.provider.ros2_control", true, true, &structural,

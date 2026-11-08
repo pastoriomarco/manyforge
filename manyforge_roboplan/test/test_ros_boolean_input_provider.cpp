@@ -13,17 +13,35 @@
 // limitations under the License.
 
 #include <manyforge_roboplan/ros_boolean_input_provider.hpp>
+#include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <functional>
+#include <future>
 #include <gtest/gtest.h>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <rclcpp/executors/single_threaded_executor.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/int32.hpp>
+#include <thread>
 #include <utility>
+
+namespace manyforge::ros2_control_execution {
+class Ros2TransportOwnerTestPeer {
+public:
+  static bool closing(Ros2TransportResources &owner) {
+    std::lock_guard lock(owner.dispatch_mutex_);
+    return owner.dispatch_stopping_;
+  }
+  static std::thread::id time_critical_thread(Ros2TransportResources &owner) {
+    std::lock_guard lock(owner.dispatch_mutex_);
+    return owner.time_critical_thread_id_;
+  }
+};
+} // namespace manyforge::ros2_control_execution
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -90,13 +108,15 @@ protected:
   void TearDown() override {
     if (provider)
       provider->Shutdown();
-    executor->cancel();
-    executor->remove_node(node);
+    if (executor) {
+      executor->cancel();
+      if (node) executor->remove_node(node);
+    }
     provider.reset();
     publisher.reset();
     executor.reset();
     node.reset();
-    context->shutdown("boolean input fixture complete");
+    if (context && context->is_valid()) context->shutdown("boolean input fixture complete");
   }
   bool SpinUntil(const std::function<bool()> &condition) {
     const auto deadline = std::chrono::steady_clock::now() + 2s;
@@ -118,7 +138,7 @@ protected:
     publisher->publish(message);
   }
 
-  core::FakeClock clock;
+  std::shared_ptr<core::FakeClock> clock = std::make_shared<core::FakeClock>();
   std::shared_ptr<rclcpp::Context> context;
   rclcpp::Node::SharedPtr node;
   std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> executor;
@@ -143,13 +163,207 @@ protected:
       core::IoSignalLivenessMode::kPeriodic};
 };
 
+TEST_F(RosBooleanInputProviderTest, MatchedPublishersTrackCompatibleEndpoints) {
+  Connect();
+  ASSERT_TRUE(SpinUntil([&] { return provider->matched_publishers() == 1U; }));
+  auto second = node->create_publisher<std_msgs::msg::Bool>(binding.topic, qos);
+  ASSERT_TRUE(SpinUntil([&] { return provider->matched_publishers() == 2U; }));
+  second.reset();
+  ASSERT_TRUE(SpinUntil([&] { return provider->matched_publishers() == 1U; }));
+  publisher.reset();
+  ASSERT_TRUE(SpinUntil([&] { return provider->matched_publishers() == 0U; }));
+  auto incompatible_qos = rclcpp::QoS(rclcpp::KeepLast(8));
+  incompatible_qos.best_effort();
+  auto incompatible = node->create_publisher<std_msgs::msg::Bool>(binding.topic, incompatible_qos);
+  ASSERT_TRUE(SpinUntil([&] { return node->count_publishers(binding.topic) == 1U; }));
+  executor->spin_some();
+  EXPECT_EQ(provider->matched_publishers(), 0U);
+}
+
+// OD-66: an owned input is an interrupt input; it runs on the owner's
+// time-critical thread, never on the owner thread.
+TEST_F(RosBooleanInputProviderTest,
+       OwnedSubscriptionDeliversOnTimeCriticalThreadAndRetiresAfterForeignDrop) {
+  class ThreadIngress final : public core::IIoSignalIngress {
+  public:
+    bool TryEnqueue(const core::IoSourceAcquisitionDTO &) noexcept override {
+      if (!delivered.exchange(true))
+        thread.set_value(std::this_thread::get_id());
+      return true;
+    }
+    void
+    NotifyLoss(const core::IoIngressLossNotificationDTO &) noexcept override {}
+    std::atomic<bool> delivered{false};
+    std::promise<std::thread::id> thread;
+  };
+  auto transport =
+      ros2_control_execution::Ros2TransportResources::create(
+          "manyforge_input_owned_test", "", 1U, [this] { return context; });
+  auto ingress = std::make_shared<ThreadIngress>();
+  auto observed = ingress->thread.get_future();
+  auto made = RosBooleanInputProvider::Create(transport->node(), ingress, clock,
+                                              binding, descriptor, qos,
+                                              std::nullopt, transport);
+  ASSERT_TRUE(made.ok());
+  auto owned_provider = std::move(made.value());
+  transport->start();
+  std::thread::id owner_thread;
+  transport->invoke([&] { owner_thread = std::this_thread::get_id(); });
+  ASSERT_TRUE(
+      SpinUntil([&] { return publisher->get_subscription_count() == 1; }));
+  Publish(true);
+  ASSERT_EQ(observed.wait_for(2s), std::future_status::ready);
+  const auto delivered_on = observed.get();
+  EXPECT_NE(delivered_on, owner_thread);
+  EXPECT_EQ(delivered_on,
+            ros2_control_execution::Ros2TransportOwnerTestPeer::time_critical_thread(*transport));
+  auto drop = std::async(std::launch::async, [&] { owned_provider.reset(); });
+  drop.get();
+  transport->quiesce();
+}
+
+TEST_F(RosBooleanInputProviderTest, OwnedInputDeliversWhileOwnerTaskBlocks) {
+  class CountingIngress final : public core::IIoSignalIngress {
+  public:
+    bool TryEnqueue(const core::IoSourceAcquisitionDTO &) noexcept override {
+      ++delivered;
+      return true;
+    }
+    void
+    NotifyLoss(const core::IoIngressLossNotificationDTO &) noexcept override {}
+    std::atomic<int> delivered{0};
+  };
+  std::atomic<bool> released{false};
+  std::promise<void> entered;
+  auto in_task = entered.get_future();
+  auto transport =
+      ros2_control_execution::Ros2TransportResources::create(
+          "manyforge_input_blocked_owner_test", "", 1U, [this] { return context; });
+  auto ingress = std::make_shared<CountingIngress>();
+  auto made = RosBooleanInputProvider::Create(transport->node(), ingress, clock,
+                                              binding, descriptor, qos,
+                                              std::nullopt, transport);
+  ASSERT_TRUE(made.ok());
+  auto owned_provider = std::move(made.value());
+  transport->start();
+  std::future<void> task;
+  struct Release final {
+    std::atomic<bool> &flag;
+    ~Release() { flag.store(true); }
+  } release{released};
+  ASSERT_TRUE(
+      SpinUntil([&] { return publisher->get_subscription_count() == 1; }));
+  // An ordinary owner task blocked on a latch (shorter than the stall bound).
+  task = std::async(std::launch::async, [&] {
+    transport->invoke([&] {
+      entered.set_value();
+      while (!released.load()) std::this_thread::sleep_for(1ms);
+    });
+  });
+  ASSERT_EQ(in_task.wait_for(2s), std::future_status::ready);
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (ingress->delivered.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+    Publish(true);
+    std::this_thread::sleep_for(5ms);
+  }
+  EXPECT_GT(ingress->delivered.load(), 0);
+  EXPECT_FALSE(released.load());  // Delivered while the owner thread was blocked.
+  released.store(true);
+  task.get();
+  owned_provider.reset();
+  transport->quiesce();
+}
+
+TEST_F(RosBooleanInputProviderTest, ClosingOwnerRefusesRebindBeforeJoin) {
+  auto transport = ros2_control_execution::Ros2TransportResources::create(
+      "manyforge_input_closing_test", "", 1U, [this] { return context; });
+  auto created = RosBooleanInputProvider::Create(
+      transport->node(), sink, clock, binding, descriptor, qos, std::nullopt, transport);
+  ASSERT_TRUE(created.ok());
+  auto owned_provider = std::move(created.value());
+  std::promise<void> entered;
+  auto observed = entered.get_future();
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  transport->start();
+  rclcpp::TimerBase::SharedPtr timer;
+  transport->invoke_creation([&] {
+    timer = transport->node()->create_wall_timer(1ms, [&] {
+      entered.set_value();
+      released.wait();
+    });
+  });
+  const bool callback_entered = observed.wait_for(5s) == std::future_status::ready;
+  std::optional<core::ErrorDTO> failure;
+  bool closing = false;
+  std::future<void> closed;
+  if (callback_entered) {
+    closed = std::async(std::launch::async, [&] { transport->quiesce(); });
+    const auto until = std::chrono::steady_clock::now() + 5s;
+    while (!(closing = ros2_control_execution::Ros2TransportOwnerTestPeer::closing(*transport)) &&
+           std::chrono::steady_clock::now() < until)
+      std::this_thread::yield();
+    if (closing) {
+      auto rebound = owned_provider->RebindIngress(
+          sink, core::IoSourceIncarnation("activation.2"), 1U);
+      if (!rebound.ok()) failure = rebound.error();
+    }
+  }
+  release.set_value();
+  if (closed.valid()) closed.get();
+  else transport->quiesce();
+  timer.reset();
+  ASSERT_TRUE(callback_entered);
+  ASSERT_TRUE(closing);
+  ASSERT_TRUE(failure.has_value());
+  EXPECT_EQ(failure->code, "component_not_ready");
+  ASSERT_TRUE(failure->details.contains("reason"));
+  EXPECT_EQ(failure->details.at("reason"), "owner_closing");
+}
+
+TEST_F(RosBooleanInputProviderTest, FaultedOwnerRefusesRebindBeforeJoin) {
+  auto transport = ros2_control_execution::Ros2TransportResources::create(
+      "manyforge_input_faulted_test", "", 1U, [this] { return context; });
+  std::promise<void> entered;
+  auto observed = entered.get_future();
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  transport->set_executor_fault_observer([&](std::string_view) {
+    entered.set_value();
+    released.wait();
+  });
+  auto created = RosBooleanInputProvider::Create(
+      transport->node(), sink, clock, binding, descriptor, qos, std::nullopt, transport);
+  ASSERT_TRUE(created.ok());
+  auto owned_provider = std::move(created.value());
+  transport->start();
+  rclcpp::TimerBase::SharedPtr timer;
+  transport->invoke_creation([&] {
+    timer = transport->node()->create_wall_timer(
+        1ms, [] { throw std::runtime_error("forced owner fault"); });
+  });
+  const bool fault_entered = observed.wait_for(5s) == std::future_status::ready;
+  std::optional<core::ErrorDTO> failure;
+  if (fault_entered) {
+    auto rebound = owned_provider->RebindIngress(
+        sink, core::IoSourceIncarnation("activation.2"), 1U);
+    if (!rebound.ok()) failure = rebound.error();
+  }
+  release.set_value();
+  transport->quiesce();
+  timer.reset();
+  ASSERT_TRUE(fault_entered);
+  ASSERT_TRUE(failure.has_value());
+  EXPECT_EQ(failure->code, "ros_transport_executor_failed");
+}
+
 TEST_F(RosBooleanInputProviderTest,
        DoesNotFabricateAnInitialSampleOrHeartbeat) {
   Connect();
   ASSERT_NE(provider, nullptr);
   EXPECT_EQ(sink->count, 0U);
   EXPECT_EQ(sink->loss_count, 0U);
-  clock.advance(1000);
+  clock->advance(1000);
   executor->spin_some();
   EXPECT_EQ(sink->count, 0U);
   EXPECT_EQ(sink->loss_count, 0U);
@@ -160,10 +374,10 @@ TEST_F(RosBooleanInputProviderTest,
        PreservesFalseTrueOrderIdentityAndIngressTimestamp) {
   Connect();
   ASSERT_NE(provider, nullptr);
-  clock.set(10);
+  clock->set(10);
   Publish(false);
   ASSERT_TRUE(SpinUntil([&] { return sink->count == 1; }));
-  clock.set(20);
+  clock->set(20);
   Publish(true);
   ASSERT_TRUE(SpinUntil([&] { return sink->count == 2; }));
   const auto &first = *sink->samples[0];
@@ -187,7 +401,7 @@ TEST_F(RosBooleanInputProviderTest,
 TEST_F(RosBooleanInputProviderTest, RetainedDriverRebindNeedsANewActualSample) {
   Connect();
   ASSERT_TRUE(provider);
-  clock.set(10);
+  clock->set(10);
   Publish(true);
   ASSERT_TRUE(SpinUntil([&] { return sink->count == 1U; }));
   Publish(false); // Buffered on the old subscription, never relabeled.
@@ -200,7 +414,7 @@ TEST_F(RosBooleanInputProviderTest, RetainedDriverRebindNeedsANewActualSample) {
   EXPECT_TRUE(provider->status().accepting);
   ASSERT_TRUE(
       SpinUntil([&] { return publisher->get_subscription_count() == 1U; }));
-  clock.set(20);
+  clock->set(20);
   Publish(false);
   ASSERT_TRUE(SpinUntil([&] { return next->count == 1U; }));
   ASSERT_TRUE(next->samples[0]);
@@ -217,13 +431,13 @@ TEST_F(RosBooleanInputProviderTest,
        ResumeRejectsThePreviousSubscriptionQueuedMessage) {
   Connect();
   ASSERT_TRUE(provider);
-  clock.set(10);
+  clock->set(10);
   Publish(false);
   ASSERT_TRUE(SpinUntil([&] { return sink->count == 1U; }));
   Publish(true); // Queued before Disable, not yet passed to its callback.
   ASSERT_TRUE(provider->Pause(1U));
   ASSERT_TRUE(provider->Resume(2U));
-  clock.set(20);
+  clock->set(20);
   executor->spin_some();
   EXPECT_EQ(sink->count, 1U);
   EXPECT_EQ(sink->loss_count, 1U);
@@ -244,13 +458,13 @@ TEST_F(RosBooleanInputProviderTest,
        CapturesReceiptBeforeCallingTheHostIngress) {
   Connect();
   ASSERT_NE(provider, nullptr);
-  clock.set(25);
-  sink->advance_on_enqueue = &clock;
+  clock->set(25);
+  sink->advance_on_enqueue = clock.get();
   Publish(true);
   ASSERT_TRUE(SpinUntil([&] { return sink->count == 1; }));
-  EXPECT_EQ(clock.now(), 1025);
+  EXPECT_EQ(clock->now(), 1025);
   EXPECT_EQ(sink->samples[0]->acquisition.trusted_received_at_ns, 25);
-  clock.advance(5000);
+  clock->advance(5000);
   EXPECT_EQ(sink->samples[0]->acquisition.trusted_received_at_ns, 25);
 }
 
@@ -259,7 +473,7 @@ TEST_F(RosBooleanInputProviderTest,
   Connect();
   ASSERT_NE(provider, nullptr);
   sink->reject = true;
-  clock.set(30);
+  clock->set(30);
   Publish(false);
   ASSERT_TRUE(SpinUntil([&] { return sink->loss_count == 1; }));
   EXPECT_EQ(sink->count, 0U);
@@ -272,7 +486,7 @@ TEST_F(RosBooleanInputProviderTest,
   EXPECT_FALSE(loss.middleware_reported_lost_messages.has_value());
   EXPECT_EQ(provider->status().last_enqueued_source_sequence, 0U);
   sink->reject = false;
-  clock.set(40);
+  clock->set(40);
   Publish(true);
   ASSERT_TRUE(SpinUntil([&] { return sink->count == 1; }));
   EXPECT_EQ(sink->samples[0]->acquisition.source_sequence, 2U);
@@ -302,7 +516,7 @@ TEST_F(RosBooleanInputProviderTest,
   ASSERT_TRUE(SpinUntil([&] { return sink->count == 1; }));
   EXPECT_FALSE(provider->MarkUnavailable(binding.incarnation, 0));
   EXPECT_EQ(sink->loss_count, 0U);
-  clock.set(50);
+  clock->set(50);
   EXPECT_TRUE(provider->MarkUnavailable(binding.incarnation, 1));
   ASSERT_EQ(sink->loss_count, 1U);
   EXPECT_EQ(sink->losses[0]->reason, core::IoIngressLossReason::kDisconnected);
@@ -390,13 +604,13 @@ TEST_F(RosBooleanInputProviderTest,
   descriptor.update_mode = core::IoSignalUpdateMode::kChangeOnly;
   descriptor.freshness = {core::IoFreshnessMode::kProviderValidity,
                           std::nullopt};
-  clock.set(50);
+  clock->set(50);
   Connect();
   ASSERT_TRUE(provider);
   ASSERT_TRUE(SpinUntil([&] { return sink->count == 1U; }));
   EXPECT_EQ(sink->samples[0]->acquisition.updates.front().value, true);
   EXPECT_EQ(sink->samples[0]->acquisition.trusted_received_at_ns, 50);
-  clock.advance(1000);
+  clock->advance(1000);
   executor->spin_some();
   EXPECT_EQ(sink->count, 1U); // no synthetic periodic refresh
 }
@@ -463,6 +677,51 @@ TEST_F(RosBooleanInputProviderTest,
   other_publisher.reset();
   other_node.reset();
   other_context->shutdown("other source type complete");
+}
+
+TEST_F(RosBooleanInputProviderTest,
+       TransportRecoveryPreservesSenderAndRejectsStaleSnapshot) {
+  class AtomicIngress final : public core::IIoSignalIngress {
+  public:
+    bool TryEnqueue(const core::IoSourceAcquisitionDTO &) noexcept override {
+      ++count;
+      return true;
+    }
+    void NotifyLoss(const core::IoIngressLossNotificationDTO &) noexcept override {}
+    std::atomic<unsigned> count{0};
+  };
+  auto ingress = std::make_shared<AtomicIngress>();
+  auto old = ros2_control_execution::Ros2TransportResources::create(
+      "bool_recovery_old", "", 1U, [this] { return context; });
+  auto replacement =
+      ros2_control_execution::Ros2TransportResources::create(
+          "bool_recovery_new", "", 1U, [this] { return context; });
+  auto made = RosBooleanInputProvider::Create(old->node(), ingress, clock, binding,
+                                              descriptor, qos, 1U, old);
+  ASSERT_TRUE(made.ok());
+  provider = std::move(made.value());
+  const auto snapshot = provider->CaptureTransportRecovery();
+  EXPECT_FALSE(
+      RosBooleanInputProvider::StageTransportRecovery(snapshot, {}).ok());
+  EXPECT_TRUE(provider->MatchesTransportRecovery(*snapshot));
+  auto staged =
+      RosBooleanInputProvider::StageTransportRecovery(snapshot, replacement);
+  ASSERT_TRUE(staged.ok());
+  EXPECT_TRUE(provider->MatchesTransportRecovery(*snapshot));
+  EXPECT_FALSE(provider->status().accepting);
+  provider->CommitTransportRecovery(*staged.value());
+  RosBooleanInputProvider::ActivateTransportRecovery(*staged.value());
+  EXPECT_FALSE(provider->MatchesTransportRecovery(*snapshot));
+  EXPECT_FALSE(provider->status().accepting);
+  EXPECT_EQ(provider->status().last_ingress_source_sequence, 0U);
+  EXPECT_TRUE(provider->Resume(2U));
+  replacement->start();
+  ASSERT_TRUE(SpinUntil([&] {
+    Publish(true);
+    return ingress->count.load() > 0U;
+  }));
+  provider.reset();
+  replacement->quiesce();
 }
 
 } // namespace manyforge::roboplan_backend

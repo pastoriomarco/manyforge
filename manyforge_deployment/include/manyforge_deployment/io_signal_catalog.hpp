@@ -4,6 +4,7 @@
 #include <manyforge_core/types/deployment_applicability.hpp>
 #include <manyforge_core/types/io_signal.hpp>
 #include <manyforge_core/types/json_value.hpp>
+#include <manyforge_core/types/program_reference.hpp>
 #include <manyforge_core/types/robot_defaults.generated.hpp>
 #include <optional>
 #include <span>
@@ -78,6 +79,22 @@ struct RetainedIoSignalConfiguration final {
   IoSignalProviderConfiguration provider;
 };
 
+/// One exact direct Program-signal match. The retained configuration pointer
+/// remains valid only while the input catalog stays alive and unchanged.
+/// `descriptor` is the actual derived input for changed_outside; its target
+/// and provider provenance are those of the retained base output.
+struct ProgramSignalMatch final {
+  const RetainedIoSignalConfiguration *retained;
+  core::IoSignalDescriptorDTO descriptor;
+  bool changed_outside;
+};
+
+/// Find every exact match, including eligible core-held changed_outside
+/// inputs. Multiple results are ambiguity, never a first-match selection.
+[[nodiscard]] std::vector<ProgramSignalMatch> FindProgramSignalMatches(
+    std::span<const RetainedIoSignalConfiguration> catalog,
+    const core::ProgramSignalReferenceDTO &reference);
+
 struct RetainedIoProviderDeviceConfiguration final {
   core::RuntimeUnitId runtime_unit_id;
   core::ControllableComponentId controllable_component_id;
@@ -85,7 +102,7 @@ struct RetainedIoProviderDeviceConfiguration final {
   /// Required after normalization for acknowledged ROS service outputs.
   /// Mock outputs have immediate synthetic acceptance and no deadline budget.
   std::optional<core::Duration> output_source_ack_timeout_ns{};
-  /// CONTRACTS §16: set on a machine's I/O member (its owner's component id
+  /// Set on a machine's I/O member (its owner's component id
   /// and its member role); absent otherwise.
   std::optional<std::string> owner_component_id{};
   std::optional<std::string> member_role{};
@@ -113,7 +130,7 @@ ResolveRetainedIoSignalCatalog(
     const core::CellGraphDTO &graph,
     const std::optional<core::RuntimeUnitId> &runtime_unit_id = std::nullopt);
 
-/// System signals (grasp lost as a signal, contract §2): one compiled input
+/// System signals (grasp lost as a signal): one compiled input
 /// per gripper target, never authored. A gripper target is a command target
 /// with a `tool.gripper.command` control binding; the signal lives on that
 /// target's component (the robot carrying the object).
@@ -135,7 +152,7 @@ inline constexpr std::string_view kGripperCommandCapabilityId =
 [[nodiscard]] std::string
 CarriedObjectLostSignalName(std::string_view command_target_id);
 
-/// CONTRACTS §16: the provider profile of a machine's I/O bank on the real
+/// The provider profile of a machine's I/O bank on the real
 /// lane (`{bank}`; its vendor family serves it through the owner's
 /// connection). Inputs sampled periodically (sample-age freshness), outputs
 /// with read-back, one channel per signal.
@@ -152,7 +169,7 @@ inline constexpr std::string_view kComponentAdapterIoProfile =
 [[nodiscard]] core::Result<std::vector<RetainedIoSignalConfiguration>>
 ResolveCompiledIoSignalCatalog(const core::CellGraphDTO &graph);
 
-/// CONTRACTS §7 (plan V2-7): the output row whose core-held
+/// The output row whose core-held
 /// `<output name>.changed_outside` signal `signal_name` names, or nullptr when
 /// the name lacks the suffix or the component has no such output. The caller
 /// still checks `core::HoldsChangedOutside` (read-back, not controller-owned).
@@ -161,7 +178,7 @@ ResolveCompiledIoSignalCatalog(const core::CellGraphDTO &graph);
     const core::ControllableComponentId &component,
     std::string_view signal_name);
 
-/// CP9: one model-free pose-source row (`pose_sources`) of a runtime unit.
+/// One model-free pose-source row (`pose_sources`) of a runtime unit.
 struct RetainedPoseSourceConfiguration final {
   core::RuntimeUnitId runtime_unit_id;
   core::ControllableComponentId controllable_component_id;

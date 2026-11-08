@@ -862,7 +862,7 @@ def _validate_model_semantics(
                 path=f"{binding_path}.pose_in_source_link",
             )
     _canonical_unique(frame_roles, path=f"{path}.frame_role_bindings")
-    # An offset frame (TCP-A) is a generated link named after its role: its
+    # An offset frame is a generated link named after its role: its
     # parent is a source link, never another offset frame.
     for frame_role in frame_offsets:
         if frame_bindings[frame_role] in frame_offsets:
@@ -970,7 +970,7 @@ def _validate_model_semantics(
     root_frame_role = _identifier(
         semantics["root_frame_role_id"], path=f"{path}.root_frame_role_id"
     )
-    # E1: a family added as data has no pin; its roles are checked against its
+    # A family added as data has no pin; its roles are checked against its
     # URDF/SRDF by `manyforge component check` (its component.yaml).
     expected = _EXPECTED_MODEL_FAMILIES.get(family_id)
     if expected is None:

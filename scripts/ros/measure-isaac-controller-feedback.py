@@ -9,8 +9,8 @@ the same ROS surfaces the C++ ROS execution adapter uses:
 * /isaac_joint_states: raw Isaac hardware-input topic for diagnostics
 
 The owner-neutral cadence and tracking reducers remain available to the future
-focused adapter.  The former ROS subscriber is intentionally absent until
-I9/I; its exact implementation is preserved at ManyForge commit
+focused adapter.  The former ROS subscriber is intentionally absent; its exact
+implementation is preserved at ManyForge commit
 08222188293df8e12f90dc72e204c21f22f92ea1, blob
 d5166babcd9960cb8bb340915db435131419d622.
 """
@@ -36,7 +36,7 @@ DEFAULT_REQUIRED_JOINTS = [
 ]
 UNAVAILABLE_MESSAGE = (
     "composable_cell_runtime_unavailable: live Isaac controller feedback "
-    "measurement requires the I9/I focused ROS/Isaac adapter gate"
+    "measurement requires the focused ROS/Isaac adapter, not available yet"
 )
 MAX_TOPIC_SAMPLES = 1_000_000
 MAX_JOINTS = 256

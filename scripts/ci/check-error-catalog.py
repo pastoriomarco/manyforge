@@ -112,8 +112,6 @@ _SKIP_PARTS = {
     "qualification",
     "verification",
     "examples",
-    "exts",
-    "jtc_characterization",
 }
 
 

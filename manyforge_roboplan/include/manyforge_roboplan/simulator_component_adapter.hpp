@@ -4,7 +4,6 @@
 #include <manyforge_core/ports/icomponent_adapter_port.hpp>
 #include <manyforge_core/types/component_state.hpp>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <string_view>
@@ -12,7 +11,7 @@
 
 namespace manyforge::roboplan_backend {
 
-/// CONTRACTS §14: the generic simulator interface, on the ROS 2
+/// The generic simulator interface, on the ROS 2
 /// `simulation_interfaces` standard (Isaac Sim, Gazebo and O3DE implement
 /// it). Nothing here knows a particular simulator: service names and timing
 /// come from the simulator component's lane row.
@@ -49,15 +48,15 @@ inline constexpr std::string_view kSimulatorUnreachableReason = "simulator_unrea
 
 /// The simulator component's state: `playing` = `enabled`; `paused` and
 /// `stopped` = `prepared` with their reason; unreachable = `offline`.
-/// `activity` is `unknown` while a request's outcome is unknown, else `idle`.
+/// An unanswered request remains an `unknown` action result; state is derived
+/// only from the simulator's observation.
 [[nodiscard]] core::ComponentState SimulatorComponentState(
-    const std::optional<SimulationState> &observed, bool request_unknown, std::int64_t now_ns);
+    const std::optional<SimulationState> &observed, std::int64_t now_ns);
 
-/// The simulator component's adapter (CONTRACTS §6, §14). `prepare` and
-/// `recover` read the state; `enable` plays, `disable` pauses
-/// (CONTRACTS §14), `sim_reset` resets. A request without a response leaves the
-/// activity `unknown` until the simulator is seen in the requested state
-/// (play/pause) or answers a later request; nothing is resent.
+/// The simulator component's adapter. `prepare` and
+/// `recover` read the state; `enable` plays, `disable` pauses,
+/// `sim_reset` resets. A request without a response keeps its `unknown`
+/// action result and is never resent.
 class SimulatorComponentAdapter final : public core::IComponentAdapter {
  public:
   explicit SimulatorComponentAdapter(std::shared_ptr<ISimulationControl> control);
@@ -69,14 +68,8 @@ class SimulatorComponentAdapter final : public core::IComponentAdapter {
 
  private:
   [[nodiscard]] SimulationCall Set(SimulationState state, const std::stop_token &stop);
-  void Settle(const SimulationCall &call);
 
   std::shared_ptr<ISimulationControl> control_;
-  mutable std::mutex mutex_;
-  /// A play/pause whose response never came: cleared once observed.
-  mutable std::optional<SimulationState> unknown_target_;
-  /// A reset whose response never came: cleared by the next answered request.
-  bool reset_unknown_{};
 };
 
 }  // namespace manyforge::roboplan_backend

@@ -1,4 +1,4 @@
-"""Action-span value export and I6/N behavior-authoring gate."""
+"""Action-span value export and the behavior-authoring gate."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from manyforge_behavior.kernel_client import ActionSpan
 ACTION_SPAN_AUTHORING_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_action_span_authoring_unavailable"
 )
-ACTION_SPAN_AUTHORING_RESTORATION_GATES: Final = ("I6", "N")
 
 
 class ActionSpanAuthoringUnavailableError(RuntimeError):
@@ -20,7 +19,7 @@ class ActionSpanAuthoringUnavailableError(RuntimeError):
 def _raise_action_span_authoring_unavailable() -> None:
     raise ActionSpanAuthoringUnavailableError(
         f"{ACTION_SPAN_AUTHORING_UNAVAILABLE_REASON_CODE}: Program-Binding "
-        "node-attempt authoring returns at I6/N"
+        "node-attempt authoring is not available"
     )
 
 
@@ -43,7 +42,6 @@ class ActionSpanMixin:
 
 
 __all__ = [
-    "ACTION_SPAN_AUTHORING_RESTORATION_GATES",
     "ActionSpan",
     "ActionSpanAuthoringUnavailableError",
     "ActionSpanMixin",

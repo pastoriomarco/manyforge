@@ -24,12 +24,13 @@
 
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_xarm_control/xarm_owner_adapter.hpp>
+#include <manyforge_xarm_control/xarm_ros_owner.hpp>
 
 namespace manyforge::xarm_control {
 
 /// The machine's two I/O subscriptions below its driver namespace, held by
 /// its owner: `xarm_io_states` (`xarm_msgs/IOStates`, the fork's port-30000
-/// stream, CONTRACTS §13), stamped at receipt and handed to the owner, which
+/// stream), stamped at receipt and handed to the owner, which
 /// hands each I/O member its half; and `xarm_cgpio_states`
 /// (`xarm_msgs/CIOState`, the rich report) for the GPIO module's health and
 /// pin configuration. Callbacks run on the node's executor and hold only the
@@ -37,7 +38,8 @@ namespace manyforge::xarm_control {
 class XArmIoStatesTransport final {
 public:
   XArmIoStatesTransport(rclcpp::Node &node, std::string_view driver_namespace,
-                        core::IClock &clock, std::shared_ptr<XArmOwnerAdapter> owner);
+                        core::IClock &clock, std::shared_ptr<XArmOwnerAdapter> owner,
+                        const XArmRosOwner *ros_owner = nullptr);
 
 private:
   rclcpp::Subscription<xarm_msgs::msg::IOStates>::SharedPtr io_states_;

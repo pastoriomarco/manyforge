@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Retain pure fail-closed Lite6 startup reduction behind an I10/R gate.
+"""Retain pure fail-closed Lite6 startup reduction behind an unavailable client.
 
 The mapping reducers remain effect-free acceptance input for observation-only
 startup: motion admission must stay closed, component roles and epochs must be
 complete and unique, and supervision progress must advance.  The historical
-Composer HTTP routes and CLI loop are removed because no I10 client contract
-exists yet.  Direct execution fails before parsing arguments or opening a
+Composer HTTP routes and CLI loop are removed because no real-Lite6 client
+contract exists yet.  Direct execution fails before parsing arguments or opening a
 socket.
 
 Exact historical source: ManyForge
 ``08222188293df8e12f90dc72e204c21f22f92ea1``, blob
-``5d2aa09d302a159bb03a0f086d4bf99484c41f09``.  The reducer returns through
-the I5/H0 status owner and the I10/R real-Lite6 product client; the old route
+``5d2aa09d302a159bb03a0f086d4bf99484c41f09``.  The reducer is input for a
+future headless status owner and real-Lite6 product client; the old route
 names are not a compatibility promise.
 """
 
@@ -198,7 +198,7 @@ def main(_argv: object = None) -> int:
 
     print(
         f"{LITE6_PRODUCT_SMOKE_UNAVAILABLE_REASON_CODE}: the real-Lite6 "
-        "status client returns at I10/R after the I5/H0 status contract",
+        "status client is not available yet",
         file=sys.stderr,
     )
     return 78

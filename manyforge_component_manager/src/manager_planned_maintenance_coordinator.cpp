@@ -74,7 +74,7 @@ ManagerPlannedMaintenanceCoordinator::Preflight(
         "planned reconfiguration predecessor is not the accepted intent");
   }
 
-  // Step 2: refuse before any Apply effect unless the affected surface is
+  // Refuse before any Apply effect unless the affected surface is
   // exactly idle. A planned configuration transition must not overlap motion,
   // a held or failure-paused run, an in-progress stop or a reset.
   switch (gate_.ReadIdleState()) {
@@ -114,7 +114,7 @@ ManagerPlannedMaintenanceCoordinator::Preflight(
         "planned reconfiguration could not establish current execution state");
   }
 
-  // Step 3: recheck that the original inputs and revisions are still current.
+  // Recheck that the original inputs and revisions are still current.
   // A stale predecessor must not be used to select the transition.
   try {
     const auto plan = plan_source_.ReadCurrentPlan();
@@ -149,7 +149,7 @@ ManagerPlannedMaintenanceCoordinator::EnterIdleMaintenance(
     return *refusal;
   }
 
-  // Step 4: close admission and prove it is closed before runtime convergence.
+  // Close admission and prove it is closed before runtime convergence.
   if (!gate_.CloseAdmissionAndProveClosed()) {
     return RefusedBeforeEffect(
         "planned_maintenance_admission_not_closed",

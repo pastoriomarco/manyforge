@@ -5,7 +5,7 @@ The former :mod:`manyforge_behavior.deployment` implementation parsed
 ``robot_id/group_id``, adapter and runtime-resource selection, launcher module
 selection, gripper transport, pose-source policy, authority, and Program/Kernel
 cross-validation.  Those meanings cannot be retained beside the composable-cell
-contracts: I6 replaces them atomically with component instances, command-target
+contracts: they are replaced atomically with component instances, command-target
 and capability addresses, and the native deployment bindings.
 
 No v0 runtime parser, compatibility selector, launcher factory, partial
@@ -27,7 +27,6 @@ from typing import Final, NoReturn
 DEPLOYMENT_ARTIFACT_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_deployment_artifact_unavailable"
 )
-DEPLOYMENT_ARTIFACT_RESTORATION_GATES: Final = ("I6", "N")
 
 
 class DeploymentArtifactUnavailableError(RuntimeError):
@@ -38,8 +37,8 @@ def _raise_deployment_artifact_unavailable() -> NoReturn:
     raise DeploymentArtifactUnavailableError(
         f"{DEPLOYMENT_ARTIFACT_UNAVAILABLE_REASON_CODE}: "
         "manyforge.deployment.v0 and singleton robot/group/runtime addressing "
-        "were removed; resource-addressed native deployment artifacts return "
-        "at I6/N"
+        "were removed; resource-addressed native deployment artifacts are "
+        "not available"
     )
 
 
@@ -57,7 +56,6 @@ class Deployment:
 
 
 __all__ = [
-    "DEPLOYMENT_ARTIFACT_RESTORATION_GATES",
     "DEPLOYMENT_ARTIFACT_UNAVAILABLE_REASON_CODE",
     "Deployment",
     "DeploymentArtifactUnavailableError",

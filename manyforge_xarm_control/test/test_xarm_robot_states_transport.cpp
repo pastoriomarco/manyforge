@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// R7 package 3: the robot_states subscription over the standard
+// The robot_states subscription over the standard
 // xarm_msgs/msg/RobotMsg, observed through the xArm vendor adapter.
 
 #include <gtest/gtest.h>
@@ -49,7 +49,7 @@ public:
 }
 
 [[nodiscard]] xarm_msgs::msg::RobotMsg emergency_stop_report() {
-  // The live report under a pressed emergency stop (R7 probe 2026-10-25):
+  // The live report under a pressed emergency stop (probe 2026-10-25):
   // C2, state 4, mode 0, no axis enabled, and all-zero angles.
   xarm_msgs::msg::RobotMsg message;
   message.state = 4;
@@ -103,6 +103,37 @@ TEST(XArmRobotStatesTransport, SubscribesAndStampsTheLatestReportAtReceipt) {
   EXPECT_EQ(observed.motion_enable_mask, 0);
 
   executor.remove_node(node);
+}
+
+TEST(XArmRobotStatesTransport, OwnerRetainsNodeAndClockUntilSubscriptionRetires) {
+  auto node = std::make_shared<rclcpp::Node>("xarm_owned_transport_test");
+  auto clock = std::make_shared<core::FakeClock>();
+  std::weak_ptr<rclcpp::Node> weak_node = node;
+  std::weak_ptr<core::FakeClock> weak_clock = clock;
+  std::shared_ptr<void> retired;
+  int invoked = 0;
+  XArmRosOwner owner{node, clock,
+                     [&](std::function<void()> work) { ++invoked; work(); },
+                     [&](std::shared_ptr<void> entity) {
+                       auto *raw = entity.get();
+                       return std::shared_ptr<void>(raw, [&, entity = std::move(entity)](void *) mutable {
+                         retired = std::move(entity);
+                       });
+                     }, {}, {}, {}};
+  auto transport = std::make_unique<XArmRobotStatesTransport>(*node, unique_namespace(), *clock,
+                                                               &owner);
+  EXPECT_EQ(invoked, 1);
+  owner.node.reset();
+  owner.clock.reset();
+  node.reset();
+  clock.reset();
+  transport.reset();
+  ASSERT_TRUE(retired);
+  EXPECT_FALSE(weak_node.expired());
+  EXPECT_FALSE(weak_clock.expired());
+  retired.reset();
+  EXPECT_TRUE(weak_node.expired());
+  EXPECT_TRUE(weak_clock.expired());
 }
 
 TEST(XArmRobotStatesTransport, ReceiveKeepsTheStatusAndOffsetOfTheLatestReport) {

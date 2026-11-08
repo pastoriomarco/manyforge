@@ -6,7 +6,7 @@ Render-content reduction and bounded demand mechanics remain payload-neutral
 and are tested below.  Generic capacity-one fanout/envelope behavior is also
 covered by ``test_viewer_transport_primitives.py``.  Manifest/frame semantics,
 resynchronization, diagnostics, and qualification-delay wire behavior return
-only with the I9/I observer contract.
+only with a new observer contract.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ HISTORICAL_CASE_FAMILIES: Final = (
         "v1_manifest_frame_and_encoder_contract",
         "historical lines 33 and 223-254",
         3,
-        ("I9", "I"),
+        ("deferred",),
         "strict v1 fixture/order, manifest revision reuse, self-contained "
         "frames, and suppression of evidence-time-only publications",
     ),
@@ -51,7 +51,7 @@ HISTORICAL_CASE_FAMILIES: Final = (
         "bounded_fanout_and_v1_resynchronization",
         "historical lines 310-567",
         9,
-        ("I9", "I"),
+        ("deferred",),
         "generic latest-slot/send bounds remain current; v1 manifest resync, "
         "per-client delay, diagnostics, epoch and cached-generation targeting "
         "return with the new observer-owned protocol",

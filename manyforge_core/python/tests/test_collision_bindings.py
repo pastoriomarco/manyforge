@@ -1,8 +1,8 @@
-"""Round-trip binding tests for normalized collision DTOs (spec §3.8.1).
+"""Round-trip binding tests for normalized collision DTOs.
 
-Chunk 1 of the collision-ownership plan. These tests assert that every new
-DTO can be constructed from Python, every field is bindable, and every
-typed enum exposes the same value names as the spec.
+These tests assert that every DTO can be constructed from Python, every
+field is bindable, and every typed enum exposes the same value names as the
+C++ type.
 """
 
 import pytest
@@ -172,7 +172,7 @@ def test_collision_pair_id_keyword_ctor():
 
 
 # ---------------------------------------------------------------------------
-# Collision policy DTOs (Chunk 3)
+# Collision policy DTOs
 # ---------------------------------------------------------------------------
 
 
@@ -507,7 +507,7 @@ def test_collision_result_round_trip():
     r.normalized_pairs_classified = [classified]
     r.policy_revision_used = "12"
     r.raw_diagnostics = {"snapshot_sync_error": "unsupported mesh"}
-    # Chunk 1: distance fields stay null even on a populated result.
+    # Distance fields stay null even on a populated result.
     assert r.min_clearance_m is None
     assert r.min_clearance_pair is None
 

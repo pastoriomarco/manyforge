@@ -147,7 +147,7 @@ class KernelImmediateStepFailedError(RuntimeError):
 
 
 class IoOutputWriteFailedError(RuntimeError):
-    """An output write ended `failed` or `unknown` (CONTRACTS §7), with the
+    """An output write ended `failed` or `unknown`, with the
     host's typed error. It is never resent."""
 
     def __init__(self, code: str, message: str, outcome: str) -> None:
@@ -328,7 +328,7 @@ class KernelClient:
         self._io_watch_method("release_io_watch_scope")(scope_request)
 
     def start_mock_io_node_simulation(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        """Decision 133: the host's exact accepted acknowledgement."""
+        """The host's exact accepted acknowledgement."""
 
         ack = self._io_watch_method("start_mock_io_node_simulation")(request)
         if (
@@ -340,7 +340,7 @@ class KernelClient:
         return ack
 
     def end_mock_io_node_simulation(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        """Decision 135: the host's reply to one node attempt's end."""
+        """The host's reply to one node attempt's end."""
 
         reply = self._io_watch_method("end_mock_io_node_simulation")(request)
         if not isinstance(reply, dict):
@@ -348,7 +348,7 @@ class KernelClient:
         return reply
 
     def set_mock_io_run_paused(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        """Decision 135: the host's reply to the Run's Halt state."""
+        """The host's reply to the Run's Halt state."""
 
         reply = self._io_watch_method("set_mock_io_run_paused")(request)
         if not isinstance(reply, dict):
@@ -662,7 +662,7 @@ class KernelClient:
         return method
 
     def set_rule_active(self, rule_id: str, active: bool) -> dict[str, Any]:
-        """Kernel `set_rule_active` (CONTRACTS §8); `rule_unknown` is refused."""
+        """Kernel `set_rule_active`; `rule_unknown` is refused."""
 
         if not isinstance(rule_id, str) or not rule_id or type(active) is not bool:
             raise ValueError("set_rule_active requires a rule id and a boolean")
@@ -680,7 +680,7 @@ class KernelClient:
     def clear_outside_change(
         self, controllable_component_id: str, signal_name: str
     ) -> dict[str, Any]:
-        """Kernel `clear_outside_change` (CONTRACTS §7); writes nothing."""
+        """Kernel `clear_outside_change`; writes nothing."""
 
         return self._successful(
             self._required("clear_outside_change")(controllable_component_id, signal_name),
@@ -690,8 +690,8 @@ class KernelClient:
     def set_io_output(
         self, component_id: str, signal_name: str, value: bool | float
     ) -> dict[str, Any]:
-        """One output write by signal id through the one write path (CONTRACTS
-        §7), sent once. A refusal (`cell_latched`, `rule_holds`) raises the
+        """One output write by signal id through the one write path, sent
+        once. A refusal (`cell_latched`, `rule_holds`) raises the
         transport's typed error; a `failed` or `unknown` result raises
         `IoOutputWriteFailedError` with the host's code."""
 

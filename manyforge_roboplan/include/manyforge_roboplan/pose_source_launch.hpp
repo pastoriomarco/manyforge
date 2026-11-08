@@ -14,7 +14,7 @@
 
 namespace manyforge::roboplan_backend {
 
-/// CP9: the supervised observer process of one `pose_source` Deployment
+/// The supervised observer process of one `pose_source` Deployment
 /// component (sim-PLC pattern). ManyForge writes the observer's site document
 /// from the Deployment row and launches `pose_source.launch.py`; it never
 /// waits for the Manager or any endpoint (the Manager may be waiting on this

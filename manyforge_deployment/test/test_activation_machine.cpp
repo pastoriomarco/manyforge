@@ -11,7 +11,7 @@
 #include "activation_deployment_intent_internal.hpp"
 #include "activation_io_provider_internal.hpp"
 
-// CONTRACTS §16 / BOUNDARY §2–§3: a machine is an owner row with member rows.
+// A machine is an owner row with member rows.
 // The intent parse drops deactivated members; the profile resolution checks
 // the slots and gives members the owner's lane; I/O members become ordinary
 // I/O device rows; the owner compiles to its `machines` row.
@@ -210,7 +210,7 @@ TEST(ActivationMachine, SlotChecksRefuseUnknownAndRepeatedRoles) {
             "deployment_member_role_repeated");
 }
 
-// AUD-5b revised: any member may be deactivated on every lane, the arm
+// Any member may be deactivated on every lane, the arm
 // included; a member slot without a member (removed) is refused.
 TEST(ActivationMachine, AnyMemberMayBeDeactivatedButNoneRemoved) {
   for (const std::string lane : {"real", "mock", "isaac"}) {
@@ -224,7 +224,7 @@ TEST(ActivationMachine, AnyMemberMayBeDeactivatedButNoneRemoved) {
   }
 }
 
-// CONTRACTS §16: with its arm deactivated, the owner runs the machine's
+// With its arm deactivated, the owner runs the machine's
 // process itself where the machine has one (real): its row carries the arm's
 // lane row, description and joints. On Mock and Isaac (no machine row) the
 // owner is passive and carries none.
@@ -265,7 +265,7 @@ TEST(ActivationMachine, AnOwnerWithItsArmDeactivatedCarriesTheArmForItsProcess) 
   EXPECT_FALSE(Resolve(Machine("real"))[0].deactivated_arm.has_value());
 }
 
-// AUD-5: a machine's member model is never placed without its machine, on
+// A machine's member model is never placed without its machine, on
 // any lane.
 TEST(ActivationMachine, AMachinePartWithoutItsMachineIsRefused) {
   for (const std::string lane : {"real", "mock", "isaac"}) {
@@ -321,7 +321,7 @@ TEST(ActivationMachine, IoMembersExpandToOrdinaryIoDeviceRowsPerLane) {
         EXPECT_EQ(profile, output ? "mock_output" : "mock");
       }
     }
-    // The owner's compiled row (BOUNDARY §3).
+    // The owner's compiled row.
     const auto machines = detail::prepare_activation_machine_types(intent, profiles);
     ASSERT_EQ(machines.size(), 1U);
     const auto &row =

@@ -37,11 +37,11 @@
 
 namespace manyforge::xarm_control {
 
-/// Offline reasons of the power actions (CONTRACTS §1 `reason`).
+/// Offline reasons of the power actions (`reason`).
 inline constexpr std::string_view kShutdownByOperatorReason = "shutdown_by_operator";
 inline constexpr std::string_view kRebootingReason = "component_rebooting";
 
-/// The member roles of an xArm machine (CONTRACTS §16).
+/// The member roles of an xArm machine.
 inline constexpr std::string_view kXArmArmRole = "arm";
 inline constexpr std::string_view kXArmControllerIoRole = "controller_io";
 inline constexpr std::string_view kXArmToolIoRole = "tool_io";
@@ -83,13 +83,13 @@ struct XArmOwnerAdapterPorts final {
   /// Whether the machine's launch is still starting (its process runs and its
   /// controller spawners have not all finished, within its launch bound).
   /// Prepare then waits for the driver's first report instead of restarting
-  /// it (CONTRACTS §6: a driver restart is for a reboot or shutdown). Empty:
+  /// it (a driver restart is for a reboot or shutdown). Empty:
   /// never settling.
   std::function<bool()> launch_settling;
 };
 
 /// After an answered `clean_error`, `get_err_warn_code` is read at these
-/// offsets (M7: three reads 150 ms apart); the first read without the error
+/// offsets (three reads 150 ms apart); the first read without the error
 /// shows it cleared, the error still read at the last one shows it stays
 /// (an e-stop still pressed).
 inline constexpr std::array<std::chrono::nanoseconds, 3> kXArmClearReadsAt{
@@ -112,24 +112,27 @@ struct XArmMember final {
   std::weak_ptr<XArmArmAdapter> arm;
 };
 
-/// The owner of an xArm machine (CONTRACTS §16; xArm 5/6/7, Lite 6, UF850):
+/// The owner of an xArm machine (xArm 5/6/7, Lite 6, UF850):
 /// the connection, the driver process, the controller's report and error
 /// register, and the power actions. Its members (arm, controller I/O, tool
 /// I/O) register with it and read the controller through it.
 ///
 /// - `prepare`: when it isn't connected (no fresh report) or was shut down
 ///   or rebooted by the operator, restart the machine's process and wait for
-///   its first report (at most `lifecycle_command_timeout` from the start);
-///   then `clean_error`, read back three times 150 ms apart (M7), then the
-///   wait (same bound) for a `robot_states` report without the error (the
-///   state is derived from it, so a member's Prepare right after sees the
-///   owner prepared), and, with a warning left, `clean_warn`; never `motion_enable` (XPW-1: the motors stay
-///   off until the arm's Enable). An error that stays (an e-stop still
-///   pressed) fails the action; a servo error C10-C17 is not cleared (power
-///   cycle). An arm under external control is released (its Enable re-arms
+///   its first report (at most `lifecycle_command_timeout` from the start).
+///   It never clears: an e-stop and the error it latches (C1-C3) are normal,
+///   reported as a stop (not a fault) that gates motion, so Prepare (and the
+///   Load that runs it) succeeds with the e-stop pressed. Any other latched
+///   error stays a fault until the explicit `recover`. Never `motion_enable`
+///   (the motors stay off until the arm's Enable, whose activation clears the
+///   error). An arm under external control is released (its Enable re-arms
 ///   it).
-/// - `recover`: the same (the reconnect when the driver connection is lost).
-/// - `power_off` (the core disabled the members first, CONTRACTS §2, §16):
+/// - `recover`: the explicit clear: connect as above, then `clean_error`,
+///   read back three times 150 ms apart, then the wait (same bound) for a
+///   `robot_states` report without the error, and, with a warning left,
+///   `clean_warn`. An error that stays (an e-stop still pressed) fails the
+///   action; a servo error C10-C17 is not cleared (power cycle).
+/// - `power_off` (the core disabled the members first):
 ///   `system_control(1)`: `offline` with reason `shutdown_by_operator` (not
 ///   a fault) until a later `prepare`.
 /// - `reboot` (members disabled first by the core): `system_control(2)`, the
@@ -138,9 +141,10 @@ struct XArmMember final {
 /// - No `enable`/`disable` of its own.
 ///
 /// State: the lane's process state; a stale `robot_states` is
-/// `fault_communication`; a controller error is its catalogue fault
+/// `fault_communication`; C1–C3 are a typed emergency stop, retained until a
+/// fresh report clears it; other controller errors are catalogue faults
 /// (`xarm_fault`); the GPIO module's state or error code (rich report) is
-/// `fault_communication`; external control of the arm (M7's rule,
+/// `fault_communication`; external control of the arm (the rule of
 /// `XArmArmAdapter::ExternalControl`) is `fault_external_control`; each with
 /// the members it `concerns` (`xarm_fault_scope`: C33 and the GPIO module the
 /// controller I/O, C19 the tool I/O, the arm's own errors and external
@@ -160,6 +164,8 @@ public:
   /// A member registers at its factory call; a member rebuilt later
   /// replaces its earlier registration (same `component_id`).
   void AddMember(XArmMember member);
+  /// Retiring the ROS owner invalidates member stop presentation evidence.
+  void ForgetMemberEstops() noexcept;
   /// Usable for its members: prepared, connected (a fresh report) and not
   /// deliberately offline.
   [[nodiscard]] bool Usable(std::int64_t now_ns) const;
@@ -192,7 +198,7 @@ private:
                                                              std::stop_token stop,
                                                              int &warning);
   /// After the clear and the release of external control: waits until the
-  /// owner's own state shows no fault (report error, staleness, GPIO module
+  /// owner's own state shows neither stop nor fault (report error, staleness, GPIO module
   /// error, external control), until `deadline_ns`; none once it does, else
   /// the remaining fault, typed.
   [[nodiscard]] std::optional<core::ActionResult>
@@ -212,6 +218,8 @@ private:
   std::optional<XArmGpioModuleStatus> gpio_;
   /// When the fault currently reported first appeared (code and vendor code).
   mutable std::optional<std::pair<std::string, std::int64_t>> fault_since_;
+  /// Last observed emergency stop; stale reports cannot clear it.
+  mutable std::optional<core::ComponentStop> stop_;
 };
 
 } // namespace manyforge::xarm_control

@@ -169,8 +169,6 @@ make_runtime_context(const RetainedBundle &retained_bundle,
       core::ProgramBindingId("resolved.stop.plan.binding"),
       retained_bundle.retained_bundle_id(),
       graph.graph_revision,
-      core::ComponentRoleId("robot"),
-      core::TargetRoleId(control_binding.command_target_id.value()),
       component.controllable_component_id,
       component.component_type_id,
       component.component_type_revision,
@@ -180,8 +178,8 @@ make_runtime_context(const RetainedBundle &retained_bundle,
       std::nullopt,
       std::move(models),
       {},
-      {core::ProgramFrameRoleBindingDTO{
-          core::FrameRoleId("base"),
+      {core::ProgramFrameBindingDTO{
+          {component.controllable_component_id, core::FrameRoleId("base")},
           component.model_role_bindings.front().model_instance_id,
           require_one(
               graph.model_instances,
@@ -286,7 +284,7 @@ make_runtime_context(const RetainedBundle &retained_bundle,
 
 TEST(ResolvedStopBasePlanResolverTest,
      ExplicitMaxStopTimeSurvivesCompilationDurableReloadAndReadiness) {
-  // Q51/item 24 (as `main`): the robot's own `max_stop_time_s` lives in its
+  // The robot's own `max_stop_time_s` lives in its
   // controlled-Stop profile and is its Stop deadline; there is no cell-wide
   // timing table and no Apply-time refusal against the profile.
   ScopedTrustedRoot root;
@@ -494,7 +492,7 @@ TEST(ResolvedStopBasePlanResolverTest, ModelBackedCommandedGripperWithoutRowReta
         rows->second = CanonicalValue(CanonicalValue::Array{});
         ++cleared;
       }
-      // M6 TOOLSPLIT: the runtime codec requires the gripper_feedback stream
+      // The runtime codec requires the gripper_feedback stream
       // exactly for the authored rows; drop it with the row so the compiler's
       // own refusal is what is tested.
       const auto streams = std::find_if(values.begin(), values.end(),

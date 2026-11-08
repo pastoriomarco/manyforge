@@ -17,20 +17,20 @@
 namespace manyforge::roboplan_backend::host_detail {
 
 /// Process-wide level of the compiled `carried_object_lost.<target>` system
-/// signals of this execution host (contract §2, §8). The Manager publishes
+/// signals of this execution host. The Manager publishes
 /// each level through the control socket; the level outlives a composition, so
 /// a re-Apply keeps it. One row per lost attachment (a gripper can carry
-/// several, each with its own `set_key`; SX-200): a row exists from the loss
+/// several, each with its own `set_key`): a row exists from the loss
 /// until the gripper's level is published `false` (next attach, Program
 /// detach, cell Reset), which removes all of that gripper's rows. Any row of a
-/// gripper means its level is `true`. No cap and no eviction; the bound
-/// (SX-202): every attach by a gripper clears that gripper's rows (the Manager
+/// gripper means its level is `true`. No cap and no eviction; the bound:
+/// every attach by a gripper clears that gripper's rows (the Manager
 /// publishes `false`), and a committed composition replacement drops the rows
 /// of gripper targets the new composition does not hold (`InstallSink`, called
 /// only at the terminal publication proof; an Apply candidate only `Seed`s, so
-/// a refused candidate changes nothing; SX-206).
+/// a refused candidate changes nothing).
 ///
-/// Ordering (SX-189): every store update and its sink delivery, and a sink's
+/// Ordering: every store update and its sink delivery, and a sink's
 /// installation with its initial levels, run under the one store mutex, so
 /// the composed source sees the levels in the order they were recorded. The
 /// sink is non-blocking (it enqueues to the host ingress) and never re-enters
@@ -42,12 +42,12 @@ public:
     core::CommandTargetId command_target_id;
     std::string carried_object_attachment_id;
     std::string scene_resource_id;
-    /// Contract §10: the attachment's stored `on_grasp_lost.set_key`, and
+    /// The attachment's stored `on_grasp_lost.set_key`, and
     /// the Manager's loss `event_id`, kept for the whole continuing loss.
     std::optional<std::string> set_key{};
     std::string loss_event_id{};
   };
-  /// Contract §10 "Coalescing" (SX-229/231): the last loss of a gripper per
+  /// Coalescing: the last loss of a gripper per
   /// `set_key`. Set by each new loss naming that key, replaced only by the
   /// next one of that gripper with the same key; a `false` (Program detach,
   /// re-attach, Reset) never clears it; a committed composition that no longer
@@ -72,7 +72,7 @@ public:
 
   /// Records the gripper's level (`loss` present = `true`: adds that
   /// attachment's row once; a repeated detection of the same continuing loss
-  /// keeps the row and its `loss_event_id` (§10); `false`: removes all of the
+  /// keeps the row and its `loss_event_id`; `false`: removes all of the
   /// gripper's rows) and
   /// delivers it to the current sink; `false` is always delivered, also for a
   /// gripper with no row. The recorded level stays when no sink is installed

@@ -2492,7 +2492,18 @@ FilesystemVerifiedProgramSource::get_verified(
   if (!bytes.has_value()) {
     return nullptr;
   }
-  const auto program = verify_program_binding_contract(*bytes, retained_bundle);
+  std::optional<VerifiedRetainedModelMap> model_map;
+  const auto &maps = retained_bundle.value().compiled_products.symbol_role_maps;
+  if (maps.size() > 1U)
+    throw ProgramContractError("read-only Program has multiple retained model maps");
+  if (!maps.empty()) {
+    FilesystemVerifiedRetainedModelMapSource model_source(current_root);
+    model_map = model_source.get_verified({retained_bundle.retained_bundle_id(), maps.front().product_id});
+    if (!model_map)
+      throw ProgramContractError("read-only Program retained model map is unavailable");
+  }
+  FilesystemVerifiedCatalogArtifactSource catalog(current_root);
+  const auto program = verify_program_binding_contract(*bytes, retained_bundle, model_map, catalog);
   if (program->value().program_id != program_id ||
       program->value().program_revision != program_revision) {
     throw ProgramContractError(
@@ -2517,7 +2528,8 @@ std::shared_ptr<const ProgramBinding>
 FilesystemVerifiedProgramBindingSource::get_verified(
     const core::ProgramBindingId &program_binding_id,
     const RetainedBundle &retained_bundle,
-    const VerifiedRetainedModelMap &retained_model_map) const {
+    const VerifiedRetainedModelMap &retained_model_map,
+    const ICatalogArtifactSource &catalog_source) const {
   const auto hex = detail::retained_digest_hex(program_binding_id.value());
   if (!hex.has_value()) {
     return nullptr;
@@ -2536,7 +2548,7 @@ FilesystemVerifiedProgramBindingSource::get_verified(
     return nullptr;
   }
   const auto binding = reload_verified_program_binding(*bytes, retained_bundle,
-                                                       retained_model_map);
+                                                       retained_model_map, catalog_source);
   if (binding->program_binding_id() != program_binding_id) {
     throw ProgramBindingError("read-only Program-Binding key/content mismatch");
   }

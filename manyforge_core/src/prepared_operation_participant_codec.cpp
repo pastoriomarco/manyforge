@@ -90,16 +90,16 @@ template <class Id>
 }
 
 [[nodiscard]] CanonicalValue frame_bindings_value(
-    const std::vector<ProgramFrameRoleBindingDTO>& values) {
+    const std::vector<ProgramFrameBindingDTO>& values) {
   CanonicalValue::Array rows;
   for (const auto& value : values) {
     CanonicalValue::Object fields{
-        {"frame_role_id", CanonicalValue(value.frame_role_id.value())},
+        {"reference", CanonicalValue(CanonicalValue::Object{
+            {"component_id", CanonicalValue(value.reference.component_id.value())},
+            {"frame_id", CanonicalValue(value.reference.frame_id.value())}})},
         {"model_instance_id", CanonicalValue(value.model_instance_id.value())},
         {"model_revision", CanonicalValue(value.model_revision.value())},
         {"compiled_frame_name", CanonicalValue(value.compiled_frame_name)}};
-    if (!value.contact_body_role_ids.empty())
-      fields.emplace_back("contact_body_role_ids", id_array(value.contact_body_role_ids));
     rows.emplace_back(std::move(fields));
   }
   return CanonicalValue(std::move(rows));
@@ -111,22 +111,22 @@ template <class Id>
     CanonicalValue::Array ids;
     for (const auto& id : body.collision_body_ids) ids.emplace_back(id);
     bodies.emplace_back(CanonicalValue::Object{
-        {"component_role_id", CanonicalValue(body.component_role_id.value())},
-        {"target_role_id", CanonicalValue(body.target_role_id.value())},
-        {"controllable_component_id", CanonicalValue(body.controllable_component_id.value())},
-        {"command_target_id", CanonicalValue(body.command_target_id.value())},
+        {"body", CanonicalValue(CanonicalValue::Object{
+            {"component_id", CanonicalValue(body.body.component_id.value())},
+            {"collision_body_id", CanonicalValue(body.body.collision_body_id.value())}})},
         {"model_role_id", body.model_role_id ? CanonicalValue(body.model_role_id->value())
                                              : CanonicalValue(nullptr)},
-        {"collision_body_role_id", CanonicalValue(body.collision_body_role_id.value())},
         {"model_instance_id", CanonicalValue(body.model_instance_id.value())},
         {"model_revision", CanonicalValue(body.model_revision.value())},
         {"collision_body_ids", CanonicalValue(std::move(ids))}});
   }
   return CanonicalValue(
-      CanonicalValue::Object{{"target_role_id", CanonicalValue(value.target_role_id.value())},
-                             {"command_target_id", CanonicalValue(value.command_target_id.value())},
+      CanonicalValue::Object{{"target", CanonicalValue(CanonicalValue::Object{
+                                 {"component_id", CanonicalValue(value.target.component_id.value())},
+                                 {"command_target_id", CanonicalValue(value.target.command_target_id.value())}})},
                              {"frame", frame_bindings_value({value.frame}).as_array().front()},
-                             {"contact_body_bindings", CanonicalValue(std::move(bodies))}});
+                             {"contact_body_bindings", CanonicalValue(std::move(bodies))},
+                             {"contact_body_role_ids", id_array(value.contact_body_role_ids)}});
 }
 
 [[nodiscard]] CanonicalValue provider_value(const PreparedProviderRuntimeOccurrenceDTO& value) {
@@ -732,11 +732,12 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
                              const RuntimeParticipantBindingDTO& binding) {
   validate_moving_validation_join(motion);
   if (binding.motion_endpoint) {
-    // B7: the TCP frame is stamped with its owner (the motion component or a
-    // tool mounted on it), so the endpoint is compared by its frame key.
+    // The resolved TCP must retain the exact captured frame owner as well as
+    // its physical frame key, including for a frame on a mounted tool.
     const auto* tcp = std::get_if<ResolvedComponentModelFrameDTO>(&motion.plan_request.tcp_frame);
     if (tcp == nullptr ||
-        !same_program_frame(ProgramFrameRoleBindingDTO{tcp->frame_role_id, tcp->model_instance_id,
+        tcp->controllable_component_id != binding.motion_endpoint->frame.reference.component_id ||
+        !same_program_frame(ProgramFrameBindingDTO{{tcp->controllable_component_id, tcp->frame_role_id}, tcp->model_instance_id,
                                                        tcp->model_revision,
                                                        tcp->compiled_frame_name},
                             binding.motion_endpoint->frame))

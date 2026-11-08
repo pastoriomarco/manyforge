@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
+#include <manyforge_core/execution_recovery_support.hpp>
 #include <manyforge_core/kernel_event_publisher.hpp>
 #include <manyforge_core/ports/icontrol_domain_execution_port.hpp>
 #include <manyforge_core/ports/igripper_command_backend.hpp>
@@ -11,6 +13,23 @@
 #include <mutex>
 
 namespace manyforge::core {
+
+enum class GripperOwnerRecoveryProofMode { kMeasured, kNoFeedback };
+
+/// Trusted retained owner supplies the exact commit fence and real measured
+/// evidence; absence of an evidence object means proof is not yet available.
+/// The callback is invoked only after rebuilt_unknown_pending has confirmed the
+/// exact target, command and generation on the current replacement owner.
+struct GripperOwnerRecoveryEvidence final {
+  std::shared_ptr<const void> owner;
+  GripperOwnerRecoveryProofMode mode{GripperOwnerRecoveryProofMode::kMeasured};
+  /// First publication sequence allowed after the candidate callback gate.
+  std::uint64_t first_sequence{};
+  std::optional<ObservedStateEvidenceDTO> sample;
+  std::string joint_order_token;
+};
+using GripperOwnerRecoverySource = std::function<std::optional<GripperOwnerRecoveryEvidence>(
+    const std::string&, std::uint64_t, std::uint64_t, const std::shared_ptr<const void>&)>;
 
 /// Command-only participant over the existing gripper backend. One preparation,
 /// exact dispatch and recovery facts; no motion FSM, planner, worker or timer.
@@ -23,11 +42,22 @@ class GripperParticipantEngine final : public IResolvedParticipantExecutionEngin
   GripperParticipantEngine(IGripperCommandBackend& backend, IClock& clock);
   ~GripperParticipantEngine() override;
 
+  /// Installed once by the retained owner; never supplied by a public caller.
+  void InstallGripperOwnerRecoverySource(GripperOwnerRecoverySource source);
+  /// Called by the existing observation wake/periodic path; no motion is sent.
+  void AdvanceGripperOwnerRecovery() const;
+  void notify_gripper_owner_loss_recorded(const std::string&, std::uint64_t,
+                                           std::uint64_t) override;
+  bool notify_exact_gripper_owner_loss_recorded(const std::string&, std::uint64_t,
+                                                 std::uint64_t) override;
+
   GripperActuationKind gripper_actuation_kind(const std::string& target) const override;
   GripperOutputMode gripper_output_mode(const std::string& target) const override;
   GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) override;
   Result<void> validate_gripper_command(const GripperCommandRequestDTO& request) const override;
   GripperCommandStatusDTO get_gripper_status(const std::string& gripper_id) const override;
+  bool rebuilt_gripper_unknown_pending(const std::string& gripper_id, std::uint64_t command_id,
+                                        std::uint64_t generation) const override;
   Result<std::uint64_t> stop_gripper(const std::string& gripper_id, std::uint64_t command_id,
                                      std::uint64_t generation) override;
   Result<void> reset_gripper(const std::string& gripper_id, std::uint64_t command_id,
@@ -96,12 +126,18 @@ class GripperParticipantEngine final : public IResolvedParticipantExecutionEngin
                                         std::uint64_t generation);
   void emit_event(KernelEvent event);
   struct PreparedCapabilityCommandSession;
+  std::shared_ptr<const void> recovery_identity_ = std::make_shared<const int>(0);
+  void AdvanceGripperOwnerRecoveryFor(
+      const std::shared_ptr<PreparedCapabilityCommandSession>& session) const;
   IGripperCommandBackend& backend_;
   IClock& clock_;
+  RecoveryReadinessPolicy owner_recovery_policy_;
   std::uint64_t next_execution_id_{1U};  // guarded by prepared_command_session_mutex_
   std::atomic<std::uint64_t> control_command_epoch_{1U};
   mutable std::mutex prepared_command_session_mutex_;
   std::atomic<std::shared_ptr<PreparedCapabilityCommandSession>> active_prepared_command_session_;
+  mutable std::mutex owner_recovery_source_mutex_;
+  GripperOwnerRecoverySource owner_recovery_source_;
   KernelEventPublisher event_publisher_;
 };
 

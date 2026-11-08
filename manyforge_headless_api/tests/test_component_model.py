@@ -1,4 +1,4 @@
-"""Component model v2 (CONTRACTS §1, §2, §5, §7, §10, §16): mirrors,
+"""Component model v2: mirrors,
 readiness, group-action order, the REST surface and the `/ws/control`
 events."""
 
@@ -21,6 +21,7 @@ from manyforge_headless_api.component_model import (
     launch_settle_bound_s,
     lifecycle_timeouts_s,
     manual_operation_resident,
+    prepare_all_targets,
     parse_component_model,
     run_readiness,
     wait_for_action,
@@ -91,6 +92,50 @@ def test_parse_keeps_the_contract_field_names() -> None:
     assert model.cell_latch == {"latched": False, "causes": []}
     assert model.signal_samples[1]["controller_owned"] is False
     assert model.required_signal_ids == ["door"]
+
+
+def test_estop_state_and_latch_cause_block_readiness_without_a_fault() -> None:
+    stop = {"code": "estop", "message": "Emergency stop (C2)", "since_ns": 1,
+            "vendor_code": "C2", "vendor_text": "Emergency input"}
+    owner = _state("machine", "prepared", stop=stop)
+    member = _state("robot", "prepared", owner_id="machine",
+                    reason={"code": "stopped_by_estop", "message": "Stopped by e-stop"})
+    model = _model(component_states=[owner, member], cell_latch={
+        "latched": True, "causes": [{"component_id": "machine", "kind": "stop", "stop": stop}],
+    })
+    assert model.component_states[0]["stop"] == stop
+    assert "Emergency stop (C2)" in latch_summary(model.cell_latch)
+    readiness = _ready(model)
+    assert not readiness["can_execute"]
+    assert any(row["code"] == "cell_latched" for row in readiness["blocked_reasons"])
+    assert any(row.get("component_id") == "machine" and row["code"] == "component_unhealthy"
+               for row in readiness["blocked_reasons"])
+
+
+def test_estop_precedes_simulation_paused_readiness_exemption() -> None:
+    stop = {"code": "estop", "message": "Emergency stop (C2)", "since_ns": 1}
+    state = _state("robot", "prepared", stop=stop,
+                   reason={"code": "simulation_paused", "message": "Simulation paused"})
+    readiness = _ready(_model(component_states=[state]))
+    assert not readiness["can_execute"]
+    assert any(row["code"] == "component_unhealthy" and row.get("component_id") == "robot"
+               for row in readiness["blocked_reasons"])
+
+
+def test_stop_change_is_visible_to_component_event_deduplication() -> None:
+    before = {"component_state": [_state("machine", "prepared")]}
+    after = {"component_state": [_state("machine", "prepared", stop={
+        "code": "estop", "message": "E-stop (C2)", "since_ns": 1, "vendor_code": "C2",
+    })]}
+    assert control_shell_fact_key(before, "component_state") != control_shell_fact_key(after, "component_state")
+
+
+@pytest.mark.parametrize("stop", [None, {}, {"code": "estop", "message": "x", "since_ns": True},
+                                   {"code": "other", "message": "x", "since_ns": 1},
+                                   {"code": "estop", "message": "x", "since_ns": 1, "extra": 1}])
+def test_malformed_component_stop_is_refused(stop: object) -> None:
+    with pytest.raises(HeadlessApiError):
+        _model(component_states=[_state("robot", stop=stop)])
 
 
 @pytest.mark.parametrize(
@@ -182,7 +227,7 @@ def test_required_signal_ids_default_to_none() -> None:
     assert parse_component_model(reply).required_signal_ids == []
 
 
-# Readiness (CONTRACTS §10) -------------------------------------------------
+# Readiness -------------------------------------------------
 
 
 def _codes(readiness: dict[str, Any]) -> list[str]:
@@ -223,7 +268,7 @@ def test_a_prepared_component_is_not_enabled_with_its_id() -> None:
 
 
 def test_a_simulation_that_is_not_playing_never_blocks_execute() -> None:
-    """SIM-1: a simulated robot stays enabled with the reason, and the
+    """A simulated robot stays enabled with the reason, and the
     simulator itself (`prepared`, paused or stopped) doesn't block, so the
     Program's own nodes can play it."""
 
@@ -234,9 +279,11 @@ def test_a_simulation_that_is_not_playing_never_blocks_execute() -> None:
                 _state("isaac_robot", reason=not_playing,
                        streams=[{"stream_id": "measured_joints", "freshness": "stale"}]),
                 _state("isaac_sim", "prepared",
-                       reason={"code": "simulation_paused", "message": "The simulation is paused."}),
+                       reason={"code": "simulation_paused", "message": "The simulation is paused."},
+                       capabilities=["sim_reset"]),
                 _state("isaac_sim_2", "prepared",
-                       reason={"code": "simulation_stopped", "message": "The simulation is stopped."}),
+                       reason={"code": "simulation_stopped", "message": "The simulation is stopped."},
+                       capabilities=["sim_reset"]),
             ]
         )
     )
@@ -245,6 +292,90 @@ def test_a_simulation_that_is_not_playing_never_blocks_execute() -> None:
     # Another prepared component still needs Enable.
     readiness = _ready(_model(component_states=[_state("robot", "prepared", reason=not_playing)]))
     assert _codes(readiness) == ["component_not_enabled"]
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "state_fields"),
+    [
+        ("offline", {"reason": {"code": "simulator_unreachable", "message": "The simulator doesn't answer."}}),
+        ("fault", {"fault": {**_FAULT, "code": "fault_process_exited", "message": "The simulator process exited."}}),
+    ],
+)
+def test_an_unavailable_simulator_does_not_block_execute_but_stays_visible(
+    lifecycle: str, state_fields: dict[str, Any],
+) -> None:
+    simulator = _state("isaac_sim", lifecycle, capabilities=["sim_reset"], **state_fields)
+    readiness = _ready(_model(component_states=[simulator]))
+
+    assert readiness["can_execute"] is True
+    assert readiness["blocked_reasons"] == []
+    assert simulator["lifecycle"] == lifecycle
+    assert simulator["capabilities"] == ["sim_reset"]
+
+
+def test_an_unanswered_simulator_action_result_does_not_block_execute() -> None:
+    simulator = _state(
+        "isaac_sim", "offline", capabilities=["sim_reset"],
+        reason={"code": "simulator_unreachable", "message": "The simulator doesn't answer."},
+        last_action={
+            "action": "sim_reset", "outcome": "unknown",
+            "error": {"code": "simulation_no_response", "message": "No response."},
+            "started_at_ns": 1, "finished_at_ns": 2,
+        },
+    )
+    model = _model(component_states=[simulator])
+
+    assert _ready(model)["can_execute"] is True
+    assert model.component_states[0]["last_action"]["outcome"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("owner_lifecycle", "owner_fields", "latch_cause"),
+    [
+        (
+            "fault",
+            {"fault": _FAULT},
+            {"component_id": "robot_owner", "kind": "fault", "fault": _FAULT},
+        ),
+        (
+            "offline",
+            {"reason": {"code": "process_exited", "message": "The owner exited."}},
+            {"component_id": "robot_owner", "kind": "offline"},
+        ),
+    ],
+)
+def test_simulator_exemption_does_not_hide_other_shared_owner_members(
+    owner_lifecycle: str,
+    owner_fields: dict[str, Any],
+    latch_cause: dict[str, Any],
+) -> None:
+    simulator = _state(
+        "isaac_sim", "offline", owner_id="robot_owner", role="simulator",
+        capabilities=["sim_reset"],
+        reason={"code": "owner_unavailable", "message": "through robot_owner: unavailable"},
+    )
+    arm = _state(
+        "isaac_arm", "offline", owner_id="robot_owner", role="arm",
+        reason={"code": "owner_unavailable", "message": "through robot_owner: unavailable"},
+    )
+    owner = _state("robot_owner", owner_lifecycle, **owner_fields)
+    model = _model(
+        component_states=[simulator, arm, owner],
+        cell_latch={"latched": True, "causes": [latch_cause]},
+    )
+
+    readiness = _ready(model)
+
+    assert readiness["can_execute"] is False
+    assert "cell_latched" in _codes(readiness)
+    unhealthy = {
+        reason["component_id"]
+        for reason in readiness["blocked_reasons"]
+        if reason["code"] == "component_unhealthy"
+    }
+    assert unhealthy == {"isaac_arm", "robot_owner"}
+    assert model.component_states[0]["lifecycle"] == "offline"
+    assert model.component_states[0]["reason"]["code"] == "owner_unavailable"
 
 
 @pytest.mark.parametrize("lifecycle", ["fault", "offline"])
@@ -267,7 +398,7 @@ def test_a_rule_hold_names_its_rule() -> None:
 
 
 def test_a_rule_hold_leaves_motion_clear_to_the_kernels_scoped_refusal() -> None:
-    # §8: a hold gates only its own scope, so other groups may still Run/Resume.
+    # A hold gates only its own scope, so other groups may still Run/Resume.
     hold = {"code": "rule_holds", "message": "door_open holds", "details": {"rule_id": "door_open"}}
     readiness = _ready(_model(rule_holds=[hold]), "running", resume=True)
     assert readiness["can_execute"] is False
@@ -388,15 +519,15 @@ def test_a_program_bound_to_a_component_outside_the_cell_blocks_execute() -> Non
     status = {
         "program_id": "pick", "executable": False,
         "message": "The Program can't run in this Deployment",
-        "non_executable": {"unresolved_roles": [
-            {"component_role_id": "picker", "controllable_component_id": "ur5e_robot"}]},
+        "non_executable": {"unresolved_targets": [
+            {"target": {"component_id": "ur5e_robot", "command_target_id": "arm"}}]},
     }
     readiness = run_readiness(_model(), _cycle(), manual_operation_in_progress=False,
                               program_status=status)
     assert readiness["can_execute"] is False
     assert readiness["blocked_reasons"] == [{
         "code": "program_not_executable",
-        "message": "The Program can't run in this Deployment (picker → ur5e_robot)"}]
+        "message": "The Program can't run in this Deployment (ur5e_robot / arm)"}]
     executable = {"program_id": "pick", "executable": True}
     assert _ready(_model())["can_execute"] is True
     assert run_readiness(_model(), _cycle(), manual_operation_in_progress=False,
@@ -638,6 +769,66 @@ def test_a_group_prepare_skips_the_members_of_an_owner_whose_prepare_failed() ->
     assert execution.actions == [("lite6", "prepare"), ("gripper", "prepare")]
 
 
+def test_a_group_enable_prepares_an_unprepared_target_and_its_machine_first() -> None:
+    # 2026-11-08: Enable all after a failed Load (e-stop) brings every member up.
+    reply = _reply(component_states=[
+        _state("lite6", "not_prepared"),
+        _state("lite6_arm", "not_prepared", owner_id="lite6", role="arm"),
+        _state("lite6_io", "not_prepared", owner_id="lite6", role="controller_io"),
+        _state("gripper", "prepared"),
+    ])
+    execution = _ModelExecution(reply)
+    _run_group(execution, "enable", ["lite6_arm", "lite6_io", "gripper"])
+    assert execution.actions == [
+        ("lite6", "prepare"), ("lite6_arm", "prepare"), ("lite6_arm", "enable"),
+        ("lite6_io", "prepare"), ("lite6_io", "enable"), ("gripper", "enable"),
+    ]
+
+
+def test_a_group_enable_does_not_enable_a_target_whose_prepare_failed() -> None:
+    reply = _reply(component_states=[
+        _state("lite6", "prepared"),
+        _state("lite6_arm", "not_prepared", owner_id="lite6", role="arm"),
+        _state("gripper", "prepared"),
+    ])
+    execution = _ModelExecution(reply)
+    execution.outcome = {"lite6_arm": "failed"}
+    _run_group(execution, "enable", ["lite6_arm", "gripper"])
+    assert execution.actions == [("lite6_arm", "prepare"), ("gripper", "enable")]
+
+
+def test_a_group_enable_recovers_a_stopped_machine_first_and_skips_its_members_if_that_fails() -> None:
+    estop = {"code": "estop", "message": "E-stop", "vendor_code": "C2", "since_ns": 0}
+    reply = _reply(component_states=[
+        _state("lite6", "prepared", stop=estop),
+        _state("lite6_arm", "prepared", owner_id="lite6", role="arm"),
+        _state("gripper", "prepared"),
+    ])
+    execution = _ModelExecution(reply)
+    _run_group(execution, "enable", ["lite6_arm", "gripper"])
+    assert execution.actions == [("lite6", "recover"), ("lite6_arm", "enable"), ("gripper", "enable")]
+
+    pressed = _ModelExecution(_reply(component_states=[
+        _state("lite6", "prepared", stop=estop),
+        _state("lite6_arm", "prepared", owner_id="lite6", role="arm"),
+        _state("gripper", "prepared"),
+    ]))
+    pressed.outcome = {"lite6": "failed"}
+    _run_group(pressed, "enable", ["lite6_arm", "gripper"])
+    assert pressed.actions == [("lite6", "recover"), ("gripper", "enable")]
+
+
+def test_a_machine_recover_prepares_its_unprepared_members_after_it() -> None:
+    reply = _reply(component_states=[
+        _state("lite6", "prepared"),
+        _state("lite6_arm", "not_prepared", owner_id="lite6", role="arm"),
+        _state("lite6_io", "enabled", owner_id="lite6", role="controller_io"),
+    ])
+    execution = _ModelExecution(reply)
+    _run_group(execution, "recover", ["lite6"])
+    assert execution.actions == [("lite6", "recover"), ("lite6_arm", "prepare")]
+
+
 def _graph(**timeouts: float) -> dict[str, Any]:
     """An active cell graph authoring `timeouts`; `io` is an I/O device."""
 
@@ -854,3 +1045,25 @@ def test_run_end_shape_is_the_contract_one() -> None:
     assert not _valid_run_end({"end_reason": "finished", "details": {}})
     assert not _valid_run_end({"end_reason": "stopped", "details": {"stopped_by": "nobody"}})
     assert not _valid_run_end({"end_reason": "failed", "details": {"operation_id": "x"}})
+
+
+def test_simulator_only_latch_cause_does_not_block_execute() -> None:
+    readiness = _ready(_model(
+        component_states=[_state("isaac_sim", "offline", capabilities=["sim_reset"])],
+        cell_latch={"latched": True, "causes": [{"component_id": "isaac_sim", "kind": "offline"}]},
+    ))
+    assert readiness["can_execute"] is True
+    assert readiness["blocked_reasons"] == []
+
+
+def test_activation_targets_skip_simulator_but_keep_ordinary_inactive_components() -> None:
+    states = [
+        _state("offline_robot", "offline", capabilities=[]),
+        _state("offline_sim", "offline", capabilities=["sim_reset"]),
+        _state("unprepared_sim", "not_prepared", capabilities=["sim_reset"]),
+        _state("prepared_robot", "prepared", capabilities=[]),
+        _state("paused_sim", "prepared", capabilities=["sim_reset"]),
+    ]
+
+    assert prepare_all_targets(states) == ["offline_robot"]
+    assert enable_all_targets(states) == ["prepared_robot"]

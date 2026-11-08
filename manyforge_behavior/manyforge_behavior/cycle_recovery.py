@@ -16,7 +16,6 @@ from typing import Final
 CYCLE_RECOVERY_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_cycle_recovery_owner_unavailable"
 )
-CYCLE_RECOVERY_RESTORATION_GATES: Final = ("I6", "N", "I8", "P5")
 
 
 class CycleRecoveryOwnerUnavailableError(RuntimeError):
@@ -29,5 +28,5 @@ class CycleRecoveryCoordinator:
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         raise CycleRecoveryOwnerUnavailableError(
             f"{CYCLE_RECOVERY_UNAVAILABLE_REASON_CODE}: the unified v2 "
-            "recovery owner returns at I6/N and I8/P5"
+            "recovery owner is not available"
         )

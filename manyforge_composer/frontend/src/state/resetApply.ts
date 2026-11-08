@@ -10,7 +10,7 @@
  * ordinary Apply of exactly the confirmed Draft revision and follows it with
  * the existing Apply tracker. Nothing is Saved, Executed, Run, resumed or
  * replayed automatically. The Deployment Apply uses the same chain while a
- * run is stopped or held (the server refuses it during a run, CONTRACTS §11);
+ * run is stopped or held (the server refuses it during a run);
  * a finished run awaiting Reset is reset by the server's Apply itself.
  */
 import type {
@@ -25,7 +25,7 @@ export type ResetApplyDocument = 'program' | 'deployment';
 
 /**
  * A Deployment Apply must Reset the run first: one exists and isn't a
- * finished run awaiting Reset, which the server's Apply resets itself (R3).
+ * finished run awaiting Reset, which the server's Apply resets itself.
  */
 export function deploymentApplyResetsRun(snapshot: ComposerHeadlessState | null): boolean {
   return snapshot !== null

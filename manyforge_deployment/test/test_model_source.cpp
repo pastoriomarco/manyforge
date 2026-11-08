@@ -2316,7 +2316,7 @@ TEST(ModelSource, EnforcesOneCombinedUrdfSrdfElementBudget) {
   }
 }
 
-// S4: quaternion -> URDF rpy -> quaternion keeps the rotation, also at and
+// Quaternion -> URDF rpy -> quaternion keeps the rotation, also at and
 // next to gimbal lock (|sin pitch| ~ 1), where yaw is 0 and roll carries the
 // turn: rpy [30, 90, 0] deg stays [30, 90, 0], never [90, 90, 0].
 TEST(ModelSource, UrdfOriginRpyRoundTripsAtGimbalLock) {

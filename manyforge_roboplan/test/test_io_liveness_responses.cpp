@@ -79,7 +79,7 @@ TEST(IoLivenessResponseTest, OutputHasNoInputLivenessDeclaration) {
                   ->is_null());
 }
 TEST(IoLivenessResponseTest, SignalSampleCarriesItsAgeOnlyWhenAsked) {
-  // CONTRACTS §7: the event stream's `state` compares samples without their
+  // The event stream's `state` compares samples without their
   // age, so an aging sample alone never makes a new state.
   const core::IoSignalId id{core::ControllableComponentId("component.io"), "input"};
   core::IoSignalDescriptorDTO descriptor{

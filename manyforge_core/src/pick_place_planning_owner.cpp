@@ -63,22 +63,20 @@ template <typename T>
   const auto* lhs = motion_payload(left);
   const auto* rhs = motion_payload(right);
   return lhs != nullptr && rhs != nullptr &&
-         left.participants.front().component_role_id ==
-             right.participants.front().component_role_id &&
-         left.participants.front().target_role_id == right.participants.front().target_role_id &&
+         left.participants.front().target == right.participants.front().target &&
          left.participants.front().required_capability_id ==
              right.participants.front().required_capability_id &&
-         lhs->base_frame_role_id == rhs->base_frame_role_id &&
+         lhs->base_frame == rhs->base_frame &&
          lhs->tcp_endpoint == rhs->tcp_endpoint;
 }
 
 [[nodiscard]] Result<void> validate_common(
     const std::string& sequence_id, const SceneResourceId& selected_object_id,
-    const FrameRoleId& carrier_frame_role_id, const OperationIntentDTO& approach,
+    const ProgramFrameReferenceDTO& carrier_frame, const OperationIntentDTO& approach,
     const OperationIntentDTO& descend, const OperationIntentDTO& tool,
     const OperationIntentDTO& retreat, const ProjectionRevisionDTO& current_projection) {
   if (sequence_id.empty() || sequence_id.size() > kMaxPickPlaceSequenceIdBytes ||
-      selected_object_id.empty() || carrier_frame_role_id.empty() ||
+      selected_object_id.empty() || carrier_frame.component_id.empty() || carrier_frame.frame_id.empty() ||
       motion_payload(approach) == nullptr || motion_payload(descend) == nullptr ||
       !command_payload(tool) || motion_payload(retreat) == nullptr ||
       !same_program_context(approach, descend) || !same_program_context(approach, tool) ||
@@ -118,46 +116,41 @@ template <typename T>
   return found == scene.carried_object_attachments.end() ? nullptr : &*found;
 }
 
-[[nodiscard]] const ProgramFrameRoleBindingDTO* find_frame(
-    const RuntimeParticipantBindingDTO& binding, const FrameRoleId& role) noexcept {
-  const auto found = std::lower_bound(
-      binding.frame_bindings.begin(), binding.frame_bindings.end(), role,
-      [](const ProgramFrameRoleBindingDTO& candidate, const FrameRoleId& selected) {
-        return candidate.frame_role_id < selected;
-      });
-  return found == binding.frame_bindings.end() || found->frame_role_id != role ? nullptr : &*found;
+[[nodiscard]] const ProgramFrameBindingDTO* find_frame(
+    const RuntimeParticipantBindingDTO& binding, const ProgramFrameReferenceDTO& reference) noexcept {
+  const auto found = std::find_if(binding.frame_bindings.begin(), binding.frame_bindings.end(),
+      [&](const auto& candidate) { return candidate.reference == reference; });
+  return found == binding.frame_bindings.end() ? nullptr : &*found;
 }
 
 /// The carrier frame is a frame role of the tool target: an unresolved one is
-/// named with that target's role, so it never reads as a frame of the arm
-/// (spec 210 §4.4).
+/// named with that target's role, so it never reads as a frame of the arm.
 template <typename T>
 [[nodiscard]] Result<T> carrier_frame_unresolved(std::string reason,
                                                  const RuntimeParticipantBindingDTO& carrier,
-                                                 const FrameRoleId& carrier_frame_role_id) {
+                                                 const ProgramFrameReferenceDTO& carrier_frame) {
   auto error = planning_error<T>(std::move(reason),
                                  "carrier frame role is absent from the exact tool binding",
                                  ErrorCode::kMissingReference)
                    .error();
   error.details.emplace("reference_type", "frame_role");
-  error.details.emplace("reference_id", carrier_frame_role_id.value());
-  if (!carrier.target_role_id.empty()) {
-    error.details.emplace("target_role_id", carrier.target_role_id.value());
-  }
+  error.details.emplace("reference_id", carrier_frame.frame_id.value());
+  error.details.emplace("component_id", carrier_frame.component_id.value());
+  error.details.emplace("command_target_id", carrier.command_target_id.value());
   return Result<T>::Err(std::move(error));
 }
 
 [[nodiscard]] bool exact_frame_receipt(const SceneFrameResolutionReceiptDTO& receipt,
                                        const ProjectionLeaseBindingDTO& projection_binding,
                                        const RuntimeParticipantBindingDTO& binding,
-                                       const FrameRoleId& frame_role_id) noexcept {
-  const auto* expected = find_frame(binding, frame_role_id);
+                                       const ProgramFrameReferenceDTO& frame) noexcept {
+  const auto* expected = find_frame(binding, frame);
   const auto* resolved = std::get_if<ResolvedComponentModelFrameDTO>(&receipt.resolved_frame);
   // The query already selected the portable target frame role. The resolved
   // frame carries the model asset's role, which may have a different name.
   return expected != nullptr && resolved != nullptr && receipt.valid() &&
          receipt.projection_binding == projection_binding &&
-         resolved->controllable_component_id == binding.controllable_component_id &&
+         resolved->controllable_component_id == frame.component_id &&
          resolved->model_instance_id == expected->model_instance_id &&
          resolved->compiled_frame_name == expected->compiled_frame_name &&
          resolved->model_revision == expected->model_revision;
@@ -188,7 +181,7 @@ template <typename T>
   if (!policy_bound || policy->runtime_object_id != runtime_object_id) {
     // One reason for both causes. The message says which one happened; the
     // details name the selected runtime object as the one reference and carry
-    // the contact policy beside it (spec 210 §4.4, §5.3).
+    // the contact policy beside it.
     auto unresolved =
         planning_error<std::vector<CollisionBodyRoleId>>(
             "pick_contact_grasp_template_unresolved",
@@ -213,19 +206,18 @@ template <typename T>
                            : policy->allowed_body_bindings;
   std::vector<CollisionBodyRoleId> roles;
   for (const auto& body : bodies) {
-    if (body.controllable_component_id != carrier_binding.controllable_component_id ||
-        body.command_target_id != carrier_binding.command_target_id) {
+    if (body.body.component_id != carrier_binding.controllable_component_id) {
       continue;
     }
     const auto exact =
         std::lower_bound(carrier_binding.collision_body_bindings.begin(),
-                         carrier_binding.collision_body_bindings.end(), body.collision_body_role_id,
-                         [](const ProgramCollisionBodyRoleBindingDTO& candidate,
-                            const CollisionBodyRoleId& selected) {
-                           return candidate.collision_body_role_id < selected;
+                         carrier_binding.collision_body_bindings.end(), body.body,
+                         [](const ProgramCollisionBodyBindingDTO& candidate,
+                            const ProgramCollisionBodyReferenceDTO& selected) {
+                           return candidate.reference < selected;
                          });
     if (exact == carrier_binding.collision_body_bindings.end() ||
-        exact->collision_body_role_id != body.collision_body_role_id ||
+        exact->reference != body.body ||
         exact->model_instance_id != body.model_instance_id ||
         exact->model_revision != body.model_revision) {
       return planning_error<std::vector<CollisionBodyRoleId>>(
@@ -233,7 +225,7 @@ template <typename T>
           "pick touch-body role differs from the exact carrier binding",
           ErrorCode::kInvariantViolation);
     }
-    roles.push_back(body.collision_body_role_id);
+    roles.push_back(body.body.collision_body_id);
   }
   std::sort(roles.begin(), roles.end());
   roles.erase(std::unique(roles.begin(), roles.end()), roles.end());
@@ -278,19 +270,12 @@ struct ResolvedPickOffsetBases final {
           "pick_offset_reference_invalid",
           "pick offset reference is malformed or has mismatched typed identity");
     }
-    // An unqualified frame reference still belongs to the moving target.
-    // This reference rule is independent of the required TCP selector spelling.
-    const ReferenceTargetDTO reference_owner = selected->target.value_or(
-        ReferenceTargetDTO{arm_binding.target_role_id, arm_binding.controllable_component_id,
-                           arm_binding.command_target_id});
     // C-P7 (G7): the candidate TCP's orientation is kept when the reference is
-    // the move's TCP entry (its target role names the entry's owner), whether
+    // the move's exact TCP frame, whether
     // that entry is the arm's own or a mounted tool's.
     const bool candidate_tcp =
-        selected->type == ReferenceDTO::Type::kFrameRole && arm_binding.motion_endpoint &&
-        reference_owner.target_role_id == arm_binding.motion_endpoint->target_role_id &&
-        reference_owner.command_target_id == arm_binding.motion_endpoint->command_target_id &&
-        std::get<FrameRoleId>(selected->id) == arm_binding.motion_endpoint->frame.frame_role_id;
+        selected->type == ReferenceDTO::Type::kComponentFrame && arm_binding.motion_endpoint &&
+        std::get<ProgramFrameReferenceDTO>(selected->id) == arm_binding.motion_endpoint->frame.reference;
     if (candidate_tcp) {
       basis.use_candidate_tcp_orientation = true;
       return Result<void>::Ok();
@@ -369,7 +354,7 @@ struct ResolvedPickOffsetBases final {
       AttachCarriedObjectRequestDTO{
           CarriedObjectAttachmentId("carried:" + intent.sequence_id), intent.selected_object_id,
           carrier_binding.controllable_component_id, carrier_binding.command_target_id,
-          intent.carrier_frame_role_id, std::move(roles), std::move(structural_revisions)},
+          intent.carrier_frame.frame_id, std::move(roles), std::move(structural_revisions)},
       std::nullopt};
 }
 
@@ -468,7 +453,7 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
   }
   const auto current_projection = scene_.CurrentProjectionRevision();
   auto common =
-      validate_common(intent.sequence_id, intent.selected_object_id, intent.carrier_frame_role_id,
+      validate_common(intent.sequence_id, intent.selected_object_id, intent.carrier_frame,
                       intent.approach_operation, intent.descend_operation, intent.tool_operation,
                       intent.retreat_operation, current_projection);
   const auto* approach_motion = motion_payload(intent.approach_operation);
@@ -516,7 +501,7 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
     operation->expected_scene_revision = planning_projection.scene_revision;
   }
   common =
-      validate_common(intent.sequence_id, intent.selected_object_id, intent.carrier_frame_role_id,
+      validate_common(intent.sequence_id, intent.selected_object_id, intent.carrier_frame,
                       intent.approach_operation, intent.descend_operation, intent.tool_operation,
                       intent.retreat_operation, planning_projection);
   if (!common.ok()) {
@@ -542,9 +527,17 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
   if (!carrier.ok()) {
     return Result<PickPlacePlanningResultDTO>::Err(carrier.error());
   }
-  if (find_frame(carrier.value(), intent.carrier_frame_role_id) == nullptr) {
+  const auto& requested_carrier = intent.tool_operation.participants.front().target;
+  if (carrier.value().controllable_component_id != requested_carrier.component_id ||
+      carrier.value().command_target_id != requested_carrier.command_target_id) {
+    return planning_error<PickPlacePlanningResultDTO>(
+        "pick_carrier_touch_roles_unresolved",
+        "pick contact policy has no touch body on the exact carrier target",
+        ErrorCode::kMissingReference);
+  }
+  if (find_frame(carrier.value(), intent.carrier_frame) == nullptr) {
     return carrier_frame_unresolved<PickPlacePlanningResultDTO>(
-        "pick_carrier_frame_unresolved", carrier.value(), intent.carrier_frame_role_id);
+        "pick_carrier_frame_unresolved", carrier.value(), intent.carrier_frame);
   }
   auto roles = touch_roles(arm.value(), carrier.value(), *descend_motion->contact_policy_id,
                            intent.selected_runtime_object_id);
@@ -563,12 +556,12 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
   const auto& arm_binding = prepared.value().binding;
   const TargetCarrierSceneFrameRefDTO base_selector{arm_binding.controllable_component_id,
                                                     arm_binding.command_target_id,
-                                                    approach_motion->base_frame_role_id};
+                                                    approach_motion->base_frame.frame_id};
   auto base = projection_.ResolveSceneFrame(
       SceneFrameResolutionQueryDTO{base_selector, predecessor.value().projection_binding});
   const TargetCarrierSceneFrameRefDTO carrier_selector{carrier.value().controllable_component_id,
                                                        carrier.value().command_target_id,
-                                                       intent.carrier_frame_role_id};
+                                                       intent.carrier_frame.frame_id};
   auto carrier_frame = projection_.ResolveSceneFrame(
       SceneFrameResolutionQueryDTO{carrier_selector, predecessor.value().projection_binding});
   if (!base.ok()) {
@@ -578,9 +571,9 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
     return Result<PickPlacePlanningResultDTO>::Err(carrier_frame.error());
   }
   if (!exact_frame_receipt(base.value(), predecessor.value().projection_binding, arm.value(),
-                           approach_motion->base_frame_role_id) ||
+                           approach_motion->base_frame) ||
       !exact_frame_receipt(carrier_frame.value(), predecessor.value().projection_binding,
-                           carrier.value(), intent.carrier_frame_role_id)) {
+                           carrier.value(), intent.carrier_frame)) {
     return planning_error<PickPlacePlanningResultDTO>(
         "pick_frame_resolution_receipt_invalid",
         "pick frame resolution differs from the exact retained arm or "
@@ -654,7 +647,7 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPlace(
   }
   const auto current_projection = scene_.CurrentProjectionRevision();
   auto common =
-      validate_common(intent.sequence_id, intent.selected_object_id, intent.carrier_frame_role_id,
+      validate_common(intent.sequence_id, intent.selected_object_id, intent.carrier_frame,
                       intent.approach_operation, intent.descend_operation, intent.tool_operation,
                       intent.retreat_operation, current_projection);
   const auto* approach_motion = motion_payload(intent.approach_operation);
@@ -699,7 +692,7 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPlace(
     operation->expected_scene_revision = planning_projection.scene_revision;
   }
   common =
-      validate_common(intent.sequence_id, intent.selected_object_id, intent.carrier_frame_role_id,
+      validate_common(intent.sequence_id, intent.selected_object_id, intent.carrier_frame,
                       intent.approach_operation, intent.descend_operation, intent.tool_operation,
                       intent.retreat_operation, planning_projection);
   if (!common.ok()) {
@@ -717,9 +710,9 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPlace(
   if (!carrier.ok()) {
     return Result<PickPlacePlanningResultDTO>::Err(carrier.error());
   }
-  if (find_frame(carrier.value(), intent.carrier_frame_role_id) == nullptr) {
+  if (find_frame(carrier.value(), intent.carrier_frame) == nullptr) {
     return carrier_frame_unresolved<PickPlacePlanningResultDTO>(
-        "place_carrier_frame_unresolved", carrier.value(), intent.carrier_frame_role_id);
+        "place_carrier_frame_unresolved", carrier.value(), intent.carrier_frame);
   }
 
   const auto* selected = find_object(*predecessor.value().logical_scene, intent.selected_object_id);
@@ -740,7 +733,7 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPlace(
   }
   const TargetCarrierSceneFrameRefDTO carrier_selector{carrier.value().controllable_component_id,
                                                        carrier.value().command_target_id,
-                                                       intent.carrier_frame_role_id};
+                                                       intent.carrier_frame.frame_id};
   auto detach =
       detach_request(intent, planning_projection, *attachment, scene_.CurrentRequestOwnerEpoch());
   AddressedPlacePlanner planner(*session.value(), scene_candidates_, projection_);

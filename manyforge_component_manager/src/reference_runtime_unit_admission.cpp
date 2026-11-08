@@ -88,7 +88,7 @@ std::optional<ReferenceRuntimeUnitAdmission> VerifyReferenceRuntimeUnitForHost(
       product->runtime_role_id() != "manager_fixture" ||
       product->status_endpoint_role_id() != "runtime_status") {
     throw ReferenceRuntimeUnitAdmissionError(
-        "reference runtime product does not select the I4 adapter contract");
+        "reference runtime product does not select the qualified adapter contract");
   }
 
   const std::string runtime_id = product->runtime_unit_id().value();

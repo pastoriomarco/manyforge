@@ -1,3 +1,4 @@
+#include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 #include "host_io_provider_installation.hpp"
 #include "applied_program_blackboard_installation.hpp"
 #include "host_io_signal_runtime.hpp"
@@ -134,7 +135,7 @@ GeometricContactInputBinding geometric_contact_binding(
   auto read_contact_bodies = [handle = view->ros2_control_runtime_handle,
                               resolver = view->target_resolver,
                               binding = *view->direct_control_motion_binding]() {
-    return resolver->ActiveTcpContactBodies(binding, handle->ReadActiveTcp().value);
+    return resolver->ActiveTcpContactBodies(binding, handle->ReadRobotTcps());
   };
   return {row.descriptor.source_id,
           core::IoSourceIncarnation("installation-owned"),
@@ -270,12 +271,247 @@ CaptureCompositionIoResourcePredecessors(
   return result;
 }
 
+struct CompositionIoOwnerRecoverySnapshot final {
+  struct Candidate {
+    std::shared_ptr<IoProviderDriverRecord> driver;
+    bool observer{};
+  };
+  struct Driver {
+    std::shared_ptr<IoProviderDriverRecord> driver;
+    std::shared_ptr<IoProviderDriverRecord::RosOwnerRecoverySnapshot> snapshot;
+  };
+  struct Output {
+    std::shared_ptr<RosBooleanOutputProvider> provider;
+    std::shared_ptr<const RosBooleanOutputProvider::TransportRecoverySnapshot>
+        snapshot;
+  };
+  std::shared_ptr<ros2_control_execution::Ros2TransportResources> failed;
+  std::vector<Candidate> candidates;
+  std::vector<std::shared_ptr<HostIoOutputChannelEntry>> channels;
+  std::vector<Driver> drivers;
+  std::vector<Output> outputs;
+  std::vector<core::ControllableComponentId> served;
+  bool closed{};
+};
+struct CompositionIoOwnerRecoveryStage final {
+  struct Driver {
+    std::shared_ptr<IoProviderDriverRecord> driver;
+    std::shared_ptr<IoProviderDriverRecord::RosOwnerRecoveryStage> stage;
+  };
+  struct Output {
+    std::shared_ptr<RosBooleanOutputProvider> provider;
+    std::shared_ptr<RosBooleanOutputProvider::TransportRecoveryStage> stage;
+  };
+  std::shared_ptr<CompositionIoOwnerRecoverySnapshot> snapshot;
+  std::vector<Driver> drivers;
+  std::vector<Output> outputs;
+  std::vector<
+      std::shared_ptr<RosBooleanOutputProvider::GpioTransportRecoveryStage>>
+      topics;
+};
+std::shared_ptr<CompositionIoOwnerRecoverySnapshot>
+CaptureCompositionIoOwnerRecovery(
+    std::span<const Composition *const> roots,
+    std::shared_ptr<ros2_control_execution::Ros2TransportResources> failed) {
+  auto result = std::make_shared<CompositionIoOwnerRecoverySnapshot>();
+  result->failed = std::move(failed);
+  std::map<IoProviderDriverRecord *,
+           CompositionIoOwnerRecoverySnapshot::Candidate>
+      drivers;
+  std::map<HostIoOutputChannelEntry *,
+           std::shared_ptr<HostIoOutputChannelEntry>>
+      channels;
+  const auto include = [&](const Composition &view, bool bridge) {
+    if (view.io_provider_drivers)
+      for (const auto &driver : *view.io_provider_drivers) {
+        if (!driver)
+          continue;
+        auto [it, inserted] = drivers.try_emplace(
+            driver.get(),
+            CompositionIoOwnerRecoverySnapshot::Candidate{driver, false});
+        static_cast<void>(inserted);
+        it->second.observer |= bridge && driver->InstalledStreamObserver();
+      }
+    for (const auto &channel : view.io_output_channels)
+      if (channel)
+        channels.emplace(channel.get(), channel);
+  };
+  for (const auto *root : roots)
+    if (root) {
+      const bool bridge = root->io_transport == result->failed &&
+                          bool(root->component_stream_sample_bridge);
+      include(*root, bridge);
+      for (const auto &part : root->participant_compositions)
+        if (part)
+          include(*part, bridge);
+    }
+  for (auto &[key, row] : drivers) {
+    static_cast<void>(key);
+    result->candidates.push_back(std::move(row));
+  }
+  // Stage and snapshot preserve this common delivery-lock order by position.
+  std::sort(result->candidates.begin(), result->candidates.end(),
+            [](const auto &left, const auto &right) {
+              return DeliveryLockOrder(left.driver, right.driver);
+            });
+  for (auto &[key, row] : channels) {
+    static_cast<void>(key);
+    result->channels.push_back(std::move(row));
+  }
+  return result;
+}
+void ResolveCompositionIoOwnerRecoveryServed(
+    CompositionIoOwnerRecoverySnapshot &snapshot) {
+  snapshot.served.clear();
+  if (!snapshot.failed)
+    return;
+  for (const auto &candidate : snapshot.candidates) {
+    if (candidate.driver->RosOwner() == snapshot.failed ||
+        candidate.observer)
+      snapshot.served.push_back(candidate.driver->domain()
+                                    .provider()
+                                    ->provider.controllable_component_id);
+  }
+  std::sort(snapshot.served.begin(), snapshot.served.end());
+  snapshot.served.erase(
+      std::unique(snapshot.served.begin(), snapshot.served.end()),
+      snapshot.served.end());
+}
+core::Result<void>
+CloseCompositionIoOwnerRecovery(CompositionIoOwnerRecoverySnapshot &snapshot) {
+  using Reply = core::Result<void>;
+  if (!snapshot.failed || snapshot.closed)
+    return Reply::Err(
+        {"io_owner_recovery_invalid", "I/O recovery snapshot is invalid", {}});
+  std::optional<core::ErrorDTO> failure;
+  for (const auto &candidate : snapshot.candidates) {
+    bool affected;
+    {
+      auto lock = candidate.driver->AcquireDelivery();
+      affected = candidate.driver->UsesRosOwnerLocked(snapshot.failed) ||
+                 candidate.observer;
+    }
+    if (!affected)
+      continue;
+    auto closed = candidate.driver->CloseAndCaptureRosOwnerRecovery(
+        snapshot.failed, candidate.observer);
+    if (!closed.ok()) {
+      if (!failure)
+        failure = closed.error();
+      continue;
+    }
+    snapshot.drivers.push_back({candidate.driver, std::move(closed.value())});
+  }
+  if (failure)
+    return Reply::Err(*failure);
+  std::set<RosBooleanOutputProvider *> captured_outputs;
+  for (const auto &channel : snapshot.channels) {
+    const auto *provider =
+        std::get_if<std::shared_ptr<RosBooleanOutputProvider>>(
+            &channel->provider);
+    if (provider && *provider &&
+        (*provider)->BelongsToTransport(snapshot.failed) &&
+        captured_outputs.insert(provider->get()).second)
+      snapshot.outputs.push_back(
+          {*provider, (*provider)->CaptureTransportRecovery()});
+  }
+  snapshot.closed = true;
+  return Reply::Ok();
+}
+const std::vector<core::ControllableComponentId> &
+CompositionIoOwnerRecoveryServed(
+    const CompositionIoOwnerRecoverySnapshot &snapshot) {
+  return snapshot.served;
+}
+core::Result<std::shared_ptr<CompositionIoOwnerRecoveryStage>>
+StageCompositionIoOwnerRecovery(
+    std::shared_ptr<CompositionIoOwnerRecoverySnapshot> snapshot,
+    std::shared_ptr<ros2_control_execution::Ros2TransportResources>
+        replacement) {
+  using Reply = core::Result<std::shared_ptr<CompositionIoOwnerRecoveryStage>>;
+  if (!snapshot || !snapshot->closed || !replacement ||
+      replacement == snapshot->failed)
+    return Reply::Err(
+        {"io_owner_recovery_invalid", "I/O recovery stage is invalid", {}});
+  auto result = std::make_shared<CompositionIoOwnerRecoveryStage>();
+  result->snapshot = std::move(snapshot);
+  for (const auto &row : result->snapshot->drivers) {
+    auto prepared = IoProviderDriverRecord::StageRosOwnerRecovery(row.snapshot,
+                                                                  replacement);
+    if (!prepared.ok())
+      return Reply::Err(prepared.error());
+    result->drivers.push_back({row.driver, std::move(prepared.value())});
+  }
+  std::map<
+      RosBooleanOutputProvider::GpioTopic *,
+      std::shared_ptr<RosBooleanOutputProvider::GpioTransportRecoveryStage>>
+      topics;
+  for (const auto &row : result->snapshot->outputs) {
+    auto pin = row.provider->gpio_topic();
+    std::shared_ptr<RosBooleanOutputProvider::GpioTransportRecoveryStage> topic;
+    if (pin) {
+      const auto found = topics.find(pin.get());
+      if (found == topics.end()) {
+        auto prepared = RosBooleanOutputProvider::StageGpioTransportRecovery(
+            pin, replacement);
+        if (!prepared.ok())
+          return Reply::Err(prepared.error());
+        topic = std::move(prepared.value());
+        topics.emplace(pin.get(), topic);
+        result->topics.push_back(topic);
+      } else
+        topic = found->second;
+    }
+    auto prepared = RosBooleanOutputProvider::StageTransportRecovery(
+        row.snapshot, replacement, topic);
+    if (!prepared.ok())
+      return Reply::Err(prepared.error());
+    result->outputs.push_back({row.provider, std::move(prepared.value())});
+  }
+  return Reply::Ok(std::move(result));
+}
+core::Result<void>
+CommitCompositionIoOwnerRecovery(CompositionIoOwnerRecoveryStage &stage) {
+  using Reply = core::Result<void>;
+  std::vector<std::unique_lock<std::mutex>> locks;
+  locks.reserve(stage.drivers.size());
+  for (const auto &row : stage.drivers)
+    locks.push_back(row.driver->AcquireDelivery());
+  for (std::size_t i = 0; i < stage.drivers.size(); ++i)
+    if (!stage.drivers[i].driver->MatchesRosOwnerRecoveryLocked(
+            *stage.snapshot->drivers[i].snapshot))
+      return Reply::Err({"io_owner_recovery_stale",
+                         "I/O driver changed during recovery",
+                         {}});
+  for (const auto &row : stage.snapshot->outputs)
+    if (!row.provider->MatchesTransportRecovery(*row.snapshot))
+      return Reply::Err({"io_owner_recovery_stale",
+                         "I/O output changed during recovery",
+                         {}});
+  for (auto &topic : stage.topics)
+    RosBooleanOutputProvider::CommitGpioTransportRecovery(*topic);
+  for (auto &row : stage.outputs)
+    row.provider->CommitTransportRecovery(*row.stage);
+  for (auto &row : stage.drivers)
+    row.driver->CommitRosOwnerRecoveryLocked(*row.stage);
+  return Reply::Ok();
+}
+void ActivateCompositionIoOwnerRecovery(
+    CompositionIoOwnerRecoveryStage &stage) noexcept {
+  for (auto &row : stage.drivers)
+    IoProviderDriverRecord::ActivateRosOwnerRecovery(*row.stage);
+}
+
 core::Result<void> PrepareCompositionIoProviderResources(
     Composition &candidate, RetainedCellRuntime &cell,
     rclcpp::Node::SharedPtr generic_node,
-    std::span<const CompositionIoResourcePredecessor> actual_existing) {
+    std::span<const CompositionIoResourcePredecessor> actual_existing,
+    std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner) {
   using Reply = core::Result<void>;
   try {
+    // Runtime and driver installation records retain copies of this node.
+    // Share the owner-retired borrow through all of those records.
+    if (owner) generic_node = owner->retain_entity(std::move(generic_node));
     if (candidate.io_resource_preparation &&
         candidate.io_resource_preparation->publication_generation ==
             candidate.publication_generation) {
@@ -314,7 +550,7 @@ core::Result<void> PrepareCompositionIoProviderResources(
     // Compiled system signals have no I/O driver or lifecycle: the runtime
     // owns their one in-process source.
     std::vector<deployment::RetainedIoSignalConfiguration> system_rows;
-    // A machine's I/O member signals on the real lane (CONTRACTS §16): no
+    // A machine's I/O member signals on the real lane: no
     // I/O driver either; their family's I/O update sink feeds them.
     std::vector<deployment::RetainedIoSignalConfiguration> adapter_rows;
     for (const auto &row : catalog.value()) {
@@ -332,6 +568,22 @@ core::Result<void> PrepareCompositionIoProviderResources(
         require(row.descriptor.output_resource &&
                     existing.contains(*row.descriptor.output_resource),
                 "retained driver has no qualified actual output channel");
+      if (owner &&
+          row.descriptor.direction == core::IoSignalDirection::kOutput &&
+          driver->resources_installed() &&
+          (row.provider.profile == "ros_set_bool" ||
+           row.provider.profile == "ros2_control_gpio")) {
+        const auto &channel =
+            existing.at(*row.descriptor.output_resource).entry;
+        const auto *leaf =
+            std::get_if<std::shared_ptr<RosBooleanOutputProvider>>(
+                &channel->provider);
+        if (!leaf || !*leaf || driver->RosOwner() != owner ||
+            !(*leaf)->BelongsToTransport(owner))
+          return Reply::Err({"io_ros_owner_mismatch",
+                             "Retained I/O output belongs to another ROS owner",
+                             {}});
+      }
       const auto [known, inserted] =
           drivers.emplace(driver->domain().control_domain_id, driver);
       require(inserted || known->second == driver,
@@ -364,7 +616,7 @@ core::Result<void> PrepareCompositionIoProviderResources(
             {row, driver->occurrence(),
              driver->driver_observation_generation_locked(), driver,
              candidate.publication_generation, ack_timeout_ns(row)});
-        // A Mock output reports its written value back (CONTRACTS §7, D2).
+        // A Mock output reports its written value back.
         if (row.provider.profile == "mock_output")
           adapter_rows.push_back(row);
       }
@@ -388,7 +640,7 @@ core::Result<void> PrepareCompositionIoProviderResources(
         fresh_aliases.insert(fresh_aliases.end(), rows.begin(), rows.end());
     auto created = CreateHostIoOutputChannels(std::move(fresh_aliases),
                                               generic_node, *cell.clock(),
-                                              captured_topics);
+                                              captured_topics, owner);
     if (!created.ok())
       return Reply::Err(created.error());
     std::map<core::ResourceId, std::shared_ptr<HostIoOutputChannelEntry>>
@@ -560,12 +812,12 @@ core::Result<void> PrepareCompositionIoProviderResources(
                   : IoProviderDriverRecord::InputAcquisitionHook{};
       const auto prepared =
           installed
-              ? driver->RebindInputsLocked(std::move(inputs), std::move(cancel),
+              ? driver->RebindInputsLocked(delivery, std::move(inputs), std::move(cancel),
                                            std::move(lifecycle),
-                                           std::move(acquisition))
+                                           std::move(acquisition), owner)
               : driver->InstallResourcesLocked(
-                    std::move(inputs), std::move(outputs), std::move(cancel),
-                    std::move(lifecycle), std::move(acquisition));
+                    delivery, std::move(inputs), std::move(outputs), std::move(cancel),
+                    std::move(lifecycle), std::move(acquisition), owner);
       if (!prepared.ok())
         return Reply::Err(prepared.error());
       std::optional<std::int64_t> inputs_budget_ns;

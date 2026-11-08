@@ -1,4 +1,4 @@
-"""Demand-driven current-state source for the UI6-G control session.
+"""Demand-driven current-state source for the execution-control session.
 
 The source is deliberately small: Program Runner wakes it through one private
 revision stream, filesystem owners wake one cold-combine bit, and each browser
@@ -329,8 +329,8 @@ def program_failure_origins(cycle: dict[str, Any]) -> dict[str, dict[str, Any]]:
     stopped or failed Run until Reset; row presence alone is the hold. The
     row's selected cause decides: its recovery class must not keep its own
     native alarm, and no participant's terminal fact may show an uncertain
-    or still-active effect. The facts are every participant's raw fact
-    (SX-1985), so a co-participant that succeeded or failed differently
+    or still-active effect. The facts are every participant's raw fact,
+    so a co-participant that succeeded or failed differently
     never suppresses the alarm. A pure logic failure carries no operation
     row and never activates the alarm.
     """
@@ -1452,7 +1452,7 @@ class HeadlessControlStateSource:
             "execution_targets": targets,
             "execution_control_state": control,
             "program_cycle": dict(facts.program_cycle),
-            # Component model v2 events (CONTRACTS §1, §5, §7, §10): each key
+            # Component model v2 events: each key
             # is sent again in a delta whenever its value changes.
             **_component_model_events(facts),
         }

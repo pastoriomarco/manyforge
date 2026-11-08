@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <future>
+#include <atomic>
 #include <iomanip>
 #include <sstream>
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
@@ -16,8 +18,8 @@
 #include <variant>
 #include <vector>
 
-// Core Stop-stage helper over the fake execution port (design §7.7: the
-// native and ROS Stop policy cases migrate here). Time and port facts are
+// Core Stop-stage helper over the fake execution port (the native and ROS
+// Stop policy cases live here). Time and port facts are
 // scripted through the injected waiter; no sleeps.
 
 namespace manyforge::core {
@@ -31,6 +33,12 @@ const ExecutionGoalKey kOriginal{kGoalId, ControllerGoalGeneration(1U)};
 const ExecutionGoalKey kSecond{kGoalId, ControllerGoalGeneration(2U)};
 const ExecutionGoalKey kThird{kGoalId, ControllerGoalGeneration(3U)};
 const RuntimeEpoch kEpoch("runtime-epoch.1");
+
+std::shared_ptr<GoalCancelAttempt> TestCancelAttempt() {
+  auto attempt = std::make_shared<GoalCancelAttempt>();
+  attempt->execution_id = 1U;
+  return attempt;
+}
 
 enum class Nominal { kControlled, kGoalCancel };
 
@@ -204,8 +212,8 @@ ResolvedParticipantStopStageDTO Stage(std::size_t index, Nominal nominal = Nomin
 }
 
 /// The Kernel's per-robot Stop-time values `elapsed_ns` after the Stop
-/// request (Q51): a controlled stage carries its own profile deadline; a hard
-/// or cancel stage carries none (the lane bounds it, Q57).
+/// request: a controlled stage carries its own profile deadline; a hard
+/// or cancel stage carries none (the lane bounds it).
 RemainingStopBudgetDTO Budget(const ResolvedParticipantStopStageDTO& stage,
                               std::int64_t elapsed_ns = 0) {
   RemainingStopBudgetDTO budget{stage.stop_id, stage.stop_generation, elapsed_ns, std::nullopt};
@@ -306,19 +314,22 @@ class GoalReadObservingPort final : public IExecutionPort {
   explicit GoalReadObservingPort(FakeExecutionPort& port) : port_(port) {}
 
   ExecutionPortCommandResultDTO Submit(const ExecutionGoalKey& key,
-                                       const TrajectoryDTO& trajectory) override {
-    return port_.Submit(key, trajectory);
+                                       const TrajectoryDTO& trajectory, std::shared_ptr<ExecutionDispatchToken> token = {}) override {
+    return port_.Submit(key, trajectory, std::move(token));
   }
   ExecutionPortCommandResultDTO Replace(
       const ExecutionGoalKey& active, const ExecutionGoalKey& next,
-      const TrajectoryDTO& trajectory) override {
-    return port_.Replace(active, next, trajectory);
+      const TrajectoryDTO& trajectory, std::shared_ptr<ExecutionDispatchToken> token = {}) override {
+    return port_.Replace(active, next, trajectory, std::move(token));
   }
-  ExecutionPortCommandResultDTO Cancel(const ExecutionGoalKey& key) override {
+  ExecutionPortCommandResultDTO Cancel(const ExecutionGoalKey& key, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) override {
     if (on_cancel) return on_cancel(key);
-    return port_.Cancel(key);
+    return port_.Cancel(key, deadline);
   }
-  ExecutionPortCommandResultDTO SetScale(double value) override { return port_.SetScale(value); }
+  std::uint64_t ReserveScaleSequence() noexcept override { return port_.ReserveScaleSequence(); }
+  bool IsLatestScaleSequence(std::uint64_t sequence) const noexcept override { return port_.IsLatestScaleSequence(sequence); }
+  ScaleSnapshot SnapshotScaleAfterFence(std::chrono::steady_clock::time_point deadline) override { return port_.SnapshotScaleAfterFence(deadline); }
+  ExecutionPortCommandResultDTO SetScale(double value, std::uint64_t sequence) override { return port_.SetScale(value, sequence); }
   std::optional<ExecutionGoalObservationDTO> ReadGoal(const ExecutionGoalKey& key) const override {
     auto goal = port_.ReadGoal(key);
     if (on_read_goal) on_read_goal(goal);
@@ -370,8 +381,9 @@ class World {
           ++ticks;
           if (on_tick) on_tick();
         },
-        [this] {
+        [this](auto) -> std::optional<double> {
           ++freezes;
+          if (freeze_expired) return std::nullopt;
           return frozen;
         },
         config);
@@ -386,9 +398,11 @@ class World {
 
   /// The dispatched goal is executing with action feedback already received.
   void Dispatch(const ResolvedParticipantStopStageDTO& stage) {
+    auto cancel = std::make_shared<GoalCancelAttempt>();
+    cancel->execution_id = 1U;
     helper->BindDispatchedGoal(Goal(stage), std::make_shared<ExecutionSampleAssociation>(
                                                 ExecutionBindingEpoch(1U), port.ReadSample(),
-                                                clock.now()));
+                                                clock.now()), std::move(cancel));
     Executing(kOriginal);
   }
 
@@ -405,7 +419,7 @@ class World {
     port.SetGoal(goal);
   }
 
-  /// The brake's final point (Q50 level-3 finish): the last point of the
+  /// The brake's final point (level-3 finish): the last point of the
   /// newest replacement as sent.
   double BrakeEnd() const {
     const auto replaces = Replaces(port);
@@ -450,6 +464,7 @@ class World {
   std::unique_ptr<ParticipantStopStageHelper> helper;
   std::function<void()> on_tick;
   double frozen{0.5};
+  bool freeze_expired{false};
   std::size_t ticks{0U};
   std::size_t freezes{0U};
   std::uint64_t receipts{0U};
@@ -466,7 +481,7 @@ void ScriptReplacement(World& world, const ExecutionGoalKey& key, std::size_t ti
     ++*count;
     if (*count == 1U) {
       world.Executing(key);
-      // The accepted replacement preempts the goal it replaced (§3.3).
+      // The accepted replacement preempts the goal it replaced.
       world.port.FinishGoal(replaces.back().active_key, ExecutionGoalResult::kPreemptedBy, key,
                             world.clock.now());
     }
@@ -488,7 +503,40 @@ void RecordPendingReplacement(World& world) {
   world.helper->RecordReplacement(
       kSecond, Original(),
       std::make_shared<ExecutionSampleAssociation>(ExecutionBindingEpoch(1U),
-                                                   world.port.ReadSample(), world.clock.now()));
+                                                   world.port.ReadSample(), world.clock.now()),
+      0.0, TestCancelAttempt());
+}
+
+TEST(ParticipantStopStageHelperTest, ConcurrentAndLateCallersShareExactCancelAttempt) {
+  World world(false);
+  GoalReadObservingPort observed(world.port);
+  world.Build(&observed);
+  world.Dispatch(Stage(0U));
+  auto attempt = std::make_shared<GoalCancelAttempt>();
+  std::promise<void> entered;
+  std::promise<void> release;
+  const auto released = release.get_future().share();
+  std::atomic<unsigned> calls{0};
+  observed.on_cancel = [&](const ExecutionGoalKey& key) {
+    if (calls.fetch_add(1) == 0) entered.set_value();
+    released.wait();
+    return world.port.Cancel(key);
+  };
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  auto first = std::async(std::launch::async, [&] {
+    return world.helper->CancelExactGoal(kOriginal, attempt, deadline);
+  });
+  entered.get_future().wait();
+  auto second = std::async(std::launch::async, [&] {
+    return world.helper->CancelExactGoal(kOriginal, attempt, deadline);
+  });
+  release.set_value();
+  const auto first_result = first.get();
+  const auto second_result = second.get();
+  const auto late_result = world.helper->CancelExactGoal(kOriginal, attempt, deadline);
+  EXPECT_EQ(calls.load(), 1U);
+  EXPECT_EQ(first_result.dispatch, second_result.dispatch);
+  EXPECT_EQ(first_result.dispatch, late_result.dispatch);
 }
 
 TEST(ParticipantStopStageHelperTest, PendingSuccessorBlocksNaturalCompletionUntilExactlyRejected) {
@@ -696,7 +744,33 @@ TEST(ParticipantStopStageHelperTest, CancellationBeforeDispatchIsSupersededWitho
   EXPECT_TRUE(world.port.commands().empty());
 }
 
-// --- Soft Stop on the §4.2 timeline -----------------------------------------------
+// --- Soft Stop timeline -----------------------------------------------------------
+
+TEST(ParticipantStopStageHelperTest, ScaleFreezeDeadlineDoesNotFabricateStopEvidence) {
+  World world;
+  const auto stage = Stage(0U, Nominal::kControlled, Parameters("soft_on_path", false));
+  world.Dispatch(stage);
+  world.Sample(0.5, 0.5, 1.0);
+  world.freeze_expired = true;
+  const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+  EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+  ASSERT_TRUE(result.error);
+  EXPECT_EQ(result.error->details.at("reason"), "stop_evidence_phase_expired");
+  EXPECT_TRUE(Replaces(world.port).empty());
+}
+
+TEST(ParticipantStopStageHelperTest, StopReplacementWithoutExecutionIdentityIsNotSent) {
+  World world;
+  const auto stage = Stage(0U);
+  world.helper->BindDispatchedGoal(Goal(stage), std::make_shared<ExecutionSampleAssociation>(
+      ExecutionBindingEpoch(1U), world.port.ReadSample(), world.clock.now()));
+  world.Executing(kOriginal);
+  world.Sample(0.5, 0.5, 1.0);
+  const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"), "stop_execution_identity_missing");
+  EXPECT_TRUE(Replaces(world.port).empty());
+}
 
 TEST(ParticipantStopStageHelperTest, SoftStopReplacesThroughThePastPointJoinAndFinishesOnSuccess) {
   World world;
@@ -715,7 +789,7 @@ TEST(ParticipantStopStageHelperTest, SoftStopReplacesThroughThePastPointJoinAndF
   ASSERT_EQ(replaces.size(), 1U);
   EXPECT_EQ(replaces.front().active_key, kOriginal);
   EXPECT_EQ(replaces.front().next_key, kSecond);
-  // Q20/Q26: the original's points before the elapsed time
+  // The original's points before the elapsed time
   // 0.5 + 0.5 * (0 + 0.02) = 0.51 keep negative times; then the ramp.
   const auto& points = replaces.front().trajectory.waypoints;
   ASSERT_GE(points.size(), 5U);
@@ -727,7 +801,7 @@ TEST(ParticipantStopStageHelperTest, SoftStopReplacesThroughThePastPointJoinAndF
     EXPECT_GT(points[index].time_from_start_s, points[index - 1U].time_from_start_s);
   }
   EXPECT_GE(points[3].time_from_start_s, 0.0);
-  // §4.2: the lead-in is the original path itself up to the trip point
+  // The lead-in is the original path itself up to the trip point
   // 0.5 + 0.5 * 0.05 = 0.525, carried with the original's own state there.
   EXPECT_NEAR(points[3].time_from_start_s, 0.525 - 0.51, 1e-9);
   EXPECT_NEAR(points[3].positions_rad[0], 0.525, 1e-12);
@@ -870,7 +944,7 @@ TEST(ParticipantStopStageHelperTest, ReplacementStartAllowanceIsARequiredLaneInp
   EXPECT_NO_THROW(world.Build());
 }
 
-/// Every read advances 0.1 ms, so the read that feeds the Q26 join is visible.
+/// Every read advances 0.1 ms, so the read that feeds the join is visible.
 class TickingClock final : public IClock {
  public:
   static constexpr Duration kReadTick = 100'000;
@@ -891,19 +965,22 @@ class SendTimeRecordingPort final : public IExecutionPort {
   SendTimeRecordingPort(FakeExecutionPort& port, const FakeClock& clock)
       : port_(port), clock_(clock) {}
   ExecutionPortCommandResultDTO Submit(const ExecutionGoalKey& key,
-                                       const TrajectoryDTO& trajectory) override {
-    return port_.Submit(key, trajectory);
+                                       const TrajectoryDTO& trajectory, std::shared_ptr<ExecutionDispatchToken> token = {}) override {
+    return port_.Submit(key, trajectory, std::move(token));
   }
   ExecutionPortCommandResultDTO Replace(
       const ExecutionGoalKey& active, const ExecutionGoalKey& next,
-      const TrajectoryDTO& trajectory) override {
+      const TrajectoryDTO& trajectory, std::shared_ptr<ExecutionDispatchToken> token = {}) override {
     replace_clock.push_back(clock_.now());
-    return port_.Replace(active, next, trajectory);
+    return port_.Replace(active, next, trajectory, std::move(token));
   }
-  ExecutionPortCommandResultDTO Cancel(const ExecutionGoalKey& key) override {
-    return port_.Cancel(key);
+  ExecutionPortCommandResultDTO Cancel(const ExecutionGoalKey& key, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) override {
+    return port_.Cancel(key, deadline);
   }
-  ExecutionPortCommandResultDTO SetScale(double value) override { return port_.SetScale(value); }
+  std::uint64_t ReserveScaleSequence() noexcept override { return port_.ReserveScaleSequence(); }
+  bool IsLatestScaleSequence(std::uint64_t sequence) const noexcept override { return port_.IsLatestScaleSequence(sequence); }
+  ScaleSnapshot SnapshotScaleAfterFence(std::chrono::steady_clock::time_point deadline) override { return port_.SnapshotScaleAfterFence(deadline); }
+  ExecutionPortCommandResultDTO SetScale(double value, std::uint64_t sequence) override { return port_.SetScale(value, sequence); }
   std::optional<ExecutionGoalObservationDTO> ReadGoal(const ExecutionGoalKey& key) const override {
     return port_.ReadGoal(key);
   }
@@ -922,7 +999,7 @@ class SendTimeRecordingPort final : public IExecutionPort {
 };
 
 TEST(ParticipantStopStageHelperTest, JoinElapsedIsMeasuredAtTheReplacementSend) {
-  // Q26 (host integration): the local time since the trip sample enters the
+  // Host integration: the local time since the trip sample enters the
   // join at the dispatch itself, after planning, so the replacement's time 0
   // is not older than its real start.
   World world(false);
@@ -934,7 +1011,7 @@ TEST(ParticipantStopStageHelperTest, JoinElapsedIsMeasuredAtTheReplacementSend) 
         world.clock.advance(std::max<Duration>(1, std::min(kTick, deadline - world.clock.now())));
         if (world.on_tick) world.on_tick();
       },
-      [&world] { return world.frozen; }, world.config);
+      [&world](auto) -> std::optional<double> { return world.frozen; }, world.config);
   const auto stage = Stage(0U);
   world.Dispatch(stage);
   world.Sample(0.5, 0.5, 1.0);
@@ -1097,7 +1174,7 @@ TEST(ParticipantStopStageHelperTest, ReleaseHoldIsCancellableAndNeverCrossesTheS
 }
 
 TEST(ParticipantStopStageHelperTest, ReleaseHoldOversleepPastHalfAPeriodSendsNothing) {
-  // SX-3475: after waking, the ACTUAL time is checked against the existing
+  // After waking, the ACTUAL time is checked against the existing
   // release plus half-period, even inside the old 50ms lead-in: this is the
   // existing lead-in budget refusal, before any send.
   World world(false);
@@ -1111,7 +1188,7 @@ TEST(ParticipantStopStageHelperTest, ReleaseHoldOversleepPastHalfAPeriodSendsNot
         world.clock.advance(19'000'000);  // release16.5ms + halfperiod2ms is already past
         ++world.ticks;
       },
-      [&world] { return world.frozen; }, world.config);
+      [&world](auto) -> std::optional<double> { return world.frozen; }, world.config);
   const auto stage = Stage(0U, Nominal::kControlled, Parameters("soft_on_path", false));
   world.Dispatch(stage);
   world.Sample(0.5, 0.5, 1.0);
@@ -1253,12 +1330,12 @@ TEST(ParticipantStopStageHelperTest, RefusedOrRejectedReplacementFailsTheStage) 
   EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kOriginal});
 }
 
-// Maintainer M6: a sent Stop trajectory finishes like a normal motion, on the
+// A sent Stop trajectory finishes like a normal motion, on the
 // controller's report, whenever it comes inside a normal motion's no-report
 // bound (here 10 s from the send: the trajectory lasts under 5.3 s), well past
 // the profile's 1.5 s deadline to start braking. Within the arrival tolerance
-// it succeeds; outside it takes the Q18 path; with no report it expires at the
-// normal-motion bound, never before.
+// it succeeds; outside it takes the goal-tolerance path; with no report it
+// expires at the normal-motion bound, never before.
 TEST(ParticipantStopStageHelperTest, SentStopTrajectoryFinishesLikeANormalMotion) {
   for (const auto ended : {std::optional(ExecutionGoalResult::kSucceeded),
                            std::optional(ExecutionGoalResult::kAbortedGoalTolerance),
@@ -1359,7 +1436,7 @@ TEST(ParticipantStopStageHelperTest, OrderedFallbacksKeepTheOriginalAbsoluteDead
   EXPECT_EQ(world.freezes, 1U);
 }
 
-// --- Item 2, item 3/Q3, Q33 -------------------------------------------------------
+// --- Natural completion, spring-back and planner-chosen hard stop ------------------
 
 TEST(ParticipantStopStageHelperTest, NaturalCompletionLetsTheOriginalGoalFinish) {
   World world;
@@ -1413,7 +1490,7 @@ TEST(ParticipantStopStageHelperTest, SpringBackSubstitutionUsesTheSameReplaceTim
   const auto replaces = Replaces(world.port);
   ASSERT_EQ(replaces.size(), 1U);
   EXPECT_LT(replaces.front().trajectory.waypoints.front().time_from_start_s, 0.0);
-  // Q25: the return ends at the exact trip cursor's pose.
+  // The return ends at the exact trip cursor's pose.
   EXPECT_NEAR(replaces.front().trajectory.waypoints.back().positions_rad[0], 1.8, 1e-6);
   const auto& diagnostics =
       std::get<JsonObjectDTO>(EvidenceObject(result).at("provider_diagnostics").value);
@@ -1650,7 +1727,7 @@ TEST(ParticipantStopStageHelperTest, DirectSpringBackProfileUsesTheSameReplaceTi
   EXPECT_NEAR(replaces.front().trajectory.waypoints.back().positions_rad[0], 0.5, 1e-6);
 }
 
-// Q130: the fast spring-back sends the passed points plus one zero-velocity
+// The fast spring-back sends the passed points plus one zero-velocity
 // point at the trip position, with no planner and no lead-in ramp.
 TEST(ParticipantStopStageHelperTest, FastSpringBackSendsPassedPointsAndOneTripPointAtOnce) {
   World world;
@@ -1728,7 +1805,7 @@ TEST(ParticipantStopStageHelperTest, FastSpringBackLetsAShortRemainingMoveFinish
   EXPECT_TRUE(std::get<bool>(evidence.at("completed_by_natural_completion").value));
 }
 
-/// §3.3: the replacement's cursor maps back to the original path through the
+/// The replacement's cursor maps back to the original path through the
 /// Stop planner's own sample mapping; after the replacement's success (and its
 /// hold, cursor reset) the original cursor stays frozen at the mapped end.
 TEST(ParticipantStopStageHelperTest, ReplacementCursorMapsToTheOriginalPathAndFreezesAtTheHold) {
@@ -1809,7 +1886,7 @@ TEST(ParticipantStopStageHelperTest, InexactContractScopeOrCoordinateRefusesBefo
 }
 
 TEST(ParticipantStopStageHelperTest, PlannerChosenHardStopIsTaggedForTheKernel) {
-  // Q33: infeasible deceleration and an initial-deviation trigger (item 6)
+  // Infeasible deceleration and an initial-deviation trigger
   // both make the planner choose the hard stop.
   {
     World world;
@@ -1835,7 +1912,7 @@ TEST(ParticipantStopStageHelperTest, PlannerChosenHardStopIsTaggedForTheKernel) 
   EXPECT_EQ(result.error->details.at("stop_disposition"), "planner_selected_hard_stop");
 }
 
-// Maintainer 2026-10-29 (Real Lite 6): the measured position trails the
+// Real Lite 6: the measured position trails the
 // command, so a lead-in anchored at the measured position can end before the
 // replacement can start (the soft Stop is refused and falls back). The lane's
 // `lead_in_anchor` selects the anchor; kCommanded (the default) starts the
@@ -1894,7 +1971,7 @@ TEST(ParticipantStopStageHelperTest, RealLaneGoalToleranceViolationIsMainsUnsett
     EXPECT_EQ(result.attempt_disposition, StopStageAttemptDispositionDTO::kDispatched);
     EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
     EXPECT_EQ(result.actual_provider_contract_mode, MotionControlledStopMode::kSoftOnPath);
-    // Q18: the Kernel maps this reason to InterventionRequired with no second
+    // The Kernel maps this reason to InterventionRequired with no second
     // Stop command; only a lane that keeps goal tolerances (every ros2_control
     // lane, merge 6 arrival) reports it.
     EXPECT_EQ(result.error->details.at("reason"),
@@ -1905,10 +1982,10 @@ TEST(ParticipantStopStageHelperTest, RealLaneGoalToleranceViolationIsMainsUnsett
   }
 }
 
-// Maintainer M6: a Stop trajectory gets the lane's arrival check like a
+// A Stop trajectory gets the lane's arrival check like a
 // motion. On a lane that keeps goal tolerances, a controlled Stop goal (soft
 // ramp, spring-back, fast spring-back) that JTC finishes within it succeeds;
-// one that JTC aborts on the goal tolerance takes the existing Q18 path
+// one that JTC aborts on the goal tolerance takes the existing path
 // (`stop_goal_tolerance_violated`: the Kernel ends the participant
 // InterventionRequired with no second Stop command).
 TEST(ParticipantStopStageHelperTest, StopTrajectoriesTakeTheLaneArrivalCheckLikeMotions) {
@@ -1960,10 +2037,10 @@ TEST(ParticipantStopStageHelperTest, PathDeviationDuringTheStopIsMeasuredFromSam
   EXPECT_NEAR(std::get<double>(evidence.at("path_deviation_max_rad").value), 0.5, 1e-6);
 }
 
-// --- Hard stop: Q42 level 3 and Q35 level 4 --------------------------------------
+// --- Hard stop: level 3 and level 4 ----------------------------------------------
 
 /// Brake installation and finish as the mechanism would report them.
-/// Scripts JTC executing the level-3 brake as characterized (SX-162/164): the
+/// Scripts JTC executing the level-3 brake as characterized: the
 /// cursor restarts on the brake; the brake's own sampled reference stays
 /// nonzero; on tick `succeeded_tick` JTC reports kSucceeded and from the next
 /// tick on publishes its success hold (cursor reset, reference velocity 0).
@@ -2033,12 +2110,12 @@ TEST(ParticipantStopStageHelperTest, ControlledHardStopBrakesFromTheLatestComman
   ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
       << result.error->details.at("reason");
   EXPECT_FALSE(result.actual_provider_contract_mode.has_value());
-  EXPECT_EQ(Scales(world.port), std::vector<double>{0.5});  // Q35 pin, once
+  EXPECT_EQ(Scales(world.port), std::vector<double>{0.5});  // factor pin, once
   EXPECT_TRUE(Cancels(world.port).empty());
   const auto replaces = Replaces(world.port);
   ASSERT_EQ(replaces.size(), 1U);
   const auto& points = replaces.front().trajectory.waypoints;
-  // Q20 join before the brake; the brake ends at rest after 0.5 * 1 / 4 s.
+  // Join before the brake; the brake ends at rest after 0.5 * 1 / 4 s.
   EXPECT_LT(points.front().time_from_start_s, 0.0);
   EXPECT_EQ(points.back().velocities_rad_s[0], 0.0);
   EXPECT_NEAR(points.back().time_from_start_s, 0.5 * 0.125 - 0.5 * 0.02, 1e-9);
@@ -2073,7 +2150,7 @@ TEST(ParticipantStopStageHelperTest, ScheduledHardStopUsesTheSameSourceEntryAndF
 }
 
 TEST(ParticipantStopStageHelperTest, ControlledHardStopFinishesOnItsSuccessThenTheFollowingHold) {
-  // SX-162/164: neither the brake's own reference nor a controller-wide hold
+  // Neither the brake's own reference nor a controller-wide hold
   // finishes level 3; only this replacement's kSucceeded followed by a hold
   // sample at exactly zero reference velocity does.
   World world;
@@ -2118,7 +2195,7 @@ TEST(ParticipantStopStageHelperTest, ControlledHardStopFinishesOnItsSuccessThenT
 
   // Without this replacement's success the hold never finishes it: as a sent
   // trajectory with the arrival check, the brake's no-report bound is a normal
-  // motion's (SX-609: max(10 s, 1.5 x duration + 2 s) from its send), not the
+  // motion's (max(10 s, 1.5 x duration + 2 s) from its send), not the
   // lane's 1 s stop-completion timeout.
   World held;
   const auto again = Stage(1U);
@@ -2138,7 +2215,7 @@ TEST(ParticipantStopStageHelperTest, ControlledHardStopFinishesOnItsSuccessThenT
   EXPECT_LE(held.clock.now() - started_at, 10'000'000'000 + kTick);
 }
 
-// SX-609: the brake finishes on the controller's report even after the lane's
+// The brake finishes on the controller's report even after the lane's
 // hard-stop timeout (here 1 s; e.g. Isaac UR10e's 0.5 s below its 1.0 s
 // goal_time). Within tolerance it succeeds; a goal-tolerance abort falls to
 // the floor, which then has the lane's hard-stop timeout of its own.
@@ -2192,10 +2269,10 @@ TEST(ParticipantStopStageHelperTest, BrakeFinishesOnTheControllerReportPastTheHa
 }
 
 TEST(ParticipantStopStageHelperTest, BrakeEndingOtherwiseThanSucceededFallsToTheFloorAtOnce) {
-  // Q42: a level-3 brake that ends aborted, preempted or unknown is not
+  // A level-3 brake that ends aborted, preempted or unknown is not
   // finished; level 4 follows at once (nothing is left to cancel, so the
   // floor observes the controller's hold) instead of waiting for the bound.
-  // M6: a brake outside the lane's arrival tolerance after `goal_time` is
+  // A brake outside the lane's arrival tolerance after `goal_time` is
   // JTC's goal-tolerance abort and takes the same path.
   for (const auto ended : {ExecutionGoalResult::kAbortedPathTolerance,
                            ExecutionGoalResult::kAbortedGoalTolerance,
@@ -2277,10 +2354,10 @@ TEST(ParticipantStopStageHelperTest, RefusedOrUninstalledBrakeFallsBackToTheCanc
             "controlled_hard_stop_not_installed");
 }
 
-// --- Q59: takeover proof within the lane lead-in; stale controller state ------
+// --- Takeover proof within the lane lead-in; stale controller state -----------
 
 TEST(ParticipantStopStageHelperTest, BrakeRecognisedWithinTheLeadInNeedsNoFallback) {
-  // Q59: the brake's own first feedback at ~50 ms is inside a 100 ms lead-in
+  // The brake's own first feedback at ~50 ms is inside a 100 ms lead-in
   // (`stop_traj_delta_s`); the 20 ms replacement start allowance is only the
   // join estimate and is not the takeover window.
   World world(false);
@@ -2327,7 +2404,7 @@ TEST(ParticipantStopStageHelperTest, BrakeRecognisedWithinTheLeadInNeedsNoFallba
 }
 
 TEST(ParticipantStopStageHelperTest, BrakeWithoutOwnFeedbackWithinTheLeadInFallsBackToCancel) {
-  // Q59: level 3 brakes at once; with no own feedback or result within the
+  // Level 3 brakes at once; with no own feedback or result within the
   // lead-in (acceptance alone is never proof) the cancel follows.
   World world(false);
   world.config.stop_traj_delta_s = 0.1;
@@ -2364,7 +2441,7 @@ TEST(ParticipantStopStageHelperTest, BrakeWithoutOwnFeedbackWithinTheLeadInFalls
   EXPECT_LE(cancel_tick - sent_tick, 11U);
 }
 
-/// SX-263: the brake's own first feedback is received at `receipt_after`
+/// The brake's own first feedback is received at `receipt_after`
 /// (local receipt, after the brake was sent) while the helper's poll only
 /// wakes at `poll_after`; afterwards the brake runs and holds like JTC.
 /// `preempts`: whether the controller already reports the original goal
@@ -2412,7 +2489,7 @@ void ScriptLateWakeBrake(World& world, const Duration receipt_after, const Durat
 }
 
 TEST(ParticipantStopStageHelperTest, BrakeFeedbackReceivedAfterTheLeadInFallsBackToCancel) {
-  // SX-263: own feedback received at 110 ms with a 100 ms lead-in is not
+  // Own feedback received at 110 ms with a 100 ms lead-in is not
   // proof of takeover, even though the poll finds it; the cancel follows.
   World world(false);
   world.config.stop_traj_delta_s = 0.1;
@@ -2430,7 +2507,7 @@ TEST(ParticipantStopStageHelperTest, BrakeFeedbackReceivedAfterTheLeadInFallsBac
 }
 
 TEST(ParticipantStopStageHelperTest, BrakeFeedbackReceivedInsideTheLeadInCountsWhenThePollWakesLate) {
-  // SX-263: own feedback received at 90 ms (lead-in 100 ms) is proof even
+  // Own feedback received at 90 ms (lead-in 100 ms) is proof even
   // though the helper's poll only wakes at 110 ms; no fallback.
   World world(false);
   world.config.stop_traj_delta_s = 0.1;
@@ -2449,7 +2526,7 @@ TEST(ParticipantStopStageHelperTest, BrakeFeedbackReceivedInsideTheLeadInCountsW
 }
 
 TEST(ParticipantStopStageHelperTest, BrakeProofCountsOnlyInsideTheStageCappedRecognitionWindow) {
-  // SX-268: the stage's remaining bound (50 ms) is shorter than the lead-in
+  // The stage's remaining bound (50 ms) is shorter than the lead-in
   // (100 ms), so the recognition window is capped at 50 ms. Proof received at
   // 80 ms is not eligible (the cancel follows); proof received at 40 ms is
   // eligible even though the poll only wakes at 80 ms.
@@ -2468,7 +2545,7 @@ TEST(ParticipantStopStageHelperTest, BrakeProofCountsOnlyInsideTheStageCappedRec
     // The 50 ms bound has passed when the poll wakes at 80 ms. Not eligible:
     // level 4 follows within that passed bound and fails. Eligible: the brake
     // took over and, as a sent trajectory, finishes on its own report under a
-    // normal motion's bound (SX-609), not the 50 ms.
+    // normal motion's bound, not the 50 ms.
     if (receipt_after > 50'000'000) {
       ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
       ASSERT_TRUE(result.error.has_value());
@@ -2484,7 +2561,7 @@ TEST(ParticipantStopStageHelperTest, BrakeProofCountsOnlyInsideTheStageCappedRec
 }
 
 TEST(ParticipantStopStageHelperTest, ReplacementFeedbackReceivedAfterTheLeadInIsNoTakeover) {
-  // SX-263 on the controlled replacement: own feedback received at 110 ms
+  // On the controlled replacement: own feedback received at 110 ms
   // with a 100 ms lead-in is not proof; the stage recommends the hard stop.
   for (const Duration receipt_after : {Duration{110'000'000}, Duration{90'000'000}}) {
     SCOPED_TRACE(receipt_after);
@@ -2532,7 +2609,7 @@ TEST(ParticipantStopStageHelperTest, ReplacementFeedbackReceivedAfterTheLeadInIs
 }
 
 TEST(ParticipantStopStageHelperTest, StaleControllerStateDuringAStopIsAFault) {
-  // Q59 (`main`'s `joint_state_max_age_s`): the controller stops reporting
+  // As `main`'s `joint_state_max_age_s`: the controller stops reporting
   // state during the Stop; after the lane's 250 ms maximum age the stage
   // fails with stale controller state instead of waiting for its bound.
   World world(false);
@@ -2893,10 +2970,10 @@ TEST(ParticipantStopStageHelperTest, NominalGoalCancelRequiresTheCancelFinishAnd
   EXPECT_TRUE(EvidenceObject(result).contains("goal_observation"));
 }
 
-// --- Q45: Stop at an applied speed factor of 0 ------------------------------------
+// --- Stop at an applied speed factor of 0 -----------------------------------------
 
 TEST(ParticipantStopStageHelperTest, AppliedFactorZeroAtTheStopRequestSelectsThePlainCancel) {
-  // Q45: only an applied 0 (from the sample associated with the goal) makes
+  // Only an applied 0 (from the sample associated with the goal) makes
   // the Stop the plain cancel; the stage is tagged for the Kernel before any
   // command, whatever was last sent.
   for (const double frozen : {0.0, 0.5}) {
@@ -2923,7 +3000,7 @@ TEST(ParticipantStopStageHelperTest, AppliedFactorZeroAtTheStopRequestSelectsThe
   EXPECT_FALSE(result.error->details.contains("stop_disposition"));
 }
 
-// --- Q50: controller evidence association (Track 2 counterexamples) -----------
+// --- Controller evidence association (counterexamples) ------------------------
 
 ExecutionGoalObservationDTO GoalWithFeedback(TimePoint source, TimePoint local, double cursor) {
   ExecutionGoalObservationDTO goal;
@@ -3055,7 +3132,7 @@ TEST(ParticipantStopStageHelperTest, DelayedOldZeroSampleAfterTheBrakeResultIsRe
 }
 
 TEST(ParticipantStopStageHelperTest, BrakeFeedbackReadInTheFinishPollCountsBeforeTheHold) {
-  // Track 2 SX-202 (Q50): retained evidence source 180; in one poll the
+  // Retained evidence source 180; in one poll the
   // brake's own feedback (source 200), its kSucceeded and a zero-velocity
   // sample on the brake's end (source 190) are read together. The feedback is
   // ingested first, so 190 is not newer than the newest evidence and does not
@@ -3164,7 +3241,7 @@ TEST(ParticipantStopStageHelperTest, CancelledGoalThatSucceededTakesTheNaturalCo
 }
 
 TEST(ParticipantStopStageHelperTest, EndedGoalHoldNeedsANewerSourceStampThanTheGoalsEvidence) {
-  // SX-264 (Q50, no new rule): the goal already ended; a zero-reference
+  // No new rule: the goal already ended; a zero-reference
   // sample with an OLDER controller source stamp, queued until after the
   // terminal result, is not the hold. Only a genuinely newer zero sample is.
   World world;
@@ -3194,7 +3271,7 @@ TEST(ParticipantStopStageHelperTest, EndedGoalHoldNeedsANewerSourceStampThanTheG
 }
 
 TEST(ParticipantStopStageHelperTest, CancelBaselineMustBeAttributedToTheCancelledGoal) {
-  // SX-218: the Stop precedes the goal's first own-associated sample. The
+  // The Stop precedes the goal's first own-associated sample. The
   // newest sample at the cancel is a pre-goal hold with a high cursor; the
   // original goal's start sample (cursor 0, reference at rest, newer source
   // stamp) arrives after the cancel with the ACK and CANCELED already known.
@@ -3233,8 +3310,8 @@ TEST(ParticipantStopStageHelperTest, CancelBaselineMustBeAttributedToTheCancelle
 
 TEST(ParticipantStopStageHelperTest,
      LateInstalledBrakeAfterTheCancelFinishesOnlyOnAZeroReferenceAfterTheSwitch) {
-  // SX-257 / SX-210 case 1 (residual, no new rule): under the Q50 attributed
-  // baseline and the Q59 lead-in window, level 3 shows no own feedback within
+  // Residual case, no new rule: under the attributed
+  // baseline and the lead-in window, level 3 shows no own feedback within
   // 100 ms, so the cancel follows (level 4). The controller then installs the
   // brake late: its samples (cursor restarted below the attributed baseline,
   // reference still moving) arrive after the cancel was sent, with the ACK
@@ -3299,9 +3376,9 @@ TEST(ParticipantStopStageHelperTest,
   ASSERT_TRUE(zero_source.has_value());
 }
 
-// --- Item 5 evidence (SX-210): not product behaviour ---------------------------
+// --- Proposed fallback rule evidence: not product behaviour --------------------
 //
-// The proposed narrow fallback rule (proposal 18) is NOT implemented in the
+// The proposed narrow fallback rule is NOT implemented in the
 // helper. `ProposedFallbackCancelFinish` below restates it in test code only,
 // so its counterexamples can be checked: when level 3 falls back to the
 // cancel, the cancel's switch baseline is the newest sample received before
@@ -3732,7 +3809,7 @@ void ExpectHardTakesOver(ActualCRun& run, const std::string& reason) {
   EXPECT_NEAR(brakes.front().trajectory.waypoints.front().positions_rad[0], run.c, 1e-10);
 }
 
-// ACTUAL-C (maintainer-approved): C < L keeps the unchanged law; C >= L
+// ACTUAL-C: C < L keeps the unchanged law; C >= L
 // (including C == L and the top of the eligible range, tau = C - L near
 // P(1 - f/2)) re-plans from source(C): first command source(C), no catch-up
 // against the source commands already issued, original spring-return target,
@@ -3897,7 +3974,7 @@ TEST(ParticipantStopStageHelperTest, ScheduledShortBrakeAndPastEndKeepTheWholeEx
       point.velocities_rad_s[0] *= speed;
     }
     world.helper->BindDispatchedGoal(goal, std::make_shared<ExecutionSampleAssociation>(
-        ExecutionBindingEpoch(1U), std::nullopt, world.clock.now()));
+        ExecutionBindingEpoch(1U), std::nullopt, world.clock.now()), TestCancelAttempt());
     world.Executing(kOriginal);
     const double cursor = speed == 0.0 ? 2.0 : 0.5;
     world.Sample(cursor, speed * cursor, speed);
@@ -3983,14 +4060,15 @@ TEST(ParticipantStopStageHelperTest, SourceOffsetSurvivesBindingRecordingAndAdop
     if (adopted) {
       ASSERT_TRUE(world.helper->ReserveReplacement(kOriginal));
       goal.key = kSecond;
-      world.helper->RecordReplacement(kSecond, goal.trajectory, association, 0.001);
+      world.helper->RecordReplacement(kSecond, goal.trajectory, association, 0.001,
+                                      TestCancelAttempt());
       world.port.FinishGoal(kOriginal, ExecutionGoalResult::kPreemptedBy, kSecond, world.clock.now());
       std::optional<StopStageDispatchedGoalDTO> candidate(goal);
       world.helper->AdoptReplacement(candidate);
       stage.controller_goal_generation = kSecond.controller_goal_generation;
       world.Executing(kSecond);
     } else {
-      world.helper->BindDispatchedGoal(goal, association);
+      world.helper->BindDispatchedGoal(goal, association, TestCancelAttempt());
     }
     world.Sample(0.002, 0.001, 1.0);  // bridge guard: planned offset must be retained
     ScriptBrake(world, adopted ? kThird : kSecond);
@@ -4193,7 +4271,7 @@ TEST(ParticipantStopStageHelperTest, SpringArrivalTargetSubtractsDeliveryOffsetO
     auto goal = Goal(stage);
     goal.planned_controller_offset_s = 0.02;
     world.helper->BindDispatchedGoal(goal, std::make_shared<ExecutionSampleAssociation>(
-        ExecutionBindingEpoch(1U), world.port.ReadSample(), world.clock.now()));
+        ExecutionBindingEpoch(1U), world.port.ReadSample(), world.clock.now()), TestCancelAttempt());
     world.Executing(kOriginal);
     world.clock.advance(5'000'000);
     world.Sample(0.52, 0.5, 1.0);

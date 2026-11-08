@@ -42,7 +42,7 @@ below.
   (UR10e + Robotiq 2F-140 baseline; there is no real UR lane yet).
 - `execution_state_source_mode: observed_robot` qualified end-to-end
   (controller-feedback freshness, tracking-tolerance envelope,
-  stop-completion timeout) per spec 240.
+  stop-completion timeout).
 - Re-enable controller-owned path/goal tolerance aborts (Isaac preview
   disables them; real robot must keep them on).
 - A readiness gate that probes the live controller before Execute, as
@@ -52,9 +52,8 @@ below.
 
 ## Fake-Controller Chaos Tests
 
-**Goal.** Cover the stop/reset race cases listed in spec 220 + the open
-points: stop before goal acceptance, stop before first feedback, stale
-goal result, controller never returns a result, repeated stop/reset
+**Goal.** Cover the stop/reset race cases: stop before goal acceptance,
+stop before first feedback, stale goal result, controller never returns a result, repeated stop/reset
 convergence, gripper action server hang.
 
 **Acceptance criteria.**
@@ -109,7 +108,7 @@ combination is release-qualified.
   measured capability profile.
 - Cumulative observed-vs-predicted drift diagnostic as a maintenance
   signal (deployment-declared rolling window + threshold).
-- Operational logging spec (spec 520) lands in production deployments
+- Operational logging lands in production deployments
   including assistant-mode audit envelopes.
 
 ## Fine-Tuning And Agentic Loop
@@ -131,7 +130,7 @@ The bar for calling ManyForge production-ready:
 1. The assistant `composer-assistant` mode hits ≥85% on the smoke
    corpus with the production recipe (77.3% before the 0.2.0 rework).
 1. Public-facing APIs (kernel state surfaces, deployment YAML schema,
-   assistant-provider contract) are versioned per spec 430 §schema and stable
+   assistant-provider contract) are versioned and stable
    enough that breaking changes are explicit major-release decisions, not
    silent patch-level behavior shifts.
 1. Keep generated REST, MCP, assistant-provider, and viewer contracts plus

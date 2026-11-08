@@ -43,7 +43,7 @@ class Client:
 
 
 def execution() -> dict[str, Any]:
-    return {'api_version': 'manyforge.execution_command_response.v1', 'command': 'observation',
+    return {'api_version': 'manyforge.execution_command_response.v4', 'command': 'observation',
             'ok': True, 'observation': {
                 'schema_version': 'manyforge.execution_observation.v4',
                 'owner_epoch': 'owner', 'cell_id': 'cell', 'retained_bundle_id': 'bundle',

@@ -621,7 +621,7 @@ class HeadlessHttpClient:
             body=body,
         )
 
-    # Component model v2 (CONTRACTS §1, §2, §5, §7, §10).
+    # Component model v2.
 
     @staticmethod
     def _path_identity(prefix: str, identity: str, suffix: str = "") -> str:
@@ -648,6 +648,26 @@ class HeadlessHttpClient:
             body={"action": action, "component_ids": list(component_ids)},
         )
 
+    def component_recovery_preflight(self, component_id: str) -> dict[str, Any]:
+        return self.request(
+            "GET",
+            self._path_identity("/api/components", component_id, "/recover-enable/preflight"),
+        )
+
+    def component_recover_enable(
+        self, component_id: str, confirmation: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            self._path_identity("/api/components", component_id, "/recover-enable"),
+            body=confirmation,
+        )
+
+    def component_recover_enable_group(self, targets: Sequence[Any]) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/components/recover-enable", body={"targets": list(targets)}
+        )
+
     def cell_latch(self) -> dict[str, Any]:
         return self.request("GET", "/api/cell/latch")
 
@@ -655,7 +675,7 @@ class HeadlessHttpClient:
         return self.request_array("/api/io")
 
     def set_io_output(self, signal_id: str, value: bool | float) -> dict[str, Any]:
-        # CONTRACTS §7: `signal_id` is `<component_id>/<signal_name>`.
+        # `signal_id` is `<component_id>/<signal_name>`.
         component_id, _, signal_name = signal_id.partition("/")
         return self.request(
             "POST",
@@ -755,6 +775,9 @@ class HeadlessHttpClient:
 
     def record_program_diagnostic(self, record: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/program/diagnostics", body=record)
+
+    def lookup_component_frame(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/program/component-frame-lookup", body=body)
 
     @staticmethod
     def _program_run_path(program_run_id: str) -> str:
@@ -1180,7 +1203,7 @@ class HeadlessHttpClient:
         else:
             params = tuple(
                 (key, normalized[key])
-                for key in ("component_role_id", "program_binding_id", "target_role_id")
+                for key in ("component_id", "program_binding_id", "command_target_id")
             )
         return self.request(
             "GET",

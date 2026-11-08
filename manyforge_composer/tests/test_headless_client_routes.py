@@ -55,7 +55,7 @@ def _binding_for_program(program: dict[str, Any]) -> dict[str, Any]:
         binding,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v2",
+        api_version="manyforge.program_binding.v3",
     )
     return binding
 
@@ -101,7 +101,7 @@ def _alarms() -> dict[str, Any]:
 
 def _execution_observation() -> dict[str, Any]:
     return {
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "command": "observation",
         "ok": True,
         "observation": {
@@ -165,7 +165,7 @@ def _program_run_status(*, state: str = "running") -> dict[str, Any]:
     digest_b = "sha256:" + "b" * 64
     digest_c = "sha256:" + "c" * 64
     return {
-        "schema_version": "manyforge.program_run_status.v3",
+        "schema_version": "manyforge.program_run_status.v4",
         "owner_id": "program-runner.cell-a",
         "owner_epoch": "program-runner.epoch.1",
         "run_revision": 1,
@@ -479,7 +479,7 @@ def headless_client() -> (
         elif path == "/api/program/runs" and request.method == "GET":
             active_only = request.url.params.get("active_only") == "true"
             payload = {
-                "schema_version": "manyforge.program_run_index.v1",
+                "schema_version": "manyforge.program_run_index.v2",
                 "owner_id": "program-runner.cell-a",
                 "owner_epoch": "program-runner.epoch.1",
                 "active_only": active_only,
@@ -537,7 +537,7 @@ def headless_client() -> (
                 json={
                     "error": {
                         "code": "kernel_owner_unavailable",
-                        "message": "returns at I6",
+                        "message": "kernel owner unavailable",
                     },
                     "ok": False,
                 },
@@ -545,7 +545,7 @@ def headless_client() -> (
             )
         elif path == "/api/manager/apply/acknowledge":
             payload = {
-                "api_version": "manyforge.manager_command_response.v1",
+                "api_version": "manyforge.manager_command_response.v2",
                 "apply_generation": int(request.url.params["apply_generation"]),
                 "apply_id": request.url.params["apply_id"],
                 "failure_acknowledgement": "acknowledged",
@@ -558,13 +558,13 @@ def headless_client() -> (
             "/api/execution/runtime-scale-control",
         } or path.startswith("/api/execution/operations/"):
             payload = {
-                "api_version": "manyforge.execution_command_response.v1",
+                "api_version": "manyforge.execution_command_response.v4",
                 "ok": True,
                 "operation": {"operation_id": "operation-1"},
             }
         elif path == "/api/execution/manual-handover":
             payload = {
-                "api_version": "manyforge.execution_command_response.v1",
+                "api_version": "manyforge.execution_command_response.v4",
                 "command": "read_manual_handover",
                 "ok": True,
                 "request_id": body["request_context"]["request_id"],
@@ -581,7 +581,7 @@ def headless_client() -> (
             "/api/execution/capability-command-previews",
         }:
             payload = {
-                "api_version": "manyforge.execution_command_response.v1",
+                "api_version": "manyforge.execution_command_response.v4",
                 "command": (
                     "preview_motion"
                     if path.endswith("motion-previews")
@@ -595,7 +595,7 @@ def headless_client() -> (
                 return httpx.Response(
                     404,
                     json={
-                        "api_version": "manyforge.manager_command_response.v1",
+                        "api_version": "manyforge.manager_command_response.v2",
                         "committed_projection_revision": None,
                         "error": {
                             "code": "object_not_found",
@@ -615,7 +615,7 @@ def headless_client() -> (
                     request=request,
                 )
             payload = {
-                "api_version": "manyforge.manager_command_response.v1",
+                "api_version": "manyforge.manager_command_response.v2",
                 "committed_projection_revision": {
                     "retained_bundle_id": "sha256:" + "b" * 64,
                     "graph_revision": "sha256:" + "c" * 64,
@@ -835,12 +835,12 @@ def test_headless_http_client_rejects_rehashed_malformed_binding_ingress() -> No
         "program_revision": "sha256:" + "a" * 64,
     }
     binding = _binding_for_program(program)
-    binding["target_role_bindings"][0]["frame_role_bindings"][0]["unknown"] = True
+    binding["target_bindings"][0]["frame_references"][0]["unknown"] = True
     binding["program_binding_id"] = compute_content_identity(
         binding,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v2",
+        api_version="manyforge.program_binding.v3",
     )
     projection = {
         "program_binding": binding,
@@ -874,12 +874,12 @@ def test_composer_passes_a_run_failure_record_through_unchanged() -> None:
         "tree_status": "failure",
         "node_statuses": {"root": "failure"},
         "reason_code": "owner_request_failed",
-        "message": "frame role tool0 is not available",
+        "message": "frame tool0 is not available",
         "details": {
-            "reason": "frame_role_unresolved",
-            "reference_type": "frame_role",
+            "reason": "frame_unresolved",
+            "reference_type": "component_frame",
             "reference_id": "tool0",
-            "target_role_id": "arm",
+            "component_id": "arm",
         },
         "origin": {
             "kind": "owner",
@@ -1063,7 +1063,7 @@ def test_composer_program_routes_forward_when_draft_matches_applied(
         "scenario_id": "cell-pick",
         "source_document_digest": digest_a,
         "expected_applied_record_digest": "sha256:" + "b" * 64,
-        # Q128: Run carries no admission generation; the server uses its current one.
+        # Run carries no admission generation; the server uses its current one.
     }
     stop = {
         "request_id": "request.program.2",
@@ -1234,8 +1234,8 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         "request_context": context,
         "selector": {
             "program_binding_id": "binding-1",
-            "component_role_id": "robot",
-            "target_role_id": "arm",
+            "component_id": "robot",
+            "command_target_id": "arm",
         },
         "expected_control_generation": 0,
         "scale": 0.5,
@@ -1277,8 +1277,8 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
                 params={
                     "program_binding_id": "binding-1",
                     "group_targets": (
-                        '[{"component_role_id":"robot-a","target_role_id":"arm"},'
-                        '{"component_role_id":"robot-b","target_role_id":"arm"}]'
+                        '[{"component_id":"robot-a","command_target_id":"arm"},'
+                        '{"component_id":"robot-b","command_target_id":"arm"}]'
                     ),
                 },
             ).status_code
@@ -1290,16 +1290,16 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
                 params={
                     "program_binding_id": "binding-1",
                     "group_targets": (
-                        '[{"component_role_id":"robot","component_role_id":"other",'
-                        '"target_role_id":"arm"}]'
+                        '[{"component_id":"robot","component_id":"other",'
+                        '"command_target_id":"arm"}]'
                     ),
                 },
             ).status_code
             == 422
         )
         valid_group = (
-            '[{"component_role_id":"robot-a","target_role_id":"arm"},'
-            '{"component_role_id":"robot-b","target_role_id":"arm"}]'
+            '[{"component_id":"robot-a","command_target_id":"arm"},'
+            '{"component_id":"robot-b","command_target_id":"arm"}]'
         )
         assert (
             composer.get(
@@ -1312,11 +1312,11 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
             ).status_code
             == 422
         )
-        for key in ("program_binding_id", "component_role_id", "target_role_id"):
+        for key in ("program_binding_id", "component_id", "command_target_id"):
             params = [
                 ("program_binding_id", "binding-1"),
-                ("component_role_id", "robot"),
-                ("target_role_id", "arm"),
+                ("component_id", "robot"),
+                ("command_target_id", "arm"),
                 (key, "first"),
                 (key, "last"),
             ]
@@ -1367,8 +1367,8 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
     assert json.loads(
         dict(parse_qsl(forwarded[6]["query"]))["group_targets"]
     ) == [
-        {"component_role_id": "robot-a", "target_role_id": "arm"},
-        {"component_role_id": "robot-b", "target_role_id": "arm"},
+        {"component_id": "robot-a", "command_target_id": "arm"},
+        {"component_id": "robot-b", "command_target_id": "arm"},
     ]
 
 
@@ -1463,8 +1463,10 @@ def test_composer_preview_and_handover_routes_are_strict_stateless_forwarders(
         },
         "participants": [
             {
-                "component_role_id": "controlled_component",
-                "target_role_id": "command_target",
+                "target": {
+                    "component_id": "controlled_component",
+                    "command_target_id": "command_target",
+                },
                 "required_capability_id": "tool.gripper.command",
                 "action_span": None,
                 "payload": {
@@ -1497,7 +1499,7 @@ def test_composer_preview_and_handover_routes_are_strict_stateless_forwarders(
     assert response.json()["command"] == command
     if command == "read_manual_handover":
         assert response.json() == {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": command,
             "ok": True,
             "request_id": body["request_context"]["request_id"],
@@ -1669,7 +1671,7 @@ def test_composer_rejects_draft_and_save_during_an_active_run(
             assert active_only is True
             assert limit == 1
             return {
-                "schema_version": "manyforge.program_run_index.v1",
+                "schema_version": "manyforge.program_run_index.v2",
                 "owner_id": "program-runner.cell-a",
                 "owner_epoch": "program-runner.epoch.1",
                 "active_only": True,
@@ -1870,7 +1872,7 @@ def test_composer_preserves_complete_scene_rejection(
         response = composer.post("/api/scene/transactions", json=body)
     assert response.status_code == 404
     assert response.json() == {
-        "api_version": "manyforge.manager_command_response.v1",
+        "api_version": "manyforge.manager_command_response.v2",
         "committed_projection_revision": None,
         "error": {
             "code": "object_not_found",
@@ -2118,7 +2120,7 @@ def test_composer_forwards_the_node_correction_preview_as_a_strict_query(
         )
         # The browser cannot name a binding, robot or capability.
         foreign = composer.post(
-            path, json={**body, "target_role_id": "other_arm"}
+            path, json={**body, "command_target_id": "other_arm"}
         )
 
     assert response.status_code == 200, response.text
@@ -2266,3 +2268,126 @@ def test_close_runtime_detach_still_rejects_native_authoring_fences(headless_cli
         response = composer.post("/api/scene/transactions", json=body)
         assert response.status_code == 422, response.text
         assert not [request for request in requests if request["path"] == "/api/scene/transactions"]
+
+
+@pytest.mark.parametrize("diagnostic", [None, {
+    "schema_version": "manyforge.motion_preview_diagnostic.v2", "kind": "validated_path", "reason": "validation_collision",
+    "source_joint_names": ["joint1"],
+    "pairs": [{"body_a": "component/arm/model/arm/body/link/collision/0",
+               "body_b": "scene/wall/shape/0"}],
+    "samples": [{"time_from_start_s": 0.0, "positions_rad": [0.0],
+                 "contacts": [{"pair_index": 0, "disposition": "unknown"}], "status": "unknown", "clearance_violations": []}],
+}])
+def test_composer_motion_preview_preserves_only_valid_failure_diagnostic(diagnostic) -> None:
+    from types import SimpleNamespace
+    from fastapi import HTTPException
+
+    class Client:
+        def preview_motion(self, body):
+            assert body["participants"][0]["payload"]["motion"]["joint_names"] == ["joint1"]
+            response = {"api_version": "manyforge.execution_command_response.v4", "ok": False,
+                        "error": {"code": "validation_collision", "message": "collision", "details": {"reason": "contact"}}}
+            if diagnostic is not None:
+                response["diagnostic_preview"] = diagnostic
+            raise HeadlessClientError("validation_collision", "collision", 422,
+                                      details={"reason": "contact"}, response=response)
+
+    router = create_headless_router(Client(), SimpleNamespace(), object())
+    endpoint = next(route.endpoint for route in router.routes if route.path == "/api/execution/motion-previews")
+    body = SimpleNamespace(model_dump=lambda **_kwargs: {"participants": [{"payload": {"motion": {"kind": "joint_goal", "joint_names": ["joint1"]}}}]})
+    with pytest.raises(HTTPException) as raised:
+        endpoint(body)
+    assert raised.value.status_code == 422
+    detail = raised.value.detail
+    assert {k: detail[k] for k in ("code", "message", "details", "producer")} == {
+        "code": "validation_collision", "message": "collision", "details": {"reason": "contact"}, "producer": "headless_api"}
+    if diagnostic is None:
+        assert "diagnostic_preview" not in detail
+    else:
+        assert detail["diagnostic_preview"] == diagnostic
+    assert "preview_receipt" not in detail and "token" not in detail
+
+
+def test_composer_motion_preview_omits_forged_diagnostic_without_changing_failure() -> None:
+    from types import SimpleNamespace
+    from fastapi import HTTPException
+    diagnostic = {"source_joint_names": ["joint1"], "pairs": [],
+                  "samples": [{"time_from_start_s": 0.0, "positions_rad": [0.0], "contacts": [], "status": "unknown"}],
+                  "receipt_digest": "forged"}
+    class Client:
+        def preview_motion(self, _body):
+            raise HeadlessClientError("validation_collision", "collision", 409,
+                response={"ok": False, "error": {"code": "validation_collision"}, "diagnostic_preview": diagnostic})
+    router = create_headless_router(Client(), SimpleNamespace(), object())
+    endpoint = next(route.endpoint for route in router.routes if route.path == "/api/execution/motion-previews")
+    with pytest.raises(HTTPException) as raised:
+        endpoint(SimpleNamespace(model_dump=lambda **_kwargs: {"participants": [{"payload": {"motion": {"kind": "joint_goal", "joint_names": ["joint1"]}}}]}))
+    assert raised.value.status_code == 409
+    assert raised.value.detail["code"] == "validation_collision"
+    assert "diagnostic_preview" not in raised.value.detail
+
+
+def test_composer_motion_preview_http_envelope_preserves_refusal() -> None:
+    from types import SimpleNamespace
+    from manyforge_headless_api.tests.test_execution_events import _bounded_diagnostic, _direct_motion_request
+
+    diagnostic = _bounded_diagnostic()
+    class Client:
+        def preview_motion(self, _body):
+            raise HeadlessClientError("validation_collision", "collision", 409,
+                details={"reason": "contact"}, response={"ok": False,
+                    "error": {"code": "validation_collision"}, "diagnostic_preview": diagnostic})
+    app = FastAPI()
+    app.include_router(create_headless_router(Client(), SimpleNamespace(), object()))
+    with TestClient(app) as client:
+        response = client.post("/api/execution/motion-previews", json=_direct_motion_request().model_dump(mode="json"))
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "validation_collision", "details": {"reason": "contact"},
+                                          "message": "collision", "producer": "headless_api", "diagnostic_preview": diagnostic}}
+
+
+@pytest.mark.parametrize("character", ["x", "é"])
+def test_composer_motion_preview_limits_final_utf8_envelope(character) -> None:
+    from fastapi.responses import JSONResponse
+    from manyforge_headless_api.execution import MOTION_PATH_PREVIEW_MAX_BYTES, _canonical_json
+    from manyforge_headless_api.tests.test_execution_events import _bounded_diagnostic, _direct_motion_request
+
+    diagnostic = _bounded_diagnostic()
+    native_error = {"code": "validation_collision"}
+    details = {"reason": "contact"}
+
+    def envelopes(length):
+        diagnostic["pairs"][0]["body_b"] = "scene/" + character * length + "/shape/0"
+        upstream = {"ok": False, "error": native_error, "diagnostic_preview": diagnostic}
+        translated = {"detail": {"code": "validation_collision", "details": details,
+                                  "message": "collision", "producer": "headless_api",
+                                  "diagnostic_preview": diagnostic}}
+        return upstream, translated
+
+    # Find a real UTF-8 boundary: the native response fits, but the final
+    # FastAPI envelope including the optional evidence exceeds the limit.
+    low, high = 0, MOTION_PATH_PREVIEW_MAX_BYTES
+    while low < high:
+        middle = (low + high + 1) // 2
+        upstream, _ = envelopes(middle)
+        if len(_canonical_json(upstream)) <= MOTION_PATH_PREVIEW_MAX_BYTES:
+            low = middle
+        else:
+            high = middle - 1
+    upstream, translated = envelopes(low)
+    assert len(_canonical_json(upstream)) <= MOTION_PATH_PREVIEW_MAX_BYTES
+    assert len(JSONResponse(content=translated).body) > MOTION_PATH_PREVIEW_MAX_BYTES
+
+    class Client:
+        def preview_motion(self, _body):
+            raise HeadlessClientError("validation_collision", "collision", 409,
+                                      details=details, response=upstream)
+
+    from types import SimpleNamespace
+    app = FastAPI()
+    app.include_router(create_headless_router(Client(), SimpleNamespace(), object()))
+    with TestClient(app) as client:
+        response = client.post("/api/execution/motion-previews", json=_direct_motion_request().model_dump(mode="json"))
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "validation_collision", "details": details,
+                                           "message": "collision", "producer": "headless_api"}}

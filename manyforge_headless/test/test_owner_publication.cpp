@@ -393,7 +393,7 @@ TEST(ManagerSourcePublication, VerifiedNonemptyProductIsNotCanonicalEmpty) {
   ASSERT_NE(canonical_empty, nullptr);
   ASSERT_TRUE(canonical_empty->is_bool());
   EXPECT_FALSE(canonical_empty->as_bool());
-  // CP8 step 1: the deployment-derived simulator row of each ROS-hosted
+  // The deployment-derived simulator row of each ROS-hosted
   // component travels with the active graph without changing its identity.
   const auto *const dependencies = payload.find_object_member("active")->find_object_member(
       "component_simulator_dependencies");

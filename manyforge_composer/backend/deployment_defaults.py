@@ -1,4 +1,4 @@
-"""Deployment defaults: the backend is their only owner (CONTRACTS §11).
+"""Deployment defaults: the backend is their only owner.
 
 A defaulted field may be absent from the Deployment document; its effective
 value is then the default here. ``GET /api/deployment/effective`` reports each
@@ -42,7 +42,7 @@ SENSOR_POINTCLOUD_DEFAULTS: dict[str, Any] = {
     "max_points": 200000,
     "minimum_period_s": 0.1,
 }
-# Per global interrupt rule (CONTRACTS §8); optional in the compiled schema.
+# Per global interrupt rule; optional in the compiled schema.
 RULE_DEFAULTS: dict[str, Any] = {"active_at_start": False}
 # Per rule with `on_trip: stop` only.
 STOP_RULE_DEFAULTS: dict[str, Any] = {"after_stop": "hold"}

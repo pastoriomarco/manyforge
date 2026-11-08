@@ -17,6 +17,8 @@
 
 namespace manyforge::deployment {
 
+class ICatalogArtifactSource;
+
 inline constexpr std::size_t kMaxDurableProgramBindingCount = 4096U;
 inline constexpr std::uint64_t kMaxDurableProgramBindingBytes =
     512ULL * 1024ULL * 1024ULL;
@@ -81,7 +83,8 @@ class ProgramBinding final {
 [[nodiscard]] std::shared_ptr<const ProgramBinding>
 reload_verified_program_binding(
     std::string_view canonical_bytes, const RetainedBundle& retained_bundle,
-    const VerifiedRetainedModelMap& retained_model_map);
+    const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactSource& catalog_source);
 
 /// Re-run the complete intrinsic identity proof over an already sealed
 /// binding. This does not replace contextual bundle/model-map verification.
@@ -89,7 +92,7 @@ reload_verified_program_binding(
     const ProgramBinding& binding) noexcept;
 
 /// The target's own frame row for one frame role; null when absent or
-/// ambiguous. Every frame has one name: there is no `tcp` alias (C-RQ8), so
+/// ambiguous. Every frame has one name: there is no `tcp` alias, so
 /// `{arm, tcp}` is the arm target's own `tcp` frame, if it has one.
 [[nodiscard]] const CompositionTargetFrameResolution* find_target_frame_role(
     const CompositionTargetResolution& target, const core::FrameRoleId& role);
@@ -106,7 +109,8 @@ class IProgramBindingSource {
   [[nodiscard]] virtual std::shared_ptr<const ProgramBinding> get_verified(
       const core::ProgramBindingId& program_binding_id,
       const RetainedBundle& retained_bundle,
-      const VerifiedRetainedModelMap& retained_model_map) const = 0;
+      const VerifiedRetainedModelMap& retained_model_map,
+      const ICatalogArtifactSource& catalog_source) const = 0;
 };
 
 /// Immutable Program-Binding publication and read port.
@@ -117,7 +121,8 @@ class IProgramBindingRepository : public IProgramBindingSource {
   [[nodiscard]] virtual bool put_if_absent(
       std::shared_ptr<const ProgramBinding> binding,
       const RetainedBundle& retained_bundle,
-      const VerifiedRetainedModelMap& retained_model_map) = 0;
+      const VerifiedRetainedModelMap& retained_model_map,
+      const ICatalogArtifactSource& catalog_source) = 0;
 };
 
 /// Get-only Program-Binding source below one immutable package root.
@@ -132,7 +137,8 @@ class FilesystemVerifiedProgramBindingSource final
   [[nodiscard]] std::shared_ptr<const ProgramBinding> get_verified(
       const core::ProgramBindingId& program_binding_id,
       const RetainedBundle& retained_bundle,
-      const VerifiedRetainedModelMap& retained_model_map) const override;
+      const VerifiedRetainedModelMap& retained_model_map,
+      const ICatalogArtifactSource& catalog_source) const override;
 
  private:
   std::filesystem::path trusted_package_root_;
@@ -168,12 +174,14 @@ class FilesystemProgramBindingRepository final
   [[nodiscard]] bool put_if_absent(
       std::shared_ptr<const ProgramBinding> binding,
       const RetainedBundle& retained_bundle,
-      const VerifiedRetainedModelMap& retained_model_map) override;
+      const VerifiedRetainedModelMap& retained_model_map,
+      const ICatalogArtifactSource& catalog_source) override;
 
   [[nodiscard]] std::shared_ptr<const ProgramBinding> get_verified(
       const core::ProgramBindingId& program_binding_id,
       const RetainedBundle& retained_bundle,
-      const VerifiedRetainedModelMap& retained_model_map) const override;
+      const VerifiedRetainedModelMap& retained_model_map,
+      const ICatalogArtifactSource& catalog_source) const override;
 
   [[nodiscard]] std::size_t size() const;
   [[nodiscard]] std::uint64_t retained_bytes() const;

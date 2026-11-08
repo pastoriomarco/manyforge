@@ -89,7 +89,7 @@ def project_execution_observation(
     error = response.get("error")
     if (
         set(response) == {"api_version", "error", "ok"}
-        and response.get("api_version") == "manyforge.execution_command_response.v1"
+        and response.get("api_version") == "manyforge.execution_command_response.v4"
         and response.get("ok") is False
         and isinstance(error, dict)
         and isinstance(error.get("code"), str)
@@ -100,7 +100,7 @@ def project_execution_observation(
         # it is not a malformed envelope.
         raise ExecutionObservationOwnerRefused(error["code"], error["message"])
     if set(response) != {"api_version", "command", "observation", "ok"} or (
-        response.get("api_version") != "manyforge.execution_command_response.v1"
+        response.get("api_version") != "manyforge.execution_command_response.v4"
         or response.get("command") != "observation"
         or response.get("ok") is not True
     ):
@@ -127,7 +127,7 @@ def project_execution_observation(
             "execution observation schema is unsupported"
         )
     raw_targets = observed.get("targets")
-    # H1a-IF.2: a cell may have no observable coordinate at all.
+    # A cell may have no observable coordinate at all.
     if not isinstance(raw_targets, list) or len(raw_targets) > 64:
         raise ExecutionObservationProjectionError(
             "observation targets must contain 0..64 entries"

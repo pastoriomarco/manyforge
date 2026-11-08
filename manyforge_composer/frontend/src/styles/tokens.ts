@@ -38,7 +38,7 @@ export type ProgramCategoryFamily =
   | 'world'
   | 'logic';
 
-/** UI6-I-VC D3: each catalog category belongs to one of five families. */
+/** Each catalog category belongs to one of five families. */
 export const CATEGORY_FAMILIES: Readonly<Record<string, ProgramCategoryFamily>> = {
   control_flow: 'execution_control',
   recovery: 'execution_control',
@@ -68,11 +68,12 @@ export const CANVAS_COLORS = {
 } as const;
 
 /**
- * 3D viewport palette. Preview colours follow spec 450: cyan current receipt,
+ * 3D viewport palette. Preview colours: cyan current receipt,
  * amber stale/pending/unvalidated, red rejected target.
  */
 export const VIEWPORT_COLORS = {
   background: '#081019',
+  noEmissive: '#000000',
   hemisphereSky: '#dbeaff',
   hemisphereGround: '#121d27',
   gridCell: '#243341',
@@ -106,6 +107,7 @@ export const VIEWPORT_COLORS = {
 
 /** CSS custom properties that must hold the same values (tokens.test.ts). */
 export const CSS_SHARED_TOKENS: Readonly<Record<string, string>> = {
+  '--mf-bg-neutral-00': VIEWPORT_COLORS.noEmissive,
   '--mf-status-idle': STATUS_COLORS.idle,
   '--mf-status-running': STATUS_COLORS.running,
   '--mf-status-held': STATUS_COLORS.held,

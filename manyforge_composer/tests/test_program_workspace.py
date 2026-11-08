@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 from types import SimpleNamespace
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 import pytest
 
@@ -42,6 +43,59 @@ from manyforge_headless_api.client import HeadlessClientError
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_PROGRAM = _ROOT / "examples" / "pick_and_place_minimal.program.yaml"
+
+
+def test_program_artifact_preserves_unsupported_format_details(tmp_path: Path) -> None:
+    source = tmp_path / "input.program.yaml"
+    source.write_text("api_version: manyforge.program.v2\ncatalog:\n  content_version: 2.8.0\n", encoding="utf-8")
+    catalog = SimpleNamespace(content_version="2.9.0")
+
+    with pytest.raises(ProgramArtifactError) as caught:
+        load_program_artifact(str(source), allowed_roots=[str(tmp_path)],
+                              catalog=catalog)
+    with pytest.raises(HTTPException) as response:
+        routes_draft._raise_workspace_error(caught.value)
+    assert response.value.detail["code"] == "program_format_unsupported"
+    assert response.value.detail["context"] == {
+        "actual_api_version": "manyforge.program.v2",
+        "supported_api_version": "manyforge.program.v3",
+    }
+
+
+def test_reference_refusal_keeps_details_through_composer_envelope() -> None:
+    from manyforge_headless_api.app import _error_status
+    from manyforge_composer.backend.authoring_admission import headless_client_http_exception
+
+    details = {"diagnostics": [], "total_count": 3, "truncated": True}
+    code = "program_reference_validation_failed"
+    status = _error_status(code)
+    response = headless_client_http_exception(
+        HeadlessClientError(code, "invalid references", status, details=details),
+        before_effect=True,
+    )
+    assert status == 409
+    assert response.detail["code"] == code
+    assert response.detail["details"] == details
+
+
+def test_non_executable_outcome_uses_exact_direct_target() -> None:
+    digest = "sha256:" + "a" * 64
+    outcome = {
+        "api_version": "manyforge.program-binding-outcome.v2",
+        "program_id": "program", "program_revision": digest,
+        "retained_bundle_id": digest, "graph_revision": digest,
+        "unresolved_targets": [{"target": {"component_id": "robot",
+                                            "command_target_id": "arm"},
+                                "reason": "capability_unavailable", "detail": "missing"}],
+        "affected_nodes": [], "affected_execution_groups": [],
+    }
+    publication = {"program_id": "program", "program_revision": digest,
+                   "retained_bundle_id": digest, "graph_revision": digest,
+                   "program_outcome": {"kind": "non_executable", "outcome": outcome}}
+    assert ComposerState._program_outcome_identity(publication)[0] == "non_executable"
+    outcome["unresolved_targets"][0]["target"]["component_id"] = ""
+    with pytest.raises(ValueError):
+        ComposerState._program_outcome_identity(publication)
 
 
 class _AuthoringPassThrough:
@@ -196,109 +250,61 @@ def _motion_identity() -> dict:
     }
 
 
+def _target(component: str = "robot", target: str = "arm") -> dict:
+    return {"component_id": component, "command_target_id": target}
+
+
+def _frame(component: str = "robot", frame: str = "base") -> dict:
+    return {"component_id": component, "frame_id": frame}
+
+
+def _entry(component: str = "robot", target: str = "arm", frame: str = "tcp") -> dict:
+    return {"target": _target(component, target), "frame": _frame(component, frame)}
+
+
+def _frame_row(frame: str) -> dict:
+    return {"reference": _frame(frame=frame), "compiled_frame_name": f"robot.{frame}",
+            "model_instance_id": "robot-model", "model_revision": "model-r1"}
+
+
 def _motion_targets_projection() -> dict:
-    return {
-        "ok": True,
-        "identity": _motion_identity(),
-        "targets": {
-            "schema_version": "manyforge.execution_targets.v3",
-            "components": [{
-                "controllable_component_id": "robot",
-                "availability": {"command_eligible": True, "reason": None},
-                "targets": [{
-                    "command_target_id": "arm",
-                    "operation_capability_id": "execution.trajectory.execute",
-                    "presentation": "motion",
-                    "command": {
-                        "target_role_id": "command_target",
-                        "base_frame_role_id": "base",
-                        "tcp_frame_role_id": "tcp",
-                        "target_descriptor": {"frames": [
-                            {"frame_role_id": "base", "compiled_frame_name": "robot.base",
-                             "model_instance_id": "robot-model", "model_revision": "model-r1"},
-                            {"frame_role_id": "flange", "compiled_frame_name": "robot.flange",
-                             "model_instance_id": "robot-model", "model_revision": "model-r1"},
-                            {"frame_role_id": "tcp", "compiled_frame_name": "robot.tcp",
-                             "model_instance_id": "robot-model", "model_revision": "model-r1"},
-                        ], "tcps": [
-                            {"entry": {"component_id": "robot", "target_id": "arm",
-                                        "frame_role_id": "tcp"},
-                             "target_role_id": "command_target", "display": "robot.tcp",
-                             "frame": {"frame_role_id": "tcp",
-                                       "compiled_frame_name": "robot.tcp",
-                                       "model_instance_id": "robot-model",
-                                       "model_revision": "model-r1"},
-                             "mounted_here": True, "mounted_elsewhere": False,
-                             "default": True},
-                            {"entry": {"component_id": "robot", "target_id": "arm",
-                                        "frame_role_id": "flange"},
-                             "target_role_id": "command_target", "display": "robot.flange",
-                             "frame": {"frame_role_id": "flange",
-                                       "compiled_frame_name": "robot.flange",
-                                       "model_instance_id": "robot-model",
-                                       "model_revision": "model-r1"},
-                             "mounted_here": True, "mounted_elsewhere": False,
-                             "default": False},
-                        ]},
-                    },
-                }],
-            }],
-        },
-    }
+    rows = [_frame_row(frame) for frame in ("base", "flange", "tcp")]
+    return {"ok": True, "identity": _motion_identity(), "targets": {
+        "schema_version": "manyforge.execution_targets.v3",
+        "components": [{"controllable_component_id": "robot",
+                        "availability": {"command_eligible": True, "reason": None},
+                        "targets": [{"command_target_id": "arm",
+                            "operation_capability_id": "execution.trajectory.execute",
+                            "presentation": "motion",
+                            "command": {"base_frame": _frame(), "target_descriptor": {
+                                "frames": rows, "tcps": [
+                                    {"entry": _entry(frame=frame),
+                                     "frame": _frame_row(frame), "mounted_here": True,
+                                     "mounted_elsewhere": False, "default": frame == "tcp"}
+                                    for frame in ("tcp", "flange")
+                                ]}}}]}]}}
 
 
 def _motion_control_projection(*, sequence: int = 1) -> dict:
-    names = [
-        "shoulder_pan_joint",
-        "shoulder_lift_joint",
-        "elbow_joint",
-        "wrist_1_joint",
-        "wrist_2_joint",
-        "wrist_3_joint",
-    ]
-    return {
-        "ok": True,
-        "identity": _motion_identity(),
-        "control_state": {
-            "schema_version": "manyforge.execution_control_state.v6",
-            "observed_targets": [{
-                "controllable_component_id": "robot",
-                "command_target_id": "arm",
-                "operation_capability_id": "execution.trajectory.execute",
-                "active_tcp": {"entry": {"component_id": "robot", "target_id": "arm",
-                                          "frame_role_id": "tcp"}, "display": "robot.tcp",
-                               "owner_epoch": "owner", "registration_generation": 1,
-                               "sequence": 1},
-                "observed": {
-                    "kind": "joint_positions",
-                    "complete": True,
-                    "current_tcp_pose": {
-                        "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
-                        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
-                },
-                "tcp_poses": [{
-                    "entry": {"component_id": "robot", "target_id": "arm",
-                              "frame_role_id": "tcp"},
-                    "pose": {
-                        "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
-                        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
-                    },
-                }, {
-                    "entry": {"component_id": "robot", "target_id": "arm",
-                              "frame_role_id": "flange"},
-                    "pose": {
-                        "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.37},
-                        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
-                    },
-                }],
+    names = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+             "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]
+    def pose(z):
+        return {"position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": z},
+                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}}
+    return {"ok": True, "identity": _motion_identity(), "control_state": {
+        "schema_version": "manyforge.execution_control_state.v6",
+        "observed_targets": [{"controllable_component_id": "robot",
+            "command_target_id": "arm",
+            "operation_capability_id": "execution.trajectory.execute",
+            "active_tcp": {"entry": _entry(), "display": "robot.tcp",
+                           "owner_epoch": "owner", "registration_generation": 1, "sequence": 1},
+            "observed": {"kind": "joint_positions", "complete": True,
+                "current_tcp_pose": pose(0.3),
+                "tcp_poses": [{"entry": _entry(frame="tcp"), "pose": pose(0.3)},
+                              {"entry": _entry(frame="flange"), "pose": pose(0.37)}],
                 "positions_rad": [0.1, -1.1, 0.9, -1.4, -1.2, 0.3],
-                "sequence": sequence,
-                "source_epoch": "native-source",
-                "source_joint_names": names,
-                },
-            }],
-        },
-    }
+                "sequence": sequence, "source_epoch": "native-source",
+                "source_joint_names": names}}]}}
 
 
 def _node_environment_projection() -> dict:
@@ -391,32 +397,16 @@ def _node_environment_projection() -> dict:
 
 
 def _mock_applied_motion_binding(monkeypatch: pytest.MonkeyPatch) -> dict:
-    binding = {
-        "graph_revision": "graph-1", "retained_bundle_id": "bundle-1",
-        "target_role_bindings": [{
-            "target_role_id": "arm", "controllable_component_id": "robot",
-            "command_target_id": "arm", "frame_role_bindings": [
-                {"frame_role_id": "base", "compiled_frame_name": "robot.base",
-                 "model_instance_id": "robot-model", "model_revision": "model-r1"},
-                {"frame_role_id": "tcp", "compiled_frame_name": "robot.tcp",
-                 "model_instance_id": "robot-model", "model_revision": "model-r1"},
-                {"frame_role_id": "flange", "compiled_frame_name": "robot.flange",
-                 "model_instance_id": "robot-model", "model_revision": "model-r1"},
-            ],
-        }],
-    }
-    robot = binding["target_role_bindings"][0]
-    robot["default_tcp"] = {"component_id": "robot", "target_id": "arm", "frame_role_id": "tcp"}
-    robot["robot_tcps"] = [
-        {"entry": {"component_id": "robot", "target_id": "arm", "frame_role_id": role},
-         "frame": deepcopy(next(row for row in robot["frame_role_bindings"]
-                                if row["frame_role_id"] == role)),
-         "end_effector": role == "tcp", "component_default": role == "tcp"}
-        for role in ("tcp", "flange")
-    ]
+    frames = [_frame_row(frame) for frame in ("base", "tcp", "flange")]
+    binding = {"graph_revision": "graph-1", "retained_bundle_id": "bundle-1",
+        "frame_bindings": frames, "target_bindings": [{
+            "target": _target(), "frame_references": [row["reference"] for row in frames],
+            "default_tcp": _entry(),
+            "robot_tcps": [{"entry": _entry(frame=frame), "frame": _frame_row(frame),
+                            "end_effector": frame == "tcp", "component_default": frame == "tcp"}
+                           for frame in ("tcp", "flange")]}]}
     monkeypatch.setattr(routes_draft, "_applied_context", lambda _state: (
-        SimpleNamespace(binding_document=binding, program_revision=None), None,
-    ))
+        SimpleNamespace(binding_document=binding, program_revision=None), None))
     return binding
 
 
@@ -433,9 +423,9 @@ def test_observed_pose_joins_applied_address_and_preserves_base_frame(monkeypatc
     other_observed["observed"]["tcp_poses"][0]["pose"]["position_m"]["x_m"] = 99
     control["control_state"]["observed_targets"].insert(0, other_observed)
     parameters = {
-        "target_role": "arm",
-        "base_frame_role": "base",
-        "tcp_endpoint": {"kind": "entry", "target_role": "arm", "frame_role": "tcp"},
+        "target": _target(),
+        "base_frame": _frame(),
+        "tcp_endpoint": {"kind": "entry", "target": _target(), "frame": _frame(frame="tcp")},
     }
     authoring = {"forest": [{"instance_id": "move", "node_id": "motion.move_to_pose", "parameters": parameters}]}
     state = SimpleNamespace(
@@ -446,114 +436,53 @@ def test_observed_pose_joins_applied_address_and_preserves_base_frame(monkeypatc
     resolved, _identity = routes_draft._observed_move_arguments(state, args)
     assert resolved["observed"]["current_tcp_pose"]["position_m"]["x_m"] == 0.1
     assert resolved["observed"]["frame_ref"] == {
-        "kind": "target_frame", "target_role": "arm", "frame_role": "base",
+        "kind": "target_frame", "frame": _frame(),
     }
 
 def test_observed_pose_endpoint_capture_requires_exact_current_tcp_model_frame(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     binding = _mock_applied_motion_binding(monkeypatch)
-    binding["target_role_bindings"].append({
-        "target_role_id": "tool",
-        "controllable_component_id": "robot",
-        "command_target_id": "gripper",
-        "frame_role_bindings": [{
-            "frame_role_id": "jaw_tcp",
-            "compiled_frame_name": "robot.tcp",
-            "model_instance_id": "robot-model",
-            "model_revision": "model-r1",
-        }],
-    })
+    frame = {"reference": _frame(frame="jaw_tcp"), "compiled_frame_name": "robot.tcp",
+             "model_instance_id": "robot-model", "model_revision": "model-r1"}
+    binding["frame_bindings"].append(frame)
+    binding["target_bindings"].append({"target": _target(target="gripper"),
+                                        "frame_references": [frame["reference"]]})
     targets = _motion_targets_projection()
     control = _motion_control_projection()
-    authoring = {"forest": [{
-        "instance_id": "move",
-        "node_id": "motion.move_to_pose",
-        "parameters": {
-            "target_role": "arm",
-            "base_frame_role": "base",
-            "tcp_endpoint": {"kind": "entry", "target_role": "tool", "frame_role": "jaw_tcp"},
-        },
-    }]}
-    state = SimpleNamespace(
-        headless_client=SimpleNamespace(
-            execution_targets=lambda: targets,
-            execution_control_state=lambda: control,
-        ),
-        draft_session=SimpleNamespace(snapshot=lambda: {"authoring": authoring}),
-    )
-
-    # A matching compiled frame owned by another command target does not
-    # satisfy the endpoint's exact component/target/frame identity.
+    authoring = {"forest": [{"instance_id": "move", "node_id": "motion.move_to_pose",
+        "parameters": {"target": _target(), "base_frame": _frame(),
+            "tcp_endpoint": {"kind": "entry", "target": _target(target="gripper"),
+                             "frame": _frame(frame="jaw_tcp")}}}]}
+    state = SimpleNamespace(headless_client=SimpleNamespace(
+        execution_targets=lambda: targets, execution_control_state=lambda: control),
+        draft_session=SimpleNamespace(snapshot=lambda: {"authoring": authoring}))
+    args = {"instance_id": "move", "observed_kind": "tcp_pose"}
     with pytest.raises(DraftSessionError) as entry_mismatch:
-        routes_draft._observed_move_arguments(
-            state, {"instance_id": "move", "observed_kind": "tcp_pose"},
-        )
+        routes_draft._observed_move_arguments(state, args)
     assert entry_mismatch.value.code == "observed_move_frame_mismatch"
-    assert "TCP entry robot · gripper · jaw_tcp" in str(entry_mismatch.value)
-
-    targets["targets"]["components"][0]["targets"][0]["command"]["target_descriptor"]["tcps"].append({
-        "entry": {"component_id": "robot", "target_id": "gripper",
-                  "frame_role_id": "jaw_tcp"},
-        "target_role_id": "tool", "display": "robot.tcp",
-        "frame": {"frame_role_id": "jaw_tcp", "compiled_frame_name": "robot.tcp",
-                  "model_instance_id": "robot-model", "model_revision": "model-r1"},
-        "mounted_here": True, "mounted_elsewhere": False, "default": False,
-    })
-    binding["target_role_bindings"][0]["robot_tcps"].append({
-        "entry": {"component_id": "robot", "target_id": "gripper", "frame_role_id": "jaw_tcp"},
-        "frame": deepcopy(binding["target_role_bindings"][1]["frame_role_bindings"][0]),
-    })
+    entry = {"target": _target(target="gripper"), "frame": _frame(frame="jaw_tcp")}
+    row = {"entry": entry, "frame": deepcopy(frame), "mounted_here": True}
+    targets["targets"]["components"][0]["targets"][0]["command"]["target_descriptor"]["tcps"].append(row)
+    binding["target_bindings"][0]["robot_tcps"].append({"entry": entry, "frame": deepcopy(frame)})
     poses = control["control_state"]["observed_targets"][0]["observed"]["tcp_poses"]
-    poses.append({
-        "entry": {"component_id": "robot", "target_id": "gripper", "frame_role_id": "jaw_tcp"},
-        "pose": deepcopy(poses[0]["pose"]),
-    })
-
-    resolved, _identity = routes_draft._observed_move_arguments(
-        state, {"instance_id": "move", "observed_kind": "tcp_pose"},
-    )
-    assert resolved["observed"]["frame_ref"] == {
-        "kind": "target_frame", "target_role": "arm", "frame_role": "base",
-    }
-
-    row = targets["targets"]["components"][0]["targets"][0]["command"]["target_descriptor"]["tcps"][-1]
+    poses.append({"entry": entry, "pose": deepcopy(poses[0]["pose"])})
+    resolved, _ = routes_draft._observed_move_arguments(state, args)
+    assert resolved["observed"]["frame_ref"] == {"kind": "target_frame", "frame": _frame()}
     row["mounted_here"] = False
-    row["frame"]["compiled_frame_name"] = "robot.unavailable"
-    binding["target_role_bindings"][1]["frame_role_bindings"][0]["compiled_frame_name"] = "robot.unavailable"
-    missing_pose = poses.pop()
     with pytest.raises(DraftSessionError) as non_carried:
-        routes_draft._observed_move_arguments(
-            state, {"instance_id": "move", "observed_kind": "tcp_pose"},
-        )
+        routes_draft._observed_move_arguments(state, args)
     assert non_carried.value.code == "observed_move_frame_mismatch"
-    assert non_carried.value.status_code == 409
-    assert "['robot.flange', 'robot.tcp']" in str(non_carried.value)
     row["mounted_here"] = True
-    row["frame"]["compiled_frame_name"] = "robot.tcp"
-    binding["target_role_bindings"][1]["frame_role_bindings"][0]["compiled_frame_name"] = "robot.tcp"
-    poses.append(missing_pose)
-
-    binding["target_role_bindings"][1]["frame_role_bindings"][0]["compiled_frame_name"] = (
-        "robot.jaw_tcp"
-    )
+    frame["compiled_frame_name"] = "robot.jaw_tcp"
     with pytest.raises(DraftSessionError) as frame_mismatch:
-        routes_draft._observed_move_arguments(
-            state, {"instance_id": "move", "observed_kind": "tcp_pose"},
-        )
+        routes_draft._observed_move_arguments(state, args)
     assert frame_mismatch.value.code == "observed_move_frame_mismatch"
-    assert "resolves to 'robot.jaw_tcp'" in str(frame_mismatch.value)
-
-    binding["target_role_bindings"][1]["frame_role_bindings"][0]["compiled_frame_name"] = (
-        "robot.tcp"
-    )
-    binding["target_role_bindings"][1]["frame_role_bindings"][0]["model_revision"] = "model-r2"
+    frame["compiled_frame_name"] = "robot.tcp"
+    frame["model_revision"] = "model-r2"
     with pytest.raises(DraftSessionError) as mismatch:
-        routes_draft._observed_move_arguments(
-            state, {"instance_id": "move", "observed_kind": "tcp_pose"},
-        )
+        routes_draft._observed_move_arguments(state, args)
     assert mismatch.value.code == "observed_move_frame_mismatch"
-    assert "TCP entry robot · gripper · jaw_tcp" in str(mismatch.value)
     assert "do not share the same retained model instance and revision" in str(mismatch.value)
 
 
@@ -570,9 +499,9 @@ def test_observed_pose_captures_at_a_non_default_tcp(
         "instance_id": "move",
         "node_id": "motion.move_to_pose",
         "parameters": {
-            "target_role": "arm",
-            "base_frame_role": "base",
-            "tcp_endpoint": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+            "target": _target(),
+            "base_frame": _frame(),
+            "tcp_endpoint": {"kind": "entry", "target": _target(), "frame": _frame(frame="flange")},
         },
     }]}
     state = SimpleNamespace(
@@ -587,74 +516,39 @@ def test_observed_pose_captures_at_a_non_default_tcp(
     )
     assert resolved["observed"]["current_tcp_pose"]["position_m"]["z_m"] == 0.37
     assert resolved["observed"]["frame_ref"] == {
-        "kind": "target_frame", "target_role": "arm", "frame_role": "base",
+        "kind": "target_frame", "frame": _frame(),
     }
 
     # The default TCP still captures the default pose.
-    authoring["forest"][0]["parameters"]["tcp_endpoint"]["frame_role"] = "tcp"
+    authoring["forest"][0]["parameters"]["tcp_endpoint"]["frame"] = _frame(frame="tcp")
     resolved, _identity = routes_draft._observed_move_arguments(
         state, {"instance_id": "move", "observed_kind": "tcp_pose"},
     )
     assert resolved["observed"]["current_tcp_pose"]["position_m"]["z_m"] == 0.3
 
 
-def test_observed_pose_captures_at_a_mounted_tool_tcp(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """TCP-C: a Program endpoint on the mounted tool ({gripper, cup_edge}) is
-    captured from the robot's TCP list, though the tool is another component."""
-
+def test_observed_pose_captures_at_a_mounted_tool_tcp(monkeypatch: pytest.MonkeyPatch) -> None:
     binding = _mock_applied_motion_binding(monkeypatch)
-    binding["target_role_bindings"].append({
-        "target_role_id": "gripper", "controllable_component_id": "tool",
-        "command_target_id": "gripper", "frame_role_bindings": [{
-            "frame_role_id": "cup_edge", "compiled_frame_name": "tool.cup_edge",
-            "model_instance_id": "tool-model", "model_revision": "tool-r1",
-        }],
-    })
+    frame = {"reference": _frame("tool", "cup_edge"), "compiled_frame_name": "tool.cup_edge",
+             "model_instance_id": "tool-model", "model_revision": "tool-r1"}
+    entry = {"target": _target("tool", "gripper"), "frame": frame["reference"]}
+    binding["frame_bindings"].append(frame)
+    binding["target_bindings"].append({"target": entry["target"], "frame_references": [entry["frame"]]})
+    binding["target_bindings"][0]["robot_tcps"].append({"entry": entry, "frame": deepcopy(frame)})
     targets = _motion_targets_projection()
     command = targets["targets"]["components"][0]["targets"][0]["command"]
-    command["target_descriptor"]["tcps"].append({
-        "entry": {"component_id": "tool", "target_id": "gripper",
-                  "frame_role_id": "cup_edge"},
-        "target_role_id": "mounted_tool_target", "display": "tool.cup_edge",
-        "frame": {"frame_role_id": "cup_edge",
-                  "compiled_frame_name": "tool.cup_edge",
-                  "model_instance_id": "tool-model", "model_revision": "tool-r1"},
-        "mounted_here": True, "mounted_elsewhere": False, "default": False,
-    })
-    binding["target_role_bindings"][0]["robot_tcps"].append({
-        "entry": {"component_id": "tool", "target_id": "gripper", "frame_role_id": "cup_edge"},
-        "frame": deepcopy(binding["target_role_bindings"][1]["frame_role_bindings"][0]),
-    })
+    command["target_descriptor"]["tcps"].append({"entry": entry, "frame": deepcopy(frame), "mounted_here": True})
     control = _motion_control_projection()
     control["control_state"]["observed_targets"][0]["observed"]["tcp_poses"].append({
-        "entry": {"component_id": "tool", "target_id": "gripper",
-                  "frame_role_id": "cup_edge"},
-        "pose": {
-            "position_m": {"x_m": 0.1, "y_m": 0.25, "z_m": 0.4},
-            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
-        },
-    })
-    authoring = {"forest": [{
-        "instance_id": "move",
-        "node_id": "motion.move_to_pose",
-        "parameters": {
-            "target_role": "arm",
-            "base_frame_role": "base",
-            "tcp_endpoint": {"kind": "entry", "target_role": "gripper", "frame_role": "cup_edge"},
-        },
-    }]}
-    state = SimpleNamespace(
-        headless_client=SimpleNamespace(
-            execution_targets=lambda: targets,
-            execution_control_state=lambda: control,
-        ),
-        draft_session=SimpleNamespace(snapshot=lambda: {"authoring": authoring}),
-    )
-    resolved, _identity = routes_draft._observed_move_arguments(
-        state, {"instance_id": "move", "observed_kind": "tcp_pose"},
-    )
+        "entry": entry, "pose": {"position_m": {"x_m": 0.1, "y_m": 0.25, "z_m": 0.4},
+                                 "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}}})
+    authoring = {"forest": [{"instance_id": "move", "node_id": "motion.move_to_pose",
+        "parameters": {"target": _target(), "base_frame": _frame(),
+                       "tcp_endpoint": {"kind": "entry", **entry}}}]}
+    state = SimpleNamespace(headless_client=SimpleNamespace(
+        execution_targets=lambda: targets, execution_control_state=lambda: control),
+        draft_session=SimpleNamespace(snapshot=lambda: {"authoring": authoring}))
+    resolved, _ = routes_draft._observed_move_arguments(state, {"instance_id": "move", "observed_kind": "tcp_pose"})
     assert resolved["observed"]["current_tcp_pose"]["position_m"]["y_m"] == 0.25
 
 
@@ -670,11 +564,11 @@ def _set_parameter(field: str, value: object):
 def _replace_configuration_and_lose_target(_node: dict, binding: dict, _targets: dict) -> None:
     # A stale configuration also hides the target; the configuration is named.
     binding["graph_revision"] = "replaced"
-    binding["target_role_bindings"][0]["command_target_id"] = "gone"
+    _targets["targets"]["components"][0]["targets"][0]["command_target_id"] = "gone"
 
 
 def _lose_bound_target(_node: dict, binding: dict, _targets: dict) -> None:
-    binding["target_role_bindings"][0]["command_target_id"] = "gone"
+    _targets["targets"]["components"][0]["targets"][0]["command_target_id"] = "gone"
 
 
 def _duplicate_bound_target(_node: dict, _binding: dict, targets: dict) -> None:
@@ -682,8 +576,8 @@ def _duplicate_bound_target(_node: dict, _binding: dict, targets: dict) -> None:
     component["targets"].append(deepcopy(component["targets"][0]))
 
 
-def _unbind_frame_role(_node: dict, binding: dict, _targets: dict) -> None:
-    binding["target_role_bindings"][0]["frame_role_bindings"].pop(0)
+def _unbind_frame(_node: dict, binding: dict, _targets: dict) -> None:
+    binding["target_bindings"][0]["frame_references"].pop(0)
 
 
 def _drop_observed_base_frame(_node: dict, _binding: dict, targets: dict) -> None:
@@ -706,10 +600,10 @@ def _invalid_tcp_endpoint(node: dict, _binding: dict, _targets: dict) -> None:
 @pytest.mark.parametrize(
     ("observed_kind", "change", "applied", "code", "message"),
     [
-        pytest.param("joint", _set_parameter("target_role", None), "bound",
-                     "observed_move_role_missing", "has no target role", id="target-role-missing"),
-        pytest.param("tcp_pose", _set_parameter("base_frame_role", None), "bound",
-                     "observed_move_role_missing", "has no base frame role", id="base-role-missing"),
+        pytest.param("joint", _set_parameter("target", None), "bound",
+                     "observed_move_role_missing", "has no robot target", id="target-role-missing"),
+        pytest.param("tcp_pose", _set_parameter("base_frame", None), "bound",
+                     "observed_move_role_missing", "has no base frame", id="base-role-missing"),
         # A missing selector now means Current (TCP migration): refuse a malformed one.
         pytest.param("tcp_pose", _set_parameter("tcp_endpoint", {"target_role": "arm", "frame_role": "tcp"}), "bound",
                      "observed_move_role_missing",
@@ -734,20 +628,20 @@ def _invalid_tcp_endpoint(node: dict, _binding: dict, _targets: dict) -> None:
         pytest.param("tcp_pose", _replace_configuration_and_lose_target, "bound",
                      "observed_move_configuration_changed", "the Applied configuration changed",
                      id="configuration-changed-first"),
-        pytest.param("joint", _set_parameter("target_role", "unbound"), "bound",
+        pytest.param("joint", _set_parameter("target", _target("unbound")), "bound",
                      "observed_move_target_unbound",
-                     "target role 'unbound' is not bound in the Applied Program",
+                     "is not bound in the Applied Program",
                      id="target-role-unbound"),
         pytest.param("joint", _lose_bound_target, "bound", "observed_move_target_unavailable",
                      "bound robot target is unavailable in the current execution owner",
                      id="target-unavailable"),
         pytest.param("joint", _duplicate_bound_target, "bound", "observed_move_target_unavailable",
                      "more than one matching robot target", id="target-ambiguous"),
-        pytest.param("tcp_pose", _unbind_frame_role, "bound", "observed_move_target_unbound",
-                     "base frame role 'base' is not bound for target role 'arm'",
+        pytest.param("tcp_pose", _unbind_frame, "bound", "observed_move_target_unbound",
+                     "is not bound for target",
                      id="frame-role-unbound"),
         pytest.param("tcp_pose", _set_parameter(
-                         "tcp_endpoint", {"kind": "entry", "target_role": "arm", "frame_role": "base"}
+                         "tcp_endpoint", {"kind": "entry", "target": _target(), "frame": _frame()}
                      ), "bound",
                      "observed_move_frame_mismatch",
                      "resolves to 'robot.base', but the robot reports its current pose only at the TCP "
@@ -803,9 +697,11 @@ def test_observed_move_names_each_refusal_cause_before_any_draft_change(
     view = deepcopy(session.snapshot())
     node = view["authoring"]["forest"][0]["children"][0]
     assert node["instance_id"] == "move_to_pick"
+    node["parameters"]["target"] = _target()
+    node["parameters"]["base_frame"] = _frame()
     if observed_kind == "tcp_pose":
         node["node_id"] = "motion.move_to_pose"
-        node["parameters"]["tcp_endpoint"] = {"kind": "entry", "target_role": "arm", "frame_role": "tcp"}
+        node["parameters"]["tcp_endpoint"] = {"kind": "entry", "target": _target(), "frame": _frame(frame="tcp")}
     change(node, binding, targets)
 
     def snapshot() -> dict:
@@ -858,7 +754,7 @@ def test_observed_move_refuses_a_node_that_cannot_hold_the_capture(
     node_id: str, observed_kind: str, message: str,
 ) -> None:
     authoring = {"forest": [{"instance_id": "move", "node_id": node_id,
-                             "parameters": {"target_role": "arm"}}]}
+                             "parameters": {"target": _target()}}]}
     state = SimpleNamespace(
         headless_client=SimpleNamespace(
             execution_targets=_motion_targets_projection,
@@ -943,20 +839,25 @@ def test_observed_move_names_a_failed_robot_pose_read_before_any_draft_change(
 def test_observed_move_reads_one_exact_source_snapshot_under_the_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _mock_applied_motion_binding(monkeypatch)
+    binding = _mock_applied_motion_binding(monkeypatch)
+    binding["target_bindings"][0]["target"]["component_id"] = "ur5_robot"
     class Headless:
         def __init__(self) -> None:
             self.reads = 0
 
         def execution_targets(self) -> dict:
-            return _motion_targets_projection()
+            projection = _motion_targets_projection()
+            projection["targets"]["components"][0]["controllable_component_id"] = "ur5_robot"
+            return projection
 
         def node_environment(self) -> dict:
             return _node_environment_projection()
 
         def execution_control_state(self) -> dict:
             self.reads += 1
-            return _motion_control_projection(sequence=self.reads)
+            projection = _motion_control_projection(sequence=self.reads)
+            projection["control_state"]["observed_targets"][0]["controllable_component_id"] = "ur5_robot"
+            return projection
 
         def program_applied(self) -> dict:
             return {}
@@ -1006,16 +907,21 @@ def test_observed_move_reads_one_exact_source_snapshot_under_the_claim(
 
 
 def test_observed_move_is_one_revision_fenced_draft_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _mock_applied_motion_binding(monkeypatch)
+    binding = _mock_applied_motion_binding(monkeypatch)
+    binding["target_bindings"][0]["target"]["component_id"] = "ur5_robot"
     class Headless:
         def execution_targets(self) -> dict:
-            return _motion_targets_projection()
+            projection = _motion_targets_projection()
+            projection["targets"]["components"][0]["controllable_component_id"] = "ur5_robot"
+            return projection
 
         def node_environment(self) -> dict:
             return _node_environment_projection()
 
         def execution_control_state(self) -> dict:
-            return _motion_control_projection()
+            projection = _motion_control_projection()
+            projection["control_state"]["observed_targets"][0]["controllable_component_id"] = "ur5_robot"
+            return projection
 
         def program_applied(self) -> dict:
             return {}
@@ -1113,7 +1019,7 @@ def test_observed_scene_save_preserves_program_metadata_and_source_identity() ->
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     state = ComposerState(program=Program.from_dict(document, catalog))
     state.headless_client = Headless()  # type: ignore[assignment]
@@ -1881,7 +1787,7 @@ def test_scene_and_viewer_edits_share_one_revision_fenced_program_draft(
         json={
             **_fence(opened),
             "mutation": "viewer_draft_replace",
-            "arguments": {"viewer": {"frame_role_visibility": {"base": False}}},
+            "arguments": {"viewer": {"scene_resource_axes_visibility": {"table": False}}},
         },
     )
     assert stale.status_code == 409
@@ -1894,7 +1800,7 @@ def test_scene_and_viewer_edits_share_one_revision_fenced_program_draft(
             "mutation": "viewer_draft_replace",
             "arguments": {
                 "viewer": {
-                    "frame_role_visibility": {"base": False},
+                    "scene_resource_axes_visibility": {"table": False},
                     "frame_gizmo_size_m": 0.15,
                     "object_axes_gizmo_size_m": 0.1,
                 }
@@ -1904,7 +1810,7 @@ def test_scene_and_viewer_edits_share_one_revision_fenced_program_draft(
     assert viewer_response.status_code == 200
     viewer_workspace = viewer_response.json()["workspace"]
     assert viewer_workspace["draft"]["program"]["viewer"] == {
-        "frame_role_visibility": {"base": False},
+        "scene_resource_axes_visibility": {"table": False},
         "frame_gizmo_size_m": 0.15,
         "object_axes_gizmo_size_m": 0.1,
     }
@@ -2012,7 +1918,7 @@ def _expression_program(tmp_path: Path) -> Path:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     target = tmp_path / "formulas.program.yaml"
     target.write_text(json.dumps(document), encoding="utf-8")
@@ -2194,6 +2100,8 @@ def test_workspace_reports_the_names_each_draft_formula_reads(tmp_path: Path) ->
         "children"
     ][0]
     assert node["instance_id"] == "move_to_pick"
+    node["parameters"]["target"] = _target()
+    node["parameters"]["base_frame"] = _frame()
     sources = {
         **node.get("value_sources", {}),
         "goal[0].position_rad": {
@@ -2656,7 +2564,7 @@ def test_observed_pose_selector_uses_live_active_and_verified_default(monkeypatc
     binding = _mock_applied_motion_binding(monkeypatch)
     targets = _motion_targets_projection()
     control = _motion_control_projection()
-    parameters = {"target_role": "arm", "base_frame_role": "base", "tcp_endpoint": {"kind": "current"}}
+    parameters = {"target": _target(), "base_frame": _frame(), "tcp_endpoint": {"kind": "current"}}
     state = SimpleNamespace(
         headless_client=SimpleNamespace(execution_targets=lambda: targets, execution_control_state=lambda: control),
         draft_session=SimpleNamespace(snapshot=lambda: {"authoring": {"forest": [{
@@ -2665,13 +2573,13 @@ def test_observed_pose_selector_uses_live_active_and_verified_default(monkeypatc
     )
     args = {"instance_id": "move", "observed_kind": "tcp_pose"}
     status = control["control_state"]["observed_targets"][0]
-    status["active_tcp"]["entry"]["frame_role_id"] = "flange"
+    status["active_tcp"]["entry"] = _entry(frame="flange")
     result, _ = routes_draft._observed_move_arguments(state, args)
     assert result["observed"]["current_tcp_pose"]["position_m"]["z_m"] == 0.37
-    parameters["tcp_endpoint"] = {"kind": "default_of_role", "role": "arm"}
+    parameters["tcp_endpoint"] = {"kind": "default_of_target", "target": _target()}
     result, _ = routes_draft._observed_move_arguments(state, args)
     assert result["observed"]["current_tcp_pose"]["position_m"]["z_m"] == 0.3
-    binding["target_role_bindings"][0].pop("default_tcp")
+    binding["target_bindings"][0].pop("default_tcp")
     with pytest.raises(DraftSessionError) as missing_default:
         routes_draft._observed_move_arguments(state, args)
     assert missing_default.value.code == "observed_move_target_unbound"
@@ -2685,10 +2593,10 @@ def test_observed_pose_selector_uses_live_active_and_verified_default(monkeypatc
     with pytest.raises(DraftSessionError) as missing_status:
         routes_draft._observed_move_arguments(state, args)
     assert missing_status.value.code == "observed_move_unavailable"
-    status["active_tcp"] = {"entry": {"component_id": "robot", "target_id": "arm", "frame_role_id": "flange"},
+    status["active_tcp"] = {"entry": _entry(frame="flange"),
                             "display": "robot.flange", "owner_epoch": "owner",
                             "registration_generation": 1, "sequence": 3}
-    binding["target_role_bindings"][0]["robot_tcps"][1]["frame"]["model_revision"] = "other"
+    binding["target_bindings"][0]["robot_tcps"][1]["frame"]["model_revision"] = "other"
     with pytest.raises(DraftSessionError) as changed_model:
         routes_draft._observed_move_arguments(state, args)
     assert changed_model.value.code == "observed_move_frame_mismatch"

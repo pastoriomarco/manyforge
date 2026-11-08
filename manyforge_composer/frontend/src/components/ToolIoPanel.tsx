@@ -42,10 +42,11 @@ import {
 /** One bound signal, addressed by its own Program binding. */
 export interface ToolIoSignal {
   programBindingId: string;
+  /** The bound target's component and command target. */
   controllableComponentId: string;
   targetId: string;
-  targetRoleId: string;
-  resourceRoleId: string;
+  /** The signal's own component (it may differ from the target's, e.g. a station I/O device). */
+  signalComponentId: string;
   signalName: string;
   direction: 'input' | 'output';
   declared: DeclaredIoSource | null;
@@ -88,7 +89,7 @@ function receiptText(receipt: MockIoInputReceipt): { text: string; warning: bool
   };
 }
 
-/** The outcome line of one manual output write (CONTRACTS §7). */
+/** The outcome line of one manual output write. */
 function writeText(write: OutputWriteState): { text: string; severity: 'info' | 'warning' | 'error' } | null {
   const value = write.value ? 'on' : 'off';
   if (write.sending) return { text: `Writing ${value}…`, severity: 'info' };
@@ -106,37 +107,34 @@ function writeText(write: OutputWriteState): { text: string; severity: 'info' | 
 
 /**
  * The one adapter from `targets.io_signal_bindings` rows to panel signals.
- * A signal bound under several target roles or bindings is listed once
- * (first row in canonical order); its declared source is joined when known.
+ * A signal bound to several targets or bindings is listed once (first row
+ * in canonical order); its declared source is joined when known.
  */
 export function toolIoSignals(
   bindings: IoSignalBinding[],
   declared: Map<string, DeclaredIoSource> | null,
 ): ToolIoSignal[] {
   const seen = new Set<string>();
-  return bindings.flatMap((target) => target.signalRoleBindings.flatMap((row) => {
-    const identity = JSON.stringify([target.controllableComponentId, row.signalName]);
+  return bindings.flatMap((target) => target.signals.flatMap((row) => {
+    const identity = JSON.stringify([row.componentId, row.signalName]);
     if (seen.has(identity)) return [];
     seen.add(identity);
     return [{
       programBindingId: target.programBindingId,
-      controllableComponentId: target.controllableComponentId,
+      controllableComponentId: target.componentId,
       targetId: target.commandTargetId,
-      targetRoleId: target.targetRoleId,
-      resourceRoleId: row.resourceRoleId,
+      signalComponentId: row.componentId,
       signalName: row.signalName,
       direction: row.direction,
-      declared: declared?.get(ioSourceKey(
-        target.controllableComponentId, target.commandTargetId, row.resourceRoleId,
-      )) ?? null,
+      declared: declared?.get(ioSourceKey(target.componentId, target.commandTargetId, row.signalName)) ?? null,
     }];
   }));
 }
 
 export function toolIoSignalKey(
-  signal: Pick<ToolIoSignal, 'programBindingId' | 'targetRoleId' | 'resourceRoleId'>,
+  signal: Pick<ToolIoSignal, 'programBindingId' | 'signalComponentId' | 'signalName'>,
 ): string {
-  return JSON.stringify([signal.programBindingId, signal.targetRoleId, signal.resourceRoleId]);
+  return JSON.stringify([signal.programBindingId, signal.signalComponentId, signal.signalName]);
 }
 
 function message(error: unknown): string {
@@ -155,9 +153,9 @@ export interface ToolIoPanelViewProps {
   systemSignals?: SystemSignalProjection[];
   /** The pushed samples by `signal_id`; null until the first `io_signals` event. */
   samples: ReadonlyMap<string, SignalSample> | null;
-  /** The cell latch blocks manual I/O (CONTRACTS §5). */
+  /** The cell latch blocks manual I/O. */
   latched: boolean;
-  /** Motion is executing in the cell: manual output writes wait (§7). */
+  /** Motion is executing in the cell: manual output writes wait. */
   motionExecuting?: boolean;
   writes: Readonly<Record<string, OutputWriteState>>;
   mocks: Readonly<Record<string, MockInputState>>;
@@ -177,7 +175,7 @@ export interface ToolIoPanelViewProps {
   globalRulesCurrent?: boolean;
 }
 
-/** Each global rule's live state (CONTRACTS §8: inactive, clear, tripped, or can't watch). */
+/** Each global rule's live state (inactive, clear, tripped, or can't watch). */
 export function GlobalRuleStatusSection({ rules, current = true }: {
   rules: readonly GlobalRuleStatus[] | null;
   current?: boolean;
@@ -234,7 +232,7 @@ const EXECUTING_REASON = codedErrorText({
 
 /**
  * True while motion executes in the cell: an arm or gripper component is
- * busy (§1, §7). An I/O component's own write, a sensor or an owner doesn't
+ * busy. An I/O component's own write, a sensor or an owner doesn't
  * count.
  */
 export function motionExecuting(components: readonly ComponentState[] | null,
@@ -250,6 +248,16 @@ function SampleFacts({ sample, known }: { sample: SignalSample | undefined; know
       <div className="deployment-resolved-grid">
         <span><small>Value</small><strong data-io-value>—</strong></span>
         <span><small>Source</small><strong>{known ? 'no sample' : 'unavailable'}</strong></span>
+      </div>
+    );
+  }
+  // An output without read-back has no device state to show: never its last write.
+  if (sample.source === 'not_readable') {
+    return (
+      <div className="deployment-resolved-grid">
+        <span><small>Value</small><strong data-io-value>not readable</strong></span>
+        <span><small>Source</small><strong data-io-source={sample.source}>{SIGNAL_SOURCE_LABELS.not_readable}</strong></span>
+        <span><small>Age</small><strong data-io-age>—</strong></span>
       </div>
     );
   }
@@ -288,7 +296,8 @@ function ToolIoSignalsView({
   if (signals.length === 0 && systemSignals.length === 0) {
     return <p className="panel-state">The running cell has no bound I/O signals.</p>;
   }
-  const components = [...new Set(signals.map((signal) => signal.controllableComponentId))];
+  // Signals are grouped and addressed by the component that owns them.
+  const components = [...new Set(signals.map((signal) => signal.signalComponentId))];
   const systemComponents = [...new Set(systemSignals.map((signal) => signal.controllableComponentId))];
   return (
     <div className="dpanel" aria-label="Tool and I/O signals">
@@ -297,9 +306,9 @@ function ToolIoSignalsView({
       {components.map((controllableComponentId) => (
         <section className="runtime-control-section" key={controllableComponentId} aria-label={`${controllableComponentId} signals`}>
           <div className="runtime-control-heading"><strong>{controllableComponentId}</strong></div>
-          {signals.filter((signal) => signal.controllableComponentId === controllableComponentId).map((signal) => {
+          {signals.filter((signal) => signal.signalComponentId === controllableComponentId).map((signal) => {
             const key = toolIoSignalKey(signal);
-            const id = ioSignalId(signal.controllableComponentId, signal.signalName);
+            const id = ioSignalId(signal.signalComponentId, signal.signalName);
             const sample = samples?.get(id);
             const changedOutside = samples?.get(`${id}${CHANGED_OUTSIDE_SUFFIX}`);
             const output = signal.direction === 'output';
@@ -309,7 +318,7 @@ function ToolIoSignalsView({
                 data-io-fresh={sample === undefined ? 'pending' : String(sample.fresh)}>
                 <div className="runtime-control-heading">
                   <strong>{signal.signalName}</strong>
-                  <small>{signal.targetId} · {signal.resourceRoleId} · {output ? 'output' : 'input'}</small>
+                  <small>{signal.controllableComponentId}/{signal.targetId} · {output ? 'output' : 'input'}</small>
                 </div>
                 <SampleFacts sample={sample} known={samples !== null} />
                 {signal.declared !== null && (
@@ -344,14 +353,13 @@ function ToolIoSignalsView({
         </section>
       ))}
       {systemSignals.length > 0 && (
-        <section className="runtime-control-section" aria-label="System signals">
-          <div className="runtime-control-heading">
-            <strong>System signals</strong><small>Read only</small>
-          </div>
+        <>
           {systemComponents.map((controllableComponentId) => (
             <section className="runtime-control-section" key={controllableComponentId}
               aria-label={`${controllableComponentId} system signals`}>
-              <div className="runtime-control-heading"><strong>{controllableComponentId}</strong></div>
+              <div className="runtime-control-heading">
+                <strong>{controllableComponentId}</strong><small>System signals · read only</small>
+              </div>
               {systemSignals.filter((signal) => signal.controllableComponentId === controllableComponentId).map((signal) => (
                 <div className="runtime-control-record" key={`${signal.commandTargetId}\u0000${signal.signalName}`}
                   data-system-signal={signal.signalName} data-system-source-kind={signal.sourceKind}>
@@ -368,7 +376,7 @@ function ToolIoSignalsView({
               ))}
             </section>
           ))}
-        </section>
+        </>
       )}
       {signals.length > 0 && (
         <p className="hint">Outputs can be written whenever no motion is executing; a write is sent once and never resent (the last write wins). Setting a Mock input simulates its source; it is not a hardware command.</p>
@@ -377,7 +385,7 @@ function ToolIoSignalsView({
   );
 }
 
-/** Manual write of one output (CONTRACTS §7); controller-owned outputs are read-only. */
+/** Manual write of one output; controller-owned outputs are read-only. */
 function OutputControls({ signal, sample, blockedReason, write, onSetOutput }: {
   signal: ToolIoSignal;
   sample: SignalSample | undefined;
@@ -449,8 +457,8 @@ function selectorOf(ownerEpoch: string, signal: ToolIoSignal): IoSignalSelector 
   return {
     ownerEpoch,
     programBindingId: signal.programBindingId,
-    targetRoleId: signal.targetRoleId,
-    resourceRoleId: signal.resourceRoleId,
+    componentId: signal.signalComponentId,
+    signalName: signal.signalName,
   };
 }
 
@@ -522,7 +530,7 @@ const NO_MOTION_COMPONENTS: ReadonlySet<string> = new Set();
 /**
  * Tool & I/O: every bound signal's pushed sample (value, source, age), the
  * `changed outside` mark of eligible outputs, manual output writes and Mock
- * input toggles. Nothing polls (CONTRACTS §7).
+ * input toggles. Nothing polls.
  */
 export function ToolIoPanel({
   enabled,
@@ -570,7 +578,7 @@ export function ToolIoPanel({
     const key = toolIoSignalKey(signal);
     setWrites((current) => ({ ...current, [key]: { value, sending: true, result: null, error: null } }));
     // One request; an unknown outcome is shown, never resent.
-    api.io.setOutput(ioSignalId(signal.controllableComponentId, signal.signalName), value)
+    api.io.setOutput(ioSignalId(signal.signalComponentId, signal.signalName), value)
       .then((result) => setWrites((current) => ({ ...current, [key]: { value, sending: false, result, error: null } })))
       .catch((error: unknown) => setWrites((current) => ({
         ...current, [key]: { value, sending: false, result: null, error: message(error) },

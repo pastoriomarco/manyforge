@@ -16,16 +16,19 @@ import {
   enableAllTargets,
   faultPresentation,
   COMPONENT_STATES_UNAVAILABLE,
-  LIFECYCLE_LABELS,
+  needsRecovery,
   offeredActions,
   ownerIds,
   prepareAllTargets,
   reasonText,
+  stateLabel,
+  stopText,
   streamLabel,
   type ComponentTreeNode,
 } from '../state/componentPresentation';
 import type { ComponentState } from '../types/components';
 import { OverlayPanel } from './OverlayPanel';
+import { RecoverEnableDialog } from './RecoverEnableDialog';
 
 /** A refused or failed request, as the operator reads it (catalogue text by code). */
 export function requestErrorText(error: unknown): string {
@@ -76,7 +79,7 @@ function useRequest(states: readonly ComponentState[]) {
 }
 
 /**
- * A component's actions (CONTRACTS §2): exactly the four lifecycle actions
+ * A component's actions: exactly the four lifecycle actions
  * plus its declared capabilities, always offered (an owner: Prepare, Recover
  * and its capabilities; an enabled component: no Prepare, `offeredActions`);
  * only an action in progress or this request in flight
@@ -91,11 +94,17 @@ export function ComponentActions({ state, enabled, states = [], className = 'dac
   const request = useRequest([state]);
   const id = state.component_id;
   const busy = !enabled || request.pending || state.action !== undefined;
-  // Power off and Reboot ask first (§16), like Reset and Halt.
+  // Power off and Reboot ask first, like Reset and Halt.
   const [confirming, setConfirming] = useState<string | null>(null);
+  // Enable on a faulted or e-stopped component recovers first, after the operator confirms the causes.
+  const [recovering, setRecovering] = useState(false);
+  const recover = needsRecovery(state, states);
   const confirmButton = useRef<HTMLButtonElement | null>(null);
+  const owner = ownerIds(states).has(id);
   const send = (action: string) => {
-    void request.run([id], () => api.components.action(id, action), {
+    // A machine's Recover runs as a group so its unprepared members prepare after it.
+    void request.run([id], () => (owner && action === 'recover'
+      ? api.components.groupAction('recover', [id]) : api.components.action(id, action)), {
       command: action, label: actionBusyLabel(action), name: `${actionLabel(action)} ${id}`,
     });
   };
@@ -103,21 +112,35 @@ export function ComponentActions({ state, enabled, states = [], className = 'dac
   return (
     <>
       <div className={className}>
-        {offeredActions(state, ownerIds(states).has(id)).map((action) => (
+        {offeredActions(state, owner).map((action) => (
           <button key={action} type="button" disabled={busy}
             title={busyReason(request.operation) ?? undefined}
             onClick={(event) => {
-              if (!CONFIRMED_ACTIONS.has(action)) { send(action); return; }
               confirmButton.current = event?.currentTarget ?? null;
+              if (action === 'enable' && recover) { setRecovering(true); return; }
+              if (!CONFIRMED_ACTIONS.has(action)) { send(action); return; }
               setConfirming(action);
             }}>
-            {busyLabel(request.operation, action, actionLabel(action))}
+            {busyLabel(request.operation, action,
+              action === 'enable' && recover ? 'Recover and enable' : actionLabel(action))}
           </button>
         ))}
       </div>
       {request.error !== null && (
         <p className="inline-message severity-error" role="alert">{request.error}</p>
       )}
+      <RecoverEnableDialog
+        componentId={id}
+        open={recovering}
+        onClose={() => setRecovering(false)}
+        returnFocusRef={confirmButton}
+        onConfirm={(confirmation) => {
+          setRecovering(false);
+          void request.run([id], () => api.components.recoverEnable(id, confirmation), {
+            command: 'enable', label: 'Recovering and enabling…', name: `Recover and enable ${id}`,
+          });
+        }}
+      />
       <OverlayPanel
         open={confirming !== null}
         title={confirmation?.title ?? ''}
@@ -148,7 +171,7 @@ export function ComponentActions({ state, enabled, states = [], className = 'dac
   );
 }
 
-/** §16: the member's owner and that owner's fault, when the fault concerns the member. */
+/** The member's owner and that owner's fault, when the fault concerns the member. */
 export function concernedOwnerFault(state: ComponentState, states: readonly ComponentState[]) {
   const owner = state.owner_id === undefined ? undefined
     : states.find((candidate) => candidate.component_id === state.owner_id);
@@ -158,8 +181,8 @@ export function concernedOwnerFault(state: ComponentState, states: readonly Comp
 }
 
 /**
- * One component's state (CONTRACTS §1) and its actions (§2). `states` (the
- * cell's) gives the machine context (§16): a member shows its owner's reason
+ * One component's state and its actions. `states` (the
+ * cell's) gives the machine context: a member shows its owner's reason
  * and, as a banner, an owner fault that concerns it. `embedded`: the rows
  * only, for a card that shows the state itself (the machine card's header).
  */
@@ -193,7 +216,7 @@ export function ComponentStatePanel({ state, enabled, states = [], embedded = fa
         </div>
       )}
       <dl>
-        {!embedded && <div><dt>State</dt><dd>{LIFECYCLE_LABELS[state.lifecycle]}</dd></div>}
+        {!embedded && <div><dt>State</dt><dd>{stateLabel(state)}</dd></div>}
         <div><dt>Activity</dt><dd>{state.activity}</dd></div>
         {reason !== null && (
           <div><dt>Reason</dt><dd>{reason}</dd></div>
@@ -205,6 +228,13 @@ export function ComponentStatePanel({ state, enabled, states = [], embedded = fa
           <div><dt>Last action</dt><dd>{actionResultText(state.last_action)}</dd></div>
         )}
       </dl>
+      {state.stop !== undefined && (
+        <div className="notice severity-warning" role="status">
+          <strong>E-stop</strong>
+          <p>{stopText(state.stop)}</p>
+          <p>Release the e-stop, then use Recover and enable.</p>
+        </div>
+      )}
       {fault !== null && (
         <div className="notice severity-error" role="alert">
           <strong>{fault.title}</strong>
@@ -232,8 +262,8 @@ export function ComponentStatePanel({ state, enabled, states = [], embedded = fa
  * The cell's components in one line, as one tree (members under their
  * machine, a mounted tool under its parent), with Prepare all (every
  * `not_prepared` or `offline` component; the backend runs owners before their
- * members) and Enable all (CONTRACTS §2: every prepared member and owner-less
- * component).
+ * members) and Enable all (every member and owner-less component; the
+ * backend prepares an unprepared one, and its machine, first).
  */
 export function CellComponentsCard({ states, enabled, mounts = {} }: {
   states: readonly ComponentState[] | null;
@@ -263,7 +293,7 @@ export function CellComponentsCard({ states, enabled, mounts = {} }: {
         </button>
         <button type="button" disabled={!enabled || request.pending || prepared.length === 0}
           title={busyReason(request.operation)
-            ?? (prepared.length === 0 ? 'No component is prepared.' : `Enable ${prepared.join(', ')}.`)}
+            ?? (prepared.length === 0 ? 'No component to enable.' : `Enable ${prepared.join(', ')}.`)}
           onClick={() => {
             void request.run(prepared, () => api.components.groupAction('enable', prepared),
               { command: 'enable_all', label: 'Enabling…', name: 'Enable all' });

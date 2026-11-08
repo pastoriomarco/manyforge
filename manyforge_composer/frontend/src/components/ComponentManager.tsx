@@ -23,11 +23,10 @@ import {
   componentRowText,
   type ComponentManagerRow,
   type ComponentManagerTab,
-  type RoleFeedback,
 } from '../utils/componentManager';
 
 /**
- * The Deployment tab pieces (Overview, Roles, Cell settings, Changes) and the
+ * The Deployment tab pieces (Overview, Program binding, Cell settings, Changes) and the
  * Components section's list: a thin client of the Deployment Draft routes,
  * the server-side Preview/Apply and the pushed component states. It owns no
  * lifecycle or Applied state.
@@ -35,7 +34,7 @@ import {
 
 const TAB_LABELS: Record<ComponentManagerTab, string> = {
   overview: 'Overview',
-  roles: 'Roles',
+  binding: 'Program binding',
   cell: 'Cell settings',
   changes: 'Changes',
 };
@@ -51,11 +50,10 @@ export const CHANGE_LABELS: Record<ComponentManagerRow['change'], string> = {
   removed: 'Removed in Draft · stops at Apply',
 };
 
-export function ComponentManagerTabs({ tab, onTab, pendingChanges, roleIssues }: {
+export function ComponentManagerTabs({ tab, onTab, pendingChanges }: {
   tab: ComponentManagerTab;
   onTab: (tab: ComponentManagerTab) => void;
   pendingChanges: boolean;
-  roleIssues: number;
 }) {
   return (
     <div className="dseg" role="tablist" aria-label="Deployment">
@@ -63,7 +61,6 @@ export function ComponentManagerTabs({ tab, onTab, pendingChanges, roleIssues }:
         <button key={value} type="button" role="tab" aria-selected={tab === value}
           aria-controls={`component-manager-${value}`} onClick={() => onTab(value)}>
           {TAB_LABELS[value]}
-          {value === 'roles' && roleIssues > 0 ? ` · ${roleIssues} role${roleIssues === 1 ? '' : 's'} open` : ''}
           {value === 'changes' && pendingChanges ? ' · pending' : ''}
         </button>
       ))}
@@ -72,10 +69,9 @@ export function ComponentManagerTabs({ tab, onTab, pendingChanges, roleIssues }:
 }
 
 /** Desired (Draft) against active (Manager Applied), with routes to the detail. */
-export function ComponentManagerSummary({ controller, rows, feedback, graph, diff, onNavigate, onOpenComponents }: {
+export function ComponentManagerSummary({ controller, rows, graph, diff, onNavigate, onOpenComponents }: {
   controller: DeploymentWorkspaceController;
   rows: readonly ComponentManagerRow[];
-  feedback: readonly RoleFeedback[];
   graph: ManagerGraphProjection | null;
   diff: ManagerDiffProjection | null;
   onNavigate: (tab: ComponentManagerTab) => void;
@@ -86,7 +82,6 @@ export function ComponentManagerSummary({ controller, rows, feedback, graph, dif
   const added = rows.filter((row) => row.change === 'added').length;
   const removed = rows.filter((row) => row.change === 'removed').length;
   const desired = rows.length - removed;
-  const roleIssues = feedback.filter((role) => role.status !== 'satisfied');
   const applyReason = deploymentActionUnavailableReason(workspace, 'apply', null);
   return (
     <section className="dcard" aria-labelledby="component-manager-summary-title">
@@ -107,10 +102,6 @@ export function ComponentManagerSummary({ controller, rows, feedback, graph, dif
           {diff === null ? 'unknown' : diff.converged ? 'converged'
             : `${diff.desiredUnits.length} desired · ${diff.observedUnits.length} observed units`}
         </dd></div>
-        <div><dt>Program roles</dt><dd>
-          {feedback.length === 0 ? 'No Program roles'
-            : roleIssues.length === 0 ? 'All bound' : `${roleIssues.length} of ${feedback.length} open`}
-        </dd></div>
       </dl>
       {workspace?.runAdmission.ready === false && workspace.runAdmission.reason && (
         <p className="inline-message severity-info" role="status">
@@ -118,9 +109,6 @@ export function ComponentManagerSummary({ controller, rows, feedback, graph, dif
         </p>
       )}
       <div className="dactions">
-        {roleIssues.length > 0 && (
-          <button type="button" onClick={() => onNavigate('roles')}>Bind Program roles</button>
-        )}
         {onOpenComponents !== undefined && (
           <button type="button" title="Each component's status, settings, frames and I/O."
             onClick={onOpenComponents}>{`Components (${desired})`}</button>
@@ -140,7 +128,7 @@ const CHANGE_BADGES: Record<Exclude<ComponentManagerRow['change'], 'applied'>, s
 };
 
 /**
- * The Draft's components and Applied-only ones as one tree (CONTRACTS §16):
+ * The Draft's components and Applied-only ones as one tree:
  * a machine's members under it, a mounted tool under the component it is
  * mounted on. Each row (the house row of Scene objects and Catalog): the id
  * over its kind and model, its state as a badge at the right; depth indents
@@ -195,46 +183,13 @@ export function ComponentList({ rows, states = {}, selectedId, onSelect }: {
   );
 }
 
-/** Each Program component role: satisfied, unbound, incompatible or unknown against the Draft. */
-export function RoleFeedbackCard({ feedback }: { feedback: readonly RoleFeedback[] }) {
-  return (
-    <section className="dcard" aria-labelledby="component-manager-roles-title">
-      <header>
-        <h4 id="component-manager-roles-title">Program roles</h4>
-        <span className="dcard-meta">{feedback.length}</span>
-      </header>
-      {feedback.length === 0 ? (
-        <p className="muted">The Program Draft declares no component roles.</p>
-      ) : (
-        <dl>
-          {feedback.map((role) => (
-            <div key={role.roleId}>
-              <dt>{role.roleId}{role.requiredTags.length > 0 ? ` (${role.requiredTags.join(', ')})` : ''}</dt>
-              <dd>
-                {/* Advisory, it blocks nothing: yellow, never red (notice rule). */}
-                <span className={`inline-message severity-${role.status === 'satisfied' ? 'info'
-                  : 'warning'}`}>{role.status}</span>
-                {' '}{role.detail}
-              </dd>
-            </div>
-          ))}
-        </dl>
-      )}
-      <p className="field-help">
-        The Scenario's role assignment names the component of each role. Add a component with that id
-        to bind the role (Components, Add component marks the components that fit an open role).
-      </p>
-    </section>
-  );
-}
-
 interface PreviewState {
   draftId: string;
   draftRevision: number;
   preview: ApplyPreview;
 }
 
-/** Changes: the Preview's per-component impact (CONTRACTS §11), then one confirmed Apply. */
+/** Changes: the Preview's per-component impact, then one confirmed Apply. */
 export function ComponentManagerChanges({ controller, rows }: {
   controller: DeploymentWorkspaceController;
   rows: readonly ComponentManagerRow[];
@@ -287,7 +242,7 @@ export function ComponentManagerChanges({ controller, rows }: {
           {busyLabel(controller.busyOperation, ['apply_preview', 'apply'], 'Apply…')}
         </button>
       </div>
-      {/* Yellow: a refused Preview or Apply changed nothing (M55 notice rule). */}
+      {/* Yellow: a refused Preview or Apply changed nothing. */}
       {error !== null && <p className="inline-message severity-warning" role="alert">{error}</p>}
       {preview !== null && !current && (
         <p className="inline-message severity-warning" role="status">

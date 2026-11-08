@@ -1,7 +1,7 @@
 import type { EdgeStyle, LayoutDirection } from '../store/composerStore';
 
 /**
- * Installation-level Composer presentation settings (UA7W.11). Presentation
+ * Installation-level Composer presentation settings. Presentation
  * only: nothing here reaches the Program, the Deployment or execution.
  * Mirrors `manyforge_composer/backend/composer_settings.py`.
  */

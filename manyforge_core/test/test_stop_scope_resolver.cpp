@@ -539,7 +539,7 @@ TEST(StopScopeResolverTest, MakesCanonicalAcceptanceWithoutSharedStopBudget) {
             ComputeRequestedStopSelectorDigest(intent).value());
   EXPECT_EQ(accepted.value().captured_scope_digest,
             ComputeCapturedStopScopeDigest(resolution.value()).value());
-  // Q51: the acceptance carries only its time; every robot's own deadlines
+  // The acceptance carries only its time; every robot's own deadlines
   // are computed at Stop time from its own profile and lane.
   EXPECT_EQ(accepted.value().accepted_at_ns, 8'000'000'000LL);
 

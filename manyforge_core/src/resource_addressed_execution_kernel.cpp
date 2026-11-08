@@ -264,7 +264,7 @@ void ResourceAddressedExecutionKernel::retain_historical_operation_locked(Operat
 
 ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     std::vector<RuntimeParticipantExecutionRegistration> registrations, IClock& clock,
-    IScheduler& scheduler, IOperationJournal& journal,
+    IOperationJournal& journal,
     ResourceAddressedExecutionKernelConfig config)
     : registry_(extract_bindings(registrations)),
       admission_mutex_(config.operation_admission_gate != nullptr
@@ -276,7 +276,6 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
           extract_published_active_control_configurations(registrations), admission_mutex_)),
       registrations_(std::move(registrations)),
       clock_(clock),
-      scheduler_(scheduler),
       journal_(journal),
       config_(std::move(config)),
       engine_event_ingress_(std::make_shared<EngineEventIngress>()),
@@ -369,13 +368,14 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     throw std::invalid_argument(
         "Stop-qualified runtime participants exceed the prequalified attempt-isolation bound");
   }
+  // Pre-start only the current cell's attempt workers; reconfiguration
+  // resizes the pool (up to the ceiling above) at its commit.
+  const auto pool_participants = std::max<std::size_t>(1U, initially_qualified_participants);
   stop_stage_attempt_executor_ = std::make_unique<BoundedStopStageAttemptExecutor>(
-      prequalified_max_live_stop_participants_ * kMaxStopEscalationStages,
-      prequalified_max_live_stop_participants_,
+      pool_participants * kMaxStopEscalationStages, pool_participants,
       static_cast<IStopStageAttemptCompletionReceiver&>(*this));
   if (!stop_stage_attempt_executor_->prequalified_ready() ||
-      stop_stage_attempt_executor_->prequalified_max_live_participants() !=
-          prequalified_max_live_stop_participants_) {
+      stop_stage_attempt_executor_->prequalified_max_live_participants() != pool_participants) {
     throw std::runtime_error("Stop-stage attempt isolation failed its admission prequalification");
   }
   auto operation_control_engines = distinct_execution_engines(registrations_);
@@ -454,7 +454,7 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     if (!recovered.terminal_certificate.has_value()) {
       // An accepted Stop with no projected terminal certificate is never
       // reconstructed or redispatched. Motion admission waits until every
-      // component reports healthy and idle (the armed cell latch, R2).
+      // component reports healthy and idle (the armed cell latch).
       motion_admission_unreconciled_ = true;
       continue;
     }
@@ -518,13 +518,23 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
         continue;
       }
       auto* engine = registration.engine;
+      auto component_id = registration.binding.value().controllable_component_id.value();
+      if (next_engine_subscription_id_ == std::numeric_limits<std::uint64_t>::max())
+        throw std::overflow_error("engine subscription identity exhausted");
+      const auto sequence_id = next_engine_subscription_id_++;
       auto ingress = engine_event_ingress_;
       const auto handle = engine->subscribe_events(
-          [ingress = std::move(ingress), engine](const KernelEvent& event) {
+          [ingress = std::move(ingress), engine, sequence_id](const KernelEvent& event) {
             auto entered = ingress->Enter();
-            if (auto* owner = entered.owner()) owner->on_engine_event(engine, event);
+            if (auto* owner = entered.owner()) owner->on_engine_event(engine, sequence_id, event);
           });
-      engine_subscriptions_.push_back(EngineSubscription{engine, handle});
+      engine_subscriptions_.push_back(EngineSubscription{engine, handle, sequence_id, std::move(component_id)});
+    }
+    for (auto& registration : registrations_) {
+      const auto subscription = std::find_if(
+          engine_subscriptions_.begin(), engine_subscriptions_.end(),
+          [&](const EngineSubscription& value) { return value.engine == registration.engine; });
+      registration.engine_subscription_id = subscription->sequence_id;
     }
     // Opening is the final construction step. A callback captured while the
     // constructor was still assembling subscriptions observes closed ingress

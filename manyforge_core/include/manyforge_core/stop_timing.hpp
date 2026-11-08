@@ -11,7 +11,7 @@ namespace manyforge::core {
 /// completion tolerance added to a controlled Stop's deceleration time.
 inline constexpr Duration kCompleteMoveOnSignalTimeoutNs = 500'000'000;
 
-/// Q28/Q51 (as `main`'s `effective_controlled_stop_deadline_ns`): the one
+/// As `main`'s `effective_controlled_stop_deadline_ns`: the one
 /// deadline of a robot's controlled Stop, measured from the Stop request and
 /// computed at Stop time from its own profile: `max_stop_time_s` when set,
 /// else the deceleration time (or its default) plus the completion
@@ -20,7 +20,7 @@ inline constexpr Duration kCompleteMoveOnSignalTimeoutNs = 500'000'000;
     const MotionInterruptStopProfileDTO& profile,
     Duration completion_tolerance_ns = kCompleteMoveOnSignalTimeoutNs);
 
-/// Maintainer M6: a dispatched Stop trajectory finishes like a normal motion,
+/// A dispatched Stop trajectory finishes like a normal motion,
 /// on the controller's report, and its no-report bound is a normal motion's
 /// (`trajectory_execution_budget_s`) for the trajectory's duration. The
 /// controlled deadline above bounds everything before that dispatch. The

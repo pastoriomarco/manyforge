@@ -15,8 +15,11 @@
 #pragma once
 
 #include <manyforge_core/component_stream_health.hpp>
+#include <atomic>
 #include <memory>
 #include <rclcpp/node.hpp>
+
+namespace manyforge::ros2_control_execution { class Ros2TransportResources; }
 
 namespace manyforge::roboplan_backend {
 
@@ -32,6 +35,8 @@ namespace manyforge::roboplan_backend {
 /// `health` is null. Subscription failures throw as rclcpp does.
 [[nodiscard]] std::shared_ptr<void>
 InstallComponentStreamSampleBridge(const std::shared_ptr<rclcpp::Node> &node,
-                                   std::shared_ptr<core::ComponentStreamHealth> health);
+                                   std::shared_ptr<core::ComponentStreamHealth> health,
+                                   std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner = {},
+                                   std::shared_ptr<std::atomic<bool>> active = {});
 
 } // namespace manyforge::roboplan_backend

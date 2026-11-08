@@ -8,9 +8,9 @@ the ordered 14-definition-name cohort has SHA-256
 * lines 9-25: fixed-offset finite-input validation -> retained here;
 * lines 28-151, 220-397: simulator capture/pose/TCP mapping -> retained as
   stateless capture tests; latest/freshness/status/payload assertions move to
-  H0/I5 and concrete simulator wiring moves to I9/I;
+  the headless owner and concrete simulator wiring moves to the Isaac lane;
 * lines 154-217: JointState translation -> retained without the angular-only
-  or latest-cache assumptions; receiver-owned state/freshness moves to H0/N;
+  or latest-cache assumptions; receiver-owned state/freshness moves to the headless owner;
 * lines 400-682: PoseStamped/PoseArray translation and depth-one transport ->
   retained without object association, status, policy, or cache ownership;
 * lines 685-766: TF lookup/translation -> retained as a stateless batch;

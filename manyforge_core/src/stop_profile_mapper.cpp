@@ -149,13 +149,13 @@ Result<MotionInterruptStopProfileDTO> resolve_motion_interrupt_stop_jerk_limits(
                            "Review and save an explicit controlled-Stop jerk choice");
   if (profile.stop_mode == MotionInterruptStopMode::kHardDeceleration)
     profile.jerk_limits_enabled = false;
-  // As main (item 24): an unset controlled-Stop deceleration time takes the
+  // As main: an unset controlled-Stop deceleration time takes the
   // 1.0 s default here, once, when the profile is loaded; the planner never
   // substitutes it. The 2.0 s ceiling is the field check above.
   if (profile.stop_mode != MotionInterruptStopMode::kHardDeceleration &&
       !profile.deceleration_time_s.has_value())
     profile.deceleration_time_s = kDefaultDecelerationTimeS;
-  // Q36: only authored jerk values are frozen here. A joint without one gets
+  // Only authored jerk values are frozen here. A joint without one gets
   // main's default at Stop time, where the lane's lead-in and the phase
   // duration are known (soft_on_path_stop_planner).
   return Result<MotionInterruptStopProfileDTO>::Ok(std::move(profile));

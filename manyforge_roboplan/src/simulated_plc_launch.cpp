@@ -40,7 +40,7 @@ std::optional<SimulatedPlcPlan>
 plan_simulated_plc(const bool simulated_unit, std::string device_id,
                    const std::vector<SimulatedPlcRow> &rows,
                    std::filesystem::path config_dir) {
-  // D1/D6: only a simulated unit ever gets a simulated PLC.
+  // Only a simulated unit ever gets a simulated PLC.
   if (!simulated_unit)
     return std::nullopt;
   SimulatedPlcPlan plan;
@@ -93,7 +93,7 @@ simulated_plc_launch_command(const SimulatedPlcPlan &plan) {
   for (const auto &service : plan.served_services)
     identity << "service " << service << '\n';
   command.identity = identity.str();
-  // D4: an unchanged simulated PLC keeps its process and I/O values.
+  // An unchanged simulated PLC keeps its process and I/O values.
   command.keep_across_apply = true;
   return command;
 }

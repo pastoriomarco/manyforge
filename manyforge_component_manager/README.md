@@ -12,12 +12,12 @@ Composable Cell Component Manager. It currently owns these bounded mechanisms:
   evidence, Scene-owned maintenance initialization, selected-bundle publication,
   fence release, and terminal success;
 - the canonical-empty prerequisite/Begin coordinator that consumes the sealed
-  I3 admission, durably records the scene-owner-accepted target, and advances
+  admission, durably records the scene-owner-accepted target, and advances
   that exact zero-native target through Rebuild, publication, and completion;
 - the whole-Apply affected-scope/fence coordinator, observe-first runtime
   convergence coordinator, Scene maintenance initialization and selected-bundle
   completion coordinators;
-- closed concrete Linux/POSIX adapters for the exact I3-qualified reference
+- closed concrete Linux/POSIX adapters for the exact qualified reference
   and execution host products, including direct-child epoch observation and a
   private transport-neutral scene-projection resolver; and
 - active-plan reconstruction plus dependency-ordered steady-state
@@ -191,7 +191,7 @@ unsupported external or replacement products fail before fence or process
 effects.
 
 Scene stages the candidate's planning projections. The Manager then sends the
-execution host its one Apply call (`HostApplyRequest`, CONTRACTS §15): the
+execution host its one Apply call (`HostApplyRequest`): the
 host refuses an enabled replaced or removed component, stops removed and
 replaced components and installs the candidate. The Manager records the private
 materialization, Scene begins the adoption, and
@@ -252,7 +252,7 @@ and cannot authorize stale finalization after a later publication.
 The initial store is deliberately exhaustion-bounded to 4,096 immutable
 receipts and a 64 MiB main database page image. It performs no pruning,
 compaction, or generation reuse: exact replay remains available until the
-store rejects a new publication at that hard boundary. This is a bounded I4
+store rejects a new publication at that hard boundary. This is a bounded
 owner, not an indefinite configuration-history service. The filesystem threat
 model is likewise explicit: bootstrap supplies a stable trusted parent
 directory, while the store rejects a final database-path symlink and opens the
@@ -267,7 +267,7 @@ replay-consistency checks, not tamper evidence against a writer that can
 rewrite the databases and recompute them.
 
 `CanonicalEmptyBootstrapCoordinator::BeginOrRecover` is a bounded Manager-side
-I4 ordering proof. It verifies that the sealed admission, its bootstrap
+ordering proof. It verifies that the sealed admission, its bootstrap
 journal and publication store, and the publication head identify the same
 cell; observes the scene owner’s exact
 command-fenced prerequisites; mints at least 128 bits of random bootstrap
@@ -302,18 +302,18 @@ These owners have no ROS types or callbacks. The only concrete process effect
 is the closed retained-POSIX reference product above; it exposes no caller-
 selected command, path, arguments, environment, working directory, or active
 command surface. The first runtime-only named Apply is operational inside the
-bounded M0 composition through the production logical-scene owner and durable
+bounded composition through the production logical-scene owner and durable
 public pointer. Its external-process proof covers bootstrap, Manager
 loss/replacement, Apply recovery, runtime crash/restart, and explicit shutdown.
-The I5/H0 headless surface does not turn this private handoff into a second
-public command API. The current N5c checkpoint qualifies nonempty native
+The headless surface does not turn this private handoff into a second
+public command API. The current checkpoint qualifies nonempty native
 projection transitions and finalized-host replacement, but does not yet
 qualify mid-transition host-loss recovery, the execution-facing lease path,
 controller/robot lifecycle,
 remote placement, motion effects, or the restored product lane.
 The lower-level journal still treats bundle and graph identities as opaque;
 only the external store composition root and coordinator require the sealed,
-verified I3 admission. The coordinator does not retain the scene owner's
+verified admission. The coordinator does not retain the scene owner's
 logical-scene value or directly open scene writes and leases. Native placement
 and transport remain adapter-private; those openings remain the scene owner's
 responsibility inside a successful Finalize or completed replacement recovery
@@ -326,9 +326,7 @@ creates no bootstrap intent and publishes nothing.
 The old generic raw persistence fixture and its `FoundationHead` compare-and-
 swap surface have been removed rather than retained as compatibility
 architecture. The former production Python runtime-observation reducer is also
-removed now that this C++ package is selected as the semantic owner. The
-independent sources under `verification/composable_cell_i4/` remain test-only
-reference fixtures and are never a fallback runtime owner.
+removed now that this C++ package is selected as the semantic owner.
 
 ## Focused build
 

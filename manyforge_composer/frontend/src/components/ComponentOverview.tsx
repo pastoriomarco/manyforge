@@ -25,7 +25,7 @@ export interface ComponentOverviewProps {
   activeAcknowledgedAlarms: number;
   clientErrorCount: number;
   error: string | null;
-  /** The pushed component states and cell latch (R4: the one view). */
+  /** The pushed component states and cell latch (the one view). */
   cellState: CellState;
   /** Each mounted component's parent (the Deployment Draft's `attachments[]`). */
   mounts?: Readonly<Record<string, string>>;
@@ -104,7 +104,7 @@ export function ComponentOverview({
               {cellState.components === null ? (
                 <p className="muted">{COMPONENT_STATES_UNAVAILABLE}</p>
               ) : flattenComponentTree(componentStateTree(cellState.components, mounts)).map(({ item, depth }) => (
-                // One tree (§16): members under their machine, a mounted tool under its parent.
+                // One tree: members under their machine, a mounted tool under its parent.
                 <OverviewComponent key={item.component_id} component={item} states={cellState.components!} depth={depth} />
               ))}
             </div>

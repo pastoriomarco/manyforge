@@ -25,27 +25,48 @@ Mutation = Callable[[dict[str, Any]], None]
 
 
 def _native_fixture() -> dict[str, Any]:
-    return json.loads(FIXTURE.read_text(encoding="utf-8"))
+    document = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    if document.get("api_version") != "manyforge.program_binding.v3":
+        pytest.skip("held: genuine native v3 Binding fixture required")
+    return document
+
+
+def test_old_program_binding_is_refused_without_repair() -> None:
+    document = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    document["api_version"] = "manyforge.program_binding.v2"
+    before = copy.deepcopy(document)
+    with pytest.raises(ProgramBindingTransportError):
+        validate_program_binding(document)
+    assert document == before
+
+
+def test_native_v3_binding_fixture_is_required_for_cumulative_gate() -> None:
+    document = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    assert document.get("api_version") == "manyforge.program_binding.v3", (
+        "native v3 Binding fixture is required"
+    )
 
 
 def _rehash(value: dict[str, Any]) -> None:
+    if value.get("api_version") != "manyforge.program_binding.v3":
+        raise ValueError("only native v3 Binding mutations may be rehashed")
     value["program_binding_id"] = compute_content_identity(
         value,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v2",
+        api_version="manyforge.program_binding.v3",
     )
 
 
 def _fixture() -> dict[str, Any]:
     """Enrich the native fixture with valid sparse rows for parser coverage."""
     value = _native_fixture()
-    component = value["component_role_bindings"][0]
-    target = value["target_role_bindings"][0]
-    collision = target["collision_body_role_bindings"][0]
+    collision = value["collision_body_bindings"][0]
+    component = next(row for row in value["component_bindings"]
+                     if row["component_id"] == collision["reference"]["component_id"])
     model = next(
         row
-        for row in component["model_role_bindings"]
+        for row in component["model_bindings"]
         if row["model_instance_id"] == collision["model_instance_id"]
     )
     value["contact_grasp_bindings"] = [
@@ -55,23 +76,15 @@ def _fixture() -> dict[str, Any]:
             "runtime_object_id": "fixture_object",
             "allowed_body_bindings": [
                 {
-                    "component_role_id": target["component_role_id"],
-                    "target_role_id": target["target_role_id"],
-                    "controllable_component_id": target[
-                        "controllable_component_id"
-                    ],
-                    "command_target_id": target["command_target_id"],
+                    "body": copy.deepcopy(collision["reference"]),
                     "model_role_id": model["model_role_id"],
-                    "collision_body_role_id": collision[
-                        "collision_body_role_id"
-                    ],
                     "model_instance_id": collision["model_instance_id"],
                     "model_revision": collision["model_revision"],
                     "collision_body_ids": [
                         "component/"
-                        f"{target['controllable_component_id']}/model/"
+                        f"{collision['reference']['component_id']}/model/"
                         f"{collision['model_instance_id']}/body/"
-                        f"{collision['collision_body_role_id']}/collision/{index}"
+                        f"{collision['reference']['collision_body_id']}/collision/{index}"
                         for index, _ in enumerate(
                             collision["compiled_collision_body_names"]
                         )
@@ -89,17 +102,17 @@ def _fixture() -> dict[str, Any]:
 
 def _robot_tcp_fixture(*, duplicate_display_identity: bool = False) -> dict[str, Any]:
     value = _native_fixture()
-    target = value["target_role_bindings"][0]
-    component_id = target["controllable_component_id"]
-    frame = copy.deepcopy(target["frame_role_bindings"][0])
+    target = value["target_bindings"][0]
+    target.pop("default_tcp", None)
+    frame = copy.deepcopy(value["frame_bindings"][0])
     entry = {
-        "component_id": component_id,
-        "target_id": target["command_target_id"],
-        "frame_role_id": frame["frame_role_id"],
+        "target": copy.deepcopy(target["target"]),
+        "frame": copy.deepcopy(frame["reference"]),
     }
     row = {
         "entry": entry,
         "frame": frame,
+        "contact_body_role_ids": [],
         "end_effector": False,
         "component_default": False,
     }
@@ -109,7 +122,7 @@ def _robot_tcp_fixture(*, duplicate_display_identity: bool = False) -> dict[str,
         # Their entry triples differ even when the display role and resolved
         # compiled frame name are the same.
         second = copy.deepcopy(row)
-        second["entry"]["target_id"] = target["command_target_id"] + "_secondary"
+        second["entry"]["target"]["command_target_id"] += "_secondary"
         rows.append(second)
     target["robot_tcps"] = rows
     _rehash(value)
@@ -125,8 +138,8 @@ def _node_policy(*, instance_id: str = "root") -> dict[str, Any]:
 
 
 def _rows(value: dict[str, Any]) -> tuple[dict[str, Any], ...]:
-    component = value["component_role_bindings"][0]
-    target = value["target_role_bindings"][0]
+    component = value["component_bindings"][0]
+    target = value["target_bindings"][0]
     contact = value["contact_grasp_bindings"][0]
     return component, target, contact
 
@@ -149,12 +162,12 @@ SHAPE_MUTATIONS: tuple[tuple[str, Mutation], ...] = (
     ("program_binding: expected closed record", _unknown(lambda value: value)),
     (".node_environment: expected closed record", lambda value: value["node_environment"].pop("catalog_id")),
     (".node_environment: expected closed record", _unknown(lambda value: value["node_environment"])),
-    (".component_role_bindings[0]: expected closed record", _unknown(lambda value: _rows(value)[0])),
-    (".model_role_bindings[0]: expected closed record", _unknown(lambda value: _rows(value)[0]["model_role_bindings"][0])),
-    (".target_role_bindings[0]: expected closed record", _unknown(lambda value: _rows(value)[1])),
-    (".frame_role_bindings[0]: expected closed record", _unknown(lambda value: _rows(value)[1]["frame_role_bindings"][0])),
+    (".component_bindings[0]: expected closed record", _unknown(lambda value: _rows(value)[0])),
+    (".model_bindings[0]: expected closed record", _unknown(lambda value: _rows(value)[0]["model_bindings"][0])),
+    (".target_bindings[0]: expected closed record", _unknown(lambda value: _rows(value)[1])),
+    (".frame_bindings[0]: expected closed record", _unknown(lambda value: value["frame_bindings"][0])),
     (".resource_role_bindings[0]: expected closed record", _unknown(lambda value: _rows(value)[1]["resource_role_bindings"][0])),
-    (".collision_body_role_bindings[0]: expected closed record", _unknown(lambda value: _rows(value)[1]["collision_body_role_bindings"][0])),
+    (".collision_body_bindings[0]: expected closed record", _unknown(lambda value: value["collision_body_bindings"][0])),
     (".capability_bindings[0]: expected closed record", _unknown(lambda value: _rows(value)[1]["capability_bindings"][0])),
     (".control_binding: expected closed record", _invalid_ref("control_binding", "control_binding_id", "control_binding_revision")),
     (".capability_provider_binding: expected closed record", _invalid_ref("capability_provider_binding", "capability_provider_binding_id", "capability_provider_binding_revision")),
@@ -174,7 +187,7 @@ def _case(name: str) -> Mutation:
     def mutate(value: dict[str, Any]) -> None:
         component, target, contact = _rows(value)
         resource = target["resource_role_bindings"][0]
-        collision = target["collision_body_role_bindings"][0]
+        collision = value["collision_body_bindings"][0]
         capability = target["capability_bindings"][0]
         body = contact["allowed_body_bindings"][0]
         provenance = value["provenance"]["source_records"]
@@ -183,33 +196,33 @@ def _case(name: str) -> Mutation:
         if name == "null":
             value["program_id"] = None
         elif name == "wrong_type":
-            value["target_role_bindings"] = {}
+            value["target_bindings"] = {}
         elif name == "identity_pattern":
             value["program_id"] = "not portable"
         elif name == "identity_bytes":
             value["program_id"] = "a" * 129
         elif name == "text_bytes":
-            target["frame_role_bindings"][0]["compiled_frame_name"] = "é" * 2049
+            value["frame_bindings"][0]["compiled_frame_name"] = "é" * 2049
         elif name == "invalid_utf8":
-            target["frame_role_bindings"][0]["compiled_frame_name"] = "\ud800"
+            value["frame_bindings"][0]["compiled_frame_name"] = "\ud800"
         elif name == "root_maximum":
-            value["component_role_bindings"] = [component] * 4097
+            value["component_bindings"] = [component] * 4097
         elif name == "nested_maximum":
-            target["frame_role_bindings"] = [target["frame_role_bindings"][0]] * 4097
+            value["frame_bindings"] = [value["frame_bindings"][0]] * 4097
         elif name == "provenance_maximum":
             value["provenance"]["source_records"] = [provenance[0]] * 16385
         elif name == "component_order":
-            value["component_role_bindings"] = [component, copy.deepcopy(component)]
+            value["component_bindings"] = [component, copy.deepcopy(component)]
         elif name == "model_order":
-            component["model_role_bindings"].append(copy.deepcopy(component["model_role_bindings"][0]))
+            component["model_bindings"].append(copy.deepcopy(component["model_bindings"][0]))
         elif name == "target_order":
-            value["target_role_bindings"].append(copy.deepcopy(target))
+            value["target_bindings"].append(copy.deepcopy(target))
         elif name == "frame_order":
-            target["frame_role_bindings"].append(copy.deepcopy(target["frame_role_bindings"][0]))
+            value["frame_bindings"].append(copy.deepcopy(value["frame_bindings"][0]))
         elif name == "resource_order":
             target["resource_role_bindings"].append(copy.deepcopy(resource))
         elif name == "collision_order":
-            target["collision_body_role_bindings"].append(copy.deepcopy(collision))
+            value["collision_body_bindings"].append(copy.deepcopy(collision))
         elif name == "capability_order":
             target["capability_bindings"].append(copy.deepcopy(capability))
         elif name == "contact_order":
@@ -228,7 +241,7 @@ def _case(name: str) -> Mutation:
             capability["control_binding"] = None
             capability["capability_provider_binding"] = None
         elif name == "target_component":
-            target["controllable_component_id"] = "mismatch"
+            target["target"]["component_id"] = "mismatch"
         elif name == "contact_penetration":
             contact["max_penetration_m"] = 0
         elif name == "contact_fraction":
@@ -244,7 +257,9 @@ def _case(name: str) -> Mutation:
         elif name == "generated_body_id":
             body["collision_body_ids"][0] = "wrong"
         elif name == "body_target":
-            body["command_target_id"] = "mismatch"
+            body_target = next(row for row in value["target_bindings"]
+                               if row["collision_body_references"])
+            body_target["collision_body_references"][0]["collision_body_id"] = "mismatch"
         elif name == "body_collision":
             body["model_revision"] = "sha256:" + "f" * 64
         elif name == "body_model":
@@ -329,7 +344,7 @@ CASES = (
     ("resource_name_duplicate", "duplicate-free"),
     ("collision_name_duplicate", "duplicate-free"),
     ("all_null_capability", "control or provider"),
-    ("target_component", "target must resolve"),
+    ("target_component", "target has no component binding"),
     ("contact_penetration", "numeric ranges"),
     ("contact_fraction", "numeric ranges"),
     ("contact_bool", "finite number"),
@@ -337,7 +352,7 @@ CASES = (
     ("body_minimum", "bounded array"),
     ("body_order", "canonical sorted unique"),
     ("generated_body_id", "generated scope"),
-    ("body_target", "exact target"),
+    ("body_target", "references must be sorted unique and resolve"),
     ("body_collision", "collision binding"),
     ("body_model", "model binding"),
     ("provenance_kind", "CatalogRecordKind"),
@@ -374,7 +389,7 @@ def test_native_binding_fixture_is_accepted_without_copy() -> None:
 
 def test_robot_tcp_rows_preserve_list_without_a_default() -> None:
     document = _robot_tcp_fixture()
-    target = document["target_role_bindings"][0]
+    target = document["target_bindings"][0]
     assert "default_tcp" not in target
     assert target["robot_tcps"][0]["end_effector"] is False
     assert validate_program_binding(document) is document
@@ -382,7 +397,7 @@ def test_robot_tcp_rows_preserve_list_without_a_default() -> None:
 
 def test_robot_tcp_presence_distinguishes_empty_from_absent() -> None:
     document = _native_fixture()
-    target = document["target_role_bindings"][0]
+    target = document["target_bindings"][0]
     target.pop("robot_tcps", None)
     _rehash(document)
     assert validate_program_binding(document) is document
@@ -399,24 +414,24 @@ def test_robot_tcp_presence_distinguishes_empty_from_absent() -> None:
 
 def test_robot_tcp_identity_is_the_full_entry_triple() -> None:
     document = _robot_tcp_fixture(duplicate_display_identity=True)
-    rows = document["target_role_bindings"][0]["robot_tcps"]
-    assert rows[0]["entry"]["component_id"] == rows[1]["entry"]["component_id"]
-    assert rows[0]["entry"]["frame_role_id"] == rows[1]["entry"]["frame_role_id"]
+    rows = document["target_bindings"][0]["robot_tcps"]
+    assert rows[0]["entry"]["target"]["component_id"] == rows[1]["entry"]["target"]["component_id"]
+    assert rows[0]["entry"]["frame"] == rows[1]["entry"]["frame"]
     assert rows[0]["frame"]["compiled_frame_name"] == rows[1]["frame"]["compiled_frame_name"]
-    assert rows[0]["entry"]["target_id"] != rows[1]["entry"]["target_id"]
+    assert rows[0]["entry"]["target"]["command_target_id"] != rows[1]["entry"]["target"]["command_target_id"]
     assert validate_program_binding(document) is document
 
 
 @pytest.mark.parametrize(
     "mutation",
     [
-        lambda row: row["frame"].__setitem__("frame_role_id", "another_frame"),
+        lambda row: row["frame"]["reference"].__setitem__("frame_id", "another_frame"),
         lambda row: row.__setitem__("end_effector", 1),
     ],
 )
 def test_robot_tcp_rows_reject_malformed_frame_and_marks(mutation) -> None:
     document = _robot_tcp_fixture()
-    mutation(document["target_role_bindings"][0]["robot_tcps"][0])
+    mutation(document["target_bindings"][0]["robot_tcps"][0])
     _rehash(document)
     with pytest.raises(ProgramBindingTransportError):
         validate_program_binding(document)
@@ -424,10 +439,10 @@ def test_robot_tcp_rows_reject_malformed_frame_and_marks(mutation) -> None:
 
 def test_robot_tcp_rows_reject_duplicate_entry_triples() -> None:
     document = _robot_tcp_fixture()
-    rows = document["target_role_bindings"][0]["robot_tcps"]
+    rows = document["target_bindings"][0]["robot_tcps"]
     rows.append(copy.deepcopy(rows[0]))
     _rehash(document)
-    with pytest.raises(ProgramBindingTransportError, match="canonical sorted unique"):
+    with pytest.raises(ProgramBindingTransportError, match="TCP entries must be sorted unique"):
         validate_program_binding(document)
 
 
@@ -527,8 +542,11 @@ def test_binding_transport_invariant_mutation_corpus(
 def test_logic_only_binding_accepts_empty_component_and_target_tables() -> None:
     # A zero-component Program binds against the empty model map.
     document = _fixture()
-    document["component_role_bindings"] = []
-    document["target_role_bindings"] = []
+    document["component_bindings"] = []
+    document["target_bindings"] = []
+    document["frame_bindings"] = []
+    document["collision_body_bindings"] = []
+    document["signal_bindings"] = []
     document["contact_grasp_bindings"] = []
     _rehash(document)
     assert validate_program_binding(document) is document
@@ -536,7 +554,7 @@ def test_logic_only_binding_accepts_empty_component_and_target_tables() -> None:
 
 def test_binding_transport_still_requires_the_component_table() -> None:
     document = _fixture()
-    del document["component_role_bindings"]
+    del document["component_bindings"]
     _rehash(document)
     with pytest.raises(ProgramBindingTransportError):
         validate_program_binding(document)
@@ -559,21 +577,26 @@ def test_transport_does_not_infer_native_bundle_context() -> None:
 
 def _signal_binding_fixture() -> dict[str, Any]:
     document = _native_fixture()
-    document["target_role_bindings"][0]["signal_role_bindings"] = [{
-        "resource_role_id": "input_ready",
-        "signal_name": "ready",
+    target = document["target_bindings"][0]
+    reference = {"component_id": target["target"]["component_id"], "signal_name": "fixture_ready"}
+    document["signal_bindings"].append({
+        "reference": reference,
+        "target": copy.deepcopy(target["target"]),
+        "runtime_unit_id": "fixture_runtime",
         "value_type": "bool",
         "direction": "input",
         "transition_capability": "sampled_only",
         "signal_descriptor_digest": "sha256:" + "a" * 64,
-    }]
+    })
+    document["signal_bindings"].sort(key=lambda row: (row["reference"]["component_id"], row["reference"]["signal_name"]))
+    target["signal_references"].append(copy.deepcopy(reference))
+    target["signal_references"].sort(key=lambda row: (row["component_id"], row["signal_name"]))
     _rehash(document)
     return document
 
 
-def test_signal_binding_optional_absence_and_closed_row_preserve_document() -> None:
+def test_signal_binding_closed_row_preserves_native_document() -> None:
     ordinary = _native_fixture()
-    assert "signal_role_bindings" not in ordinary["target_role_bindings"][0]
     assert validate_program_binding(ordinary) is ordinary
     document = _signal_binding_fixture()
     assert validate_program_binding(document) is document
@@ -581,18 +604,20 @@ def test_signal_binding_optional_absence_and_closed_row_preserve_document() -> N
 
 
 @pytest.mark.parametrize("mutation", [
-    lambda target: target.__setitem__("signal_role_bindings", []),
-    lambda target: target["signal_role_bindings"][0].__setitem__("unknown", True),
-    lambda target: target["signal_role_bindings"][0].__setitem__("value_type", True),
-    lambda target: target["signal_role_bindings"][0].__setitem__("direction", "bidirectional"),
-    lambda target: target["signal_role_bindings"][0].__setitem__("transition_capability", "inferred"),
-    lambda target: target["signal_role_bindings"][0].__setitem__("signal_descriptor_digest", "sha256:" + "A" * 64),
-    lambda target: target["signal_role_bindings"].append(copy.deepcopy(target["signal_role_bindings"][0])),
-    lambda target: target["signal_role_bindings"][0].__setitem__("resource_role_id", target["resource_role_bindings"][0]["resource_role_id"]),
+    lambda document, row: document["signal_bindings"].remove(row),
+    lambda document, row: row.__setitem__("unknown", True),
+    lambda document, row: row.__setitem__("value_type", True),
+    lambda document, row: row.__setitem__("direction", "bidirectional"),
+    lambda document, row: row.__setitem__("transition_capability", "inferred"),
+    lambda document, row: row.__setitem__("signal_descriptor_digest", "sha256:" + "A" * 64),
+    lambda document, row: document["signal_bindings"].append(copy.deepcopy(row)),
+    lambda document, row: row["target"].__setitem__("command_target_id", "other_target"),
 ])
-def test_signal_binding_shape_and_coordinate_exclusivity_fail_closed(mutation: Callable[[dict[str, Any]], None]) -> None:
+def test_signal_binding_shape_and_target_correspondence_fail_closed(mutation) -> None:
     document = _signal_binding_fixture()
-    mutation(document["target_role_bindings"][0])
+    row = next(row for row in document["signal_bindings"]
+               if row["reference"]["signal_name"] == "fixture_ready")
+    mutation(document, row)
     _rehash(document)
     with pytest.raises(ProgramBindingTransportError):
         validate_program_binding(document)
@@ -600,33 +625,40 @@ def test_signal_binding_shape_and_coordinate_exclusivity_fail_closed(mutation: C
 
 def _pneumatic_binding_fixture() -> dict[str, Any]:
     document = _native_fixture()
-    gripper = next(row for row in document["target_role_bindings"]
+    gripper = next(row for row in document["target_bindings"]
                    if any(cap["capability_id"] == "tool.gripper.command"
                           for cap in row["capability_bindings"]))
+    component = gripper["target"]["component_id"]
+    references = {}
     for kind in ("input", "output"):
-        role = f"pneumatic.{kind}"
         target = copy.deepcopy(gripper)
-        target["target_role_id"] = role
-        target["command_target_id"] = "io"
-        target["frame_role_bindings"] = []
+        target["target"] = {"component_id": component, "command_target_id": f"fixture_{kind}"}
+        target["frame_references"] = []
+        target["frame_associations"] = []
         target["resource_role_bindings"] = []
-        target["collision_body_role_bindings"] = []
-        target["capability_bindings"][0]["capability_id"] = (
-            "io.gpio.get_input" if kind == "input" else "io.gpio.set_output"
-        )
-        target["signal_role_bindings"] = [{
-            "resource_role_id": kind, "signal_name": kind, "value_type": "bool",
+        target["collision_body_references"] = []
+        for field in ("robot_tcps", "default_tcp", "pneumatic_io"):
+            target.pop(field, None)
+        capability = copy.deepcopy(gripper["capability_bindings"][0])
+        capability["capability_id"] = "io.gpio.get_input" if kind == "input" else "io.gpio.set_output"
+        target["capability_bindings"] = [capability]
+        reference = {"component_id": component, "signal_name": f"fixture_{kind}"}
+        references[kind] = reference
+        target["signal_references"] = [copy.deepcopy(reference)]
+        document["signal_bindings"].append({
+            "reference": copy.deepcopy(reference), "target": copy.deepcopy(target["target"]),
+            "runtime_unit_id": "fixture_runtime", "value_type": "bool",
             "direction": kind, "transition_capability": "sampled_only",
             "signal_descriptor_digest": "sha256:" + "a" * 64,
-        }]
-        document["target_role_bindings"].append(target)
+        })
+        document["target_bindings"].append(target)
     gripper["pneumatic_io"] = {
-        "outputs": [{"target_role_id": "pneumatic.output", "resource_role_id": "output",
+        "outputs": [{"signal": references["output"],
                      "open_value": True, "close_value": False}],
-        "inputs": [{"input": "workpiece_grasped", "target_role_id": "pneumatic.input",
-                    "resource_role_id": "input"}],
+        "inputs": [{"input": "workpiece_grasped", "signal": references["input"]}],
     }
-    document["target_role_bindings"].sort(key=lambda row: row["target_role_id"])
+    document["target_bindings"].sort(key=lambda row: (row["target"]["component_id"], row["target"]["command_target_id"]))
+    document["signal_bindings"].sort(key=lambda row: (row["reference"]["component_id"], row["reference"]["signal_name"]))
     _rehash(document)
     return document
 
@@ -637,14 +669,14 @@ def test_pneumatic_binding_routes_exact_bound_signals() -> None:
 
 
 @pytest.mark.parametrize("mutation", [
-    lambda route: route["outputs"][0].__setitem__("target_role_id", "pneumatic.input"),
+    lambda route: route["outputs"][0].__setitem__("signal", copy.deepcopy(route["inputs"][0]["signal"])),
     lambda route: route["outputs"][0].__setitem__("open_value", 1),
     lambda route: route["inputs"][0].__setitem__("input", "unknown"),
     lambda route: route["inputs"].append(copy.deepcopy(route["inputs"][0])),
 ])
 def test_pneumatic_binding_rejects_wrong_signal_values_or_duplicate_inputs(mutation) -> None:
     document = _pneumatic_binding_fixture()
-    gripper = next(row for row in document["target_role_bindings"] if "pneumatic_io" in row)
+    gripper = next(row for row in document["target_bindings"] if "pneumatic_io" in row)
     mutation(gripper["pneumatic_io"])
     _rehash(document)
     with pytest.raises(ProgramBindingTransportError):
@@ -653,11 +685,16 @@ def test_pneumatic_binding_rejects_wrong_signal_values_or_duplicate_inputs(mutat
 
 def _endpoint_fixture() -> dict[str, Any]:
     value = _fixture()
-    target = value["target_role_bindings"][0]
-    body = target["collision_body_role_bindings"][0]
-    frame = next(frame for frame in target["frame_role_bindings"]
-                 if frame["model_instance_id"] == body["model_instance_id"])
-    frame["contact_body_role_ids"] = [body["collision_body_role_id"]]
+    body = value["collision_body_bindings"][0]
+    # The target that carries the body (the fixture's targets are sorted).
+    target = next(row for row in value["target_bindings"]
+                  if body["reference"] in row["collision_body_references"])
+    frame = next(frame for frame in value["frame_bindings"]
+                 if frame["model_instance_id"] == body["model_instance_id"]
+                 and frame["reference"]["component_id"] == body["reference"]["component_id"]
+                 and frame["reference"] in target["frame_references"])
+    association = next(row for row in target["frame_associations"] if row["frame"] == frame["reference"])
+    association["contact_body_role_ids"] = [body["reference"]["collision_body_id"]]
     policy = value["contact_grasp_bindings"][0]
     policy["bodies_from_motion_endpoint"] = True
     policy["allowed_body_bindings"] = []
@@ -673,14 +710,15 @@ def test_endpoint_binding_transport_preserves_exact_association() -> None:
 @pytest.mark.parametrize("fault", ["missing_body", "wrong_model", "duplicate_body", "false_selector", "mixed_bodies"])
 def test_endpoint_binding_transport_rejects_invalid_association(fault: str) -> None:
     value = _endpoint_fixture()
-    target = value["target_role_bindings"][0]
-    frame = next(frame for frame in target["frame_role_bindings"] if "contact_body_role_ids" in frame)
+    association = next(row for target in value["target_bindings"]
+                       for row in target["frame_associations"] if row["contact_body_role_ids"])
+    frame = next(row for row in value["frame_bindings"] if row["reference"] == association["frame"])
     if fault == "missing_body":
-        frame["contact_body_role_ids"] = ["absent"]
+        association["contact_body_role_ids"] = ["absent"]
     elif fault == "wrong_model":
         frame["model_revision"] = "sha256:" + "f" * 64
     elif fault == "duplicate_body":
-        frame["contact_body_role_ids"] *= 2
+        association["contact_body_role_ids"] *= 2
     elif fault == "false_selector":
         value["contact_grasp_bindings"][0]["bodies_from_motion_endpoint"] = False
     else:

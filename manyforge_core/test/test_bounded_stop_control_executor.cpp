@@ -32,6 +32,13 @@ void* Allocate(const std::size_t size) {
   throw std::bad_alloc();
 }
 
+// Out of line, as in test_runtime_collision_query_session.cpp: gcc 13 at -O1
+// (the TSan build) otherwise inlines free() into gtest's `new TestClass` and
+// reports a false -Wmismatched-new-delete.
+[[gnu::noinline]] void Deallocate(void* memory) noexcept {
+  std::free(memory);
+}
+
 }  // namespace
 
 void* operator new(const std::size_t size) {
@@ -53,22 +60,22 @@ void* operator new[](const std::size_t size, const std::nothrow_t&) noexcept {
   return std::malloc(size == 0U ? 1U : size);
 }
 void operator delete(void* memory) noexcept {
-  std::free(memory);
+  Deallocate(memory);
 }
 void operator delete[](void* memory) noexcept {
-  std::free(memory);
+  Deallocate(memory);
 }
 void operator delete(void* memory, std::size_t) noexcept {
-  std::free(memory);
+  Deallocate(memory);
 }
 void operator delete[](void* memory, std::size_t) noexcept {
-  std::free(memory);
+  Deallocate(memory);
 }
 void operator delete(void* memory, const std::nothrow_t&) noexcept {
-  std::free(memory);
+  Deallocate(memory);
 }
 void operator delete[](void* memory, const std::nothrow_t&) noexcept {
-  std::free(memory);
+  Deallocate(memory);
 }
 
 namespace manyforge::core {

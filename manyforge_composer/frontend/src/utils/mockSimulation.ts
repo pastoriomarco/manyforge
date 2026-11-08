@@ -1,14 +1,14 @@
 import type {
-  JsonValue, ProgramAuthoringDocument, ProgramBindingDocument, ProgramTreeNode,
+  JsonValue, ProgramSignalReference, ProgramTreeNode,
 } from '../types/api';
 import { conditionKind } from './interruptAuthoring';
-import { declaredIoSources, ioSourceKey, type IoSourceProfile } from './ioSignalConfiguration';
+import type { IoSourceProfile } from './ioSignalConfiguration';
+import type { CandidateSignalFact } from './interruptAuthoring';
 import { INTERRUPT_MOTION_NODE_IDS } from './programAuthoring';
-import { resolvedTargetRoles } from './targetRoleResolution';
 import { valuePathParameter } from './valuePaths';
 
 /**
- * Per-node Mock signal simulation (contracts 133/135): the literal-only
+ * Per-node Mock signal simulation: the literal-only
  * `mock_simulation` rows of a signal-reading node, catalog schema type
  * `mock_signal_simulation`. Each row names one signal the node itself reads,
  * its value at node start and optionally one new value after an offset from
@@ -28,10 +28,7 @@ export const MOCK_SIMULATION_SIGNAL_UNUSED = 'mock_simulation_signal_unused';
 export const MOCK_SIMULATION_SIGNAL_DUPLICATE = 'mock_simulation_signal_duplicate';
 export const MOCK_SIMULATION_SOURCE_REFUSED = 'mock_simulation_value_source_refused';
 
-export interface MockSignal {
-  targetRole: string;
-  resourceRole: string;
-}
+export type MockSignal = ProgramSignalReference;
 
 export interface MockSimulationRow {
   signal: MockSignal;
@@ -53,11 +50,12 @@ function closed(record: Record<string, JsonValue>, required: readonly string[], 
 }
 
 export function mockSignalId(signal: MockSignal): string {
-  return `${signal.targetRole}/${signal.resourceRole}`;
+  return JSON.stringify([signal.component_id, signal.signal_name]);
 }
 
 const compareSignals = (left: MockSignal, right: MockSignal) => (
-  mockSignalId(left) < mockSignalId(right) ? -1 : mockSignalId(left) > mockSignalId(right) ? 1 : 0);
+  left.component_id < right.component_id ? -1 : left.component_id > right.component_id ? 1
+    : left.signal_name < right.signal_name ? -1 : left.signal_name > right.signal_name ? 1 : 0);
 
 /** The signals a condition compares (`condition_signals`), unique and sorted. */
 export function conditionSignals(condition: JsonValue | undefined): MockSignal[] {
@@ -68,8 +66,8 @@ export function conditionSignals(condition: JsonValue | undefined): MockSignal[]
     if (kind === null || record === null) return;
     if (kind === 'compare') {
       const signal = objectOf(objectOf(objectOf(record.compare)?.operand)?.signal);
-      if (typeof signal?.target_role === 'string' && typeof signal.resource_role === 'string') {
-        const item = { targetRole: signal.target_role, resourceRole: signal.resource_role };
+      if (typeof signal?.component_id === 'string' && typeof signal.signal_name === 'string') {
+        const item = { component_id: signal.component_id, signal_name: signal.signal_name };
         found.set(mockSignalId(item), item);
       }
       return;
@@ -84,16 +82,17 @@ export function conditionSignals(condition: JsonValue | undefined): MockSignal[]
 /**
  * The signals a node's condition reads, i.e. those it may simulate: the
  * interrupt condition's signals of the two interrupt motion nodes, the one
- * `(target_role, resource_role)` signal of the I/O input nodes, else none.
+ * direct signal of the I/O input nodes, else none.
  */
 export function nodeMockSignals(node: Pick<ProgramTreeNode, 'node_id' | 'parameters'>): MockSignal[] {
   const parameters = node.parameters ?? {};
   if ((INTERRUPT_MOTION_NODE_IDS as readonly string[]).includes(node.node_id)) {
     return conditionSignals(parameters.interrupt_condition);
   }
+  const signal = objectOf(parameters.signal);
   if ((IO_SIGNAL_INPUT_NODE_IDS as readonly string[]).includes(node.node_id)
-    && typeof parameters.target_role === 'string' && typeof parameters.resource_role === 'string') {
-    return [{ targetRole: parameters.target_role, resourceRole: parameters.resource_role }];
+    && typeof signal?.component_id === 'string' && typeof signal.signal_name === 'string') {
+    return [{ component_id: signal.component_id, signal_name: signal.signal_name }];
   }
   return [];
 }
@@ -113,13 +112,13 @@ export function parseMockSimulation(value: JsonValue | undefined): ParsedMockSim
       return invalid(index, 'needs exactly a signal, a start value and an optional change.');
     }
     const signal = objectOf(row.signal);
-    if (signal === null || !closed(signal, ['target_role', 'resource_role'])
-      || typeof signal.target_role !== 'string' || typeof signal.resource_role !== 'string') {
-      return invalid(index, 'signal must be exactly a target role and a resource role.');
+    if (signal === null || !closed(signal, ['component_id', 'signal_name'])
+      || typeof signal.component_id !== 'string' || typeof signal.signal_name !== 'string') {
+      return invalid(index, 'signal must be exactly a component and signal name.');
     }
     if (typeof row.start_value !== 'boolean') return invalid(index, 'start value must be true or false.');
     const parsed: MockSimulationRow = {
-      signal: { targetRole: signal.target_role, resourceRole: signal.resource_role },
+      signal: { component_id: signal.component_id, signal_name: signal.signal_name },
       startValue: row.start_value,
     };
     if (row.change !== undefined) {
@@ -140,7 +139,7 @@ export function parseMockSimulation(value: JsonValue | undefined): ParsedMockSim
 
 export function serializeMockSimulation(rows: readonly MockSimulationRow[]): JsonValue {
   return rows.map((row) => ({
-    signal: { target_role: row.signal.targetRole, resource_role: row.signal.resourceRole },
+    signal: { component_id: row.signal.component_id, signal_name: row.signal.signal_name },
     start_value: row.startValue,
     ...(row.change === undefined ? {} : { change: { after_ms: row.change.afterMs, value: row.change.value } }),
   }));
@@ -184,32 +183,20 @@ export function mockSimulationProblem(
   return problems.size === 0 ? null : [...problems.values()][0];
 }
 
-/**
- * The declared source profile of each signal a node reads, by `mockSignalId`,
- * from the current binding and Deployment Draft. A signal is missing when its
- * source is not declared there (unknown: the simulation stays editable).
- * Without a binding, the target resolves through `program` and the scenario
- * `roleAssignment` (targetRoleResolution).
- */
+/** Source profiles only from the current qualified Draft candidate. */
 export function mockSignalProfiles(
   signals: readonly MockSignal[],
-  binding: ProgramBindingDocument | null | undefined,
-  deploymentDocument: Record<string, JsonValue> | null,
-  program?: Pick<ProgramAuthoringDocument, 'target_roles'>,
-  roleAssignment?: Record<string, JsonValue> | null,
+  candidateSignals: readonly (CandidateSignalFact & { provider_profile?: string | null })[] | null,
 ): Map<string, IoSourceProfile> {
-  const declared = declaredIoSources(deploymentDocument);
-  const targets = binding == null
-    ? (program === undefined ? [] : resolvedTargetRoles(program, roleAssignment))
-    : binding.target_role_bindings;
   const result = new Map<string, IoSourceProfile>();
   for (const signal of signals) {
-    const target = targets?.find((row) => row.target_role_id === signal.targetRole);
-    if (target === undefined) continue;
-    const profile = declared.get(ioSourceKey(
-      target.controllable_component_id, target.command_target_id, signal.resourceRole,
-    ))?.profile;
-    if (profile !== undefined) result.set(mockSignalId(signal), profile);
+    const matches = (candidateSignals ?? []).filter((row) => !row.ambiguous
+      && row.reference.component_id === signal.component_id && row.reference.signal_name === signal.signal_name);
+    const profile = matches.length === 1 ? matches[0].provider_profile : null;
+    if (profile === 'mock' || profile === 'ros_bool' || profile === 'ros2_control_gpio'
+      || profile === 'geometric_contact') {
+      result.set(mockSignalId(signal), profile);
+    }
   }
   return result;
 }

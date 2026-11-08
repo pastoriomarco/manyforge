@@ -49,7 +49,7 @@ class ExecutionControlSubmission:
 
 
 class ExecutionControlLane(str, Enum):
-    """The two transport scheduling classes required by UI6."""
+    """The two transport scheduling classes of execution control."""
 
     STOP = "stop"
     ORDINARY = "ordinary"

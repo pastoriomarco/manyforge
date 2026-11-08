@@ -11,8 +11,8 @@ const probeEntry: CatalogEntry = {
   description: 'Execute a precision contact search with a scoped interrupt.', stability: 'stable',
   kind: 'leaf', childrenMin: 0, childrenMax: 0,
   parameters: [
-    { id: 'target_role', required: true,
-      schema: { type: 'string', 'x-manyforge-semantic-type': 'target_role' },
+    { id: 'target', required: true,
+      schema: { type: 'object', 'x-manyforge-semantic-type': 'target_reference' },
       schemaHash: 'sha256:t', hasDefault: false },
     { id: 'stop_mode', required: true,
       schema: { type: 'string', enum: ['spring_back_hold', 'soft_on_path', 'hard_deceleration', 'spring_back_fast'] },
@@ -29,14 +29,14 @@ describe('probe Stop warning', () => {
   it('shows the inherited-setting warning on the probe node without invalidating it', () => {
     const node: ProgramTreeNode = {
       node_id: 'motion.probe_search', instance_id: 'probe', children: [],
-      parameters: { target_role: 'arm', stop_mode: 'soft_on_path' },
+      parameters: { target: { component_id: 'robot', command_target_id: 'arm' }, stop_mode: 'soft_on_path' },
     };
     const program: ProgramAuthoringDocument = {
-      api_version: 'manyforge.program.v2', program_id: 'p', program_profile: 'composable-cell-v1',
-      name: 'P', catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.4.0' },
-      component_roles: { robot: {} }, target_roles: { arm: {} }, parameters: [],
+      api_version: 'manyforge.program.v3', program_id: 'p', program_profile: 'composable-cell-v1',
+      name: 'P', catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '3.0.0' },
+      parameters: [],
       blackboard: { namespaces: [], keys: [] },
-      schema_version: 'manyforge.composer_authoring_forest.v1', forest: [node], positions: {},
+      schema_version: 'manyforge.composer_authoring_forest.v2', forest: [node], positions: {},
     };
     const deployment = {
       // Compiled v1: intent v2 cannot carry a recoverable substitution.
@@ -54,9 +54,8 @@ describe('probe Stop warning', () => {
           },
         }] },
       } },
-      binding: { target_role_bindings: [
-        { target_role_id: 'arm', controllable_component_id: 'robot', command_target_id: 'arm' },
-      ] },
+      // The node's direct target resolves the Stop settings; no binding is needed.
+      binding: null,
     } as unknown as DeploymentWorkspaceResponse;
     const onInvalidEditChange = vi.fn();
     const before = JSON.stringify(node);

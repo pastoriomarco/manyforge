@@ -140,7 +140,7 @@ def _start_manager(root: Path) -> subprocess.Popen[bytes]:
         time.sleep(0.01)
     process.terminate()
     process.wait(timeout=5)
-    raise RuntimeError("Manager did not publish its complete H0 source set")
+    raise RuntimeError("Manager did not publish its complete source set")
 
 
 def _stop_manager(process: subprocess.Popen[bytes]) -> None:

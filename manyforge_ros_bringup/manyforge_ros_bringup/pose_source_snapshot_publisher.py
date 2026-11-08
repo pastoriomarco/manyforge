@@ -4,7 +4,7 @@ The process is a thin producer and the supervised process of one
 ``pose_source`` Deployment component (``source_id`` = component id). It
 normalizes depth-one JointState and Detection3D subscriptions plus bounded
 ``simulation_interfaces`` reads, then hands immutable observations to Manager.
-Each good observation it submits is also one sample of its binding's CP9
+Each good observation it submits is also one sample of its binding's
 stream (``poses/<object_id>/<policy_id>``), which the execution host declared.
 It owns no freshness, scene apply, lifecycle, command admission, or Composer
 protocol.
@@ -53,7 +53,11 @@ from manyforge_ros.pose_source_sidecar import (
     normalize_joint_state_message,
     read_simulation_entity_states,
 )
-from manyforge_ros.scene_mirror_probe import SimulationSceneMirrorClient
+from manyforge_ros.scene_mirror_probe import (
+    SimulationSceneMirrorClient,
+    _EntityOperationDispatcher,
+    _EntityOperationOwnerUnavailable,
+)
 
 
 class _Dispatcher(Protocol):
@@ -87,8 +91,17 @@ def _default_dispatcher_factory(
     )
 
 
-def _default_simulation_client_factory(node: Node, timeout_s: float) -> Any:
-    return SimulationSceneMirrorClient(node, service_timeout_s=timeout_s)
+def _default_simulation_client_factory(
+    node: Node,
+    timeout_s: float,
+    *,
+    entity_operation_dispatcher: _EntityOperationDispatcher | None = None,
+) -> Any:
+    return SimulationSceneMirrorClient(
+        node,
+        service_timeout_s=timeout_s,
+        entity_operation_dispatcher=entity_operation_dispatcher,
+    )
 
 
 class PoseSourceSnapshotPublisher(Node):
@@ -177,6 +190,7 @@ class PoseSourceSnapshotPublisher(Node):
         self._simulation_client: Any | None = None
         self._simulation_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._simulation_owner_fault = threading.Event()
         self._started = False
         self._stopped = False
         self._last_retry_log_s = 0.0
@@ -338,10 +352,77 @@ class PoseSourceSnapshotPublisher(Node):
         self._simulation_node = Node(
             "manyforge_isaac_pose_service_client", context=self.context
         )
-        self._simulation_client = self._simulation_client_factory(
-            self._simulation_node,
-            self._simulation_service_timeout_s,
-        )
+        if self._simulation_client_factory is _default_simulation_client_factory:
+            self._simulation_client = _default_simulation_client_factory(
+                self._simulation_node,
+                self._simulation_service_timeout_s,
+                entity_operation_dispatcher=(
+                    self._dispatch_simulation_entity_operation
+                ),
+            )
+        else:
+            self._simulation_client = self._simulation_client_factory(
+                self._simulation_node,
+                self._simulation_service_timeout_s,
+            )
+
+    def _dispatch_simulation_entity_operation(
+        self,
+        operation: Callable[[], Any],
+        *,
+        allow_stopped: bool = False,
+    ) -> Any:
+        """Run one client entity mutation on the attached executor thread.
+
+        The only foreign caller is the single simulation poll worker. It waits
+        for this short operation's result outside the owner thread before
+        issuing its next operation, so executor task ordering is not relied on.
+        Lifecycle close calls with ``allow_stopped`` only after joining that
+        worker; the entrypoint then runs on the same thread that called spin().
+        """
+        node = self._simulation_node
+        executor = None if node is None else node.executor
+        if executor is None or not executor.is_spinning:
+            if allow_stopped:
+                return operation()
+            raise _EntityOperationOwnerUnavailable(
+                "pose-source owner executor is not spinning"
+            )
+
+        completed = threading.Event()
+        state: dict[str, Any] = {}
+
+        def run_on_owner() -> None:
+            try:
+                state["result"] = operation()
+            except Exception as error:
+                state["error"] = error
+            finally:
+                completed.set()
+
+        try:
+            executor.create_task(run_on_owner)
+        except Exception as error:
+            self._simulation_owner_fault.set()
+            raise _EntityOperationOwnerUnavailable(
+                "pose-source owner executor failed to schedule an entity operation"
+            ) from error
+        while not completed.wait(0.01):
+            if executor.is_spinning:
+                continue
+            if completed.is_set():
+                break
+            raise _EntityOperationOwnerUnavailable(
+                "pose-source owner executor stopped before entity operation ran"
+            )
+
+        if "error" in state:
+            raise state["error"]
+        if "result" not in state:
+            raise _EntityOperationOwnerUnavailable(
+                "pose-source owner executor interrupted entity operation"
+            )
+        return state["result"]
 
     def _ensure_tf(self) -> None:
         if self._tf_buffer is not None:
@@ -534,6 +615,8 @@ class PoseSourceSnapshotPublisher(Node):
                             ),
                             source_key=entity,
                         )
+                if self._simulation_owner_fault.is_set():
+                    return
             except Exception as error:
                 if self._stop_event.is_set():
                     break
@@ -546,6 +629,8 @@ class PoseSourceSnapshotPublisher(Node):
                         error=normalized,
                         source_key=binding.request.entity,
                     )
+                if self._simulation_owner_fault.is_set():
+                    return
             remaining = max(0.0, period_s - (time.monotonic() - started))
             self._stop_event.wait(remaining)
 

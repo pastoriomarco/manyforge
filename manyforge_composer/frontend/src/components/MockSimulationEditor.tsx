@@ -17,7 +17,7 @@ function afterMsProblem(text: string): string | null {
 }
 
 /**
- * The node's "Mock simulation" (contracts 133/135): one line per signal the
+ * The node's "Mock simulation": one line per signal the
  * node's condition reads — its value when the node starts and optionally one
  * new value a number of ms after node start. Replayed on every node start;
  * applies only to Mock I/O sources. Stored rows for signals the node no
@@ -60,6 +60,7 @@ export function MockSimulationEditor({
       )}
       {signals.map((signal) => {
         const id = mockSignalId(signal);
+        const label = `${signal.component_id} · ${signal.signal_name}`;
         const index = rows.findIndex((row) => mockSignalId(row.signal) === id);
         const row = index < 0 ? null : rows[index];
         const profile = profiles.get(id);
@@ -68,9 +69,9 @@ export function MockSimulationEditor({
           ? (next === null ? undefined : save([...rows, next]))
           : replace(index, next));
         return (
-          <div className="interrupt-condition-compare" role="group" aria-label={`Mock ${id}`} key={id}>
-            <code>{id}</code>
-            <select aria-label={`${id} start value`} value={row === null ? '' : String(row.startValue)}
+          <div className="interrupt-condition-compare" role="group" aria-label={`Mock ${label}`} key={id}>
+            <code>{label}</code>
+            <select aria-label={`${label} start value`} value={row === null ? '' : String(row.startValue)}
               disabled={disabled}
               onChange={(event) => set(event.target.value === '' ? null
                 : { ...(row ?? { signal }), startValue: event.target.value === 'true' })}>
@@ -79,7 +80,7 @@ export function MockSimulationEditor({
               <option value="true">Start on</option>
             </select>
             {row !== null && (
-              <select aria-label={`${id} change`} value={row.change === undefined ? 'none' : 'change'}
+              <select aria-label={`${label} change`} value={row.change === undefined ? 'none' : 'change'}
                 disabled={disabled}
                 onChange={(event) => {
                   const start = { signal: row.signal, startValue: row.startValue };
@@ -93,7 +94,7 @@ export function MockSimulationEditor({
             {row?.change !== undefined && (
               <>
                 <DraftTextInput
-                  aria-label={`${id} change after (ms)`}
+                  aria-label={`${label} change after (ms)`}
                   inputMode="numeric"
                   size={6}
                   value={row.change.afterMs}
@@ -103,7 +104,7 @@ export function MockSimulationEditor({
                   onCommit={(text) => set({ ...row, change: { ...row.change!, afterMs: Number(text.trim()) } })}
                 />
                 <span>ms to</span>
-                <select aria-label={`${id} change value`} value={String(row.change.value)} disabled={disabled}
+                <select aria-label={`${label} change value`} value={String(row.change.value)} disabled={disabled}
                   onChange={(event) => set({ ...row, change: { ...row.change!, value: event.target.value === 'true' } })}>
                   <option value="false">off</option>
                   <option value="true">on</option>

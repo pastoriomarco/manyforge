@@ -28,14 +28,14 @@ function object(value: JsonValue | undefined): Row | null {
 }
 
 /**
- * A machine is one card (CONTRACTS §16; plan, "Authoring and Apply"): the
+ * A machine is one card: the
  * header names it and its model with the machine-wide state; then the lane
  * and the address, the owner's state rows, faults and actions; then one row
  * per member (deactivate switch, name selecting its settings, state, inline
  * messages and actions), and Remove. No nested cards. Members
  * come from the machine's package and are always all present: any member may
- * be deactivated, none removed (AUD-5b revised). Every state shown is the
- * pushed `ComponentState` (R4); edits are Draft edits.
+ * be deactivated, none removed. Every state shown is the
+ * pushed `ComponentState`; edits are Draft edits.
  */
 export function MachineCard({
   owner, members, machine, profiles, controller, states, enabled, selectedId, onSelect, onRemoved,

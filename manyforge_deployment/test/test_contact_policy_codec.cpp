@@ -23,7 +23,7 @@ namespace manyforge::deployment {
 namespace {
 
 constexpr std::string_view kSchemaRevision =
-    "sha256:c7ad633867abbe4583dee2eda51dca5b33bd8e8827777a8ac9ab86b2aba20490";
+    "sha256:f7adb173ef71d9de9011c85a19224cace5e721918fb1659fcada6ab93901ad33";
 
 static_assert(!std::is_aggregate_v<QualifiedContactPolicy>);
 static_assert(!std::is_default_constructible_v<QualifiedContactPolicy>);
@@ -40,9 +40,10 @@ static_assert(
 [[nodiscard]] CanonicalValue component_selector() {
   return CanonicalValue(CanonicalValue::Object{
       {"kind", CanonicalValue("component_model_body")},
-      {"component_role_id", CanonicalValue("robot")},
-      {"model_role_id", CanonicalValue("arm_model")},
-      {"collision_body_role_id", CanonicalValue("tool_collision")},
+      {"body", CanonicalValue(CanonicalValue::Object{
+                   {"component_id", CanonicalValue("robot")},
+                   {"collision_body_id", CanonicalValue("tool_collision")},
+               })},
   });
 }
 
@@ -177,9 +178,14 @@ TEST(ContactPolicyCodec, ProducesExactTypedGraspEnvelopeAndSelectors) {
       std::get<core::ContactGraspEnvelopeDTO>(selected_zone.envelope);
   EXPECT_DOUBLE_EQ(envelope.max_penetration_m, 0.002);
   EXPECT_DOUBLE_EQ(envelope.terminal_window_start_fraction, 0.8);
-  EXPECT_TRUE(
+  ASSERT_TRUE(
       std::holds_alternative<core::ContactComponentModelBodySelectorDTO>(
           selected_zone.body_pairs.front().body_a));
+  const auto &body = std::get<core::ContactComponentModelBodySelectorDTO>(
+                         selected_zone.body_pairs.front().body_a)
+                         .body;
+  EXPECT_EQ(body.component_id, core::ControllableComponentId("robot"));
+  EXPECT_EQ(body.collision_body_id, core::CollisionBodyRoleId("tool_collision"));
   EXPECT_TRUE(std::holds_alternative<core::ContactRuntimeObjectSelectorDTO>(
       selected_zone.body_pairs.front().body_b));
 }

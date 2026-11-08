@@ -24,7 +24,7 @@ function completeAddress(address: GizmoTargetAddress): boolean {
 
 /**
  * Convert a world-space gizmo anchor into a local, addressed authoring draft.
- * This is deliberately not an API command or candidate DTO: I6 must bind the
+ * This is deliberately not an API command or candidate DTO: a future client must bind the
  * draft to its qualified Program-Binding and command-schema contracts.
  */
 export function gizmoPoseDraft(

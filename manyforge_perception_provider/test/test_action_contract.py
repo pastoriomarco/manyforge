@@ -308,8 +308,8 @@ class TestActionContract(unittest.TestCase):
             self.node.destroy_service(service)
 
     def test_launch_shares_node_specific_asset_symmetry(self):
-        launch_path = Path(__file__).resolve().parents[1] / 'launch/phase1_orin.launch.py'
-        spec = importlib.util.spec_from_file_location('phase1_launch_fixture', launch_path)
+        launch_path = Path(__file__).resolve().parents[1] / 'launch/orin_perception.launch.py'
+        spec = importlib.util.spec_from_file_location('orin_perception_launch_fixture', launch_path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         with tempfile.TemporaryDirectory() as directory:

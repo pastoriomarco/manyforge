@@ -1,6 +1,6 @@
-api_version: manyforge.program.v2
+api_version: manyforge.program.v3
 program_id: vision_guided_pose_pick
-program_revision: sha256:15a79d601e0ff1b8ebf94a3aa5290221e95445b72017ed9ea752795bb04c11bb
+program_revision: sha256:116d55f473a2e261127685ade85e9417a28935800a2d4b96ed829434ff190bfc
 program_profile: composable-cell-v1
 name: vision_guided_pose_pick
 description: Preview Program for the typed vision-guided pose dataflow. A model response supplies bounded
@@ -8,8 +8,8 @@ description: Preview Program for the typed vision-guided pose dataflow. A model 
   intentionally fail-closed when a single-image model invents unreachable metric coordinates rather than
   grounding them in an authoritative pose source.
 catalog:
-  api_version: manyforge.node_catalog.v2
-  content_version: 2.9.0
+  api_version: manyforge.node_catalog.v3
+  content_version: 3.0.0
 compatibility:
   lanes:
   - manyforge-only
@@ -19,43 +19,6 @@ compatibility:
   tags:
   - ur5
   - vision-pick
-component_roles:
-  robot:
-    required_component_type_tags:
-    - articulated-arm
-    required_model_roles:
-    - arm_model
-target_roles:
-  arm:
-    component_role: robot
-    required_capabilities:
-    - capability_id: execution.feedback.phase_events
-      parameters: {}
-      disposition: required
-    - capability_id: execution.trajectory.execute
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.trajectory.time_parameterized
-      parameters: {}
-      disposition: required
-    - capability_id: state.observed.current
-      parameters: {}
-      disposition: required
-    - capability_id: validation.trajectory.non_collision
-      parameters: {}
-      disposition: required
-    required_frame_roles:
-    - base
-    - tcp
-    required_resource_roles:
-    - arm_joints
-    required_collision_body_roles:
-    - arm_collision
-    required_model_roles:
-    - arm_model
 scene:
 - scene_resource_id: left_part
   shape:
@@ -67,9 +30,9 @@ scene:
   pose:
     frame_ref:
       kind: component_frame
-      component_role: robot
-      model_role: arm_model
-      frame_role: base
+      frame:
+        component_id: ur5_robot
+        frame_id: base
     position_m:
     - 0.4
     - -0.14
@@ -91,9 +54,9 @@ scene:
   pose:
     frame_ref:
       kind: component_frame
-      component_role: robot
-      model_role: arm_model
-      frame_role: base
+      frame:
+        component_id: ur5_robot
+        frame_id: base
     position_m:
     - 0.4
     - 0.14
@@ -115,9 +78,9 @@ scene:
   pose:
     frame_ref:
       kind: component_frame
-      component_role: robot
-      model_role: arm_model
-      frame_role: base
+      frame:
+        component_id: ur5_robot
+        frame_id: base
     position_m:
     - 0.55
     - 0.0
@@ -174,8 +137,12 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_approach_pose
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: ur5_robot
+        command_target_id: arm
+      base_frame:
+        component_id: ur5_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       velocity_scale: 0.35
@@ -188,8 +155,12 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_grasp_pose
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: ur5_robot
+        command_target_id: arm
+      base_frame:
+        component_id: ur5_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       velocity_scale: 0.2
@@ -208,17 +179,25 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: retreat_after_grasp
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: ur5_robot
+        command_target_id: arm
+      base_frame:
+        component_id: ur5_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       target_mode: relative
       target_reference:
-        type: frame_role
-        frame_role_id: tcp
+        type: component_frame
+        frame:
+          component_id: ur5_robot
+          frame_id: tcp
       offset_reference:
-        type: frame_role
-        frame_role_id: base
+        type: component_frame
+        frame:
+          component_id: ur5_robot
+          frame_id: base
       goal:
         position_m:
         - 0.0
@@ -234,15 +213,20 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_place_pose
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: ur5_robot
+        command_target_id: arm
+      base_frame:
+        component_id: ur5_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       goal:
         frame_ref:
           kind: target_frame
-          target_role: arm
-          frame_role: base
+          frame:
+            component_id: ur5_robot
+            frame_id: base
         position_m:
         - 0.22
         - 0.0

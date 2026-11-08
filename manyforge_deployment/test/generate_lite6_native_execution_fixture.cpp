@@ -130,71 +130,72 @@ void write_exact_file(const std::filesystem::path &path,
   }
 }
 
-[[nodiscard]] CanonicalValue read_scenario_member(std::string_view scenario,
-                                                  std::string_view member) {
-  return deployment::parse_strict_json_model_yaml(
-             deployment::test::maintained_activation_fixture_detail::Read(
-                 std::filesystem::path(MANYFORGE_WORKSPACE_ROOT) / scenario /
-                 member))
-      .root();
-}
-
-/// The selected Program's roles: the maintained Scenario's own roles and
-/// assignment (`robot` -> the arm, `tool` -> its mounted gripper), or the
-/// standalone Robotiq Position owner.
-struct ProgramRoles final {
-  CanonicalValue component_roles;
-  CanonicalValue target_roles;
-  CanonicalValue assignment;
-};
-
-[[nodiscard]] ProgramRoles scenario_program_roles(std::string_view scenario) {
-  using deployment::test::maintained_activation_fixture_detail::Member;
-  const auto program = read_scenario_member(scenario, "program.yaml");
-  return {Member(program, "component_roles"), Member(program, "target_roles"),
-          read_scenario_member(scenario, "assignment.yaml")};
-}
-
-[[nodiscard]] ProgramRoles robotiq_program_roles() {
-  return {
-      deployment::parse_strict_json_model_yaml(R"({"robot":{}})").root(),
-      deployment::parse_strict_json_model_yaml(R"({"gripper":{
-        "component_role":"robot",
-        "required_capabilities":[
-          {"capability_id":"tool.gripper.command","parameters":{},"disposition":"required"},
-          {"capability_id":"tool.gripper.feedback","parameters":{},"disposition":"required"}],
-        "required_frame_roles":["tcp"],"required_resource_roles":["fingers"],
-        "required_collision_body_roles":["gripper_collision"],
-        "required_model_roles":["gripper_model"]}})").root(),
-      deployment::parse_strict_json_model_yaml(R"({
-        "component_roles":[{"component_role_id":"robot","controllable_component_id":"robotiq_gripper"}],
-        "target_roles":[{"command_target_id":"gripper","target_role_id":"gripper"}]})").root(),
-  };
-}
-
 [[nodiscard]] CanonicalValue make_program_root(const deployment::RetainedBundle &bundle,
-                                               const ProgramRoles &roles,
+                                               const std::optional<core::ProgramTargetReferenceDTO> &arm,
+                                               const std::optional<core::ProgramTargetReferenceDTO> &gripper,
+                                               const CanonicalValue::Array &joint_goal,
                                                const bool robotiq_position) {
   CanonicalValue::Array children;
-  if (robotiq_position) {
+  const auto target = [](const core::ProgramTargetReferenceDTO &ref) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"component_id", CanonicalValue(ref.component_id.value())},
+        {"command_target_id", CanonicalValue(ref.command_target_id.value())}});
+  };
+  if (gripper) {
     for (const auto preset : {"closed", "open"}) {
       children.emplace_back(CanonicalValue::Object{
           {"node_id", CanonicalValue("gripper.command_position")},
           {"instance_id", CanonicalValue(std::string("robotiq_") + preset)},
           {"parameters", CanonicalValue(CanonicalValue::Object{
-              {"target_role", CanonicalValue("gripper")},
-              {"position", CanonicalValue(CanonicalValue::Object{
-                  {"kind", CanonicalValue("named_preset")},
-                  {"name", CanonicalValue(preset)},
-              })},
+              {"target", target(*gripper)},
+              {"position", robotiq_position
+                  ? CanonicalValue(CanonicalValue::Object{{"kind", CanonicalValue("named_preset")},
+                                                           {"name", CanonicalValue(preset)}})
+                  : CanonicalValue(CanonicalValue::Object{{"kind", CanonicalValue("linear_m")},
+                                                           {"value_m", CanonicalValue(std::string_view(preset) == "open" ? 0.0081 : 0.0)}})},
               {"command_duration_s", CanonicalValue(1.0)},
           })},
           {"children", CanonicalValue(CanonicalValue::Array{})},
       });
     }
   }
-  return CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.program.v2")},
+  if (arm) {
+    if (joint_goal.empty()) throw std::logic_error("native motion fixture has no real source joints");
+    const auto base = CanonicalValue(CanonicalValue::Object{
+        {"component_id", CanonicalValue(arm->component_id.value())}, {"frame_id", CanonicalValue("base")}});
+    children.emplace_back(CanonicalValue::Object{
+        {"node_id", CanonicalValue("model.get_frame_pose")},
+        {"instance_id", CanonicalValue("fixture_fk")},
+        {"parameters", CanonicalValue(CanonicalValue::Object{
+            {"target", target(*arm)}, {"frame", base}, {"output_key", CanonicalValue("fixture_pose")}})},
+        {"children", CanonicalValue(CanonicalValue::Array{})}});
+    const auto pose = deployment::parse_strict_json_model_yaml(
+        R"({"position_m":[0.3,0.0,0.3],"orientation":{"xyzw":[0,0,0,1]}})").root();
+    const auto add_motion = [&](std::string_view id, std::string_view instance,
+                                std::string_view parameter, CanonicalValue value) {
+      CanonicalValue::Object parameters{{"target", target(*arm)}, {"base_frame", base},
+                                        {std::string(parameter), std::move(value)}};
+      if (gripper) {
+        parameters.emplace_back("tcp_endpoint", CanonicalValue(CanonicalValue::Object{
+            {"kind", CanonicalValue("entry")}, {"target", target(*gripper)},
+            {"frame", CanonicalValue(CanonicalValue::Object{
+                {"component_id", CanonicalValue(gripper->component_id.value())},
+                {"frame_id", CanonicalValue("tcp")}})}}));
+      }
+      children.emplace_back(CanonicalValue::Object{
+          {"node_id", CanonicalValue(std::string(id))}, {"instance_id", CanonicalValue(std::string(instance))},
+          {"parameters", CanonicalValue(std::move(parameters))},
+          {"children", CanonicalValue(CanonicalValue::Array{})}});
+    };
+    add_motion("motion.move_to_joint_target", "fixture_joint", "goal", CanonicalValue(joint_goal));
+    add_motion("motion.move_to_pose", "fixture_pose", "goal", pose);
+    const auto next_pose = deployment::parse_strict_json_model_yaml(
+        R"({"position_m":[0.31,0.0,0.3],"orientation":{"xyzw":[0,0,0,1]}})").root();
+    add_motion("motion.follow_cartesian_path", "fixture_cartesian", "path",
+               CanonicalValue(CanonicalValue::Array{pose, next_pose}));
+  }
+  CanonicalValue::Object root{
+      {"api_version", CanonicalValue("manyforge.program.v3")},
       {"program_id", CanonicalValue(robotiq_position
           ? "i6_robotiq_position_gripper_program" : "i6_native_joint_motion_program")},
       {"program_revision", CanonicalValue(std::string(kZeroDigest))},
@@ -203,13 +204,11 @@ struct ProgramRoles final {
           ? "I6 standalone Robotiq Position commands" : "I6 addressed native joint motion")},
       {"catalog",
        CanonicalValue(CanonicalValue::Object{
-           {"api_version", CanonicalValue("manyforge.node_catalog.v2")},
+           {"api_version", CanonicalValue("manyforge.node_catalog.v3")},
            {"content_version",
             CanonicalValue(
                 bundle.value().catalogs.node_environment.content_version)},
        })},
-      {"component_roles", roles.component_roles},
-      {"target_roles", roles.target_roles},
       {"execution_groups",
        CanonicalValue(CanonicalValue::Object{
            {"selection.a",
@@ -228,17 +227,27 @@ struct ProgramRoles final {
                    {"parameters", CanonicalValue(CanonicalValue::Object{})},
                    {"children", CanonicalValue(std::move(children))},
                })},
-  });
+  };
+  if (arm) {
+    root.emplace_back("blackboard", CanonicalValue(CanonicalValue::Object{
+        {"namespaces", CanonicalValue(CanonicalValue::Array{})},
+        {"keys", CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+            {"key", CanonicalValue("fixture_pose")}, {"type", CanonicalValue("stored_pose")},
+            {"access", CanonicalValue("read_write")}, {"persistence", CanonicalValue("run")}})})}}));
+  }
+  return CanonicalValue(std::move(root));
 }
 
 [[nodiscard]] std::string make_program_bytes(const deployment::RetainedBundle &bundle,
-                                             const ProgramRoles &roles,
+                                             const std::optional<core::ProgramTargetReferenceDTO> &arm,
+                                             const std::optional<core::ProgramTargetReferenceDTO> &gripper,
+                                             const CanonicalValue::Array &joint_goal,
                                              const bool robotiq_position) {
-  CanonicalValue root = make_program_root(bundle, roles, robotiq_position);
+  CanonicalValue root = make_program_root(bundle, arm, gripper, joint_goal, robotiq_position);
   const std::string revision = deployment::detail::compute_content_identity(
       root, deployment::detail::ContentIdentitySpec{
                 .identity_domain = "program-revision",
-                .api_version = "manyforge.program.v2",
+                .api_version = "manyforge.program.v3",
                 .own_field = "program_revision",
             });
   auto members = root.as_object();
@@ -498,30 +507,61 @@ int main(int argc, char **argv) {
           }) != 1)
         throw std::logic_error("Robotiq Position fixture must keep exactly one software hard floor");
     }
-    const auto roles = robotiq_position
-        ? robotiq_program_roles()
-        : scenario_program_roles(arguments.fixture_kind == FixtureKind::kUr5ArmOnlyRos
-                                     ? kUr5Scenario : kLite6Scenario);
-    const auto has_target = [&](std::string_view role) {
-      return roles.target_roles.find_object_member(role) != nullptr;
-    };
-    const bool include_arm = has_target("arm");
-    const bool include_gripper = has_target("gripper");
+    std::optional<core::ProgramTargetReferenceDTO> arm_target;
+    std::optional<core::ProgramTargetReferenceDTO> gripper_target;
+    for (const auto &row : bundle.value().cell_graph.control_bindings) {
+      const core::ProgramTargetReferenceDTO target{row.controllable_component_id, row.command_target_id};
+      auto *slot = row.capability_id.value() == "execution.trajectory.execute" ? &arm_target
+                 : row.capability_id.value() == "tool.gripper.command" ? &gripper_target : nullptr;
+      if (slot && *slot && **slot != target)
+        throw std::logic_error("native fixture has ambiguous command targets");
+      if (slot) *slot = target;
+    }
+    const bool include_arm = arm_target.has_value();
+    const bool include_gripper = gripper_target.has_value();
+    if (include_arm == robotiq_position || (robotiq_position && !include_gripper))
+      throw std::logic_error("native fixture has an unexpected motion/gripper target shape");
+    CanonicalValue::Array joint_goal;
+    if (arm_target) {
+      const auto arm = std::find_if(model_map->control_bindings().begin(), model_map->control_bindings().end(),
+          [&](const auto &row) {
+            return row.controllable_component_id == arm_target->component_id &&
+                   row.command_target_id == arm_target->command_target_id;
+          });
+      if (arm == model_map->control_bindings().end())
+        throw std::logic_error("native fixture arm has no verified source joint map");
+      std::set<std::string> names;
+      for (const auto &resource : arm->resources)
+        for (const auto &coordinate : resource.coordinates)
+          if (names.insert(coordinate.source_joint_name).second)
+            joint_goal.emplace_back(CanonicalValue::Object{{"joint_name", CanonicalValue(coordinate.source_joint_name)},
+                                                           {"position_rad", CanonicalValue(0.0)}});
+    }
     const std::string program_bytes =
-        make_program_bytes(bundle, roles, robotiq_position);
-    const auto program =
-        deployment::verify_program_binding_contract(program_bytes, bundle);
+        make_program_bytes(bundle, arm_target, gripper_target, joint_goal, robotiq_position);
     deployment::FilesystemCatalogArtifactStore catalog_store(package_root);
-    const auto assignment = deployment::parse_program_role_assignment(roles.assignment);
+    const auto program =
+        deployment::verify_program_binding_contract(program_bytes, bundle, model_map, catalog_store);
     auto binding = deployment::compile_program_binding(
-        *program, assignment, bundle, *model_map, catalog_store);
+        *program, bundle, *model_map, catalog_store);
+    if (arm_target) {
+      const auto &targets = binding->value().target_bindings;
+      const auto arm = std::find_if(targets.begin(), targets.end(),
+          [&](const auto &row) { return row.target == *arm_target; });
+      if (arm == targets.end() || std::none_of(arm->capability_bindings.begin(),
+          arm->capability_bindings.end(), [](const auto &capability) {
+            return capability.capability_id.value() == "model.kinematics.fk";
+          }))
+        throw std::logic_error("native motion fixture does not bind the authored FK requirement");
+    }
     deployment::FilesystemProgramRepository program_repository(package_root);
     if (!program_repository.put_if_absent(program, bundle)) {
       throw std::logic_error("native execution fixture Program already exists");
     }
     deployment::FilesystemProgramBindingRepository binding_repository(
         package_root);
-    if (!binding_repository.put_if_absent(binding, bundle, *model_map)) {
+    if (!binding_repository.put_if_absent(
+            binding, bundle, *model_map, catalog_store)) {
       throw std::logic_error(
           "native execution fixture Program Binding already exists");
     }
@@ -555,17 +595,14 @@ int main(int argc, char **argv) {
     write_exact_file(program_path, program_bytes);
     write_exact_file(output_root / "program_binding.json",
                      std::string(binding->canonical_bytes()));
-    // Component ids in Prepare/Enable order: the arm owner, then its tool.
+    // Exact referenced components in stable order.
     CanonicalValue::Array component_ids;
-    std::string gripper_component_role;
-    for (const auto &row : roles.assignment.find_object_member("component_roles")->as_array())
-      component_ids.push_back(*row.find_object_member("controllable_component_id"));
-    if (include_gripper)
-      gripper_component_role =
-          roles.target_roles.find_object_member("gripper")
-              ->find_object_member("component_role")->as_string();
+    std::set<std::string> components;
+    if (arm_target) components.insert(arm_target->component_id.value());
+    if (gripper_target) components.insert(gripper_target->component_id.value());
+    for (const auto &id : components) component_ids.emplace_back(id);
     CanonicalValue::Object manifest_members{
-        {"api_version", CanonicalValue("manyforge.i6.native-execution-fixture.v1")},
+        {"api_version", CanonicalValue("manyforge.i6.native-execution-fixture.v2")},
         {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
         {"retained_bundle_id", CanonicalValue(bundle.retained_bundle_id().value())},
         {"graph_revision", CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
@@ -576,12 +613,11 @@ int main(int argc, char **argv) {
         {"program_revision", CanonicalValue(program->value().program_revision.value())},
         {"program_binding_id", CanonicalValue(binding->program_binding_id().value())},
         {"controllable_component_ids", CanonicalValue(std::move(component_ids))},
-        {"component_role_id", CanonicalValue(include_arm ? "robot" : gripper_component_role)},
     };
     if (include_gripper) {
-      manifest_members.emplace_back("gripper_component_role_id",
-                                    CanonicalValue(gripper_component_role));
-      manifest_members.emplace_back("gripper_target_role_id", CanonicalValue("gripper"));
+      manifest_members.emplace_back("gripper_target", CanonicalValue(CanonicalValue::Object{
+          {"component_id", CanonicalValue(gripper_target->component_id.value())},
+          {"command_target_id", CanonicalValue(gripper_target->command_target_id.value())}}));
       manifest_members.emplace_back("gripper_capability_id",
                                     CanonicalValue("tool.gripper.command"));
       manifest_members.emplace_back(
@@ -601,7 +637,9 @@ int main(int argc, char **argv) {
       manifest_members.emplace_back("gripper_output_mode", CanonicalValue("commanded"));
       manifest_members.emplace_back("gripper_command_duration_s", CanonicalValue(1.0));
     } else {
-      manifest_members.emplace_back("target_role_id", CanonicalValue("arm"));
+      manifest_members.emplace_back("motion_target", CanonicalValue(CanonicalValue::Object{
+          {"component_id", CanonicalValue(arm_target->component_id.value())},
+          {"command_target_id", CanonicalValue(arm_target->command_target_id.value())}}));
       manifest_members.emplace_back("execution_capability_id",
                                     CanonicalValue("execution.trajectory.execute"));
       manifest_members.emplace_back(

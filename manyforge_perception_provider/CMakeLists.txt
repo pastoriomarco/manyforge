@@ -63,7 +63,7 @@ if(BUILD_TESTING)
   target_link_libraries(test_provider_model provider_model)
   ament_add_gtest(test_native_translation test/test_native_translation.cpp)
   target_link_libraries(test_native_translation native_translation)
-  # The launch test runs in its own ROS domain (Fast DDS #6599, N16).
+  # The launch test runs in its own ROS domain (Fast DDS #6599).
   add_launch_test(test/test_action_contract.py TIMEOUT 90
     RUNNER "${ament_cmake_ros_DIR}/run_test_isolated.py"
     ENV ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST)

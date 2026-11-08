@@ -86,7 +86,7 @@ inline constexpr std::size_t kMaxRos2ControlExecutionRuntimeManifestBytes =
 inline constexpr std::size_t
     kMaxRos2ControlExecutionLaunchDescriptorBytes = 4U * 1024U;
 
-/// Q85: reject collisions on the exclusive topics of the known Isaac profiles.
+/// Reject collisions on the exclusive topics of the known Isaac profiles.
 /// Both authored compilation and retained activation use this one check. Only
 /// an arm (a component with a motion target limit) owns those topics.
 void require_no_exclusive_ros_controller_topic_collision(
@@ -111,7 +111,7 @@ void require_no_exclusive_ros_controller_topic_collision(
 decode_ros2_control_execution_gripper_target_configurations(
     const core::JsonValueDTO::Array &rows);
 
-/// CP9: the strict `component_streams` rows of one ROS unit configuration,
+/// The strict `component_streams` rows of one ROS unit configuration,
 /// sorted by (component, stream). Exactly `measured_joints` for every
 /// controller-profile component plus `gripper_feedback` for every gripper-row
 /// component; `fault` + `auto` is refused. Shared by the pre-Draft row hook
@@ -127,11 +127,11 @@ decode_ros2_control_execution_component_streams(
 [[nodiscard]] std::optional<core::StopLeadInAnchor>
 decode_ros2_control_stop_lead_in_anchor(const std::optional<std::string> &value);
 
-/// M6b: a controller profile row's optional `controller_tcp_offset_sync`
+/// A controller profile row's optional `controller_tcp_offset_sync`
 /// (absent: on); a value that is not a boolean is refused.
 [[nodiscard]] bool decode_ros2_control_tcp_offset_sync(const core::JsonValueDTO *value);
 
-/// DX817: one source classifier for the already-qualified selected graph.
+/// One source classifier for the already-qualified selected graph.
 /// Absence preserves the historical physical/default Stop contract. A returned
 /// enum comes only from the exact strict ROS target row, never a policy token.
 [[nodiscard]] std::optional<core::GripperActuationKind>

@@ -161,7 +161,8 @@ public:
               "metadata");
         }
         ConfigureDurability(database_);
-        Transaction transaction(database_, "BEGIN IMMEDIATE");
+        Transaction transaction(database_, "BEGIN IMMEDIATE",
+                                &maintenance_snapshot_cache_);
         Exec(database_, detail::kEmbeddedCanonicalEmptySceneSchema);
         InsertMetadata(database_, fixed_query_, admission_digest_);
         Exec(database_, detail::kEmbeddedLogicalSceneTransactionMigration);
@@ -181,7 +182,8 @@ public:
         if (version == kCanonicalEmptySceneStoreSchemaVersion) {
           ValidateBaseDatabase(database_, fixed_query_, admission_digest_);
           ConfigureDurability(database_);
-          Transaction transaction(database_, "BEGIN IMMEDIATE");
+          Transaction transaction(database_, "BEGIN IMMEDIATE",
+                                &maintenance_snapshot_cache_);
           Exec(database_, detail::kEmbeddedLogicalSceneTransactionMigration);
           InsertMigrationMetadata(database_);
           Exec(database_, detail::kEmbeddedNativeProjectionHandoffMigration);
@@ -198,7 +200,8 @@ public:
           ValidateTransactionDatabase(database_, fixed_query_,
                                       admission_digest_);
           ConfigureDurability(database_);
-          Transaction transaction(database_, "BEGIN IMMEDIATE");
+          Transaction transaction(database_, "BEGIN IMMEDIATE",
+                                &maintenance_snapshot_cache_);
           Exec(database_, detail::kEmbeddedNativeProjectionHandoffMigration);
           InsertNativeHandoffMigrationMetadata(database_);
           Exec(database_, detail::kEmbeddedBoundedHistoryMigration);
@@ -213,7 +216,8 @@ public:
           ValidateNativeHandoffDatabase(database_, fixed_query_,
                                         admission_digest_);
           ConfigureDurability(database_);
-          Transaction transaction(database_, "BEGIN IMMEDIATE");
+          Transaction transaction(database_, "BEGIN IMMEDIATE",
+                                &maintenance_snapshot_cache_);
           Exec(database_, detail::kEmbeddedBoundedHistoryMigration);
           InsertBoundedHistoryMigrationMetadata(database_);
           Exec(database_, detail::kEmbeddedMaintenanceInitializationMigration);
@@ -224,7 +228,8 @@ public:
           changed_schema = true;
         } else if (version == kBoundedHistoryStoreSchemaVersion) {
           ConfigureDurability(database_);
-          Transaction transaction(database_, "BEGIN IMMEDIATE");
+          Transaction transaction(database_, "BEGIN IMMEDIATE",
+                                &maintenance_snapshot_cache_);
           Exec(database_, detail::kEmbeddedMaintenanceInitializationMigration);
           InsertMaintenanceInitializationMigrationMetadata(database_);
           Exec(database_, detail::kEmbeddedInitialSceneBaselineMigration);
@@ -233,7 +238,8 @@ public:
           changed_schema = true;
         } else if (version == kMaintenanceInitializationSchemaVersion) {
           ConfigureDurability(database_);
-          Transaction transaction(database_, "BEGIN IMMEDIATE");
+          Transaction transaction(database_, "BEGIN IMMEDIATE",
+                                &maintenance_snapshot_cache_);
           Exec(database_, detail::kEmbeddedInitialSceneBaselineMigration);
           InsertInitialSceneBaselineMigrationMetadata(database_);
           transaction.Commit();
@@ -249,7 +255,8 @@ public:
       }
       if (ScalarInteger(database_, "PRAGMA user_version") ==
           kInitialSceneBaselineSchemaVersion) {
-        Transaction transaction(database_, "BEGIN IMMEDIATE");
+        Transaction transaction(database_, "BEGIN IMMEDIATE",
+                                &maintenance_snapshot_cache_);
         ConvertProviderObservationEvidence(database_);
         transaction.Commit();
         changed_schema = true;
@@ -288,6 +295,7 @@ public:
       auto lifecycle_lock = sqlite_lifecycle_internal::
           AcquireCanonicalEmptySceneStoreLifecycleLockForClose();
       if (database_ != nullptr) {
+        maintenance_statements_.Clear();
         if (sqlite3_close_v2(database_) == SQLITE_OK) {
           database_ = nullptr;
         }
@@ -300,6 +308,8 @@ public:
     std::lock_guard operation_lock(maintenance_operation_mutex_);
     std::lock_guard lock(mutex_);
     InvalidateSceneCommitState();
+    maintenance_snapshot_cache_.Clear();
+    maintenance_statements_.Clear();
     auto lifecycle_lock = sqlite_lifecycle_internal::
         AcquireCanonicalEmptySceneStoreLifecycleLockForClose();
     if (database_ == nullptr) {
@@ -328,8 +338,10 @@ public:
 
   [[nodiscard]] DurableState ReadStateTransaction() const {
     auto *value = database();
-    Transaction transaction(value, "BEGIN");
-    auto state = ReadCompleteDurableState(value, fixed_query_);
+    Transaction transaction(value, "BEGIN", &maintenance_snapshot_cache_);
+    auto state = ReadCompleteDurableState(value, fixed_query_,
+                                          &maintenance_snapshot_cache_,
+                                          &maintenance_statements_);
     transaction.Commit();
     return state;
   }
@@ -342,8 +354,10 @@ public:
       return *scene_commit_state_cache_;
     }
 
-    Transaction transaction(value, "BEGIN");
-    auto durable_state = ReadCompleteDurableState(value, fixed_query_);
+    Transaction transaction(value, "BEGIN", &maintenance_snapshot_cache_);
+    auto durable_state = ReadCompleteDurableState(value, fixed_query_,
+                                          &maintenance_snapshot_cache_,
+                                          &maintenance_statements_);
     std::optional<SceneTransactionStoreState> transaction_state;
     if (durable_state.accepted.has_value() &&
         durable_state.finalization_receipt.has_value()) {
@@ -399,6 +413,8 @@ public:
   mutable std::mutex mutex_;
   sqlite3 *database_{};
   mutable std::optional<SceneCommitStateCache> scene_commit_state_cache_;
+  mutable MaintenanceSnapshotCache maintenance_snapshot_cache_;
+  mutable PersistentStatementCache maintenance_statements_;
 };
 
 } // namespace manyforge::scene

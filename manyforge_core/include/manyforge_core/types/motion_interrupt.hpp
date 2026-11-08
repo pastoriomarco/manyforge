@@ -81,9 +81,8 @@ struct MotionInterruptSoftOnPathPlannerConfigDTO {
   bool jerk_limits_enabled = true;
 };
 
-/// Controlled-stop capability surface declared by an execution backend
-/// (spec/240 backend capability profile; spec/260 §5.6 dual-boundary
-/// capability validation). The kernel reads this once at execution
+/// Controlled-stop capability surface declared by an execution backend.
+/// The kernel reads this once at execution
 /// time and gates pre-dispatch arming against it. Default empty means
 /// the backend has not declared any controlled-stop modes and any
 /// `complete_move_on_signal` execute request fails closed at arm time.
@@ -118,7 +117,7 @@ struct MotionInterruptStopCapabilityDTO {
 };
 
 /// Controlled-stop profile requested by a motion-scoped interrupt
-/// binding (spec/210 §3.11 `MotionInterruptStopProfileDTO`).
+/// binding.
 ///
 /// Selected by the motion node (e.g. `MoveUntilSignal` /
 /// `ProbeSearchMove`) and executed only by the kernel/backend path.
@@ -140,7 +139,7 @@ struct MotionInterruptStopProfileDTO {
   /// spring-back the value is split into equal forward-deceleration (lead-in
   /// included) and reverse-return halves.
   std::optional<double> deceleration_time_s;
-  /// Q28/Q51 (`main`'s per-profile override): upper bound on this robot's
+  /// `main`'s per-profile override: upper bound on this robot's
   /// controlled Stop, measured from the Stop request. Absent: the deceleration
   /// time (or its default) plus `complete_move_on_signal_timeout` (500 ms).
   std::optional<double> max_stop_time_s;
@@ -371,14 +370,14 @@ inline std::string motion_interrupt_stop_profile_field_error(
 }
 
 /// Result of a controlled-stop request issued to the execution backend
-/// at trip time (spec/260 §5.6). The backend MUST set
+/// at trip time. The backend MUST set
 /// `accepted=false` and a populated `error` when it cannot execute any
 /// controlled stop (including the trivial native-simulated path);
 /// otherwise it reports the mode it actually executed, which surface
 /// issued the stop, whether the controller confirmed, and the timing
 /// fields the kernel later embeds in `MotionTripOutcomeDTO`.
 ///
-/// The kernel applies the conjunctive fallback rule (spec/210 §3.11)
+/// The kernel applies the conjunctive fallback rule
 /// to this result before declaring `signal_trip` success. Any of the
 /// following degrades the outcome to `failed`: `accepted=false`,
 /// `backend_stop_confirmed=false`, `confirmation_latency_ns` exceeding the
@@ -407,7 +406,7 @@ struct ControlledStopResultDTO {
       MotionInterruptStopCommandSource::kDiagnosticOther;
   /// `true` only when the backend's controller acknowledged the
   /// controlled stop within the deadline. Required for a successful
-  /// `signal_trip` outcome (spec/210 §3.11).
+  /// `signal_trip` outcome.
   bool backend_stop_confirmed = false;
   /// Time from `execute_controlled_stop` call to backend
   /// acknowledgement. Echoed into `MotionTripOutcomeDTO.latch_to_stop_confirmed_ns`
@@ -436,7 +435,7 @@ struct ControlledStopResultDTO {
   std::optional<ErrorDTO> error;
   /// Bounded JSON-safe diagnostics. MUST carry a stable
   /// `command_source` reason when `stop_command_source ==
-  /// kDiagnosticOther` (spec/210 §3.11).
+  /// kDiagnosticOther`.
   InterruptStructuredValue diagnostics;
 };
 
@@ -538,7 +537,7 @@ struct ControlledStopResultDTO {
 }
 
 /// Per-move binding that arms a `kMove`-scoped interrupt policy for
-/// exactly one `ExecuteRequestDTO` (spec/260 §2.6).
+/// exactly one `ExecuteRequestDTO`.
 ///
 /// Carried on `ExecuteRequestDTO.motion_interrupt_scopes`, so arming is
 /// atomic with dispatch — the behavior runtime never owns a separate
@@ -558,19 +557,19 @@ struct MotionInterruptScopeDTO {
   std::optional<std::int64_t> arm_timeout_ns;
   /// Opaque BT blackboard key the behavior runtime associates with the
   /// resulting `MotionTripOutcomeDTO`. The kernel does not interpret
-  /// the key but persists it; format rule (spec/260 §2.6): UTF-8,
+  /// the key but persists it; format rule: UTF-8,
   /// 1–128 bytes, no NUL, matches `[A-Za-z_][A-Za-z0-9_.:-]*`.
   std::optional<std::string> result_binding_key;
   /// v1 MUST be `true`; present so later advisory scopes can downgrade
   /// without a schema break.
   bool required = true;
-  /// Controlled-stop profile (spec/260 §5.6 + spec/210 §3.11)
+  /// Controlled-stop profile
   /// selected by the motion node. REQUIRED when the bound
   /// policy's `preemption_action == kCompleteMoveOnSignal`; missing
   /// here is an arm-time rejection. Free-move / non-trip scopes (none
   /// in v1) MAY omit.
   std::optional<MotionInterruptStopProfileDTO> stop_profile;
-  /// Motion-node category metadata for authored Stop guidance (spec/210 §3.11).
+  /// Motion-node category metadata for authored Stop guidance.
   /// `kGeneric` matches `MoveUntilSignal`-class nodes; `kPrecisionContact`
   /// matches `ProbeSearchMove`-class nodes. Natural completion and qualified
   /// recoverable substitution retain their authored choices in both categories.
@@ -580,7 +579,7 @@ struct MotionInterruptScopeDTO {
 };
 
 /// Source from which the kernel captured a controlled stop snapshot
-/// for a motion-execution terminal outcome (spec/210 §3.11).
+/// for a motion-execution terminal outcome.
 enum class ExecutionStopSnapshotSource {
   /// Preferred: backend-reported stopped joint state and time.
   kExecutionBackendFeedback,
@@ -592,7 +591,7 @@ enum class ExecutionStopSnapshotSource {
 };
 
 /// Stop-state observation captured by the kernel after a
-/// `complete_move_on_signal` latch (spec/260 §5.6). Distinct from
+/// `complete_move_on_signal` latch. Distinct from
 /// `ExecutionSnapshotDTO`: certifies a *final* stop for one motion
 /// outcome, not an in-flight progress sample.
 struct ExecutionStopSnapshotDTO {
@@ -616,7 +615,7 @@ struct ExecutionStopSnapshotDTO {
 };
 
 /// Records exactly one winning desired-trip latch under a move-scoped
-/// interrupt binding (spec/210 §3.11). Embedded inside
+/// interrupt binding. Embedded inside
 /// `MotionExecutionOutcomeDTO` only when
 /// `terminal_cause == kSignalTrip`. The DTO requires a validated stop
 /// snapshot, so it is never present on failure outcomes.
@@ -629,7 +628,7 @@ struct MotionTripOutcomeDTO {
   /// Exact profile carried by the winning scope. The backend MUST
   /// report both requested and executed stop modes; a
   /// successful `signal_trip` outcome is invalid if the executed mode
-  /// is unknown (spec/210 §3.11).
+  /// is unknown.
   MotionInterruptStopProfileDTO requested_stop_profile;
   /// Mode the backend actually executed. MUST match
   /// `requested_stop_profile.stop_mode` unless this is the explicitly
@@ -665,7 +664,7 @@ struct MotionTripOutcomeDTO {
   /// `executed_stop_mode != requested_stop_profile.stop_mode`.
   std::optional<std::string> fallback_reason;
   /// The originating scope's
-  /// `MotionInterruptScopeDTO.result_binding_key` (spec/260 §2.6),
+  /// `MotionInterruptScopeDTO.result_binding_key`,
   /// echoed into the trip outcome so BT/runtime consumers can
   /// correlate the outcome with the blackboard slot that owns its
   /// downstream result. Absent when the scope did not set the key.
@@ -673,7 +672,7 @@ struct MotionTripOutcomeDTO {
   InterruptStructuredValue diagnostics;
 };
 
-/// Terminal-cause taxonomy for a motion execution (spec/210 §3.11).
+/// Terminal-cause taxonomy for a motion execution.
 enum class MotionExecutionTerminalCause {
   /// Trajectory reached planned endpoint; move carried no scopes.
   kCompletedNormally,
@@ -698,7 +697,7 @@ enum class MotionExecutionTerminalCause {
   kInterruptedFault,
 };
 
-/// Immutable terminal record of one motion execution (spec/210 §3.11).
+/// Immutable terminal record of one motion execution.
 /// Stored in the kernel's terminal-outcome surface; queryable via
 /// `get_execution_outcome(execution_id)`. Emitted exactly
 /// once per terminal execution; never mutated after publication.

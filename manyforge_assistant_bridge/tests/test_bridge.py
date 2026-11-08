@@ -215,7 +215,7 @@ def _request(projection: dict[str, Any]) -> dict[str, Any]:
             "candidateAvailable": True,
             "programRevision": "sha256:" + "8" * 64,
             "program": {
-                "api_version": "manyforge.program.v2",
+                "api_version": "manyforge.program.v3",
                 "program_revision": "sha256:" + "8" * 64,
             },
             "diagnostics": [],
@@ -705,6 +705,38 @@ def test_bridge_rejects_a_self_consistent_but_nonactive_projection_before_model(
     assert upstream_calls == 0
     audit = [json.loads(line) for line in (tmp_path / "audit.jsonl").read_text().splitlines()]
     assert audit[-1]["exitReason"] == "assistant_projection_stale"
+
+
+def test_bridge_accepts_a_projection_whose_source_observation_moved_on(
+    tmp_path: Path,
+) -> None:
+    # Composer's read and the bridge's read are separate Headless reads; the
+    # Manager section's age, generations and digest move between them.
+    projection = _projection()
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ok"}}]}, request=request
+        )
+
+    async def composer(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, request=request)
+
+    service = _service(
+        tmp_path, projection, upstream_handler=upstream, composer_handler=composer
+    )
+    forwarded = deepcopy(projection)
+    forwarded["source"]["receiver_age_ns"] = 250_000_000
+    forwarded["source"]["projection_generation"] = 0
+    forwarded["source"]["selection_source_generation"] = 0
+    forwarded["source"]["selection_source_content_digest"] = "sha256:" + "6" * 64
+    with TestClient(create_app(service.config, service=service)) as client:
+        body = _request(forwarded)
+        assert client.post("/v1/manyforge/assistant", json=body).status_code == 202
+        status = _terminal(client, "request.1")
+
+    assert status["state"] == "completed"
+    assert status["response"]["message"] == "ok"
 
 
 def test_bridge_rejects_removed_envelopes_at_the_http_boundary(tmp_path: Path) -> None:

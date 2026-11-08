@@ -32,11 +32,13 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -195,19 +197,70 @@ void Check(sqlite3 *database, const int result,
 
 void Exec(sqlite3 *database, const std::string_view sql);
 
+class PersistentStatementCache final {
+public:
+  ~PersistentStatementCache() { Clear(); }
+  PersistentStatementCache() = default;
+  PersistentStatementCache(const PersistentStatementCache &) = delete;
+  PersistentStatementCache &operator=(const PersistentStatementCache &) = delete;
+
+  [[nodiscard]] sqlite3_stmt *Acquire(sqlite3 *database,
+                                      const std::string_view sql) {
+    const auto found = statements_.find(sql);
+    if (found != statements_.end()) {
+      return found->second;
+    }
+    sqlite3_stmt *statement = nullptr;
+    Check(database,
+          sqlite3_prepare_v3(database, std::string(sql).c_str(), -1,
+                             SQLITE_PREPARE_PERSISTENT, &statement, nullptr),
+          "prepare SQLite statement");
+    try {
+      statements_.emplace(std::string(sql), statement);
+    } catch (...) {
+      sqlite3_finalize(statement);
+      throw;
+    }
+    return statement;
+  }
+
+  void Clear() noexcept {
+    for (const auto &[sql, statement] : statements_) {
+      static_cast<void>(sql);
+      sqlite3_finalize(statement);
+    }
+    statements_.clear();
+  }
+
+private:
+  std::map<std::string, sqlite3_stmt *, std::less<>> statements_;
+};
+
 class Statement final {
 public:
-  Statement(sqlite3 *database, const std::string_view sql)
-      : database_(database) {
-    Check(database_,
-          sqlite3_prepare_v2(database_, std::string(sql).c_str(), -1,
-                             &statement_, nullptr),
-          "prepare SQLite statement");
+  Statement(sqlite3 *database, const std::string_view sql,
+            PersistentStatementCache *cache = nullptr)
+      : database_(database), cached_(cache != nullptr) {
+    if (cache != nullptr) {
+      statement_ = cache->Acquire(database, sql);
+    } else {
+      Check(database_,
+            sqlite3_prepare_v2(database_, std::string(sql).c_str(), -1,
+                               &statement_, nullptr),
+            "prepare SQLite statement");
+    }
   }
 
   ~Statement() {
     if (statement_ != nullptr) {
-      sqlite3_finalize(statement_);
+      if (cached_) {
+        // Like the previous finalize, cleanup does not replace an earlier
+        // step/validation error with a cleanup error.
+        sqlite3_reset(statement_);
+        sqlite3_clear_bindings(statement_);
+      } else {
+        sqlite3_finalize(statement_);
+      }
     }
   }
 
@@ -271,19 +324,67 @@ public:
 
 private:
   sqlite3 *database_;
+  bool cached_;
   sqlite3_stmt *statement_{};
+};
+
+// Cached values are keyed by retained sequence and column, and are usable only
+// after the exact SQLite text bytes have been fetched and compared again.
+class MaintenanceSnapshotCache final {
+public:
+  struct Entry final {
+    std::int64_t sequence;
+    std::string bytes;
+    LogicalSceneSnapshotDTO snapshot;
+    std::optional<ContentDigest> content_hash;
+  };
+
+  [[nodiscard]] Entry *Find(const std::int64_t sequence, const bool baseline,
+                            const std::string_view bytes) noexcept {
+    auto &entry = entries_[Index(sequence, baseline)];
+    if (!entry.has_value() || entry->sequence != sequence ||
+        entry->bytes != bytes) {
+      return nullptr;
+    }
+    return &*entry;
+  }
+
+  void Store(const std::int64_t sequence, const bool baseline,
+             std::string bytes, const LogicalSceneSnapshotDTO &snapshot) {
+    entries_[Index(sequence, baseline)] =
+        Entry{sequence, std::move(bytes), snapshot, std::nullopt};
+  }
+
+  void Clear() noexcept {
+    for (auto &entry : entries_) {
+      entry.reset();
+    }
+  }
+
+private:
+  static std::size_t Index(const std::int64_t sequence,
+                           const bool baseline) noexcept {
+    return (static_cast<std::uint64_t>(sequence) %
+            kMaximumMaintenanceInitializations) * 2U + (baseline ? 1U : 0U);
+  }
+  std::array<std::optional<Entry>, kMaximumMaintenanceInitializations * 2U>
+      entries_{};
 };
 
 class Transaction final {
 public:
-  Transaction(sqlite3 *database, const std::string_view begin)
-      : database_(database) {
+  Transaction(sqlite3 *database, const std::string_view begin,
+              MaintenanceSnapshotCache *cache = nullptr)
+      : database_(database), cache_(cache) {
     Exec(database_, begin);
   }
 
   ~Transaction() {
     if (!finished_) {
       sqlite3_exec(database_, "ROLLBACK", nullptr, nullptr, nullptr);
+      if (cache_ != nullptr) {
+        cache_->Clear();
+      }
     }
   }
 
@@ -297,10 +398,12 @@ public:
 
 private:
   sqlite3 *database_;
+  MaintenanceSnapshotCache *cache_;
   bool finished_{};
 };
 
-std::int64_t ScalarInteger(sqlite3 *database, const std::string_view sql);
+std::int64_t ScalarInteger(sqlite3 *database, const std::string_view sql,
+                           PersistentStatementCache *cache = nullptr);
 
 void ValidateBoundedIdentity(const std::string_view value,
                              const std::string_view label);
@@ -582,7 +685,9 @@ bool SettleInterruptedMaintenanceInitializations(sqlite3 *database);
 
 DurableState ReadCompleteDurableState(
     sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query);
+    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
+    MaintenanceSnapshotCache *cache = nullptr,
+    PersistentStatementCache *statements = nullptr);
 
 bool RecoverIncompleteSceneTransaction(
     sqlite3 *database,

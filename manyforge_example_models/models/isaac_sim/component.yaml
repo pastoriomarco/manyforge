@@ -1,4 +1,4 @@
-# Component descriptor of the Isaac Sim simulator (CONTRACTS §14). The
+# Component descriptor of the Isaac Sim simulator. The
 # simulator is a component like any other: `playing` = enabled, paused or
 # stopped = prepared with the reason, unreachable = offline; Enable plays,
 # Disable pauses, capability sim_reset. It runs on the generic simulator adapter

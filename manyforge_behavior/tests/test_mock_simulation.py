@@ -1,4 +1,4 @@
-"""Node Mock simulation (contract item 133): catalog shape and Program
+"""Node Mock simulation: catalog shape and Program
 validation of the literal-only ``mock_simulation`` rows."""
 
 from __future__ import annotations
@@ -15,19 +15,21 @@ from manyforge_behavior.catalog_schema import validate_value
 from manyforge_behavior.interrupt_condition import condition_signals
 from manyforge_behavior.program import Program, ProgramValidationError
 
+from .v3_fixtures import signal, target, frame
+
 _ROOT = Path(__file__).resolve().parents[2]
 _CATALOG = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
 _MOTION = ("motion.move_until_signal", "motion.probe_search")
 _IO = ("io.get_input", "io.check_input", "io.wait_for_input")
 _GOAL = {
-    "frame_ref": {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
+    "frame_ref": {"kind": "target_frame", "frame": frame("ur5_robot", "base")},
     "position_m": [0.3, 0.0, 0.2],
     "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
 }
 
 
 def _signal(resource_role: str) -> dict[str, Any]:
-    return {"signal": {"target_role": "arm", "resource_role": resource_role}}
+    return {"signal": signal("ur5_robot", resource_role)}
 
 
 def _compare(resource_role: str) -> dict[str, Any]:
@@ -63,9 +65,8 @@ def _contact_policy() -> dict[str, Any]:
                 "body_pairs": [
                     {
                         "body_a": {
-                            "collision_body_role_id": "arm_collision",
-                            "component_role_id": "robot",
                             "kind": "component_model_body",
+                            "body": {"component_id": "ur5_robot", "collision_body_id": "arm_collision"},
                         },
                         "body_b": {"kind": "runtime_object", "runtime_object_id": "cell.probe"},
                     }
@@ -97,18 +98,6 @@ def _program(
         "api_version": _CATALOG.api_version,
         "content_version": _CATALOG.content_version,
     }
-    arm = document["target_roles"]["arm"]
-    arm["required_resource_roles"] = sorted(
-        {*arm["required_resource_roles"], "part_present", "door_closed"}
-    )
-    capabilities = {row["capability_id"] for row in arm["required_capabilities"]}
-    for requirement in _CATALOG.get(node_id).required_capabilities:
-        if requirement.scope == "target_binding" and requirement.when_parameter is None:
-            capabilities.add(requirement.capability_id)
-    arm["required_capabilities"] = [
-        {"capability_id": capability, "parameters": {}, "disposition": "required"}
-        for capability in sorted(capabilities)
-    ]
     document["blackboard"] = {
         "namespaces": [{"namespace_id": "cell", "owner": "program"}],
         "keys": [
@@ -122,8 +111,8 @@ def _program(
         document["contact_policies"] = [_contact_policy()]
     if node_id in _MOTION:
         parameters: dict[str, Any] = {
-            "target_role": "arm",
-            "base_frame_role": "base",
+            "target": target("ur5_robot", "arm"),
+            "base_frame": frame("ur5_robot", "base"),
             "tcp_endpoint": {"kind": "current"},  # TCP migration: old selector without kind; missing/current = own TCP
             "goal": deepcopy(_GOAL),
             "stop_mode": "soft_on_path",
@@ -133,7 +122,7 @@ def _program(
             parameters["contact_policy_id"] = "probe_contact"
             parameters["contact_scene_resource_id"] = "table"
     else:
-        parameters = {"target_role": "arm", "resource_role": "part_present"}
+        parameters = {"signal": signal("ur5_robot", "part_present")}
         if node_id == "io.get_input":
             parameters["output_key"] = "cell.seen"
         else:
@@ -153,7 +142,7 @@ def _program(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, _CATALOG)
 
@@ -168,7 +157,7 @@ def test_signal_reading_nodes_declare_an_optional_mock_simulation(node_id: str) 
     assert not mock.required and not mock.has_default
     schema = _CATALOG.schema_registry.resolve(mock.schema)
     assert schema.schema_type == "array"
-    assert schema.max_items is None  # no authored-row cap (Track 2 review)
+    assert schema.max_items is None  # no authored-row cap
 
 
 def test_other_nodes_do_not_take_a_mock_simulation() -> None:
@@ -224,9 +213,9 @@ def test_schema_refuses_malformed_rows(rows: Any) -> None:
 
 
 def test_condition_signals_are_the_signal_operands() -> None:
-    assert condition_signals(_CONDITION) == {
-        ("arm", "part_present"),
-        ("arm", "door_closed"),
+    assert condition_signals(_CONDITION, direct_references=True) == {
+        ("ur5_robot", "part_present"),
+        ("ur5_robot", "door_closed"),
     }
 
 

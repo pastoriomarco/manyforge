@@ -30,8 +30,8 @@ def test_client_has_no_headless_import_or_readiness_writer() -> None:
 @pytest.mark.parametrize(
     "payload",
     [
-        b'{"api_version":"manyforge.execution_command_response.v1",'
-        b'"api_version":"manyforge.execution_command_response.v1"}',
+        b'{"api_version":"manyforge.execution_command_response.v4",'
+        b'"api_version":"manyforge.execution_command_response.v4"}',
         b'{"ok":NaN}',
         b'{ "ok":true}',
         b"[]",
@@ -46,15 +46,16 @@ def test_strict_response_rejects_duplicate_nonfinite_noncanonical_packets(
     assert invalid.value.code == "execution_command_response_invalid"
 
 
+@pytest.mark.parametrize("version", ["v0", "v1", "v2"])
 def test_response_envelope_rejects_wrong_packet_version(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
+    monkeypatch: pytest.MonkeyPatch, tmp_path, version: str
 ) -> None:
     client = CellAdmissionClient(tmp_path)
     monkeypatch.setattr(
         client,
         "_exchange",
         lambda _packet, **_kwargs: {
-            "api_version": "manyforge.execution_command_response.v0",
+            "api_version": f"manyforge.execution_command_response.{version}",
             "command": "cell_admission_get",
             "ok": True,
             "authoring_admission": {
@@ -95,7 +96,7 @@ def test_exact_native_get_request_and_admission_response(
     def exchange(packet: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         packets.append(packet)
         return {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "authoring_admission": {
                 "admission_generation": 7,
                 "authoring_allowed": True,
@@ -111,7 +112,7 @@ def test_exact_native_get_request_and_admission_response(
     }
     assert packets == [
         {
-            "api_version": "manyforge.execution_command.v1",
+            "api_version": "manyforge.execution_command.v3",
             "command": "cell_admission_get",
         }
     ]
@@ -127,7 +128,7 @@ def test_exact_native_acquire_request_and_claim_response(
     def exchange(packet: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         packets.append(packet)
         return {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "claim": {
                 "accepted_at_ns": 42,
                 "acquired_admission_generation": 7,
@@ -142,7 +143,7 @@ def test_exact_native_acquire_request_and_claim_response(
     assert client.acquire(intent)["claim_generation"] == 3
     assert packets == [
         {
-            "api_version": "manyforge.execution_command.v1",
+            "api_version": "manyforge.execution_command.v3",
             "command": "cell_admission_acquire",
             "request": intent,
         }
@@ -157,7 +158,7 @@ def test_exact_native_error_is_preserved_as_known_outcome(
         client,
         "_exchange",
         lambda _packet, **_kwargs: {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": "cell_admission_acquire",
             "error": {
                 "code": "stale_generation",
@@ -178,13 +179,13 @@ def test_exact_native_error_is_preserved_as_known_outcome(
     "response",
     [
         {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": "cell_admission_get",
             "ok": True,
             "result": {"admission_generation": 1, "authoring_allowed": True},
         },
         {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "authoring_admission": {
                 "admission_generation": 1,
                 "authoring_allowed": True,
@@ -248,7 +249,7 @@ def test_operator_alarm_attention_is_published_on_the_cell_admission_port(
         deadlines.append(kwargs.get("deadline"))
         socket_files.append(kwargs.get("socket_file"))
         return {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": command,
             "ok": True,
             "operator_alarm_attention": {
@@ -270,7 +271,7 @@ def test_operator_alarm_attention_is_published_on_the_cell_admission_port(
     assert socket_files == [cell_admission.EXECUTION_CONTROL_SOCKET_FILE]
     assert sent == [
         {
-            "api_version": "manyforge.execution_command.v1",
+            "api_version": "manyforge.execution_command.v3",
             "command": command,
             "request": projection,
         }

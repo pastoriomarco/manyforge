@@ -9,9 +9,9 @@ folder (absolute when the Draft has none). Tags come from the component-type
 catalog of the row's model family, for Program role compatibility; a family
 tagged ``tool`` is a tool, mounted on a robot's ``flange`` by an attachment row.
 
-Machines (CONTRACTS §16) come from their models instead (the description's
-``component_models``): one ``kind: machine`` entry per machine model, snake_case
-(BOUNDARY §5), after the others, with ready owner and member rows;
+Machines come from their models instead (the description's
+``component_models``): one ``kind: machine`` entry per machine model, snake_case,
+after the others, with ready owner and member rows;
 adding one posts the owner row plus one member row per member. Example rows of
 a machine (owner or member), and rows whose assembly reaches one, are not
 offered on their own.
@@ -165,7 +165,7 @@ def _arm_row(
 def _machine_entries(
     sources: dict[str, Any], project_root: Path | None
 ) -> list[dict[str, Any]]:
-    """BOUNDARY §5 (amended): `{kind: machine, model_id, title, lanes[],
+    """`{kind: machine, model_id, title, lanes[],
     default_owner_id, owner_row, members: [{role, model_id, title, row}]}`.
     Rows are ready Deployment rows under the default ids (owner:
     `default_owner_id`, member: `<default_owner_id>_<role>`, inner references
@@ -506,7 +506,7 @@ def component_catalog(project_root: str | None) -> dict[str, Any]:
     sources = json.loads(_SOURCES.read_text(encoding="utf-8"))
     ordered += _sensor_entries(sources)
     offered = {entry["componentProfileId"] for entry in ordered}
-    # BOUNDARY §5: one entry per machine model (owner plus member rows).
+    # One entry per machine model (owner plus member rows).
     ordered += _machine_entries(sources, destination)
     return {
         "schemaVersion": "manyforge.composer_component_catalog.v1",

@@ -60,7 +60,7 @@ export interface AlarmMembership {
 }
 
 /**
- * One record that gates motion (spec 530 §10.1 `motion_attention_membership`):
+ * One record that gates motion (`motion_attention_membership`):
  * an acknowledgement-gated record while unacknowledged, a condition interlock
  * while active. The complete, unpaginated set.
  */
@@ -90,8 +90,8 @@ export interface OperatorAlarmRecord extends AlarmMembership {
 }
 
 /**
- * The motion-attention projection the Kernel acknowledged holding (spec 530
- * §11). The Kernel admits Program motion by this copy alone, which lags the
+ * The motion-attention projection the Kernel acknowledged holding.
+ * The Kernel admits Program motion by this copy alone, which lags the
  * owner snapshot by up to one publication period plus its deadline.
  */
 export interface KernelAlarmAttention {

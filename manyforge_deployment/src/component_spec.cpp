@@ -227,7 +227,7 @@ struct Relations final {
   return rows;
 }
 
-/// CONTRACTS §16: a member's owner, from its controller profile or I/O
+/// A member's owner, from its controller profile or I/O
 /// device row (both name the owner and the member's role).
 struct Membership final {
   std::string owner;
@@ -329,7 +329,7 @@ struct Membership final {
       {"models", CanonicalValue(std::move(models))},
       {"mounts", CanonicalValue(std::move(mounts))},
   };
-  // CONTRACTS §16: a machine owner's process launches its arm member's
+  // A machine owner's process launches its arm member's
   // description (the arm's models, custom TCPs and the mounts on it).
   if (with_arm_member) {
     if (const auto arm = ArmMemberOf(bundle.value(), graph, id)) {
@@ -591,7 +591,7 @@ BuildSpec(const RetainedBundle &bundle, const SiteFacts &site_facts,
               requirement_units)},
       {"host", CanonicalValue(std::move(launch))},
   });
-  // CONTRACTS §16: a machine owner's process is launched with its arm
+  // A machine owner's process is launched with its arm
   // member (its controllers, host rows, adapter and bindings): the host
   // rebuilds the owner with that arm, so a change to it replaces the owner.
   // The arm's description is already in the owner's description.

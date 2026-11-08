@@ -1,6 +1,6 @@
 # Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
 # `scripts/manyforge component check manyforge_example_models/models/xarm_gripper`.
-# Mounts on a robot's `flange` interface as its own component (merge 6).
+# Mounts on a robot's `flange` interface as its own component.
 api_version: manyforge.component_package.v1
 kind: tool
 id: ufactory.xarm_gripper

@@ -1,8 +1,8 @@
 {
-  "api_version": "manyforge.program.v2",
+  "api_version": "manyforge.program.v3",
   "catalog": {
-    "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.9.0"
+    "api_version": "manyforge.node_catalog.v3",
+    "content_version": "3.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
@@ -15,21 +15,6 @@
       "uf850"
     ]
   },
-  "component_roles": {
-    "robot": {
-      "required_component_type_tags": [
-        "articulated-arm"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ]
-    },
-    "tool": {
-      "required_component_type_tags": [
-        "gripper"
-      ]
-    }
-  },
   "description": "Smoke Program for a robot added as data: a joint move, gripper open and close, and the move back.",
   "forest": [
     {
@@ -39,7 +24,10 @@
           "instance_id": "move_to_ready",
           "node_id": "motion.move_to_joint_target",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "uf850_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 10.0,
             "goal": [
               {
@@ -68,7 +56,10 @@
               }
             ],
             "planning_timeout_s": 2.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "uf850_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             }
@@ -94,7 +85,10 @@
               "kind": "angular_rad",
               "value_rad": 0.0
             },
-            "target_role": "gripper",
+            "target": {
+              "command_target_id": "gripper",
+              "component_id": "xarm_gripper"
+            },
             "wait_for_duration": true
           }
         },
@@ -112,7 +106,10 @@
               "kind": "angular_rad",
               "value_rad": 0.6
             },
-            "target_role": "gripper",
+            "target": {
+              "command_target_id": "gripper",
+              "component_id": "xarm_gripper"
+            },
             "wait_for_duration": true
           }
         },
@@ -130,7 +127,10 @@
               "kind": "angular_rad",
               "value_rad": 0.0
             },
-            "target_role": "gripper",
+            "target": {
+              "command_target_id": "gripper",
+              "component_id": "xarm_gripper"
+            },
             "wait_for_duration": true
           }
         },
@@ -139,7 +139,10 @@
           "instance_id": "move_back",
           "node_id": "motion.move_to_joint_target",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "uf850_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 10.0,
             "goal": [
               {
@@ -168,7 +171,10 @@
               }
             ],
             "planning_timeout_s": 2.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "uf850_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             }
@@ -203,81 +209,5 @@
   "program_id": "uf850_smoke",
   "program_profile": "composable-cell-v1",
   "scene": [],
-  "schema_version": "manyforge.composer_authoring_forest.v1",
-  "target_roles": {
-    "arm": {
-      "component_role": "robot",
-      "required_capabilities": [
-        {
-          "capability_id": "execution.feedback.phase_events",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "execution.trajectory.execute",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.motion.joint_goal",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.trajectory.time_parameterized",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "state.observed.current",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "validation.trajectory.non_collision",
-          "disposition": "required",
-          "parameters": {}
-        }
-      ],
-      "required_collision_body_roles": [
-        "arm_collision"
-      ],
-      "required_frame_roles": [
-        "base"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ],
-      "required_resource_roles": [
-        "arm_joints"
-      ]
-    },
-    "gripper": {
-      "component_role": "tool",
-      "required_capabilities": [
-        {
-          "capability_id": "model.kinematics.fk",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "tool.gripper.command",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "tool.gripper.feedback",
-          "disposition": "required",
-          "parameters": {}
-        }
-      ],
-      "required_collision_body_roles": [
-        "gripper_collision"
-      ],
-      "required_frame_roles": [],
-      "required_resource_roles": [
-        "fingers"
-      ]
-    }
-  }
+  "schema_version": "manyforge.composer_authoring_forest.v2"
 }

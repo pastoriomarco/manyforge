@@ -1,4 +1,4 @@
-"""Python parity for the immutable I2 model/compiler trust stages."""
+"""Python parity for the immutable model/compiler trust stages."""
 
 from __future__ import annotations
 

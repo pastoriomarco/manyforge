@@ -8,7 +8,7 @@
 // operator profile; a position gripper with K = 2 stages; one evidence item per
 // stage. The acceptance carries no affected operation snapshots: those stay in
 // the acceptance journal row, unchanged by the lean record, so they are left out
-// of these bounds (plan §1.4). The measured bytes are printed and recorded as
+// of these bounds. The measured bytes are printed and recorded as
 // test properties as evidence.
 
 #include <gtest/gtest.h>
@@ -97,7 +97,7 @@ struct ParticipantFixture final {
 
 [[nodiscard]] ResolvedStopBasePlanDTO GoldenBasePlan() {
   const auto path =
-      std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
+      std::filesystem::path(MANYFORGE_CORE_TEST_GOLDEN_DIR) / "resolved_stop_base_plan.v1.json";
   std::ifstream stream(path, std::ios::binary);
   std::ostringstream bytes;
   bytes << stream.rdbuf();

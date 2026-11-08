@@ -1,13 +1,13 @@
 """Publish the Alarm Lifecycle Owner's motion attention to the native Kernel.
 
-Headless owns the alarm lifecycle; the Kernel owns admission (ADR-0026). This
+Headless owns the alarm lifecycle; the Kernel owns admission. This
 adapter only carries the owner's immutable, generation-fenced projection to
 the Kernel's existing cell-admission fact port. It evaluates nothing: the
-Kernel applies the spec 450 §5.2 resource test at admission and at the final
+Kernel applies the resource test at admission and at the final
 pre-dispatch recheck, and fails closed when the projection is missing or
 older than its freshness bound.
 
-Timing contract (spec 530 §11). Publication runs on its own thread, which
+Timing contract. Publication runs on its own thread, which
 does nothing else. Every period ``P`` it starts one publication with a
 monotonic deadline ``D`` after its start:
 
@@ -91,7 +91,7 @@ class KernelHeldAttention:
     one content, so the acknowledged projection is the Kernel's held copy.
     Only its admission-relevant identity is kept: whether it is reconciled
     and which active configuration it was judged against. Clients use it to
-    anticipate admission (spec 530 §11) without polling the Kernel: a Run is
+    anticipate admission without polling the Kernel: a Run is
     admitted only once the Kernel holds a reconciled projection of the active
     configuration, which lags the owner by up to ``P + D``.
     """

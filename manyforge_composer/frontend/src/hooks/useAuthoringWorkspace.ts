@@ -75,7 +75,7 @@ export function useAuthoringWorkspace(
         records: apply.records,
         reason: !apply.mutationAvailable || inFlight
           ? 'A Manager operation is pending or authoring is unavailable.' : null,
-        // New and Load wait only for an Apply actually in flight (R3).
+        // New and Load wait only for an Apply actually in flight.
         replaceReason: inFlight ? 'A Manager Apply is in progress.' : null,
         applying: inFlight,
       };
@@ -213,7 +213,7 @@ export function useAuthoringWorkspace(
   const editOwnerReason = transportStatus !== 'connected'
     ? 'Current backend status is unavailable.'
     : draftEditUnavailableReason(published, snapshot);
-  // New and Load: the server decides a run (R3); the rest still applies.
+  // New and Load: the server decides a run; the rest still applies.
   const replaceOwnerReason = transportStatus !== 'connected'
     ? 'Current backend status is unavailable.'
     : scenarioReplacementUnavailableReason(published, snapshot) ?? managerAdmission.replaceReason;

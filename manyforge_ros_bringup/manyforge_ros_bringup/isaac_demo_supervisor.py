@@ -12,10 +12,9 @@ import sys
 
 
 UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
-RESTORATION_GATE = "I5/H0 + I6/N + I8/P5 + I9/I"
 UNAVAILABLE_MESSAGE = (
-    f"{UNAVAILABLE_REASON_CODE}: the Isaac product requires the "
-    f"{RESTORATION_GATE} restoration gates; no DemoSupervisor fallback exists"
+    f"{UNAVAILABLE_REASON_CODE}: the Isaac product is not available through "
+    "this entrypoint; no DemoSupervisor fallback exists"
 )
 
 

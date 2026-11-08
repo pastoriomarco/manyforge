@@ -2,7 +2,6 @@ import type {
   BlackboardKeyDeclaration,
   JsonValue,
   ProgramAuthoringDocument,
-  ProgramBindingDocument,
   ProgramTreeNode,
 } from '../types/api';
 import type { TargetStopResponse } from '../types/robotControl';
@@ -22,21 +21,16 @@ import {
   NODE_OUTCOME_VALUES,
 } from './blackboardNamespaces';
 import {
-  declaredIoSources,
-  ioSourceKey,
   rowInputLiveness,
   type IoLivenessMode,
 } from './ioSignalConfiguration';
 import { INTERRUPT_MOTION_NODE_IDS, programBlackboardKeys } from './programAuthoring';
-import { resolvedInputSignals, resolvedTargetRoles } from './targetRoleResolution';
 import {
-  CARRIED_OBJECT_LOST_RESOURCE_ROLE,
-  systemSignalOriginSuffix,
   type CarriedObjectLostSignalChoice,
 } from './systemSignalAuthoring';
 
 /**
- * Interrupt rule authoring (schema04): the closed condition grammar shared by
+ * Interrupt rule authoring: the closed condition grammar shared by
  * node rules and global Deployment rules, its operand choices and local
  * validation, the robot's Stop stage labels, and the Deployment
  * `policies.interrupt_rules` rows.
@@ -58,14 +52,16 @@ export interface ConditionOperandChoice {
   label: string;
   /** '' for signals, else the key (for namespace grouping). */
   key: string;
-  valueType: ConditionValueType;
+  valueType: ConditionValueType | null;
+  disabled?: boolean;
+  reason?: string;
   /** Closed string values offered as a select (outcome and rule-state keys). */
   values?: readonly string[];
   /** A signal's declared liveness, when the Deployment Draft declares it. */
   liveness?: IoLivenessMode;
 }
 
-/** Operand label suffix of a change-only signal (contracts 76/81). */
+/** Operand label suffix of a change-only signal. */
 export const LIVENESS_UNPROVEN_SUFFIX = ' · liveness unproven';
 
 function signalLabel(base: string, liveness: IoLivenessMode | undefined): string {
@@ -84,8 +80,8 @@ export function operandId(operand: JsonValue): string {
 }
 
 /** Operators a value type accepts: bool and string only compare for (in)equality. */
-export function operatorsFor(type: ConditionValueType): readonly ConditionOperator[] {
-  return type === 'bool' || type === 'string' ? ['==', '!='] : CONDITION_OPERATORS;
+export function operatorsFor(type: ConditionValueType | null): readonly ConditionOperator[] {
+  return type === null ? [] : type === 'bool' || type === 'string' ? ['==', '!='] : CONDITION_OPERATORS;
 }
 
 export function defaultLiteral(choice: ConditionOperandChoice): JsonValue {
@@ -102,7 +98,7 @@ function keyChoice(key: BlackboardKeyDeclaration): ConditionOperandChoice | null
       ? INTERRUPT_NODE_OUTCOME_VALUES : NODE_OUTCOME_VALUES)
       : undefined;
   const operand = { key: key.key };
-  // System keys are listed by the node or rule they belong to (contract 105(b)).
+  // System keys are listed by the node or rule they belong to.
   const owner = key.key.slice(namespace.length + 1);
   const label = namespace === NODE_OUTCOME_NAMESPACE ? `${owner} (node outcome)`
     : namespace === INTERRUPT_STATE_NAMESPACE ? `${owner} (rule state)`
@@ -117,96 +113,41 @@ function keyChoice(key: BlackboardKeyDeclaration): ConditionOperandChoice | null
   };
 }
 
-/**
- * Node-rule operands: the input signals of every Program target role bound in
- * the current binding (`signal_role_bindings`, inputs only), with the
- * liveness the Deployment Draft declares for them, then every declared scalar
- * key incl. `node_outcome.*` and `interrupt_state.*`. Without a binding, the
- * target roles resolve through the scenario role assignment and their signals
- * are the Deployment Draft's declared inputs (targetRoleResolution).
- */
+/** One exact signal from the generation-checked immutable Deployment candidate. */
+export interface CandidateSignalFact {
+  reference: { component_id: string; signal_name: string };
+  ambiguous: boolean;
+  value_type: string | null;
+  direction: 'input' | 'output' | null;
+  liveness?: IoLivenessMode | null;
+}
+
+/** Node-rule operands from candidate inputs and declared scalar keys. */
 export function nodeConditionChoices(
-  program: Pick<ProgramAuthoringDocument, 'blackboard' | 'forest' | 'target_roles'>,
-  binding: ProgramBindingDocument | null | undefined,
+  program: Pick<ProgramAuthoringDocument, 'blackboard' | 'forest'>,
+  candidateSignals: readonly CandidateSignalFact[] | null,
   globalRuleIds: readonly string[],
-  deploymentDocument: Record<string, JsonValue> | null = null,
-  roleAssignment: Record<string, JsonValue> | null = null,
-  systemSignals: readonly CarriedObjectLostSignalChoice[] = [],
-  changedOutside: ReadonlySet<string> = new Set(),
 ): ConditionOperandChoice[] {
-  const declared = declaredIoSources(deploymentDocument);
-  const targets = binding == null
-    ? resolvedTargetRoles(program, roleAssignment).map((target) => ({
-      ...target,
-      signal_role_bindings: resolvedInputSignals(program, target, deploymentDocument)
-        .map((row) => ({ ...row, direction: 'input' as const })),
-    }))
-    : binding.target_role_bindings;
-  const signals: ConditionOperandChoice[] = [];
-  for (const target of targets) {
-    if (!Object.hasOwn(program.target_roles ?? {}, target.target_role_id)) continue;
-    const requiredRoles = objectOf(program.target_roles[target.target_role_id])?.required_resource_roles;
-    const requiresCarriedObjectLost = Array.isArray(requiredRoles)
-      && requiredRoles.includes(CARRIED_OBJECT_LOST_RESOURCE_ROLE);
-    const systemSignal = systemSignals.find((row) => (
-      row.controllableComponentId === target.controllable_component_id
-      && row.commandTargetId === target.command_target_id
-    ));
-    for (const row of target.signal_role_bindings ?? []) {
-      // V2-7: an eligible output offers its core-held `changed outside` signal.
-      if (row.direction === 'output'
-        && changedOutside.has(ioSignalId(target.controllable_component_id, row.signal_name))) {
-        const operand = { signal: {
-          target_role: target.target_role_id,
-          resource_role: `${row.resource_role_id}${CHANGED_OUTSIDE_SUFFIX}`,
-        } };
-        signals.push({
-          id: operandId(operand),
-          operand,
-          label: `${target.target_role_id} · ${row.resource_role_id} (${row.signal_name}) → changed outside`,
-          key: '',
-          valueType: 'bool',
-        });
-        continue;
-      }
-      if (row.direction !== 'input') continue;
-      if (row.resource_role_id === CARRIED_OBJECT_LOST_RESOURCE_ROLE
-        && (!requiresCarriedObjectLost || systemSignal?.signalName !== row.signal_name)) continue;
-      const operand = { signal: { target_role: target.target_role_id, resource_role: row.resource_role_id } };
-      const liveness = declared.get(ioSourceKey(
-        target.controllable_component_id, target.command_target_id, row.resource_role_id,
-      ))?.liveness;
-      const originSuffix = row.resource_role_id === CARRIED_OBJECT_LOST_RESOURCE_ROLE
-        ? systemSignalOriginSuffix(systemSignal) : '';
-      const label = `${target.target_role_id} · ${row.resource_role_id} (${row.signal_name}, input)`;
-      signals.push({
-        id: operandId(operand),
-        operand,
-        label: `${signalLabel(label, liveness)}${originSuffix}`,
-        key: '',
-        valueType: row.value_type,
-        ...(liveness === undefined ? {} : { liveness }),
-      });
-    }
-    if (systemSignal !== undefined && requiresCarriedObjectLost) {
-      const operand = {
-        signal: { target_role: target.target_role_id, resource_role: CARRIED_OBJECT_LOST_RESOURCE_ROLE },
-      };
-      const id = operandId(operand);
-      if (!signals.some((choice) => choice.id === id)) {
-        signals.push({
-          id,
-          operand,
-          label: `${target.target_role_id} · ${CARRIED_OBJECT_LOST_RESOURCE_ROLE} (${systemSignal.signalName}, input)${systemSignalOriginSuffix(systemSignal)}`,
-          key: '',
-          valueType: 'bool',
-        });
-      }
-    }
+  const choices = new Map<string, ConditionOperandChoice>();
+  for (const row of candidateSignals ?? []) {
+    const { component_id, signal_name } = row.reference;
+    const operand = { signal: { component_id, signal_name } };
+    const id = operandId(operand);
+    const label = signal_name.endsWith(CHANGED_OUTSIDE_SUFFIX)
+      ? `${component_id} · ${signal_name.slice(0, -CHANGED_OUTSIDE_SUFFIX.length)} → changed outside`
+      : `${component_id} · ${signal_name} (input)`;
+    const liveness = row.liveness ?? undefined;
+    const reason = row.ambiguous ? 'Signal identity is ambiguous in the Deployment Draft.'
+      : row.direction !== 'input' ? 'An interrupt condition requires an input signal.'
+        : row.value_type !== 'bool' ? 'This interrupt condition requires a boolean signal.' : undefined;
+    choices.set(id, { id, operand, label: signalLabel(label, liveness), key: '',
+      valueType: row.value_type === 'bool' ? 'bool' : null,
+      ...(reason === undefined ? {} : { disabled: true, reason }),
+      ...(liveness === undefined ? {} : { liveness }) });
   }
   const keys = programBlackboardKeys(program, globalRuleIds)
     .flatMap((key) => { const choice = keyChoice(key); return choice === null ? [] : [choice]; });
-  return [...signals, ...keys];
+  return [...choices.values(), ...keys];
 }
 
 /** A Deployment input signal row: component id, signal name and value type. */
@@ -215,7 +156,6 @@ export interface DeploymentInputSignal {
   signalName: string;
   valueType: ConditionValueType;
   liveness?: IoLivenessMode;
-  provenance?: 'last_apply';
 }
 
 /** Global-rule operands: Deployment input signals, then the given scalar keys. */
@@ -228,12 +168,11 @@ export function globalConditionChoices(
       const operand = {
         signal: { controllable_component_id: signal.controllableComponentId, signal_name: signal.signalName },
       };
-      const originSuffix = signal.provenance === 'last_apply' ? ' · from last Apply' : '';
       const label = `${signal.controllableComponentId} · ${signal.signalName} (input)`;
       return {
         id: operandId(operand),
         operand,
-        label: `${signalLabel(label, signal.liveness)}${originSuffix}`,
+        label: signalLabel(label, signal.liveness),
         key: '',
         valueType: signal.valueType,
         ...(signal.liveness === undefined ? {} : { liveness: signal.liveness }),
@@ -309,7 +248,8 @@ export function conditionProblem(
     }
     const id = operandId(compare.operand);
     const choice = byId.get(id);
-    if (choice === undefined) return `${path}: ${id} is not a bound input signal or a declared scalar key.`;
+    if (choice === undefined) return `${path}: ${id} is not a candidate signal or a declared scalar key.`;
+    if (choice.disabled || choice.valueType === null) return `${path}: ${choice.reason ?? 'This signal is unavailable.'}`;
     if (choice.liveness === 'change_only') {
       return `${path}: ${choice.label.slice(0, -LIVENESS_UNPROVEN_SUFFIX.length)} is a change-only source whose liveness is unproven between changes, so it cannot be an interrupt condition operand. Declare its source periodic, or read it with an I/O wait, read or check node instead.`;
     }
@@ -366,7 +306,7 @@ export function unguardedNodeOutcomeKeys(condition: JsonValue | undefined): stri
   return [...tested].filter((key) => !guarded.has(key)).sort();
 }
 
-/** The robot's three qualified Stop stages, in chain order (contract 61). */
+/** The robot's three qualified Stop stages, in chain order. */
 export const STOP_STAGE_LABELS = [
   'Controlled stop (incl. spring-back)',
   'Controller goal cancel',
@@ -379,7 +319,7 @@ export interface QualifiedStopStage {
   label: string;
 }
 
-/** A published motion target's qualified Stop chain (SX-2167 `stop_response`). */
+/** A published motion target's qualified Stop chain (`stop_response`). */
 export interface TargetStopChain {
   controllableComponentId: string;
   commandTargetId: string;
@@ -407,19 +347,24 @@ export function qualifiedStopStages(response: TargetStopResponse): QualifiedStop
   }));
 }
 
-/** The qualified stages of the motion target bound to `targetRole`, or null when not published. */
-export function stopStagesForTargetRole(
-  chains: readonly TargetStopChain[],
-  targetRoleBindings: readonly { target_role_id: string; controllable_component_id: string; command_target_id: string }[]
-    | null | undefined,
-  targetRole: unknown,
-): QualifiedStopStage[] | null {
-  if (typeof targetRole !== 'string') return null;
-  const binding = targetRoleBindings?.find((row) => row.target_role_id === targetRole);
-  if (binding === undefined) return null;
-  const chain = chains.find((row) => row.controllableComponentId === binding.controllable_component_id
-    && row.commandTargetId === binding.command_target_id);
-  return chain?.stopResponse === undefined ? null : qualifiedStopStages(chain.stopResponse);
+/** Uses the candidate's exact target and capability; ambiguous routes are never combined. */
+export function candidateStopStages(
+  target: { component_id: string; command_target_id: string } | null,
+  capabilityId: string | null,
+  targets: ReadonlyArray<import('./referenceValidation').ReferenceSelectorFacts['targets'][number]> | null,
+): { stages: QualifiedStopStage[] | null; reason: string | null; routes: import('./referenceValidation').CandidateStopRoute[] } {
+  if (target === null || capabilityId === null || targets === null) return { stages: null, reason: 'Qualified Draft target or capability is unavailable.', routes: [] };
+  const matches = targets.filter((row) => row.target.component_id === target.component_id
+    && row.target.command_target_id === target.command_target_id);
+  if (matches.length !== 1) return { stages: null, reason: 'The target is missing or ambiguous in the qualified Draft.', routes: [] };
+  const routes = matches[0].stop_routes.filter((route) => route.capability_id === capabilityId);
+  if (routes.length !== 1) return { stages: null, routes, reason: routes.length === 0
+    ? 'No qualified Stop route exists for this capability.' : 'Multiple Stop routes match this capability.' };
+  const route = routes[0];
+  if (!route.available) return { stages: null, routes, reason: route.reason?.message ?? 'The Stop route is unavailable.' };
+  return { stages: route.stages.map((stage, index) => ({ id: stage.stage_id,
+    label: `${index + 1}. ${STOP_STAGE_KIND_LABELS[stage.stage_kind] ?? readable(stage.stage_kind)}`
+      + ` (${stage.command_kind.replaceAll('_', ' ')})` })), reason: null, routes };
 }
 
 /**
@@ -434,9 +379,9 @@ export function commonStopStages(chains: readonly TargetStopChain[]): QualifiedS
   ));
 }
 
-export const STOP_STAGES_UNAVAILABLE_HINT = 'The robot’s qualified Stop stage ids are available after Apply; until then the first stage applies.';
+export const STOP_STAGES_UNAVAILABLE_HINT = 'Qualified Stop stages are unavailable for this selection; until then the first stage applies.';
 
-/** Stages a success threshold may name: the entry stage and every later one (contract 70). */
+/** Stages a success threshold may name: the entry stage and every later one. */
 export function successThroughStages(
   stages: readonly QualifiedStopStage[],
   entryStageId: string | undefined,
@@ -447,7 +392,7 @@ export function successThroughStages(
 
 export const INTERRUPT_NODE_IDS: ReadonlySet<string> = new Set(INTERRUPT_MOTION_NODE_IDS);
 
-// ---- Contract 87: interrupt condition keys declare `initial:` ----
+// ---- Interrupt condition keys declare `initial:` ----
 
 /** The Core's stable refusal reason, used verbatim in the GUI. */
 export const INTERRUPT_KEY_INITIAL_REQUIRED = 'interrupt_key_initial_required';
@@ -455,7 +400,7 @@ export const INTERRUPT_KEY_INITIAL_REQUIRED = 'interrupt_key_initial_required';
 /**
  * The flag of one condition whose declared keys lack `initial:` (presence
  * only: false / 0 are valid), or null. Undeclared keys are refused elsewhere;
- * system keys are exempt: the system defines their start value (contract 105).
+ * system keys are exempt: the system defines their start value.
  */
 export function interruptKeyInitialProblem(
   condition: JsonValue | undefined,
@@ -489,10 +434,10 @@ export function interruptConditionKeyUses(
   return found;
 }
 
-// ---- Global Deployment rules (schema04 §3) ----
+// ---- Global Deployment rules ----
 
 /**
- * Contract 73: every arm (`all_motion`), the robots of selected Applied
+ * Every arm (`all_motion`), the robots of selected Applied
  * Program execution groups (`{execution_groups}`, 1..N unique, sorted), or
  * everything in the cell (`everything`).
  */
@@ -500,7 +445,7 @@ export type GlobalRuleScope = 'all_motion' | 'everything' | { execution_groups: 
 export type GlobalRuleScopeKind = 'all_motion' | 'execution_groups' | 'everything';
 
 /**
- * CONTRACTS §8. `on_trip: stop` issues the operator's Stop on the scope, then
+ * `on_trip: stop` issues the operator's Stop on the scope, then
  * holds the scope (`rule_holds`) while the condition holds; `after_stop` says
  * what happens to the stopped node (`hold`, the default, or `fail_node`).
  * `notify` only publishes `interrupt_state.<rule_id>`. Any active rule that
@@ -511,7 +456,7 @@ export interface GlobalInterruptRule {
   rule_id: string;
   condition: JsonValue;
   scope: GlobalRuleScope;
-  /** 0–100; omitted = 0 (contract 59). */
+  /** 0–100; omitted = 0. */
   priority?: number;
   on_trip: RuleOnTrip;
   /** Only with `on_trip: stop`; omitted = hold. */
@@ -634,7 +579,7 @@ export function globalRuleProblem(
   return conditionProblem(rule.condition, choices);
 }
 
-// ---- Contracts 106, 110, 111: global rules' key operands ----
+// ---- Global rules' key operands ----
 
 /** The Core's stable refusal reasons, used verbatim in the GUI. */
 export const GLOBAL_RULE_KEY_UNDECLARED = 'global_rule_key_undeclared';
@@ -672,7 +617,7 @@ function readsSignal(condition: JsonValue | undefined): boolean {
 
 /**
  * One global rule's operands: Deployment input signals, the Program Draft's
- * keys except `interrupt_state.*` (refused in global rules, contract 111),
+ * keys except `interrupt_state.*` (refused in global rules),
  * and every user key the rule already reads that the Program does not
  * declare (kept editable; flagged by `globalRuleKeyNotes`). `programKeys` is
  * null when there is no Program.
@@ -695,22 +640,12 @@ export function globalRuleChoices(
   const knownInputs = new Set(inputs.map((signal) => `${signal.controllableComponentId}\u0000${signal.signalName}`));
   for (const signal of systemSignals) {
     const key = `${signal.controllableComponentId}\u0000${signal.signalName}`;
-    if (knownInputs.has(key)) {
-      if (signal.provenance === 'last_apply') {
-        const existing = inputs.find((row) => (
-          row.controllableComponentId === signal.controllableComponentId
-          && row.signalName === signal.signalName
-        ));
-        if (existing !== undefined) existing.provenance = 'last_apply';
-      }
-      continue;
-    }
+    if (knownInputs.has(key)) continue;
     knownInputs.add(key);
     inputs.push({
       controllableComponentId: signal.controllableComponentId,
       signalName: signal.signalName,
       valueType: signal.valueType,
-      ...(signal.provenance === undefined ? {} : { provenance: signal.provenance }),
     });
   }
   const choices = globalConditionChoices(inputs, [...declared, ...pending]);
@@ -725,8 +660,8 @@ export function globalRuleChoices(
 const NO_SIGNAL_IDS: ReadonlySet<string> = new Set();
 
 /**
- * The outputs whose core-held `changed outside` signal exists (CONTRACTS §7:
- * outputs with read-back that aren't controller-owned): the base `signal_id`
+ * The outputs whose core-held `changed outside` signal exists (outputs with
+ * read-back that aren't controller-owned): the base `signal_id`
  * of every pushed `<signal_id>.changed_outside` sample.
  */
 export function changedOutsideOutputs(samples: readonly { signal_id: string }[] | null): ReadonlySet<string> {
@@ -735,7 +670,7 @@ export function changedOutsideOutputs(samples: readonly { signal_id: string }[] 
 }
 
 /**
- * "<output> → changed outside" operands (plan V2-7), nested under the
+ * "<output> → changed outside" operands, nested under the
  * Deployment's outputs that hold one; an operand the condition already reads
  * stays listed so it remains editable while the cell isn't running.
  */
@@ -780,7 +715,7 @@ function conditionOperandIds(condition: JsonValue | undefined): Set<string> {
 /**
  * The notes of one global rule's key operands:
  * - `waiting`: keys no Program declares yet (no Program): the whole rule is
- *   inactive until a Program declares them (contract 110);
+ *   inactive until a Program declares them;
  * - `undeclared`: keys the Program lacks: its Apply is refused (106);
  * - `stateOperands`: `interrupt_state.*` keys, refused in global rules (111);
  * - `mixed`: the rule reads signals and keys, so it does not act while no

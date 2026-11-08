@@ -4,8 +4,8 @@ The complete effectful supervisor is pinned at source blob
 ``8c0ecee5ad79b553063c0f171740a3ccf617e8d7`` (sha256
 ``febb08a34f5b13491cbc7675656a51135b0f360dca71c8c97be47d95eab40978``).
 Its HTTP probes (lines 77-142), Composer-v0 status envelope (164-230), status
-POST (232-256), polling/signal loop, and shutdown post (264-304) are H0
-and I6/N acceptance inputs, not a callable fallback. The Component Manager
+POST (232-256), polling/signal loop, and shutdown post (264-304) are
+acceptance inputs, not a callable fallback. The Component Manager
 owns process convergence and publication; the current bridge therefore does
 not revive this second launcher.
 """

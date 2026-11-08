@@ -3,7 +3,7 @@
 Pure data-in/data-out: consumes ManyForge execution diagnostic snapshots and
 yields AUTOSAR-DEM-style fault reports
 (FAILED on fault latch, PASSED on clear) keyed by the externally published
-``MANYFORGE_*`` fault code. The ROS service transport returns at I6/N; this
+``MANYFORGE_*`` fault code. The ROS service transport is not available yet; this
 module never imports rclpy or medkit types so its
 contract tests run hermetically in any lane.
 

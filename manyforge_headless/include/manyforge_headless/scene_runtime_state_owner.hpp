@@ -144,7 +144,7 @@ struct CarriedObjectLossEvent final {
   /// alarm and Stop forced when the signal publication failed.
   manyforge::core::GraspLostResponseDTO on_grasp_lost;
   /// The typed publication error when the system signal could not be
-  /// published (SX-204); absent otherwise.
+  /// published; absent otherwise.
   std::optional<std::string> signal_error{};
   friend bool operator==(const CarriedObjectLossEvent &,
                          const CarriedObjectLossEvent &) = default;

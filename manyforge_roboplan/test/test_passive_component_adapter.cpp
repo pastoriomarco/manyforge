@@ -12,7 +12,7 @@ using core::ComponentAction;
 using core::ComponentActivity;
 using core::ComponentLifecycle;
 
-// CONTRACTS §6 "Components without a lane": the lifecycle actions succeed at
+// The lifecycle actions succeed at
 // once, so a lane-free tool can be enabled; no streams, no capabilities.
 TEST(PassiveComponentAdapter, LifecycleActionsSucceedAtOnce) {
   PassiveComponentAdapter adapter;

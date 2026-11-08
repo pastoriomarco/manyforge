@@ -25,6 +25,7 @@ import { listDeleteMove, type ListMove } from '../../utils/valuePaths';
 import { DraftTextInput } from '../common/DraftInputs';
 import { FrameSelector } from './FrameSelector';
 import { SourceableLeaf, SourceableValue, useValueSources } from './ValueSourceField';
+import type { ManualFillPreviewValues } from '../../utils/manualFillPreview';
 
 /** Commit one edited value; list edits name how their items moved, so sources move with them. */
 export type ValueCommit = (value: JsonValue, moves?: readonly ListMove[]) => void;
@@ -36,6 +37,21 @@ type SpecializedInvalidReporter = (token: symbol, message: string | null) => voi
 const SpecializedInvalidContext = createContext<SpecializedInvalidReporter>(() => undefined);
 // The Program's declared frames, for every frame field of one value.
 const FrameScopeContext = createContext<FrameScope | null>(null);
+export const ProgramManualFillPreviewContext = createContext<ManualFillPreviewValues>(new Map());
+
+export function ProgramManualFillPreviewProvider({
+  values,
+  children,
+}: {
+  values: ManualFillPreviewValues;
+  children: ReactNode;
+}) {
+  return (
+    <ProgramManualFillPreviewContext.Provider value={values}>
+      {children}
+    </ProgramManualFillPreviewContext.Provider>
+  );
+}
 
 function useSpecializedInvalidReporter() {
   const report = useContext(SpecializedInvalidContext);
@@ -73,23 +89,50 @@ function numericArray(value: JsonValue | undefined): number[] {
   return Array.isArray(value) ? value as number[] : [];
 }
 
+/**
+ * A control whose fill preview shows the new value inside the control itself,
+ * over the current one, so a preview never adds rows or resizes anything
+ * (hovering a fill button must not move the button away from the pointer).
+ */
+function FillTarget({ previewValue, children }: { previewValue: string | undefined; children: ReactNode }) {
+  return (
+    <span className="program-fill-target">
+      {children}
+      {previewValue !== undefined && (
+        <span className="program-fill-overlay" aria-hidden="true">→ {previewValue}</span>
+      )}
+    </span>
+  );
+}
+
 function NumberField({
   label,
+  visibleLabel = label,
   value,
   disabled,
   path,
+  previewPath,
+  previewOverride,
   schema = NUMBER_SCHEMA,
   onCommit,
 }: {
   label: string;
+  /** Short visible axis label; the accessible and validation label stays complete. */
+  visibleLabel?: string;
   value: number;
   disabled: boolean;
   /** The value's path when it may come from a source. */
   path?: string;
+  previewPath?: string;
+  /** A fill preview already expressed in this field's form (e.g. a converted orientation). */
+  previewOverride?: string;
   schema?: CatalogJsonSchema;
   onCommit: (value: number) => void;
 }) {
   const reportInvalid = useSpecializedInvalidReporter();
+  const previewValues = useContext(ProgramManualFillPreviewContext);
+  const previewValue = previewOverride
+    ?? (previewPath === undefined ? undefined : previewValues.get(previewPath));
   const input = (
     <DraftTextInput
       type="number"
@@ -108,11 +151,13 @@ function NumberField({
     />
   );
   return (
-    <label className="program-specialized-number">
-      <span>{label}</span>
-      {path === undefined
-        ? input
-        : <SourceableLeaf path={path} schema={schema} label={label}>{input}</SourceableLeaf>}
+    <label className={`program-specialized-number${previewValue === undefined ? '' : ' program-manual-fill-changed'}`}>
+      <span>{visibleLabel}</span>
+      <FillTarget previewValue={previewValue}>
+        {path === undefined
+          ? input
+          : <SourceableLeaf path={path} schema={schema} label={label}>{input}</SourceableLeaf>}
+      </FillTarget>
     </label>
   );
 }
@@ -124,6 +169,8 @@ function VectorEditor({
   value,
   disabled,
   path,
+  previewPath,
+  previewOverrides,
   onCommit,
 }: {
   label: string;
@@ -133,19 +180,26 @@ function VectorEditor({
   disabled: boolean;
   /** The vector's path when each number may come from a source. */
   path?: string;
+  previewPath?: string;
+  /** Per-axis fill previews already in this editor's form; they replace `previewPath`. */
+  previewOverrides?: string[];
   onCommit: (value: JsonValue) => void;
 }) {
   return (
     <fieldset className="program-vector-editor">
-      <legend>{label} <span>{units}</span></legend>
-      <div>
+      <legend>{label} ({units})</legend>
+      <div className={labels.length === 4 ? 'program-vector-fields four' : 'program-vector-fields'}>
         {labels.map((axis, index) => (
           <NumberField
             key={axis}
             label={`${label} ${axis}`}
+            visibleLabel={axis.toUpperCase()}
             value={value[index] ?? 0}
             disabled={disabled}
             path={path === undefined ? undefined : `${path}[${index}]`}
+            previewPath={previewPath === undefined || previewOverrides !== undefined
+              ? undefined : `${previewPath}[${index}]`}
+            previewOverride={previewOverrides?.[index]}
             onCommit={(nextValue) => {
               const next = [...value];
               next[index] = nextValue;
@@ -159,7 +213,7 @@ function VectorEditor({
 }
 
 function frameReferenceFields(kind: string): string[] {
-  if (kind === 'target_frame') return ['target_role', 'frame_role'];
+  if (kind === 'target_frame') return ['component_id', 'frame_id'];
   if (kind === 'scene_resource') return ['scene_resource_id'];
   return [];
 }
@@ -178,8 +232,9 @@ export function completeFrameReferenceTransition(
   for (const field of frameReferenceFields(kind)) {
     const value = fields[field]?.trim();
     if (!value) return undefined;
-    candidate[field] = value;
+    if (kind !== 'target_frame') candidate[field] = value;
   }
+  if (kind === 'target_frame') candidate.frame = { component_id: fields.component_id.trim(), frame_id: fields.frame_id.trim() };
   return firstCatalogSchemaValidationMessage(schema, candidate, 'frame_ref')
     ? undefined
     : candidate;
@@ -270,14 +325,18 @@ function FrameReferenceEditor({
   schema,
   value,
   disabled,
+  path,
   onCommit,
 }: {
   schema: CatalogJsonSchema;
   value: JsonObject;
   disabled: boolean;
+  path?: string;
   onCommit: (value: JsonValue) => void;
 }) {
   const reportInvalid = useSpecializedInvalidReporter();
+  const previewValues = useContext(ProgramManualFillPreviewContext);
+  const previewValue = path === undefined ? undefined : previewValues.get(path);
   const currentKind = typeof value.kind === 'string' ? value.kind : '';
   const [draft, setDraft] = useState<Record<string, string>>(() =>
     Object.fromEntries(Object.entries(value).filter((row): row is [string, string] =>
@@ -296,7 +355,7 @@ function FrameReferenceEditor({
   const stage = (next: Record<string, string>) => {
     setDraft(next);
     const complete = completeFrameReferenceTransition(schema, next.kind, next);
-    reportInvalid(complete ? null : 'Complete every required frame role.');
+    reportInvalid(complete ? null : 'Complete every required frame reference field.');
     if (complete) onCommit(complete);
   };
 
@@ -314,24 +373,27 @@ function FrameReferenceEditor({
         offer={offer}
         value={value}
         disabled={disabled}
+        previewValue={previewValue}
         onCommit={onCommit}
       />
     );
   }
   return (
     <div className="program-variant-editor">
-      <label>
-        Frame reference
-        <select
-          aria-label="Frame reference kind"
-          value={kind}
-          disabled={disabled}
-          onChange={(event) => stage({ kind: event.target.value })}
-        >
-          {enumStrings(schema.properties?.kind).map((option) => (
-            <option key={option} value={option}>{option.replaceAll('_', ' ')}</option>
-          ))}
-        </select>
+      <label className={previewValue === undefined ? '' : 'program-manual-fill-changed'}>
+        <span>Frame reference</span>
+        <FillTarget previewValue={previewValue}>
+          <select
+            aria-label="Frame reference kind"
+            value={kind}
+            disabled={disabled}
+            onChange={(event) => stage({ kind: event.target.value })}
+          >
+            {enumStrings(schema.properties?.kind).map((option) => (
+              <option key={option} value={option}>{option.replaceAll('_', ' ')}</option>
+            ))}
+          </select>
+        </FillTarget>
       </label>
       {frameReferenceFields(kind).map((field) => (
         <label key={field}>
@@ -345,7 +407,7 @@ function FrameReferenceEditor({
         </label>
       ))}
       {completeFrameReferenceTransition(schema, kind, draft) === undefined && (
-        <p className="program-form-hint">Complete every required frame role before this reference is saved.</p>
+        <p className="program-form-hint">Complete every required frame reference field before this reference is saved.</p>
       )}
     </div>
   );
@@ -357,12 +419,14 @@ function ScopedFrameReference({
   offer,
   value,
   disabled,
+  previewValue,
   onCommit,
 }: {
   scope: FrameScope;
   offer: FrameOffer;
   value: JsonObject;
   disabled: boolean;
+  previewValue?: string;
   onCommit: (value: JsonValue) => void;
 }) {
   const reportInvalid = useSpecializedInvalidReporter();
@@ -374,19 +438,49 @@ function ScopedFrameReference({
   }, [reportInvalid, usable]);
   return (
     <div className="program-variant-editor">
-      <label>
-        Frame reference
-        <FrameSelector
-          scope={scope}
-          value={frame}
-          offer={offer}
-          disabled={disabled}
-          ariaLabel="Frame reference"
-          onChange={(next) => onCommit(next as unknown as JsonValue)}
-        />
+      <label className={previewValue === undefined ? '' : 'program-manual-fill-changed'}>
+        <span>Frame reference</span>
+        <FillTarget previewValue={previewValue}>
+          <FrameSelector
+            scope={scope}
+            value={frame}
+            offer={offer}
+            disabled={disabled}
+            ariaLabel="Frame reference"
+            onChange={(next) => onCommit(next as unknown as JsonValue)}
+          />
+        </FillTarget>
       </label>
     </div>
   );
+}
+
+/**
+ * A fill that stores the orientation in the other form (the robot pose and the
+ * move preview store a quaternion) is previewed in the form this editor shows,
+ * with the stored-form change on the representation selector.
+ */
+function useOrientationFillPreview(
+  path: string | undefined,
+  usesQuaternion: boolean,
+): { formLabel?: string; values?: string[] } {
+  const previewValues = useContext(ProgramManualFillPreviewContext);
+  if (path === undefined) return {};
+  const otherForm = usesQuaternion ? 'rpy_deg' : 'xyzw';
+  const otherAxes = usesQuaternion ? 3 : 4;
+  const incoming = Array.from({ length: otherAxes },
+    (_, index) => previewValues.get(`${path}.orientation.${otherForm}[${index}]`));
+  if (incoming.every((item) => item === undefined)) return {};
+  const numbers = incoming.map((item) => Number(item));
+  const converted = numbers.every(Number.isFinite)
+    ? convertOrientation({ [otherForm]: numbers }, usesQuaternion ? 'xyzw' : 'rpy_deg')
+    : undefined;
+  const shown = numericArray(converted?.[usesQuaternion ? 'xyzw' : 'rpy_deg']);
+  const decimals = usesQuaternion ? 4 : 2;
+  return {
+    formLabel: usesQuaternion ? 'RPY degrees' : 'Quaternion xyzw',
+    values: shown.length === 0 ? undefined : shown.map((item) => String(Number(item.toFixed(decimals)))),
+  };
 }
 
 function MotionPoseEditor({
@@ -394,12 +488,15 @@ function MotionPoseEditor({
   value,
   disabled,
   path,
+  relativeGoal = false,
   onCommit,
 }: {
   schema: CatalogJsonSchema;
   value: JsonObject;
   disabled: boolean;
   path?: string;
+  /** A relative goal is stated from target_reference, so it takes no frame of its own. */
+  relativeGoal?: boolean;
   onCommit: (value: JsonValue) => void;
 }) {
   const sources = useValueSources();
@@ -410,6 +507,7 @@ function MotionPoseEditor({
   const orientationSchema = schema.properties?.orientation;
   const usesQuaternion = Array.isArray(orientation.xyzw);
   const counterpart = convertOrientation(orientation, usesQuaternion ? 'rpy_deg' : 'xyzw');
+  const orientationPreview = useOrientationFillPreview(path, usesQuaternion);
   const frameSchema = schema.properties?.frame_ref;
   const commit = (patch: JsonObject) => onCommit({ ...value, ...patch });
   const frameRequired = schema.required?.includes('frame_ref') ?? false;
@@ -424,8 +522,14 @@ function MotionPoseEditor({
             schema={frameSchema}
             value={objectValue(value.frame_ref)}
             disabled={disabled}
+            path={path === undefined ? undefined : `${path}.frame_ref`}
             onCommit={(frameRef) => commit({ frame_ref: frameRef })}
           />
+          {relativeGoal && (
+            <p className="program-form-hint">
+              A relative move is stated from target_reference, so this frame must be the robot's base frame. Remove it, or switch target_mode to absolute.
+            </p>
+          )}
           {!frameRequired && (
             <button
               type="button"
@@ -441,7 +545,7 @@ function MotionPoseEditor({
           )}
         </>
       )}
-      {frameSchema && value.frame_ref === undefined && (
+      {frameSchema && value.frame_ref === undefined && !relativeGoal && (
         <button
           type="button"
           className="text-button"
@@ -460,25 +564,28 @@ function MotionPoseEditor({
         value={numericArray(value.position_m)}
         disabled={disabled}
         path={path === undefined ? undefined : `${path}.position_m`}
+        previewPath={path === undefined ? undefined : `${path}.position_m`}
         onCommit={(position) => commit({ position_m: position })}
       />
-      <label>
+      <label className={orientationPreview.formLabel === undefined ? undefined : 'program-manual-fill-changed'}>
         Orientation representation
-        <select
-          aria-label="Orientation representation"
-          value={usesQuaternion ? 'xyzw' : 'rpy_deg'}
-          disabled={disabled || orientationSourced}
-          title={orientationSourced
-            ? 'Type roll, pitch and yaw again before changing the stored form.'
-            : undefined}
-          onChange={(event) => {
-            const next = completeOrientationTransition(schema, value, event.target.value);
-            if (next) onCommit(next);
-          }}
-        >
-          {hasProperties(orientationSchema, ['rpy_deg']) && <option value="rpy_deg">RPY degrees</option>}
-          {hasProperties(orientationSchema, ['xyzw']) && <option value="xyzw">Quaternion xyzw</option>}
-        </select>
+        <FillTarget previewValue={orientationPreview.formLabel}>
+          <select
+            aria-label="Orientation representation"
+            value={usesQuaternion ? 'xyzw' : 'rpy_deg'}
+            disabled={disabled || orientationSourced}
+            title={orientationSourced
+              ? 'Type roll, pitch and yaw again before changing the stored form.'
+              : undefined}
+            onChange={(event) => {
+              const next = completeOrientationTransition(schema, value, event.target.value);
+              if (next) onCommit(next);
+            }}
+          >
+            {hasProperties(orientationSchema, ['rpy_deg']) && <option value="rpy_deg">RPY degrees</option>}
+            {hasProperties(orientationSchema, ['xyzw']) && <option value="xyzw">Quaternion xyzw</option>}
+          </select>
+        </FillTarget>
       </label>
       <VectorEditor
         label="Orientation"
@@ -488,6 +595,8 @@ function MotionPoseEditor({
         disabled={disabled}
         // A quaternion is typed or bound only with its whole pose.
         path={path === undefined || usesQuaternion ? undefined : `${path}.orientation.rpy_deg`}
+        previewPath={path === undefined ? undefined : `${path}.orientation.${usesQuaternion ? 'xyzw' : 'rpy_deg'}`}
+        previewOverrides={orientationPreview.values}
         onCommit={(next) => commit({
           orientation: usesQuaternion ? { xyzw: next } : { rpy_deg: next },
         })}
@@ -498,8 +607,6 @@ function MotionPoseEditor({
 }
 
 const MOTION_REFERENCE_FIELDS: Record<string, string> = {
-  frame_role: 'frame_role_id',
-  component_body_role: 'collision_body_role_id',
   scene_resource: 'scene_resource_id',
   runtime_object: 'runtime_object_id',
 };
@@ -537,39 +644,28 @@ export function completeMotionReferenceTransition(
     : candidate;
 }
 
-const FRAME_REFERENCE_TYPES = ['frame_role', 'cell_frame', 'scene_resource'];
+const FRAME_REFERENCE_TYPES = ['component_frame', 'cell_frame', 'scene_resource'];
 
 /** The pose frame a motion reference names, or null for a non-frame reference. */
-export function motionReferenceFrame(
-  value: JsonObject,
-  movingTargetRole: string | undefined,
-): ProgramPoseFrame | null {
+export function motionReferenceFrame(value: JsonObject): ProgramPoseFrame | null {
   if (value.type === 'cell_frame') return { kind: 'cell_frame' };
   if (value.type === 'scene_resource' && typeof value.scene_resource_id === 'string') {
     return { kind: 'scene_resource', scene_resource_id: value.scene_resource_id };
   }
-  if (value.type !== 'frame_role' || typeof value.frame_role_id !== 'string') return null;
-  const robot = typeof value.target_role === 'string' ? value.target_role : movingTargetRole;
-  return robot === undefined
-    ? null
-    : { kind: 'target_frame', target_role: robot, frame_role: value.frame_role_id };
+  if (value.type !== 'component_frame') return null;
+  return poseFrameOf({ kind: 'target_frame', frame: value.frame });
 }
 
 /**
- * The motion reference for one chosen frame: the moving robot's own frame
- * keeps the unqualified form; another robot's frame names that robot.
+ * The motion reference for one chosen frame; a component frame always
+ * names its component (direct reference).
  */
-export function motionReferenceForFrame(
-  frame: ProgramPoseFrame,
-  movingTargetRole: string | undefined,
-): JsonObject {
+export function motionReferenceForFrame(frame: ProgramPoseFrame): JsonObject {
   if (frame.kind === 'cell_frame') return { type: 'cell_frame' };
   if (frame.kind === 'scene_resource') {
     return { type: 'scene_resource', scene_resource_id: frame.scene_resource_id };
   }
-  return frame.target_role === movingTargetRole
-    ? { type: 'frame_role', frame_role_id: frame.frame_role }
-    : { type: 'frame_role', frame_role_id: frame.frame_role, target_role: frame.target_role };
+  return { type: 'component_frame', frame: { ...frame.frame } };
 }
 
 function ScopedMotionReferenceEditor({
@@ -604,12 +700,11 @@ function ScopedMotionReferenceEditor({
     reportInvalid(null);
   }, [currentType, reportInvalid, value]);
   const offer: FrameOffer = {
-    otherRobots: frameTypes.includes('frame_role') && schema.properties?.target_role !== undefined,
+    otherRobots: frameTypes.includes('component_frame'),
     cell: frameTypes.includes('cell_frame'),
     scene: frameTypes.includes('scene_resource'),
   };
-  const moving = scope.movingTargetRole;
-  const frame = choiceOf(currentType) === 'frame' ? motionReferenceFrame(value, moving) : null;
+  const frame = choiceOf(currentType) === 'frame' ? motionReferenceFrame(value) : null;
   const frameUsable = frame !== null
     && offeredFrameChoices(scope, offer).some((choice) => choice.key === frameKey(frame));
   const commitCandidate = (candidate: JsonObject | undefined) => {
@@ -661,10 +756,41 @@ function ScopedMotionReferenceEditor({
             offer={offer}
             disabled={disabled}
             ariaLabel="Motion reference frame"
-            onChange={(next) => commitCandidate(motionReferenceForFrame(next, moving))}
+            onChange={(next) => commitCandidate(motionReferenceForFrame(next))}
           />
         </label>
       )}
+      {draftChoice === 'component_body' && (() => {
+        const choices = scope.bodies ?? [];
+        const bodyValue = value.type === 'component_body' && value.body !== null
+          && typeof value.body === 'object' && !Array.isArray(value.body) ? value.body : null;
+        const selected = bodyValue && typeof bodyValue.component_id === 'string'
+          && typeof bodyValue.collision_body_id === 'string'
+          ? JSON.stringify([bodyValue.component_id, bodyValue.collision_body_id]) : '';
+        const key = (body: { component_id: string; collision_body_id: string }) => (
+          JSON.stringify([body.component_id, body.collision_body_id])
+        );
+        const known = choices.some((body) => key(body) === selected);
+        return <label>
+          Component collision body
+          <select
+            aria-label="Motion reference component collision body"
+            aria-invalid={selected !== '' && !known || undefined}
+            value={selected}
+            disabled={disabled}
+            onChange={(event) => {
+              const body = choices.find((row) => key(row) === event.target.value);
+              if (body) commitCandidate({ type: 'component_body', body: { ...body } });
+            }}
+          >
+            {selected === '' && <option value="" disabled>Select a body</option>}
+            {selected !== '' && !known && <option value={selected} disabled>Current body is unavailable in the captured model</option>}
+            {choices.map((body) => <option key={key(body)} value={key(body)}>
+              {body.component_id} · {body.collision_body_id}
+            </option>)}
+          </select>
+        </label>;
+      })()}
       {field && draftChoice !== 'frame' && (
         <label>
           {field.replaceAll('_', ' ')}
@@ -966,16 +1092,19 @@ function JointTargetListEditor({
   schema,
   value,
   disabled,
+  path,
   sourceJointInventory,
   onCommit,
 }: {
   schema: CatalogJsonSchema;
   value: JsonValue[];
   disabled: boolean;
+  path?: string;
   sourceJointInventory?: ProgramSourceJointInventory | null;
   onCommit: (value: JsonValue) => void;
 }) {
   const reportInvalid = useSpecializedInvalidReporter();
+  const previewValues = useContext(ProgramManualFillPreviewContext);
   const availableJointNames = useMemo(
     () => sourceJointInventory?.jointNames ?? [],
     [sourceJointInventory],
@@ -1020,6 +1149,8 @@ function JointTargetListEditor({
       )}
       {rows.map((row) => {
         const unavailableCurrent = inventoryAvailable && !row.available;
+        const previewValue = path === undefined ? undefined
+          : previewValues.get(`${path}[${row.jointName}].position_rad`);
         const selectionDisabled = disabled
           || (!row.selected && (!inventoryAvailable || maximumSelected));
         return (
@@ -1048,17 +1179,19 @@ function JointTargetListEditor({
               <code>{row.jointName}</code>
               {unavailableCurrent && <span>not commandable by this target</span>}
             </label>
-            <label className="program-joint-target-position">
+            <label className={`program-joint-target-position${previewValue === undefined ? '' : ' program-manual-fill-changed'}`}>
               <span className="sr-only">Position (rad)</span>
-              <JointTargetPositionInput
-                jointName={row.jointName}
-                value={row.selected ? row.positionText : ''}
-                disabled={disabled || !row.selected}
-                onCommit={(positionText) => stage(rows.map((candidate) =>
-                  candidate.jointName === row.jointName
-                    ? { ...candidate, positionText }
-                    : candidate))}
-              />
+              <FillTarget previewValue={previewValue}>
+                <JointTargetPositionInput
+                  jointName={row.jointName}
+                  value={row.selected ? row.positionText : ''}
+                  disabled={disabled || !row.selected}
+                  onCommit={(positionText) => stage(rows.map((candidate) =>
+                    candidate.jointName === row.jointName
+                      ? { ...candidate, positionText }
+                      : candidate))}
+                />
+              </FillTarget>
             </label>
           </div>
         );
@@ -1111,12 +1244,14 @@ function CartesianPathEditor({
   value,
   disabled,
   path,
+  relativeGoal = false,
   onCommit,
 }: {
   schema: CatalogJsonSchema;
   value: JsonValue[];
   disabled: boolean;
   path?: string;
+  relativeGoal?: boolean;
   onCommit: ValueCommit;
 }) {
   const itemSchema = schema.items ?? {};
@@ -1131,6 +1266,7 @@ function CartesianPathEditor({
             value={objectValue(waypoint)}
             disabled={disabled}
             path={waypointPath}
+            relativeGoal={relativeGoal}
             onCommit={(nextWaypoint) => {
               const next = [...value];
               next[index] = nextWaypoint;
@@ -1304,7 +1440,7 @@ function specializedKind(schema: CatalogJsonSchema): string | null {
   const variants = enumStrings(schema.properties?.type);
   if (
     schema.type === 'object'
-    && variants.includes('frame_role')
+    && variants.includes('component_frame')
     && variants.includes('pose')
   ) return 'motion-reference';
   const coordinateKinds = enumStrings(schema.properties?.kind);
@@ -1336,6 +1472,7 @@ export function ProgramSpecializedEditor({
   path,
   sourceJointInventory,
   frameScope,
+  relativeGoal = false,
   onCommit,
   onInvalidChange,
 }: {
@@ -1347,6 +1484,8 @@ export function ProgramSpecializedEditor({
   sourceJointInventory?: ProgramSourceJointInventory | null;
   /** The Program's declared frames; without it frame fields are typed as text. */
   frameScope?: FrameScope;
+  /** The node's goal is relative (target_mode), so poses take no frame of their own. */
+  relativeGoal?: boolean;
   onCommit: ValueCommit;
   onInvalidChange?: (message: string | null) => void;
 }) {
@@ -1377,20 +1516,21 @@ export function ProgramSpecializedEditor({
         schema={schema}
         value={value as JsonValue[]}
         disabled={disabled}
+        path={path}
         sourceJointInventory={sourceJointInventory}
         onCommit={onCommit}
       />
     );
   } else if (kind === 'cartesian-path') {
-    content = <CartesianPathEditor schema={schema} value={value as JsonValue[]} disabled={disabled} path={path} onCommit={onCommit} />;
+    content = <CartesianPathEditor schema={schema} value={value as JsonValue[]} disabled={disabled} path={path} relativeGoal={relativeGoal} onCommit={onCommit} />;
   } else if (kind === 'motion-pose') {
-    content = <MotionPoseEditor schema={schema} value={objectValue(value)} disabled={disabled} path={path} onCommit={onCommit} />;
+    content = <MotionPoseEditor schema={schema} value={objectValue(value)} disabled={disabled} path={path} relativeGoal={relativeGoal} onCommit={onCommit} />;
   } else if (kind === 'motion-reference') {
     content = <MotionReferenceEditor schema={schema} value={objectValue(value)} disabled={disabled} path={path} onCommit={onCommit} />;
   } else if (kind === 'coordinate') {
     content = <CoordinateEditor schema={schema} value={objectValue(value)} disabled={disabled} path={path} onCommit={onCommit} />;
   } else if (kind === 'frame-reference') {
-    content = <FrameReferenceEditor schema={schema} value={objectValue(value)} disabled={disabled} onCommit={onCommit} />;
+    content = <FrameReferenceEditor schema={schema} value={objectValue(value)} disabled={disabled} path={path} onCommit={onCommit} />;
   }
   return (
     <SpecializedInvalidContext.Provider value={reportInvalid}>

@@ -9,6 +9,8 @@ from threading import Event, Thread
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Mapping
 
+from .v3_fixtures import frame, signal, target, target_binding
+
 import py_trees
 import pytest
 
@@ -274,7 +276,7 @@ class _ControlTransport(_Transport):
         return {
             "ok": True,
             "owner_epoch": "kernel.epoch.7",
-            "target_role_id": "arm",
+            "target": target("robot.1", "arm.command"),
             "operation": deepcopy(self.operations["controlled"]),
             "runtime_scale": deepcopy(self.scale),
         }
@@ -315,7 +317,7 @@ def _control_port():
     context = _context()
     binding = {
         **context.program_binding,
-        "target_role_bindings": [
+        "target_bindings": [
             {
                 **row,
                 "capability_bindings": [
@@ -330,7 +332,7 @@ def _control_port():
                     ),
                 ],
             }
-            for row in context.program_binding["target_role_bindings"]
+            for row in context.program_binding["target_bindings"]
         ],
     }
     owner.bind(replace(context, program_binding=binding))
@@ -399,7 +401,7 @@ def test_recovery_node_submits_only_the_authored_current_offer_once(accepted, in
     result = owner.controls.start(
         "recovery.apply_offered_action",
         identity,
-        OwnerNodeInputs({"target_role": "arm", "recovery_action": "acknowledge_and_continue"}),
+        OwnerNodeInputs({"target": target("robot.1", "arm.command"), "recovery_action": "acknowledge_and_continue"}),
     )
     assert result.state is (OwnerTaskState.SUCCEEDED if accepted is True else OwnerTaskState.FAILED)
     assert not owner.controls._pending
@@ -466,7 +468,7 @@ def test_recovery_node_rejects_ambiguous_stale_or_unoffered_work_before_effect(f
         owner.controls.start(
             "recovery.apply_offered_action",
             _identity("recovery"),
-            OwnerNodeInputs({"target_role": "arm", "recovery_action": action}),
+            OwnerNodeInputs({"target": target("robot.1", "arm.command"), "recovery_action": action}),
         )
     assert not calls
     assert not owner.controls._pending
@@ -481,7 +483,7 @@ def test_recovery_node_rejects_ambiguous_stale_or_unoffered_work_before_effect(f
 def test_control_node_submits_once_then_observes_owner_outcome(node, state):
     owner, transport = _control_port()
     identity = NodeAttemptIdentity("program-run.1", "control", "attempt.1")
-    task = owner.controls.start(node, identity, OwnerNodeInputs({"target_role": "arm"}))
+    task = owner.controls.start(node, identity, OwnerNodeInputs({"target": target("robot.1", "arm.command")}))
     assert task.state is OwnerTaskState.ACTIVE
     assert len(transport.controls) == len(transport.queries) == 1
     request = transport.controls[0][2]
@@ -507,7 +509,7 @@ def test_stop_control_node_waits_for_exact_stop_certificate(full, terminal, succ
     task = owner.controls.start(
         "kernel.full_stop" if full else "kernel.stop_operation",
         identity,
-        OwnerNodeInputs({} if full else {"target_role": "arm"}),
+        OwnerNodeInputs({} if full else {"target": target("robot.1", "arm.command")}),
     )
     for _ in range(3):
         assert owner.controls.observe(task.task_id).state is OwnerTaskState.ACTIVE
@@ -543,7 +545,7 @@ def test_control_node_waits_for_provider_completion_not_just_observed_state(
     task = owner.controls.start(
         node,
         NodeAttemptIdentity("program-run.1", "control", "held"),
-        OwnerNodeInputs({"target_role": "arm"}),
+        OwnerNodeInputs({"target": target("robot.1", "arm.command")}),
     )
     transport.control_pending = True
     transport.resident["controlled"] = True
@@ -566,7 +568,7 @@ def test_control_node_cannot_treat_replacement_owner_history_as_completed_reset(
     task = owner.controls.start(
         "kernel.reset_operation",
         NodeAttemptIdentity("program-run.1", "control", "replaced"),
-        OwnerNodeInputs({"target_role": "arm"}),
+        OwnerNodeInputs({"target": target("robot.1", "arm.command")}),
     )
     transport.owner_epoch = "replacement"
     transport.resident["controlled"] = False
@@ -581,7 +583,7 @@ def test_control_node_cannot_claim_a_later_controls_completion():
     task = owner.controls.start(
         "kernel.reset_operation",
         NodeAttemptIdentity("program-run.1", "control", "superseded"),
-        OwnerNodeInputs({"target_role": "arm"}),
+        OwnerNodeInputs({"target": target("robot.1", "arm.command")}),
     )
     transport.last_control["request_id"] = "another-reset"
     assert owner.controls.observe(task.task_id).reason_code == "operation_control_superseded"
@@ -613,7 +615,7 @@ def test_operation_scale_node_waits_for_application_without_changing_scope_setti
     task = owner.controls.start(
         "kernel.set_runtime_scale",
         identity,
-        OwnerNodeInputs({"target_role": "arm", "scale": 0.5}),
+        OwnerNodeInputs({"target": target("robot.1", "arm.command"), "scale": 0.5}),
     )
     assert owner.controls.observe(task.task_id).state is OwnerTaskState.ACTIVE
     transport.scale["state"] = "applied"
@@ -635,7 +637,7 @@ def test_control_query_cannot_cross_program_scope(field, value):
         owner.controls.start(
             "kernel.reset_operation",
             NodeAttemptIdentity("program-run.1", "control", "attempt.bad"),
-            OwnerNodeInputs({"target_role": "arm"}),
+            OwnerNodeInputs({"target": target("robot.1", "arm.command")}),
         )
     assert transport.controls == []
     assert owner.controls._pending == {}
@@ -651,13 +653,13 @@ def test_control_task_retention_is_pending_only_and_cancel_never_reissues_effect
     for index in range(1000):
         identity = NodeAttemptIdentity("program-run.1", "control", f"attempt.{index}")
         task = owner.controls.start(
-            "kernel.reset_operation", identity, OwnerNodeInputs({"target_role": "arm"})
+            "kernel.reset_operation", identity, OwnerNodeInputs({"target": target("robot.1", "arm.command")})
         )
         assert owner.controls.observe(task.task_id).state is OwnerTaskState.SUCCEEDED
         owner.controls.acknowledge(task.task_id, identity)
     identity = NodeAttemptIdentity("program-run.1", "control", "attempt.cancel")
     task = owner.controls.start(
-        "kernel.stop_operation", identity, OwnerNodeInputs({"target_role": "arm"})
+        "kernel.stop_operation", identity, OwnerNodeInputs({"target": target("robot.1", "arm.command")})
     )
     owner.controls.cancel(task.task_id, identity)
     assert len(transport.controls) == 1001
@@ -682,47 +684,27 @@ def _context() -> ProgramRunPortContext:
             "program_revision": _DIGEST_A,
             "retained_bundle_id": _DIGEST_B,
             "graph_revision": _DIGEST_C,
-            "target_role_bindings": [
-                {
-                    "target_role_id": "arm",
-                    "component_role_id": "robot",
-                    "controllable_component_id": "robot.1",
-                    "command_target_id": "arm.command",
-                    "capability_bindings": [
-                        {
-                            "capability_id": "execution.trajectory.execute",
-                            "command_schema": None,
-                        },
-                        {
-                            "capability_id": "model.kinematics.fk",
-                            "command_schema": None,
-                        },
-                        {
-                            "capability_id": "state.observed.current",
-                            "command_schema": None,
-                        },
-                    ],
-                },
-                {
-                    "target_role_id": "gripper",
-                    "component_role_id": "tool",
-                    "controllable_component_id": "tool.1",
-                    "command_target_id": "gripper.command",
-                    "capability_bindings": [
-                        {
-                            "capability_id": "tool.gripper.command",
-                            "command_schema": {
-                                "command_schema_id": "gripper.command_position",
-                                "command_schema_revision": _DIGEST_E,
-                            },
-                        },
-                        {
-                            "capability_id": "tool.gripper.feedback",
-                            "command_schema": None,
-                        },
-                    ],
-                },
+            "target_bindings": [
+                target_binding("robot.1", "arm.command", [
+                    {"capability_id": "execution.trajectory.execute", "command_schema": None},
+                    {"capability_id": "model.kinematics.fk", "command_schema": None},
+                    {"capability_id": "state.observed.current", "command_schema": None},
+                ]),
+                target_binding("tool.1", "gripper.command", [
+                    {"capability_id": "tool.gripper.command", "command_schema": {
+                        "command_schema_id": "gripper.command_position",
+                        "command_schema_revision": _DIGEST_E,
+                    }},
+                    {"capability_id": "tool.gripper.feedback", "command_schema": None},
+                ]),
             ],
+            "frame_bindings": [
+                {"reference": frame("robot.1", "base")},
+                {"reference": frame("robot.1", "tcp")},
+                {"reference": frame("tool.1", "tcp")},
+            ],
+            "collision_body_bindings": [],
+            "signal_bindings": [],
             "contact_grasp_bindings": [
                 {
                     "contact_policy_id": "pick.contact",
@@ -772,9 +754,9 @@ def _identity(instance: str = "move-relative") -> NodeAttemptIdentity:
 def _motion_inputs() -> OwnerNodeInputs:
     return OwnerNodeInputs(
         parameters={
-            "target_role": "arm",
-            "base_frame_role": "base",
-            "tcp_endpoint": {"kind": "entry", "target_role": "arm", "frame_role": "tcp"},
+            "target": target("robot.1", "arm.command"),
+            "base_frame": frame("robot.1", "base"),
+            "tcp_endpoint": {"kind": "entry", "target": target("robot.1", "arm.command"), "frame": frame("robot.1", "tcp")},
             "goal": {
                 "position_m": [0.0, 0.0, 0.1],
                 "orientation": {"rpy_deg": [180.0, 0.0, 0.0]},
@@ -785,8 +767,8 @@ def _motion_inputs() -> OwnerNodeInputs:
                 "scene_resource_id": "graspable",
             },
             "offset_reference": {
-                "type": "frame_role",
-                "frame_role_id": "base",
+                "type": "component_frame",
+                "frame": frame("robot.1", "base"),
             },
             "velocity_scale": 0.4,
             "acceleration_scale": 0.4,
@@ -832,7 +814,7 @@ def test_native_queries_use_one_captured_read_without_effects(
             assert query["owner_epoch"] == "kernel.epoch.7"
             assert query["program_binding_id"] == _DIGEST_A
             frame = query["kind"] == "frame_pose"
-            assert query["target_role_id"] == ("arm" if frame else "gripper")
+            assert query["target"] == (target("robot.1", "arm.command") if frame else target("tool.1", "gripper.command"))
             value = (
                 {
                     "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
@@ -855,7 +837,7 @@ def test_native_queries_use_one_captured_read_without_effects(
                 "ok": True,
                 "target_observation": {
                     **query,
-                    "schema_version": "manyforge.target_observation.v1",
+                    "schema_version": "manyforge.target_observation.v2",
                     "source_epoch": "source.1",
                     "source_sequence": 7,
                     "value": value,
@@ -866,9 +848,9 @@ def test_native_queries_use_one_captured_read_without_effects(
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
     parameters = (
-        {"target_role": "arm", "frame_role": "tcp", "output_key": "pose"}
+        {"target": target("robot.1", "arm.command"), "frame": frame("robot.1", "tcp"), "output_key": "pose"}
         if node_id == "model.get_frame_pose"
-        else {"target_role": "gripper", "expected_state": expected_state}
+        else {"target": target("tool.1", "gripper.command"), "expected_state": expected_state}
     )
     result = port.queries.invoke(
         node_id, _identity("query"), OwnerNodeInputs(parameters=parameters)
@@ -897,7 +879,7 @@ def test_native_queries_use_one_captured_read_without_effects(
     assert transport.controls == []
 
 
-def test_relative_pose_submission_uses_capture_and_preserves_portable_roles() -> None:
+def test_relative_pose_submission_uses_capture_and_preserves_direct_references() -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
@@ -910,8 +892,7 @@ def test_relative_pose_submission_uses_capture_and_preserves_portable_roles() ->
     assert request["program_binding_id"] == _DIGEST_A
     assert request["expected_scene_revision"] is None
     participant = request["participants"][0]
-    assert participant["component_role_id"] == "robot"
-    assert participant["target_role_id"] == "arm"
+    assert participant["target"] == target("robot.1", "arm.command")
     assert participant["execution_scope"] == {
         "node_instance_id": _identity().node_instance_id,
         "node_attempt_id": _identity().node_attempt_id,
@@ -923,8 +904,7 @@ def test_relative_pose_submission_uses_capture_and_preserves_portable_roles() ->
         "scene_resource_id": "graspable",
     }
     assert payload["offset_reference"] == {
-        "type": "frame_role",
-        "frame_role_id": "base",
+        "type": "component_frame", "frame": frame("robot.1", "base"),
     }
     assert payload["motion"]["goal"]["orientation"]["x"] == pytest.approx(1.0)
     assert "compiled_frame_name" not in repr(request)
@@ -967,7 +947,7 @@ def _absolute_inputs(node_id: str, frames: list[Any]) -> OwnerNodeInputs:
     return OwnerNodeInputs(parameters=parameters)
 
 
-_BASE = {"kind": "target_frame", "target_role": "arm", "frame_role": "base"}
+_BASE = {"kind": "target_frame", "frame": frame("robot.1", "base")}
 
 
 @pytest.mark.parametrize(
@@ -981,12 +961,12 @@ _BASE = {"kind": "target_frame", "target_role": "arm", "frame_role": "base"}
             {"type": "scene_resource", "scene_resource_id": "fixture"},
         ),
         (
-            {"kind": "target_frame", "target_role": "arm", "frame_role": "tcp"},
-            {"type": "frame_role", "frame_role_id": "tcp", "target": _ARM},
+            {"kind": "target_frame", "frame": frame("robot.1", "tcp")},
+            {"type": "component_frame", "frame": frame("robot.1", "tcp")},
         ),
         (
-            {"kind": "target_frame", "target_role": "gripper", "frame_role": "tcp"},
-            {"type": "frame_role", "frame_role_id": "tcp", "target": _GRIPPER},
+            {"kind": "target_frame", "frame": frame("tool.1", "tcp")},
+            {"type": "component_frame", "frame": frame("tool.1", "tcp")},
         ),
     ],
 )
@@ -1024,7 +1004,7 @@ def test_absolute_goal_frame_is_forwarded_as_one_goal_frame_reference(
         ("motion.move_to_pose", [{"kind": "cell_frame"}], "relative", "relative goal"),
         (
             "motion.move_to_pose",
-            [{"kind": "target_frame", "target_role": "ghost", "frame_role": "tcp"}],
+            [{"kind": "target_frame", "frame": frame("ghost", "tcp")}],
             "absolute",
             "absent from the Program Binding",
         ),
@@ -1096,7 +1076,7 @@ def test_pick_place_cartesian_phases_keep_exact_corners_and_deployment_timing() 
 
 @pytest.mark.parametrize("clearance_m", [None, 0.0, 0.0005])
 def test_motion_clearance_is_forwarded_only_when_the_node_sets_it(clearance_m) -> None:
-    # M6 decision 16: a motion node's clearance_m reaches the owner as the
+    # A motion node's clearance_m reaches the owner as the
     # move's own clearance; absent keeps the Deployment clearance.
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
@@ -1122,9 +1102,8 @@ def test_reference_names_another_robot_frame_or_the_cell_by_binding_identity() -
         parameters={
             **_motion_inputs().parameters,
             "target_reference": {
-                "type": "frame_role",
-                "frame_role_id": "tcp",
-                "target_role": "gripper",
+                "type": "component_frame",
+                "frame": frame("tool.1", "tcp"),
             },
             "offset_reference": {"type": "cell_frame"},
         }
@@ -1134,9 +1113,8 @@ def test_reference_names_another_robot_frame_or_the_cell_by_binding_identity() -
 
     payload = transport.submissions[0]["participants"][0]["payload"]
     assert payload["target_reference"] == {
-        "type": "frame_role",
-        "frame_role_id": "tcp",
-        "target": _GRIPPER,
+        "type": "component_frame",
+        "frame": frame("tool.1", "tcp"),
     }
     assert payload["offset_reference"] == {"type": "cell_frame"}
     assert "goal_frame_reference" not in payload
@@ -1158,7 +1136,7 @@ def test_frame_transform_query_forwards_both_frames_and_names_owner_refusals() -
                 "ok": True,
                 "target_observation": {
                     **query,
-                    "schema_version": "manyforge.target_observation.v1",
+                    "schema_version": "manyforge.target_observation.v2",
                     "evaluated_at_ns": 12,
                     "scene_revision": {"scene_id": _DIGEST_A, "revision_id": 4, "content_hash": _DIGEST_B},
                     "resolution_evidence_digests": [_DIGEST_C],
@@ -1173,7 +1151,7 @@ def test_frame_transform_query_forwards_both_frames_and_names_owner_refusals() -
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
     pose = {
-        "frame_ref": {"kind": "target_frame", "target_role": "gripper", "frame_role": "tcp"},
+        "frame_ref": {"kind": "target_frame", "frame": frame("tool.1", "tcp")},
         "position_m": [0.0, 0.0, 0.1],
         "orientation": {"rpy_deg": [0.0, 0.0, 0.0]},
     }
@@ -1182,7 +1160,7 @@ def test_frame_transform_query_forwards_both_frames_and_names_owner_refusals() -
 
     assert queries == [
         {
-            "schema_version": "manyforge.target_observation_query.v1",
+            "schema_version": "manyforge.target_observation_query.v2",
             "owner_epoch": "kernel.epoch.7",
             "program_binding_id": _DIGEST_A,
             "kind": "frame_transform",
@@ -1190,7 +1168,7 @@ def test_frame_transform_query_forwards_both_frames_and_names_owner_refusals() -
                 "position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.1},
                 "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
             },
-            "source_frame": {"type": "frame_role", "frame_role_id": "tcp", "target": _GRIPPER},
+            "source_frame": {"type": "component_frame", "frame": frame("tool.1", "tcp")},
             "target_frame": {"type": "cell_frame"},
         }
     ]
@@ -1265,7 +1243,7 @@ def test_partial_stop_reset_requires_resident_operations_to_be_reset_first() -> 
 def test_uncontained_stop_reset_accepts_exact_generation_after_intervention_is_retired(
     stop_state: str,
 ) -> None:
-    # R3: the cell latch blocks execution after a partial or failed Stop, so
+    # The cell latch blocks execution after a partial or failed Stop, so
     # Reset completes; only the Resume fence release needs a succeeded Stop.
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
@@ -1495,9 +1473,9 @@ def test_owner_failures_name_the_reference_that_failed() -> None:
     operation.update({"state": "failed", "operation_revision": 3})
     details = {
         "reason": "program_reference_robot_frame_missing",
-        "reference_type": "frame_role",
+        "reference_type": "component_frame",
         "reference_id": "tcp",
-        "target_role_id": "gripper",
+        "component_id": "gripper",
     }
     operation["participants"] = [
         {
@@ -1516,7 +1494,7 @@ def test_owner_failures_name_the_reference_that_failed() -> None:
     assert snapshot.message == (
         "robot frame role is absent from the retained target map "
         "(program_reference_robot_frame_missing; "
-        "reference frame_role 'tcp' of target role 'gripper')"
+        "reference component_frame 'tcp' of component 'gripper')"
     )
     rejected = KernelOperationAdmissionRejectedError(
         "missing_reference",
@@ -2275,7 +2253,7 @@ def test_gripper_schema_comes_from_captured_program_binding() -> None:
     port.bind(_context())
     inputs = OwnerNodeInputs(
         parameters={
-            "target_role": "gripper",
+            "target": target("tool.1", "gripper.command"),
             "position": {"kind": "linear_m", "value_m": 0.008},
             "max_effort": {"kind": "linear_newton", "value_n": 10.0},
             "command_duration_s": 0.8,
@@ -2286,13 +2264,13 @@ def test_gripper_schema_comes_from_captured_program_binding() -> None:
     port.operations.start("gripper.command_position", _identity("open-gripper"), inputs)
 
     participant = transport.submissions[0]["participants"][0]
-    assert participant["component_role_id"] == "tool"
+    assert participant["target"] == target("tool.1", "gripper.command")
     assert participant["payload"]["command_schema_revision"] == _DIGEST_E
 
 
 def _gripper_inputs(duration_s: float = 0.8) -> OwnerNodeInputs:
     return OwnerNodeInputs(parameters={
-        "target_role": "gripper",
+        "target": target("tool.1", "gripper.command"),
         "position": {"kind": "linear_m", "value_m": 0.008},
         "max_effort": {"kind": "linear_newton", "value_n": 10.0},
         "command_duration_s": duration_s,
@@ -2315,9 +2293,9 @@ def _preset_transport(transport=None, *, kind="angular_rad"):
     transport = _Transport() if transport is None else transport
     schema = {"command_schema_id": "gripper.command_position", "command_schema_revision": _DIGEST_E}
     transport.preset_descriptor = {
-        "schema_version": "manyforge.manual_control_gripper_descriptor.v3",
+        "schema_version": "manyforge.manual_control_gripper_descriptor.v5",
         "controllable_component_id": "tool.1", "command_target_id": "gripper.command",
-        "component_role_id": "manual_component", "target_role_id": "manual_target",
+        "target": {"component_id": "tool.1", "command_target_id": "gripper.command"},
         "source_kind": "model_role", "coordinate_kind": kind,
         "unit": "rad" if kind == "angular_rad" else "m",
         "min_position": 0.0, "max_position": 1.0,
@@ -2346,7 +2324,7 @@ def _preset_transport(transport=None, *, kind="angular_rad"):
         "identity": {"owner_epoch": "kernel.epoch.7", "graph_revision": _DIGEST_C,
                      "retained_bundle_id": _DIGEST_B},
         "targets": {
-            "schema_version": "manyforge.execution_targets.v3",
+            "schema_version": "manyforge.execution_targets.v4",
             "components": [{"controllable_component_id": "tool.1", "targets": [{
                 "command_target_id": "gripper.command", "operation_capability_id": "tool.gripper.command",
                 "presentation": "gripper", "command": {
@@ -2371,7 +2349,7 @@ def _preset_transport(transport=None, *, kind="angular_rad"):
     ("pneumatic", "none", "no_output", "not_required"),
 ])
 @pytest.mark.parametrize("alias,value", [("open", 0.8), ("closed", 0.1)])
-def test_named_gripper_alias_consumes_exact_v3_mode_policy_matrix(
+def test_named_gripper_alias_consumes_exact_v5_mode_policy_matrix(
     actuation, mode, completion, confirmation, alias, value,
 ):
     transport = _preset_transport(kind="linear_m")
@@ -2396,12 +2374,17 @@ def test_named_gripper_alias_consumes_exact_v3_mode_policy_matrix(
     "old_version", "missing_mode", "null_mode", "unknown_mode", "position_none",
     "missing_actuation", "unknown_actuation", "missing_completion", "wrong_completion",
     "missing_confirmation", "wrong_confirmation", "unconfigured_model",
+    "missing_target", "wrong_target",
 ])
-def test_named_gripper_alias_refuses_old_or_incomplete_v3_descriptor(case):
+def test_named_gripper_alias_refuses_old_or_incomplete_v5_descriptor(case):
     transport = _preset_transport()
     descriptor = transport.preset_descriptor
     if case == "old_version":
-        descriptor["schema_version"] = "manyforge.manual_control_gripper_descriptor.v2"
+        descriptor["schema_version"] = "manyforge.manual_control_gripper_descriptor.v4"
+    elif case == "missing_target":
+        descriptor.pop("target")
+    elif case == "wrong_target":
+        descriptor["target"]["command_target_id"] = "other.command"
     elif case == "missing_mode":
         descriptor.pop("output_mode")
     elif case == "null_mode":
@@ -2939,11 +2922,11 @@ class _PickPlaceTransport(_Transport):
 def _pick_inputs(*, policy: str = "pause_for_operator") -> OwnerNodeInputs:
     return OwnerNodeInputs(
         parameters={
-            "target_role": "arm",
-            "tool_target_role": "gripper",
-            "base_frame_role": "base",
-            "tcp_endpoint": {"kind": "entry", "target_role": "arm", "frame_role": "tcp"},
-            "carrier_frame_role": "tcp",
+            "target": target("robot.1", "arm.command"),
+            "tool_target": target("tool.1", "gripper.command"),
+            "base_frame": frame("robot.1", "base"),
+            "tcp_endpoint": {"kind": "entry", "target": target("robot.1", "arm.command"), "frame": frame("robot.1", "tcp")},
+            "carrier_frame_ref": frame("robot.1", "tcp"),
             "selected_object_id": "graspable",
             "synthesis": {
                 "pick_offset_envelope": {
@@ -2984,9 +2967,8 @@ def test_pick_offsets_accept_cell_and_other_robot_frames_like_motion_references(
     synthesis = dict(parameters["synthesis"])
     synthesis["pick_offset_reference"] = {"type": "cell_frame"}
     synthesis["approach_offset_reference"] = {
-        "type": "frame_role",
-        "frame_role_id": "tcp",
-        "target_role": "gripper",
+        "type": "component_frame",
+        "frame": frame("tool.1", "tcp"),
     }
     parameters["synthesis"] = synthesis
 
@@ -3002,15 +2984,13 @@ def test_pick_offsets_accept_cell_and_other_robot_frames_like_motion_references(
     # The robot qualifier resolves through the captured Program Binding, the
     # same mapping a motion reference uses.
     assert forwarded["approach_offset_reference"] == {
-        "type": "frame_role",
-        "frame_role_id": "tcp",
-        "target": _GRIPPER,
+        "type": "component_frame",
+        "frame": frame("tool.1", "tcp"),
     }
 
     synthesis["approach_offset_reference"] = {
-        "type": "frame_role",
-        "frame_role_id": "tcp",
-        "target_role": "unbound_robot",
+        "type": "component_frame",
+        "frame": frame("unbound_robot", "tcp"),
     }
     requests = len(transport.pick_requests)
     with pytest.raises(ProductionPortError, match="absent from the Program Binding"):
@@ -3035,8 +3015,7 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
         "approach_pose": {
             "frame_ref": {
                 "kind": "target_frame",
-                "target_role": "arm",
-                "frame_role": "base",
+                "frame": frame("robot.1", "base"),
             },
             "position_m": [0.4, 0.0, 0.2],
             "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
@@ -3045,8 +3024,7 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
             {
                 "frame_ref": {
                     "kind": "target_frame",
-                    "target_role": "arm",
-                    "frame_role": "base",
+                    "frame": frame("robot.1", "base"),
                 },
                 "position_m": [0.4, 0.0, 0.2],
                 "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
@@ -3054,8 +3032,7 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
             {
                 "frame_ref": {
                     "kind": "target_frame",
-                    "target_role": "arm",
-                    "frame_role": "base",
+                    "frame": frame("robot.1", "base"),
                 },
                 "position_m": [0.4, 0.0, 0.2],
                 "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
@@ -3064,8 +3041,7 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
         "pick_pose": {
             "frame_ref": {
                 "kind": "target_frame",
-                "target_role": "arm",
-                "frame_role": "base",
+                "frame": frame("robot.1", "base"),
             },
             "position_m": [0.4, 0.0, 0.2],
             "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
@@ -3073,8 +3049,7 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
         "retreat_pose": {
             "frame_ref": {
                 "kind": "target_frame",
-                "target_role": "arm",
-                "frame_role": "base",
+                "frame": frame("robot.1", "base"),
             },
             "position_m": [0.4, 0.0, 0.2],
             "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
@@ -3083,8 +3058,7 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
             {
                 "frame_ref": {
                     "kind": "target_frame",
-                    "target_role": "arm",
-                    "frame_role": "base",
+                    "frame": frame("robot.1", "base"),
                 },
                 "position_m": [0.4, 0.0, 0.2],
                 "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
@@ -3092,8 +3066,7 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
             {
                 "frame_ref": {
                     "kind": "target_frame",
-                    "target_role": "arm",
-                    "frame_role": "base",
+                    "frame": frame("robot.1", "base"),
                 },
                 "position_m": [0.4, 0.0, 0.2],
                 "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
@@ -3420,53 +3393,27 @@ def test_named_planning_output_reuses_resolved_numeric_tool_position(phase, alia
 def _scene_context() -> ProgramRunPortContext:
     value = _context()
     binding = dict(value.program_binding)
-    binding["component_role_bindings"] = [
-        {
-            "component_role_id": "robot",
-            "controllable_component_id": "robot.1",
-            "component_type_id": "robot.type",
-            "component_type_revision": _DIGEST_D,
-            "model_role_bindings": [
-                {
-                    "model_role_id": "arm_model",
-                    "model_instance_id": "robot.1.model",
-                    "model_revision": _DIGEST_E,
-                }
-            ],
-        }
+    binding["component_bindings"] = [{
+        "component_id": "robot.1",
+        "model_bindings": [{
+            "model_role_id": "arm_model", "model_instance_id": "robot.1.model",
+            "model_revision": _DIGEST_E,
+        }],
+    }]
+    binding["frame_bindings"] = [
+        {"reference": frame("robot.1", name), "model_instance_id": "robot.1.model",
+         "model_revision": _DIGEST_E}
+        for name in ("base", "tcp")
     ]
-    binding["target_role_bindings"] = [
-        {
-            "target_role_id": "arm",
-            "component_role_id": "robot",
-            "controllable_component_id": "robot.1",
-            "command_target_id": "arm.command",
-            "frame_role_bindings": [
-                {
-                    "frame_role_id": "base",
-                    "model_instance_id": "robot.1.model",
-                    "model_revision": _DIGEST_E,
-                    "compiled_frame_name": "robot_1_base",
-                },
-                {
-                    "frame_role_id": "tcp",
-                    "model_instance_id": "robot.1.model",
-                    "model_revision": _DIGEST_E,
-                    "compiled_frame_name": "robot_1_tcp",
-                },
-            ],
-            "resource_role_bindings": [],
-            "collision_body_role_bindings": [
-                {
-                    "collision_body_role_id": "tool_collision",
-                    "model_instance_id": "robot.1.model",
-                    "model_revision": _DIGEST_E,
-                    "compiled_collision_body_names": ["robot_1_tool"],
-                }
-            ],
-            "capability_bindings": [],
-        }
-    ]
+    binding["collision_body_bindings"] = [{
+        "reference": {"component_id": "robot.1", "collision_body_id": "tool_collision"},
+        "model_instance_id": "robot.1.model", "model_revision": _DIGEST_E,
+    }]
+    binding["target_bindings"] = [target_binding(
+        "robot.1", "arm.command", [],
+        frame_references=[frame("robot.1", "base"), frame("robot.1", "tcp")],
+        collision_body_references=[{"component_id": "robot.1", "collision_body_id": "tool_collision"}],
+    )]
     return ProgramRunPortContext(
         program_run_id=value.program_run_id,
         applied_record_digest=value.applied_record_digest,
@@ -3689,7 +3636,7 @@ class _SceneTransport:
             self.admission_generation += 2
         context = request["request_context"]
         return {
-            "api_version": "manyforge.manager_command_response.v1",
+            "api_version": "manyforge.manager_command_response.v2",
             "committed_projection_revision": deepcopy(self.revision),
             "error": None,
             "ok": True,
@@ -3702,7 +3649,7 @@ class _SceneTransport:
         }
 
     def scene_transaction_status(self, body):
-        return {"api_version": "manyforge.manager_command_response.v1", "ok": True, "result": None}
+        return {"api_version": "manyforge.manager_command_response.v2", "ok": True, "result": None}
 
 
 def _scene_port(transport):
@@ -3724,7 +3671,7 @@ def _scene_port(transport):
 
 def _pose_latch_owner_response() -> dict[str, Any]:
     return {
-        "api_version": "manyforge.manager_command_response.v1",
+        "api_version": "manyforge.manager_command_response.v2",
         "cell_id": "cell-a",
         "initialization_generation": 1,
         "initialization_state": "ready",
@@ -3747,7 +3694,7 @@ def _pose_latch_success_response(request: Mapping[str, Any]) -> dict[str, Any]:
     committed_projection["scene_revision"]["content_hash"] = _DIGEST_F
     return {
         "already_applied_observation_count": 0,
-        "api_version": "manyforge.manager_command_response.v1",
+        "api_version": "manyforge.manager_command_response.v2",
         "committed_observation_count": 1,
         "initial_projection_revision": projection,
         "latched_observation_count": 1,
@@ -3827,11 +3774,11 @@ def test_between_nodes_capture_retains_deployment_and_scene_fences(crossed) -> N
 @pytest.mark.parametrize(
     "latch_response,expected_reason",
     [
-        ({"api_version": "manyforge.manager_command_response.v1", "ok": True},
+        ({"api_version": "manyforge.manager_command_response.v2", "ok": True},
          "scene_runtime_latch_failed"),
         (
             {
-                "api_version": "manyforge.manager_command_response.v1",
+                "api_version": "manyforge.manager_command_response.v2",
                 "ok": False,
                 "error": {"code": "stale_scene_projection", "message": "stale"},
             },
@@ -4079,7 +4026,7 @@ def _scene_rejection(body, code, message):
     context = body["request_context"]
     return SceneTransactionRejectedError(
         {
-            "api_version": "manyforge.manager_command_response.v1",
+            "api_version": "manyforge.manager_command_response.v2",
             "ok": False,
             "request_id": context["request_id"],
             "request_owner_epoch": context["request_owner_epoch"],
@@ -4131,9 +4078,7 @@ def _authored_scene() -> list[dict[str, Any]]:
             "pose": {
                 "frame_ref": {
                     "kind": "component_frame",
-                    "component_role": "robot",
-                    "model_role": "arm_model",
-                    "frame_role": "base",
+                    "frame": frame("robot.1", "base"),
                 },
                 "position_m": [0.5, 0.0, 0.4],
                 "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
@@ -4213,13 +4158,37 @@ def test_empty_apply_unknown_does_not_resend_or_claim_no_effect() -> None:
     assert len(transport.submissions) == 1
 
 
+def test_empty_apply_unknown_preserves_typed_transport_cause_without_retry() -> None:
+    class TypedFailure(RuntimeError):
+        code = "manager_command_unavailable"
+        details = {"reason": "timeout", "component_id": "manager"}
+        response = {"detail": {"code": code}}
+
+    class LostScene(_SceneTransport):
+        def commit_scene_transaction(self, body):
+            self.submissions.append(dict(body))
+            raise TypedFailure("Manager request timed out")
+
+    transport = LostScene(populated=True)
+    result = _scene_port(transport).clear_applied_scene(
+        retained_bundle_id=_DIGEST_B, graph_revision=_DIGEST_C,
+        request_id="apply.1", is_current=lambda: True,
+    )
+    assert result["state"] == "unknown"
+    assert result["reason"] == "scene_outcome_unknown"
+    assert result["cause_code"] == "manager_command_unavailable"
+    assert result["cause_details"] == {"reason": "timeout", "component_id": "manager"}
+    assert result["last_observed_remaining"] == ["old-part", "old-support"]
+    assert len(transport.submissions) == 1
+
+
 @pytest.mark.parametrize("refused", [False, True])
 def test_empty_apply_foreign_receipt_is_unknown(refused):
     class ForeignReceipt(_SceneTransport):
         def commit_scene_transaction(self, body):
             if refused:
                 self.submissions.append(dict(body))
-                return {"api_version": "manyforge.manager_command_response.v1", "ok": False,
+                return {"api_version": "manyforge.manager_command_response.v2", "ok": False,
                         "projection_status": "not_attempted", "request_id": "another.request",
                         "request_owner_epoch": body["request_context"]["request_owner_epoch"],
                         "error": {"code": "missing_reference", "message": "unavailable"}}
@@ -4241,7 +4210,7 @@ def test_empty_apply_refused_detach_keeps_part_and_its_support() -> None:
             if body["operation"]["kind"] == "detach_carried_object_at_current_pose":
                 self.submissions.append(dict(body))
                 return {
-                    "api_version": "manyforge.manager_command_response.v1",
+                    "api_version": "manyforge.manager_command_response.v2",
                     "request_id": body["request_context"]["request_id"],
                     "request_owner_epoch": body["request_context"]["request_owner_epoch"],
                     "ok": False, "projection_status": "not_attempted",
@@ -4347,6 +4316,38 @@ def test_scene_initialization_retries_no_effect_admission_race_with_new_identity
     assert rejected["expected_admission_generation"] == 1
     assert committed["expected_admission_generation"] == 2
     assert rejected["request_context"]["request_id"] != committed["request_context"]["request_id"]
+
+
+@pytest.mark.parametrize("response", [
+    None,
+    {"detail": {"code": "authoring_not_ready"}},
+    {"api_version": "manyforge.manager_command_response.v2", "ok": False,
+     "projection_status": "failed_projection_uncertain",
+     "error": {"code": "authoring_not_ready", "details": {"reason": "delivery_unknown"}}},
+])
+def test_scene_initialization_does_not_retry_unknown_authoring_error(response) -> None:
+    from manyforge_behavior.scene_client import SceneOutcomeUnknownError
+
+    class UnknownAuthoring(RuntimeError):
+        code = "authoring_not_ready"
+        details = {"reason": "delivery_unknown"}
+
+        def __init__(self):
+            super().__init__("outcome unconfirmed")
+            self.response = response
+
+    class UnknownTransport(_SceneTransport):
+        def commit_scene_transaction(self, body):
+            self.submissions.append(deepcopy(dict(body)))
+            raise UnknownAuthoring()
+
+    transport = UnknownTransport()
+    with pytest.raises(SceneOutcomeUnknownError) as caught:
+        _scene_port(transport).prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
+    assert not hasattr(caught.value, "code")
+    assert caught.value.cause_code == "authoring_not_ready"
+    assert caught.value.cause_details == {"reason": "delivery_unknown"}
+    assert len(transport.submissions) == 1
 
 
 def test_scene_initialization_upserts_only_the_changed_authored_object() -> None:
@@ -4481,7 +4482,7 @@ def test_lost_scene_reply_is_observed_while_held_without_replaying_the_action() 
         def scene_transaction_status(self, body):
             assert body == self.submissions[-1]
             return {
-                "api_version": "manyforge.manager_command_response.v1",
+                "api_version": "manyforge.manager_command_response.v2",
                 "ok": True,
                 "result": self.receipt if self.receipt_ready else None,
             }
@@ -4561,7 +4562,7 @@ def test_scene_rejected_by_stop_stays_unstarted_until_a_newer_release(lose_reply
         def scene_transaction_status(self, body):
             assert body == self.rejections[-1]
             return {
-                "api_version": "manyforge.manager_command_response.v1",
+                "api_version": "manyforge.manager_command_response.v2",
                 "ok": True,
                 "result": self.receipt,
             }
@@ -4698,16 +4699,16 @@ def test_scene_nodes_translate_roles_and_detach_at_current_pose() -> None:
         OwnerNodeInputs(
             parameters={
                 "scene_resource_id": "graspable",
-                "target_role": "arm",
-                "carrier_frame_role": "tcp",
-                "touch_body_roles": ["tool_collision"],
+                "target": target("robot.1", "arm.command"),
+                "carrier_frame_ref": frame("robot.1", "tcp"),
+                "touch_bodies": [{"component_id": "robot.1", "collision_body_id": "tool_collision"}],
             }
         ),
     )
     detached = port.invoke(
         "scene.detach_carried_object",
         _identity("detach"),
-        OwnerNodeInputs(parameters={"scene_resource_id": "graspable", "target_role": "arm"}),
+        OwnerNodeInputs(parameters={"scene_resource_id": "graspable", "target": target("robot.1", "arm.command")}),
     )
 
     assert attached.succeeded is True
@@ -4731,9 +4732,9 @@ def test_attach_node_encodes_on_grasp_lost_only_when_non_default() -> None:
     transport.submissions.clear()
     parameters = {
         "scene_resource_id": "graspable",
-        "target_role": "arm",
-        "carrier_frame_role": "tcp",
-        "touch_body_roles": ["tool_collision"],
+        "target": target("robot.1", "arm.command"),
+        "carrier_frame_ref": frame("robot.1", "tcp"),
+        "touch_bodies": [{"component_id": "robot.1", "collision_body_id": "tool_collision"}],
     }
 
     omitted = port.invoke(
@@ -4747,7 +4748,7 @@ def test_attach_node_encodes_on_grasp_lost_only_when_non_default() -> None:
         "scene.detach_carried_object",
         _identity("detach-omitted"),
         OwnerNodeInputs(
-            parameters={"scene_resource_id": "graspable", "target_role": "arm"}
+            parameters={"scene_resource_id": "graspable", "target": target("robot.1", "arm.command")}
         ),
     )
 
@@ -4774,7 +4775,7 @@ def test_attach_node_encodes_on_grasp_lost_only_when_non_default() -> None:
         "scene.detach_carried_object",
         _identity("detach-plain"),
         OwnerNodeInputs(
-            parameters={"scene_resource_id": "graspable", "target_role": "arm"}
+            parameters={"scene_resource_id": "graspable", "target": target("robot.1", "arm.command")}
         ),
     )
 
@@ -4836,9 +4837,9 @@ def test_scene_node_failure_keeps_the_owner_reason() -> None:
         OwnerNodeInputs(
             parameters={
                 "scene_resource_id": "graspable",
-                "target_role": "arm",
-                "carrier_frame_role": "tcp",
-                "touch_body_roles": ["tool_collision"],
+                "target": target("robot.1", "arm.command"),
+                "carrier_frame_ref": frame("robot.1", "tcp"),
+                "touch_bodies": [{"component_id": "robot.1", "collision_body_id": "tool_collision"}],
             }
         ),
     )
@@ -4848,7 +4849,7 @@ def test_scene_node_failure_keeps_the_owner_reason() -> None:
     detached = port.invoke(
         "scene.detach_carried_object",
         _identity("detach"),
-        OwnerNodeInputs(parameters={"scene_resource_id": "graspable", "target_role": "arm"}),
+        OwnerNodeInputs(parameters={"scene_resource_id": "graspable", "target": target("robot.1", "arm.command")}),
     )
 
     assert detached.succeeded is False
@@ -4905,9 +4906,9 @@ def test_scene_node_never_retries_a_refused_commit(code, reason) -> None:
         OwnerNodeInputs(
             parameters={
                 "scene_resource_id": "graspable",
-                "target_role": "arm",
-                "carrier_frame_role": "tcp",
-                "touch_body_roles": ["tool_collision"],
+                "target": target("robot.1", "arm.command"),
+                "carrier_frame_ref": frame("robot.1", "tcp"),
+                "touch_bodies": [{"component_id": "robot.1", "collision_body_id": "tool_collision"}],
             }
         ),
     )
@@ -4946,9 +4947,9 @@ def test_scene_node_does_not_retry_a_stale_owner_epoch() -> None:
         OwnerNodeInputs(
             parameters={
                 "scene_resource_id": "graspable",
-                "target_role": "arm",
-                "carrier_frame_role": "tcp",
-                "touch_body_roles": ["tool_collision"],
+                "target": target("robot.1", "arm.command"),
+                "carrier_frame_ref": frame("robot.1", "tcp"),
+                "touch_bodies": [{"component_id": "robot.1", "collision_body_id": "tool_collision"}],
             }
         ),
     )
@@ -5169,7 +5170,7 @@ _PREVIEW_VARIANTS = {
         "motion.follow_cartesian_path",
         lambda: _absolute_inputs(
             "motion.follow_cartesian_path",
-            [{"kind": "target_frame", "target_role": "gripper", "frame_role": "tcp"}] * 2,
+            [{"kind": "target_frame", "frame": frame("tool.1", "tcp")}] * 2,
         ),
         "goal_frame_motion_preview_unsupported",
     ),
@@ -5194,6 +5195,7 @@ def test_node_preview_uses_the_execution_motion_builder_exactly(variant) -> None
         inputs.parameters,
         targets=bound.targets,
         contact_grasps=bound.contact_grasps,
+        binding=bound.capture.program_binding,
         move_id=executed_payload["move_id"],
     )
     # One builder: relative targets, goal frames, contact inputs and limits
@@ -5216,10 +5218,9 @@ def test_node_preview_uses_the_execution_motion_builder_exactly(variant) -> None
             **executed_payload,
             "move_id": None,
         }
-        assert participant.target.target_role_id == "arm"
+        assert participant.target.reference() == target("robot.1", "arm.command")
         assert previewed == {
-            "component_role_id": executed["participants"][0]["component_role_id"],
-            "target_role_id": executed["participants"][0]["target_role_id"],
+            "target": executed["participants"][0]["target"],
             "required_capability_id": "execution.trajectory.execute",
             "action_span": None,
             "payload": previewed["payload"],
@@ -5262,7 +5263,7 @@ def test_node_preview_refuses_unbound_runs_and_non_motion_nodes() -> None:
             "motion.move_to_pose",
             _absolute_inputs(
                 "motion.move_to_pose",
-                [{"kind": "target_frame", "target_role": "ghost", "frame_role": "tcp"}],
+                [{"kind": "target_frame", "frame": frame("ghost", "tcp")}],
             ).parameters,
             request_id="p",
         )
@@ -5919,14 +5920,14 @@ def test_a_refused_close_keeps_the_operation_retained_for_reset() -> None:
 @pytest.mark.parametrize(
     ("previous", "current", "reason"),
     [
-        # SX-667: a deadline of 0 is no exemption once the hold had an
+        # A deadline of 0 is no exemption once the hold had an
         # observation; losing it is refused.
         ({"observed_state_available": True, "observed_state_valid_until_ns": 0},
          {"observed_state_available": False}, "observed_state_unavailable"),
         ({"observed_state_available": True, "observed_state_valid_until_ns": 0},
          {"observed_state_available": True, "observed_state_fresh": True,
           "observed_state_at_rest": True}, None),
-        # SX-674: still reported fresh, but its positive deadline elapsed.
+        # Still reported fresh, but its positive deadline elapsed.
         ({"observed_state_available": True},
          {"observed_state_available": True, "observed_state_fresh": True,
           "observed_state_at_rest": True, "observed_state_valid_until_ns": 1},
@@ -5961,7 +5962,7 @@ def test_observed_state_refusal_follows_the_observation_not_its_deadline(
 def test_manual_result_press_reads_the_owner_fresh_not_the_cached_terminal(
     fresh, at_rest, reason
 ) -> None:
-    """SX-655: the manual-result press re-reads the Kernel's assessment; a
+    """The manual-result press re-reads the Kernel's assessment; a
     cached terminal claiming a fresh, at-rest robot is never the answer."""
 
     fixture = _stopped_motion_for_recovery()
@@ -6167,7 +6168,7 @@ def test_a_newcomer_refused_by_priority_names_the_winner() -> None:
 
 
 def test_a_rule_holds_refusal_is_the_kernels_own_admission_refusal() -> None:
-    """CONTRACTS §8: no "Motion waits"; the node fails at once with it."""
+    """No "Motion waits"; the node fails at once with it."""
 
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
@@ -6219,16 +6220,64 @@ def test_clear_outside_change_names_the_bound_output_and_writes_nothing() -> Non
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_pneumatic_context())
     result = port.queries.invoke("io.clear_outside_change", _identity("clear"), OwnerNodeInputs(
-        parameters={"target_role": "io.a", "resource_role": "valve.a"}))
+        parameters={"signal": signal("io.2", "valve.a")}))
     assert result.succeeded
     assert transport.outside_clears == [("io.2", "valve.a")]
     assert transport.submissions == []
     # Only an output has the flag: an input is refused before any call.
     refused = port.queries.invoke("io.clear_outside_change", _identity("clear.2"), OwnerNodeInputs(
-        parameters={"target_role": "io.c", "resource_role": "part"}))
+        parameters={"signal": signal("io.3", "part")}))
     assert not refused.succeeded
     assert refused.reason_code == "io_signal_direction_mismatch"
     assert transport.outside_clears == [("io.2", "valve.a")]
+
+
+def test_dynamic_direct_changed_outside_uses_sealed_base_and_runtime_refusal() -> None:
+    from types import SimpleNamespace
+    from manyforge_behavior.production_ports import _NativeTargetQueryPort, _SignalBinding
+
+    class RuntimeRefusal(Exception):
+        code = "io_signal_changed_outside_unavailable"
+        details = {"reason": "io_signal_changed_outside_unavailable"}
+
+    class Kernel:
+        def __init__(self):
+            self.eligible = True
+            self.queries = []
+
+        def query_target(self, query):
+            self.queries.append(query)
+            if not self.eligible:
+                raise RuntimeRefusal("no readback")
+            return {"target_observation": {
+                **query, "schema_version": "manyforge.target_observation.v2",
+                "value": {"value": True, "quality": "fresh"},
+            }}
+
+    target = {"component_id": "io.2", "command_target_id": "gpio"}
+    base = _SignalBinding("io.2", "valve", target, "bool", "output", "sampled_only", "digest")
+    context = SimpleNamespace(signals={("io.2", "valve"): base},
+                              request_owner_epoch="epoch", capture=SimpleNamespace(program_binding_id="binding"))
+    kernel = Kernel()
+    owner = SimpleNamespace(_context=lambda _: context, _kernel=kernel)
+    port = _NativeTargetQueryPort(owner)
+    identity = SimpleNamespace(program_run_id="run")
+    reference = {"component_id": "io.2", "signal_name": "valve.changed_outside"}
+    inputs = OwnerNodeInputs(parameters={"signal": reference})
+
+    result = port._read_io_input("io.get_input", identity, inputs)
+    assert result.succeeded and result.output is True
+    assert kernel.queries[-1]["signal"] == reference
+
+    kernel.eligible = False
+    result = port._read_io_input("io.get_input", identity, inputs)
+    assert not result.succeeded
+    assert result.reason_code == "io_signal_changed_outside_unavailable"
+
+    context.signals.clear()
+    result = port._read_io_input("io.get_input", identity, inputs)
+    assert not result.succeeded and result.reason_code == "io_signal_unbound"
+    assert len(kernel.queries) == 2
 
 
 def test_changed_outside_is_read_like_any_fresh_input_signal() -> None:
@@ -6238,7 +6287,7 @@ def test_changed_outside_is_read_like_any_fresh_input_signal() -> None:
         def query_target(self, query):
             queries.append(dict(query))
             return {"ok": True, "target_observation": {
-                **query, "schema_version": "manyforge.target_observation.v1",
+                **query, "schema_version": "manyforge.target_observation.v2",
                 "value": {"value": True, "quality": "fresh", "signal_name": "valve.a.changed_outside",
                           "source_id": "core.changed_outside.io.2.valve.a",
                           "source_epoch": "core", "source_sequence": 2}}}
@@ -6246,13 +6295,13 @@ def test_changed_outside_is_read_like_any_fresh_input_signal() -> None:
     port = NativeKernelProgramPort(KernelClient(QueryTransport()))
     port.bind(_pneumatic_context())
     result = port.queries.invoke("io.check_input", _identity("outside"), OwnerNodeInputs(
-        parameters={"target_role": "io.a", "resource_role": "valve.a.changed_outside",
+        parameters={"signal": signal("io.2", "valve.a.changed_outside"),
                     "expected_value": True}))
     assert result.succeeded
-    assert queries[0]["resource_role_id"] == "valve.a.changed_outside"
+    assert queries[0]["signal"] == signal("io.2", "valve.a.changed_outside")
     # An input has no changed_outside signal: its base is not an output.
     refused = port.queries.invoke("io.check_input", _identity("outside.2"), OwnerNodeInputs(
-        parameters={"target_role": "io.c", "resource_role": "part.changed_outside",
+        parameters={"signal": signal("io.3", "part.changed_outside"),
                     "expected_value": True}))
     assert not refused.succeeded
     assert refused.reason_code == "io_signal_direction_mismatch"
@@ -6298,7 +6347,7 @@ def test_an_observed_operation_carries_its_exact_state_and_residency() -> None:
     assert observed.metadata["resident"] is True
 
     # An exact successful read showing the operation no longer resident:
-    # its retirement already completed (SX-1974).
+    # its retirement already completed.
     fixture.transport.resident[observed.metadata["operation_id"]] = False
     retired = fixture.port.operations.observe(fixture.started.task_id)
     assert retired.metadata["resident"] is False
@@ -6307,15 +6356,12 @@ def test_an_observed_operation_carries_its_exact_state_and_residency() -> None:
 @pytest.mark.parametrize(
     ("selector", "expected"),
     [
-        ({"kind": "current"}, {"kind": "entry", "entry": {
-            "component_id": "tool.1", "target_id": "gripper.command", "frame_role_id": "tip",
-        }}),
-        ({"kind": "default_of_role", "role": "gripper"},
-         {"kind": "default_of_role", "role": "gripper"}),
-        ({"kind": "entry", "target_role": "gripper", "frame_role": "tcp"},
-         {"kind": "entry", "entry": {
-             "component_id": "tool.1", "target_id": "gripper.command", "frame_role_id": "tcp",
-         }}),
+        ({"kind": "current"}, {"kind": "entry", "target": target("tool.1", "gripper.command"),
+                               "frame": frame("tool.1", "tip")}),
+        ({"kind": "default_of_target", "target": target("tool.1", "gripper.command")},
+         {"kind": "default_of_target", "target": target("tool.1", "gripper.command")}),
+        ({"kind": "entry", "target": target("tool.1", "gripper.command"), "frame": frame("tool.1", "tcp")},
+         {"kind": "entry", "target": target("tool.1", "gripper.command"), "frame": frame("tool.1", "tcp")}),
     ],
 )
 def test_motion_start_accepts_frozen_tcp_selectors(selector, expected) -> None:
@@ -6324,9 +6370,11 @@ def test_motion_start_accepts_frozen_tcp_selectors(selector, expected) -> None:
     port.bind(_context())
     parameters = dict(_motion_inputs().parameters)
     parameters["tcp_endpoint"] = selector
-    inputs = OwnerNodeInputs(parameters, blackboard={"active_tcp": {
-        "component_id": "tool.1", "target_id": "gripper.command", "frame_role_id": "tip",
-    }})
+    inputs = OwnerNodeInputs(parameters, blackboard={
+        "active_tcp/robot.1/arm.command": {
+            "target": target("tool.1", "gripper.command"), "frame": frame("tool.1", "tip"),
+        },
+    })
     assert isinstance(inputs.parameters["tcp_endpoint"], MappingProxyType)
 
     port.operations.start("motion.move_to_pose", _identity("frozen-tcp"), inputs)
@@ -6341,9 +6389,9 @@ def test_motion_start_accepts_frozen_tcp_selectors(selector, expected) -> None:
         (["current"], "must be a mapping"),
         ({"kind": "unsupported"}, "unsupported TCP selector kind"),
         ({"kind": "current", "role": "gripper"}, "unknown fields"),
-        ({"kind": "default_of_role"}, "missing required fields"),
-        ({"kind": "entry", "target_role": "gripper", "frame_role": "INVALID"},
-         "portable lower-case identifier"),
+        ({"kind": "default_of_target"}, "missing required fields"),
+        ({"kind": "entry", "target": target("tool.1", "gripper.command"), "frame": {"component_id": "tool.1"}},
+         "missing required fields"),
     ],
 )
 def test_motion_start_rejects_invalid_frozen_tcp_selectors(selector, message) -> None:
@@ -6379,13 +6427,12 @@ def test_qualified_tcp_endpoint_is_identical_for_execution_and_preview(node_id) 
     port.bind(_context())
     inputs = _contact_pose_inputs() if node_id == 'motion.move_to_pose' else _interrupt_inputs(node_id)
     parameters = dict(inputs.parameters)
-    parameters['tcp_endpoint'] = {'kind': 'entry', 'target_role': 'gripper', 'frame_role': 'tcp'}
+    parameters['tcp_endpoint'] = {'kind': 'entry', 'target': target('tool.1', 'gripper.command'), 'frame': frame('tool.1', 'tcp')}
     identity = _identity('endpoint-preview')
     port.operations.start(node_id, identity, OwnerNodeInputs(parameters))
     payload = transport.submissions[0]['participants'][0]['payload']
-    assert payload['tcp_endpoint'] == {'kind': 'entry', 'entry': {
-        'component_id': 'tool.1', 'target_id': 'gripper.command', 'frame_role_id': 'tcp',
-    }}
+    assert payload['tcp_endpoint'] == {'kind': 'entry', 'target': target('tool.1', 'gripper.command'),
+                                       'frame': frame('tool.1', 'tcp')}
     assert 'tcp_frame_role_id' not in payload
     # Exercise the first real strict ingress, rather than only our recording
     # transport: the previous legacy-only model rejected this emitted payload.
@@ -6405,10 +6452,9 @@ def test_qualified_tcp_endpoint_is_identical_for_execution_and_preview(node_id) 
 
 
 def test_pick_place_phase_motion_preserves_qualified_tcp_endpoint() -> None:
-    parameters = {'base_frame_role': 'base'}
-    tcp_endpoint = {'kind': 'entry', 'entry': {
-        'component_id': 'tool.1', 'target_id': 'gripper.command', 'frame_role_id': 'tcp',
-    }}
+    parameters = {'base_frame': frame('robot.1', 'base')}
+    tcp_endpoint = {'kind': 'entry', 'target': target('tool.1', 'gripper.command'),
+                    'frame': frame('tool.1', 'tcp')}
     payload = NativeKernelProgramPort._phase_motion_payload(
         identity=_identity('pick-endpoint'), parameters=parameters,
         phase='approach', tcp_endpoint=tcp_endpoint, motion={
@@ -6433,7 +6479,7 @@ def test_joint_goal_uses_the_common_exact_contact_binding_before_strict_ingress(
     parameters = dict(_motion_inputs().parameters)
     parameters.update(
         target_mode='absolute', target_reference=None, offset_reference=None,
-        tcp_endpoint={'kind': 'entry', 'target_role': 'gripper', 'frame_role': 'tcp'},
+        tcp_endpoint={'kind': 'entry', 'target': target('tool.1', 'gripper.command'), 'frame': frame('tool.1', 'tcp')},
         goal=[{'joint_name': 'joint1', 'position_rad': 0.0}],
         contact_policy_id='pick.contact', contact_scene_resource_id='part.7',
     )
@@ -6458,9 +6504,8 @@ def test_joint_goal_uses_the_common_exact_contact_binding_before_strict_ingress(
 
     parsed = MotionParticipantRequest.model_validate(payload)
     assert parsed.model_dump(mode='json')['tcp_endpoint'] == {
-        'kind': 'entry', 'entry': {
-            'component_id': 'tool.1', 'target_id': 'gripper.command', 'frame_role_id': 'tcp',
-        },
+        'kind': 'entry', 'target': target('tool.1', 'gripper.command'),
+        'frame': frame('tool.1', 'tcp'),
     }
 
 
@@ -6477,31 +6522,28 @@ def _thawed(value: Any) -> Any:
 def _pneumatic_context():
     context = _context()
     binding = _thawed(context.program_binding)
-    gripper = next(row for row in binding["target_role_bindings"] if row["target_role_id"] == "gripper")
+    gripper = next(row for row in binding["target_bindings"]
+                   if row["target"] == target("tool.1", "gripper.command"))
     gripper["pneumatic_io"] = {
         "outputs": [
-            {"target_role_id": "io.a", "resource_role_id": "valve.a", "open_value": True, "close_value": False},
-            {"target_role_id": "io.b", "resource_role_id": "valve.b", "open_value": False, "close_value": True},
+            {"signal": signal("io.2", "valve.a"), "open_value": True, "close_value": False},
+            {"signal": signal("io.1", "valve.b"), "open_value": False, "close_value": True},
         ],
-        "inputs": [{"input": "workpiece_grasped", "target_role_id": "io.c", "resource_role_id": "part"}],
+        "inputs": [{"input": "workpiece_grasped", "signal": signal("io.3", "part")}],
     }
-    for role, component, resource, direction in (
-        ("io.a", "io.2", "valve.a", "output"),
-        ("io.b", "io.1", "valve.b", "output"),
-        ("io.c", "io.3", "part", "input"),
+    for component, resource, direction in (
+        ("io.2", "valve.a", "output"),
+        ("io.1", "valve.b", "output"),
+        ("io.3", "part", "input"),
     ):
-        binding["target_role_bindings"].append({
-            "target_role_id": role, "component_role_id": f"{role}.component",
-            "controllable_component_id": component, "command_target_id": "io.command",
-            "capability_bindings": [{
-                "capability_id": "io.gpio.set_output" if direction == "output" else "io.gpio.get_input",
-                "command_schema": None,
-            }],
-            "signal_role_bindings": [{
-                "resource_role_id": resource, "signal_name": resource, "value_type": "bool",
-                "direction": direction, "transition_capability": "sampled_only",
-                "signal_descriptor_digest": _DIGEST_E,
-            }],
+        binding["target_bindings"].append(target_binding(component, "io.command", [{
+            "capability_id": "io.gpio.set_output" if direction == "output" else "io.gpio.get_input",
+            "command_schema": None,
+        }]))
+        binding["signal_bindings"].append({
+            "reference": signal(component, resource), "target": target(component, "io.command"),
+            "value_type": "bool", "direction": direction,
+            "transition_capability": "sampled_only", "signal_descriptor_digest": _DIGEST_E,
         })
     return replace(context, program_binding=binding)
 
@@ -6524,7 +6566,7 @@ def test_pneumatic_plan_uses_endpoint_and_false_before_true(position_request, ex
     plan = port.operations.pneumatic_plan(_identity(), OwnerNodeInputs(parameters))
     assert plan["logical"].parameters["position"] == {"kind": "linear_m", "value_m": expected}
     assert [row["value"] for row in plan["outputs"]] == values
-    assert plan["inputs"] == [{"target_role": "io.c", "resource_role": "part", "expected_value": True}]
+    assert plan["inputs"] == [{"signal": signal("io.3", "part"), "expected_value": True}]
     assert transport.submissions == []
 
 
@@ -6532,9 +6574,9 @@ def test_pneumatic_valve_rows_write_their_signal_ids_without_kernel_operations()
     transport = _preset_transport(kind="linear_m")
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_pneumatic_context())
-    for role, resource in (("io.a", "valve.a"), ("io.b", "valve.b")):
+    for component, resource in (("io.2", "valve.a"), ("io.1", "valve.b")):
         result = port.queries.invoke("io.set_output", _identity(), OwnerNodeInputs({
-            "target_role": role, "resource_role": resource, "value": False,
+            "signal": signal(component, resource), "value": False,
         }))
         assert result.succeeded
     # The captured target role resolves to the component id and signal name.
@@ -6549,10 +6591,10 @@ def test_pneumatic_valve_rows_write_their_signal_ids_without_kernel_operations()
     (True, {"kind": "named_preset", "name": "open"}, None),
     (True, {"kind": "named_preset", "name": "closed"},
      {"node_id": "gripper.check_status",
-      "parameters": {"target_role": "gripper", "expected_state": "reached"}}),
+      "parameters": {"target": target("tool.1", "gripper.command"), "expected_state": "reached"}}),
     (True, {"kind": "linear_m", "value_m": 0.2},
      {"node_id": "gripper.check_status",
-      "parameters": {"target_role": "gripper", "expected_state": "reached"}}),
+      "parameters": {"target": target("tool.1", "gripper.command"), "expected_state": "reached"}}),
 ])
 def test_position_grasp_confirmation_rides_the_existing_descriptor_read(
         required, position_request, expected):
@@ -6574,7 +6616,7 @@ def test_position_grasp_confirmation_rides_the_existing_descriptor_read(
 @pytest.mark.parametrize("name,expected", [
     ("open", None),
     ("closed", {"node_id": "io.check_input", "parameters": {
-        "target_role": "io.c", "resource_role": "part", "expected_value": True}}),
+        "signal": signal("io.3", "part"), "expected_value": True}}),
 ])
 def test_pneumatic_grasp_confirmation_reads_the_mapped_workpiece_input(name, expected):
     transport = _preset_transport(kind="linear_m")
@@ -6597,7 +6639,7 @@ def test_gripper_status_read_carries_typed_grasp_evidence(confirmed):
     class QueryTransport(_Transport):
         def query_target(self, query):
             return {"ok": True, "target_observation": {
-                **query, "schema_version": "manyforge.target_observation.v1",
+                **query, "schema_version": "manyforge.target_observation.v2",
                 "source_epoch": "source.1", "source_sequence": 7,
                 "value": {"state": "completed", "grasp_confirmed": confirmed, "command_id": 1,
                           "generation": 2, "source_id": "binding.gripper", "source_revision": _DIGEST_A,
@@ -6607,7 +6649,7 @@ def test_gripper_status_read_carries_typed_grasp_evidence(confirmed):
     port = NativeKernelProgramPort(KernelClient(QueryTransport()))
     port.bind(_context())
     result = port.queries.invoke("gripper.check_status", _identity("grasp"), OwnerNodeInputs(
-        parameters={"target_role": "gripper", "expected_state": "reached"}))
+        parameters={"target": target("tool.1", "gripper.command"), "expected_state": "reached"}))
     assert result.succeeded
     assert result.metadata["grasp_confirmed"] is confirmed
 
@@ -6626,7 +6668,7 @@ def test_contact_release_motion_lowers_only_its_exact_policy_and_object():
     parameters = dict(_motion_inputs().parameters)
     parameters.update(
         target_mode="absolute", target_reference=None, offset_reference=None,
-        tcp_endpoint={"kind": "entry", "target_role": "gripper", "frame_role": "tcp"},
+        tcp_endpoint={"kind": "entry", "target": target("tool.1", "gripper.command"), "frame": frame("tool.1", "tcp")},
         goal=[{"joint_name": "joint1", "position_rad": 0.0}],
         contact_policy_id="pick.contact", contact_scene_resource_id="part.7",
     )
@@ -6635,9 +6677,8 @@ def test_contact_release_motion_lowers_only_its_exact_policy_and_object():
     )
     payload = transport.submissions[0]["participants"][0]["payload"]
     assert payload["motion"]["kind"] == "joint_goal"
-    assert payload["tcp_endpoint"] == {"kind": "entry", "entry": {
-        "component_id": "tool.1", "target_id": "gripper.command", "frame_role_id": "tcp",
-    }}
+    assert payload["tcp_endpoint"] == {"kind": "entry",
+        "target": target("tool.1", "gripper.command"), "frame": frame("tool.1", "tcp")}
     assert payload["contact_policy_id"] == "pick.contact"
     assert payload["runtime_object_bindings"] == [
         {"runtime_object_id": "selected_object", "scene_resource_id": "part.7"},
@@ -6669,22 +6710,22 @@ def test_set_tcp_current_lowers_blackboard_entry_before_submission() -> None:
     transport = RefusingTransport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
-    entry = {"component_id": "tool.1", "target_id": "gripper.command", "frame_role_id": "tip"}
+    entry = {"target": target("tool.1", "gripper.command"), "frame": frame("tool.1", "tip")}
     with pytest.raises(KernelOperationAdmissionRejectedError) as refused:
         port.operations.start(
             "motion.set_tcp", _identity("set-tcp-current"),
-            OwnerNodeInputs({"target_role": "arm", "tcp": {"kind": "current"}},
-                            blackboard={"active_tcp": entry}),
+            OwnerNodeInputs({"target": target("robot.1", "arm.command"), "tcp": {"kind": "current"}},
+                            blackboard={"active_tcp/robot.1/arm.command": entry}),
         )
     assert refused.value.details["reason"] == "entry_rejected"
     assert transport.submissions[0]["participants"][0]["payload"]["tcp"] == {
-        "kind": "entry", "entry": entry,
+        "kind": "entry", **entry,
     }
 
-    with pytest.raises(ProductionPortError, match="active_tcp.arm.*has no value"):
+    with pytest.raises(ProductionPortError, match="active_tcp/robot.1/arm.command.*has no value"):
         port.operations.start(
             "motion.set_tcp", _identity("set-tcp-unavailable"),
-            OwnerNodeInputs({"target_role": "arm", "tcp": {"kind": "current"}}),
+            OwnerNodeInputs({"target": target("robot.1", "arm.command"), "tcp": {"kind": "current"}}),
         )
     assert len(transport.submissions) == 1
 
@@ -6706,7 +6747,7 @@ def test_set_tcp_result_is_applied_before_success() -> None:
         active_tcp_result=lambda run, robot, value: applied.append((run, robot, deepcopy(value))))
     port.bind(_context())
     result = port.operations.start("motion.set_tcp", _identity("tcp-success"), OwnerNodeInputs({
-        "target_role": "arm", "tcp": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+        "target": target("robot.1", "arm.command"), "tcp": {"kind": "entry", "target": target("robot.1", "arm.command"), "frame": frame("robot.1", "flange")},
     }))
     assert result.state is OwnerTaskState.SUCCEEDED
     assert applied == [("program-run.1", "robot.1", rows)]
@@ -6724,16 +6765,17 @@ def _tcp_result_runtime():
         def __init__(self):
             self.values = {}
 
-        def write_active_tcp(self, role, entry):
+        def write_active_tcp(self, component_id, command_target_id, entry):
+            key = (component_id, command_target_id)
             if entry is None:
-                self.values.pop(role, None)
+                self.values.pop(key, None)
             else:
-                self.values[role] = deepcopy(entry)
+                self.values[key] = deepcopy(entry)
 
     runtime = object.__new__(ProgramRuntime)
     runtime._active_tcp_stores_lock = Lock()
     store = Store()
-    runtime._active_tcp_stores = {"program-run.1": (store, {"robot.1": ("arm",)})}
+    runtime._active_tcp_stores = {"program-run.1": (store, {"robot.1": ("arm.command",)})}
     runtime._active_tcp_mirror = ActiveTcpMirror(on_change=runtime._write_active_tcp)
     runtime._active_tcp_mirror.set_owner("kernel.epoch.7")
     return runtime, store
@@ -6747,7 +6789,7 @@ def _tcp_result_row(owner, entry, sequence=1):
 def _motion_test_port(transport):
     """Use the real Runner result consumer for terminal motion observations."""
     runtime, _store = _tcp_result_runtime()
-    entry = {"component_id": "robot.1", "target_id": "arm.command", "frame_role_id": "tcp"}
+    entry = {"target": target("robot.1", "arm.command"), "frame": frame("robot.1", "tcp") }
     rows = [_tcp_result_row("kernel.epoch.7", entry)]
     runtime._active_tcp_mirror.apply_rows(rows)
     read = transport.read
@@ -6765,8 +6807,8 @@ def test_stale_set_tcp_receipt_preserves_new_owner_store_and_operation_outcome(
     new_owner_has_value,
 ) -> None:
     runtime, store = _tcp_result_runtime()
-    old = {"component_id": "robot.1", "target_id": "arm.command", "frame_role_id": "old"}
-    new = {**old, "frame_role_id": "new"}
+    old = {"target": target("robot.1", "arm.command"), "frame": frame("robot.1", "old") }
+    new = {**old, "frame": frame("robot.1", "new")}
     runtime._active_tcp_mirror.apply_rows([_tcp_result_row("kernel.epoch.7", old)])
 
     class DelayedReceipt(_Transport):
@@ -6785,11 +6827,11 @@ def test_stale_set_tcp_receipt_preserves_new_owner_store_and_operation_outcome(
     port.bind(_context())
     identity = _identity("stale-tcp-result")
     result = port.operations.start("motion.set_tcp", identity, OwnerNodeInputs({
-        "target_role": "arm", "tcp": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+        "target": target("robot.1", "arm.command"), "tcp": {"kind": "entry", "target": target("robot.1", "arm.command"), "frame": frame("robot.1", "flange")},
     }))
     assert result.state is OwnerTaskState.SUCCEEDED
     assert result.settlement_proven is True
-    assert store.values == ({"arm": new} if new_owner_has_value else {})
+    assert store.values == ({("robot.1", "arm.command"): new} if new_owner_has_value else {})
     assert runtime._active_tcp_mirror.owner_epoch == "kernel.epoch.new"
     port.operations.acknowledge(result.task_id, identity)
     assert transport.operation_reads == 0
@@ -6799,13 +6841,13 @@ def test_same_owner_tcp_result_conflict_does_not_settle_as_success() -> None:
     from manyforge_program_runner.active_tcp_mirror import ActiveTcpWireError
 
     runtime, store = _tcp_result_runtime()
-    current = {"component_id": "robot.1", "target_id": "arm.command", "frame_role_id": "current"}
-    conflict = {**current, "frame_role_id": "conflict"}
+    current = {"target": target("robot.1", "arm.command"), "frame": frame("robot.1", "current") }
+    conflict = {**current, "frame": frame("robot.1", "conflict")}
     runtime._active_tcp_mirror.apply_rows([_tcp_result_row("kernel.epoch.7", current, sequence=4)])
     rows = [_tcp_result_row("kernel.epoch.7", conflict, sequence=4)]
     with pytest.raises(ActiveTcpWireError):
         runtime._apply_active_tcp_result("program-run.1", "robot.1", rows)
-    assert store.values == {"arm": current}
+    assert store.values == {("robot.1", "arm.command"): current}
 
     class ConflictingReceipt(_Transport):
         def submit(self, body):
@@ -6818,18 +6860,18 @@ def test_same_owner_tcp_result_conflict_does_not_settle_as_success() -> None:
     port = NativeKernelProgramPort(KernelClient(transport), active_tcp_result=runtime._apply_active_tcp_result)
     port.bind(_context())
     result = port.operations.start("motion.set_tcp", _identity("conflicting-tcp-result"), OwnerNodeInputs({
-        "target_role": "arm", "tcp": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+        "target": target("robot.1", "arm.command"), "tcp": {"kind": "entry", "target": target("robot.1", "arm.command"), "frame": frame("robot.1", "flange")},
     }))
     assert result.state is OwnerTaskState.FAILED
     assert result.settlement_proven is False
-    assert store.values == {"arm": current}
+    assert store.values == {("robot.1", "arm.command"): current}
     assert len(transport.submissions) == 1
 
 
 def test_stale_move_tcp_row_keeps_existing_owner_scoped_acknowledgement() -> None:
     runtime, store = _tcp_result_runtime()
-    old = {"component_id": "robot.1", "target_id": "arm.command", "frame_role_id": "old"}
-    new = {**old, "frame_role_id": "new"}
+    old = {"target": target("robot.1", "arm.command"), "frame": frame("robot.1", "old") }
+    new = {**old, "frame": frame("robot.1", "new")}
     runtime._active_tcp_mirror.apply_rows([_tcp_result_row("kernel.epoch.7", old)])
 
     class ReplacedOwnerTransport(_Transport):
@@ -6848,23 +6890,23 @@ def test_stale_move_tcp_row_keeps_existing_owner_scoped_acknowledgement() -> Non
     port.bind(_context())
     identity = _identity("stale-move-result")
     parameters = dict(_motion_inputs().parameters)
-    parameters["tcp_endpoint"] = {"kind": "default_of_role", "role": "gripper"}
+    parameters["tcp_endpoint"] = {"kind": "default_of_target", "target": target("tool.1", "gripper.command")}
     started = port.operations.start("motion.move_to_pose", identity, OwnerNodeInputs(parameters))
     transport.operations[started.task_id]["state"] = "completed"
     runtime._active_tcp_mirror.set_owner("kernel.epoch.new")
     runtime._active_tcp_mirror.apply_rows([_tcp_result_row("kernel.epoch.new", new)])
     assert port.operations.observe(started.task_id).state is OwnerTaskState.SUCCEEDED
-    assert store.values == {"arm": new}
+    assert store.values == {("robot.1", "arm.command"): new}
     with pytest.raises(RuntimeError, match="old owner acknowledgement refused"):
         port.operations.acknowledge(started.task_id, identity)
     assert transport.controls[-1][2]["request_context"]["request_owner_epoch"] == "kernel.epoch.7"
-    assert store.values == {"arm": new}
+    assert store.values == {("robot.1", "arm.command"): new}
 
 
 @pytest.mark.parametrize("action", ["scope", "cancel", "acknowledge", "unbind"])
 def test_non_node_observations_ignore_unavailable_active_tcp_result(action) -> None:
     runtime, store = _tcp_result_runtime()
-    entry = {"component_id": "robot.1", "target_id": "arm.command", "frame_role_id": "tcp"}
+    entry = {"target": target("robot.1", "arm.command"), "frame": frame("robot.1", "tcp") }
     runtime._active_tcp_mirror.apply_rows([_tcp_result_row("kernel.epoch.7", entry, sequence=5)])
     runtime._active_tcp_mirror.stream_lost()
     assert store.values == {}
@@ -6942,7 +6984,7 @@ def test_unknown_set_tcp_reset_reads_status_without_replay_and_retries_failed_re
         active_tcp_result=apply_result)
     port.bind(_context())
     result = port.operations.start("motion.set_tcp", _identity("tcp-unknown"), OwnerNodeInputs({
-        "target_role": "arm", "tcp": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+        "target": target("robot.1", "arm.command"), "tcp": {"kind": "entry", "target": target("robot.1", "arm.command"), "frame": frame("robot.1", "flange")},
     }))
     assert result.state is OwnerTaskState.FAILED and not result.settlement_proven
     port.scope.request_stop("program-run.1", "stop-tcp-unknown", "reset")
@@ -6992,7 +7034,7 @@ def test_reset_retires_old_owner_unknown_set_tcp_without_claiming_effect(caplog)
     port = NativeKernelProgramPort(KernelClient(transport), active_tcp_result=lambda *_: True)
     port.bind(_context())
     result = port.operations.start("motion.set_tcp", _identity("tcp-replaced"), OwnerNodeInputs({
-        "target_role": "arm", "tcp": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+        "target": target("robot.1", "arm.command"), "tcp": {"kind": "entry", "target": target("robot.1", "arm.command"), "frame": frame("robot.1", "flange")},
     }))
     assert result.state is OwnerTaskState.FAILED and not result.settlement_proven
     port.scope.request_stop("program-run.1", "stop-tcp-replaced", "reset")
@@ -7023,7 +7065,7 @@ def test_reset_retires_old_owner_unknown_set_tcp_without_claiming_effect(caplog)
 
 def test_admitted_set_tcp_failure_applies_confirmed_value_before_failure() -> None:
     rows = [{"component_id": "robot.1", "entry": {
-        "component_id": "robot.1", "target_id": "arm", "frame_role_id": "flange"},
+        "target": target("robot.1", "arm"), "frame": frame("robot.1", "flange")},
         "owner_epoch": "kernel.epoch.7", "registration_generation": 1, "sequence": 4}]
 
     class FailedStep(_Transport):
@@ -7042,7 +7084,7 @@ def test_admitted_set_tcp_failure_applies_confirmed_value_before_failure() -> No
         active_tcp_result=lambda run, robot, value: applied.append((run, robot, deepcopy(value))))
     port.bind(_context())
     result = port.operations.start("motion.set_tcp", _identity("tcp-failure"), OwnerNodeInputs({
-        "target_role": "arm", "tcp": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+        "target": target("robot.1", "arm.command"), "tcp": {"kind": "entry", "target": target("robot.1", "arm.command"), "frame": frame("robot.1", "flange")},
     }))
     assert result.state is OwnerTaskState.FAILED
     assert result.settlement_proven is True
@@ -7066,7 +7108,7 @@ def test_failed_move_applies_confirmed_tcp_before_terminal_failure() -> None:
         active_tcp_result=lambda run, robot, value: applied.append((run, robot, deepcopy(value))))
     port.bind(_context())
     parameters = dict(_motion_inputs().parameters)
-    parameters["tcp_endpoint"] = {"kind": "default_of_role", "role": "gripper"}
+    parameters["tcp_endpoint"] = {"kind": "default_of_target", "target": target("tool.1", "gripper.command")}
     started = port.operations.start("motion.move_to_pose", _identity("tcp-failed-move"),
                                     OwnerNodeInputs(parameters))
     transport.operations[started.task_id]["state"] = "failed"
@@ -7100,7 +7142,7 @@ def test_motion_terminal_waits_when_confirmed_tcp_cannot_be_applied(
     port = NativeKernelProgramPort(KernelClient(transport), active_tcp_result=update)
     port.bind(_context())
     parameters = dict(_motion_inputs().parameters)
-    parameters["tcp_endpoint"] = {"kind": "default_of_role", "role": "gripper"}
+    parameters["tcp_endpoint"] = {"kind": "default_of_target", "target": target("tool.1", "gripper.command")}
     started = port.operations.start("motion.move_to_pose", _identity("tcp-apply-retry"),
                                     OwnerNodeInputs(parameters))
     transport.operations[started.task_id]["state"] = native_state

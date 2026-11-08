@@ -1,10 +1,16 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <stop_token>
 #include <vector>
 
 #include <manyforge_core/time/iclock.hpp>
@@ -15,7 +21,7 @@
 namespace manyforge::core {
 
 // ---------------------------------------------------------------------------
-// Execution port (shared execution design §3).
+// Execution port.
 //
 // ROS-free, transport-independent contract between Core and the mechanism that
 // executes one robot participant's trajectories (today a stock JTC through the
@@ -56,7 +62,7 @@ using ExecutionReceiptCount = StrongCounter<ExecutionReceiptCountTag>;
 /// participant's goal and `controller_goal_generation` advances on every
 /// replacement of it (Stop ramp, spring-back), so `Replace` always names two
 /// distinct keys. Binding identity is deliberately not part of the key: every
-/// observation carries the binding epoch instead (§3.1).
+/// observation carries the binding epoch instead.
 struct ExecutionGoalKey final {
   ControllerGoalId controller_goal_id{std::string{}};
   ControllerGoalGeneration controller_goal_generation{0U};
@@ -77,6 +83,56 @@ enum class ExecutionPortDispatch {
   kNotDispatched,
   kDispatched,
   kEffectUncertain,
+};
+
+struct ScaleSnapshot final {
+  enum class Status { kFactor, kNoPriorFactor, kDeadlineExpired };
+  Status status{Status::kNoPriorFactor};
+  double factor{};
+};
+
+/// Exact one-shot boundary shared by a pending dispatch and its Stop.
+class ExecutionDispatchToken final {
+ public:
+  explicit ExecutionDispatchToken(std::optional<std::uint64_t> execution_id = {}) noexcept
+      : execution_id_(execution_id) {}
+  [[nodiscard]] std::optional<std::uint64_t> execution_id() const noexcept {
+    return execution_id_;
+  }
+  enum class State { kReserved, kFenced, kAdmitted };
+  [[nodiscard]] State Fence() noexcept {
+    auto expected = State::kReserved;
+    if (state_.compare_exchange_strong(expected, State::kFenced,
+                                       std::memory_order_acq_rel))
+      return State::kFenced;
+    return expected;
+  }
+  [[nodiscard]] bool TryAdmit() noexcept {
+    auto expected = State::kReserved;
+    return state_.compare_exchange_strong(expected, State::kAdmitted,
+                                          std::memory_order_acq_rel);
+  }
+  [[nodiscard]] State state() const noexcept { return state_.load(std::memory_order_acquire); }
+  void Finish(ExecutionPortDispatch result) {
+    {
+      std::lock_guard lock(completion_mutex_);
+      completion_ = result;
+    }
+    completion_ready_.notify_all();
+  }
+  [[nodiscard]] std::optional<ExecutionPortDispatch> WaitUntil(
+      std::chrono::steady_clock::time_point deadline, std::stop_token cancellation = {}) {
+    std::unique_lock lock(completion_mutex_);
+    if (!completion_ready_.wait_until(lock, cancellation, deadline, [&] { return completion_.has_value(); }))
+      return std::nullopt;
+    return completion_;
+  }
+ private:
+  const std::optional<std::uint64_t> execution_id_;
+  std::atomic<State> state_{State::kReserved};
+  std::mutex completion_mutex_;
+  std::condition_variable_any completion_ready_;
+  std::optional<ExecutionPortDispatch> completion_;
 };
 
 /// Why a command was not dispatched. Present only with `kNotDispatched`.
@@ -220,7 +276,7 @@ struct ExecutionGoalFeedbackDTO final {
                          const ExecutionGoalFeedbackDTO&) = default;
 };
 
-/// Goal records each adapter keeps (§3.1): two, the active goal and its
+/// Goal records each adapter keeps: two, the active goal and its
 /// predecessor (so `kPreemptedBy` stays readable during a Stop replacement).
 /// It bounds the facts kept, not the number of motions. When a new goal
 /// arrives the oldest finished record is dropped; if both records are still
@@ -269,18 +325,18 @@ struct ExecutionGoalObservationDTO final {
 ///
 /// It is not assigned to any goal. Core associates it with a goal only by
 /// evidence (the goal's own action feedback, or the observed switch of the
-/// cursor to the new trajectory); a stamp after acceptance is not sufficient
-/// (§3.1). Every joint vector follows `ReadLaneFacts().joint_names` (the
+/// cursor to the new trajectory); a stamp after acceptance is not sufficient.
+/// Every joint vector follows `ReadLaneFacts().joint_names` (the
 /// binding's controller joint order), independent of any submitted trajectory.
 ///
-/// Cancel association (Core's hard-stop finish, Q5, Q35): a sample counts for
+/// Cancel association (Core's hard-stop finish): a sample counts for
 /// a cancel only if its local receipt is ordered after the cancel was sent
 /// (`cancel_sent_local_stamp`) AND it shows the controller actually switching
 /// to its cancel trajectory (cursor restarting, or the reference jumping to
 /// the cancel trajectory's start). The switch may precede the receipt of the
 /// cancel acknowledgement or result. An old zero sample, or a trajectory frozen
-/// at factor 0, never counts. Q35: the hard stop is finished when the cancel's
-/// associated braking reference reaches zero velocity (Q5), or when the
+/// at factor 0, never counts. The hard stop is finished when the cancel's
+/// associated braking reference reaches zero velocity, or when the
 /// controller reports an applied factor of 0 and has positively acknowledged
 /// this cancel (its cancel trajectory cannot advance at factor 0; installing it
 /// may still step the commanded position once to the cancel trajectory's start,
@@ -331,7 +387,7 @@ struct ExecutionReadinessDTO final {
                          const ExecutionReadinessDTO&) = default;
 };
 
-/// Controller timing since the previous `ReadTiming()` (Q4). Best-effort:
+/// Controller timing since the previous `ReadTiming()`. Best-effort:
 /// every field is absent when the mechanism did not report it. Telemetry loss
 /// (stamp gaps) is distinct from controller lateness (periodicity).
 struct ExecutionTimingDTO final {
@@ -349,7 +405,7 @@ struct ExecutionTimingDTO final {
   friend bool operator==(const ExecutionTimingDTO&, const ExecutionTimingDTO&) = default;
 };
 
-/// How `Cancel` brings the mechanism to rest (Q2: JTC
+/// How `Cancel` brings the mechanism to rest (JTC
 /// `decelerate_on_cancel` on every lane is `kDecelerate`).
 enum class ExecutionCancelSemantics {
   kDecelerate,
@@ -404,7 +460,7 @@ struct ExecutionLaneFactsDTO final {
   double feedback_rate_hz{0.0};
   double state_rate_hz{0.0};
   /// Nominal controller-manager update rate; Core publishes the speed ramp at
-  /// this rate (Q11).
+  /// this rate.
   double controller_update_rate_hz{0.0};
   ExecutionGoalTolerancePolicy goal_tolerance_policy{ExecutionGoalTolerancePolicy::kErased};
   /// Qualified binding supports one atomic replacement trajectory/start stamp
@@ -434,45 +490,69 @@ class IExecutionPort {
   /// accelerations are required (Core's sampler fills them). The joint set is
   /// that of `ReadLaneFacts().joint_names`; the adapter maps by name.
   virtual ExecutionPortCommandResultDTO Submit(const ExecutionGoalKey& key,
-                                               const TrajectoryDTO& trajectory) = 0;
+                                               const TrajectoryDTO& trajectory,
+                                               std::shared_ptr<ExecutionDispatchToken> token = {}) = 0;
 
   /// Replace the active goal with a trajectory that continues it (soft Stop
   /// ramp, spring-back). Transport-neutral: the trajectory may start with
   /// points at or before the mechanism's current time, so the mechanism keeps
-  /// following the original points through the lead-in. ROS realization (Q20,
-  /// ManyMove's past-point join): Core keeps the original trajectory's past
+  /// following the original points through the lead-in. ROS realization
+  /// (ManyMove's past-point join): Core keeps the original trajectory's past
   /// points with all times shifted by the elapsed time (negative times on the
   /// wire, never clamped), followed by the Stop ramp; the adapter serializes
   /// them faithfully. `kStaleKey` when `active_key` is not the current goal.
-  /// Every goal, a Stop's included, gets the lane's goal check (maintainer
-  /// M6: a Stop trajectory has the same arrival tolerance and `goal_time` as a
-  /// motion). A cancel-type Stop sends no goal.
+  /// Every goal, a Stop's included, gets the lane's goal check (a Stop
+  /// trajectory has the same arrival tolerance and `goal_time` as a motion). A cancel-type Stop sends no goal.
   virtual ExecutionPortCommandResultDTO Replace(
       const ExecutionGoalKey& active_key, const ExecutionGoalKey& next_key,
-      const TrajectoryDTO& trajectory) = 0;
+      const TrajectoryDTO& trajectory, std::shared_ptr<ExecutionDispatchToken> token = {}) = 0;
 
   /// Same identity/prefix contract as Replace, with its time-zero anchored to
   /// the named binding's controller clock. Refusal is explicit; silently
   /// falling back to an immediate send would change the chosen curve origin.
   virtual ExecutionPortCommandResultDTO ReplaceScheduled(
       const ExecutionGoalKey& /*active_key*/, const ExecutionGoalKey& /*next_key*/,
-      const TrajectoryDTO& /*trajectory*/, const ExecutionReplacementStartDTO& /*start*/) {
+      const TrajectoryDTO& /*trajectory*/, const ExecutionReplacementStartDTO& /*start*/,
+      std::shared_ptr<ExecutionDispatchToken> /*token*/ = {}) {
     return {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kUnsupported,
             std::nullopt};
   }
 
-  /// The lane's hard stop (Q2). The acknowledgement never implies rest: the
-  /// finish is decided by Core (Q5, Q35; see the cancel
+  /// The lane's hard stop. The acknowledgement never implies rest: the
+  /// finish is decided by Core (see the cancel
   /// association on `ExecutionControllerSampleDTO`). On a goal still pending
   /// (no mechanism handle yet) the mechanism latches the cancel and sends it
   /// on acceptance, returning `kEffectUncertain` meanwhile. A refused or
   /// unsent cancel is never containment evidence.
-  virtual ExecutionPortCommandResultDTO Cancel(const ExecutionGoalKey& key) = 0;
+  virtual ExecutionPortCommandResultDTO Cancel(
+      const ExecutionGoalKey& key,
+      std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) = 0;
 
-  /// Publish one speed factor in [0, 1] (Q11). Values apply in send order on
+  /// Publish one speed factor in [0, 1]. Values apply in send order on
   /// one binding epoch; a new epoch starts at the configured initial factor.
   /// The applied factor is read back from `ReadSample()`.
-  virtual ExecutionPortCommandResultDTO SetScale(double value) = 0;
+  /// Reserve in the caller's scale authority before releasing its lock. A
+  /// later reservation also fences a previously reserved unpublished value.
+  virtual std::uint64_t ReserveScaleSequence() noexcept {
+    return scale_sequence_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  }
+  [[nodiscard]] virtual bool IsLatestScaleSequence(std::uint64_t sequence) const noexcept {
+    return scale_sequence_.load(std::memory_order_acquire) == sequence;
+  }
+  virtual ExecutionPortCommandResultDTO SetScale(double value, std::uint64_t sequence) = 0;
+  /// After fencing older reservations, wait only for this port's scale leaf
+  /// and return the last dispatched or effect-uncertain factor, if any.
+  virtual ScaleSnapshot SnapshotScaleAfterFence(std::chrono::steady_clock::time_point deadline) = 0;
+  /// Whether the controller currently listens for scale input (a matched
+  /// subscriber). Lock-free and non-waiting. nullopt: not observable.
+  [[nodiscard]] virtual std::optional<bool> ScaleInputListening() const noexcept {
+    return std::nullopt;
+  }
+
+ private:
+  std::atomic<std::uint64_t> scale_sequence_{0};
+
+ public:
 
   /// Goal-scoped facts; nullopt for a key never sent through this port or
   /// whose record left the ring (`kExecutionGoalRecordCapacity`).

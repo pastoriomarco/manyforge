@@ -28,8 +28,11 @@ _KEY_VALUE_TYPE = "key_value"
 # An ``interrupt_condition`` holds one closed per-node interrupt condition
 # (interrupt_condition.py); it takes no other schema keys.
 _CONDITION_TYPE = "interrupt_condition"
+_DIRECT_CONDITION_TYPE = "component_interrupt_condition"
 _ALLOWED_SCHEMA_TYPES = (
-    _SCALAR_TYPES | _COMPOSITE_TYPES | {_KEY_VALUE_TYPE, _CONDITION_TYPE}
+    _SCALAR_TYPES
+    | _COMPOSITE_TYPES
+    | {_KEY_VALUE_TYPE, _CONDITION_TYPE, _DIRECT_CONDITION_TYPE}
 )
 KEY_VALUE_TYPES = ("bool", "float64", "int64", "stored_pose", "string", "string_list")
 _KEY_VALUE_ONLY_KEYS = {"value_type_from_key", "value_types"}
@@ -76,6 +79,16 @@ _SEMANTIC_TYPES = {
     "scene_resource",
     "source_joint",
     "target_role",
+    "target_reference",
+    "signal_reference",
+    "frame_reference",
+    "collision_body_reference",
+}
+_REFERENCE_SEMANTIC_FIELDS = {
+    "target_reference": frozenset({"component_id", "command_target_id"}),
+    "signal_reference": frozenset({"component_id", "signal_name"}),
+    "frame_reference": frozenset({"component_id", "frame_id"}),
+    "collision_body_reference": frozenset({"component_id", "collision_body_id"}),
 }
 _SCOPED_SEMANTIC_TYPES = {
     "collision_body_role",
@@ -84,6 +97,7 @@ _SCOPED_SEMANTIC_TYPES = {
     "resource_role",
 }
 _PORTABLE_ID_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
+_CATALOG_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 def _strip_schema_descriptions(value: Any, *, in_properties_map: bool = False) -> Any:
@@ -202,7 +216,7 @@ class CatalogSchemaRegistry:
 
     def schema_hash(self, schema: CatalogSchema) -> str:
         # Hash the STRUCTURE only — prose descriptions are excluded so a
-        # docs-only edit does not perturb the hash (ADR-0023 §6: a prose
+        # docs-only edit does not perturb the hash (a prose
         # improvement must not invalidate a runtime callback that gates on it).
         payload = json.dumps(
             _strip_schema_descriptions(self.to_json_schema(schema)),
@@ -272,12 +286,12 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
         raise CatalogSchemaError(f"{path}: type must be one of: {allowed}")
     if schema_type == _KEY_VALUE_TYPE:
         return _parse_key_value_schema(raw_schema, path=path)
-    if schema_type == _CONDITION_TYPE:
+    if schema_type in {_CONDITION_TYPE, _DIRECT_CONDITION_TYPE}:
         unknown = sorted(set(raw_schema) - {"type", "description"})
         if unknown:
-            raise CatalogSchemaError(f"{path}: {_CONDITION_TYPE} forbids schema keys {unknown}")
+            raise CatalogSchemaError(f"{path}: {schema_type} forbids schema keys {unknown}")
         return CatalogSchema(
-            schema_type=_CONDITION_TYPE,
+            schema_type=schema_type,
             description=_optional_string(raw_schema, "description", path),
         )
     present_key_value_keys = sorted(_KEY_VALUE_ONLY_KEYS & set(raw_schema))
@@ -420,7 +434,24 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
             raise CatalogSchemaError(
                 f"{path}.semantic_type has unsupported value {semantic_type!r}"
             )
-        if schema_type != "string":
+        if semantic_type in _REFERENCE_SEMANTIC_FIELDS:
+            expected = _REFERENCE_SEMANTIC_FIELDS[semantic_type]
+            if (
+                schema_type != "object"
+                or set(properties) != expected
+                or set(required) != expected
+                or len(required) != len(expected)
+                or additional_properties
+                or any(
+                    prop.schema_type != "string" or prop.nullable
+                    for prop in properties.values()
+                )
+            ):
+                raise CatalogSchemaError(
+                    f"{path}: {semantic_type} must be a closed object with "
+                    f"required string fields {sorted(expected)}"
+                )
+        elif schema_type != "string":
             raise CatalogSchemaError(f"{path}.semantic_type requires type=string")
 
     semantic_scope_parameter = raw_schema.get("semantic_scope_parameter")
@@ -579,6 +610,24 @@ def _validate_schema(
                             f"{path}.{group_name} references unknown field '{field_name}'"
                         )
         for prop_name, prop_schema in schema.properties.items():
+            for condition_name, condition in (
+                ("required_when", prop_schema.required_when),
+                ("allowed_when", prop_schema.allowed_when),
+            ):
+                for condition_field, expected in condition.items():
+                    if isinstance(expected, tuple) and condition_field in declared:
+                        selector = registry.resolve(schema.properties[condition_field])
+                        if (
+                            selector.schema_type != "enum"
+                            or not expected
+                            or any(type(item) is not str for item in expected)
+                            or len(set(expected)) != len(expected)
+                            or any(item not in selector.enum_values for item in expected)
+                        ):
+                            raise CatalogSchemaError(
+                                f"{path}.properties.{prop_name}.{condition_name} "
+                                "must use a nonempty set of declared enum values"
+                            )
             for condition_field in prop_schema.required_when:
                 if condition_field not in declared:
                     raise CatalogSchemaError(
@@ -611,7 +660,7 @@ def _validate_schema(
     elif schema.schema_type == _KEY_VALUE_TYPE:
         if "stored_pose" in schema.value_types:
             registry.resolve(CatalogSchema(ref="#/schema_types/stored_pose"), stack=stack)
-    elif schema.schema_type in _SCALAR_TYPES | {"enum", _CONDITION_TYPE}:
+    elif schema.schema_type in _SCALAR_TYPES | {"enum", _CONDITION_TYPE, _DIRECT_CONDITION_TYPE}:
         if schema.properties:
             raise CatalogSchemaError(
                 f"{path}: scalar/enum schemas cannot declare properties"
@@ -671,8 +720,10 @@ def _validate_value(
                     schema_type,
                 )
             )
-    elif schema_type == _CONDITION_TYPE:
-        issue = interrupt_condition.condition_structure_issue(value)
+    elif schema_type in {_CONDITION_TYPE, _DIRECT_CONDITION_TYPE}:
+        issue = interrupt_condition.condition_structure_issue(
+            value, direct_references=schema_type == _DIRECT_CONDITION_TYPE
+        )
         if issue is not None:
             issue_path, message = issue
             issues.append(_issue(path + issue_path[1:], message, schema_type))
@@ -721,6 +772,29 @@ def _validate_value(
         if not isinstance(value, Mapping):
             issues.append(_issue(path, "must be an object", schema_type))
         else:
+            if schema.semantic_type in _REFERENCE_SEMANTIC_FIELDS:
+                for name in sorted(_REFERENCE_SEMANTIC_FIELDS[schema.semantic_type]):
+                    member = value.get(name)
+                    if not isinstance(member, str):
+                        continue
+                    try:
+                        encoded_length = len(member.encode("utf-8"))
+                    except UnicodeEncodeError:
+                        encoded_length = 513
+                    valid = (
+                        bool(member)
+                        and "\x00" not in member
+                        and encoded_length <= (512 if name == "signal_name" else 128)
+                        and (
+                            name == "signal_name"
+                            or (name == "component_id" and _PORTABLE_ID_RE.fullmatch(member) is not None)
+                            or (name != "component_id" and _CATALOG_ID_RE.fullmatch(member) is not None)
+                        )
+                    )
+                    if not valid:
+                        issues.append(
+                            _issue(f"{path}.{name}", "is not a valid identifier", "string")
+                        )
             supplied = set(value)
             declared = set(schema.properties)
             unknown = tuple(sorted(supplied - declared))
@@ -855,8 +929,13 @@ def _to_json_schema(
         if schema.value_type_from_key is not None:
             result["x-manyforge-value-type-from-key"] = schema.value_type_from_key
         return result
-    elif schema_type == _CONDITION_TYPE:
-        return {**result, **interrupt_condition.json_schema()}
+    elif schema_type in {_CONDITION_TYPE, _DIRECT_CONDITION_TYPE}:
+        return {
+            **result,
+            **interrupt_condition.json_schema(
+                direct_references=schema_type == _DIRECT_CONDITION_TYPE
+            ),
+        }
     elif schema_type == "enum":
         result["type"] = "string"
         result["enum"] = list(schema.enum_values)
@@ -883,6 +962,19 @@ def _to_json_schema(
             name: _to_json_schema(prop_schema, registry)
             for name, prop_schema in sorted(schema.properties.items())
         }
+        if schema.semantic_type in _REFERENCE_SEMANTIC_FIELDS:
+            for name in _REFERENCE_SEMANTIC_FIELDS[schema.semantic_type]:
+                prop = result["properties"][name]
+                prop["minLength"] = 1
+                prop["maxLength"] = 512 if name == "signal_name" else 128
+                if name == "signal_name":
+                    prop["x-manyforge-max-utf8-bytes"] = 512
+                    prop["pattern"] = "^[^\\u0000]+$"
+                else:
+                    prop["pattern"] = (
+                        "^[a-z][a-z0-9_.-]*$" if name == "component_id"
+                        else "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+                    )
         if schema.required:
             result["required"] = list(schema.required)
         all_of: list[dict[str, Any]] = []
@@ -903,15 +995,12 @@ def _to_json_schema(
             if prop_schema.required_when:
                 key = tuple(sorted(prop_schema.required_when.items()))
                 conditional_required.setdefault(key, []).append(field_name)
-        for condition_items, required_fields in sorted(conditional_required.items()):
+        for condition_items, required_fields in sorted(
+            conditional_required.items(), key=lambda item: repr(item[0])
+        ):
             all_of.append(
                 {
-                    "if": {
-                        "required": [key for key, _value in condition_items],
-                        "properties": {
-                            key: {"const": value} for key, value in condition_items
-                        },
-                    },
+                    "if": _json_schema_condition(dict(condition_items)),
                     "then": {"required": sorted(required_fields)},
                 }
             )
@@ -1074,14 +1163,19 @@ def _required_when_matches(schema: CatalogSchema, value: Mapping[str, Any]) -> b
 def _condition_matches(condition: Mapping[str, Any], value: Mapping[str, Any]) -> bool:
     if not condition:
         return False
-    return all(value.get(key) == expected for key, expected in condition.items())
+    return all(
+        value.get(key) in expected if isinstance(expected, tuple)
+        else value.get(key) == expected
+        for key, expected in condition.items()
+    )
 
 
 def _json_schema_condition(condition: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "required": [key for key, _value in sorted(condition.items())],
         "properties": {
-            key: {"const": value} for key, value in sorted(condition.items())
+            key: ({"enum": list(value)} if isinstance(value, tuple) else {"const": value})
+            for key, value in sorted(condition.items())
         },
     }
 

@@ -53,7 +53,7 @@ interface OperatorAlarmPanelProps {
 }
 
 /**
- * Alarm presentation and exact-record callback binding retained for I5. The
+ * Alarm presentation and exact-record callback binding retained for a future client. The
  * headless owner supplies lifecycle and freshness; this component only maps
  * those facts and submits acknowledgement intent through its callback.
  */

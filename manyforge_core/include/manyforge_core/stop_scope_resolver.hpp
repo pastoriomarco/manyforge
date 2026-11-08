@@ -140,7 +140,7 @@ struct StopAcceptedPredecessorInput final {
 
 /// Construct one immutable Stop acceptance from an already-resolved scope.
 /// The constructor derives both content identities. No Stop budget is
-/// accepted (Q51): each robot's deadlines come from its own profile and lane
+/// accepted: each robot's deadlines come from its own profile and lane
 /// at stage dispatch.
 [[nodiscard]] Result<StopAcceptedDTO> MakeStopAccepted(
     const StopIntentDTO& intent, StopId stop_id, StopGeneration stop_generation,

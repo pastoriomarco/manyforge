@@ -41,7 +41,7 @@ auto DispatchHeartbeatForDrain(const char *first_stuck, bool shutting_down,
   return std::string(text.substr(0U, end));
 }
 
-/// CONTRACTS §11, §15 (N28): whether a replaced or removed component keeps
+/// Whether a replaced or removed component keeps
 /// the host Apply from going ahead. An `enabled` one does, unless its latest
 /// action is a failed Disable (the Apply's own, `apply_orchestration`), no
 /// action runs and it isn't moving: that one is stopped like a dead one.
@@ -125,10 +125,14 @@ IsScenarioCompositionRefusal(const std::exception_ptr &failure) {
 /// keeps its typed code and cause; anything else is the generic failure.
 [[nodiscard]] inline manyforge::core::ErrorDTO
 SelectedRuntimeCompositionRpcError(const std::exception &error) {
-  if (const auto *typed = dynamic_cast<const manyforge::core::TypedError *>(&error);
-      typed != nullptr &&
-      typed->code() == manyforge::component_manager::kScenarioCompositionRefusedCode)
-    return typed->error();
+  if (const auto *typed = dynamic_cast<const manyforge::core::TypedError *>(&error)) {
+    if (typed->code() == manyforge::component_manager::kScenarioCompositionRefusedCode)
+      return typed->error();
+    if (typed->code() == "direct_control_primary_target_missing" ||
+        typed->code() == "direct_control_primary_target_ambiguous")
+      return {"selected_runtime_composition_request_failed", error.what(),
+              {{"code", typed->code()}}};
+  }
   return {"selected_runtime_composition_request_failed", error.what(), {}};
 }
 

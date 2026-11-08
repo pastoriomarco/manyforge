@@ -176,7 +176,7 @@ def test_arm_only_scenario_matches_robot_descriptor(tmp_path: Path, family: str)
 
 
 def test_machine_arm_scenario_takes_its_owners_lane(tmp_path: Path) -> None:
-    # A member names no lane: it runs on its owner's (CONTRACTS §16).
+    # A member names no lane: it runs on its owner's.
     root = _workspace(tmp_path, "lite6")
     scenario = _scenario(tmp_path, "lite6")
     path = scenario / "deployment.yaml"
@@ -665,7 +665,7 @@ def test_a_tcp_named_like_a_frame_role_on_another_link_is_refused(
 
 
 def test_a_non_default_tcp_may_be_named_tcp(tmp_path: Path) -> None:
-    # C-RQ8/C-P3: `tcp` is an ordinary name (no Cell alias of the default
+    # `tcp` is an ordinary name (no Cell alias of the default
     # TCP), so a later TCP may use it; the first stays the default.
     root = _workspace(tmp_path, "lite_gripper")
     folder = _cup_tool(root, [{"id": "cup_center", "frame": "link_tcp"},
@@ -715,7 +715,7 @@ _TOOL_RUNTIME_SOURCES = {
 
 
 def _mounted_scenario(tmp_path: Path, lane: str | None = None,
-                      change=None, tool_role: str = "lite_gripper") -> Path:
+                      change=None) -> Path:
     """lite6_robot (Mock) with lite_gripper mounted on its flange, and an I/O device."""
     scenario = _scenario(tmp_path / "ws" / "examples", "lite6")
     path = scenario / "deployment.yaml"
@@ -751,14 +751,6 @@ def _mounted_scenario(tmp_path: Path, lane: str | None = None,
     if change is not None:
         change(deployment)
     path.write_text(yaml.safe_dump(deployment), encoding="utf-8")
-    assignment = {
-        "component_roles": [
-            {"component_role_id": "robot", "controllable_component_id": "lite6_robot"},
-            {"component_role_id": "tool", "controllable_component_id": tool_role},
-        ],
-        "target_roles": [],
-    }
-    (scenario / "assignment.yaml").write_text(json.dumps(assignment), encoding="utf-8")
     return scenario
 
 
@@ -860,42 +852,40 @@ def _tool_gripper(key: str, value):
 
 
 @pytest.mark.parametrize(
-    ("change", "tool_role", "code", "text"),
+    ("change", "code", "text"),
     [
         (lambda d: _tool_component(d).update(root_pose_in_cell={"position_m": [0, 0, 0]}),
-         "lite_gripper", "component_attachment_invalid", "omits root_pose_in_cell"),
-        (lambda d: d.update(attachments=[]), "lite_gripper",
+         "component_attachment_invalid", "omits root_pose_in_cell"),
+        (lambda d: d.update(attachments=[]),
          "component_attachment_invalid", "needs exactly one attachments row"),
-        (_attachment("child", "interface", "wrist"), "lite_gripper",
+        (_attachment("child", "interface", "wrist"),
          "component_attachment_invalid", "child.interface must be 'mount'"),
-        (_attachment("parent", "interface", "wrist"), "lite_gripper",
+        (_attachment("parent", "interface", "wrist"),
          "component_attachment_invalid", "parent.interface must be 'flange', got 'wrist'"),
-        (_attachment("parent", "component_id", "ghost"), "lite_gripper",
+        (_attachment("parent", "component_id", "ghost"),
          "component_attachment_invalid", "parent 'ghost' is not a component"),
-        (_attachment("parent", "component_id", "gripper_io"), "lite_gripper",
+        (_attachment("parent", "component_id", "gripper_io"),
          "component_attachment_invalid", "parent 'gripper_io' has no 'flange' interface"),
-        (_second_tool_on_the_same_flange, "lite_gripper", "component_attachment_invalid",
+        (_second_tool_on_the_same_flange, "component_attachment_invalid",
          "the flange of 'lite6_robot' is not free"),
-        (None, "lite6_robot", "component_attachment_invalid",
-         "role 'tool' selects 'lite6_robot', which is not a mounted tool"),
         (_tool_runtime("component_streams", [{"stream_id": "measured_joints"}]),
-         "lite_gripper", "component_scenario_mismatch",
+         "component_scenario_mismatch",
          "component_streams must declare exactly []"),
-        (_tool_runtime("gripper_target_configurations", []), "lite_gripper",
+        (_tool_runtime("gripper_target_configurations", []),
          "component_scenario_mismatch", "gripper_target_configurations is empty"),
-        (_tool_gripper("mount_frame", "link_eef"), "lite_gripper",
+        (_tool_gripper("mount_frame", "link_eef"),
          "component_scenario_mismatch", "mount_frame 'link_eef' must be mount.frame"),
-        (_tool_gripper("controllable_component_id", "lite6_robot"), "lite_gripper",
+        (_tool_gripper("controllable_component_id", "lite6_robot"),
          "component_scenario_mismatch", "a tool's gripper row names the tool"),
-        (_tool_gripper("open_state_ref", "wide"), "lite_gripper",
+        (_tool_gripper("open_state_ref", "wide"),
          "component_scenario_mismatch", "open_state_ref 'wide' is not a group_state"),
     ],
 )
 def test_mounted_tool_scenario_mistakes_give_one_clear_line(
-    tmp_path: Path, change, tool_role: str, code: str, text: str
+    tmp_path: Path, change, code: str, text: str
 ) -> None:
     root = _workspace(tmp_path, "lite6", "lite_gripper")
-    scenario = _mounted_scenario(tmp_path, change=change, tool_role=tool_role)
+    scenario = _mounted_scenario(tmp_path, change=change)
     report, _loaded = descriptor.check(root, _tool("lite_gripper", root), scenario)
     assert code in _codes(report)
     line = next(error.line() for error in report.errors
@@ -971,7 +961,7 @@ def test_curated_list() -> None:
     assert set(ROBOTS.values()) | set(TOOLS.values()) | {
         "manyforge.mock_pneumatic_gripper_io"
     } <= set(entries)
-    # A UFACTORY arm is placed only as its machine's member (AUD-5).
+    # A UFACTORY arm is placed only as its machine's member.
     lite6 = entries["ufactory.lite6"]
     assert lite6["kind"] == "robot" and not lite6["addable"] and lite6["errors"] == []
     assert lite6["path"] == "manyforge_example_models/models/lite6"
@@ -1053,7 +1043,7 @@ def test_command_line(tmp_path: Path, capsys) -> None:
     assert "nothing written" in capsys.readouterr().out
 
 
-# --- machines and model-form I/O devices (plan, "Machines: owners and members")
+# --- machines and model-form I/O devices (owners and members) ----------
 
 
 MACHINES = {
@@ -1071,7 +1061,7 @@ def test_curated_machines_and_their_io_members_pass(machine: str) -> None:
     members = [(m["role"], m["model"]) for m in loaded.data["members"]]
     arm, controller_io, tool_io = MACHINES[machine]
     assert members == [("arm", arm), ("controller_io", controller_io), ("tool_io", tool_io)]
-    # AUD-5b revised: no member is required; no Mock or Isaac row.
+    # No member is required; no Mock or Isaac row.
     assert loaded.data["lanes"] == {"real": {"adapter": "xarm"}}
     for model in (controller_io, tool_io):
         report, io = descriptor.check(ROOT, ROOT / "components/io_device" / model)
@@ -1145,7 +1135,7 @@ def test_curated_list_offers_machines_not_their_io_members() -> None:
     assert not io["addable"] and io["runtime"] == {"componentProfileId": "ufactory.lite6_controller_io"}
 
 
-# --- sensors (a point-cloud source, decision AUD-9) -------------------------
+# --- sensors (a point-cloud source) --------------------------------------
 
 POINTCLOUD = ROOT / "components/sensor/manyforge.pointcloud_source"
 
@@ -1154,7 +1144,7 @@ def test_curated_pointcloud_source_passes_and_is_listed() -> None:
     report, loaded = descriptor.check(ROOT, POINTCLOUD)
     assert report.errors == [] and loaded is not None and loaded.kind == "sensor"
     assert loaded.data["sensor"] == "pointcloud"
-    # One adapter on every lane (PC-1): no lane rows, no frame default.
+    # One adapter on every lane: no lane rows, no frame default.
     assert "lanes" not in loaded.data
     assert loaded.data["adapter_row"] == {"adapter": "pointcloud", "stream_budget_s": 1.0}
     entry = next(entry for entry in descriptor.list_components(ROOT)["components"]

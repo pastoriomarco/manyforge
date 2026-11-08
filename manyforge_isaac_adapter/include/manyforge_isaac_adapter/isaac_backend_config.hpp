@@ -21,6 +21,7 @@ namespace manyforge::isaac_adapter {
     const deployment::ros2_control_execution_runtime_contract::Configuration &runtime_configuration,
     const core::RuntimeParticipantBinding &motion_binding, const IsaacArmFacts &arm,
     const IsaacLaneSettings &settings, const roboplan_backend::ControllerLaneRates &rates,
+    bool supports_scale,
     const std::map<std::string, double, std::less<>> &max_deceleration_on_cancel_by_source_joint,
     std::span<const core::StreamParameterOverrideDTO> stream_overrides = {});
 

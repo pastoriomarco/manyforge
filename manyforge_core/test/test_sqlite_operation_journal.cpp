@@ -21,6 +21,7 @@
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_core/stop_journal_projection_codec.hpp>
 #include <manyforge_core/stop_scope_resolver.hpp>
 #include <manyforge_core/stop_terminal_reducer.hpp>
@@ -77,7 +78,7 @@ class ScopedTemporaryDirectory final {
       RetainedBundleId("retained-bundle"),
       std::nullopt,
       {OperationParticipantIntentDTO{
-          ComponentRoleId("robot"), TargetRoleId("gripper"), CapabilityId("tool.gripper.command"),
+          {ControllableComponentId("robot.1"), CommandTargetId("gripper")}, CapabilityId("tool.gripper.command"),
           std::nullopt,
           CapabilityCommandIntentDTO{
               CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
@@ -394,7 +395,7 @@ TEST(SqliteOperationJournalTest, EarlierJournalFormatsAreRefusedAndLeftUntouched
   // Earlier Stop/controller-only/common-goal and v16 (Stop payload copies)
   // formats are refused, never converted, and their retained bytes stay as
   // they were.
-  for (const int version : {9, 10, 11, 12, 13, 14, 15, 16, 17, 18}) {
+  for (const int version : {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}) {
     SCOPED_TRACE(version);
     ScopedTemporaryDirectory directory;
     const auto database = directory.path() / "journal.sqlite3";
@@ -437,9 +438,10 @@ TEST(SqliteOperationJournalTest, EarlierJournalFormatsAreRefusedAndLeftUntouched
     try {
       SqliteOperationJournal refused(database, cell);
       ADD_FAILURE() << "an earlier journal format was opened";
-    } catch (const std::runtime_error& error) {
+    } catch (const TypedError& error) {
+      EXPECT_EQ(error.code(), "operation_journal_version_unsupported");
       EXPECT_EQ(std::string(error.what()),
-                "operation journal predates the v19 takeover record and is not converted");
+                "operation journal version is unsupported; settle and Reset using the old version, or clean-start");
     }
     EXPECT_EQ(retained(), before);
     sqlite3_stmt* user_version = nullptr;
@@ -855,7 +857,7 @@ TEST(SqliteOperationJournalTest, AcceptedMotionRecordsAbsoluteGoalFrameAndRobotQ
   goal.orientation.w = 1.0;
   MotionParticipantIntentDTO motion{
       MoveId("move.framed"),
-      FrameRoleId("base"),
+      {ControllableComponentId("robot.1"), FrameRoleId("base")},
       CurrentTcpDTO{},
       TolerancesDTO{0.01, 0.001, 0.01},
       SpeedProfileDTO{},
@@ -870,9 +872,8 @@ TEST(SqliteOperationJournalTest, AcceptedMotionRecordsAbsoluteGoalFrameAndRobotQ
       {},
       {}};
   motion.goal_frame_reference =
-      ReferenceDTO(FrameRoleId("tcp"),
-                   ReferenceTargetDTO{TargetRoleId("peer_arm"),
-                                      ControllableComponentId("robot.2"), CommandTargetId("arm")});
+      ReferenceDTO(ProgramFrameReferenceDTO{ControllableComponentId("robot.2"),
+                                            FrameRoleId("tcp")});
   intent.participants.front().payload = motion;
   const auto state =
       OperationState("operation.goal-frame", OperationStateKind::kExecuting, 10);
@@ -883,10 +884,8 @@ TEST(SqliteOperationJournalTest, AcceptedMotionRecordsAbsoluteGoalFrameAndRobotQ
   ASSERT_EQ(events.value().events.size(), 1U);
   const auto& payload = events.value().events.front().payload_json;
   EXPECT_NE(payload.find("\"target_mode\":\"absolute\""), std::string::npos);
-  EXPECT_NE(payload.find("\"goal_frame_reference\":{\"id\":\"tcp\",\"pose\":null,"
-                         "\"target\":{\"command_target_id\":\"arm\","
-                         "\"controllable_component_id\":\"robot.2\","
-                         "\"target_role_id\":\"peer_arm\"},\"type\":\"frame_role\"}"),
+  EXPECT_NE(payload.find("\"goal_frame_reference\":{\"id\":{\"component_id\":\"robot.2\","
+                         "\"frame_id\":\"tcp\"},\"pose\":null,\"type\":\"component_frame\"}"),
             std::string::npos)
       << payload;
 }
@@ -2326,7 +2325,7 @@ TEST(SqliteOperationJournalTest, CapturedScopeAndFailureAreImmutableAcrossOwnerR
   intent.participants.front().required_capability_id = CapabilityId("execution.trajectory.execute");
   intent.participants.front().payload = MotionParticipantIntentDTO{
       MoveId("move"),
-      FrameRoleId("base"),
+      {ControllableComponentId("robot.1"), FrameRoleId("base")},
       CurrentTcpDTO{},
       TolerancesDTO{},
       SpeedProfileDTO{},
@@ -2370,7 +2369,7 @@ TEST(SqliteOperationJournalTest, CapturedScopeAndFailureAreImmutableAcrossOwnerR
     ASSERT_TRUE(events.ok());
     ASSERT_EQ(events.value().events.size(), 2U);
     EXPECT_NE(events.value().events.front().payload_json.find(
-                  "manyforge.operation_journal_record.v8"), std::string::npos);
+                  "manyforge.operation_journal_record.v9"), std::string::npos);
     EXPECT_EQ(events.value().events.front().payload_json.find("automatic_retry_context"),
               std::string::npos);
     EXPECT_NE(events.value().events.back().payload_json.find("planning_failed"),
@@ -2422,7 +2421,7 @@ TEST(SqliteOperationJournalTest, ExactParticipantFactsSurviveCaptureAndReopenWit
       const auto& bytes = events.value().events.back().payload_json;
       EXPECT_EQ(bytes.find("terminal_fact") != std::string::npos, effect.has_value());
       if (effect) {
-        EXPECT_NE(bytes.find("manyforge.operation_journal_record.v8"), std::string::npos);
+        EXPECT_NE(bytes.find("manyforge.operation_journal_record.v9"), std::string::npos);
       }
       if (effect) {
         auto mismatch = failed;
@@ -2485,7 +2484,7 @@ TEST(SqliteOperationJournalTest,
         bytes.replace(at, current.size(), legacy);
       }
     } else {
-      const std::string version = "manyforge.operation_journal_record.v8";
+      const std::string version = "manyforge.operation_journal_record.v9";
       const auto at = bytes.find(version);
       ASSERT_NE(at, std::string::npos);
       bytes.replace(at, version.size(), "manyforge.operation_journal_record.v5");
@@ -2536,7 +2535,7 @@ TEST(SqliteOperationJournalTest, LogicalPreemptionPersistsWithoutClaimingPhysica
       const auto events = journal.ReadEvents(epoch, 0U, 8U);
       ASSERT_TRUE(events.ok());
       EXPECT_NE(events.value().events.back().payload_json.find(
-                    "manyforge.operation_journal_record.v8"), std::string::npos);
+                    "manyforge.operation_journal_record.v9"), std::string::npos);
       EXPECT_EQ(preempted.participants.front().state, OperationStateKind::kExecuting);
       EXPECT_FALSE(preempted.participants.front().terminal_fact);
       auto erased = preempted;
@@ -2624,7 +2623,7 @@ TEST(SqliteOperationJournalTest, InterruptRuleStateUsesExistingOrderedOperationa
   EXPECT_EQ(replay.value().next_after_sequence, last_sequence);
 }
 
-// Active TCP (M7, design 4, A2a-2): one confirmed change is an operational
+// Active TCP: one confirmed change is an operational
 // `active_tcp_changed` row (the Runner's mirror and History read it) with
 // robot, previous and new entry (null: none), source, offset sent,
 // registration generation and sequence; an invalid change consumes no
@@ -2634,8 +2633,8 @@ TEST(SqliteOperationJournalTest, ActiveTcpChangeIsAnOperationalRow) {
   const RequestOwnerEpoch owner("active_tcp.owner");
   SqliteOperationJournal journal(directory.path() / "active-tcp.sqlite3", CellId("cell.test"), 8U);
   ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 0, 8U, {}).ok());
-  const TcpEntryDTO tool{ControllableComponentId("gripper"), CommandTargetId("gripper"),
-                         FrameRoleId("tcp")};
+  const TcpEntryReferenceDTO tool{{ControllableComponentId("robot"), CommandTargetId("arm")},
+                                  {ControllableComponentId("gripper"), FrameRoleId("tcp")}};
   ActiveTcpChangeDTO change{ControllableComponentId("robot"), std::nullopt, tool,
                             ActiveTcpChangeSource::kRobotControl, true, 2U, 3U, 7};
   const auto recorded = journal.RecordActiveTcpChanged(owner, change);
@@ -2654,10 +2653,10 @@ TEST(SqliteOperationJournalTest, ActiveTcpChangeIsAnOperationalRow) {
   EXPECT_EQ(event.occurred_at_ns, 7);
   const auto payload = manyforge::content_identity::parse_canonical_json(event.payload_json);
   EXPECT_EQ(payload.find_object_member("api_version")->as_string(),
-            "manyforge.active_tcp_change.v1");
+            "manyforge.active_tcp_change.v2");
   EXPECT_EQ(payload.find_object_member("component_id")->as_string(), "robot");
   EXPECT_TRUE(payload.find_object_member("previous")->is_null());
-  EXPECT_EQ(payload.find_object_member("entry")->find_object_member("component_id")->as_string(),
+  EXPECT_EQ(payload.find_object_member("entry")->find_object_member("frame")->find_object_member("component_id")->as_string(),
             "gripper");
   EXPECT_EQ(payload.find_object_member("source")->as_string(), "robot_control");
   EXPECT_TRUE(payload.find_object_member("offset_sent")->as_bool());
@@ -2832,7 +2831,7 @@ TEST(SqliteOperationJournalTest,
     ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
     auto intent = CommandIntent("request.siblings", epoch.value());
     intent.participants.push_back(intent.participants.front());
-    intent.participants.back().component_role_id = ComponentRoleId("robot2");
+    intent.participants.back().target.component_id = ControllableComponentId("robot2");
     auto accepted = Acceptance(intent, state);
     accepted.participant_assignments.push_back({1U, sibling.participant_id});
     ASSERT_TRUE(journal.RecordOperationAccepted(epoch, intent, accepted, state).ok());
@@ -2936,7 +2935,7 @@ TEST(SqliteOperationJournalTest, CommonCommandIdentityUsesOneNeutralStoredShape)
               manyforge::content_identity::sha256_digest(event.payload_json));
     const auto payload = manyforge::content_identity::parse_canonical_json(event.payload_json);
     EXPECT_EQ(payload.find_object_member("api_version")->as_string(),
-              "manyforge.operation_journal_record.v8");
+              "manyforge.operation_journal_record.v9");
     const auto& participant = payload.find_object_member("operation_state")
                                   ->find_object_member("participants")->as_array().front();
     ASSERT_NE(participant.find_object_member("command_id"), nullptr);
@@ -2989,7 +2988,7 @@ TEST(SqliteOperationJournalTest, RuleEvidenceSurvivesRealJournalCoalescingAndReo
     const auto events = journal.ReadEvents(owner, 0U, 8U);
     ASSERT_TRUE(events.ok()); ASSERT_EQ(events.value().events.size(), 2U);
     const auto payload = manyforge::content_identity::parse_canonical_json(events.value().events.back().payload_json);
-    EXPECT_EQ(payload.find_object_member("api_version")->as_string(), "manyforge.operation_journal_record.v8");
+    EXPECT_EQ(payload.find_object_member("api_version")->as_string(), "manyforge.operation_journal_record.v9");
   }
   SqliteOperationJournal reopened(database, CellId("cell.test"), 8U);
   const auto recovered = reopened.BeginOwnerEpoch(RequestOwnerEpoch("owner.rules.replacement"), 20, 8U, resources);
@@ -3205,7 +3204,7 @@ TEST(SqliteOperationJournalTest, AcceptedMotionRecordsItsRequiredOwnerQualifiedT
     auto intent = CommandIntent("endpoint-" + std::to_string(selected), epoch.value());
     MotionParticipantIntentDTO motion{
         MoveId("move.endpoint"),
-        FrameRoleId("base"),
+        {ControllableComponentId("robot.1"), FrameRoleId("base")},
         CurrentTcpDTO{},
         TolerancesDTO{0.01, 0.001, 0.01},
         SpeedProfileDTO{},
@@ -3220,9 +3219,9 @@ TEST(SqliteOperationJournalTest, AcceptedMotionRecordsItsRequiredOwnerQualifiedT
         {},
         {}};
     if (selected) {
-      motion.tcp_endpoint = TcpEntryDTO{ControllableComponentId("lite_gripper"),
-                                        CommandTargetId("gripper"),
-                                        FrameRoleId(selected == 1 ? "left_tip" : "right_tip")};
+      motion.tcp_endpoint = TcpEntryReferenceDTO{
+          {ControllableComponentId("robot.1"), CommandTargetId("arm")},
+          {ControllableComponentId("lite_gripper"), FrameRoleId(selected == 1 ? "left_tip" : "right_tip")}};
     }
     intent.participants.front().payload = motion;
     const auto state = OperationState("operation.endpoint-" + std::to_string(selected),
@@ -3239,10 +3238,10 @@ TEST(SqliteOperationJournalTest, AcceptedMotionRecordsItsRequiredOwnerQualifiedT
   for (std::size_t index = 1; index < 3; ++index) {
     const auto& bytes = events.value().events[index].payload_json;
     const std::string expected =
-        std::string("\"tcp_endpoint\":{\"entry\":{\"component_id\":\"lite_gripper\","
-                    "\"frame_role_id\":\"") +
+        std::string("\"tcp_endpoint\":{\"frame\":{\"component_id\":\"lite_gripper\","
+                    "\"frame_id\":\"") +
         (index == 1 ? "left_tip" : "right_tip") +
-        "\",\"target_id\":\"gripper\"},\"kind\":\"entry\"}";
+        "\"},\"kind\":\"entry\",\"target\":{\"command_target_id\":\"arm\",\"component_id\":\"robot.1\"}}";
     EXPECT_NE(bytes.find(expected), std::string::npos);
     EXPECT_EQ(bytes.find("tcp_frame_role_id"), std::string::npos);
   }
@@ -3259,7 +3258,7 @@ namespace {
 // attempt of one participant embeds the same plan (one digest).
 [[nodiscard]] ResolvedStopBasePlanDTO GoldenStopBasePlan() {
   const auto path =
-      std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
+      std::filesystem::path(MANYFORGE_CORE_TEST_GOLDEN_DIR) / "resolved_stop_base_plan.v1.json";
   std::ifstream stream(path, std::ios::binary);
   std::ostringstream bytes;
   bytes << stream.rdbuf();
@@ -3309,8 +3308,6 @@ namespace {
       ProgramBindingId(Digest('b').value()),
       base.retained_bundle_id,
       base.graph_revision,
-      ComponentRoleId("robot"),
-      TargetRoleId("arm"),
       ControllableComponentId("robot.1"),
       ComponentTypeId("robot.type"),
       ComponentTypeRevision("robot.type.revision"),
@@ -3321,7 +3318,7 @@ namespace {
       {ProgramModelRoleBindingDTO{ModelRoleId("body"), ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision")}},
       {},
-      {ProgramFrameRoleBindingDTO{FrameRoleId("base"), ModelInstanceId("robot.model"),
+      {ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("base")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision"), "robot_base"}},
       {RuntimeResourceBindingDTO{ResourceRoleId("joint.1"), ResourceId("joint.1"),
                                  std::string("joint_1"), "joint_1", CoordinateKind::kAngular},
@@ -3657,7 +3654,7 @@ struct LeanRoundTripCase final {
   bool predecessor;
 };
 
-// Plan §5.2 tests 2 and 3: acceptance -> terminal, then reopen on a new owner
+// Acceptance -> terminal, then reopen on a new owner
 // epoch.
 TEST(SqliteOperationJournalTest, LeanStopRecordRecoversExactTruthFromSingleStoredCopies) {
   for (const auto& test_case :
@@ -3743,7 +3740,7 @@ TEST(SqliteOperationJournalTest, LeanStopRecordRecoversExactTruthFromSingleStore
   }
 }
 
-// Plan §5.2 test 4: history capacity 8, 20 operations, 3 owner epochs and
+// History capacity 8, 20 operations, 3 owner epochs and
 // joined receipts keep every index reference valid.
 TEST(SqliteOperationJournalTest, LeanStopIndexKeepsEveryReferenceAcrossPruningAndOwnerEpochs) {
   ScopedTemporaryDirectory temporary;
@@ -3848,7 +3845,7 @@ TEST(SqliteOperationJournalTest, LeanStopIndexKeepsEveryReferenceAcrossPruningAn
             "11");
 }
 
-// Plan §5.2 test 5: a v16 journal (Stop payload copies) is refused with the
+// A v16 journal (Stop payload copies) is refused with the
 // explicit message and its file bytes stay unchanged.
 TEST(SqliteOperationJournalTest, V16JournalIsRefusedAndItsFileBytesStayUnchanged) {
   ScopedTemporaryDirectory temporary;
@@ -3876,16 +3873,83 @@ TEST(SqliteOperationJournalTest, V16JournalIsRefusedAndItsFileBytesStayUnchanged
             SQLITE_OK);
   ASSERT_EQ(sqlite3_close(legacy), SQLITE_OK);
   const auto before = FileSha256(database);
-  // The constructor reports operation_journal_format_unsupported as a
-  // std::runtime_error whose text is the refusal message.
+  // The constructor retains the typed version refusal and leaves the journal untouched.
   try {
     SqliteOperationJournal refused(database, cell_id, 8U);
     ADD_FAILURE() << "a v16 journal was opened";
-  } catch (const std::runtime_error& error) {
+  } catch (const TypedError& error) {
+    EXPECT_EQ(error.code(), "operation_journal_version_unsupported");
     EXPECT_EQ(std::string(error.what()),
-              "operation journal predates the v19 takeover record and is not converted");
+              "operation journal version is unsupported; settle and Reset using the old version, or clean-start");
   }
   EXPECT_EQ(FileSha256(database), before);
+}
+
+TEST(SqliteOperationJournalTest, OldDeleteModeJournalIsRefusedWithoutChangingBytesOrMode) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  sqlite3* legacy = nullptr;
+  ASSERT_EQ(sqlite3_open(database.c_str(), &legacy), SQLITE_OK);
+  ASSERT_EQ(sqlite3_exec(legacy, "PRAGMA journal_mode=DELETE; CREATE TABLE legacy (value INTEGER); "
+                                 "INSERT INTO legacy VALUES (1); PRAGMA user_version=1;",
+                         nullptr, nullptr, nullptr), SQLITE_OK);
+  ASSERT_EQ(sqlite3_close(legacy), SQLITE_OK);
+  const auto before = FileSha256(database);
+  const auto permissions = std::filesystem::status(database).permissions();
+  try {
+    SqliteOperationJournal refused(database, CellId("cell.1"), 8U);
+    ADD_FAILURE() << "an older nonempty journal was opened";
+  } catch (const TypedError& error) {
+    EXPECT_EQ(error.code(), "operation_journal_version_unsupported");
+  }
+  EXPECT_EQ(FileSha256(database), before);
+  EXPECT_EQ(std::filesystem::status(database).permissions(), permissions);
+  sqlite3* reader = nullptr;
+  ASSERT_EQ(sqlite3_open_v2(database.c_str(), &reader, SQLITE_OPEN_READONLY, nullptr), SQLITE_OK);
+  sqlite3_stmt* statement = nullptr;
+  ASSERT_EQ(sqlite3_prepare_v2(reader, "PRAGMA journal_mode", -1, &statement, nullptr), SQLITE_OK);
+  ASSERT_EQ(sqlite3_step(statement), SQLITE_ROW);
+  EXPECT_STREQ(reinterpret_cast<const char*>(sqlite3_column_text(statement, 0)), "delete");
+  EXPECT_EQ(sqlite3_finalize(statement), SQLITE_OK);
+  EXPECT_EQ(sqlite3_close(reader), SQLITE_OK);
+}
+
+TEST(SqliteOperationJournalTest, FailedPreflightPathLookupRefusesStorageWithoutOpening) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  std::filesystem::create_symlink(database.filename(), database);
+  try {
+    SqliteOperationJournal refused(database, CellId("cell.1"), 8U);
+    ADD_FAILURE() << "a cyclic journal path was opened";
+  } catch (const TypedError& error) {
+    EXPECT_EQ(error.code(), "operation_journal_path_invalid");
+  }
+  EXPECT_TRUE(std::filesystem::is_symlink(std::filesystem::symlink_status(database)));
+}
+
+TEST(SqliteOperationJournalTest, OldWalJournalIsRefusedBeforeWritableOpen) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  sqlite3* legacy = nullptr;
+  ASSERT_EQ(sqlite3_open(database.c_str(), &legacy), SQLITE_OK);
+  ASSERT_EQ(sqlite3_exec(legacy, "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; "
+                                 "CREATE TABLE legacy (value INTEGER); INSERT INTO legacy VALUES (1); "
+                                 "PRAGMA user_version=1;", nullptr, nullptr, nullptr), SQLITE_OK);
+  const auto wal = std::filesystem::path(database.string() + "-wal");
+  ASSERT_TRUE(std::filesystem::exists(wal));
+  const auto before_database = FileSha256(database);
+  const auto before_wal = FileSha256(wal);
+  const auto permissions = std::filesystem::status(database).permissions();
+  try {
+    SqliteOperationJournal refused(database, CellId("cell.1"), 8U);
+    ADD_FAILURE() << "an older WAL journal was opened";
+  } catch (const TypedError& error) {
+    EXPECT_EQ(error.code(), "operation_journal_version_unsupported");
+  }
+  EXPECT_EQ(FileSha256(database), before_database);
+  EXPECT_EQ(FileSha256(wal), before_wal);
+  EXPECT_EQ(std::filesystem::status(database).permissions(), permissions);
+  EXPECT_EQ(sqlite3_close(legacy), SQLITE_OK);
 }
 
 TEST(SqliteOperationJournalTest, ChangedValidAcceptedPayloadFailsNonterminalStopRecovery) {
@@ -4001,7 +4065,7 @@ TEST(SqliteOperationJournalTest, InterruptedSnapshotStillRefusesTheCleanOwnerClo
   EXPECT_EQ(blocked.error().code, "operation_journal_owner_close_blocked");
 }
 
-// R3: retained Stop truth is bounded by eviction, never refusal. More than the
+// Retained Stop truth is bounded by eviction, never refusal. More than the
 // recovery bound of terminal Stops across owner epochs keeps every restart
 // working; the oldest terminal Stops (and their journal rows) go, while the
 // latest prior epoch's nonterminal Stop and the newest generations survive.

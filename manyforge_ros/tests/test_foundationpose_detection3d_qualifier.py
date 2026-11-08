@@ -1,6 +1,6 @@
 """Owner-neutral FoundationPose evidence and pre-effect gate contracts.
 
-The four former live ROS cases remain exact I9/I acceptance input at
+The four former live ROS cases remain exact acceptance input at
 ManyForge commit 08222188293df8e12f90dc72e204c21f22f92ea1, blob
 6e1af85d44d3304a3620cec30d1c83ff1f3ae9f5.  They are not runnable fallbacks
 for the deleted live subscriber.

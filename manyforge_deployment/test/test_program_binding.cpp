@@ -23,6 +23,7 @@
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
+#include <manyforge_deployment/cell_kinematic_index.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
@@ -43,14 +44,14 @@ using manyforge::core::ProgramBindingDTO;
 using manyforge::core::ProgramBindingId;
 using manyforge::core::ProgramBindingProvenanceDTO;
 using manyforge::core::ProgramCapabilityBindingDTO;
-using manyforge::core::ProgramComponentRoleBindingDTO;
+using manyforge::core::ProgramComponentBindingDTO;
 using manyforge::core::ProgramControlBindingRefDTO;
-using manyforge::core::ProgramFrameRoleBindingDTO;
+using manyforge::core::ProgramFrameBindingDTO;
 using manyforge::core::ProgramId;
 using manyforge::core::ProgramModelRoleBindingDTO;
 using manyforge::core::ProgramResourceRoleBindingDTO;
 using manyforge::core::ProgramRevision;
-using manyforge::core::ProgramTargetRoleBindingDTO;
+using manyforge::core::ProgramTargetBindingDTO;
 using manyforge::core::ResourceId;
 using manyforge::core::ResourceRoleId;
 using manyforge::core::TargetRoleId;
@@ -58,6 +59,7 @@ using manyforge::deployment::CompositionComponentModelFrame;
 using manyforge::deployment::CanonicalValue;
 using manyforge::deployment::FilesystemProgramBindingRepository;
 using manyforge::deployment::FilesystemVerifiedProgramBindingSource;
+using manyforge::deployment::FilesystemVerifiedCatalogArtifactSource;
 using manyforge::deployment::FilesystemVerifiedRetainedBundleSource;
 using manyforge::deployment::FilesystemVerifiedRetainedModelMapSource;
 using manyforge::deployment::ProgramBindingError;
@@ -105,12 +107,20 @@ class ScopedTrustedRoot final {
 struct BindingContext final {
   std::shared_ptr<const manyforge::deployment::RetainedBundle> bundle;
   VerifiedRetainedModelMap model_map;
+  std::filesystem::path catalog_root;
+
+  [[nodiscard]] FilesystemVerifiedCatalogArtifactSource catalog_source() const {
+    return FilesystemVerifiedCatalogArtifactSource(catalog_root);
+  }
 };
 
 [[nodiscard]] BindingContext make_context(
-    const std::filesystem::path& root) {
-  const auto materialized =
-      materialize_lite6_retained_consumer_fixture(root);
+    const std::filesystem::path& root, bool tcp_contact = false) {
+  const auto materialized = tcp_contact
+      ? manyforge::deployment::test::materialize_lite6_retained_consumer_fixture_from(
+            root, manyforge::deployment::test::make_lite6_ros2_control_shared_consumer_retention_fixture(
+                      {}, 1U, false, true))
+      : materialize_lite6_retained_consumer_fixture(root);
   const FilesystemVerifiedRetainedBundleSource bundle_source(root);
   auto bundle = bundle_source.get_verified(
       materialized.bundle->retained_bundle_id());
@@ -126,7 +136,7 @@ struct BindingContext final {
   if (!model_map.has_value()) {
     throw std::logic_error("test could not reload retained model map");
   }
-  return {std::move(bundle), std::move(*model_map)};
+  return {std::move(bundle), std::move(*model_map), root};
 }
 
 [[nodiscard]] BindingContext make_other_cell_context(
@@ -153,7 +163,7 @@ struct BindingContext final {
     throw std::logic_error(
         "test could not reload other-cell retained model map");
   }
-  return {std::move(bundle), std::move(*model_map)};
+  return {std::move(bundle), std::move(*model_map), root};
 }
 
 [[nodiscard]] ProgramBindingDTO make_binding_value(
@@ -200,62 +210,57 @@ struct BindingContext final {
     compiled_names.push_back(row.coordinates.front().compiled_joint_name);
   }
 
+  const auto frame_ref = manyforge::core::ProgramFrameReferenceDTO{component.controllable_component_id, FrameRoleId("tcp")};
+  const auto body_ref = manyforge::core::ProgramCollisionBodyReferenceDTO{component.controllable_component_id, CollisionBodyRoleId("arm_collision")};
+  const auto target_ref = manyforge::core::ProgramTargetReferenceDTO{component.controllable_component_id, control.command_target_id};
+  // A motion binding carries the exact TCP inventory derived from the same
+  // retained map and qualified catalogs used by contextual verification.
+  const auto direct = manyforge::deployment::compile_direct_control_motion_program_binding(
+      component.controllable_component_id, control.command_target_id,
+      *context.bundle, context.model_map, context.catalog_source());
+  if (!direct)
+    throw std::logic_error("test motion target did not compile");
+  const auto compiled_target = std::find_if(
+      direct->value().target_bindings.begin(), direct->value().target_bindings.end(),
+      [&](const auto& row) { return row.target == target_ref; });
+  if (compiled_target == direct->value().target_bindings.end() || !compiled_target->robot_tcps)
+    throw std::logic_error("test motion target has no exact compiled TCP inventory");
+  const auto robot_tcps = compiled_target->robot_tcps;
+  std::optional<manyforge::core::TcpEntryReferenceDTO> default_tcp;
+  if (const auto* value = context.model_map.kinematic_index().default_tcp_of(component.controllable_component_id)) {
+    const auto* default_target = context.model_map.find_target(component.controllable_component_id, value->command_target_id);
+    const auto* default_row = default_target ? manyforge::deployment::find_target_frame_role(*default_target, value->frame_role_id) : nullptr;
+    const auto* default_frame = default_row ? std::get_if<CompositionComponentModelFrame>(&default_row->frame) : nullptr;
+    if (!default_frame) throw std::logic_error("test default TCP does not resolve");
+    default_tcp = manyforge::core::TcpEntryReferenceDTO{{component.controllable_component_id, value->command_target_id},
+        {default_frame->controllable_component_id, default_frame->frame_role_id}};
+  }
   return ProgramBindingDTO{
       std::string(manyforge::core::kProgramBindingApiVersion),
       ProgramBindingId(std::string(kZeroDigest)),
-      ProgramId("i6_test_program"),
+      ProgramId("binding_test_program"),
       ProgramRevision(sha256_digest("i6 test program revision")),
-      context.bundle->retained_bundle_id(),
-      graph.graph_revision,
+      context.bundle->retained_bundle_id(), graph.graph_revision,
       bundle.catalogs.node_environment,
-      {ProgramComponentRoleBindingDTO{
-          ComponentRoleId("robot"),
-          component.controllable_component_id,
-          component.component_type_id,
-          component.component_type_revision,
-          {ProgramModelRoleBindingDTO{
-              component.model_role_bindings.front().model_role_id,
-              model.model_instance_id,
-              model.model_revision,
-          }},
-      }},
-      {ProgramTargetRoleBindingDTO{
-          TargetRoleId("arm"),
-          ComponentRoleId("robot"),
-          component.controllable_component_id,
-          control.command_target_id,
-          {ProgramFrameRoleBindingDTO{
-              FrameRoleId("tcp"), frame->model_instance_id,
-              frame->model_revision, frame->compiled_frame_name,
-          }},
-          {ProgramResourceRoleBindingDTO{
-              ResourceRoleId("joints"), std::move(resources),
-              std::move(compiled_names),
-          }},
-          {manyforge::core::ProgramCollisionBodyRoleBindingDTO{
-              CollisionBodyRoleId("arm_collision"),
-              target->collision_bodies.front().model_instance_id,
-              model.model_revision,
-              target->collision_bodies.front().compiled_link_names,
-          }},
-          {ProgramCapabilityBindingDTO{
-              CapabilityId(control.capability_id),
-              CapabilityDefinitionRevision(
-                  control.capability_definition_revision),
-              ProgramControlBindingRefDTO{
-                  control.control_binding_id,
-                  control.control_binding_revision,
-              },
-              std::nullopt,
-              std::nullopt,
-          }},
-      }},
-      ProgramBindingProvenanceDTO{
-          bundle.provenance.compiler_contract_digest,
-          ContentDigest(sha256_digest("i6 exact role assignment")),
-          bundle.provenance.source_records,
-          bundle.provenance.source_records,
-      },
+      {ProgramComponentBindingDTO{component.controllable_component_id,
+          component.component_type_id, component.component_type_revision,
+          {ProgramModelRoleBindingDTO{component.model_role_bindings.front().model_role_id,
+                                      model.model_instance_id, model.model_revision}}}},
+      {ProgramTargetBindingDTO{target_ref, {frame_ref}, {body_ref}, {},
+          {ProgramResourceRoleBindingDTO{ResourceRoleId("joints"), std::move(resources), std::move(compiled_names)}},
+          {ProgramCapabilityBindingDTO{CapabilityId(control.capability_id),
+              CapabilityDefinitionRevision(control.capability_definition_revision),
+              ProgramControlBindingRefDTO{control.control_binding_id, control.control_binding_revision},
+              std::nullopt, std::nullopt}}, std::nullopt, robot_tcps, default_tcp,
+          {{frame_ref, {}}}}},
+      {ProgramFrameBindingDTO{frame_ref, frame->model_instance_id,
+                              frame->model_revision, frame->compiled_frame_name}},
+      {},
+      {manyforge::core::ProgramCollisionBodyBindingDTO{body_ref,
+          target->collision_bodies.front().model_instance_id, model.model_revision,
+          target->collision_bodies.front().compiled_link_names}},
+      ProgramBindingProvenanceDTO{bundle.provenance.compiler_contract_digest,
+          bundle.provenance.source_records, bundle.provenance.source_records},
   };
 }
 
@@ -310,9 +315,7 @@ TEST(ProgramBindingTest,
   ScopedTrustedRoot root;
   const auto context = make_context(root.path());
   const auto binding = make_binding_value(context);
-  const auto &component = binding.component_role_bindings.front();
-  const auto model_role =
-      component.model_role_bindings.front().model_role_id.value();
+  const auto &component = binding.component_bindings.front();
   const CanonicalValue scene(CanonicalValue::Object{
       {"scene",
        CanonicalValue(CanonicalValue::Array{
@@ -328,9 +331,9 @@ TEST(ProgramBindingTest,
                             {"frame_ref",
                              CanonicalValue(CanonicalValue::Object{
                                  {"kind", CanonicalValue("component_frame")},
-                                 {"component_role", CanonicalValue("robot")},
-                                 {"model_role", CanonicalValue(model_role)},
-                                 {"frame_role", CanonicalValue("tcp")}})},
+                                 {"frame", CanonicalValue(CanonicalValue::Object{
+                                     {"component_id", CanonicalValue(component.component_id.value())},
+                                     {"frame_id", CanonicalValue("tcp")}})}})},
                             {"position_m",
                              CanonicalValue(CanonicalValue::Array{
                                  CanonicalValue(0.0), CanonicalValue(0.0),
@@ -375,9 +378,9 @@ TEST(ProgramBindingTest,
       &objects.front().frame_ref);
   ASSERT_NE(frame, nullptr);
   EXPECT_EQ(frame->controllable_component_id,
-            component.controllable_component_id);
+            component.component_id);
   EXPECT_EQ(frame->model_instance_id,
-            component.model_role_bindings.front().model_instance_id);
+            component.model_bindings.front().model_instance_id);
   EXPECT_NEAR(objects.front().pose.orientation.z, 0.70710678118, 1e-9);
   EXPECT_TRUE(std::holds_alternative<manyforge::core::CellSceneFrameRefDTO>(
       objects.back().frame_ref));
@@ -398,9 +401,9 @@ TEST(ProgramBindingTest, InitialSceneProjectionRejectsMissingComponentFrame) {
                         {"pose", CanonicalValue(CanonicalValue::Object{
                                      {"frame_ref", CanonicalValue(CanonicalValue::Object{
                                                        {"kind", CanonicalValue("component_frame")},
-                                                       {"component_role", CanonicalValue("robot")},
-                                                       {"model_role", CanonicalValue("missing")},
-                                                       {"frame_role", CanonicalValue("tcp")}})},
+                                                       {"frame", CanonicalValue(CanonicalValue::Object{
+                                                           {"component_id", CanonicalValue("missing")},
+                                                           {"frame_id", CanonicalValue("tcp")}})}})},
                                      {"position_m", CanonicalValue(CanonicalValue::Array{
                                                         CanonicalValue(0.0), CanonicalValue(0.0),
                                                         CanonicalValue(0.0)})},
@@ -485,7 +488,7 @@ TEST(ProgramBindingTest,
   EXPECT_EQ(sealed->canonical_bytes(), canonical_json(sealed->normalized_root()));
 
   const auto reloaded = reload_verified_program_binding(
-      sealed->canonical_bytes(), *context.bundle, context.model_map);
+      sealed->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source());
   ASSERT_NE(reloaded, nullptr);
   EXPECT_EQ(reloaded->program_binding_id(), sealed->program_binding_id());
   EXPECT_EQ(reloaded->value(), sealed->value());
@@ -495,24 +498,29 @@ TEST(ProgramBindingTest, RobotTcpPresenceSurvivesCanonicalSealAndReload) {
   ScopedTrustedRoot root;
   const auto context = make_context(root.path());
   auto value = make_binding_value(context);
-  auto &target = value.target_role_bindings.front();
+  auto &target = value.target_bindings.front();
+  // The exact compiled TCP inventory of this motion target. A motion target
+  // must carry it, so presence is the exact inventory, never an empty list.
+  const auto exact_tcps = target.robot_tcps;
+  ASSERT_TRUE(exact_tcps && !exact_tcps->empty());
   target.robot_tcps.reset();
   const auto absent = ProgramBindingConstructionAuthority::seal(value);
   EXPECT_EQ(absent->canonical_bytes().find("\"robot_tcps\""), std::string::npos);
   // Structural round-trip only: this fixture is an arm, not a non-robot.
   const auto absent_reloaded =
       ProgramBindingConstructionAuthority::reload_intrinsic(absent->canonical_bytes());
-  EXPECT_FALSE(absent_reloaded->value().target_role_bindings.front().robot_tcps);
+  EXPECT_FALSE(absent_reloaded->value().target_bindings.front().robot_tcps);
 
-  target.robot_tcps.emplace();
-  const auto empty = ProgramBindingConstructionAuthority::seal(value);
-  EXPECT_NE(empty->canonical_bytes().find("\"robot_tcps\":[]"), std::string::npos);
-  EXPECT_NE(empty->program_binding_id(), absent->program_binding_id());
-  const auto empty_reloaded = reload_verified_program_binding(
-      empty->canonical_bytes(), *context.bundle, context.model_map);
-  ASSERT_TRUE(empty_reloaded->value().target_role_bindings.front().robot_tcps);
-  EXPECT_TRUE(empty_reloaded->value().target_role_bindings.front().robot_tcps->empty());
-  EXPECT_EQ(empty_reloaded->value(), empty->value());
+  target.robot_tcps = exact_tcps;
+  const auto present = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_NE(present->canonical_bytes().find("\"robot_tcps\":["), std::string::npos);
+  EXPECT_EQ(present->canonical_bytes().find("\"robot_tcps\":[]"), std::string::npos);
+  EXPECT_NE(present->program_binding_id(), absent->program_binding_id());
+  const auto present_reloaded = reload_verified_program_binding(
+      present->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source());
+  ASSERT_TRUE(present_reloaded->value().target_bindings.front().robot_tcps);
+  EXPECT_EQ(*present_reloaded->value().target_bindings.front().robot_tcps, *exact_tcps);
+  EXPECT_EQ(present_reloaded->value(), present->value());
 }
 
 TEST(ProgramBindingTest, MotionEndpointReleaseBindingRoundTripsExactEnvelope) {
@@ -531,7 +539,7 @@ TEST(ProgramBindingTest, MotionEndpointReleaseBindingRoundTripsExactEnvelope) {
   EXPECT_EQ(sealed->canonical_bytes().find("terminal_window_start_fraction"),
             std::string::npos);
   const auto loaded = reload_verified_program_binding(
-      sealed->canonical_bytes(), *context.bundle, context.model_map);
+      sealed->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source());
   EXPECT_EQ(loaded->value(), sealed->value());
   EXPECT_EQ(std::get<manyforge::core::ContactReleaseEnvelopeDTO>(
                 loaded->value().contact_grasp_bindings.front().envelope), release);
@@ -555,30 +563,27 @@ TEST(ProgramBindingTest,
       sealed->canonical_bytes().find("\"bodies_from_motion_endpoint\":true"),
       std::string::npos);
   const auto loaded = reload_verified_program_binding(
-      sealed->canonical_bytes(), *context.bundle, context.model_map);
+      sealed->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source());
   EXPECT_EQ(loaded->value(), sealed->value());
   value.contact_grasp_bindings.front().bodies_from_motion_endpoint = false;
   EXPECT_THROW(
       static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
       ProgramBindingError);
-  const auto &target = value.target_role_bindings.front();
-  const auto &body = target.collision_body_role_bindings.front();
+  const auto &body = value.collision_body_bindings.front();
   std::vector<std::string> ids;
   for (std::size_t i = 0U; i < body.compiled_collision_body_names.size(); ++i) {
     ids.push_back(manyforge::core::make_component_collision_body_id(
-        target.controllable_component_id, body.model_instance_id,
-        body.collision_body_role_id, i));
+        body.reference.component_id, body.model_instance_id,
+        body.reference.collision_body_id, i));
   }
   value.contact_grasp_bindings.front().allowed_body_bindings.push_back(
-      {target.component_role_id, target.target_role_id,
-       target.controllable_component_id, target.command_target_id, std::nullopt,
-       body.collision_body_role_id, body.model_instance_id, body.model_revision,
+      {body.reference, std::nullopt, body.model_instance_id, body.model_revision,
        std::move(ids)});
   const auto legacy = ProgramBindingConstructionAuthority::seal(value);
   EXPECT_EQ(legacy->canonical_bytes().find("bodies_from_motion_endpoint"),
             std::string::npos);
   EXPECT_EQ(reload_verified_program_binding(legacy->canonical_bytes(),
-                                            *context.bundle, context.model_map)
+                                            *context.bundle, context.model_map, context.catalog_source())
                 ->value(),
             legacy->value());
   value.contact_grasp_bindings.front().bodies_from_motion_endpoint = true;
@@ -590,44 +595,45 @@ TEST(ProgramBindingTest,
 TEST(ProgramBindingTest,
      EndpointContactBodyAssociationsAreOptionalAndFrameScoped) {
   ScopedTrustedRoot root;
-  const auto context = make_context(root.path());
+  const auto context = make_context(root.path(), true);
   auto value = make_binding_value(context);
   const auto legacy = ProgramBindingConstructionAuthority::seal(value);
-  EXPECT_EQ(legacy->canonical_bytes().find("contact_body_role_ids"),
+  EXPECT_NE(legacy->canonical_bytes().find("\"contact_body_role_ids\":[]"),
             std::string::npos);
 
-  auto &target = value.target_role_bindings.front();
-  target.frame_role_bindings.front().contact_body_role_ids = {
+  value.target_bindings.front().frame_associations.front().contact_body_role_ids = {
       CollisionBodyRoleId("arm_collision")};
   const auto first_endpoint = ProgramBindingConstructionAuthority::seal(value);
   EXPECT_NE(first_endpoint->canonical_bytes().find(
                 "\"contact_body_role_ids\":[\"arm_collision\"]"),
             std::string::npos);
   const auto reopened = reload_verified_program_binding(
-      first_endpoint->canonical_bytes(), *context.bundle, context.model_map);
+      first_endpoint->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source());
   EXPECT_EQ(reopened->value(), first_endpoint->value());
 
-  auto second_frame = target.frame_role_bindings.front();
-  second_frame.frame_role_id = manyforge::core::FrameRoleId("sibling_tcp");
+  auto second_frame = value.frame_bindings.front();
+  second_frame.reference.frame_id = manyforge::core::FrameRoleId("sibling_tcp");
   second_frame.compiled_frame_name += "_sibling";
-  second_frame.contact_body_role_ids = {
-      CollisionBodyRoleId("sibling_collision")};
-  target.frame_role_bindings.push_back(std::move(second_frame));
-  auto second_body = target.collision_body_role_bindings.front();
-  second_body.collision_body_role_id = CollisionBodyRoleId("sibling_collision");
+  const auto second_ref = second_frame.reference;
+  value.frame_bindings.push_back(std::move(second_frame));
+  value.target_bindings.front().frame_references.push_back(second_ref);
+  value.target_bindings.front().frame_associations.push_back(
+      {second_ref, {CollisionBodyRoleId("sibling_collision")}});
+  auto second_body = value.collision_body_bindings.front();
+  second_body.reference.collision_body_id = CollisionBodyRoleId("sibling_collision");
   second_body.compiled_collision_body_names = {"sibling_left", "sibling_right"};
-  target.collision_body_role_bindings.push_back(std::move(second_body));
+  value.collision_body_bindings.push_back(std::move(second_body));
   const auto two_endpoints = ProgramBindingConstructionAuthority::seal(value);
-  EXPECT_NE(two_endpoints->canonical_bytes().find("\"frame_role_id\":\"tcp\""),
+  EXPECT_NE(two_endpoints->canonical_bytes().find("\"frame_id\":\"tcp\""),
             std::string::npos);
   EXPECT_NE(two_endpoints->canonical_bytes().find(
-                "\"frame_role_id\":\"sibling_tcp\""),
+                "\"frame_id\":\"sibling_tcp\""),
             std::string::npos);
   EXPECT_NE(two_endpoints->canonical_bytes().find(
                 "\"contact_body_role_ids\":[\"sibling_collision\"]"),
             std::string::npos);
 
-  target.collision_body_role_bindings.back().model_revision =
+  value.collision_body_bindings.back().model_revision =
       manyforge::core::ModelRevision(std::string(kZeroDigest));
   EXPECT_THROW(
       static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
@@ -648,7 +654,7 @@ TEST(ProgramBindingTest, NodePoliciesAreRequiredSparseAndIdentitySensitive) {
   ASSERT_EQ(sealed->value().node_policies.size(), 1U);
   EXPECT_EQ(sealed->value().node_policies.front().instance_id.value(), "root");
   const auto reloaded = reload_verified_program_binding(
-      sealed->canonical_bytes(), *context.bundle, context.model_map);
+      sealed->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source());
   ASSERT_NE(reloaded, nullptr);
   EXPECT_EQ(reloaded->value(), sealed->value());
 
@@ -696,7 +702,7 @@ TEST(ProgramBindingTest, NodePolicyWireAndCrossFieldNegativesFailClosed) {
   missing_node_policies.erase(position, field.size());
   EXPECT_THROW(
       static_cast<void>(reload_verified_program_binding(
-          missing_node_policies, *context.bundle, context.model_map)),
+          missing_node_policies, *context.bundle, context.model_map, context.catalog_source())),
       ProgramBindingError);
 }
 
@@ -710,7 +716,7 @@ TEST(ProgramBindingTest, RawNodePolicyReloadRejectsEveryBoundedNegativeFamily) {
   const auto expect_rejected = [&](const std::string& bytes) {
     EXPECT_THROW(
         static_cast<void>(reload_verified_program_binding(
-            bytes, *context.bundle, context.model_map)),
+            bytes, *context.bundle, context.model_map, context.catalog_source())),
         ProgramBindingError);
   };
 
@@ -790,7 +796,7 @@ TEST(ProgramBindingTest, InterventionStopScopeIsClosedAndSurvivesReload) {
   EXPECT_NE(own_groups->program_binding_id(),
             default_scope->program_binding_id());
   const auto reopened = reload_verified_program_binding(
-      own_groups->canonical_bytes(), *context.bundle, context.model_map);
+      own_groups->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source());
   ASSERT_NE(reopened, nullptr);
   EXPECT_EQ(reopened->value()
                 .node_policies.front()
@@ -802,7 +808,7 @@ TEST(ProgramBindingTest, InterventionStopScopeIsClosedAndSurvivesReload) {
         static_cast<void>(reload_verified_program_binding(
             replace_once(valid, "\"intervention_stop_scope\":\"own_groups\"",
                          "\"intervention_stop_scope\":" + std::string(invalid)),
-            *context.bundle, context.model_map)),
+            *context.bundle, context.model_map, context.catalog_source())),
         ProgramBindingError);
   }
   value.node_policies.front().recovery_policy.intervention_stop_scope =
@@ -816,14 +822,13 @@ TEST(ProgramBindingTest, ContextRejectsAResealedGeneratedFrameSubstitution) {
   ScopedTrustedRoot root;
   const BindingContext context = make_context(root.path());
   ProgramBindingDTO stale = make_binding_value(context);
-  stale.target_role_bindings.front()
-      .frame_role_bindings.front()
+  stale.frame_bindings.front()
       .compiled_frame_name += "_substituted";
   const auto sealed = ProgramBindingConstructionAuthority::seal(std::move(stale));
 
   EXPECT_THROW(
       static_cast<void>(reload_verified_program_binding(
-          sealed->canonical_bytes(), *context.bundle, context.model_map)),
+          sealed->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source())),
       ProgramBindingError);
 }
 
@@ -833,15 +838,15 @@ TEST(ProgramBindingTest, ReloadRejectsCanonicalBytesWithAStaleContentIdentity) {
   const auto sealed =
       ProgramBindingConstructionAuthority::seal(make_binding_value(context));
   std::string tampered(sealed->canonical_bytes());
-  const std::string original = "\"program_id\":\"i6_test_program\"";
-  const std::string replacement = "\"program_id\":\"i6_fake_program\"";
+  const std::string original = "\"program_id\":\"binding_test_program\"";
+  const std::string replacement = "\"program_id\":\"binding_fake_program\"";
   const std::size_t position = tampered.find(original);
   ASSERT_NE(position, std::string::npos);
   tampered.replace(position, original.size(), replacement);
 
   EXPECT_THROW(
       static_cast<void>(reload_verified_program_binding(
-          tampered, *context.bundle, context.model_map)),
+          tampered, *context.bundle, context.model_map, context.catalog_source())),
       ProgramBindingError);
 }
 
@@ -849,12 +854,168 @@ TEST(ProgramBindingTest, ConstructionCanonicalizesRoleTablesAndRejectsDuplicates
   ScopedTrustedRoot root;
   const BindingContext context = make_context(root.path());
   ProgramBindingDTO duplicate = make_binding_value(context);
-  duplicate.component_role_bindings.push_back(
-      duplicate.component_role_bindings.front());
+  duplicate.component_bindings.push_back(
+      duplicate.component_bindings.front());
   EXPECT_THROW(
       static_cast<void>(
           ProgramBindingConstructionAuthority::seal(std::move(duplicate))),
       ProgramBindingError);
+}
+
+TEST(ProgramBindingTest, DirectReferencesAreBoundToExactOwnerAndTarget) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path());
+  const auto original = make_binding_value(context);
+  const auto sealed = ProgramBindingConstructionAuthority::seal(original);
+  EXPECT_NE(sealed->canonical_bytes().find("manyforge.program_binding.v3"),
+            std::string::npos);
+  EXPECT_EQ(sealed->canonical_bytes().find("role_assignment_digest"),
+            std::string::npos);
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::reload_intrinsic(
+                   replace_once(std::string(sealed->canonical_bytes()),
+                                "\"frame_bindings\":[{",
+                                "\"frame_bindings\":[{\"contact_body_role_ids\":[],"))),
+               ProgramBindingError);
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::reload_intrinsic(
+                   replace_once(std::string(sealed->canonical_bytes()),
+                                "manyforge.program_binding.v3",
+                                "manyforge.program_binding.v2"))),
+               ProgramBindingError);
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::reload_intrinsic(
+                   replace_once(std::string(sealed->canonical_bytes()),
+                                "\"signal_bindings\":[]",
+                                "\"signal_bindings\":[],\"role_assignment_digest\":null"))),
+               ProgramBindingError);
+
+  auto duplicate = original;
+  duplicate.target_bindings.front().frame_references.push_back(
+      duplicate.target_bindings.front().frame_references.front());
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(duplicate)),
+               ProgramBindingError);
+
+  auto wrong_owner = original;
+  wrong_owner.target_bindings.front().frame_references.front().component_id =
+      manyforge::core::ControllableComponentId("other_component");
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(wrong_owner)),
+               ProgramBindingError);
+
+  auto substituted = original;
+  substituted.frame_bindings.front().reference.component_id =
+      manyforge::core::ControllableComponentId("other_component");
+  substituted.target_bindings.front().frame_references.front() =
+      substituted.frame_bindings.front().reference;
+  substituted.target_bindings.front().frame_associations.front().frame =
+      substituted.frame_bindings.front().reference;
+  const auto resealed = ProgramBindingConstructionAuthority::seal(substituted);
+  EXPECT_THROW(static_cast<void>(reload_verified_program_binding(
+                   resealed->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source())),
+               ProgramBindingError);
+}
+
+TEST(ProgramBindingTest, ContextRejectsMissingOrForgedDefaultTcp) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path());
+  const auto original = make_binding_value(context);
+  ASSERT_TRUE(original.target_bindings.front().default_tcp.has_value());
+  const auto valid = ProgramBindingConstructionAuthority::seal(original);
+  EXPECT_NO_THROW(static_cast<void>(reload_verified_program_binding(valid->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source())));
+
+  auto missing = original;
+  missing.target_bindings.front().default_tcp.reset();
+  const auto sealed_missing = ProgramBindingConstructionAuthority::seal(std::move(missing));
+  EXPECT_THROW(static_cast<void>(reload_verified_program_binding(sealed_missing->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source())), ProgramBindingError);
+
+  auto forged = original;
+  forged.target_bindings.front().default_tcp->frame.frame_id = FrameRoleId("forged_tcp");
+  const auto sealed_forged = ProgramBindingConstructionAuthority::seal(std::move(forged));
+  EXPECT_THROW(static_cast<void>(reload_verified_program_binding(sealed_forged->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source())), ProgramBindingError);
+}
+
+TEST(ProgramBindingTest, SharedFrameKeepsDistinctTargetContactSets) {
+  ScopedTrustedRoot root;
+  auto value = make_binding_value(make_context(root.path()));
+  auto& first = value.target_bindings.front();
+  first.frame_associations.front().contact_body_role_ids = {
+      CollisionBodyRoleId("arm_collision")};
+  auto second = first;
+  second.target.command_target_id = manyforge::core::CommandTargetId("other_target");
+  second.frame_associations.front().contact_body_role_ids.clear();
+  value.target_bindings.push_back(second);
+  const auto sealed = ProgramBindingConstructionAuthority::seal(value);
+  const auto loaded = ProgramBindingConstructionAuthority::reload_intrinsic(
+      sealed->canonical_bytes());
+  ASSERT_EQ(loaded->value().target_bindings.size(), 2U);
+  const auto original_target = value.target_bindings.front().target;
+  const auto found = std::find_if(loaded->value().target_bindings.begin(),
+                                  loaded->value().target_bindings.end(),
+                                  [&](const auto& target) { return target.target == original_target; });
+  ASSERT_NE(found, loaded->value().target_bindings.end());
+  const auto other = std::find_if(loaded->value().target_bindings.begin(),
+                                  loaded->value().target_bindings.end(),
+                                  [&](const auto& target) { return target.target == second.target; });
+  ASSERT_NE(other, loaded->value().target_bindings.end());
+  const auto& a = found->frame_associations.front();
+  const auto& b = other->frame_associations.front();
+  EXPECT_EQ(a.frame, b.frame);
+  EXPECT_EQ(a.contact_body_role_ids,
+            std::vector<CollisionBodyRoleId>{CollisionBodyRoleId("arm_collision")});
+  EXPECT_TRUE(b.contact_body_role_ids.empty());
+
+  auto missing = value;
+  missing.target_bindings.front().frame_associations.clear();
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(missing)),
+               ProgramBindingError);
+  auto duplicate = value;
+  duplicate.target_bindings.front().frame_associations.push_back(
+      duplicate.target_bindings.front().frame_associations.front());
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(duplicate)),
+               ProgramBindingError);
+}
+
+TEST(ProgramBindingTest, SharedTcpFrameKeepsInventoryContactSets) {
+  ScopedTrustedRoot root;
+  auto value = make_binding_value(make_context(root.path()));
+  auto& target = value.target_bindings.front();
+  const auto frame = value.frame_bindings.front();
+  auto other_target = target.target;
+  other_target.command_target_id = manyforge::core::CommandTargetId("other_target");
+  target.robot_tcps = std::vector<manyforge::core::ProgramRobotTcpBindingDTO>{
+      {{target.target, frame.reference}, frame, {CollisionBodyRoleId("arm_collision")}, false, false},
+      {{other_target, frame.reference}, frame, {}, false, false}};
+  const auto sealed = ProgramBindingConstructionAuthority::seal(value);
+  const auto loaded = ProgramBindingConstructionAuthority::reload_intrinsic(sealed->canonical_bytes());
+  ASSERT_TRUE(loaded->value().target_bindings.front().robot_tcps);
+  const auto& rows = *loaded->value().target_bindings.front().robot_tcps;
+  ASSERT_EQ(rows.size(), 2U);
+  const auto first = std::find_if(rows.begin(), rows.end(), [&](const auto& row) {
+    return row.entry.target == target.target;
+  });
+  const auto second = std::find_if(rows.begin(), rows.end(), [&](const auto& row) {
+    return row.entry.target == other_target;
+  });
+  ASSERT_NE(first, rows.end());
+  ASSERT_NE(second, rows.end());
+  EXPECT_EQ(first->contact_body_role_ids,
+            std::vector<CollisionBodyRoleId>{CollisionBodyRoleId("arm_collision")});
+  EXPECT_TRUE(second->contact_body_role_ids.empty());
+}
+
+TEST(ProgramBindingTest, ContextRequiresExactTcpOwnerTarget) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path());
+  auto value = make_binding_value(context);
+  auto& target = value.target_bindings.front();
+  ASSERT_TRUE(target.robot_tcps);
+  ASSERT_FALSE(target.robot_tcps->empty());
+  const auto valid = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_NO_THROW(static_cast<void>(reload_verified_program_binding(
+      valid->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source())));
+
+  target.robot_tcps->front().entry.target.command_target_id =
+      manyforge::core::CommandTargetId("unrelated_target");
+  const auto forged = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_THROW(static_cast<void>(reload_verified_program_binding(
+      forged->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source())), ProgramBindingError);
 }
 
 TEST(ProgramBindingTest,
@@ -867,23 +1028,23 @@ TEST(ProgramBindingTest,
   {
     FilesystemProgramBindingRepository repository(root.path());
     EXPECT_TRUE(repository.put_if_absent(
-        sealed, *context.bundle, context.model_map));
+        sealed, *context.bundle, context.model_map, context.catalog_source()));
     EXPECT_FALSE(repository.put_if_absent(
-        sealed, *context.bundle, context.model_map));
+        sealed, *context.bundle, context.model_map, context.catalog_source()));
     EXPECT_EQ(repository.size(), 1U);
     EXPECT_EQ(repository.retained_bytes(), sealed->canonical_bytes().size());
   }
 
   FilesystemProgramBindingRepository reopened(root.path());
   const auto read = reopened.get_verified(
-      sealed->program_binding_id(), *context.bundle, context.model_map);
+      sealed->program_binding_id(), *context.bundle, context.model_map, context.catalog_source());
   ASSERT_NE(read, nullptr);
   EXPECT_EQ(read->program_binding_id(), sealed->program_binding_id());
   EXPECT_EQ(read->value(), sealed->value());
   EXPECT_EQ(read->canonical_bytes(), sealed->canonical_bytes());
   EXPECT_EQ(reopened.get_verified(
                 ProgramBindingId(std::string(kZeroDigest)),
-                *context.bundle, context.model_map),
+                *context.bundle, context.model_map, context.catalog_source()),
             nullptr);
 }
 
@@ -896,23 +1057,26 @@ TEST(ProgramBindingTest,
   {
     FilesystemProgramBindingRepository writer(root.path());
     ASSERT_TRUE(writer.put_if_absent(
-        sealed, *context.bundle, context.model_map));
+        sealed, *context.bundle, context.model_map, context.catalog_source()));
   }
 
   const auto entry_count_before = static_cast<std::size_t>(std::distance(
       std::filesystem::recursive_directory_iterator(root.path()),
       std::filesystem::recursive_directory_iterator()));
   manyforge::deployment::test::ScopedProcfdRoot procfd(root.path());
+  const FilesystemVerifiedCatalogArtifactSource procfd_catalog_source(
+      procfd.path());
   const FilesystemVerifiedProgramBindingSource source(procfd.path());
   manyforge::deployment::test::ScopedPathReplacement replacement(
       root.path());
   const auto read = source.get_verified(
-      sealed->program_binding_id(), *context.bundle, context.model_map);
+      sealed->program_binding_id(), *context.bundle, context.model_map,
+      procfd_catalog_source);
   ASSERT_NE(read, nullptr);
   EXPECT_EQ(read->canonical_bytes(), sealed->canonical_bytes());
   EXPECT_EQ(source.get_verified(
                 ProgramBindingId(std::string(kZeroDigest)),
-                *context.bundle, context.model_map),
+                *context.bundle, context.model_map, procfd_catalog_source),
             nullptr);
   EXPECT_EQ(static_cast<std::size_t>(std::distance(
       std::filesystem::recursive_directory_iterator(root.path()),
@@ -931,7 +1095,7 @@ TEST(ProgramBindingTest,
       empty_procfd.path());
   EXPECT_EQ(empty_source.get_verified(
                 sealed->program_binding_id(), *context.bundle,
-                context.model_map),
+                context.model_map, context.catalog_source()),
             nullptr);
   EXPECT_FALSE(
       std::filesystem::exists(empty_root.path() / "program-bindings"));
@@ -950,7 +1114,7 @@ TEST(ProgramBindingTest,
       unsafe_procfd.path());
   EXPECT_THROW(
       static_cast<void>(unsafe_source.get_verified(
-          sealed->program_binding_id(), *context.bundle, context.model_map)),
+          sealed->program_binding_id(), *context.bundle, context.model_map, context.catalog_source())),
       manyforge::deployment::RetainedBundleError);
   EXPECT_TRUE(std::filesystem::is_empty(outside));
   std::filesystem::remove_all(outside);
@@ -964,7 +1128,7 @@ TEST(ProgramBindingTest,
       ProgramBindingConstructionAuthority::seal(make_binding_value(context));
   FilesystemProgramBindingRepository repository(root.path());
   ASSERT_TRUE(repository.put_if_absent(
-      sealed, *context.bundle, context.model_map));
+      sealed, *context.bundle, context.model_map, context.catalog_source()));
 
   ScopedTrustedRoot other_root;
   const BindingContext other = make_other_cell_context(other_root.path());
@@ -972,82 +1136,90 @@ TEST(ProgramBindingTest,
             context.bundle->retained_bundle_id());
   EXPECT_THROW(
       static_cast<void>(repository.get_verified(
-          sealed->program_binding_id(), *other.bundle, other.model_map)),
+          sealed->program_binding_id(), *other.bundle, other.model_map, other.catalog_source())),
       ProgramBindingError);
 }
 
-TEST(ProgramBindingTest,
-     SignalBindingsAreSparseClosedAndCannotAliasCoordinates) {
+TEST(ProgramBindingTest, DirectSignalBindingsAreClosedAndContextVerified) {
   ScopedTrustedRoot root;
   const auto context = make_context(root.path());
   auto value = make_binding_value(context);
   const auto ordinary = ProgramBindingConstructionAuthority::seal(value);
-  EXPECT_EQ(ordinary->canonical_bytes().find("signal_role_bindings"),
-            std::string::npos);
-  auto &target = value.target_role_bindings.front();
-  target.signal_role_bindings.push_back(
-      {ResourceRoleId("input_ready"), "ready",
-       manyforge::core::IoSignalValueType::kBoolean,
-       manyforge::core::IoSignalDirection::kInput,
-       manyforge::core::IoTransitionCapability::kSampledOnly,
-       ContentDigest(std::string(kZeroDigest))});
-  const auto extended = ProgramBindingConstructionAuthority::seal(value);
-  EXPECT_NE(extended->program_binding_id(), ordinary->program_binding_id());
-  EXPECT_NE(extended->canonical_bytes().find("signal_role_bindings"),
-            std::string::npos);
-  // This retained fixture declares no I/O descriptor: a resealed invented row
-  // cannot acquire a qualified binding merely by passing the closed codec.
-  EXPECT_THROW(
-      static_cast<void>(reload_verified_program_binding(
-          extended->canonical_bytes(), *context.bundle, context.model_map)),
-      ProgramBindingError);
-  target.signal_role_bindings.front().resource_role_id =
-      target.resource_role_bindings.front().resource_role_id;
-  EXPECT_THROW(
-      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
-      ProgramBindingError);
-  target.signal_role_bindings.clear();
-  EXPECT_EQ(ProgramBindingConstructionAuthority::seal(value)->canonical_bytes(),
-            ordinary->canonical_bytes());
+  EXPECT_NE(ordinary->canonical_bytes().find("\"signal_bindings\":[]"), std::string::npos);
+  const auto target = value.target_bindings.front().target;
+  const manyforge::core::ProgramSignalReferenceDTO ref{target.component_id, "ready"};
+  value.target_bindings.front().signal_references.push_back(ref);
+  value.signal_bindings.push_back({ref, target, manyforge::core::RuntimeUnitId("io"),
+      manyforge::core::IoSignalValueType::kBoolean,
+      manyforge::core::IoSignalDirection::kInput,
+      manyforge::core::IoTransitionCapability::kSampledOnly,
+      ContentDigest(std::string(kZeroDigest))});
+  const auto invented = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_NE(invented->program_binding_id(), ordinary->program_binding_id());
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::reload_intrinsic(
+                   replace_once(std::string(invented->canonical_bytes()),
+                                "\"direction\":\"input\"",
+                                "\"direction\":\"unknown\""))),
+               ProgramBindingError);
+  EXPECT_THROW(static_cast<void>(reload_verified_program_binding(invented->canonical_bytes(),
+      *context.bundle, context.model_map, context.catalog_source())), ProgramBindingError);
+  value.signal_bindings.push_back(value.signal_bindings.front());
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(value)), ProgramBindingError);
 }
 
-TEST(ProgramBindingTest,
-     SignalBindingRejectsUnknownEnumsDuplicateRolesAndBadDigests) {
+TEST(ProgramBindingTest, DirectSignalBindingRejectsInvalidEnumsAndDigest) {
   ScopedTrustedRoot root;
   auto value = make_binding_value(make_context(root.path()));
-  auto &signals = value.target_role_bindings.front().signal_role_bindings;
-  signals.push_back({ResourceRoleId("input_ready"), "ready",
-                     manyforge::core::IoSignalValueType::kBoolean,
-                     manyforge::core::IoSignalDirection::kInput,
-                     manyforge::core::IoTransitionCapability::kSampledOnly,
-                     ContentDigest(std::string(kZeroDigest))});
-  const auto valid = signals.front();
-  signals.front().direction =
-      static_cast<manyforge::core::IoSignalDirection>(255);
-  EXPECT_THROW(
-      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
-      ProgramBindingError);
-  signals.front() = valid;
-  signals.front().transition_capability =
-      static_cast<manyforge::core::IoTransitionCapability>(255);
-  EXPECT_THROW(
-      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
-      ProgramBindingError);
-  signals.front() = valid;
-  signals.front().signal_descriptor_digest = ContentDigest("not_a_digest");
-  EXPECT_THROW(
-      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
-      ProgramBindingError);
-  signals.front() = valid;
-  signals.push_back(valid);
-  EXPECT_THROW(
-      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
-      ProgramBindingError);
+  const auto target = value.target_bindings.front().target;
+  const manyforge::core::ProgramSignalReferenceDTO ref{target.component_id, "ready"};
+  value.target_bindings.front().signal_references.push_back(ref);
+  value.signal_bindings.push_back({ref, target, manyforge::core::RuntimeUnitId("io"),
+      manyforge::core::IoSignalValueType::kBoolean,
+      manyforge::core::IoSignalDirection::kInput,
+      manyforge::core::IoTransitionCapability::kSampledOnly,
+      ContentDigest(std::string(kZeroDigest))});
+  const auto valid = value.signal_bindings.front();
+  value.signal_bindings.front().direction = static_cast<manyforge::core::IoSignalDirection>(255);
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(value)), ProgramBindingError);
+  value.signal_bindings.front() = valid;
+  value.signal_bindings.front().transition_capability = static_cast<manyforge::core::IoTransitionCapability>(255);
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(value)), ProgramBindingError);
+  value.signal_bindings.front() = valid;
+  value.signal_bindings.front().signal_descriptor_digest = ContentDigest("not_a_digest");
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(value)), ProgramBindingError);
+}
+
+TEST(ProgramBindingTest, DirectSignalNamesUseBoundedUtf8BytesWithoutNul) {
+  ScopedTrustedRoot root;
+  auto value = make_binding_value(make_context(root.path()));
+  const auto target = value.target_bindings.front().target;
+  const auto check = [&](const std::string &name) {
+    auto candidate = value;
+    const manyforge::core::ProgramSignalReferenceDTO ref{target.component_id, name};
+    candidate.target_bindings.front().signal_references.push_back(ref);
+    candidate.signal_bindings.push_back({ref, target, manyforge::core::RuntimeUnitId("io"),
+        manyforge::core::IoSignalValueType::kBoolean,
+        manyforge::core::IoSignalDirection::kInput,
+        manyforge::core::IoTransitionCapability::kSampledOnly,
+        ContentDigest(std::string(kZeroDigest))});
+    return candidate;
+  };
+  for (const auto &name : {std::string("sensor / ready?"), std::string(510U, 'x') + "/?",
+                           std::string(510U, 'x') + "\xc3\xa9"}) {
+    const auto sealed = ProgramBindingConstructionAuthority::seal(check(name));
+    const auto loaded = ProgramBindingConstructionAuthority::reload_intrinsic(sealed->canonical_bytes());
+    ASSERT_EQ(loaded->value().signal_bindings.size(), 1U);
+    EXPECT_EQ(loaded->value().signal_bindings.front().reference.signal_name, name);
+  }
+  for (const auto &name : {std::string{}, std::string(513U, 'x'),
+                           std::string(511U, 'x') + "\xc3\xa9", std::string("a\0b", 3U)})
+    EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(check(name))),
+                 ProgramBindingError);
 }
 
 
 
-// TCP-D: the owner guard (`CellKinematicIndex::carries`) accepts the component
+// The owner guard (`CellKinematicIndex::carries`) accepts the component
 // itself and every component mounted on it, directly or through a tool chain;
 // nothing else.
 TEST(ProgramBindingMountedOwnerTest, SelfOrMountedDescendantFollowsAttachments) {
@@ -1069,7 +1241,7 @@ TEST(ProgramBindingMountedOwnerTest, SelfOrMountedDescendantFollowsAttachments) 
           "sha256:0000000000000000000000000000000000000000000000000000000000000000"),
       core::CellId("tool-split-cell"),
       {}, {}, {}, {}, {},
-      {edge("lite6_robot", "flange", "lite_gripper"),
+      {edge("lite6_arm", "flange", "lite_gripper"),
        edge("lite_gripper", "tool_flange", "sensor")},
   };
   const auto mounted = [&](std::string component, std::string owner) {
@@ -1077,20 +1249,19 @@ TEST(ProgramBindingMountedOwnerTest, SelfOrMountedDescendantFollowsAttachments) 
         core::ControllableComponentId(component),
         core::ControllableComponentId(owner));
   };
-  EXPECT_TRUE(mounted("lite6_robot", "lite6_robot"));
-  EXPECT_TRUE(mounted("lite6_robot", "lite_gripper"));
-  EXPECT_TRUE(mounted("lite6_robot", "sensor"));        // tool chain
+  EXPECT_TRUE(mounted("lite6_arm", "lite6_arm"));
+  EXPECT_TRUE(mounted("lite6_arm", "lite_gripper"));
+  EXPECT_TRUE(mounted("lite6_arm", "sensor"));        // tool chain
   EXPECT_TRUE(mounted("lite_gripper", "sensor"));
-  EXPECT_FALSE(mounted("lite_gripper", "lite6_robot"));  // never upwards
-  EXPECT_FALSE(mounted("lite6_robot", "station_io"));    // unmounted
+  EXPECT_FALSE(mounted("lite_gripper", "lite6_arm"));  // never upwards
+  EXPECT_FALSE(mounted("lite6_arm", "station_io"));    // unmounted
   graph.component_attachments.clear();
-  EXPECT_FALSE(mounted("lite6_robot", "lite_gripper"));
+  EXPECT_FALSE(mounted("lite6_arm", "lite_gripper"));
 }
 
-// B5/B1 with BFIX: on a shared flange without a primary mark, the tool is the
+// On a shared flange without a primary mark, the tool is the
 // child carrying a TCP (a camera that is no tool needs no mark), and a robot
-// whose flange tool has no default TCP has no End-effector TCP (C-P2,
-// B-run-1).
+// whose flange tool has no default TCP has no End-effector TCP.
 TEST(ProgramBindingMountedOwnerTest, FlangeToolAndMissingEndEffectorTcp) {
   namespace core = manyforge::core;
   const std::string zero =
@@ -1117,12 +1288,12 @@ TEST(ProgramBindingMountedOwnerTest, FlangeToolAndMissingEndEffectorTcp) {
                               std::move(components), {}, {}, std::move(edges)};
   };
   using manyforge::deployment::CellKinematicIndex;
-  const core::ControllableComponentId robot("lite6_robot");
+  const core::ControllableComponentId robot("lite6_arm");
   // A camera (no TCP) first on the flange, the gripper second: the gripper.
   const CellKinematicIndex shared(graph(
-      {component("lite6_robot", std::nullopt), component("camera", std::nullopt),
+      {component("lite6_arm", std::nullopt), component("camera", std::nullopt),
        component("lite_gripper", cup)},
-      {edge("lite6_robot", "camera", false), edge("lite6_robot", "lite_gripper", false)}));
+      {edge("lite6_arm", "camera", false), edge("lite6_arm", "lite_gripper", false)}));
   ASSERT_NE(shared.tool_on(robot, "flange"), nullptr);
   EXPECT_EQ(shared.tool_on(robot, "flange")->value(), "lite_gripper");
   const core::CommandTargetId arm("arm");
@@ -1130,14 +1301,14 @@ TEST(ProgramBindingMountedOwnerTest, FlangeToolAndMissingEndEffectorTcp) {
   EXPECT_EQ(shared.end_effector_entry(robot, arm)->component_id.value(), "lite_gripper");
   // A primary mark still wins.
   const CellKinematicIndex marked(graph(
-      {component("lite6_robot", std::nullopt), component("camera", std::nullopt),
+      {component("lite6_arm", std::nullopt), component("camera", std::nullopt),
        component("lite_gripper", cup)},
-      {edge("lite6_robot", "camera", true), edge("lite6_robot", "lite_gripper", false)}));
+      {edge("lite6_arm", "camera", true), edge("lite6_arm", "lite_gripper", false)}));
   EXPECT_EQ(marked.tool_on(robot, "flange")->value(), "camera");
-  // C-P2: a bracket without a TCP leaves the robot without an End-effector TCP.
+  // A bracket without a TCP leaves the robot without an End-effector TCP.
   const CellKinematicIndex bracket(graph(
-      {component("lite6_robot", std::nullopt), component("lite_bracket", std::nullopt)},
-      {edge("lite6_robot", "lite_bracket", false)}));
+      {component("lite6_arm", std::nullopt), component("lite_bracket", std::nullopt)},
+      {edge("lite6_arm", "lite_bracket", false)}));
   EXPECT_EQ(bracket.tool_on(robot, "flange")->value(), "lite_bracket");
   EXPECT_FALSE(bracket.end_effector_entry(robot, arm).has_value());
 }

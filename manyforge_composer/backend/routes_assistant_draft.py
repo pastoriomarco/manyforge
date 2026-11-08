@@ -24,6 +24,7 @@ from .assistant_schema_validation import (
     validate_callback_arguments,
 )
 from .draft_session import DraftSessionError, SUPPORTED_DRAFT_MUTATIONS
+from .routes_draft import validate_captured_program_source
 from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
 )
@@ -549,7 +550,18 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                 next_snapshot = state.draft_session.validate(
                     node_environment.catalog
                 )
-                details = {"valid": True}
+                identity = state.authoring_workspace.identity()
+                body.require_workspace_fence(identity)
+                _require_equal(body.draft_id, identity.program_draft_id, field="draftId")
+                _require_equal(body.expected_draft_revision, identity.program_draft_revision,
+                               field="expectedDraftRevision")
+                validation = validate_captured_program_source(
+                    state, next_snapshot["authoring"], expected_identity=identity
+                )
+                details = {
+                    "valid": validation["valid"],
+                    "reference_validation": validation["reference_validation"],
+                }
             else:
                 raise HTTPException(
                     status_code=400,

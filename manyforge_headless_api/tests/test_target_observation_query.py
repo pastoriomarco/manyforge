@@ -12,12 +12,14 @@ from manyforge_headless_api.native import HeadlessApiError
 
 def _query(kind="frame_pose"):
     return {
-        "schema_version": "manyforge.target_observation_query.v1",
+        "schema_version": "manyforge.target_observation_query.v2",
         "owner_epoch": "owner.1",
         "program_binding_id": "sha256:" + "a" * 64,
-        "target_role_id": "arm" if kind == "frame_pose" else "gripper",
+        "target": {"component_id": "robot", "command_target_id":
+                   "arm" if kind == "frame_pose" else "gripper"},
         "kind": kind,
-        **({"frame_role_id": "tcp"} if kind == "frame_pose" else {}),
+        **({"frame": {"component_id": "robot", "frame_id": "tcp"}}
+           if kind == "frame_pose" else {}),
     }
 
 
@@ -48,10 +50,10 @@ def _response(query, coordinate_kind="angular_rad"):
     return {
         "ok": True,
         "command": "query_target",
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "target_observation": {
             **query,
-            "schema_version": "manyforge.target_observation.v1",
+            "schema_version": "manyforge.target_observation.v2",
             "source_epoch": "source.1",
             "source_sequence": 7,
             "value": value,
@@ -86,7 +88,7 @@ def test_query_has_one_exact_read_and_preserves_typed_owner_evidence(kind, coord
     assert client.query_target(TargetObservationQuery.model_validate(query)) == response
     assert requests == [
         {
-            "api_version": "manyforge.execution_command.v1",
+            "api_version": "manyforge.execution_command.v3",
             "command": "query_target",
             "query": query,
         }
@@ -94,7 +96,7 @@ def test_query_has_one_exact_read_and_preserves_typed_owner_evidence(kind, coord
 
 
 def test_frame_query_may_request_an_exact_relative_frame():
-    query = {**_query(), "relative_to_frame_role_id": "base"}
+    query = {**_query(), "relative_to_frame": {"component_id": "robot", "frame_id": "base"}}
     response = _response(query)
     client, requests = _client(response)
 
@@ -109,10 +111,10 @@ def test_frame_query_may_request_an_exact_relative_frame():
         {"owner_epoch": ""},
         {"owner_epoch": 123},
         {"program_binding_id": "other"},
-        {"target_role_id": ""},
-        {"frame_role_id": None},
+        {"target": {"component_id": "", "command_target_id": "arm"}},
+        {"frame": None},
         {"request_id": "effect"},
-        {"schema_version": "manyforge.target_observation_query.v2"},
+        {"schema_version": "manyforge.target_observation_query.v1"},
     ],
 )
 def test_query_rejects_unknown_or_crossed_request_shapes(change):
@@ -123,13 +125,13 @@ def test_query_rejects_unknown_or_crossed_request_shapes(change):
 def test_gripper_query_cannot_name_an_arbitrary_frame():
     with pytest.raises(ValidationError):
         TargetObservationQuery.model_validate(
-            {**_query("gripper_status"), "frame_role_id": "tcp"}
+            {**_query("gripper_status"), "frame": {"component_id": "robot", "frame_id": "tcp"}}
         )
     with pytest.raises(ValidationError):
         TargetObservationQuery.model_validate(
             {
                 **_query("gripper_status"),
-                "relative_to_frame_role_id": "base",
+                "relative_to_frame": {"component_id": "robot", "frame_id": "base"},
             }
         )
 
@@ -205,16 +207,12 @@ def test_owner_rejection_is_not_retried_or_replaced_by_cached_state():
     assert len(requests) == 1
 
 
-_ROBOT = {
-    "target_role_id": "peer",
-    "controllable_component_id": "robot.2",
-    "command_target_id": "arm.command",
-}
+_FRAME = {"component_id": "robot.2", "frame_id": "tcp"}
 
 
 def _transform_query(**change):
     return {
-        "schema_version": "manyforge.target_observation_query.v1",
+        "schema_version": "manyforge.target_observation_query.v2",
         "owner_epoch": "owner.1",
         "program_binding_id": "sha256:" + "a" * 64,
         "kind": "frame_transform",
@@ -222,7 +220,7 @@ def _transform_query(**change):
             "position_m": {"x_m": 0.1, "y_m": 0.0, "z_m": 0.2},
             "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
         },
-        "source_frame": {"type": "frame_role", "frame_role_id": "tcp", "target": _ROBOT},
+        "source_frame": {"type": "component_frame", "frame": _FRAME},
         "target_frame": {"type": "cell_frame"},
         **change,
     }
@@ -232,10 +230,10 @@ def _transform_response(query):
     return {
         "ok": True,
         "command": "query_target",
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "target_observation": {
             **query,
-            "schema_version": "manyforge.target_observation.v1",
+            "schema_version": "manyforge.target_observation.v2",
             "evaluated_at_ns": "18446744073",
             "scene_revision": {
                 "scene_id": "sha256:" + "c" * 64,
@@ -263,14 +261,13 @@ def test_frame_transform_names_two_frames_and_no_target_and_keeps_its_answer_sha
 @pytest.mark.parametrize(
     "change",
     [
-        {"target_role_id": "arm"},
-        {"frame_role_id": "tcp"},
+        {"target": {"component_id": "robot", "command_target_id": "arm"}},
+        {"frame": {"component_id": "robot", "frame_id": "tcp"}},
         {"pose": None},
         {"target_frame": None},
-        # A transform frame role always names its robot.
-        {"source_frame": {"type": "frame_role", "frame_role_id": "tcp"}},
+        {"source_frame": {"type": "component_frame"}},
         {"source_frame": {"type": "pose", "pose": None}},
-        {"source_frame": {"type": "frame_role", "frame_role_id": "tcp", "target": {}}},
+        {"source_frame": {"type": "component_frame", "frame": {}}},
     ],
 )
 def test_frame_transform_query_is_closed(change):

@@ -15,7 +15,7 @@ class CellCompilerError : public std::invalid_argument {
   using std::invalid_argument::invalid_argument;
 };
 
-/// Immutable, non-caller-constructible result of the complete pure I2
+/// Immutable, non-caller-constructible result of the complete pure
 /// semantic compiler.
 ///
 /// The exact applicability-qualified predecessor owns the identity-verified
@@ -61,7 +61,7 @@ class CompilerQualifiedCellIr final {
       const ApplicabilityQualifiedCellIr&);
 };
 
-/// Closes the pure I2 trust boundary over its exact non-forgeable predecessor.
+/// Closes the pure compiler trust boundary over its exact non-forgeable predecessor.
 ///
 /// This is the sole public producer of CompilerQualifiedCellIr. It performs no
 /// I/O and accepts no raw graph, structural, composition, or caller-built DTO

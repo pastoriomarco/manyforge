@@ -15,9 +15,9 @@ class VerifiedControllerLifecycleExpectedDomain;
 /// a caller-owned topology or endpoint declaration. The decoder accepts it
 /// only when every binding, route, activation set, controller, interface, and
 /// endpoint joins the verified retained product exactly. The source runtime
-/// identity is supplied by the CCLC-owned current runtime snapshot and is not
-/// discovered or substituted by this deployment reader.
-/// DX791: only a strict selected pneumatic `output_mode:none` row can seal
+/// identity comes from the execution host's current runtime snapshot and is
+/// not discovered or substituted by this deployment reader.
+/// Only a strict selected pneumatic `output_mode:none` row can seal
 /// physical-controller-not-applicable. Logical bindings/routes/endpoints and
 /// source identities remain exact; commanded and all other domains retain
 /// the unchanged required-physical-controller guards.

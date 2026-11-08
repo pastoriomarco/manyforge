@@ -17,6 +17,8 @@ safety system ([Safety](README.md#safety)).
 
 ### Breaking changes
 
+- **Direct Scenario references.** Older Scenario projects using assignments
+  must be re-authored with direct component, target, frame, and signal references.
 - **Component model v2.** Every component reports one state (lifecycle
   offline / not prepared / prepared / enabled / fault, activity idle / busy /
   unknown, stream freshness) and offers the actions Prepare, Enable, Disable
@@ -124,27 +126,27 @@ safety system ([Safety](README.md#safety)).
   `optimize` (`first`, `rrt_star`, `best_of_n`), collision check step and node
   budget; Deployment default with a per-motion `planner` override. See
   [Planner block](docs/reference/ROBOPLAN_ADAPTER_NOTES.md#planner-block).
-- **Corner blending (RP-2):** `blend_radius_m` per Follow Cartesian path move
+- **Corner blending:** `blend_radius_m` per Follow Cartesian path move
   and per waypoint rounds corners so the tool runs through them; 0 keeps the
   exact corner. See [Cartesian paths](docs/reference/ROBOPLAN_ADAPTER_NOTES.md#cartesian-paths).
-- **Cartesian timing (CT-1):** `cartesian_timing` `constant_speed` (default)
+- **Cartesian timing:** `cartesian_timing` `constant_speed` (default)
   or `time_optimal`, per move with a Deployment default.
-- **TCP limit inside time scaling (RP-3):** every move is timed to keep the
+- **TCP limit inside time scaling:** every move is timed to keep the
   active TCP within 0.98 of its speed limit; the speed check runs on the
   active TCP only. See
   [Time-scaling and the TCP speed limit](docs/reference/ROBOPLAN_ADAPTER_NOTES.md#time-scaling-and-the-tcp-speed-limit).
-- **Motion timing (N12 / RP-3b):** a per-robot Deployment setting
+- **Motion timing:** a per-robot Deployment setting
   `motion_timing` for joint and pose goals, shown in the Execution host
   configuration card. `smooth` is the default: TOPP-RA within the joint
-  limits, then one uniform stretch under the TCP limit (the M8 timing,
-  gentle starts and stops). `fast` is RP-3: the TCP bound inside TOPP-RA,
+  limits, then one uniform stretch under the TCP limit (gentle
+  starts and stops). `fast` puts the TCP bound inside TOPP-RA,
   quicker with abrupt acceleration changes. Cartesian paths follow
   `cartesian_timing`. Changing it restarts nothing.
-- **Collision clearance (CLR-1):** planned and validated moves keep the
+- **Collision clearance:** planned and validated moves keep the
   Deployment's `collision_clearance_m` (default 1 mm) from obstacles;
   per-move `clearance_m` overrides it. See
   [Collision validation](docs/reference/ARCHITECTURE.md#collision-validation).
-- **Check fresh plans before dispatch (CLR-2):** a per-robot Deployment
+- **Check fresh plans before dispatch:** a per-robot Deployment
   setting `collision_check_fresh_plans` (default on), shown in the Execution
   host configuration card: ManyForge's collision engine checks every waypoint
   of a newly planned move before it starts. Changing it restarts nothing. See
@@ -156,17 +158,17 @@ safety system ([Safety](README.md#safety)).
 - **Contact pairs per request:** the active contact-grasp pairs travel with
   each plan and IK request, so a contact-policy change keeps the planner
   worker. See [Planner scene](docs/reference/ROBOPLAN_ADAPTER_NOTES.md#planner-scene).
-- **Gripper Stop near the target (GRP-1):** a gripper already within its
+- **Gripper Stop near the target:** a gripper already within its
   `stop_finish_tolerance` finishes its goal instead of being cancelled. See
   [Stop near the target](docs/authoring/GRIPPERS.md#stop-near-the-target).
-- **Wait for the set duration (GRP-2):** `gripper.command_position`
+- **Wait for the set duration:** `gripper.command_position`
   `wait_for_duration` completes after `command_duration_s` on every lane. See
   [When a gripper command completes](docs/authoring/GRIPPERS.md#when-a-gripper-command-completes).
-- **Real xArm motors on only at Enable (XPW-1):** Prepare connects and clears
+- **Real xArm motors on only at Enable:** Prepare connects and clears
   errors with the motors off; the arm's Enable switches them on. Machine
   actions **Power off** and **Reboot**. See
   [What each action does on an xArm](docs/operations/REAL_ROBOT_SETUP.md#what-each-action-does-on-an-xarm).
-- **Reset robot position on Isaac (RP-1b):** Isaac robots declare
+- **Reset robot position on Isaac:** Isaac robots declare
   `reset_position`, like Mock: the trajectory controller off, the
   Deployment's initial joints written once through the stock writer to
   Isaac's joint commands, the controller back on to hold them. Refused with
@@ -249,7 +251,7 @@ safety system ([Safety](README.md#safety)).
   itself. Replaces 0.1.0's simulator reset with
   `simulation_control.reset.resume_play_after_reset`. See
   [Stack setup](docs/operations/STACK_SETUP.md).
-- **A simulation that isn't playing (SIM-1)** never blocks Enable, Activate or
+- **A simulation that isn't playing** never blocks Enable, Activate or
   Execute; new motion on it is refused as an operator Stop
   (`simulation_not_playing`), so Program nodes can play the simulation again.
 - **Lanes replace 0.1.0's deployment modes** (`composer_only`,
@@ -276,10 +278,10 @@ safety system ([Safety](README.md#safety)).
 - 0.1.0's native execution backend for simulated lanes: replaced by the Mock
   lane on ROS.
 - Pre-dispatch collision sampling **between** a trajectory's waypoints (along
-  the executed spline, at the collision-check step): removed by CLR-1; the
-  check now covers the trajectory's own waypoints (10 ms grid) and the
-  collision clearance covers the spline's deviation. Last implemented on
-  `dev` at commit `0703ea48` (introduced in `53cc751e`; not in 0.1.0):
+  the executed spline, at the collision-check step): removed with the
+  collision clearance; the check now covers the trajectory's own waypoints
+  (10 ms grid) and the collision clearance covers the spline's deviation.
+  Last implemented on `dev` at commit `0703ea48` (introduced in `53cc751e`; not in 0.1.0):
   `manyforge_core/src/validation_sampling.cpp`,
   `manyforge_core/include/manyforge_core/trajectory/validation_sampling.hpp`,
   and its use in `component_lifecycle_plan_validity.cpp`.
@@ -310,20 +312,20 @@ safety system ([Safety](README.md#safety)).
 
 ### Fixed
 
-- The runtime lookahead no longer stops a move that leaves a contact
-  (LKA-1): it compares the plan with itself.
+- The runtime lookahead no longer stops a move that leaves a contact:
+  it compares the plan with itself.
 - Component actions are no longer refused when unrelated ROS nodes start or
-  stop (EPC-1): only the publisher count of the component's own topics counts.
+  stop: only the publisher count of the component's own topics counts.
 - An interrupt rule sees every write to a key it reads, in order, before the
-  next write or motion (BBK-1): short pulses still trip it.
+  next write or motion: short pulses still trip it.
 - A gripper Stop at the end of its stroke no longer races the stock
-  controller's cancel (GRP-1).
+  controller's cancel.
 - A gripper Stop no longer hangs when its cancel arrives just as the goal
   finishes (the stock controller then sends no result): the controller's
   acceptance of the cancel ends the command, and the Isaac gripper bridge now
-  holds the fingers before accepting, like the stock controller (N10b). A Stop
+  holds the fingers before accepting, like the stock controller. A Stop
   also sends no cancel when the controller reported the goal reached or the
-  node's `command_duration_s` has passed (N10).
+  node's `command_duration_s` has passed.
 - A rule with `hold` now holds the run when it trips while nothing in its
   scope moves, instead of failing the next motion node.
 - xArm: an output write answered `ret=1` counts as accepted; an output shown
@@ -418,8 +420,7 @@ replaces are listed in its Removed and Changed sections.
   provably execution-local (no active streaming/direct-control lease, no
   running intervention session), the cycle manager automatically
   acknowledges it through the new kernel API. Otherwise
-  Run fails closed with a structured reason. See `spec/400` §6.6.2 and the
-  audit-K4 decision.
+  Run fails closed with a structured reason.
 - **Direct-control and streaming observability**: direct-control WebSocket
   paths now have bounded timing checks, structured event draining, rejection
   reasons, and stress coverage for end/new-begin races.
@@ -585,12 +586,11 @@ replaces are listed in its Removed and Changed sections.
   once across all waypoints instead of per-iteration. Full FK/IK parallelism
   with planning remains blocked on RoboPlan 0.3.0 exposing a thread-local
   Pinocchio `Data` view.
-- `RecoveryTrigger` enum aligned with the `spec/460` §6.2.2 canonical
-  taxonomy: `EXECUTE_TIMEOUT` and `POSTCONDITION_FAILED` added. The legacy
+- `RecoveryTrigger` enum aligned with the canonical taxonomy: `EXECUTE_TIMEOUT` and `POSTCONDITION_FAILED` added. The legacy
   `TIMEOUT`/`NODE_FAILURE` aliases were subsequently removed entirely (see
   Removed); persisted traces carry trigger strings outward only and are never
   parsed back into the enum.
-- Cycle-manager state-machine documentation in `spec/400` §6.6.2 now shows
+- Cycle-manager state-machine documentation now shows
   the real five-state model (`IDLE/RUNNING/STOPPED/INTERRUPT_HANDLER/`
   `DIRECT_CONTROL`) instead of the legacy three-state diagram.
 - `manyforge_ros_bringup`: license declaration changed from `Proprietary` to
@@ -613,7 +613,7 @@ replaces are listed in its Removed and Changed sections.
   longer accepts `trigger_reason="manual_request"`. The MCP allowlist now
   mirrors `RecoveryTrigger.value` exactly; `manual_request` is a
   `session_kind` concept (carried automatically by `manual_intervention`
-  sessions) and not a recovery trigger per `spec/460` §6.2.2. **Migration**:
+  sessions) and not a recovery trigger. **Migration**:
   external MCP clients that explicitly passed `trigger_reason="manual_request"`
   should omit the field (the default for `manual_intervention` is unchanged)
   or pass a canonical recovery-trigger value when starting a
@@ -647,7 +647,7 @@ replaces are listed in its Removed and Changed sections.
   (details: `reason_code=intervention_required`) while the kernel is in
   `kInterventionRequired`. The previous implicit clearing of intervention by
   re-issuing `execute()` is removed to preserve the operator-intervention
-  audit boundary (audit K4). Callers must now call
+  audit boundary. Callers must now call
   `acknowledge_intervention(principal_id, reason)` before re-running. Cycle
   manager and Composer Run route already do this transparently when the
   leftover state is execution-local.

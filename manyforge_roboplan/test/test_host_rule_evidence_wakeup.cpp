@@ -161,7 +161,7 @@ TEST_F(HostRuleEvidenceWakeupTest, CarriedObjectLostSignalFollowsTheHostStore) {
   };
   auto system = make(1U);
   system->Start();
-  system->AdoptCarriedObjectLostSignals();  // Committed (SX-206).
+  system->AdoptCarriedObjectLostSignals();  // Committed.
   Advance();
   // The initial acquisition makes the signal fresh and false.
   EXPECT_EQ(Value(*system, signal), std::optional(false));
@@ -191,7 +191,7 @@ TEST_F(HostRuleEvidenceWakeupTest, CarriedObjectLostSignalFollowsTheHostStore) {
   Advance();
   EXPECT_EQ(Value(*system, signal), std::optional(false));
   EXPECT_TRUE(store.Losses().empty());
-  // A false for a gripper that is not lost is still delivered (SX-188).
+  // A false for a gripper that is not lost is still delivered.
   EXPECT_EQ(store.Publish(robot, gripper, std::nullopt), std::nullopt);
   Advance();
   EXPECT_EQ(Value(*system, signal), std::optional(false));
@@ -232,7 +232,7 @@ TEST_F(HostRuleEvidenceWakeupTest, ASystemSignalSampleIsFreshForReadiness) {
 }
 
 TEST_F(HostRuleEvidenceWakeupTest, ARefusedApplyCandidateLeavesTheRowsAndTheSinkUntouched) {
-  // SX-206: an Apply candidate starts (and replays the levels) before the
+  // An Apply candidate starts (and replays the levels) before the
   // terminal publication; only the committed composition prunes and takes
   // the sink.
   auto &store = host_carried_object_lost_signals();
@@ -288,11 +288,11 @@ TEST(HostCarriedObjectLostSignalsTest, OneRowPerLostAttachmentAndFalseIsAlwaysDe
   store.Publish(robot, gripper,
                 Loss{robot, gripper, "attachment.2", "cup", std::nullopt, "loss.2"});
   // The same continuing loss detected again (a failed detach): the row and
-  // its loss event id stay (contract §10).
+  // its loss event id stay.
   store.Publish(robot, gripper,
                 Loss{robot, gripper, "attachment.1", "box", "part_lost", "loss.3"});
   const auto losses = store.Losses();
-  ASSERT_EQ(losses.size(), 2U);  // Both keys stay (SX-200).
+  ASSERT_EQ(losses.size(), 2U);  // Both keys stay.
   EXPECT_EQ(losses[0].carried_object_attachment_id, "attachment.1");
   EXPECT_EQ(losses[0].loss_event_id, "loss.1");
   EXPECT_EQ(losses[0].set_key, std::optional<std::string>("part_lost"));
@@ -359,7 +359,7 @@ TEST(HostCarriedObjectLostSignalsTest, DeliveriesFollowTheRecordedOrderAlsoAgain
 
 
 TEST(HostCarriedObjectLostSignalsTest, LastLossesCoalescePerGripperAndKeyAndOutliveTheLevel) {
-  // Contract §10 "Coalescing" (SX-229/231).
+  // Coalescing.
   HostCarriedObjectLostSignals store;
   const core::ControllableComponentId robot("robot.g1");
   const core::CommandTargetId gripper("gripper"), other("other");
@@ -397,7 +397,7 @@ TEST(HostCarriedObjectLostSignalsTest, LastLossesCoalescePerGripperAndKeyAndOutl
 }
 
 TEST(HostCarriedObjectLostSignalsTest, AnAttachByTheGripperClearsItsRows) {
-  // SX-202 (a): the Manager publishes `false` for every attach by a gripper.
+  // The Manager publishes `false` for every attach by a gripper.
   HostCarriedObjectLostSignals store;
   const core::ControllableComponentId robot("robot.g1");
   const core::CommandTargetId left("left"), right("right");
@@ -412,7 +412,7 @@ TEST(HostCarriedObjectLostSignalsTest, AnAttachByTheGripperClearsItsRows) {
 }
 
 TEST(HostCarriedObjectLostSignalsTest, ACompositionReplacementDropsTheRowsOfGrippersItDoesNotHold) {
-  // SX-202 (b): rows of targets still composed survive; the others drop.
+  // Rows of targets still composed survive; the others drop.
   HostCarriedObjectLostSignals store;
   const core::ControllableComponentId robot("robot.g1");
   const core::CommandTargetId kept("kept"), gone("gone");

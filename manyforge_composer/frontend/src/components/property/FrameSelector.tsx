@@ -34,6 +34,10 @@ export function FrameSelector({
   const unavailable = value !== null && !choices.some((choice) => choice.key === current);
   const groups = new Map<string, ProgramFrameChoice[]>();
   for (const choice of choices) groups.set(choice.group, [...(groups.get(choice.group) ?? []), choice]);
+  const disabledFrames = (scope.unavailableFrames ?? []).filter(({ reference }) => {
+    const key = frameKey({ kind: 'target_frame', frame: reference });
+    return !choices.some((choice) => choice.key === key);
+  });
   return (
     <select
       aria-label={ariaLabel}
@@ -48,7 +52,8 @@ export function FrameSelector({
       }}
     >
       {value === null && <option value="" disabled>Select a frame</option>}
-      {unavailable && <option value={current}>Not available · {frameLabel(value!)}</option>}
+      {unavailable && !disabledFrames.some(({ reference }) => frameKey({ kind: 'target_frame', frame: reference }) === current)
+        && <option value={current} disabled>Not available · {frameLabel(value!)}</option>}
       {[...groups.entries()].map(([group, rows]) => (
         <optgroup key={group} label={group}>
           {rows.map((choice) => (
@@ -56,6 +61,12 @@ export function FrameSelector({
           ))}
         </optgroup>
       ))}
+      {disabledFrames.length > 0 && <optgroup label="Unavailable component frames">
+        {disabledFrames.map(({ reference, reason }) => {
+          const frame: ProgramPoseFrame = { kind: 'target_frame', frame: reference };
+          return <option key={frameKey(frame)} value={frameKey(frame)} disabled>{frameLabel(frame)} · {reason}</option>;
+        })}
+      </optgroup>}
     </select>
   );
 }

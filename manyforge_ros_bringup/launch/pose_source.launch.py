@@ -1,4 +1,4 @@
-"""Start the observer of one ManyForge ``pose_source`` component (CP9).
+"""Start the observer of one ManyForge ``pose_source`` component.
 
 ros2 launch manyforge_ros_bringup pose_source.launch.py \
     site_config_path:=<file> manager_run_root:=<dir> source_epoch_base:=<base>
@@ -44,7 +44,7 @@ def node_kwargs(
 
 
 def launch_setup(context, *args, **kwargs):
-    keep_sigint_out_of_tasks(context)  # Q116: before any Node action exists.
+    keep_sigint_out_of_tasks(context)  # Before any Node action exists.
     return [
         Node(
             **node_kwargs(

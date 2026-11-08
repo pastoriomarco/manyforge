@@ -19,7 +19,7 @@
 
 namespace manyforge::deployment {
 
-// Build-qualified v1 source-verification limits. I3 store retrieval and every
+// Build-qualified v1 source-verification limits. Store retrieval and every
 // language binding must preflight the same contract rather than duplicating
 // policy constants.
 inline constexpr std::uint64_t kMaxModelSourceXmlEntrypointBytes =
@@ -75,7 +75,7 @@ struct ModelSourceRetrievalPlanRow final {
                          const ModelSourceRetrievalPlanRow&) = default;
 };
 
-/// I2-owned declaration preflight consumed by I3 retrieval and verification.
+/// Compiler-owned declaration preflight consumed by store retrieval and verification.
 ///
 /// The plan contains no bytes and performs no I/O. Its private construction
 /// prevents callers from reinterpreting MIME, entrypoint, key, or limit
@@ -670,7 +670,7 @@ class ModelSourceIr final {
 /// immutable artifact identities, bounded XML syntax, and retained URDF/SRDF
 /// structural references have been verified.
 ///
-/// The exact I2 retrieval plan is retained transitively as source provenance;
+/// The exact compiler retrieval plan is retained transitively as source provenance;
 /// the model-asset views below derive from that sole owned plan.
 ///
 /// This product proves neither graph placement nor lane/runtime compatibility.
@@ -746,7 +746,7 @@ class SourceVerifiedModelAsset final {
     const ModelSourceRetrievalPlan& retrieval_plan,
     std::vector<ResolvedModelSourceArtifactCandidate> resolved_artifacts);
 
-/// Convenience entrypoint that runs the same I2-owned declaration preflight.
+/// Convenience entrypoint that runs the same compiler-owned declaration preflight.
 [[nodiscard]] SourceVerifiedModelAsset verify_model_source_closure(
     const QualifiedModelAsset& qualified_asset,
     std::vector<ResolvedModelSourceArtifactCandidate> resolved_artifacts);

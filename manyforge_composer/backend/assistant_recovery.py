@@ -2,7 +2,7 @@
 
 This module deliberately knows nothing about the former Composer tool IDs,
 node-catalog wire, or free-form backend error strings.  It contains only pure
-presentation mechanics that the H0 read client and future N operation client
+presentation mechanics that a read client and a future operation client
 may bind to typed owner-issued error contracts.
 """
 

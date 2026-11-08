@@ -1,6 +1,6 @@
 """Component model v2 mirrors and the one Execute/Resume readiness owner.
 
-Plain Python mirrors of the core types (CONTRACTS §1, §2, §5, §7, §10) with
+Plain Python mirrors of the core types with
 the contract's field names, the parse of the execution host's
 ``read_component_model`` reply, and :func:`run_readiness`, the only place that
 computes ``RunReadiness`` (from component states, the cell latch, rule holds,
@@ -28,12 +28,17 @@ COMPONENT_ACTIONS: frozenset[str] = frozenset(
     {"prepare", "enable", "disable", "recover", "reset_position", "power_off", "reboot", "sim_reset"}
 )
 LIFECYCLE_ACTIONS: frozenset[str] = frozenset({"prepare", "enable", "disable", "recover"})
-# CONTRACTS §2, §16: group actions that stop or remove run members before
+# Group actions that stop or remove run members before
 # their owner; `prepare` runs each owner before its members.
 STOPPING_ACTIONS: frozenset[str] = frozenset({"disable", "power_off", "reboot"})
 # A component's lifecycle timeout when its Deployment row sets none
 # (`configuration.lifecycle_command_timeout_s`, default 10 s).
 DEFAULT_LIFECYCLE_TIMEOUT_S = 10.0
+# The host's stop grace of a component's controller launch group before its
+# SIGKILL (C++ `manyforge::core::kControllerLaunchStopGrace`, the one source;
+# a test keeps them equal). A host Apply may retire one per component it
+# changes: its bound counts it (the Manager's `HostApplyTimeout`, F8).
+HOST_COMPONENT_STOP_GRACE_S = 10.0
 
 
 class ErrorText(TypedDict):
@@ -48,9 +53,17 @@ class Fault(TypedDict):
     operator_action: Literal["enable", "recover", "none"]
     vendor_code: NotRequired[str]
     vendor_text: NotRequired[str]
-    # §4, §16: on an owner's fault, the members it concerns.
+    # On an owner's fault, the members it concerns.
     concerns: NotRequired[list[str]]
     since_ns: int
+
+
+class ComponentStop(TypedDict):
+    code: Literal["estop"]
+    message: str
+    since_ns: int
+    vendor_code: NotRequired[str]
+    vendor_text: NotRequired[str]
 
 
 class ComponentStream(TypedDict):
@@ -66,12 +79,20 @@ class ActionError(TypedDict):
     vendor_text: NotRequired[str]
 
 
+class ActionPhase(TypedDict):
+    component_id: str
+    action: Literal["recover", "enable"]
+    outcome: Outcome
+    error: NotRequired[ActionError]
+
+
 class ActionResult(TypedDict):
     action: Action
     outcome: Outcome
     error: NotRequired[ActionError]
     started_at_ns: int
     finished_at_ns: int
+    phases: NotRequired[list[ActionPhase]]
 
 
 class ActionInProgress(TypedDict):
@@ -88,28 +109,30 @@ class ComponentDetail(TypedDict):
 
 class ComponentState(TypedDict):
     component_id: str
-    # §16: the machine this component is a member of, and its member slot.
+    # The machine this component is a member of, and its member slot.
     owner_id: NotRequired[str]
     role: NotRequired[str]
     lifecycle: Lifecycle
     fault: NotRequired[Fault]
+    stop: NotRequired[ComponentStop]
     # Why it's offline / not_prepared; a member shown offline through its
-    # owner carries `owner_unavailable` (§1).
+    # owner carries `owner_unavailable`.
     reason: NotRequired[ErrorText]
     activity: Activity
     streams: list[ComponentStream]
     capabilities: list[str]
     action: NotRequired[ActionInProgress]
     last_action: NotRequired[ActionResult]
-    # §1 (AUD-2): the adapter's read-only diagnostics, display only.
+    # The adapter's read-only diagnostics, display only.
     details: NotRequired[list[ComponentDetail]]
     observed_at_ns: int
 
 
 class CellLatchCause(TypedDict):
     component_id: str
-    kind: Literal["fault", "offline", "activity_unknown"]
+    kind: Literal["fault", "offline", "activity_unknown", "stop"]
     fault: NotRequired[Fault]
+    stop: NotRequired[ComponentStop]
 
 
 class CellLatch(TypedDict):
@@ -120,10 +143,10 @@ class CellLatch(TypedDict):
 class SignalSample(TypedDict):
     signal_id: str
     value: bool | float | int | None
-    source: Literal["device", "manyforge_write", "outside", "last_write"]
+    source: Literal["device", "manyforge_write", "outside", "not_readable"]
     age_ns: int
     fresh: bool
-    # §7 "per output": present on outputs only.
+    # Present on outputs only.
     controller_owned: NotRequired[bool]
 
 
@@ -137,7 +160,7 @@ class BlockedReason(TypedDict):
     message: str
     component_id: NotRequired[str]
     rule_id: NotRequired[str]
-    # `rule_holds` only: the hold's scope (§8) and, for execution groups, the
+    # `rule_holds` only: the hold's scope and, for execution groups, the
     # components it holds; the GUI disables the groups it meets.
     scope: NotRequired[str]
     component_ids: NotRequired[list[str]]
@@ -149,7 +172,7 @@ class RunReadiness(TypedDict):
     can_resume: bool
     # Motion may start or continue (Motion panel Run/Resume of a group): no
     # latch, component or input reason, whatever the run state; a rule hold
-    # is refused by the kernel in its own scope only (§8).
+    # is refused by the kernel in its own scope only.
     motion_clear: bool
     blocked_reasons: list[BlockedReason]
 
@@ -169,11 +192,11 @@ class ComponentModel:
     # its installed bindings); a stale or missing one blocks Execute.
     required_signal_ids: list[str]
     # The applied Program's motion components; a rule hold blocks
-    # Execute/Resume only when its scope meets them (§8, §10).
+    # Execute/Resume only when its scope meets them.
     program_motion_component_ids: list[str]
     # The kernel's `ReadExecutionBlocks()` rows `{code, message, details}`:
     # blocks of no component (`execution_host_internal_fault`,
-    # `manager_unavailable`); each blocks Execute and Resume (§10).
+    # `manager_unavailable`); each blocks Execute and Resume.
     execution_blocks: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -187,15 +210,35 @@ def _rows(value: object, label: str) -> list[dict[str, Any]]:
     return value
 
 
+def _validate_stop(value: object) -> None:
+    if (
+        not isinstance(value, dict)
+        or not {"code", "message", "since_ns"} <= value.keys()
+        or not value.keys() <= {"code", "message", "since_ns", "vendor_code", "vendor_text"}
+        or value["code"] != "estop"
+        or not isinstance(value["message"], str)
+        or not value["message"]
+        or type(value["since_ns"]) is not int
+        or value["since_ns"] < 0
+        or any(key in value and not isinstance(value[key], str) for key in ("vendor_code", "vendor_text"))
+    ):
+        raise _invalid("component stop is invalid")
+
+
 def parse_component_model(response: Mapping[str, Any]) -> ComponentModel:
     """Parse the host's ``read_component_model`` reply (shape checks only)."""
 
     latch = response.get("cell_latch")
     if not isinstance(latch, dict) or type(latch.get("latched")) is not bool:
         raise _invalid("component model cell_latch is invalid")
-    _rows(latch.get("causes"), "cell_latch.causes")
+    causes = _rows(latch.get("causes"), "cell_latch.causes")
+    for cause in causes:
+        if cause.get("kind") == "stop":
+            _validate_stop(cause.get("stop"))
     states = _rows(response.get("component_states"), "component_states")
     for state in states:
+        if "stop" in state:
+            _validate_stop(state["stop"])
         if not isinstance(state.get("component_id"), str) or state.get(
             "lifecycle"
         ) not in ("offline", "not_prepared", "prepared", "enabled", "fault"):
@@ -243,8 +286,8 @@ def latch_summary(latch: CellLatch) -> str:
         return "Cell latched"
     first = causes[0]
     lead = f"{first['component_id']}: " + (
-        first["fault"]["message"]
-        if "fault" in first
+        first["fault"]["message"] if "fault" in first
+        else first["stop"]["message"] if "stop" in first
         else {"offline": "offline", "activity_unknown": "activity unknown"}.get(
             first["kind"], first["kind"]
         )
@@ -253,7 +296,7 @@ def latch_summary(latch: CellLatch) -> str:
 
 
 # Typed refusals of Execute, Resume and a group's Run/Resume before any
-# effect: every RunReadiness reason and execution block (§10), and the
+# effect: every RunReadiness reason and execution block, and the
 # runner's own run refusals. Headless and runner map them to 409, never 5xx.
 RUN_REFUSAL_CODES: frozenset[str] = frozenset(
     {
@@ -280,8 +323,9 @@ RUN_REFUSAL_CODES: frozenset[str] = frozenset(
     }
 )
 
-# A simulator component's reasons while it isn't playing (CONTRACTS §14):
-# `prepared`, never blocking Execute (SIM-1).
+# Existing nonblocking reasons on simulated robot/tool states while they are
+# prepared. The simulator itself is identified by `sim_reset` and skipped
+# separately, including when its lifecycle is offline or faulted.
 SIMULATION_NOT_PLAYING_REASONS: frozenset[str] = frozenset(
     {"simulation_paused", "simulation_stopped"}
 )
@@ -296,7 +340,7 @@ _RESUME_COMMAND = "program_resume_full_stop"
 def rule_hold_meets_program(hold: Mapping[str, Any], program_motion: Iterable[str]) -> bool:
     """A hold's scope meets the Program: `everything` always; `all_motion`
     when the Program moves anything; execution groups when one of their
-    components is a Program motion component (§8)."""
+    components is a Program motion component."""
 
     details = hold.get("details", {})
     scope = details.get("scope")
@@ -309,7 +353,7 @@ def rule_hold_meets_program(hold: Mapping[str, Any], program_motion: Iterable[st
 
 
 def owner_ids(states: Iterable[ComponentState]) -> set[str]:
-    """Owners: every component that is some state's `owner_id` (§16)."""
+    """Owners: every component that is some state's `owner_id`."""
 
     return {state["owner_id"] for state in states if "owner_id" in state}
 
@@ -335,19 +379,18 @@ def _runner_allows(cycle: Mapping[str, Any], command_kind: str) -> bool:
 
 
 def program_not_executable(status: Mapping[str, Any] | None) -> BlockedReason | None:
-    """The applied Program's binding problem (e.g. a role bound to a component
-    that isn't in the running cell), from the applied-Program status."""
+    """The applied Program's binding problem, from applied-Program status."""
 
     if not status or status.get("program_id") is None or status.get("executable"):
         return None
     outcome = status.get("non_executable") or {}
-    roles = ", ".join(
-        f"{row.get('component_role_id')} → {row.get('controllable_component_id')}"
-        for row in outcome.get("unresolved_roles") or ()
-        if isinstance(row, Mapping)
+    targets = ", ".join(
+        f"{row['target'].get('component_id')} / {row['target'].get('command_target_id')}"
+        for row in outcome.get("unresolved_targets") or ()
+        if isinstance(row, Mapping) and isinstance(row.get("target"), Mapping)
     )
     message = status.get("message") or "The applied Program can't run in this Deployment"
-    return _reason("program_not_executable", f"{message} ({roles})" if roles else message)
+    return _reason("program_not_executable", f"{message} ({targets})" if targets else message)
 
 
 def run_readiness(
@@ -357,15 +400,15 @@ def run_readiness(
     manual_operation_in_progress: bool,
     program_status: Mapping[str, Any] | None = None,
 ) -> RunReadiness:
-    """CONTRACTS §10: the one computation of Execute/Resume readiness.
+    """The one computation of Execute/Resume readiness.
 
     ``cycle`` is the Program runner's cycle status (None: the runner can't be
     read); ``program_status`` the applied-Program status (None: unknown).
     Every component in the cell must be enabled (deactivated ones never
-    reach it); an owner has no Enable (§16): `prepared` is its usable state.
-    SIM-1: a simulator that isn't playing (`prepared`, paused or stopped)
-    doesn't block either, so the Program's own nodes can play it; a simulated
-    robot or tool stays `enabled` meanwhile (reason `simulation_not_playing`)."""
+    reach it); an owner has no Enable: `prepared` is its usable state.
+    A component declaring `sim_reset` is the simulator itself: its state does
+    not block Execute, so a Program's own nodes can operate it. Simulated
+    robots and tools keep their own lifecycle and health rules."""
 
     reasons: list[BlockedReason] = []
     if cycle is None:
@@ -379,8 +422,28 @@ def run_readiness(
                 "A manual operation is in progress; wait for it or Stop it",
             )
         )
-    if model.cell_latch["latched"]:
-        reasons.append(_reason("cell_latched", latch_summary(model.cell_latch)))
+    simulator_ids = {
+        state["component_id"]
+        for state in model.component_states
+        if "sim_reset" in state["capabilities"]
+    }
+    blocking_latch_causes = [
+        cause
+        for cause in model.cell_latch["causes"]
+        if cause["component_id"] not in simulator_ids
+    ]
+    # Core excludes a simulator's own state from the canonical cell latch.
+    # Ignore a simulator-only cause from a mixed-version runtime too, while
+    # keeping every ordinary component cause (and an unexplained latch).
+    if model.cell_latch["latched"] and (
+        blocking_latch_causes or not model.cell_latch["causes"]
+    ):
+        reasons.append(
+            _reason(
+                "cell_latched",
+                latch_summary({"latched": True, "causes": blocking_latch_causes}),
+            )
+        )
     for block in model.execution_blocks:
         component_id = block.get("details", {}).get("component_id")
         ids = {"component_id": component_id} if isinstance(component_id, str) else {}
@@ -390,12 +453,19 @@ def run_readiness(
         reasons.append(binding_problem)
     owners = owner_ids(model.component_states)
     for state in model.component_states:
+        # `sim_reset` is the simulator discriminator. Its own offline/fault
+        # state is visible but does not block Execute; Core applies the same
+        # identity contract when deriving the cell latch.
+        if "sim_reset" in state.get("capabilities", []):
+            continue
         component_id = state["component_id"]
         lifecycle = state["lifecycle"]
-        if lifecycle in ("fault", "offline"):
+        if component_id in simulator_ids:
+            continue
+        if "stop" in state or lifecycle in ("fault", "offline"):
             detail = (
-                state["fault"]["message"]
-                if "fault" in state
+                state["stop"]["message"] if "stop" in state
+                else state["fault"]["message"] if "fault" in state
                 else state.get("reason", {}).get("message", lifecycle)
             )
             reasons.append(
@@ -420,7 +490,7 @@ def run_readiness(
                 )
             )
     # Every hold is shown with its scope; only one meeting the Program's
-    # motion blocks Execute/Resume (§8, §10).
+    # motion blocks Execute/Resume.
     other_holds: list[BlockedReason] = []
     for hold in model.rule_holds:
         details = hold.get("details", {})
@@ -471,7 +541,7 @@ def run_readiness(
         "can_resume": cycle is not None
         and _runner_allows(cycle, _RESUME_COMMAND)
         and not reasons,
-        # §8: a rule hold gates only its own scope; the kernel refuses motion
+        # A rule hold gates only its own scope; the kernel refuses motion
         # in that scope (`rule_holds`), so it doesn't hold every group here.
         "motion_clear": all(reason["code"] == "rule_holds" for reason in reasons),
         "blocked_reasons": run_reasons + other_holds,
@@ -479,31 +549,40 @@ def run_readiness(
 
 
 def enable_all_targets(states: Iterable[ComponentState]) -> list[str]:
-    """Enable all = `enable` on every `prepared` member and owner-less
-    component, in cell order; owners have no Enable (§2, §16)."""
+    """Enable every prepared non-simulator member and owner-less component.
+
+    Simulators expose `sim_reset` and are controlled explicitly, never by
+    Activate-and-execute.
+    """
 
     states = list(states)
     owners = owner_ids(states)
     return [
         state["component_id"]
         for state in states
-        if state["lifecycle"] == "prepared" and state["component_id"] not in owners
+        if state["lifecycle"] == "prepared"
+        and state["component_id"] not in owners
+        and "sim_reset" not in state["capabilities"]
     ]
 
 
 def prepare_all_targets(states: Iterable[ComponentState]) -> list[str]:
-    """Prepare all = `prepare` on every `not_prepared` or `offline` component,
-    in cell order (the group action runs owners before their members)."""
+    """Prepare all not-prepared or offline non-simulator components.
+
+    Simulators expose `sim_reset` and are controlled explicitly, never by
+    Activate-and-execute.
+    """
 
     return [
         state["component_id"]
         for state in states
         if state["lifecycle"] in ("not_prepared", "offline")
+        and "sim_reset" not in state["capabilities"]
     ]
 
 
 def group_action_order(states: Iterable[ComponentState], action: str) -> list[str]:
-    """CONTRACTS §2: the order of a group action over the cell.
+    """The order of a group action over the cell.
 
     `prepare` runs each owner before its members, and anything that stops or
     removes (`STOPPING_ACTIONS`) runs the members before their owner; a
@@ -552,7 +631,7 @@ def lifecycle_timeouts_s(cell_graph: Mapping[str, Any]) -> dict[str, float]:
 
 
 def launch_settle_bound_s(timeouts: Iterable[float]) -> float:
-    """The host's launch bound (M7's bring-up bound, `LaunchSettleBound`): the
+    """The host's launch bound (the bring-up bound, `LaunchSettleBound`): the
     sum of the lifecycle timeouts of the components a composition launches or
     removes, one default when that is none."""
 
@@ -585,7 +664,7 @@ def wait_for_action(
 
     The coordinator publishes the finished action as ``last_action``. The wait
     is bounded by the component's lifecycle timeout (``timeout_s``): a result
-    that hasn't come back by then is ``unknown`` and nothing resends it (§2).
+    that hasn't come back by then is ``unknown`` and nothing resends it.
     """
 
     started_ns = time.time_ns()

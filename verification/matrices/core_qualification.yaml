@@ -1,4 +1,0 @@
-matrix_id: core_qualification
-description: Core deterministic qualification batch for industrial control-flow semantics.
-scenarios:
-  - verification/scenarios/basic_pick_and_place_complete.scenario.yaml

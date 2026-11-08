@@ -582,7 +582,7 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
           deployment.applicability_inputs().value().scene_pose_sources;
       !sources.empty())
     root.emplace_back("scene_pose_sources", EncodeScenePoseSources(sources));
-  // CP9 stream parameter overrides travel only from the revision-verified
+  // Stream parameter overrides travel only from the revision-verified
   // deployment projection; the normalized policies omit an empty table.
   if (const auto &policies =
           deployment.applicability_inputs().normalized_policies();
@@ -2013,7 +2013,7 @@ void detail::require_pinocchio_family_mimic_profile(
   for (const auto &joint : urdf.joints) {
     if (!joints_by_name.emplace(joint.name, &joint).second) {
       detail::fail_retained_bundle(
-          "I3 Pinocchio-family profile received duplicate URDF joints");
+          "Pinocchio-family profile received duplicate URDF joints");
     }
   }
   for (const auto &joint : urdf.joints) {
@@ -2023,14 +2023,14 @@ void detail::require_pinocchio_family_mimic_profile(
     const auto source = joints_by_name.find(joint.mimic->joint_name);
     if (source == joints_by_name.end()) {
       detail::fail_retained_bundle(
-          "I3 Pinocchio-family profile received an unresolved mimic "
+          "Pinocchio-family profile received an unresolved mimic "
           "source");
     }
     if (source->second->mimic.has_value()) {
       detail::fail_retained_bundle(
-          "I3 planning/collision publication rejects mimic-of-mimic: "
+          "planning/collision publication rejects mimic-of-mimic: "
           "the current Pinocchio-family import profile is qualified only "
-          "for one-level master/follower relations; generic I2 "
+          "for one-level master/follower relations; generic "
           "source/composition retains valid chains unchanged");
     }
   }
@@ -2363,12 +2363,12 @@ detail::RetainedBundleMaterializer::materialize_prepared(
           bundle->canonical_bytes()));
     } catch (const std::exception &error) {
       throw std::logic_error(
-          std::string("I3 materializer produced an invalid retained-bundle "
+          std::string("materializer produced an invalid retained-bundle "
                       "projection: ") +
           error.what());
     }
     throw std::logic_error(
-        "I3 materializer projection reparsed but differed from its typed "
+        "materializer projection reparsed but differed from its typed "
         "value");
   }
   return bundle;

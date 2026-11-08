@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <future>
 #include <gtest/gtest.h>
@@ -30,6 +31,11 @@ public:
       const control_msgs::msg::JointTrajectoryControllerState& message) {
     Ros2ControlExecutionBackend::ReceiveState(port.state_, message);
   }
+  static void receive_gated_state(Ros2ControlExecutionBackend& port,
+      const std::shared_ptr<std::atomic<bool>>& gate,
+      const control_msgs::msg::JointTrajectoryControllerState& message) {
+    Ros2ControlExecutionBackend::ReceiveGatedState(port.state_, gate, message);
+  }
   static bool executor_is_spinning(const Ros2TransportResources &resources) {
     return resources.executor_->is_spinning();
   }
@@ -46,6 +52,9 @@ public:
   }
   static auto client(const Ros2ControlExecutionBackend &port) {
     return port.action_client_;
+  }
+  static auto client_group(const Ros2ControlExecutionBackend &port) {
+    return port.action_callback_group_;
   }
   static bool owns_sdk_entities(const Ros2ControlExecutionBackend &port) {
     return port.action_client_ && port.state_sub_ && port.scale_pub_;
@@ -79,6 +88,43 @@ bool wait_until(const std::function<bool()> &condition) {
   }
   return condition();
 }
+struct ScopedTransportQuiesce {
+  Ros2TransportResources &resources;
+  ~ScopedTransportQuiesce() { resources.quiesce(); }
+};
+// Holds an owner busy in one dispatched task (bounded at 3 s, below the
+// owner-stall bound) until released or destroyed.
+class BlockedOwner {
+public:
+  explicit BlockedOwner(Ros2TransportResources &owner)
+      : thread_([this, &owner] {
+          owner.invoke([this] {
+            entered_.set_value();
+            (void)release_future_.wait_for(3s);
+          });
+          finished_.store(true);
+        }) {
+    entered = entered_future_.wait_for(3s) == std::future_status::ready;
+  }
+  ~BlockedOwner() {
+    release();
+    thread_.join();
+  }
+  void release() {
+    std::call_once(released_, [this] { release_.set_value(); });
+  }
+  bool finished() const { return finished_.load(); }
+  bool entered{false};
+
+private:
+  std::promise<void> entered_;
+  std::future<void> entered_future_ = entered_.get_future();
+  std::promise<void> release_;
+  std::future<void> release_future_ = release_.get_future();
+  std::once_flag released_;
+  std::atomic<bool> finished_{false};
+  std::thread thread_;
+};
 ExecutionGoalKey key(std::uint64_t generation) {
   return {ControllerGoalId("test.operation.arm"),
           ControllerGoalGeneration(generation)};
@@ -109,11 +155,61 @@ public:
   }
 };
 
+// The production scheduler has an independent StopControl worker. This
+// small test scheduler preserves that asynchronous boundary for late cancel.
+class TestStopScheduler final : public IScheduler {
+public:
+  TestStopScheduler() : worker_([this] {
+    for (;;) {
+      std::function<void()> task;
+      {
+        std::unique_lock lock(mutex_);
+        cv_.wait(lock, [&] { return closing_ || !tasks_.empty(); });
+        if (tasks_.empty() && closing_) return;
+        task = std::move(tasks_.front());
+        tasks_.pop_front();
+      }
+      task();
+    }
+  }) {}
+  ~TestStopScheduler() override {
+    { std::lock_guard lock(mutex_); closing_ = true; }
+    cv_.notify_all();
+    worker_.join();
+  }
+  ScheduleHandle schedule(TimePoint, std::function<void()> task,
+                          SchedulerPriority priority) override {
+    if (reject.load()) throw std::runtime_error("injected StopControl refusal");
+    if (priority != SchedulerPriority::StopControl)
+      throw std::logic_error("unexpected test scheduler lane");
+    std::lock_guard lock(mutex_);
+    const auto handle = ++next_;
+    tasks_.push_back(std::move(task));
+    cv_.notify_one();
+    return handle;
+  }
+  void cancel(ScheduleHandle) override {}
+  std::atomic<bool> reject{false};
+private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<std::function<void()>> tasks_;
+  bool closing_{false};
+  ScheduleHandle next_{0};
+  std::thread worker_;
+};
+
 class Rig {
 public:
-  FakeClock clock;
+  std::shared_ptr<FakeClock> clock_owner = std::make_shared<FakeClock>();
+  FakeClock &clock = *clock_owner;
+  TestStopScheduler scheduler;
   std::shared_ptr<Sink> sink = std::make_shared<Sink>();
-  Ros2TransportResources resources;
+  // The fake server remains live independently of each adapter epoch.
+  std::shared_ptr<Ros2TransportResources> resources_owner;
+  Ros2TransportResources &resources;
+  std::shared_ptr<Ros2TransportResources> epoch_resources;
+  std::shared_ptr<Ros2TransportResources> successor_resources;
   std::unique_ptr<Ros2ControlExecutionBackend> adapter;
   std::unique_ptr<Ros2ControlExecutionBackend> successor;
   std::atomic<std::uint64_t> cancel_count{0};
@@ -132,8 +228,9 @@ public:
   explicit Rig(bool two_bindings = false, bool scheduled_replacement = false,
                ExecutionGoalTolerancePolicy goal_tolerance_policy =
                    ExecutionGoalTolerancePolicy::kErased)
-      : resources("jtc_adapter_test_" + std::to_string(++sequence_), "", 2,
-                  sink, "arm", clock) {
+      : resources_owner(Ros2TransportResources::create(
+            "jtc_adapter_test_" + std::to_string(++sequence_), "", 2, sink, "arm", clock)),
+        resources(*resources_owner) {
     goal_tolerance_policy_ = goal_tolerance_policy;
     route_ = "/adapter_test_" + std::to_string(sequence_.load());
     server_ = rclcpp_action::create_server<Action>(
@@ -150,7 +247,11 @@ public:
                      ? rclcpp_action::GoalResponse::REJECT
                      : rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
         },
-        [this](std::shared_ptr<ServerGoal>) {
+        [this](std::shared_ptr<ServerGoal> handle) {
+          {
+            std::lock_guard lock(cancel_ids_mutex_);
+            cancel_ids_.push_back(handle->get_goal_id());
+          }
           ++cancel_count;
           if (delay_next_cancel.exchange(false)) {
             std::unique_lock lock(response_mutex_);
@@ -171,23 +272,21 @@ public:
                      ->create_publisher<
                          control_msgs::msg::JointTrajectoryControllerState>(
                          route_ + "/state", rclcpp::QoS(10).reliable());
-    scale_sub_ =
-        resources.node()
-            ->create_subscription<control_msgs::msg::SpeedScalingFactor>(
-                route_ + "/scale", rclcpp::QoS(1).reliable().transient_local(),
-                [this](control_msgs::msg::SpeedScalingFactor::ConstSharedPtr
-                           value) {
-                  last_scale = value->factor;
-                  ++scale_count;
-                });
+    scale_sub_ = make_scale_subscriber();
     clock.set(42);
+    epoch_resources = make_epoch();
     adapter = std::make_unique<Ros2ControlExecutionBackend>(
-        resources, clock, config(1, scheduled_replacement));
-    if (two_bindings)
+        epoch_resources, clock_owner, scheduler, config(1, scheduled_replacement));
+    if (two_bindings) {
+      successor_resources = make_epoch();
       successor = std::make_unique<Ros2ControlExecutionBackend>(
-          resources, clock, config(2, scheduled_replacement));
+          successor_resources, clock_owner, scheduler, config(2, scheduled_replacement));
+    }
     adapter->ObserveReadiness({true, true, true, ExecutionBindingEpoch{1}});
     resources.start();
+    epoch_resources->start();
+    if (successor_resources)
+      successor_resources->start();
   }
   ~Rig() {
     release_response();
@@ -199,12 +298,50 @@ public:
     adapter.reset();
     successor.reset();
   }
+  rclcpp::Subscription<control_msgs::msg::SpeedScalingFactor>::SharedPtr
+  make_scale_subscriber() {
+    return resources.node()
+        ->create_subscription<control_msgs::msg::SpeedScalingFactor>(
+            route_ + "/scale", rclcpp::QoS(1).reliable().transient_local(),
+            [this](control_msgs::msg::SpeedScalingFactor::ConstSharedPtr value) {
+              last_scale = value->factor;
+              ++scale_count;
+            });
+  }
+  // The fake controller stops and starts listening for scale input; its
+  // subscription is created and destroyed on its own owner thread.
+  void drop_scale_subscriber() {
+    resources.invoke([this] { scale_sub_.reset(); });
+  }
+  void restore_scale_subscriber() {
+    resources.invoke_creation([this] { scale_sub_ = make_scale_subscriber(); });
+  }
+  std::shared_ptr<Ros2TransportResources> make_epoch() {
+    return Ros2TransportResources::create(
+        "jtc_epoch_test_" + std::to_string(++sequence_), "", 1);
+  }
+  void rebind(std::uint64_t epoch) {
+    epoch_resources = make_epoch();
+    adapter = std::make_unique<Ros2ControlExecutionBackend>(
+        epoch_resources, clock_owner, scheduler, config(epoch));
+    adapter->ObserveReadiness({true, true, true, ExecutionBindingEpoch{epoch}});
+    epoch_resources->start();
+  }
   void release_response() {
     std::lock_guard lock(response_mutex_);
     response_released_ = true;
     response_cv_.notify_all();
   }
-  void remove_action_server() { server_.reset(); }
+  void remove_action_server() {
+    // The server executor's wait set can retain the waitable after the last
+    // fixture reference is reset. Unregister and wake recollection first.
+    auto server = std::move(server_);
+    const auto node = resources.node();
+    node->get_node_waitables_interface()->remove_waitable(server, nullptr);
+    node->get_node_base_interface()->get_default_callback_group()
+        ->trigger_notify_guard_condition();
+    server.reset();
+  }
   JtcExecutionAdapterConfig config(std::uint64_t epoch,
                                    bool scheduled_replacement = false) const {
     JtcExecutionAdapterConfig config;
@@ -212,6 +349,7 @@ public:
     config.state_topic = route_ + "/state";
     config.scale_topic = route_ + "/scale";
     config.binding_epoch = ExecutionBindingEpoch(epoch);
+    config.lifecycle_command_timeout_ns = 1'000'000'000;
     config.lane_facts.joint_names = {"a", "b"};
     config.lane_facts.supports_scale = true;
     config.lane_facts.supports_scheduled_replacement = scheduled_replacement;
@@ -256,6 +394,10 @@ public:
     std::lock_guard lock(mutex_);
     return goals_.size();
   }
+  std::vector<rclcpp_action::GoalUUID> cancel_ids() {
+    std::lock_guard lock(cancel_ids_mutex_);
+    return cancel_ids_;
+  }
   void state(double factor = 0.25, std::uint32_t nanosecond = 0) {
     EXPECT_TRUE(
         wait_until([&] { return state_pub_->get_subscription_count() > 0; }));
@@ -284,6 +426,8 @@ private:
   static std::atomic<std::uint64_t> sequence_;
   std::string route_;
   std::mutex mutex_;
+  std::mutex cancel_ids_mutex_;
+  std::vector<rclcpp_action::GoalUUID> cancel_ids_;
   std::mutex response_mutex_;
   std::condition_variable response_cv_;
   bool response_released_{false};
@@ -296,6 +440,31 @@ private:
 };
 std::atomic<std::uint64_t> Rig::sequence_{0};
 
+TEST(Ros2ControlExecutionBackendTest, StagedStateGateDoesNotReplayPremarkerSample) {
+  Rig rig;
+  auto epoch = rig.make_epoch();
+  auto gate = std::make_shared<std::atomic<bool>>(false);
+  Ros2ControlExecutionBackend adapter(epoch, rig.clock_owner, rig.scheduler, rig.config(2), gate);
+  // State samples are admitted only once the backend's readiness is observed.
+  adapter.ObserveReadiness({true, true, true, ExecutionBindingEpoch(2)});
+  control_msgs::msg::JointTrajectoryControllerState message;
+  message.joint_names = {"a", "b"};
+  message.reference.positions = {0.1, 0.2};
+  message.reference.velocities = {0.0, 0.0};
+  message.output.positions = {0.1, 0.2};
+  message.feedback.positions = {0.1, 0.2};
+  message.error.positions = {0.0, 0.0};
+  JtcExecutionPortTestPeer::receive_gated_state(adapter, gate, message);
+  EXPECT_FALSE(adapter.ReadSample());
+  gate->store(true, std::memory_order_release);
+  EXPECT_FALSE(adapter.ReadSample());
+  message.header.stamp.sec = 9;
+  JtcExecutionPortTestPeer::receive_gated_state(adapter, gate, message);
+  const auto sample = adapter.ReadSample();
+  ASSERT_TRUE(sample);
+  EXPECT_EQ(sample->source_stamp_ns, 9'000'000'000LL);
+}
+
 TEST(JtcExecutionPort, StateReceiptIsAcquiredBeforeStateLockAndNeverRestamped) {
   Rig rig;
   class AcquisitionClock final : public IClock {
@@ -307,8 +476,11 @@ TEST(JtcExecutionPort, StateReceiptIsAcquiredBeforeStateLockAndNeverRestamped) {
       if (on_read) on_read();
       return acquired;
     }
-  } clock;
-  Ros2ControlExecutionBackend adapter(rig.resources, clock, rig.config(2));
+  };
+  auto clock_owner = std::make_shared<AcquisitionClock>();
+  auto &clock = *clock_owner;
+  auto epoch = rig.make_epoch();
+  Ros2ControlExecutionBackend adapter(epoch, clock_owner, rig.scheduler, rig.config(2));
   adapter.ObserveReadiness({true, true, true, ExecutionBindingEpoch(2)});
   std::promise<void> entered;
   auto acquisition = entered.get_future();
@@ -354,6 +526,17 @@ TEST(JtcExecutionPort, EndpointFactsKeepRetainedBindingsAndScalingPublishersSepa
   EXPECT_EQ(rig.goal_count(), 0U);
 }
 
+// OD-62 (b): the scale publisher's matched event tracks whether the
+// controller listens; readers load an atomic, nothing polls the graph.
+TEST(JtcExecutionPort, ScaleInputListeningFollowsTheMatchedSubscriber) {
+  Rig rig;
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ScaleInputListening() == std::optional(true); }));
+  rig.drop_scale_subscriber();
+  EXPECT_TRUE(wait_until([&] { return rig.adapter->ScaleInputListening() == std::optional(false); }));
+  rig.restore_scale_subscriber();
+  EXPECT_TRUE(wait_until([&] { return rig.adapter->ScaleInputListening() == std::optional(true); }));
+}
+
 TEST(JtcExecutionPort, EndpointFactsNameSecondPublisherAndRestartOverlap) {
   Rig rig;
   std::optional<ErrorDTO> observed;
@@ -373,7 +556,8 @@ TEST(JtcExecutionPort, EndpointFactsNameSecondPublisherAndRestartOverlap) {
   const auto topic = rig.config(1).state_topic;
   // A second instance's publisher, on its own unspun node (see
   // EndpointFactsCountZeroOneAndTwoPublishers).
-  Ros2TransportResources peer("endpoint_second_instance", "", 1);
+  auto peer_owner = Ros2TransportResources::create("endpoint_second_instance", "", 1);
+  auto &peer = *peer_owner;
   auto second = peer.node()->create_publisher<
       control_msgs::msg::JointTrajectoryControllerState>(topic, rclcpp::QoS(10));
   ASSERT_TRUE(wait_until([&] {
@@ -415,9 +599,9 @@ TEST(JtcExecutionPort, EndpointGraphFindsIncompatibleQosPublisherWithoutMatchedC
 TEST(JtcExecutionPort, EndpointFactsDoNotCountSharedJointStatePublishers) {
   Rig rig;
   auto first = rig.resources.node()->create_publisher<sensor_msgs::msg::JointState>(
-      "/q127_shared_isaac_joint_states", 10);
+      "/shared_isaac_joint_states", 10);
   auto second = rig.resources.node()->create_publisher<sensor_msgs::msg::JointState>(
-      "/q127_shared_isaac_joint_states", 10);
+      "/shared_isaac_joint_states", 10);
   ASSERT_TRUE(wait_until([&] {
     rig.adapter->RefreshEndpointFacts();
     return !rig.adapter->ReadEndpointDiagnostic();
@@ -436,7 +620,7 @@ TEST(JtcExecutionPort, EndpointFactsReportGraphReadFailureAsNotEstablished) {
   EXPECT_EQ(rig.goal_count(), 0U);
 }
 
-// EPC-1: the selected topic's publisher count alone decides: 0 is not
+// The selected topic's publisher count alone decides: 0 is not
 // established, 1 is clean, 2+ is a duplicate instance.
 std::optional<std::string> endpoint_code(SelectedRosEndpointFacts &facts) {
   facts.Refresh();
@@ -456,7 +640,8 @@ TEST(JtcExecutionPort, EndpointFactsCountZeroOneAndTwoPublishers) {
   EXPECT_EQ(facts.ReadError()->details.at("endpoint_count"), "0");
   // The publishers live on another, unspun node: a publisher on the spinning
   // rig node stays in the graph until its executor wakes up again.
-  Ros2TransportResources peer("endpoint_count_peer", "", 1);
+  auto peer_owner = Ros2TransportResources::create("endpoint_count_peer", "", 1);
+  auto &peer = *peer_owner;
   auto first = peer.node()->create_publisher<sensor_msgs::msg::JointState>(topic, 10);
   ASSERT_TRUE(wait_until([&] { return !endpoint_code(facts); }));
   auto second = peer.node()->create_publisher<sensor_msgs::msg::JointState>(topic, 10);
@@ -499,7 +684,7 @@ TEST(JtcExecutionPort, EndpointFactsIgnoreUnrelatedNodesStartingAndStopping) {
   };
   for (int cycle = 0; cycle < 3; ++cycle) {
     const auto name = "endpoint_count_unrelated_" + std::to_string(cycle);
-    auto unrelated = std::make_unique<Ros2TransportResources>(name, "", 1);
+    auto unrelated = Ros2TransportResources::create(name, "", 1);
     auto other = unrelated->node()->create_publisher<sensor_msgs::msg::JointState>(
         "/endpoint_count_unrelated_other", 10);
     ASSERT_TRUE(wait_until([&] {
@@ -538,7 +723,7 @@ TEST(JtcExecutionPort, SubmitMapsFullPvaAndReportsLocalAcceptanceAndUuid) {
   EXPECT_EQ(actual->goal_tolerance[0].position, -1.0);
 }
 
-// Merge 6 arrival: a lane that keeps goal tolerances sends none, so stock JTC
+// Arrival: a lane that keeps goal tolerances sends none, so stock JTC
 // applies its configured per-joint `goal` constraint (the lane's arrival
 // tolerance) and succeeds only when finished within it.
 TEST(JtcExecutionPort, KeptGoalTolerancesSendNoOverride) {
@@ -550,7 +735,7 @@ TEST(JtcExecutionPort, KeptGoalTolerancesSendNoOverride) {
   EXPECT_TRUE(actual->path_tolerance.empty());
 }
 
-// Maintainer M6 (reverses ARRIVE-FIX1): on a lane that keeps goal tolerances,
+// On a lane that keeps goal tolerances,
 // a Stop goal (ramp, spring-back, brake), immediate or scheduled, carries no
 // per-goal override and no goal time, exactly like a motion goal: stock JTC
 // applies the lane's arrival tolerance and `goal_time`. A cancel-type Stop
@@ -566,6 +751,8 @@ TEST(JtcExecutionPort, StopGoalsKeepTheLaneArrivalCheckLikeMotionGoals) {
   const auto preempt = [&](std::size_t index, const ExecutionGoalKey &predecessor) {
     auto result = std::make_shared<Action::Result>();
     result->error_code = Action::Result::INVALID_GOAL;
+    // Stock JTC's preemption result, so the record ends known (evictable).
+    result->error_string = "Current goal preempted by new incoming action.";
     rig.handle(index)->abort(result);
     ASSERT_TRUE(wait_until([&] {
       const auto goal = rig.adapter->ReadGoal(predecessor);
@@ -582,10 +769,9 @@ TEST(JtcExecutionPort, StopGoalsKeepTheLaneArrivalCheckLikeMotionGoals) {
   EXPECT_TRUE(lane_check(*rig.handle(1)->get_goal()));
   preempt(0, key(1));
   // A Stop replacement.
-  ASSERT_EQ(rig.adapter
-                ->Replace(key(2), key(3), trajectory())
-                .dispatch,
-            ExecutionPortDispatch::kDispatched);
+  const auto stop_replace = rig.adapter->Replace(key(2), key(3), trajectory());
+  ASSERT_EQ(stop_replace.dispatch, ExecutionPortDispatch::kDispatched)
+      << (stop_replace.error ? stop_replace.error->message : std::string("no error"));
   ASSERT_TRUE(rig.accepted(key(3)));
   EXPECT_TRUE(lane_check(*rig.handle(2)->get_goal()));
   preempt(1, key(2));
@@ -646,6 +832,46 @@ TEST(JtcExecutionPort, PendingCancelIsRetainedAndSentOnAcceptance) {
   EXPECT_FALSE(rig.adapter->ReadSample());
 }
 
+// Readiness-loss cancels still leave through the StopControl scheduler; a
+// refused schedule is reported at once, on the caller's thread.
+TEST(JtcExecutionPort, RejectedLossCancelScheduleReportsUnknownActivity) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  rig.scheduler.reject.store(true);
+  rig.adapter->ObserveReadiness({false, true, true, ExecutionBindingEpoch{1}});
+  EXPECT_TRUE(rig.adapter->ReadGoalActivity().late_cancel_not_issued);
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+  const auto goal = rig.adapter->ReadGoal(key(1));
+  ASSERT_TRUE(goal);
+  EXPECT_FALSE(goal->cancel_sent_local_stamp);
+  EXPECT_EQ(goal->result, ExecutionGoalResult::kEndedUnknown);
+}
+
+// A cancel requested before acceptance is sent from the goal-response
+// callback itself: a refusing scheduler cannot stop it, and it is sent once.
+TEST(JtcExecutionPort, PendingCancelIsSentFromResponseWithoutSchedulerHop) {
+  Rig rig;
+  rig.delay_next_response = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.response_blocked.load(); }));
+  ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kEffectUncertain);
+  rig.scheduler.reject.store(true);
+  rig.release_response();
+  const auto accepted = rig.handle();
+  ASSERT_TRUE(wait_until([&] {
+    return rig.adapter->ReadGoal(key(1))
+        ->cancel_ack_local_receipt_stamp.has_value();
+  }));
+  EXPECT_EQ(rig.cancel_count.load(), 1U);
+  EXPECT_EQ(rig.cancel_ids(),
+            (std::vector<rclcpp_action::GoalUUID>{accepted->get_goal_id()}));
+  EXPECT_FALSE(rig.adapter->ReadGoalActivity().late_cancel_not_issued);
+  EXPECT_TRUE(rig.adapter->ReadGoal(key(1))->cancel_sent_local_stamp);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->result);
+}
+
 TEST(JtcExecutionPort, RejectedPendingCancelSendsNothing) {
   Rig rig;
   rig.delay_next_response = true;
@@ -663,7 +889,7 @@ TEST(JtcExecutionPort, RejectedPendingCancelSendsNothing) {
   EXPECT_EQ(rig.cancel_count.load(), 0U);
 }
 
-TEST(JtcExecutionPort, RetiredPendingCancelCannotSendOnLateAcceptance) {
+TEST(JtcExecutionPort, RetiredPendingCancelSendsOnceOnLateAcceptance) {
   Rig rig;
   rig.delay_next_response = true;
   ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
@@ -672,10 +898,11 @@ TEST(JtcExecutionPort, RetiredPendingCancelCannotSendOnLateAcceptance) {
             ExecutionPortDispatch::kEffectUncertain);
   rig.adapter->ObserveReadiness({false, true, true, ExecutionBindingEpoch{1}});
   rig.release_response();
-  (void)rig.handle();
+  const auto accepted = rig.handle();
+  ASSERT_TRUE(wait_until([&] { return rig.cancel_count.load() == 1U; }));
+  EXPECT_EQ(rig.cancel_ids(), (std::vector<rclcpp_action::GoalUUID>{accepted->get_goal_id()}));
   EXPECT_EQ(rig.adapter->ReadGoal(key(1))->result,
             ExecutionGoalResult::kEndedUnknown);
-  EXPECT_EQ(rig.cancel_count.load(), 0U);
 }
 
 TEST(JtcExecutionPort, ShutdownReleasesSdkOwnersWithoutSendingPendingCancel) {
@@ -709,7 +936,8 @@ TEST(JtcExecutionPort, ShutdownUnregistersClientWhileCollectionIsInProgress) {
   Rig rig;
   auto client = JtcExecutionPortTestPeer::client(*rig.adapter);
   const auto sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);
-  auto group = rig.resources.node()->get_node_base_interface()->get_default_callback_group();
+  // The client lives in its own time-critical group (OD-66).
+  auto group = JtcExecutionPortTestPeer::client_group(*rig.adapter);
   std::mutex mutex;
   std::condition_variable cv;
   bool entered = false;
@@ -785,45 +1013,33 @@ TEST(JtcExecutionPort, PendingCancelResponseCannotReviveRetiredFactsOrNewEpoch) 
   EXPECT_EQ(rig.scale_count.load(), 0U);
 }
 
-TEST(JtcExecutionPort, ExecutorKeepsSdkAliveThroughExecutingFeedbackCallback) {
+TEST(JtcExecutionPort, OwnedShutdownDrainsFiniteFeedbackCallback) {
   Rig rig;
-  struct Gate {
-    std::mutex mutex;
-    std::condition_variable cv;
-    bool entered{false};
-    bool released{false};
+  struct FeedbackState {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> completed{false};
   };
-  auto gate = std::make_shared<Gate>();
+  auto feedback = std::make_shared<FeedbackState>();
   auto client = JtcExecutionPortTestPeer::client(*rig.adapter);
   const auto sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);
-  // Use this actual SDK client's feedback callback as a deterministic barrier
-  // inside Client::execute, without blocking an adapter facts/command lock.
   rclcpp_action::Client<Action>::SendGoalOptions options;
-  options.feedback_callback = [gate](auto, auto) {
-    std::unique_lock lock(gate->mutex);
-    gate->entered = true;
-    gate->cv.notify_all();
-    gate->cv.wait_for(lock, 3s, [&] { return gate->released; });
+  options.feedback_callback = [feedback](auto, auto) {
+    feedback->entered = true;
+    std::this_thread::sleep_for(200ms);
+    feedback->completed = true;
   };
   Action::Goal goal;
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ActionServerIsReady(); }));
   auto future = client->async_send_goal(goal, options);
   ASSERT_TRUE(wait_until([&] { return future.wait_for(0s) == std::future_status::ready; }));
   ASSERT_TRUE(future.get());
-  client.reset(); // Only adapter and SDK execution ownership remain.
+  client.reset();
   rig.handle()->publish_feedback(std::make_shared<Action::Feedback>());
-  {
-    std::unique_lock lock(gate->mutex);
-    ASSERT_TRUE(gate->cv.wait_for(lock, 3s, [&] { return gate->entered; }));
-  }
+  ASSERT_TRUE(wait_until([&] { return feedback->entered.load(); }));
   rig.adapter->shutdown();
+  EXPECT_TRUE(feedback->completed.load());
   EXPECT_FALSE(JtcExecutionPortTestPeer::owns_sdk_entities(*rig.adapter));
-  EXPECT_FALSE(sdk.client.expired()); // Actual executor-owned raw-this callback.
   rig.adapter.reset();
-  {
-    std::lock_guard lock(gate->mutex);
-    gate->released = true;
-  }
-  gate->cv.notify_all();
   ASSERT_TRUE(wait_until([&] { return sdk.expired(); }));
   EXPECT_EQ(rig.cancel_count.load(), 0U);
   EXPECT_EQ(rig.scale_count.load(), 0U);
@@ -859,9 +1075,7 @@ TEST(JtcExecutionPort, RepeatedBindingsReturnAllSdkEntityCountsToBaseline) {
     rig.adapter.reset();
     ASSERT_TRUE(wait_until([&] { return sdk.expired() && assert_no_entities(); }));
     if (epoch < 20) {
-      rig.adapter = std::make_unique<Ros2ControlExecutionBackend>(rig.resources, rig.clock,
-                                                                 rig.config(epoch + 1));
-      rig.adapter->ObserveReadiness({true, true, true, ExecutionBindingEpoch{epoch + 1}});
+      rig.rebind(epoch + 1);
     }
   }
 }
@@ -880,10 +1094,7 @@ TEST(JtcExecutionPort, RepeatedRebindAndTransportShutdownStress) {
       ASSERT_TRUE(wait_until([&] { return sdk.expired(); }));
       EXPECT_TRUE(rig.resources.started());
       if (epoch < 20) {
-        rig.adapter = std::make_unique<Ros2ControlExecutionBackend>(
-            rig.resources, rig.clock, rig.config(epoch + 1));
-        rig.adapter->ObserveReadiness(
-            {true, true, true, ExecutionBindingEpoch{epoch + 1}});
+        rig.rebind(epoch + 1);
       }
     }
     rig.resources.quiesce();
@@ -921,8 +1132,9 @@ TEST(JtcExecutionPort, ImmediateQuiescenceAfterStartCannotLoseExecutorCancellati
   FakeClock clock;
   const auto sink = std::make_shared<Sink>();
   for (unsigned iteration = 0; iteration < 8U; ++iteration) {
-    Ros2TransportResources resources("jtc_immediate_quiescence_" + std::to_string(iteration),
+    auto resources_owner = Ros2TransportResources::create("jtc_immediate_quiescence_" + std::to_string(iteration),
                                     "", 2, sink, "arm", clock);
+    auto &resources = *resources_owner;
     resources.start();
     EXPECT_TRUE(JtcExecutionPortTestPeer::executor_is_spinning(resources));
     resources.quiesce();
@@ -932,8 +1144,9 @@ TEST(JtcExecutionPort, ImmediateQuiescenceAfterStartCannotLoseExecutorCancellati
 }
 
 TEST(Ros2TransportResources, TransportOnlyRunsCallbacksWithoutSceneProjection) {
-  Ros2TransportResources resources("generic_io_transport_test",
+  auto resources_owner = Ros2TransportResources::create("generic_io_transport_test",
                                    "/generic_io_test", 2);
+  auto &resources = *resources_owner;
   EXPECT_EQ(std::string(resources.node()->get_namespace()), "/generic_io_test");
   EXPECT_THROW(resources.projection_worker(), std::logic_error);
   auto received = std::make_shared<std::promise<void>>();
@@ -955,64 +1168,56 @@ TEST(Ros2TransportResources, TransportOnlyRunsCallbacksWithoutSceneProjection) {
   resources.quiesce();
 }
 
-// Production layout: the host builds every transport with 3 executor threads.
-// A throwing callback ends only the thread that ran it; the others keep
-// serving callbacks and the fault is typed instead of std::terminate.
-TEST(Ros2TransportResources, ExecutorCallbackThrowIsAContainedTypedFaultWithThreeThreads) {
-  Ros2TransportResources resources("executor_fault_transport_test",
+// A callback exception ends the stock single-threaded owner and publishes the
+// existing typed fault exactly once. Entities are created before spin.
+TEST(Ros2TransportResources, ExecutorCallbackThrowEndsOwnerWithTypedFault) {
+  auto resources_owner = Ros2TransportResources::create("executor_fault_transport_test",
                                    "/executor_fault_test", 3);
+  auto &resources = *resources_owner;
+  EXPECT_EQ(resources.owner_name(), "/executor_fault_test/executor_fault_transport_test");
   std::atomic<int> observed{0};
   resources.set_executor_fault_observer([&](std::string_view reason) {
     EXPECT_EQ(reason, "ros_transport_executor_failed");
     ++observed;
   });
   EXPECT_FALSE(resources.executor_fault().has_value());
+  const auto timer = resources.node()->create_wall_timer(
+      1ms, [] { throw std::runtime_error("executor callback failed"); });
+  ScopedTransportQuiesce join{resources};
   resources.start();
-  const auto node = resources.node();
-  const auto throwing_group =
-      node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-  const auto healthy_group =
-      node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-  std::atomic<bool> thrown{false};
-  std::atomic<int> ticks{0};
-  const auto throwing = node->create_wall_timer(
-      1ms,
-      [&] {
-        if (!thrown.exchange(true))
-          throw std::runtime_error("executor callback failed");
-      },
-      throwing_group);
-  const auto healthy = node->create_wall_timer(1ms, [&] { ++ticks; }, healthy_group);
   ASSERT_TRUE(wait_until([&] { return resources.executor_fault().has_value(); }));
+  resources.quiesce();
   EXPECT_EQ(resources.executor_fault(),
             std::optional<std::string>("executor callback failed"));
-  const int after_fault = ticks.load();
-  ASSERT_TRUE(wait_until([&] { return ticks.load() > after_fault + 5; }));
-  EXPECT_TRUE(JtcExecutionPortTestPeer::executor_is_spinning(resources));
+  EXPECT_FALSE(JtcExecutionPortTestPeer::executor_is_spinning(resources));
   EXPECT_EQ(observed.load(), 1);
-  resources.quiesce();
 }
 
-// A callback that throws every time ends all 3 threads in turn, the spinning
-// thread included: still no terminate, one recorded fault, one notification.
-TEST(Ros2TransportResources, RepeatedExecutorThrowsEndEveryThreadWithoutTerminating) {
-  Ros2TransportResources resources("executor_fault_repeat_test",
-                                   "/executor_fault_test", 3);
-  std::atomic<int> observed{0};
-  resources.set_executor_fault_observer([&](std::string_view) { ++observed; });
-  resources.start();
-  const auto timer = resources.node()->create_wall_timer(
-      1ms, [] { throw std::runtime_error("executor wait failed"); });
-  ASSERT_TRUE(wait_until(
-      [&] { return !JtcExecutionPortTestPeer::executor_is_spinning(resources); }));
-  EXPECT_EQ(resources.executor_fault(), std::optional<std::string>("executor wait failed"));
-  EXPECT_EQ(observed.load(), 1);
-  resources.quiesce();
+// A fault remains contained in each independently owned transport.
+TEST(Ros2TransportResources, ExecutorFaultIsContainedInIndependentOwners) {
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    auto resources_owner = Ros2TransportResources::create("executor_fault_repeat_test",
+                                     "/executor_fault_test", 3);
+    auto &resources = *resources_owner;
+    std::atomic<int> observed{0};
+    resources.set_executor_fault_observer([&](std::string_view) { ++observed; });
+    const auto timer = resources.node()->create_wall_timer(
+        1ms, [] { throw std::runtime_error("executor wait failed"); });
+    ScopedTransportQuiesce join{resources};
+    resources.start();
+    ASSERT_TRUE(wait_until([&] { return resources.executor_fault().has_value(); }));
+    resources.quiesce();
+    EXPECT_FALSE(JtcExecutionPortTestPeer::executor_is_spinning(resources));
+    EXPECT_EQ(resources.executor_fault(),
+              std::optional<std::string>("executor wait failed"));
+    EXPECT_EQ(observed.load(), 1);
+  }
 }
 
 TEST(Ros2TransportResources, TransportOnlyCanQuiesceBeforeStart) {
-  Ros2TransportResources resources("generic_io_unstarted_transport_test", "",
+  auto resources_owner = Ros2TransportResources::create("generic_io_unstarted_transport_test", "",
                                    2);
+  auto &resources = *resources_owner;
   EXPECT_FALSE(resources.started());
   resources.quiesce();
   EXPECT_FALSE(
@@ -1034,9 +1239,10 @@ TEST(Ros2TransportResources, SuppliedContextSurvivesLocalQuiescenceAndRetainedNo
       ++provider_calls;
       return context;
     };
-    auto first = std::make_unique<Ros2TransportResources>(
+    auto first = Ros2TransportResources::create(
         "shared_context_first", "", 2, provider);
-    Ros2TransportResources second("shared_context_second", "", 2, provider);
+    auto second_owner = Ros2TransportResources::create("shared_context_second", "", 2, provider);
+    auto &second = *second_owner;
     EXPECT_EQ(provider_calls, 2U);
     EXPECT_NE(first->node(), second.node());
     EXPECT_EQ(first->node()->get_node_base_interface()->get_context(), context);
@@ -1073,23 +1279,25 @@ TEST(Ros2TransportResources, SuppliedContextSurvivesLocalQuiescenceAndRetainedNo
 
 TEST(Ros2TransportResources, SuppliedContextMustAlreadyBeValid) {
   auto context = std::make_shared<rclcpp::Context>();
-  EXPECT_THROW((Ros2TransportResources("uninitialized_context", "", 2,
+  EXPECT_THROW((Ros2TransportResources::create("uninitialized_context", "", 2,
                                       [context] { return context; })),
                std::invalid_argument);
-  EXPECT_THROW((Ros2TransportResources("null_context", "", 2,
+  EXPECT_THROW((Ros2TransportResources::create("null_context", "", 2,
                                       [] { return std::shared_ptr<rclcpp::Context>{}; })),
                std::invalid_argument);
   int argc = 0;
   context->init(argc, nullptr);
   context->shutdown("test invalid supplied context");
-  EXPECT_THROW((Ros2TransportResources("shutdown_context", "", 2,
+  EXPECT_THROW((Ros2TransportResources::create("shutdown_context", "", 2,
                                       [context] { return context; })),
                std::invalid_argument);
 }
 
 TEST(Ros2TransportResources, DefaultPrivateContextsRemainIndependent) {
-  Ros2TransportResources first("private_context_first", "", 2);
-  Ros2TransportResources second("private_context_second", "", 2);
+  auto first_owner = Ros2TransportResources::create("private_context_first", "", 2);
+  auto &first = *first_owner;
+  auto second_owner = Ros2TransportResources::create("private_context_second", "", 2);
+  auto &second = *second_owner;
   const auto first_context = first.node()->get_node_base_interface()->get_context();
   const auto second_context = second.node()->get_node_base_interface()->get_context();
   EXPECT_NE(first_context, second_context);
@@ -1100,10 +1308,309 @@ TEST(Ros2TransportResources, DefaultPrivateContextsRemainIndependent) {
   EXPECT_FALSE(second_context->is_valid());
 }
 
+// Readiness-loss cancels no longer hop through the epoch owner, so the
+// backend installs no owner notification.
+TEST(JtcExecutionPort, BackendInstallsNoOwnerNotification) {
+  Rig rig;
+  auto resources = rig.make_epoch();
+  Ros2ControlExecutionBackend adapter(resources, rig.clock_owner, rig.scheduler, rig.config(3));
+  EXPECT_NO_THROW(resources->set_owner_notification([] {}));
+  EXPECT_TRUE(adapter.shutdown());
+}
+
+// The fake controller has its own executor; only the adapter is on the
+// dedicated epoch owner, as in the production split.
+struct DedicatedEpochRig {
+  Rig server;
+  std::shared_ptr<Ros2TransportResources> resources =
+      Ros2TransportResources::create("jtc_dedicated_epoch", "", 1);
+  std::shared_ptr<Ros2ControlExecutionBackend> adapter =
+      std::make_shared<Ros2ControlExecutionBackend>(resources, server.clock_owner, server.scheduler,
+                                                     server.config(2));
+
+  DedicatedEpochRig() {
+    adapter->ObserveReadiness({true, true, true, ExecutionBindingEpoch{2}});
+  }
+  ~DedicatedEpochRig() {
+    adapter->close_admission();
+    resources->quiesce();
+    adapter->release_ros_entities();
+  }
+  void start() { resources->start(); }
+};
+
+TEST(JtcExecutionPort, DedicatedEpochSendsAndReceivesFeedbackAndResult) {
+  DedicatedEpochRig rig;
+  rig.start();
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ActionServerIsReady(); }));
+  ASSERT_EQ(rig.adapter->Submit(key(1), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.server.accepted(key(1), rig.adapter.get()));
+  auto feedback = std::make_shared<Action::Feedback>();
+  feedback->joint_names = {"b", "a"};
+  feedback->desired.positions = {0.2, 0.1};
+  feedback->desired.velocities = {2.0, 1.0};
+  feedback->desired.accelerations = {20.0, 10.0};
+  feedback->actual.positions = {0.19, 0.09};
+  rig.server.handle()->publish_feedback(feedback);
+  ASSERT_TRUE(wait_until([&] {
+    const auto goal = rig.adapter->ReadGoal(key(1));
+    return goal && goal->latest_feedback.has_value();
+  }));
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->latest_feedback->desired_positions_rad,
+            (std::vector<double>{0.1, 0.2}));
+  auto result = std::make_shared<Action::Result>();
+  result->error_code = Action::Result::SUCCESSFUL;
+  rig.server.handle()->succeed(result);
+  ASSERT_TRUE(wait_until([&] {
+    const auto goal = rig.adapter->ReadGoal(key(1));
+    return goal && goal->result == ExecutionGoalResult::kSucceeded;
+  }));
+}
+
+// OD-66: controller state runs on the epoch's time-critical thread, so an
+// ordinary owner task blocked on a latch does not delay it.
+TEST(JtcExecutionPort, DedicatedEpochStateArrivesWhileOwnerTaskBlocks) {
+  std::atomic<bool> released{false};
+  std::promise<void> entered;
+  auto in_task = entered.get_future();
+  DedicatedEpochRig rig;
+  std::future<void> task;
+  struct Release final {
+    std::atomic<bool> &flag;
+    ~Release() { flag.store(true); }
+  } release{released};
+  rig.start();
+  const auto received = [&](std::uint32_t nanosecond) {
+    const auto sample = rig.adapter->ReadSample();
+    return sample && sample->source_stamp_ns == 10'000'000'000 + nanosecond;
+  };
+  // Prove the epoch's subscription is matched before blocking its owner.
+  bool matched = false;
+  for (std::uint32_t attempt = 1; attempt <= 20 && !matched; ++attempt) {
+    rig.server.state(0.25, attempt);
+    matched = wait_until([&] { return received(attempt); });
+  }
+  ASSERT_TRUE(matched);
+  // Shorter than the owner stall bound.
+  task = std::async(std::launch::async, [&] {
+    rig.resources->invoke([&] {
+      entered.set_value();
+      while (!released.load()) std::this_thread::sleep_for(1ms);
+    });
+  });
+  ASSERT_EQ(in_task.wait_for(2s), std::future_status::ready);
+  rig.server.state(0.25, 777U);
+  EXPECT_TRUE(wait_until([&] { return received(777U); }));
+  EXPECT_FALSE(released.load());  // Arrived while the owner thread was blocked.
+  released.store(true);
+  task.get();
+}
+
+TEST(JtcExecutionPort, DedicatedEpochDefersCancelUntilAcceptance) {
+  DedicatedEpochRig rig;
+  rig.start();
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ActionServerIsReady(); }));
+  ExecutionPortCommandResultDTO sent;
+  ExecutionPortCommandResultDTO pending;
+  // Both calls run in one owner callback. The goal response callback cannot
+  // run on that owner until this callback returns, without blocking any thread.
+  rig.resources->invoke([&] {
+    sent = rig.adapter->Submit(key(1), trajectory());
+    pending = rig.adapter->Cancel(key(1));
+  });
+  ASSERT_EQ(sent.dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_EQ(pending.dispatch, ExecutionPortDispatch::kEffectUncertain);
+  ASSERT_TRUE(wait_until([&] {
+    const auto goal = rig.adapter->ReadGoal(key(1));
+    return goal && goal->cancel_ack_local_receipt_stamp.has_value();
+  }));
+  EXPECT_EQ(rig.server.cancel_count.load(), 1U);
+}
+
+TEST(JtcExecutionPort, DedicatedEpochReadinessLossCancelsAcceptedGoalOnce) {
+  DedicatedEpochRig rig;
+  rig.start();
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ActionServerIsReady(); }));
+  ASSERT_EQ(rig.adapter->Submit(key(1), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.server.accepted(key(1), rig.adapter.get()));
+  rig.adapter->ObserveReadiness({false, true, true, ExecutionBindingEpoch{2}});
+  rig.adapter->ObserveReadiness({false, true, true, ExecutionBindingEpoch{2}});
+  ASSERT_TRUE(wait_until([&] { return rig.server.cancel_count.load() == 1U; }));
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->result,
+            ExecutionGoalResult::kEndedUnknown);
+  rig.adapter->close_admission();
+  EXPECT_EQ(rig.server.cancel_count.load(), 1U);
+}
+
+TEST(JtcExecutionPort, FaultRebuildRetiresAcceptedGoalWithoutCancel) {
+  DedicatedEpochRig rig;
+  rig.start();
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ActionServerIsReady(); }));
+  ASSERT_EQ(rig.adapter->Submit(key(1), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.server.accepted(key(1), rig.adapter.get()));
+  rig.adapter->close_admission_without_cancel();
+  rig.resources->quiesce();
+  rig.adapter->release_ros_entities();
+  const auto retained = rig.adapter->ReadGoal(key(1));
+  ASSERT_TRUE(retained.has_value());
+  EXPECT_EQ(retained->result, ExecutionGoalResult::kEndedUnknown);
+  EXPECT_EQ(rig.server.cancel_count.load(), 0U);
+  EXPECT_EQ(rig.adapter->Submit(key(2), trajectory()).dispatch,
+            ExecutionPortDispatch::kNotDispatched);
+}
+
+TEST(JtcExecutionPort, DedicatedEpochExplicitCancelCanBeRepeated) {
+  DedicatedEpochRig rig;
+  rig.start();
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ActionServerIsReady(); }));
+  ASSERT_EQ(rig.adapter->Submit(key(1), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.server.accepted(key(1), rig.adapter.get()));
+  EXPECT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  EXPECT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kDispatched);
+}
+
+TEST(JtcExecutionPort, DedicatedEpochCloseDrainsBothExactLossCancels) {
+  DedicatedEpochRig rig;
+  rig.start();
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ActionServerIsReady(); }));
+  ASSERT_EQ(rig.adapter->Submit(key(1), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.server.accepted(key(1), rig.adapter.get()));
+  ASSERT_EQ(rig.adapter->Replace(key(1), key(2), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.server.accepted(key(2), rig.adapter.get()));
+  const auto first = rig.server.handle(0)->get_goal_id();
+  const auto second = rig.server.handle(1)->get_goal_id();
+  rig.resources->invoke([&] {
+    rig.adapter->ObserveReadiness(
+        {false, true, true, ExecutionBindingEpoch{2}});
+    rig.adapter->close_admission();
+  });
+  ASSERT_TRUE(wait_until([&] { return rig.server.cancel_count.load() == 2U; }));
+  const auto ids = rig.server.cancel_ids();
+  ASSERT_EQ(ids.size(), 2U);
+  EXPECT_NE(std::find(ids.begin(), ids.end(), first), ids.end());
+  EXPECT_NE(std::find(ids.begin(), ids.end(), second), ids.end());
+}
+
+TEST(JtcExecutionPort, DedicatedEpochLateAcceptanceAfterLossCancelsOnce) {
+  DedicatedEpochRig rig;
+  rig.start();
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ActionServerIsReady(); }));
+  ExecutionPortCommandResultDTO submitted;
+  ExecutionPortCommandResultDTO pending;
+  // The response is delivered on a later owner turn; no executor is blocked.
+  rig.resources->invoke([&] {
+    submitted = rig.adapter->Submit(key(1), trajectory());
+    pending = rig.adapter->Cancel(key(1));
+    rig.adapter->ObserveReadiness(
+        {false, true, true, ExecutionBindingEpoch{2}});
+  });
+  ASSERT_EQ(submitted.dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_EQ(pending.dispatch, ExecutionPortDispatch::kEffectUncertain);
+  ASSERT_TRUE(wait_until([&] { return rig.server.cancel_count.load() == 1U; }));
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->result,
+            ExecutionGoalResult::kEndedUnknown);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->accepted_stamp_ns);
+  rig.adapter->close_admission();
+  EXPECT_EQ(rig.server.cancel_count.load(), 1U);
+}
+
+TEST(JtcExecutionPort,
+     DedicatedEpochLateAcceptanceWithoutPriorCancelIsContained) {
+  DedicatedEpochRig rig;
+  rig.start();
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ActionServerIsReady(); }));
+  ExecutionPortCommandResultDTO submitted;
+  rig.resources->invoke([&] {
+    submitted = rig.adapter->Submit(key(1), trajectory());
+    rig.adapter->ObserveReadiness(
+        {false, true, true, ExecutionBindingEpoch{2}});
+  });
+  ASSERT_EQ(submitted.dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.server.cancel_count.load() == 1U; }));
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->result,
+            ExecutionGoalResult::kEndedUnknown);
+}
+
+TEST(JtcExecutionPort, DedicatedEpochReadinessDoesNotWaitForUnrelatedTask) {
+  DedicatedEpochRig rig;
+  rig.start();
+  std::atomic<bool> running{false};
+  std::jthread caller([&] {
+    rig.resources->invoke([&] {
+      running.store(true);
+      std::this_thread::sleep_for(2s);
+      running.store(false);
+    });
+  });
+  ASSERT_TRUE(wait_until([&] { return running.load(); }));
+  rig.adapter->ObserveReadiness({false, true, true, ExecutionBindingEpoch{2}});
+  const bool returned_during_task = running.load();
+  caller.join();
+  EXPECT_TRUE(returned_during_task);
+}
+
+TEST(JtcExecutionPort, DedicatedEpochFencesSendsAfterOwnerFault) {
+  DedicatedEpochRig rig;
+  std::atomic<bool> request_fault{false};
+  const auto timer = rig.resources->node()->create_wall_timer(1ms, [&] {
+    if (request_fault.load())
+      throw std::runtime_error("dedicated epoch test fault");
+  });
+  // Stop the owner before the timer and its captured flag leave scope, also
+  // on an early assertion return.
+  struct JoinBeforeTimerDestruction {
+    Ros2TransportResources &resources;
+    ~JoinBeforeTimerDestruction() { resources.quiesce(); }
+  } join_before_timer_destruction{*rig.resources};
+  rig.start();
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ActionServerIsReady(); }));
+  request_fault = true;
+  ASSERT_TRUE(wait_until([&] { return rig.resources->executor_fault().has_value(); }));
+  EXPECT_EQ(rig.resources->executor_fault(),
+            std::optional<std::string>("dedicated epoch test fault"));
+  // A faulted owner is a component fault: no further goal is sent.
+  const auto after_fault = rig.adapter->Submit(key(1), trajectory());
+  EXPECT_EQ(after_fault.dispatch, ExecutionPortDispatch::kNotDispatched);
+  EXPECT_EQ(after_fault.refusal, ExecutionPortRefusal::kStaleKey);
+  rig.adapter->close_admission();
+  EXPECT_EQ(rig.adapter->Submit(key(1), trajectory()).refusal,
+            ExecutionPortRefusal::kNotReady);
+  EXPECT_EQ(rig.adapter->SetScale(0.5).refusal, ExecutionPortRefusal::kNotReady);
+}
+
+TEST(JtcExecutionPort, DedicatedEpochClosesBeforeReleaseAndRetainsClosedResults) {
+  Rig rig;
+  auto resources = Ros2TransportResources::create(
+      "jtc_dedicated_epoch_test", "", 1);
+  auto adapter = std::make_shared<Ros2ControlExecutionBackend>(
+      resources, rig.clock_owner, rig.scheduler, rig.config(2));
+  adapter->ObserveReadiness({true, true, true, ExecutionBindingEpoch{2}});
+  resources->start();
+  adapter->close_admission();
+  EXPECT_FALSE(adapter->ReadReadiness().controller_active);
+  EXPECT_FALSE(adapter->ReadSample());
+  EXPECT_EQ(adapter->SetScale(2.0).refusal, ExecutionPortRefusal::kInvalidInput);
+  EXPECT_EQ(adapter->SetScale(0.5).refusal, ExecutionPortRefusal::kNotReady);
+  resources->quiesce();
+  adapter->release_ros_entities();
+  adapter->release_ros_entities();
+  resources.reset(); // The retained adapter owns the stopped epoch resources.
+  EXPECT_EQ(adapter->SetScale(0.5).refusal, ExecutionPortRefusal::kNotReady);
+  EXPECT_FALSE(adapter->ActionServerIsReady());
+}
+
 TEST(JtcExecutionPort, ShutdownAfterContextStoppedNeedsNoNotificationOrCommands) {
   Rig rig;
   const auto sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);
-  rig.resources.quiesce();
+  rig.epoch_resources->quiesce();
   rig.adapter->shutdown();
   rig.adapter->shutdown();
   EXPECT_FALSE(JtcExecutionPortTestPeer::owns_sdk_entities(*rig.adapter));
@@ -1242,7 +1749,9 @@ TEST(JtcExecutionPort,
     EXPECT_EQ(result.dispatch, ExecutionPortDispatch::kNotDispatched);
     EXPECT_EQ(result.refusal, ExecutionPortRefusal::kInvalidInput);
   }
-  EXPECT_EQ(rig.goal_count(), 1U);
+  // The client can observe the goal response before the fake server's
+  // accept callback has run: they are served by different owner executors.
+  ASSERT_TRUE(wait_until([&] { return rig.goal_count() == 1U; }));
   EXPECT_FALSE(rig.adapter->ReadGoal(key(2)));
   // Refusals do not reserve the successor key or alter the current goal.
   ASSERT_EQ(rig.adapter
@@ -1339,7 +1848,66 @@ TEST(JtcExecutionPort, LaterActionDiscoveryLossDoesNotChangePortReadiness) {
   EXPECT_EQ(after, before);
 }
 
-TEST(JtcExecutionPort, BindingLossDoesNotIssueCancelAndRejectsLateSuccess) {
+TEST(JtcExecutionPort, FencedDispatchTokenIsKnownUnsent) {
+  Rig rig;
+  // Discovery precedes the fence check; wait so the fence is what refuses.
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ActionServerIsReady(); }));
+  auto token = std::make_shared<ExecutionDispatchToken>();
+  EXPECT_EQ(token->Fence(), ExecutionDispatchToken::State::kFenced);
+  const auto result = rig.adapter->Submit(key(1), trajectory(), token);
+  EXPECT_EQ(result.dispatch, ExecutionPortDispatch::kNotDispatched);
+  EXPECT_EQ(result.refusal, ExecutionPortRefusal::kStaleKey);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1)));
+  EXPECT_EQ(rig.goal_count(), 0U);
+}
+
+TEST(JtcExecutionPort, ScalePublishDoesNotWaitForOwnerCallback) {
+  using namespace std::chrono_literals;
+  Rig rig;
+  std::promise<void> entered, release;
+  auto ready = entered.get_future();
+  auto gate = release.get_future().share();
+  auto owner = std::async(std::launch::async, [&] {
+    rig.epoch_resources->invoke([&] { entered.set_value(); gate.wait(); });
+  });
+  if (ready.wait_for(3s) != std::future_status::ready) {
+    release.set_value();
+    owner.get();
+    FAIL() << "owner callback did not start";
+    return;
+  }
+  auto scale = std::async(std::launch::async, [&] { return rig.adapter->SetScale(0.25); });
+  const auto completed = scale.wait_for(500ms);
+  release.set_value();
+  owner.get();
+  const auto result = scale.get();
+  EXPECT_EQ(completed, std::future_status::ready);
+  EXPECT_EQ(result.dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.scale_count.load() > 0; }));
+  EXPECT_DOUBLE_EQ(rig.last_scale.load(), 0.25);
+}
+
+TEST(JtcExecutionPort, NewerScaleReservationFencesOlderAndSnapshotKeepsPublishedValue) {
+  Rig rig;
+  const auto initial = rig.adapter->SnapshotScaleAfterFence(
+      std::chrono::steady_clock::now() + std::chrono::seconds(1));
+  EXPECT_EQ(initial.status, ScaleSnapshot::Status::kNoPriorFactor);
+  const auto older = rig.adapter->ReserveScaleSequence();
+  const auto newer = rig.adapter->ReserveScaleSequence();
+  ASSERT_EQ(rig.adapter->SetScale(0.8, newer).dispatch, ExecutionPortDispatch::kDispatched);
+  const auto stale = rig.adapter->SetScale(0.3, older);
+  EXPECT_EQ(stale.dispatch, ExecutionPortDispatch::kNotDispatched);
+  EXPECT_EQ(stale.refusal, ExecutionPortRefusal::kStaleKey);
+  ASSERT_TRUE(wait_until([&] { return rig.scale_count.load() > 0; }));
+  EXPECT_DOUBLE_EQ(rig.last_scale.load(), 0.8);
+  (void)rig.adapter->ReserveScaleSequence(); // Freeze fences any older reservation.
+  const auto snapshot = rig.adapter->SnapshotScaleAfterFence(
+      std::chrono::steady_clock::now() + std::chrono::seconds(1));
+  ASSERT_EQ(snapshot.status, ScaleSnapshot::Status::kFactor);
+  EXPECT_DOUBLE_EQ(snapshot.factor, 0.8);
+}
+
+TEST(JtcExecutionPort, BindingLossRequestsCancelAndRejectsLateTerminal) {
   Rig rig;
   ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
   ASSERT_TRUE(rig.accepted(key(1)));
@@ -1348,12 +1916,39 @@ TEST(JtcExecutionPort, BindingLossDoesNotIssueCancelAndRejectsLateSuccess) {
   rig.adapter->ObserveReadiness({false, true, true, ExecutionBindingEpoch{1}});
   EXPECT_EQ(rig.adapter->ReadGoal(key(1))->result,
             ExecutionGoalResult::kEndedUnknown);
-  EXPECT_EQ(rig.cancel_count.load(), 0U);
+  ASSERT_TRUE(wait_until([&] { return rig.cancel_count.load() == 1U; }));
   auto result = std::make_shared<Action::Result>();
-  result->error_code = Action::Result::SUCCESSFUL;
-  rig.handle()->succeed(result);
+  const auto retired = rig.handle();
+  ASSERT_TRUE(wait_until([&] { return retired->is_canceling(); }));
+  retired->canceled(result);
   EXPECT_EQ(rig.adapter->ReadGoal(key(1))->result,
             ExecutionGoalResult::kEndedUnknown);
+}
+
+TEST(JtcExecutionPort, ReadinessRecoveryRetainsUnknownGoalRecordsAtCapacity) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  ASSERT_EQ(rig.adapter->Replace(key(1), key(2), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(2)));
+
+  rig.adapter->ObserveReadiness({false, true, true, ExecutionBindingEpoch{1}});
+  ASSERT_TRUE(wait_until([&] { return rig.cancel_count.load() == 2U; }));
+  for (const auto &goal_key : {key(1), key(2)}) {
+    const auto goal = rig.adapter->ReadGoal(goal_key);
+    ASSERT_TRUE(goal.has_value());
+    EXPECT_EQ(goal->result, ExecutionGoalResult::kEndedUnknown);
+  }
+  rig.adapter->ObserveReadiness({true, true, true, ExecutionBindingEpoch{1}});
+  const auto refused = rig.adapter->Submit(key(3), trajectory());
+  EXPECT_EQ(refused.dispatch, ExecutionPortDispatch::kNotDispatched);
+  EXPECT_EQ(refused.refusal, ExecutionPortRefusal::kNotReady);
+  for (const auto &goal_key : {key(1), key(2)}) {
+    const auto goal = rig.adapter->ReadGoal(goal_key);
+    ASSERT_TRUE(goal.has_value());
+    EXPECT_EQ(goal->result, ExecutionGoalResult::kEndedUnknown);
+  }
 }
 
 TEST(JtcExecutionPort, OldCallbacksCannotCompleteNewBindingWithReusedKey) {
@@ -1362,6 +1957,8 @@ TEST(JtcExecutionPort, OldCallbacksCannotCompleteNewBindingWithReusedKey) {
   ASSERT_TRUE(rig.accepted(key(1)));
   const auto old = rig.handle();
   rig.adapter.reset();
+  ASSERT_TRUE(wait_until([&] { return rig.cancel_count.load() == 1U; }));
+  ASSERT_TRUE(wait_until([&] { return old->is_canceling(); }));
   rig.successor->ObserveReadiness({true, true, true, ExecutionBindingEpoch{2}});
   ExecutionPortCommandResultDTO dispatched;
   ASSERT_TRUE(wait_until([&] {
@@ -1375,7 +1972,7 @@ TEST(JtcExecutionPort, OldCallbacksCannotCompleteNewBindingWithReusedKey) {
   ASSERT_TRUE(current);
   auto result = std::make_shared<Action::Result>();
   result->error_code = Action::Result::SUCCESSFUL;
-  old->succeed(result);
+  old->canceled(result);
   EXPECT_EQ(rig.successor->ReadGoal(key(1))->binding_epoch,
             ExecutionBindingEpoch{2});
   EXPECT_FALSE(rig.successor->ReadGoal(key(1))->result);
@@ -1418,6 +2015,32 @@ TEST(JtcExecutionPort,
   ASSERT_TRUE(wait_until([&] { return rig.cancel_count.load() == 1; }));
 }
 
+TEST(JtcExecutionPort, CancelDoesNotReachARecordDisconnectedByTerminalEviction) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  ASSERT_EQ(rig.adapter->Replace(key(1), key(2), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(2)));
+  auto result = std::make_shared<Action::Result>();
+  result->error_code = Action::Result::SUCCESSFUL;
+  rig.handle(1)->succeed(result);
+  ASSERT_TRUE(wait_until([&] {
+    const auto observation = rig.adapter->ReadGoal(key(2));
+    return observation && observation->result == ExecutionGoalResult::kSucceeded;
+  }));
+  ASSERT_FALSE(rig.adapter->ReadGoal(key(1))->result);
+  // Making room evicts the terminal current record. The still-live first
+  // record is no longer a predecessor of this new goal.
+  ASSERT_EQ(rig.submit(key(3)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(3)));
+  ASSERT_EQ(rig.adapter->Cancel(key(3)).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.cancel_count.load() == 1U; }));
+  ASSERT_TRUE(wait_until([&] { return rig.handle(2)->is_canceling(); }));
+  EXPECT_FALSE(rig.handle()->is_canceling());
+}
+
 TEST(JtcExecutionPort,
      ReportsControllerPathAndGoalToleranceAbortsAsDistinctFacts) {
   for (const auto &[code, expected] :
@@ -1450,9 +2073,10 @@ TEST(JtcExecutionPort, TwoUnfinishedRecordsRefuseNewGoalsBeforeEffect) {
             ExecutionPortRefusal::kNotReady);
   EXPECT_FALSE(rig.adapter->ReadGoal(key(3)));
   EXPECT_EQ(rig.goal_count(), 2U);
-  EXPECT_EQ(rig.adapter->Cancel(key(1)).refusal,
-            ExecutionPortRefusal::kStaleKey);
-  EXPECT_EQ(rig.cancel_count.load(), 0U);
+  // OD-55: the port cancels the exact key it is given; an unfinished
+  // predecessor is still cancellable (Core walks the chain).
+  EXPECT_EQ(rig.adapter->Cancel(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  EXPECT_TRUE(wait_until([&] { return rig.cancel_count.load() == 1U; }));
 }
 
 TEST(JtcExecutionPort,
@@ -1662,9 +2286,13 @@ TEST(JtcExecutionPort,
   ASSERT_TRUE(rig.accepted(key(1)));
   ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch,
             ExecutionPortDispatch::kDispatched);
+  // A repeat joins the pending request; a new request is sent only after the
+  // first one's rejection arrived.
   rig.clock.set(93);
-  ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch,
-            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] {
+    EXPECT_EQ(rig.adapter->Cancel(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+    return rig.cancel_count.load() == 2U;
+  }));
   auto response = std::make_shared<action_msgs::srv::CancelGoal::Response>();
   response->return_code = action_msgs::srv::CancelGoal::Response::ERROR_NONE;
   action_msgs::msg::GoalInfo info;
@@ -1712,5 +2340,141 @@ TEST(JtcExecutionPort, DeactivationErrorIsNotMisclassifiedAsPreemption) {
   EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->preempted_by);
 }
 
+TEST(JtcExecutionPort, CloseDoesNotResendOrWaitForAlreadyAcknowledgedCancel) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] {
+    const auto goal = rig.adapter->ReadGoal(key(1));
+    return goal && goal->cancel_ack_local_receipt_stamp.has_value();
+  }));
+  ASSERT_FALSE(rig.adapter->ReadGoal(key(1))->result);
+  ASSERT_EQ(rig.cancel_count.load(), 1U);
+  const auto started = std::chrono::steady_clock::now();
+  rig.adapter->close_admission(started + std::chrono::seconds(2));
+  EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(1));
+  EXPECT_EQ(rig.cancel_count.load(), 1U);
+  EXPECT_TRUE(rig.adapter->loss_cancel_shutdown_settled());
+}
+
+TEST(JtcExecutionPort, CloseWaitsForAlreadySentCancelReplyWithoutResending) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  rig.delay_next_cancel = true;
+  ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.cancel_blocked.load(); }));
+  std::atomic<bool> started{false};
+  std::promise<void> done;
+  auto completed = done.get_future();
+  std::jthread close([&] {
+    started.store(true);
+    rig.adapter->close_admission(std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    done.set_value();
+  });
+  struct ReleaseOnExit { Rig& rig; ~ReleaseOnExit() { rig.release_response(); } } release{rig};
+  ASSERT_TRUE(wait_until([&] { return started.load(); }));
+  EXPECT_EQ(completed.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+  rig.release_response();
+  ASSERT_EQ(completed.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+  close.join();
+  EXPECT_EQ(rig.cancel_count.load(), 1U);
+  EXPECT_TRUE(rig.adapter->loss_cancel_shutdown_settled());
+}
+
+TEST(JtcExecutionPort, CloseContainsPendingLateAcceptanceBeforeOwnerShutdown) {
+  Rig rig;
+  rig.delay_next_response = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.response_blocked.load(); }));
+  std::atomic<bool> started{false};
+  std::promise<void> done;
+  auto completed = done.get_future();
+  std::jthread close([&] {
+    started.store(true);
+    rig.adapter->close_admission(std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    done.set_value();
+  });
+  struct ReleaseOnExit { Rig& rig; ~ReleaseOnExit() { rig.release_response(); } } release{rig};
+  ASSERT_TRUE(wait_until([&] { return started.load(); }));
+  EXPECT_EQ(completed.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+  rig.release_response();
+  ASSERT_EQ(completed.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+  close.join();
+  EXPECT_EQ(rig.cancel_count.load(), 1U);
+  EXPECT_TRUE(rig.epoch_resources->node()->get_node_base_interface()->get_context()->is_valid());
+}
+
+TEST(JtcExecutionPort, CloseReportsUnsettledWhenCancelReplyMissesDeadline) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  rig.delay_next_cancel = true;
+  ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.cancel_blocked.load(); }));
+  struct ReleaseOnExit { Rig& rig; ~ReleaseOnExit() { rig.release_response(); } } release{rig};
+  rig.adapter->close_admission(std::chrono::steady_clock::now() + std::chrono::milliseconds(50));
+  EXPECT_FALSE(rig.adapter->loss_cancel_shutdown_settled());
+  rig.release_response();
+}
+
+// Graph reads are made on the calling thread, never dispatched to the epoch
+// owner: both return while that owner is held in another task.
+TEST(JtcExecutionPort, EndpointRefreshAndActionReadinessDoNotWaitForBlockedOwner) {
+  Rig rig;
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ActionServerIsReady(); }));
+  BlockedOwner blocked(*rig.epoch_resources);
+  ASSERT_TRUE(blocked.entered);
+  const auto started = std::chrono::steady_clock::now();
+  rig.adapter->RefreshEndpointFacts();
+  const bool ready = rig.adapter->ActionServerIsReady();
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  const bool returned_while_blocked = !blocked.finished();
+  blocked.release();
+  EXPECT_TRUE(returned_while_blocked);
+  EXPECT_LT(elapsed, 1s);
+  EXPECT_TRUE(ready);
+}
+
+// Readiness loss schedules the exact cancel from the caller's thread; the
+// epoch owner is not involved, so the cancel leaves while it is held busy.
+TEST(JtcExecutionPort, ReadinessLossCancelLeavesWhileEpochOwnerIsBlocked) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  const auto accepted = rig.handle()->get_goal_id();
+  BlockedOwner blocked(*rig.epoch_resources);
+  ASSERT_TRUE(blocked.entered);
+  rig.adapter->ObserveReadiness({false, true, true, ExecutionBindingEpoch{1}});
+  const bool sent = wait_until([&] { return rig.cancel_count.load() == 1U; });
+  const bool sent_while_blocked = sent && !blocked.finished();
+  blocked.release();
+  EXPECT_TRUE(sent_while_blocked);
+  EXPECT_EQ(rig.cancel_ids(), (std::vector<rclcpp_action::GoalUUID>{accepted}));
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->result, ExecutionGoalResult::kEndedUnknown);
+  rig.adapter->ObserveReadiness({false, true, true, ExecutionBindingEpoch{1}});
+  EXPECT_EQ(rig.cancel_count.load(), 1U);
+}
+
+// The settle wait is for responses only the epoch owner delivers, so on that
+// owner close_admission closes admission and refuses the wait at once.
+TEST(JtcExecutionPort, CloseAdmissionOnEpochOwnerClosesAndRefusesWithoutWaiting) {
+  DedicatedEpochRig rig;
+  rig.start();
+  bool closed = true;
+  std::chrono::steady_clock::duration elapsed{};
+  rig.resources->invoke([&] {
+    const auto started = std::chrono::steady_clock::now();
+    closed = rig.adapter->close_admission(started + 2s);
+    elapsed = std::chrono::steady_clock::now() - started;
+  });
+  EXPECT_FALSE(closed);
+  EXPECT_LT(elapsed, 1s);
+  EXPECT_FALSE(rig.adapter->ReadReadiness().controller_active);
+  EXPECT_EQ(rig.adapter->Submit(key(1), trajectory()).dispatch,
+            ExecutionPortDispatch::kNotDispatched);
+  EXPECT_TRUE(rig.adapter->close_admission());
+}
 } // namespace
 } // namespace manyforge::ros2_control_execution

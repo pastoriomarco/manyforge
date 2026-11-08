@@ -7,10 +7,12 @@
 #include <string_view>
 #include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/global_io_rule_qualification.hpp>
+#include <manyforge_deployment/prepared_catalog_source.hpp>
 #include <manyforge_deployment/prepared_activation_repository.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_io_condition_compiler.hpp>
 #include <manyforge_deployment/program_io_stop_response_validation.hpp>
+#include <manyforge_deployment/program_reference_validator.hpp>
 #include <manyforge_deployment/retained_io_policy_compiler.hpp>
 #include <optional>
 #include <unistd.h>
@@ -124,7 +126,7 @@ TEST(RetainedTcpInventoryTest, MountedToolIsMarkedElsewhereFromTheOtherRobot) {
   const auto ur_rows = d::direct_control_motion_tcps(
       *ur_binding, inventory, *product.bundle, *product.model_map);
   const auto carried = std::find_if(lite_rows.begin(), lite_rows.end(),
-      [&](const auto &row) { return row.binding.entry.component_id == tool; });
+      [&](const auto &row) { return row.binding.entry.target.component_id == tool; });
   ASSERT_NE(carried, lite_rows.end());
   EXPECT_TRUE(carried->mounted_here);
   EXPECT_FALSE(carried->mounted_elsewhere);
@@ -178,16 +180,16 @@ TEST(RetainedTcpInventoryTest, IncludesRealUnmountedToolWithoutCarryingIt) {
       robot, arm_target, *product.bundle, *product.model_map, catalog);
   ASSERT_TRUE(binding);
   const auto target = std::find_if(
-      binding->value().target_role_bindings.begin(),
-      binding->value().target_role_bindings.end(),
-      [&](const auto &row) { return row.controllable_component_id == robot &&
-                                    row.command_target_id == arm_target; });
-  ASSERT_NE(target, binding->value().target_role_bindings.end());
+      binding->value().target_bindings.begin(),
+      binding->value().target_bindings.end(),
+      [&](const auto &row) { return row.target.component_id == robot &&
+                                    row.target.command_target_id == arm_target; });
+  ASSERT_NE(target, binding->value().target_bindings.end());
   ASSERT_TRUE(target->robot_tcps.has_value());
   const auto row = std::find_if(target->robot_tcps->begin(), target->robot_tcps->end(),
-      [&](const auto &tcp) { return tcp.entry.component_id == tool &&
-                                   tcp.entry.target_id == tool_target &&
-                                   tcp.entry.frame_role_id.value() == "tcp"; });
+      [&](const auto &tcp) { return tcp.entry.target.component_id == tool &&
+                                   tcp.entry.target.command_target_id == tool_target &&
+                                   tcp.entry.frame.frame_id.value() == "tcp"; });
   ASSERT_NE(row, target->robot_tcps->end());
   EXPECT_FALSE(row->end_effector);
   const auto rows = d::direct_control_motion_tcps(
@@ -201,11 +203,10 @@ TEST(RetainedTcpInventoryTest, IncludesRealUnmountedToolWithoutCarryingIt) {
 
 V program_root(const d::RetainedBundle &bundle, bool motion, bool key = true) {
   auto root = parse(
-      R"({"api_version":"manyforge.program.v2","program_id":"global_rule_program",
+      R"({"api_version":"manyforge.program.v3","program_id":"global_rule_program",
     "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
     "program_profile":"composable-cell-v1","name":"Global rule fixture",
-    "catalog":{"api_version":"manyforge.node_catalog.v2","content_version":"0.0.0"},
-    "component_roles":{},"target_roles":{},
+    "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
     "execution_groups":{"inspect":{"execution_policy":"independent"}},
     "blackboard":{"namespaces":[],"keys":[{"key":"ready","type":"bool","access":"read_write","persistence":"run","initial":false}]},
     "tree":{"node_id":"sequence","instance_id":"root","parameters":{},"execution_groups":["inspect"],"children":[]}})");
@@ -218,29 +219,14 @@ V program_root(const d::RetainedBundle &bundle, bool motion, bool key = true) {
   if (motion) {
     root = replace(root, "execution_groups", parse(
         R"({"arm_group":{"execution_policy":"independent"}})"));
-    root = replace(root, "component_roles", parse(R"({"robot":{}})"));
-    auto target = parse(
-        R"({"component_role":"robot","required_capabilities":[],"required_frame_roles":["base"],"required_resource_roles":["arm_joints"],"required_model_roles":["arm_model"],"required_collision_body_roles":["arm_collision"]})");
-    V::Array capabilities;
-    for (const auto *id :
-         {"execution.feedback.phase_events", "execution.trajectory.execute",
-          "planning.motion.pose_goal",
-          "planning.trajectory.time_parameterized", "state.observed.current",
-          "validation.trajectory.non_collision"})
-      capabilities.emplace_back(V::Object{{"capability_id", V(id)},
-                                          {"parameters", V(V::Object{})},
-                                          {"disposition", V("required")}});
-    target =
-        replace(target, "required_capabilities", V(std::move(capabilities)));
-    root = replace(root, "target_roles", V(V::Object{{"arm", target}}));
     root = replace(
         root, "tree",
         parse(
-            R"({"node_id":"motion.move_to_pose","instance_id":"move","execution_groups":["arm_group"],"parameters":{"target_role":"arm","base_frame_role":"base","tcp_endpoint":{"kind":"current"},"goal":{"position_m":[0,0,0],"orientation":{"xyzw":[0,0,0,1]}}},"children":[]})"));
+            R"({"node_id":"motion.move_to_pose","instance_id":"move","execution_groups":["arm_group"],"parameters":{"target":{"component_id":"lite6_robot","command_target_id":"arm"},"base_frame":{"component_id":"lite6_robot","frame_id":"base"},"tcp_endpoint":{"kind":"current"},"goal":{"frame_ref":{"kind":"target_frame","frame":{"component_id":"lite6_robot","frame_id":"base"}},"position_m":[0,0,0],"orientation":{"xyzw":[0,0,0,1]}}},"children":[]})"));
   }
   root = d::normalize_program_authoring(root);
   const auto revision = d::detail::compute_content_identity(
-      root, {"program-revision", "manyforge.program.v2", "program_revision"});
+      root, {"program-revision", "manyforge.program.v3", "program_revision"});
   return replace(root, "program_revision", V(revision));
 }
 struct Selected final {
@@ -251,9 +237,6 @@ struct Selected final {
 Selected select(const std::filesystem::path &root,
                 const d::RetainedBundle &bundle, bool motion = false,
                 bool key = true, const V *authored = nullptr) {
-  auto program = d::verify_program_binding_contract(
-      d::canonical_json(authored ? *authored : program_root(bundle, motion, key)),
-      bundle);
   d::FilesystemVerifiedRetainedModelMapSource maps(root);
   auto map = maps.get_verified(
       {bundle.retained_bundle_id(),
@@ -261,13 +244,10 @@ Selected select(const std::filesystem::path &root,
   if (!map)
     throw std::logic_error("actual retained map missing");
   d::FilesystemCatalogArtifactStore catalog(root);
-  c::ProgramRoleAssignmentDTO assignment;
-  if (motion)
-    assignment = {{{c::ComponentRoleId("robot"),
-                    c::ControllableComponentId("lite6_robot")}},
-                  {{c::TargetRoleId("arm"), c::CommandTargetId("arm")}}};
-  auto binding =
-      d::compile_program_binding(*program, assignment, bundle, *map, catalog);
+  auto program = d::verify_program_binding_contract(
+      d::canonical_json(authored ? *authored : program_root(bundle, motion, key)),
+      bundle, *map, catalog);
+  auto binding = d::compile_program_binding(*program, bundle, *map, catalog);
   return {std::move(program), std::move(binding), std::move(*map)};
 }
 
@@ -279,7 +259,7 @@ void coincident_gripper_presets(V::Object &document) {
     if (!component.find_object_member("model_source")) continue;
     auto configuration = *component.find_object_member("configuration");
     auto runtime = *configuration.find_object_member("runtime_configuration");
-    // Since the M6 tool split only the gripper component carries the presets.
+    // Since the tool split only the gripper component carries the presets.
     if (!runtime.find_object_member("gripper_target_configurations")) continue;
     auto grippers = runtime.find_object_member("gripper_target_configurations")->as_array();
     grippers.front() = replace(grippers.front(), "open_state_ref", V("closed"));
@@ -328,55 +308,46 @@ TEST(RetainedIoPolicyCompilerTest, PneumaticMappedSignalsCompileAndReloadAcrossC
   const auto product = d::test::MaterializeMaintainedInterruptDeployment(
       root.path, parse(R"({"interrupt_rules":[]})"), "examples/mock_lite6_pneumatic_pick_and_place.scenario");
   ASSERT_TRUE(product.model_map);
+  const d::detail::PreparedCatalogSource catalog_source(product.catalog_artifacts);
   const auto fixture = d::test::compile_pneumatic_program_fixture(root.path, product, 2U);
-  const auto &targets = fixture.binding->value().target_role_bindings;
-  const auto find = [&](std::string_view role) -> const c::ProgramTargetRoleBindingDTO & {
-    const auto row = std::find_if(targets.begin(), targets.end(),
-                                  [&](const auto &item) { return item.target_role_id.value() == role; });
-    if (row == targets.end()) throw std::logic_error("pneumatic target missing");
-    return *row;
-  };
-  const auto &first = find("gripper_0");
-  const auto &second = find("gripper_1");
-  ASSERT_TRUE(first.pneumatic_io);
-  ASSERT_TRUE(second.pneumatic_io);
-  ASSERT_EQ(first.pneumatic_io->outputs.size(), 1U);
-  ASSERT_EQ(first.pneumatic_io->inputs.size(), 1U);
-  EXPECT_EQ(first.pneumatic_io->outputs.front().target_role_id,
-            second.pneumatic_io->outputs.front().target_role_id);
-  EXPECT_EQ(first.pneumatic_io->inputs.front().target_role_id,
-            second.pneumatic_io->inputs.front().target_role_id);
-  const auto &valve = find(first.pneumatic_io->outputs.front().target_role_id.value());
-  const auto &sensor = find(first.pneumatic_io->inputs.front().target_role_id.value());
-  EXPECT_EQ(valve.controllable_component_id.value(), "gripper_io");
-  EXPECT_EQ(sensor.controllable_component_id.value(), "gripper_io");
-  EXPECT_EQ(valve.signal_role_bindings.front().signal_name, "valve");
-  EXPECT_EQ(sensor.signal_role_bindings.front().signal_name, "workpiece_grasped");
+  const auto &binding = fixture.binding->value();
+  const auto gripper = std::find_if(binding.target_bindings.begin(), binding.target_bindings.end(),
+      [](const auto &row) { return row.target.component_id.value() == "lite_gripper" &&
+                                  row.target.command_target_id.value() == "gripper"; });
+  ASSERT_NE(gripper, binding.target_bindings.end());
+  ASSERT_TRUE(gripper->pneumatic_io);
+  ASSERT_EQ(gripper->pneumatic_io->outputs.size(), 1U);
+  ASSERT_EQ(gripper->pneumatic_io->inputs.size(), 1U);
+  const auto &valve = gripper->pneumatic_io->outputs.front().signal;
+  const auto &sensor = gripper->pneumatic_io->inputs.front().signal;
+  EXPECT_EQ(valve.component_id.value(), "gripper_io");
+  EXPECT_EQ(valve.signal_name, "valve");
+  EXPECT_EQ(sensor.component_id.value(), "gripper_io");
+  EXPECT_EQ(sensor.signal_name, "workpiece_grasped");
+  EXPECT_EQ(std::count_if(binding.target_bindings.begin(), binding.target_bindings.end(),
+      [&](const auto &row) { return row.target == gripper->target; }), 1);
   EXPECT_EQ(d::reload_verified_program_binding(fixture.binding->canonical_bytes(),
-                                               *product.bundle, *product.model_map)->value(),
-            fixture.binding->value());
+                                               *product.bundle, *product.model_map,
+                                               catalog_source)->value(), binding);
 }
 
-TEST(RetainedIoPolicyCompilerTest, PneumaticOutputReusesOneAuthoredTargetAndRefusesAmbiguity) {
+TEST(RetainedIoPolicyCompilerTest, PneumaticOutputReusesExactSignalAcrossAuthoredNodes) {
   Root root;
   const auto product = d::test::MaterializeMaintainedInterruptDeployment(
       root.path, parse(R"({"interrupt_rules":[]})"), "examples/mock_lite6_pneumatic_pick_and_place.scenario");
-  const auto fixture = d::test::compile_pneumatic_program_fixture(root.path, product, 1U, 1U);
-  const auto &targets = fixture.binding->value().target_role_bindings;
-  const auto gripper = std::find_if(targets.begin(), targets.end(),
-      [](const auto &row) { return row.target_role_id.value() == "gripper_0"; });
-  ASSERT_NE(gripper, targets.end());
+  const auto fixture = d::test::compile_pneumatic_program_fixture(root.path, product, 1U, 2U);
+  const auto &binding = fixture.binding->value();
+  const auto gripper = std::find_if(binding.target_bindings.begin(), binding.target_bindings.end(),
+      [](const auto &row) { return row.target.component_id.value() == "lite_gripper" &&
+                                  row.target.command_target_id.value() == "gripper"; });
+  ASSERT_NE(gripper, binding.target_bindings.end());
   ASSERT_TRUE(gripper->pneumatic_io);
-  EXPECT_EQ(gripper->pneumatic_io->outputs.front().target_role_id.value(), "valve_0");
-  try {
-    (void)d::test::compile_pneumatic_program_fixture(root.path, product, 1U, 2U);
-    FAIL() << "ambiguous output aliases must be refused";
-  } catch (const d::ProgramBindingCompilerError &error) {
-    const std::string message = error.what();
-    EXPECT_NE(message.find("pneumatic_io_signal_ambiguous_target"), std::string::npos);
-    EXPECT_NE(message.find("valve_0"), std::string::npos);
-    EXPECT_NE(message.find("valve_1"), std::string::npos);
-  }
+  ASSERT_EQ(gripper->pneumatic_io->outputs.size(), 1U);
+  const auto &valve = gripper->pneumatic_io->outputs.front().signal;
+  EXPECT_EQ(valve.component_id.value(), "gripper_io");
+  EXPECT_EQ(valve.signal_name, "valve");
+  EXPECT_EQ(std::count_if(binding.signal_bindings.begin(), binding.signal_bindings.end(),
+      [&](const auto &row) { return row.reference == valve; }), 1);
 }
 
 TEST(RetainedIoPolicyCompilerTest, PneumaticMappedCoincidentPresetsFailAtActivationCompilation) {
@@ -395,32 +366,41 @@ TEST(RetainedIoPolicyCompilerTest, PneumaticMappedCoincidentPresetsFailAtActivat
   }
 }
 
-TEST(RetainedIoPolicyCompilerTest, PneumaticReloadRejectsTwoAliasesForOnePhysicalValve) {
+TEST(RetainedIoPolicyCompilerTest, PneumaticReloadRejectsDuplicatePhysicalValve) {
   Root root;
   const auto product = d::test::MaterializeMaintainedInterruptDeployment(
       root.path, parse(R"({"interrupt_rules":[]})"), "examples/mock_lite6_pneumatic_pick_and_place.scenario",
       add_second_pneumatic_valve);
+  const d::detail::PreparedCatalogSource catalog_source(product.catalog_artifacts);
   const auto fixture = d::test::compile_pneumatic_program_fixture(root.path, product);
   auto forged = fixture.binding->value();
-  const auto gripper_index = static_cast<std::size_t>(std::find_if(
-      forged.target_role_bindings.begin(), forged.target_role_bindings.end(),
-      [](const auto &row) { return row.target_role_id.value() == "gripper_0"; }) -
-      forged.target_role_bindings.begin());
-  ASSERT_LT(gripper_index, forged.target_role_bindings.size());
-  auto &route = *forged.target_role_bindings[gripper_index].pneumatic_io;
-  ASSERT_EQ(route.outputs.size(), 2U);
-  const auto first = route.outputs.front();
-  const auto physical = std::find_if(forged.target_role_bindings.begin(), forged.target_role_bindings.end(),
-      [&](const auto &row) { return row.target_role_id == first.target_role_id; });
-  ASSERT_NE(physical, forged.target_role_bindings.end());
-  auto alias = *physical;
-  alias.target_role_id = c::TargetRoleId("forged_valve_alias");
-  route.outputs.back() = first;
-  route.outputs.back().target_role_id = alias.target_role_id;
-  forged.target_role_bindings.push_back(std::move(alias));
-  const auto resealed = d::detail::ProgramBindingConstructionAuthority::seal(std::move(forged));
+  const auto gripper = std::find_if(forged.target_bindings.begin(), forged.target_bindings.end(),
+      [](const auto &row) { return row.target.component_id.value() == "lite_gripper" &&
+                                  row.target.command_target_id.value() == "gripper"; });
+  ASSERT_NE(gripper, forged.target_bindings.end());
+  ASSERT_TRUE(gripper->pneumatic_io);
+  auto &outputs = gripper->pneumatic_io->outputs;
+  ASSERT_EQ(outputs.size(), 2U);
+  outputs.back() = outputs.front();
+  EXPECT_THROW((void)d::detail::ProgramBindingConstructionAuthority::seal(std::move(forged)),
+               d::ProgramBindingError);
+
+  // A structurally valid route with changed valve polarity must also fail
+  // contextual reload against the exact retained Deployment mapping.
+  auto changed = fixture.binding->value();
+  const auto changed_gripper = std::find_if(changed.target_bindings.begin(), changed.target_bindings.end(),
+      [](const auto &row) { return row.target.component_id.value() == "lite_gripper" &&
+                                  row.target.command_target_id.value() == "gripper"; });
+  ASSERT_NE(changed_gripper, changed.target_bindings.end());
+  ASSERT_TRUE(changed_gripper->pneumatic_io);
+  ASSERT_FALSE(changed_gripper->pneumatic_io->outputs.empty());
+  auto &first = changed_gripper->pneumatic_io->outputs.front();
+  first.open_value = !first.open_value;
+  first.close_value = !first.close_value;
+  const auto resealed = d::detail::ProgramBindingConstructionAuthority::seal(std::move(changed));
   EXPECT_THROW((void)d::reload_verified_program_binding(resealed->canonical_bytes(),
-                  *product.bundle, *product.model_map), d::ProgramBindingError);
+                  *product.bundle, *product.model_map, catalog_source),
+               d::ProgramBindingError);
 }
 
 TEST(RetainedIoPolicyCompilerTest,
@@ -451,7 +431,7 @@ TEST(RetainedIoPolicyCompilerTest,
 TEST(RetainedIoPolicyCompilerTest,
      GlobalRuleCompilesContractFieldsWithCompilerDefaults) {
   Root default_root, explicit_root, failing_root;
-  // CONTRACTS §8: on_trip is required; after_stop defaults to hold (stop
+  // on_trip is required; after_stop defaults to hold (stop
   // only) and active_at_start to false.
   {
     Root missing_root;
@@ -584,10 +564,11 @@ TEST(RetainedIoPolicyCompilerTest,
   authored = replace(authored, "blackboard", replace(board, "keys", V(keys)));
   authored = replace(authored, "program_revision",
                      V(d::detail::compute_content_identity(
-                         authored, {"program-revision", "manyforge.program.v2",
+                         authored, {"program-revision", "manyforge.program.v3",
                                     "program_revision"})));
+  d::FilesystemCatalogArtifactStore catalog(root.path);
   EXPECT_THROW(d::verify_program_binding_contract(d::canonical_json(authored),
-                                                  *fixture.bundle),
+                                                  *fixture.bundle, selected.map, catalog),
                d::ProgramContractError);
 }
 
@@ -703,15 +684,13 @@ TEST(RetainedIoPolicyCompilerTest,
                    .ok());
   d::FilesystemCatalogArtifactStore catalog(root.path);
   d::FilesystemRawArtifactStore raw_store(root.path);
-  const auto assignment = parse(
-      R"({"component_roles":[{"component_role_id":"robot","controllable_component_id":"lite6_robot"}],"target_roles":[{"target_role_id":"arm","command_target_id":"arm"}]})");
   const auto prepared = d::assemble_prepared_activation(
       {d::PreparedScenarioOrigin{
            "global.apply.fixture",
            c::ContentDigest("sha256:" + std::string(64U, 'a')),
            "/fixtures/global-apply.scenario"},
        c::ContentDigest("sha256:" + std::string(64U, 'b')), "optional"},
-      *fixture.bundle, selected.map, *selected.program, assignment, catalog,
+      *fixture.bundle, selected.map, *selected.program, catalog,
       raw_store);
   d::FilesystemPreparedActivationRepository repository(root.path);
   ASSERT_TRUE(repository.put_if_absent(prepared));
@@ -732,7 +711,7 @@ TEST(RetainedIoPolicyCompilerTest,
                "/fixtures/global-apply.scenario"},
            c::ContentDigest("sha256:" + std::string(64U, 'b')), "optional"},
           *wrong.bundle, wrong_selected.map, *wrong_selected.program,
-          assignment, wrong_catalog, wrong_raw),
+          wrong_catalog, wrong_raw),
       d::PreparedActivationInputError);
 }
 
@@ -765,7 +744,7 @@ TEST(RetainedIoPolicyCompilerTest,
                "/fixtures/global-apply.scenario"},
            c::ContentDigest("sha256:" + std::string(64U, 'b')), "optional"},
           *fixture.bundle, selected.map, *selected.program,
-          parse(R"({"component_roles":[],"target_roles":[]})"), catalog, raw));
+          catalog, raw));
       FAIL() << "A selected Program without the required group/key must refuse";
     } catch (const d::PreparedActivationInputError &error) {
       const std::string message = error.what();
@@ -791,7 +770,7 @@ TEST(RetainedIoPolicyCompilerTest,
         // on_trip is required (after_stop and active_at_start default).
         without(rule(V("all_motion"), true), "on_trip"),
         replace(rule(V("all_motion"), true), "latch_release", V("operator")),
-        // CONTRACTS §8: gate, full_stop and idle_behaviour are gone.
+        // gate, full_stop and idle_behaviour are gone.
         replace(rule(V("all_motion"), true), "on_trip", V("gate")),
         replace(rule(V("all_motion"), true), "on_trip", V("full_stop")),
         replace(rule(V("all_motion"), true), "idle_behaviour", V("latch")),
@@ -859,7 +838,7 @@ V interrupt_key_program(V authored, std::string type,
   authored = d::normalize_program_authoring(authored);
   return replace(authored, "program_revision",
                  V(d::detail::compute_content_identity(
-                     authored, {"program-revision", "manyforge.program.v2",
+                     authored, {"program-revision", "manyforge.program.v3",
                                 "program_revision"})));
 }
 V initial_key_condition(const V &value) {
@@ -923,9 +902,9 @@ TEST(RetainedIoPolicyCompilerTest,
     auto tree =
         parse(R"({"node_id":"motion.move_until_signal","instance_id":"move",
       "execution_groups":["arm_group"],"children":[],
-      "parameters":{"target_role":"arm","tcp_endpoint":{"kind":"current"},"stop_mode":"soft_on_path","priority":0,
+      "parameters":{"target":{"component_id":"lite6_robot","command_target_id":"arm"},"base_frame":{"component_id":"lite6_robot","frame_id":"base"},"tcp_endpoint":{"kind":"current"},"stop_mode":"soft_on_path","priority":0,
         "activation_mode":"require_inactive_at_arm","on_signal":"success","on_no_signal":"failure",
-        "goal":{"frame_ref":{"kind":"target_frame","target_role":"arm","frame_role":"base"},
+        "goal":{"frame_ref":{"kind":"target_frame","frame":{"component_id":"lite6_robot","frame_id":"base"}},
           "position_m":[0.1,0.1,0.1],"orientation":{"xyzw":[0,0,0,1]}},
         "interrupt_condition":{"compare":{"operand":{"key":"ready"},"op":"==","value":false}}}})");
     tree =
@@ -1174,97 +1153,56 @@ TEST(
 }
 
 TEST(RetainedIoPolicyCompilerTest,
-     ActualTrialMotionConditionsBindOnlyTheirQualifiedLogicalInputRoles) {
+     ActualTrialMotionConditionsBindOnlyTheirQualifiedDirectInputs) {
   Root root;
   const auto fixture = d::test::MaterializeMaintainedInterruptDeployment(
       root.path, parse(R"({"interrupt_rules":[]})"),
       "examples/mock_lite6_signal_moves.scenario");
   const auto &bundle = *fixture.bundle;
   ASSERT_TRUE(fixture.model_map.has_value());
-  EXPECT_TRUE(std::none_of(fixture.model_map->control_bindings().begin(),
-                           fixture.model_map->control_bindings().end(),
-                           [](const auto &row) {
-                             return row.controllable_component_id ==
-                                    c::ControllableComponentId("station_io");
-                           }));
   auto authored = program_root(bundle, true);
-  authored = replace(authored, "component_roles",
-                     parse(R"({"robot":{},"station":{}})"));
-  auto targets = *authored.find_object_member("target_roles");
-  targets = replace(targets, "station", parse(R"({
-    "component_role":"station","required_capabilities":[{
-      "capability_id":"io.gpio.get_input","parameters":{},"disposition":"required"}],
-    "required_frame_roles":[],"required_resource_roles":["edge_sensor","probe_contact"],
-    "required_collision_body_roles":[],"required_model_roles":[]})"));
-  authored = replace(authored, "target_roles", targets);
-  const auto scenario =
-      d::parse_strict_json_model_yaml(
-          d::test::maintained_activation_fixture_detail::Read(
-              std::filesystem::path(MANYFORGE_WORKSPACE_ROOT) /
-              "examples/mock_lite6_signal_moves.scenario/program.yaml"))
-          .root();
-  V::Array children;
-  for (const auto &node : scenario.find_object_member("forest")
-                              ->as_array()
-                              .front()
-                              .find_object_member("children")
-                              ->as_array()) {
-    const auto &id = node.find_object_member("instance_id")->as_string();
-    if (id == "search_trip" || id == "search_no_trip")
-      children.push_back(node);
-  }
-  ASSERT_EQ(children.size(), 2U);
-  // No ordinary io.* leaf exists to accidentally classify these resources.
-  // Exercise both literal references in a nested condition on the real trial
-  // node.
-  auto parameters = *children.front().find_object_member("parameters");
-  parameters = replace(parameters, "interrupt_condition", parse(R"({"all":[
-    {"compare":{"operand":{"signal":{"target_role":"station","resource_role":"probe_contact"}},"op":"==","value":true}},
-    {"not":{"compare":{"operand":{"signal":{"target_role":"station","resource_role":"edge_sensor"}},"op":"==","value":true}}}]})"));
-  children.front() = replace(children.front(), "parameters", parameters);
+  auto node = parse(R"({"node_id":"motion.move_until_signal","instance_id":"search_trip",
+    "children":[],"parameters":{
+      "target":{"component_id":"lite6_robot","command_target_id":"arm"},
+      "base_frame":{"component_id":"lite6_robot","frame_id":"base"},
+      "tcp_endpoint":{"kind":"current"},"stop_mode":"soft_on_path",
+      "activation_mode":"require_inactive_at_arm","on_signal":"success","on_no_signal":"failure",
+      "goal":{"frame_ref":{"kind":"target_frame","frame":{"component_id":"lite6_robot","frame_id":"base"}},
+        "position_m":[0.1,0.1,0.1],"orientation":{"xyzw":[0,0,0,1]}},
+      "interrupt_condition":{"all":[
+        {"compare":{"operand":{"signal":{"component_id":"station_io","signal_name":"probe_contact"}},"op":"==","value":true}},
+        {"not":{"compare":{"operand":{"signal":{"component_id":"station_io","signal_name":"edge_sensor"}},"op":"==","value":true}}}]}}})");
+  auto second = replace(node, "instance_id", V("search_no_trip"));
+  auto second_parameters = *second.find_object_member("parameters");
+  second_parameters = replace(second_parameters, "interrupt_condition", parse(R"({
+    "compare":{"operand":{"signal":{"component_id":"station_io","signal_name":"edge_sensor"}},"op":"==","value":true}})"));
+  second = replace(second, "parameters", second_parameters);
   auto tree = parse(R"({"node_id":"sequence","instance_id":"signal_trial",
     "execution_groups":["arm_group"],"parameters":{},"children":[]})");
-  tree = replace(tree, "children", V(children));
+  tree = replace(tree, "children", V(V::Array{node, second}));
   authored = replace(authored, "tree", tree);
   const auto seal = [](V value) {
-    return d::test::with_program_revision(
-        d::normalize_program_authoring(value));
+    return d::test::with_program_revision(d::normalize_program_authoring(value));
   };
-  const auto program = d::verify_program_binding_contract(
-      d::canonical_json(seal(authored)), bundle);
-  const c::ProgramRoleAssignmentDTO assignment{
-      {{c::ComponentRoleId("robot"), c::ControllableComponentId("lite6_robot")},
-       {c::ComponentRoleId("station"),
-        c::ControllableComponentId("station_io")}},
-      {{c::TargetRoleId("arm"), c::CommandTargetId("arm")},
-       {c::TargetRoleId("station"), c::CommandTargetId("io")}}};
   d::FilesystemCatalogArtifactStore catalogs(root.path);
-  const auto binding = d::compile_program_binding(*program, assignment, bundle,
-                                                  *fixture.model_map, catalogs);
+  const auto program = d::verify_program_binding_contract(d::canonical_json(seal(authored)), bundle,
+                                                            *fixture.model_map, catalogs);
+  const auto binding = d::compile_program_binding(*program, bundle, *fixture.model_map, catalogs);
   ASSERT_NE(binding, nullptr);
-  const auto station = std::find_if(
-      binding->value().target_role_bindings.begin(),
-      binding->value().target_role_bindings.end(), [](const auto &row) {
-        return row.target_role_id == c::TargetRoleId("station");
-      });
-  ASSERT_NE(station, binding->value().target_role_bindings.end());
-  EXPECT_TRUE(station->resource_role_bindings.empty());
-  ASSERT_EQ(station->signal_role_bindings.size(), 2U);
-  EXPECT_EQ(station->signal_role_bindings[0].resource_role_id,
-            c::ResourceRoleId("edge_sensor"));
-  EXPECT_EQ(station->signal_role_bindings[1].resource_role_id,
-            c::ResourceRoleId("probe_contact"));
-  for (const auto &role : station->signal_role_bindings) {
-    EXPECT_EQ(role.direction, c::IoSignalDirection::kInput);
-    EXPECT_EQ(role.value_type, c::IoSignalValueType::kBoolean);
+  const auto &signals = binding->value().signal_bindings;
+  for (const auto *name : {"edge_sensor", "probe_contact"}) {
+    const auto found = std::find_if(signals.begin(), signals.end(), [&](const auto &row) {
+      return row.reference == c::ProgramSignalReferenceDTO{c::ControllableComponentId("station_io"), name};
+    });
+    ASSERT_NE(found, signals.end());
+    EXPECT_EQ(found->direction, c::IoSignalDirection::kInput);
+    EXPECT_EQ(found->value_type, c::IoSignalValueType::kBoolean);
   }
-  const auto checked =
-      d::compile_program_io_conditions(*program, *binding, bundle);
+  const auto checked = d::compile_program_io_conditions(*program, *binding, bundle);
   ASSERT_TRUE(checked.ok()) << checked.error().message;
   ASSERT_EQ(checked.value().program_node_conditions.size(), 2U);
   const auto find_node = [&](std::string_view id) {
-    return std::find_if(
-        checked.value().program_node_conditions.begin(),
+    return std::find_if(checked.value().program_node_conditions.begin(),
         checked.value().program_node_conditions.end(),
         [&](const auto &row) { return row.node_instance_id.value() == id; });
   };
@@ -1272,56 +1210,30 @@ TEST(RetainedIoPolicyCompilerTest,
   const auto no_trip = find_node("search_no_trip");
   ASSERT_NE(trip, checked.value().program_node_conditions.end());
   ASSERT_NE(no_trip, checked.value().program_node_conditions.end());
-  EXPECT_EQ(trip->required_signal_sources,
-            (std::vector<c::InterruptSourceId>{
-                c::InterruptSourceId("station_io.edge_sensor"),
-                c::InterruptSourceId("station_io.probe_contact")}));
-  EXPECT_EQ(no_trip->required_signal_sources,
-            (std::vector<c::InterruptSourceId>{
-                c::InterruptSourceId("station_io.edge_sensor")}));
+  EXPECT_EQ(trip->required_signal_sources, (std::vector<c::InterruptSourceId>{
+      c::InterruptSourceId("station_io.edge_sensor"), c::InterruptSourceId("station_io.probe_contact")}));
+  EXPECT_EQ(no_trip->required_signal_sources, (std::vector<c::InterruptSourceId>{
+      c::InterruptSourceId("station_io.edge_sensor")}));
 
-  // An undeclared condition role cannot obtain a target-wide signal grant.
-  auto foreign_children = children;
-  auto foreign_parameters = parameters;
-  foreign_parameters =
-      replace(foreign_parameters, "interrupt_condition", parse(R"({
-    "compare":{"operand":{"signal":{"target_role":"station","resource_role":"lamp"}},"op":"==","value":true}})"));
-  foreign_children.front() =
-      replace(foreign_children.front(), "parameters", foreign_parameters);
-  const auto foreign = d::verify_program_binding_contract(
-      d::canonical_json(seal(replace(
-          authored, "tree", replace(tree, "children", V(foreign_children))))),
-      bundle);
-  try {
-    (void)d::compile_program_binding(*foreign, assignment, bundle,
-                                     *fixture.model_map, catalogs);
-    FAIL() << "undeclared condition resource was accepted";
-  } catch (const d::ProgramBindingCompilerError &failure) {
-    EXPECT_NE(
-        std::string(failure.what())
-            .find(
-                "io_signal_unbound: condition input needs its exact required"),
-        std::string::npos);
-  }
-
-  // A declared output is still not an interrupt input.
-  auto output_targets = targets;
-  auto output_target = *targets.find_object_member("station");
-  output_target = replace(output_target, "required_resource_roles",
-                          parse(R"(["edge_sensor","lamp","probe_contact"])"));
-  output_targets = replace(output_targets, "station", output_target);
-  const auto output = d::verify_program_binding_contract(
-      d::canonical_json(seal(
-          replace(replace(authored, "target_roles", output_targets), "tree",
-                  replace(tree, "children", V(foreign_children))))),
-      bundle);
-  try {
-    (void)d::compile_program_binding(*output, assignment, bundle,
-                                     *fixture.model_map, catalogs);
-    FAIL() << "output condition resource was accepted as an input";
-  } catch (const d::ProgramBindingCompilerError &failure) {
-    EXPECT_NE(std::string(failure.what()).find("io_signal_direction_mismatch"),
-              std::string::npos);
+  // An unknown direct signal and an output cannot be admitted as inputs.
+  for (const auto *name : {"not_present", "lamp"}) {
+    auto bad_parameters = *node.find_object_member("parameters");
+    const V reference(V::Object{{"component_id", V("station_io")}, {"signal_name", V(name)}});
+    const V bad_condition(V::Object{{"compare", V(V::Object{
+        {"operand", V(V::Object{{"signal", reference}})}, {"op", V("==")}, {"value", V(true)}})}});
+    bad_parameters = replace(bad_parameters, "interrupt_condition", bad_condition);
+    const auto bad_node = replace(node, "parameters", bad_parameters);
+    const auto bad_tree = replace(tree, "children", V(V::Array{bad_node, second}));
+    const auto bytes = d::canonical_json(seal(replace(authored, "tree", bad_tree)));
+    try {
+      (void)d::verify_program_binding_contract(bytes, bundle, *fixture.model_map, catalogs);
+      FAIL() << "invalid input reference must be refused before binding";
+    } catch (const d::ProgramReferenceValidationRefusal &error) {
+      const auto expected = std::string_view(name) == "not_present"
+                                ? "signal_missing" : "signal_direction_mismatch";
+      EXPECT_TRUE(std::any_of(error.diagnostics().begin(), error.diagnostics().end(),
+                              [&](const auto &diagnostic) { return diagnostic.code == expected; }));
+    }
   }
 }
 

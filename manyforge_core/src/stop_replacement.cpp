@@ -340,7 +340,7 @@ Result<TrajectoryDTO> build_stop_replacement_join(const TrajectoryDTO& active,
         "stop_join_input_invalid",
         "The Stop join needs two complete trajectories over the same joints"));
   }
-  // §4.2 steps 3-4: with the trip point still ahead, the original path itself
+  // With the trip point still ahead, the original path itself
   // (its own waypoints and polynomials) runs up to the trip point.
   const bool trip_ahead = trip_path_s > elapsed_s;
   if (trip_ahead &&

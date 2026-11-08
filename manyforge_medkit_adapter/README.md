@@ -2,8 +2,8 @@
 
 This package currently retains the transport-neutral fault latch, healing,
 archive-reference, and medkit-report mapping in `forwarder.py`. The effectful
-adapter entrypoint is intentionally unavailable until I6/N provides an
-addressed runtime diagnostics source; it exits 78 before parsing arguments,
+adapter entrypoint is intentionally unavailable until an addressed runtime
+diagnostics source exists; it exits 78 before parsing arguments,
 accessing a network, importing ROS, or publishing a fault.
 
 ManyForge core stays medkit-free — this package owns the coupling, one-way.
@@ -11,7 +11,7 @@ ManyForge core stays medkit-free — this package owns the coupling, one-way.
 The previous Composer-polling adapter is a behavior reference, not a runnable
 fallback. Its complete source is pinned at
 `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`, blob
-`ef1b592fac2c99ebb10c4683b86c654704e7d3aa`. At N, the restored adapter must
+`ef1b592fac2c99ebb10c4683b86c654704e7d3aa`. The restored adapter must
 consume addressed owner-issued diagnostics while preserving FAILED-on-latch,
 PASSED healing, severity, archive-reference, discovery, and fail-closed
 behavior.

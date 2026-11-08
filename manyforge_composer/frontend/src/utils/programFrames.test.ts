@@ -1,72 +1,55 @@
 import { describe, expect, it } from 'vitest';
 
-import type { ProgramDocument } from '../types/api';
-import {
-  canonicalFrames,
-  offeredFrameChoices,
-  poseFrameOf,
-  programFrameChoices,
-  type ProgramPoseFrame,
-} from './programFrames';
+import type { ProgramDocument, ProgramFrameReference } from '../types/api';
+import { canonicalFrames, offeredFrameChoices, poseFrameOf, programFrameChoices } from './programFrames';
 
-const program = {
-  target_roles: {
-    arm: { required_frame_roles: ['base', 'tcp'] },
-    peer: { required_frame_roles: ['base', 'tcp'] },
-  },
-  scene: [{ scene_resource_id: 'table' }],
-} as unknown as Pick<ProgramDocument, 'target_roles' | 'scene'>;
+const program = { scene: [{ scene_resource_id: 'table' }] } as unknown as Pick<ProgramDocument, 'scene'>;
+const frames: ProgramFrameReference[] = [
+  { component_id: 'arm', frame_id: 'base' },
+  { component_id: 'arm', frame_id: 'tcp' },
+  { component_id: 'peer', frame_id: 'base' },
+  { component_id: 'peer', frame_id: 'tcp' },
+];
 
 describe('program frames', () => {
-  it('lists the moving robot first, then other robots by name, the cell and Scene objects', () => {
-    const choices = programFrameChoices({ program, movingTargetRole: 'peer' });
+  it('lists only captured component-frame facts and preserves component ownership', () => {
+    const choices = programFrameChoices({ program, frames, movingComponentId: 'peer', movingFrames: frames.slice(2) });
     expect(choices.map((choice) => [choice.group, choice.label])).toEqual([
-      ['Moving robot · peer', 'peer · base'],
-      ['Moving robot · peer', 'peer · tcp'],
-      ['Other robots', 'arm · base'],
-      ['Other robots', 'arm · tcp'],
-      ['Cell', 'Cell'],
-      ['Scene objects', 'table'],
+      ['Moving robot · peer', 'peer · base'], ['Moving robot · peer', 'peer · tcp'],
+      ['Other robots', 'arm · base'], ['Other robots', 'arm · tcp'],
+      ['Cell', 'Cell'], ['Scene objects', 'table'],
     ]);
-    // The same frame name on two robots stays two frames.
     expect(new Set(choices.map((choice) => choice.key)).size).toBe(choices.length);
-    expect(programFrameChoices({ program }).slice(0, 4).map((choice) => choice.group))
-      .toEqual(['Robots', 'Robots', 'Robots', 'Robots']);
+    expect(programFrameChoices({ program }).map((choice) => choice.key)).toEqual(['cell', 'scene:table']);
   });
 
-  it('offers only a key’s allowed frames and a field’s accepted kinds', () => {
-    const allowed: ProgramPoseFrame[] = [
-      { kind: 'scene_resource', scene_resource_id: 'table' },
-      { kind: 'target_frame', target_role: 'arm', frame_role: 'tcp' },
+  it('filters exact direct frame pairs and offered kinds', () => {
+    const allowed = [
+      { kind: 'scene_resource' as const, scene_resource_id: 'table' },
+      { kind: 'target_frame' as const, frame: { component_id: 'arm', frame_id: 'tcp' } },
     ];
-    expect(programFrameChoices({ program, allowedFrames: allowed }).map((choice) => choice.key))
-      .toEqual(['robot:arm:tcp', 'scene:table']);
-    expect(offeredFrameChoices(
-      { program, movingTargetRole: 'arm' },
-      { otherRobots: false, cell: false, scene: false },
-    ).map((choice) => choice.key)).toEqual(['robot:arm:base', 'robot:arm:tcp']);
+    expect(programFrameChoices({ program, frames, allowedFrames: allowed }).map((choice) => choice.key))
+      .toEqual(['component:arm:tcp', 'scene:table']);
+    expect(offeredFrameChoices({ program, frames, movingComponentId: 'arm', movingFrames: frames.slice(0, 2) },
+      { otherRobots: false, cell: false, scene: false }).map((choice) => choice.key))
+      .toEqual(['component:arm:base', 'component:arm:tcp']);
   });
 
-  it('orders allowed frames canonically like the Program validator and drops duplicates', () => {
-    const tcp: ProgramPoseFrame = { kind: 'target_frame', target_role: 'arm', frame_role: 'tcp' };
-    expect(canonicalFrames([
-      tcp,
-      { kind: 'scene_resource', scene_resource_id: 'table' },
-      { kind: 'target_frame', target_role: 'arm', frame_role: 'base' },
-      { kind: 'cell_frame' },
-      tcp,
-    ])).toEqual([
-      { kind: 'cell_frame' },
-      { kind: 'scene_resource', scene_resource_id: 'table' },
-      { kind: 'target_frame', target_role: 'arm', frame_role: 'base' },
-      tcp,
-    ]);
+  it('retains a mounted-tool frame in the exact moving-target selection', () => {
+    const tool = { component_id: 'tool', frame_id: 'tcp' };
+    const choices = offeredFrameChoices({ program, frames: [...frames, tool],
+      movingComponentId: 'arm', movingFrames: [frames[0]!, tool] },
+    { otherRobots: false, cell: false, scene: false });
+    expect(choices.map((choice) => choice.key)).toEqual(['component:arm:base', 'component:tool:tcp']);
   });
 
-  it('reads only closed pose frames', () => {
-    expect(poseFrameOf({ kind: 'cell_frame' })).toEqual({ kind: 'cell_frame' });
-    expect(poseFrameOf({ kind: 'cell_frame', cell_id: 'c' })).toBeNull();
-    expect(poseFrameOf({ kind: 'target_frame', target_role: 'arm' })).toBeNull();
-    expect(poseFrameOf({ kind: 'scene_resource', scene_resource_id: '' })).toBeNull();
+  it('parses closed v3 frames, rejects role aliases, and orders pairs canonically', () => {
+    const arm = { kind: 'target_frame' as const, frame: { component_id: 'arm', frame_id: '2_TCP' } };
+    const peer = { kind: 'target_frame' as const, frame: { component_id: 'peer', frame_id: '2_TCP' } };
+    expect(poseFrameOf(arm)).toEqual(arm);
+    expect(poseFrameOf({ kind: 'target_frame', target_role: 'arm', frame_role: 'tcp' })).toBeNull();
+    expect(poseFrameOf({ kind: 'target_frame', frame: { component_id: 'arm', frame_id: 'tcp', extra: true } })).toBeNull();
+    expect(poseFrameOf({ kind: 'target_frame', frame: { component_id: 'ARM', frame_id: 'tcp' } })).toBeNull();
+    expect(canonicalFrames([peer, arm, arm])).toEqual([arm, peer]);
   });
 });

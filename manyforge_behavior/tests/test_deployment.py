@@ -13,21 +13,21 @@ dependency order as follows:
   ``robot_id/group_id`` dispatch, ``runtime_resources``, Python
   runner-module/factory selection, ``manyforge.skill.v0``, and the local
   skill/catalog compatibility path;
-* **I5/H0 then I6/N:** model endpoint, assistant mode/tool/prompt authoring and
+* **headless read, then addressed runtime:** model endpoint, assistant mode/tool/prompt authoring and
   Composer deployment-client behavior, using headless truth and the new native
   artifact projection rather than a second deployment owner;
-* **I6/N:** strict specs-approved program/deployment loading, component and
+* **addressed runtime:** strict program/deployment loading, component and
   command-target binding, native adapter/capability selection, bounded
   cross-artifact validation, two-same-type-instance addressing, and all seven
   native deployment inputs;
-* **I8/P5:** cooperative-interrupt rejection, execution-stop capability, and
+* **Kernel Stop:** cooperative-interrupt rejection, execution-stop capability, and
   deadline/settlement cases, now owned by resource-scoped Kernel Stop rather
   than deployment or runner policy;
-* **I9/I:** pose-source, simulator-control, Isaac bridge, reset, viewer, and
+* **Isaac:** pose-source, simulator-control, Isaac bridge, reset, viewer, and
   five registered Isaac deployment cases;
-* **I10/R and I11/T:** real Lite6 admission plus generalized articulated and
+* **real robot and tools:** real Lite6 admission plus generalized articulated and
   fixed-pneumatic tool/gripper semantics; and
-* **N7 replacement:** the exact active retained viewer product now supplies
+* **viewer replacement:** the exact active retained viewer product now supplies
   Composer geometry through Headless, so the temporary v0 ``robot_config``
   excerpt is removed; the transport-neutral Lite6 model closure, digest,
   runtime-capture, and source-provenance cases remain in
@@ -47,7 +47,6 @@ import pytest
 
 from manyforge_behavior import deployment
 from manyforge_behavior.deployment import (
-    DEPLOYMENT_ARTIFACT_RESTORATION_GATES,
     DEPLOYMENT_ARTIFACT_UNAVAILABLE_REASON_CODE,
     Deployment,
     DeploymentArtifactUnavailableError,
@@ -83,11 +82,7 @@ def test_deployment_entrypoints_fail_before_reading_legacy_input(
     message = str(raised.value)
     assert DEPLOYMENT_ARTIFACT_UNAVAILABLE_REASON_CODE in message
     assert "manyforge.deployment.v0" in message
-    assert "I6/N" in message
-
-
-def test_deployment_gate_names_exact_restoration_boundary() -> None:
-    assert DEPLOYMENT_ARTIFACT_RESTORATION_GATES == ("I6", "N")
+    assert "not available" in message
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,6 @@
-api_version: manyforge.program.v2
+api_version: manyforge.program.v3
 program_id: trocar_lite6_foundationpose_pick
-program_revision: sha256:68793950ea0f3d4d8a08f5eefa57ddb51af7dafe997254ea6a397841f1b07491
+program_revision: sha256:eead1a0eec72be8bd4fe479ed37e4d3773905d7a07f922d29708b9665a32434a
 program_profile: composable-cell-v1
 name: trocar_lite6_foundationpose_pick
 description: Retained Isaac-compatible Lite6 trocar pick Program. The Manager latches the FoundationPose
@@ -8,8 +8,8 @@ description: Retained Isaac-compatible Lite6 trocar pick Program. The Manager la
   original top-down pick and place sequence using the physical lite-gripper and typed simulator lifecycle.
   When another Active TCP is selected, pick offsets stay relative to the gripper TCP.
 catalog:
-  api_version: manyforge.node_catalog.v2
-  content_version: 2.9.0
+  api_version: manyforge.node_catalog.v3
+  content_version: 3.0.0
 compatibility:
   lanes:
   - isaac-sim
@@ -23,72 +23,6 @@ compatibility:
   - isaac-sim
   - lite6
   - pick-and-place
-component_roles:
-  robot:
-    required_component_type_tags:
-    - articulated-arm
-    required_model_roles:
-    - arm_model
-  tool:
-    required_component_type_tags:
-    - gripper
-target_roles:
-  arm:
-    component_role: robot
-    required_capabilities:
-    - capability_id: execution.feedback.phase_events
-      parameters: {}
-      disposition: required
-    - capability_id: execution.trajectory.execute
-      parameters: {}
-      disposition: required
-    - capability_id: model.kinematics.fk
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.cartesian_path
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.joint_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.trajectory.time_parameterized
-      parameters: {}
-      disposition: required
-    - capability_id: state.observed.current
-      parameters: {}
-      disposition: required
-    - capability_id: validation.trajectory.non_collision
-      parameters: {}
-      disposition: required
-    required_frame_roles:
-    - base
-    required_resource_roles:
-    - arm_joints
-    required_collision_body_roles:
-    - arm_collision
-    required_model_roles:
-    - arm_model
-  gripper:
-    component_role: tool
-    required_capabilities:
-    - capability_id: model.kinematics.fk
-      parameters: {}
-      disposition: required
-    - capability_id: tool.gripper.command
-      parameters: {}
-      disposition: required
-    - capability_id: tool.gripper.feedback
-      parameters: {}
-      disposition: required
-    required_frame_roles:
-    - tcp
-    required_resource_roles:
-    - fingers
-    required_collision_body_roles:
-    - gripper_collision
 scene:
 - scene_resource_id: graspable
   shape:
@@ -100,9 +34,9 @@ scene:
   pose:
     frame_ref:
       kind: component_frame
-      component_role: robot
-      model_role: arm_model
-      frame_role: base
+      frame:
+        component_id: isaac_lite6_trocar_robot
+        frame_id: base
     position_m:
     - 0.18
     - -0.2
@@ -205,7 +139,7 @@ blackboard:
 contact_policies:
 - api_version: manyforge.contact_policy.v1
   policy_id: selected_object_grasp
-  version: sha256:13cce018403acdc3768ed8f1e86656fa482cf40aa3a1eb7984cd6c93e9acc47c
+  version: sha256:4dd457c3867359c71b3ff8a1885042786887a79dec93808446726efa1dabc5c1
   mode: contact_grasp
   sensing_mode: geometry_only
   default_unmatched_response: hard_stop
@@ -214,8 +148,9 @@ contact_policies:
     body_pairs:
     - body_a:
         kind: component_model_body
-        component_role_id: tool
-        collision_body_role_id: gripper_collision
+        body:
+          component_id: lite_gripper
+          collision_body_id: gripper_collision
       body_b:
         kind: runtime_object
         runtime_object_id: selected_object
@@ -240,7 +175,9 @@ tree:
   - node_id: gripper.command_position
     instance_id: open_gripper_start
     parameters:
-      target_role: gripper
+      target:
+        component_id: lite_gripper
+        command_target_id: gripper
       position:
         kind: linear_m
         value_m: 0.0081
@@ -252,8 +189,12 @@ tree:
   - node_id: motion.move_to_joint_target
     instance_id: move_to_rest
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_lite6_trocar_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_lite6_trocar_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       goal:
@@ -279,12 +220,20 @@ tree:
   - node_id: planning.plan_pick_sequence
     instance_id: plan_foundationpose_trocar_pick
     parameters:
-      target_role: arm
-      tool_target_role: gripper
-      base_frame_role: base
+      target:
+        component_id: isaac_lite6_trocar_robot
+        command_target_id: arm
+      tool_target:
+        component_id: lite_gripper
+        command_target_id: gripper
+      base_frame:
+        component_id: isaac_lite6_trocar_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
-      carrier_frame_role: tcp
+      carrier_frame_ref:
+        component_id: lite_gripper
+        frame_id: tcp
       selected_object_id: graspable
       synthesis:
         pick_offset_envelope:
@@ -322,13 +271,15 @@ tree:
           - 0.0
           - 0.0
         pick_offset_reference:
-          type: frame_role
-          frame_role_id: tcp
-          target_role: gripper
+          type: component_frame
+          frame:
+            component_id: lite_gripper
+            frame_id: tcp
         approach_offset_reference:
-          type: frame_role
-          frame_role_id: tcp
-          target_role: gripper
+          type: component_frame
+          frame:
+            component_id: lite_gripper
+            frame_id: tcp
         force_vertical_pick: true
         min_tcp_z_m: 0.016
         search_strategy: first_feasible
@@ -353,8 +304,12 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_planned_pick_approach
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_lite6_trocar_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_lite6_trocar_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       planning_timeout_s: 10.0
@@ -371,8 +326,12 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_planned_pick
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_lite6_trocar_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_lite6_trocar_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       velocity_scale: 0.2
@@ -396,7 +355,9 @@ tree:
     - node_id: gripper.command_position
       instance_id: close_gripper
       parameters:
-        target_role: gripper
+        target:
+          component_id: lite_gripper
+          command_target_id: gripper
         position:
           kind: linear_m
           value_m: 0.0
@@ -408,10 +369,15 @@ tree:
     - node_id: scene.attach_carried_object
       instance_id: attach_graspable
       parameters:
-        target_role: gripper
-        carrier_frame_role: tcp
-        touch_body_roles:
-        - gripper_collision
+        target:
+          component_id: lite_gripper
+          command_target_id: gripper
+        carrier_frame_ref:
+          component_id: lite_gripper
+          frame_id: tcp
+        touch_bodies:
+        - component_id: lite_gripper
+          collision_body_id: gripper_collision
       children: []
       value_sources:
         scene_resource_id:
@@ -426,8 +392,12 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: retreat_after_pick
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_lite6_trocar_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_lite6_trocar_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       planning_timeout_s: 10.0
@@ -444,15 +414,20 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_drop_approach
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_lite6_trocar_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_lite6_trocar_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       goal:
         frame_ref:
           kind: target_frame
-          target_role: arm
-          frame_role: base
+          frame:
+            component_id: isaac_lite6_trocar_robot
+            frame_id: base
         position_m:
         - 0.16
         - 0.08
@@ -472,15 +447,20 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_drop
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_lite6_trocar_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_lite6_trocar_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       goal:
         frame_ref:
           kind: target_frame
-          target_role: arm
-          frame_role: base
+          frame:
+            component_id: isaac_lite6_trocar_robot
+            frame_id: base
         position_m:
         - 0.16
         - 0.08
@@ -497,7 +477,9 @@ tree:
   - node_id: gripper.command_position
     instance_id: open_gripper_release
     parameters:
-      target_role: gripper
+      target:
+        component_id: lite_gripper
+        command_target_id: gripper
       position:
         kind: linear_m
         value_m: 0.0081
@@ -509,7 +491,9 @@ tree:
   - node_id: scene.detach_carried_object
     instance_id: detach_graspable
     parameters:
-      target_role: gripper
+      target:
+        component_id: lite_gripper
+        command_target_id: gripper
     children: []
     value_sources:
       scene_resource_id:
@@ -519,15 +503,20 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: drop_retreat
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_lite6_trocar_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_lite6_trocar_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       goal:
         frame_ref:
           kind: target_frame
-          target_role: arm
-          frame_role: base
+          frame:
+            component_id: isaac_lite6_trocar_robot
+            frame_id: base
         position_m:
         - 0.16
         - 0.08
@@ -547,8 +536,12 @@ tree:
   - node_id: motion.move_to_joint_target
     instance_id: return_rest
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_lite6_trocar_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_lite6_trocar_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       goal:

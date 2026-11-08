@@ -61,6 +61,7 @@ def test_main_collects_independent_group_and_ordinary_failures(
             test_regex=None,
             exclude_test_regex=None,
             summary_prefix="TEST_RUNNER",
+            isolate_filter=[],
             timeout_seconds=300.0,
         ),
     )
@@ -91,6 +92,58 @@ def test_main_collects_independent_group_and_ordinary_failures(
     assert "identity=\"first\"" in output
     assert "identity=\"third\"" in output
     assert "identity=\"OrdinaryOne\"" in output
+
+
+def test_fixture_setup_ctest_runs_before_the_gtest_groups(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = load_runner()
+    registry = [
+        {
+            "name": "Suite.NeedsPackage",
+            "command": ["binary", "--gtest_filter=Suite.NeedsPackage"],
+            "properties": [
+                {"name": "FIXTURES_REQUIRED", "value": ["Package"]},
+                {"name": "WORKING_DIRECTORY", "value": str(tmp_path)},
+            ],
+        },
+        {"name": "OrdinaryCheck", "command": ["python3", "check.py"]},
+        {
+            "name": "ProducePackage",
+            "command": ["python3", "produce.py"],
+            "properties": [{"name": "FIXTURES_SETUP", "value": ["Package"]}],
+        },
+    ]
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        runner,
+        "parse_args",
+        lambda: SimpleNamespace(
+            build_dir=str(tmp_path),
+            test_regex=None,
+            exclude_test_regex=None,
+            summary_prefix="TEST_RUNNER",
+            isolate_filter=[],
+            timeout_seconds=300.0,
+        ),
+    )
+    monkeypatch.setattr(runner, "load_registry", lambda *_args: registry)
+
+    def run_group(index, group):
+        calls.append(group.binary)
+        return 1, 1, 0, False
+
+    def run_ordinary(index, test, build_dir):
+        calls.append(test.name)
+        return 1, 1, 0
+
+    monkeypatch.setattr(runner, "run_group", run_group)
+    monkeypatch.setattr(runner, "run_ordinary_test", run_ordinary)
+
+    assert runner.main() == 0
+    assert calls == ["ProducePackage", "binary", "OrdinaryCheck"]
 
 
 def test_isolated_fallback_runs_every_filter_before_reporting_failures(
@@ -142,3 +195,61 @@ def test_deployment_ordinary_check_uses_the_configured_test_timeout() -> None:
 
     assert "PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}" in block
     assert "PROPERTIES TIMEOUT 60" not in block
+
+
+def test_explicit_isolates_run_once_each_outside_group(tmp_path, monkeypatch):
+    runner = load_runner()
+    isolates = frozenset({'Suite.IsolatedOne', 'Suite.IsolatedTwo'})
+    group = runner.BinaryGroup(binary='binary', working_directory=str(tmp_path),
+        enabled_filters=['Suite.OrdinaryOne', 'Suite.IsolatedOne', 'Suite.OrdinaryTwo', 'Suite.IsolatedTwo'],
+        registered_count=4, isolate_filters=isolates)
+    calls = []
+
+    def execute(command, _working_directory, _timeout_seconds):
+        calls.append(command[1])
+        count = len(command[1].split('=', 1)[1].split(':'))
+        return 0, (f'[==========] {count} tests from 1 test suite ran.\n'
+                   f'[  PASSED  ] {count} tests.\n'), False
+
+    monkeypatch.setattr(runner, 'execute', execute)
+    assert runner.run_group(1, group) == (4, 4, 0, False)
+    assert calls == ['--gtest_filter=Suite.OrdinaryOne:Suite.OrdinaryTwo',
+                     '--gtest_filter=Suite.IsolatedOne', '--gtest_filter=Suite.IsolatedTwo']
+
+
+def test_isolates_still_run_after_grouped_sanitizer_failure(tmp_path, monkeypatch):
+    runner = load_runner()
+    group = runner.BinaryGroup(binary='binary', working_directory=str(tmp_path),
+        enabled_filters=['Suite.Other', 'Suite.Isolated'], registered_count=2,
+        isolate_filters=frozenset({'Suite.Isolated'}))
+    calls = []
+
+    def execute(command, _working_directory, _timeout_seconds):
+        calls.append(command[1])
+        if command[1] == '--gtest_filter=Suite.Other':
+            return 66, 'WARNING: ThreadSanitizer', False
+        return 0, '[==========] 1 test from 1 test suite ran.\n[  PASSED  ] 1 test.\n', False
+
+    monkeypatch.setattr(runner, 'execute', execute)
+    with pytest.raises(RuntimeError, match='sanitizer finding in grouped'):
+        runner.run_group(1, group)
+    assert calls == ['--gtest_filter=Suite.Other', '--gtest_filter=Suite.Isolated']
+
+
+def test_only_isolates_continue_after_one_sanitizer_finding(tmp_path, monkeypatch):
+    runner = load_runner()
+    group = runner.BinaryGroup(binary='binary', working_directory=str(tmp_path),
+        enabled_filters=['Suite.IsolatedOne', 'Suite.IsolatedTwo'], registered_count=2,
+        isolate_filters=frozenset({'Suite.IsolatedOne', 'Suite.IsolatedTwo'}))
+    calls = []
+
+    def execute(command, _working_directory, _timeout_seconds):
+        calls.append(command[1])
+        if command[1] == '--gtest_filter=Suite.IsolatedOne':
+            return 66, 'WARNING: ThreadSanitizer', False
+        return 0, '[==========] 1 test from 1 test suite ran.\n[  PASSED  ] 1 test.\n', False
+
+    monkeypatch.setattr(runner, 'execute', execute)
+    with pytest.raises(RuntimeError, match='sanitizer finding in isolated'):
+        runner.run_group(1, group)
+    assert calls == ['--gtest_filter=Suite.IsolatedOne', '--gtest_filter=Suite.IsolatedTwo']

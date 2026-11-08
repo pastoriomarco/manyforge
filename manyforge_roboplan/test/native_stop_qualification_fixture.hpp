@@ -43,8 +43,6 @@ make_binding(bool distinct_compiled_joint_names = false) {
       core::ProgramBindingId("program-binding"),
       core::RetainedBundleId("bundle"),
       core::GraphRevision("graph"),
-      core::ComponentRoleId("robot"),
-      core::TargetRoleId("arm"),
       core::ControllableComponentId("robot.1"),
       core::ComponentTypeId("aggregate.robot"),
       core::ComponentTypeRevision("aggregate-revision"),
@@ -58,11 +56,11 @@ make_binding(bool distinct_compiled_joint_names = false) {
       {core::RuntimeModelGroupBindingDTO{core::ModelGroupRoleId("arm_group"),
                                          core::ModelInstanceId("robot.model"),
                                          "arm", compiled_joints}},
-      {core::ProgramFrameRoleBindingDTO{
-           core::FrameRoleId("base"), core::ModelInstanceId("robot.model"),
+      {core::ProgramFrameBindingDTO{
+           {core::ControllableComponentId("robot.1"), core::FrameRoleId("base")}, core::ModelInstanceId("robot.model"),
            core::ModelRevision("model-revision"), "base"},
-       core::ProgramFrameRoleBindingDTO{
-           core::FrameRoleId("tcp"), core::ModelInstanceId("robot.model"),
+       core::ProgramFrameBindingDTO{
+           {core::ControllableComponentId("robot.1"), core::FrameRoleId("tcp")}, core::ModelInstanceId("robot.model"),
            core::ModelRevision("model-revision"), "tool0"}},
       std::move(resources),
       {},

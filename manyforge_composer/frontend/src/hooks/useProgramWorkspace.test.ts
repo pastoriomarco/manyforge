@@ -14,9 +14,13 @@ const apiMock = vi.hoisted(() => ({
     get: vi.fn(),
     mutate: vi.fn(),
     apply: vi.fn(),
+    discard: vi.fn(),
+    revert: vi.fn(),
+    openDraft: vi.fn(),
   },
   scenarioDocuments: {
     save: vi.fn(),
+    discard: vi.fn(),
   },
   cellApply: {
     load: vi.fn(),
@@ -86,7 +90,7 @@ function testPublication(
   workspace: ProgramWorkspaceResponse,
 ): PublishedAuthoringWorkspace {
   const snapshot = {
-    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2' as const,
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v3' as const,
     workspaceEpoch: 'workspace.epoch.1',
     workspaceRevision: 1,
     program: { draft: workspace.draft, saved: workspace.saved },
@@ -106,7 +110,6 @@ function testPublication(
       documentDescription: null,
       sourceDiagnostics: [],
       sourceDocumentDigest: null,
-      programRoleAssignment: null,
       sourceProgramDigest: null,
       sourceDeploymentDigest: null,
     },
@@ -130,17 +133,15 @@ function workspace(
   programRevision = `sha256:${String(draftRevision).padStart(64, '0')}`,
 ): ProgramWorkspaceResponse {
   const program = {
-    api_version: 'manyforge.program.v2' as const,
+    api_version: 'manyforge.program.v3' as const,
     program_id: 'program-1',
     program_revision: programRevision,
     program_profile: 'composable-cell-v1' as const,
     name: 'Fixture',
     catalog: {
-      api_version: 'manyforge.node_catalog.v2' as const,
+      api_version: 'manyforge.node_catalog.v3' as const,
       content_version: 'fixture',
     },
-    component_roles: {},
-    target_roles: {},
     tree: {
       node_id: 'timer',
       instance_id: 'root',
@@ -160,14 +161,12 @@ function workspace(
       draftRevision,
       programLoaded: true,
       authoring: {
-        schema_version: 'manyforge.composer_authoring_forest.v1',
+        schema_version: 'manyforge.composer_authoring_forest.v2',
         api_version: program.api_version,
         program_id: program.program_id,
         program_profile: program.program_profile,
         name: program.name,
         catalog: program.catalog,
-        component_roles: program.component_roles,
-        target_roles: program.target_roles,
         forest: [program.tree],
         positions: {},
       },
@@ -284,6 +283,7 @@ async function mountHarness(
   const { createRoot } = await import('react-dom/client');
   root = createRoot(makeNode('div') as unknown as Element);
   const Consumer = memo((_props: { mutate: ReturnType<typeof useProgramWorkspace>['mutate'] }) => {
+    void _props;
     onConsumerRender?.();
     return null;
   });
@@ -314,7 +314,7 @@ async function mountHarness(
         identity: authoringWorkspaceIdentity(nextSnapshot),
         snapshot: nextSnapshot,
       };
-    }, [published, workspaceEpoch, workspaceRevision, programDraftRevision, deploymentDraftId, deploymentDraftRevision]);
+    }, [workspaceEpoch, workspaceRevision, programDraftRevision, deploymentDraftId, deploymentDraftRevision]);
     const authoring = useMemo(
       () => testAuthoringController(currentPublication, currentSnapshot),
       [currentPublication, currentSnapshot],
@@ -731,6 +731,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
     expect(latest?.state.message).toContain('New Scenario');
     expect(scenarioOpened).toHaveBeenCalledOnce();
+    expect(latest?.scenarioDraftInputResetEpoch).toBe(1);
   });
 
   it('a failed New shows its typed refusal and is not retried', async () => {
@@ -743,6 +744,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     let result: unknown;
     await act(async () => { result = await latest?.newScenarioDocument(); });
     expect(result).toBeNull();
+    expect(latest?.scenarioDraftInputResetEpoch).toBe(0);
     expect(apiMock.cellApply.newScenario).toHaveBeenCalledOnce();
     expect(latest?.state.error).toContain('New Scenario refused');
     expect(scenarioOpened).not.toHaveBeenCalled();
@@ -753,7 +755,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
     await act(async () => initial.resolve(workspace(1)));
     const digest = `sha256:${'b'.repeat(64)}`;
-    const fetchMock = vi.fn(async (_url: string) => ({ ok: true, status: 200, json: async () => ({
+    const fetchMock = vi.fn(async (_url: string) => (void _url, { ok: true, status: 200, json: async () => ({
       schema_version: 'manyforge.current_scenario.v1', ready: true, unavailable_reasons: [],
       current_scenario: {
         scenario_id: 'mock_lite6_motion_preemption', source_document_digest: digest,
@@ -866,6 +868,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(latest?.state.message).toContain('arm prepared');
     expect(latest?.state.message).toContain('Enable the components to run');
     expect(scenarioOpened).toHaveBeenCalledTimes(1);
+    expect(latest?.scenarioDraftInputResetEpoch).toBe(1);
 
     // A failed Load (ApplyResult outcome failed) is shown and does not count as opened.
     apiMock.cellApply.load.mockResolvedValueOnce({ outcome: 'failed', components: [],
@@ -874,5 +877,73 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(apiMock.cellApply.load).toHaveBeenCalledTimes(2);
     expect(latest?.state.error).toContain('Apply failed');
     expect(scenarioOpened).toHaveBeenCalledTimes(1);
+    expect(latest?.scenarioDraftInputResetEpoch).toBe(1);
+  });
+
+  it('rebases text only after successful Program, Scenario, and open-Draft resets', async () => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    await mountHarness(initial, authoringSnapshot(workspace(2)), testPublication(workspace(2)));
+    await act(async () => initial.resolve(workspace(2)));
+    expect(latest?.programDraftInputResetEpoch).toBe(0);
+    expect(latest?.scenarioDraftInputResetEpoch).toBe(0);
+
+    apiMock.programWorkspace.discard.mockResolvedValueOnce(workspace(1));
+    await act(async () => {
+      latest?.discard();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(latest?.programDraftInputResetEpoch).toBe(1);
+    expect(latest?.scenarioDraftInputResetEpoch).toBe(0);
+
+    apiMock.scenarioDocuments.discard.mockRejectedValueOnce(new Error('discard failed'));
+    await act(async () => {
+      latest?.discardScenario();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(latest?.programDraftInputResetEpoch).toBe(1);
+    expect(latest?.scenarioDraftInputResetEpoch).toBe(0);
+    apiMock.scenarioDocuments.discard.mockResolvedValueOnce(workspace(1));
+    await act(async () => {
+      latest?.discardScenario();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(latest?.programDraftInputResetEpoch).toBe(1);
+    expect(latest?.scenarioDraftInputResetEpoch).toBe(1);
+
+    apiMock.programWorkspace.revert.mockRejectedValueOnce(new Error('revert failed'));
+    await act(async () => {
+      latest?.revert();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(latest?.scenarioDraftInputResetEpoch).toBe(1);
+    apiMock.programWorkspace.revert.mockResolvedValueOnce({
+      status: 'accepted', headless: { apply_id: 'revert-apply', apply_generation: 2 }, workspace: workspace(1),
+    });
+    await act(async () => {
+      latest?.revert();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(latest?.scenarioDraftInputResetEpoch).toBe(2);
+    expect(latest?.state.transitionStatus).toBe('accepted');
+
+    apiMock.programWorkspace.openDraft.mockRejectedValueOnce(new Error('open failed'));
+    await act(async () => {
+      latest?.openDraft('/workspace/other.program.yaml', true);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(latest?.programDraftInputResetEpoch).toBe(1);
+    apiMock.programWorkspace.openDraft.mockResolvedValueOnce(workspace(2));
+    await act(async () => {
+      latest?.openDraft('/workspace/other.program.yaml', true);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(latest?.programDraftInputResetEpoch).toBe(2);
   });
 });

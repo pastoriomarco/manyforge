@@ -184,7 +184,7 @@ the dwell (for example to 3000) and Apply.
 ## When a gripper command completes
 
 A controlled gripper (a position gripper on a controller: the Mock lane's
-gripper controller, Isaac's GripperCommand transport, or the Real driver) is
+gripper controller, Isaac's ParallelGripperCommand transport, or the Real driver) is
 done when its controller reports the command done. `command_duration_s` with
 **Wait for command duration** (`wait_for_duration: true`) makes the node wait
 **longer** than that: until the duration has also passed since the command
@@ -246,7 +246,7 @@ tool has no controller manager of its own. Its launch
 (`isaac_gripper.launch.py`) publishes the tool's description. The tool's
 `lanes.isaac` row picks the transport (`gripper_transport`):
 
-- `ros_gripper_command` (Robotiq 2F-140): a GripperCommand action
+- `ros_gripper_command` (Robotiq 2F-140): a ParallelGripperCommand action
   `<controller>/gripper_cmd`, served by a bridge that the tool's launch also
   runs; its parameters are the lane's `gripper_bridges/<model>.yaml`, named
   by the row's `gripper_bridge`. The row also has

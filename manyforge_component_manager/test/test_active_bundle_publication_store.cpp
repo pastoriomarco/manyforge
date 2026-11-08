@@ -661,6 +661,67 @@ TEST(
       ActiveBundlePublicationIntegrityError);
 }
 
+// Publish checks only what it touches; the complete receipt verification runs
+// at open and on explicit request. A stored receipt whose fields no longer
+// match its digests is detected by both.
+TEST(
+    ActiveBundlePublicationStoreIntegrity,
+    CorruptedReceiptFailsClosedOnReopenAndExplicitVerify) {
+  TemporaryDirectory directory;
+  const auto source = directory.path() / "source.sqlite3";
+  const auto database = directory.path() / "publication.sqlite3";
+  {
+    SqliteActiveBundlePublicationStore writer(source, CellId{"cell-a"});
+    static_cast<void>(writer.PublishActiveBundle(BootstrapRequest()));
+  }
+  SqliteActiveBundlePublicationStore store(database, CellId{"cell-a"});
+
+  // Copy the valid receipt and head, changing one receipt field.
+  sqlite3* raw = nullptr;
+  ASSERT_EQ(sqlite3_open(database.string().c_str(), &raw), SQLITE_OK);
+  SqliteExec(
+      raw,
+      "ATTACH DATABASE '" + source.string() + "' AS source;"
+      "BEGIN IMMEDIATE;"
+      "INSERT INTO main.active_bundle_publication_receipts "
+      "SELECT publication_generation,transaction_kind,transaction_id,"
+      "transaction_generation,projection_stage_generation,"
+      "expected_previous_publication_generation,"
+      "candidate_retained_bundle_id,candidate_graph_revision,"
+      "candidate_scene_id,candidate_scene_revision_id+1,"
+      "candidate_scene_content_hash,private_materialization_content_digest,"
+      "obsolete_managed_command_surfaces_retired_evidence_digest,"
+      "request_digest,durable_public_pointer_content_digest "
+      "FROM source.active_bundle_publication_receipts;"
+      "UPDATE main.active_bundle_publication_head SET "
+      "(publication_generation,request_digest,"
+      "durable_public_pointer_content_digest)=(SELECT "
+      "publication_generation,request_digest,"
+      "durable_public_pointer_content_digest "
+      "FROM source.active_bundle_publication_head) WHERE singleton=1;"
+      "COMMIT;"
+      "DETACH DATABASE source;");
+  ASSERT_EQ(sqlite3_close(raw), SQLITE_OK);
+
+  const auto expect_digest_mismatch = [](const auto& action) {
+    try {
+      action();
+      ADD_FAILURE() << "corrupted receipt was not detected";
+    } catch (const ActiveBundlePublicationIntegrityError& error) {
+      EXPECT_NE(
+          std::string_view(error.what()).find("digest is inconsistent"),
+          std::string_view::npos)
+          << error.what();
+    }
+  };
+  expect_digest_mismatch(
+      [&] { static_cast<void>(store.VerifyIntegrity()); });
+  store.Close();
+  expect_digest_mismatch([&] {
+    SqliteActiveBundlePublicationStore reopened(database, CellId{"cell-a"});
+  });
+}
+
 TEST(
     ActiveBundlePublicationStoreIntegrity,
     UnexpectedPersistentSchemaObjectIsRejected) {

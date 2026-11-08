@@ -196,7 +196,7 @@ TrajectoryDTO prepared_cruise_trajectory() {
           TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0}};
 }
 
-// Item 6: main's quintic return peaks at 1.875 * d / T. Here d = 0.06 and
+// Main's quintic return peaks at 1.875 * d / T. Here d = 0.06 and
 // T = 0.1, so the quintic would peak at path rate 1.125.
 SoftOnPathInitialStateDTO cruise_trip_state() {
   auto state = measured_state_1d(1.2, 1.0);
@@ -428,7 +428,7 @@ TEST(SoftOnPathStopPlannerTest, BuildsDerivativeCompleteWallTimeRampFromMeasured
   EXPECT_NEAR(final_wp.velocities_rad_s.at(0), 0.0, 1e-9);
   EXPECT_NEAR(final_wp.accelerations_rad_s2.at(0), 0.0, 1e-9);
 
-  // As main (item 24): 50 ms handoff at 0.5 rad/s inside the 500 ms
+  // As main: 50 ms handoff at 0.5 rad/s inside the 500 ms
   // deceleration time, then a smooth decel whose average path-time speed is
   // 0.25 rad/s for the remaining 450 ms.
   EXPECT_NEAR(final_wp.positions_rad.at(0), 0.3375, 1e-9);
@@ -455,7 +455,7 @@ TEST(SoftOnPathStopPlannerTest, OneSecondOperatorCurveHasExactMidpointAndEndpoin
   ASSERT_NE(midpoint_it, plan.replacement_trajectory.waypoints.end());
 
   // The first 50 ms continues the accepted command inside the 1 s
-  // deceleration time (item 24). At 500 ms wall time the 950 ms ramp has
+  // deceleration time. At 500 ms wall time the 950 ms ramp has
   // advanced 450 ms.
   const double ramp_s = 0.95;
   const double r = 0.45 / ramp_s;
@@ -541,7 +541,7 @@ TEST(SpringBackOnPathStopPlannerTest, BuildsTwoPhaseOnPathReturnToTripCursor) {
 }
 
 TEST(SpringBackJoinTest, LateForwardBrakingShiftsTheReturnWhileTheStopFitsItsDeadline) {
-  // Item 6 at-rest join: early or on-time braking joins at the half boundary.
+  // At-rest join: early or on-time braking joins at the half boundary.
   EXPECT_DOUBLE_EQ(*detail::spring_back_return_start_s(0.5, 0.5, 0.5, 1.0), 0.5);
   EXPECT_DOUBLE_EQ(*detail::spring_back_return_start_s(0.47, 0.5, 0.5, 1.0), 0.5);
   // Late braking: the return starts after it, never overlapping it ...
@@ -701,7 +701,7 @@ TEST(SoftOnPathStopPlannerTest, CanRejectMeasuredVelocityThatIsNotPathCoherent) 
 
   ASSERT_FALSE(planned.ok());
   EXPECT_EQ(planned.error().details.at("reason"), "initial_velocity_deviation_exceeds_limit");
-  // Item 6: a deviation trigger goes straight to the hard stop.
+  // A deviation trigger goes straight to the hard stop.
   EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(planned.error()));
   EXPECT_FALSE(planned.error().details.contains("recommended_fallback"));
 }
@@ -792,7 +792,7 @@ TEST(SoftOnPathStopPlannerTest, SeamAnchorsAtCommandCursorNotLaggingMeasured) {
 }
 
 TEST(SoftOnPathStopPlannerTest, LeadInConsumesTheDecelerationTime) {
-  // As main (item 24): the lead-in sits inside the deceleration time.
+  // As main: the lead-in sits inside the deceleration time.
   auto state = measured_state_1d(0.2, 0.5);
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.05;
@@ -939,7 +939,7 @@ TEST(SoftOnPathStopPlannerTest, MeasuresInitialPathDriftAndCanEnforceDeploymentL
   auto rejected = plan_soft_on_path_stop(linear_trajectory_2d(), profile, state, config);
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"), "initial_path_deviation_exceeds_limit");
-  // Item 6: a deviation trigger goes straight to the hard stop, never to the
+  // A deviation trigger goes straight to the hard stop, never to the
   // spring-back fallback, even though this profile allows that fallback.
   EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(rejected.error()));
   EXPECT_FALSE(rejected.error().details.contains("recommended_fallback"));
@@ -980,7 +980,7 @@ TEST(SoftOnPathStopPlannerTest, MeasuresFeedbackPathDeviationWithJointNameOrderi
 }
 
 TEST(StopPhaseJerkLimitsTest, AuthoredJerkIsVerbatimAndMissingJerkUsesMainsDefault) {
-  // Decision Q36, as main (soft 1073-1086, spring-back 1491-1499).
+  // As main (soft 1073-1086, spring-back 1491-1499).
   const auto trajectory = linear_trajectory_2d();
   const std::map<std::string, double> accel{{"joint_1", 4.0}, {"joint_2", 6.0}};
   SoftOnPathPlannerConfig config;
@@ -1059,7 +1059,7 @@ TEST(SoftOnPathStopPlannerTest, RejectsRampThatWouldPassAcceptedTrajectoryEnd) {
 }
 
 TEST(SoftOnPathStopPlannerTest, RecommendsNaturalCompletionWhenShortPathPolicyAllowsIt) {
-  // main's predicate (item 2): the ramp overruns the accepted path end.
+  // main's predicate: the ramp overruns the accepted path end.
   auto profile = soft_profile(0.5);
   profile.fallback_stop_modes.clear();
   profile.allow_natural_completion_on_short_path = true;
@@ -1082,7 +1082,7 @@ TEST(SoftOnPathStopPlannerTest, RecommendsNaturalCompletionWhenShortPathPolicyAl
 }
 
 TEST(SpringBackOnPathStopPlannerTest, NaturalCompletionIsNotReCheckedInsideSpringBack) {
-  // Item 2: natural completion is decided once, before spring-back. A
+  // Natural completion is decided once, before spring-back. A
   // spring-back whose forward half would overrun the path end is a hard stop,
   // whatever the profile's natural-completion flag says.
   for (const bool allow : {false, true}) {

@@ -209,7 +209,6 @@ def test_mock_robot_plus_io_device_load_prepares_only_the_robot_model(
             deployment={"components": [_mock_robot(), _io_device()]},
             model_source_closure=_closure("robot"),
             program=None,
-            program_role_assignment={"component_roles": [], "target_roles": []},
         )
 
     assert prepared_sources == [("robot", "lite6")]

@@ -22,8 +22,10 @@ def _publication(scenario_id="scenario_b"):
             {"apply_id": "apply-2", "apply_generation": 2,
              "scene_initialization": "preserve",
              "record_digest": "sha256:" + "b" * 64, "origin": _origin(scenario_id)}]
-    return {"schema_version": "manyforge.committed_scenario_activation.v3", **deepcopy(rows[-1]),
-            "publication_generation": 3, "program": None, "committed_applies": rows}
+    return {"schema_version": "manyforge.committed_scenario_activation.v4", **deepcopy(rows[-1]),
+            "publication_generation": 3, "program": None, "program_frame_facts": None,
+            "program_binding_id": None, "retained_bundle_id": "sha256:" + "c" * 64,
+            "graph_revision": "sha256:" + "d" * 64, "committed_applies": rows}
 
 
 def test_typed_history_keeps_every_apply_and_returns_exact_source_without_mutation():
@@ -128,3 +130,47 @@ def test_scenario_origin_requires_its_project_folder():
         validate_prepared_activation_origin(origin)
     with pytest.raises(ValueError):
         PreparedScenarioOrigin.model_validate(origin)
+
+
+def test_committed_frame_facts_are_tied_to_current_program_and_apply():
+    value = _publication()
+    revision = "sha256:" + "c" * 64
+    value["program"] = {"program_revision": revision}
+    value["program_binding_id"] = "sha256:" + "d" * 64
+    value["retained_bundle_id"] = "sha256:" + "e" * 64
+    value["graph_revision"] = "sha256:" + "f" * 64
+    value["program_frame_facts"] = {
+        "applied_record_digest": value["record_digest"],
+        "program_binding_id": "sha256:" + "d" * 64,
+        "program_revision": revision,
+        "retained_bundle_id": "sha256:" + "e" * 64,
+        "graph_revision": "sha256:" + "f" * 64,
+        "components": ["arm"],
+        "frames": [{"reference": {"component_id": "arm", "frame_id": "base"}, "match_count": 1}],
+    }
+    assert validate_committed_scenario_activation(value) is value
+    for field in ("applied_record_digest", "program_binding_id", "program_revision", "retained_bundle_id", "graph_revision"):
+        stale = deepcopy(value)
+        stale["program_frame_facts"][field] = "sha256:" + "1" * 64
+        with pytest.raises(ProgramBindingTransportError):
+            validate_committed_scenario_activation(stale)
+    unbound = deepcopy(value)
+    unbound["program_binding_id"] = None
+    with pytest.raises(ProgramBindingTransportError):
+        validate_committed_scenario_activation(unbound)
+    unbound["program_frame_facts"] = None
+    assert validate_committed_scenario_activation(unbound) is unbound
+    no_program = deepcopy(value)
+    no_program["program"] = None
+    no_program["program_frame_facts"] = None
+    with pytest.raises(ProgramBindingTransportError):
+        validate_committed_scenario_activation(no_program)
+
+
+def test_older_committed_schema_is_refused_without_rewriting():
+    value = _publication()
+    value["schema_version"] = "manyforge.committed_scenario_activation.v3"
+    before = deepcopy(value)
+    with pytest.raises(ProgramBindingTransportError):
+        validate_committed_scenario_activation(value)
+    assert value == before

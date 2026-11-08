@@ -865,6 +865,25 @@ FilesystemProgramRepository::FilesystemProgramRepository(
 
 FilesystemProgramRepository::~FilesystemProgramRepository() = default;
 
+namespace {
+std::shared_ptr<const ProgramBindingContract> verify_durable_program(
+    std::string_view bytes, const RetainedBundle& bundle,
+    const std::filesystem::path& root) {
+  std::optional<VerifiedRetainedModelMap> model_map;
+  const auto& maps = bundle.value().compiled_products.symbol_role_maps;
+  if (maps.size() > 1U)
+    throw ProgramContractError("durable Program has multiple retained model maps");
+  if (!maps.empty()) {
+    FilesystemVerifiedRetainedModelMapSource source(root);
+    model_map = source.get_verified({bundle.retained_bundle_id(), maps.front().product_id});
+    if (!model_map)
+      throw ProgramContractError("durable Program retained model map is unavailable");
+  }
+  FilesystemCatalogArtifactStore catalog(root);
+  return verify_program_binding_contract(bytes, bundle, model_map, catalog);
+}
+} // namespace
+
 bool FilesystemProgramRepository::put_if_absent(
     std::shared_ptr<const ProgramBindingContract> program,
     const RetainedBundle& retained_bundle) {
@@ -874,8 +893,8 @@ bool FilesystemProgramRepository::put_if_absent(
   }
   storage_->files.require_insert_size(
       program->canonical_program_bytes().size());
-  const auto reloaded = verify_program_binding_contract(
-      program->canonical_program_bytes(), retained_bundle);
+  const auto reloaded = verify_durable_program(
+      program->canonical_program_bytes(), retained_bundle, storage_->files.trusted_root());
   if (reloaded->value() != program->value() ||
       reloaded->normalized_program_root() !=
           program->normalized_program_root()) {
@@ -917,8 +936,8 @@ FilesystemProgramRepository::get_verified(
         if (!bytes.has_value()) {
           return nullptr;
         }
-        auto program =
-            verify_program_binding_contract(*bytes, retained_bundle);
+        auto program = verify_durable_program(*bytes, retained_bundle,
+                                              storage_->files.trusted_root());
         if (program->value().program_id != program_id ||
             program->value().program_revision != program_revision) {
           throw ProgramContractError(
@@ -962,7 +981,8 @@ FilesystemProgramBindingRepository::~FilesystemProgramBindingRepository() =
 bool FilesystemProgramBindingRepository::put_if_absent(
     std::shared_ptr<const ProgramBinding> binding,
     const RetainedBundle& retained_bundle,
-    const VerifiedRetainedModelMap& retained_model_map) {
+    const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactSource& catalog_source) {
   storage_->files.require_owner_process();
   if (binding == nullptr) {
     throw ProgramBindingError(
@@ -974,7 +994,7 @@ bool FilesystemProgramBindingRepository::put_if_absent(
         "durable Program-Binding repository rejects an invalid identity");
   }
   const auto reloaded = reload_verified_program_binding(
-      binding->canonical_bytes(), retained_bundle, retained_model_map);
+      binding->canonical_bytes(), retained_bundle, retained_model_map, catalog_source);
   if (reloaded->program_binding_id() != binding->program_binding_id() ||
       reloaded->value() != binding->value()) {
     throw ProgramBindingError(
@@ -994,38 +1014,24 @@ std::shared_ptr<const ProgramBinding>
 FilesystemProgramBindingRepository::get_verified(
     const core::ProgramBindingId& program_binding_id,
     const RetainedBundle& retained_bundle,
-    const VerifiedRetainedModelMap& retained_model_map) const {
+    const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactSource& catalog_source) const {
   storage_->files.require_owner_process();
   const auto hex =
       detail::retained_digest_hex(program_binding_id.value());
   if (!hex.has_value()) {
     return nullptr;
   }
-  // The verified binding is a pure function of its content-addressed entry,
-  // the content-addressed bundle and that bundle's exact model map; reuse it
-  // while the entry is unchanged.
-  static detail::VerifiedReadMemo<std::shared_ptr<const ProgramBinding>> memo(
-      16U);
-  return memo.get(
-      detail::verified_read_key(
-          storage_->files.trusted_root().string(), std::string(*hex),
-          retained_bundle.retained_bundle_id().value(),
-          retained_model_map.query().retained_bundle_id.value(),
-          retained_model_map.query().product_id.value()),
-      kPosixErrors, kReadMessages,
-      [&]() -> std::shared_ptr<const ProgramBinding> {
-        const auto bytes = storage_->files.get_verified(*hex);
-        if (!bytes.has_value()) {
-          return nullptr;
-        }
-        auto binding = reload_verified_program_binding(
-            *bytes, retained_bundle, retained_model_map);
-        if (binding->program_binding_id() != program_binding_id) {
-          throw std::runtime_error(
-              "durable Program-Binding repository key/content mismatch");
-        }
-        return binding;
-      });
+  // Revalidate on each read because the supplied catalog capture is part of
+  // the contextual proof and is not represented by the file's cache key.
+  const auto bytes = storage_->files.get_verified(*hex);
+  if (!bytes.has_value()) return nullptr;
+  auto binding = reload_verified_program_binding(
+      *bytes, retained_bundle, retained_model_map, catalog_source);
+  if (binding->program_binding_id() != program_binding_id) {
+    throw std::runtime_error("durable Program-Binding repository key/content mismatch");
+  }
+  return binding;
 }
 
 std::size_t FilesystemProgramBindingRepository::size() const {

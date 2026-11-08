@@ -23,20 +23,20 @@ namespace deployment = manyforge::deployment;
 using content_identity::CanonicalValue;
 
 inline constexpr std::string_view kCommandApiVersion =
-    "manyforge.execution_command.v1";
+    "manyforge.execution_command.v3";
 inline constexpr std::string_view kResponseApiVersion =
-    "manyforge.execution_command_response.v1";
+    "manyforge.execution_command_response.v4";
 inline constexpr std::string_view kSocketFileName = "execution-command.sock";
 inline constexpr std::string_view kControlSocketFileName = "execution-control.sock";
 inline constexpr std::string_view kObservationSocketFileName =
     "execution-observation.sock";
-/// Event subscription stream (contract §8.1): one subscription per connection.
+/// Event subscription stream: one subscription per connection.
 inline constexpr std::string_view kEventStreamSocketFileName = "execution-events.sock";
 inline constexpr std::string_view kManagerSocketFileName = "manager-command.sock";
 inline constexpr std::string_view kManagerCommandApiVersion =
     "manyforge.manager_command.v1";
 inline constexpr std::string_view kManagerResponseApiVersion =
-    "manyforge.manager_command_response.v1";
+    "manyforge.manager_command_response.v2";
 inline constexpr std::string_view kLockFileName = ".execution-host.lock";
 inline constexpr std::size_t kMaximumPacketBytes = 1024U * 1024U;
 inline constexpr std::size_t kMaximumResponseBytes =

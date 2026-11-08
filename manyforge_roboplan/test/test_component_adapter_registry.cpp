@@ -17,7 +17,7 @@
 namespace manyforge::roboplan_backend {
 namespace {
 
-// CONTRACTS §6: the core keeps no list of vendors or lanes; the registry
+// The core keeps no list of vendors or lanes; the registry
 // serves whatever families are installed. These are in-process families.
 class IdleAdapter final : public core::IComponentAdapter {
  public:
@@ -95,7 +95,7 @@ TEST(ComponentAdapterRegistry, FamilyRefusalIsInvalidAdapterData) {
   EXPECT_EQ(made.error().message, "the row names no driver");
 }
 
-// CONTRACTS §16: one call per component; an owner's handle reaches its
+// One call per component; an owner's handle reaches its
 // members through their context, opaque to the host.
 TEST(ComponentAdapterRegistry, AnOwnersHandleReachesItsMembers) {
   const auto registry = Registry();
@@ -175,7 +175,7 @@ void InstallTestIndex(const std::map<std::string, std::filesystem::path> &librar
   ::setenv("AMENT_PREFIX_PATH", prefix.c_str(), 1);
 }
 
-// CONTRACTS §6: Mock and the simulator are families like any other, loaded
+// Mock and the simulator are families like any other, loaded
 // only through the index; Mock brings its ros2_control lane hooks.
 TEST(ComponentAdapterRegistry, LoadsTheMockAndSimulationFamiliesFromTheIndex) {
   InstallTestIndex({{"mock", MANYFORGE_MOCK_ADAPTER_FAMILY_LIBRARY},

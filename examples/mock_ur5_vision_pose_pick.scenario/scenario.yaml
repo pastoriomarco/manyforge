@@ -1,19 +1,17 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Mock UR5 vision-guided pose pick. Needs one connected viewer snapshot source so assistant.query_model can attach a live scene snapshot. Load and Execute the Program.",
   "members": {
-    "assignment.yaml": "sha256:10e42acc3e46a6f842fc6fd5e2bb3eef41f005fb4ea03423f340ac4c2b34eee6",
     "deployment.yaml": "sha256:8d0b89f41cb8c47896dc20945be7a1f787327b6107e065bcaaac884616e068c5",
-    "program.yaml": "sha256:918476f4c00303c1d56b9cbdb58ecaa7e0903195c093eafd0e4e9b06ea4f6983"
+    "program.yaml": "sha256:552621d761d74c7d507adc6a55fd62b9361022168cd0c4dfa6e5afa49d2e52aa"
   },
   "name": "mock_ur5_vision_pose_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:909904f3a56f8233d2ceda3efc1ed19909b14c1039e055aa6ffbfc736e19bf7f",
+    "checked_content_digest": "sha256:85da18efa64427dbec85a78217138f21d244428dd49688a85e34aca6f287a558",
     "last_known_status": "ready",
     "manyforge_version": "0.2.0"
   },

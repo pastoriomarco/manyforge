@@ -16,7 +16,7 @@ export function managerApplyRecord(phase = 'fence_held', terminal: string | null
     incomplete: terminal === null, intent_digest: digest, phase,
     scene_initialization: 'preserve',
     prepared_activation: {
-      schema_version: 'manyforge.prepared_activation_input.v6',
+      schema_version: 'manyforge.prepared_activation_input.v7',
       prepared_activation_id: digest, origin: { kind: 'scenario', scenario_id: 'fixture',
         source_document_digest: digest, project_path: '/projects/fixture.scenario' }, captured_input_digest: digest,
       deployment_artifact_id: 'deployment.fixture', deployment_revision: digest,

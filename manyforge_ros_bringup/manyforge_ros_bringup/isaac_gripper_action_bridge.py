@@ -1,8 +1,8 @@
-"""Thin GripperCommand-to-Isaac JointState transport adapter.
+"""Thin ParallelGripperCommand-to-Isaac JointState transport adapter.
 
 ManyForge's retained C++ backend owns command meaning, lifecycle admission,
 timeouts, cancellation, and status. This process only adapts the standard
-``GripperCommand`` action used by the UR/Robotiq profile to Isaac's raw
+``ParallelGripperCommand`` action used by the UR/Robotiq profile to Isaac's raw
 ``JointState`` command and observed-state topics. It consumes the same single
 backend command-enable fact as the arm Stop-topic adapter and fails closed on
 publisher loss or ambiguity.
@@ -16,7 +16,7 @@ import time
 from collections.abc import Sequence
 
 import rclpy
-from control_msgs.action import GripperCommand
+from control_msgs.action import ParallelGripperCommand
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -62,7 +62,7 @@ class IsaacGripperActionBridge(Node):
         self._latest_state_generation = 0
         self._active_target_positions: list[float] | None = None
         # Set by the cancel callback: the goal's target is never published
-        # again, so nothing overrides the hold (N10b).
+        # again, so nothing overrides the hold.
         self._goal_cancelled = False
         self._goal_reservation = SingleGoalReservation()
         self._last_readiness_value: bool | None = None
@@ -97,7 +97,7 @@ class IsaacGripperActionBridge(Node):
         )
         self._action_server = ActionServer(
             self,
-            GripperCommand,
+            ParallelGripperCommand,
             self._action_name,
             execute_callback=self._execute_goal,
             goal_callback=self._goal_callback,
@@ -250,10 +250,12 @@ class IsaacGripperActionBridge(Node):
             self._latest_state_generation += 1
         self._publish_readiness_if_due()
 
-    def _goal_callback(self, request: GripperCommand.Goal) -> GoalResponse:
-        if not finite_float(request.command.position):
+    def _goal_callback(self, request: ParallelGripperCommand.Goal) -> GoalResponse:
+        # Like the stock parallel gripper action controller: exactly one
+        # finger joint position; the effort is optional.
+        if len(request.command.position) != 1 or not finite_float(request.command.position[0]):
             return GoalResponse.REJECT
-        if not finite_float(request.command.max_effort) or request.command.max_effort < 0:
+        if any(not finite_float(value) or value < 0 for value in request.command.effort):
             return GoalResponse.REJECT
         if self._require_state_before_goal and not self._state_is_fresh():
             return GoalResponse.REJECT
@@ -266,7 +268,7 @@ class IsaacGripperActionBridge(Node):
         return GoalResponse.ACCEPT
 
     def _cancel_callback(self, _goal_handle: object) -> CancelResponse:
-        # Like the stock GripperActionController: hold the fingers where they
+        # Like the stock parallel gripper action controller: hold the fingers where they
         # are before answering ACCEPT (Isaac keeps the last commanded target),
         # so the accepted cancel already stopped them. The goal loop then
         # reports the goal cancelled.
@@ -279,14 +281,14 @@ class IsaacGripperActionBridge(Node):
                     current, self._command_multipliers, self._command_offsets))
         return CancelResponse.ACCEPT
 
-    def _execute_goal(self, goal_handle: object) -> GripperCommand.Result:
+    def _execute_goal(self, goal_handle: object) -> ParallelGripperCommand.Result:
         try:
             return self._execute_reserved_goal(goal_handle)
         finally:
             self._goal_reservation.release()
 
-    def _execute_reserved_goal(self, goal_handle: object) -> GripperCommand.Result:
-        target = float(goal_handle.request.command.position)
+    def _execute_reserved_goal(self, goal_handle: object) -> ParallelGripperCommand.Result:
+        target = float(goal_handle.request.command.position[0])
         command_positions = map_gripper_positions(
             target,
             self._command_multipliers,
@@ -308,8 +310,8 @@ class IsaacGripperActionBridge(Node):
             last_generation=first_generation,
         )
         deadline = time.monotonic() + self._goal_timeout_s
-        feedback = GripperCommand.Feedback()
-        result = GripperCommand.Result()
+        feedback = ParallelGripperCommand.Feedback()
+        result = ParallelGripperCommand.Result()
 
         while rclpy.ok():
             if goal_handle.is_cancel_requested:
@@ -321,10 +323,10 @@ class IsaacGripperActionBridge(Node):
                 generation=generation,
                 matches=matches,
             )
-            feedback.position = self._current_position(target)
-            feedback.effort = 0.0
-            feedback.stalled = False
-            feedback.reached_goal = reached
+            feedback.state.position = [self._current_position(target)]
+            feedback.state.effort = [0.0]
+            # ParallelGripperCommand feedback is the state only; stalled and
+            # reached_goal are in the result.
             goal_handle.publish_feedback(feedback)
             if reached:
                 goal_handle.succeed()
@@ -348,15 +350,15 @@ class IsaacGripperActionBridge(Node):
 
     def _finish_result(
         self,
-        result: GripperCommand.Result,
+        result: ParallelGripperCommand.Result,
         fallback: float,
         *,
         reached: bool,
         stalled: bool,
         retain_target: bool = False,
-    ) -> GripperCommand.Result:
-        result.position = self._current_position(fallback)
-        result.effort = 0.0
+    ) -> ParallelGripperCommand.Result:
+        result.state.position = [self._current_position(fallback)]
+        result.state.effort = [0.0]
         result.stalled = stalled
         result.reached_goal = reached
         if not retain_target:

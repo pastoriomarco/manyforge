@@ -3,7 +3,7 @@ import type { ExecutionOwnerStatus } from '../types/robotControl';
 import { codedErrorText } from './componentPresentation';
 
 interface ManualValve {
-  /** The wire signal id `<component>/<signal>` (CONTRACTS §7). */
+  /** The wire signal id `<component>/<signal>`. */
   signalId: string;
   value: boolean;
   componentId: string;
@@ -50,7 +50,7 @@ export function manualPneumaticValves(status: ExecutionOwnerStatus, position: nu
 }
 
 /**
- * Write each valve through the one output write path (CONTRACTS §7), one
+ * Write each valve through the one output write path, one
  * after the other; a failed or unknown write stops the sequence with its
  * code and is never resent.
  */

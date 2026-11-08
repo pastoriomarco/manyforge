@@ -65,7 +65,7 @@ struct IoSignalSubsystem::State final {
     std::optional<IoSignalSampleDTO> latest;
     std::uint64_t latest_loss_generation{};
     /// Outputs with read-back that aren't controller owned: the core-held
-    /// `changed_outside` signal of this output (CONTRACTS §7).
+    /// `changed_outside` signal of this output.
     std::optional<IoSignalId> changed_outside{};
   };
   struct Source final {
@@ -145,10 +145,7 @@ struct IoSignalSubsystem::State final {
       source.core_held = true;
       source.record_capacity = limits.records_per_source;
       output.changed_outside = id;
-      derived.push_back({id, source_id, IoSignalValueType::kBoolean, IoSignalDirection::kInput,
-          IoSignalUpdateMode::kChangeOnly, IoTransitionCapability::kSampledOnly,
-          {IoFreshnessMode::kProviderValidity, std::nullopt}, std::nullopt,
-          IoSignalLivenessMode::kInProcess});
+      derived.push_back(ChangedOutsideDescriptor(output.descriptor));
     }
     for (auto& descriptor : derived) {
       const auto id = descriptor.signal_id;
@@ -507,8 +504,7 @@ struct IoSignalSubsystem::State final {
       if (signal == signals.end()) return Result<void>::Err(invalid("io_signal_unknown"));
       if (update.source != IoSignalSampleSource::kDevice &&
           update.source != IoSignalSampleSource::kManyforgeWrite &&
-          update.source != IoSignalSampleSource::kOutside &&
-          update.source != IoSignalSampleSource::kLastWrite)
+          update.source != IoSignalSampleSource::kOutside)
         return Result<void>::Err(invalid("io_sample_shape_invalid"));
       if (signal->second.descriptor.source_id != acquisition.source_id)
         return Result<void>::Err(invalid("io_signal_source_mismatch"));
@@ -616,7 +612,7 @@ struct IoSignalSubsystem::State final {
   std::map<std::uint64_t, Registration> watches;
   std::uint64_t last_watch_id{};
   /// What `signal_samples` last showed of each signal: value, source and
-  /// freshness (CONTRACTS §7 `SignalSample` without its age).
+  /// freshness (`SignalSample` without its age).
   using PublishedSample =
       std::tuple<std::optional<std::variant<bool, double>>, IoSignalSampleSource, bool>;
   std::map<IoSignalId, PublishedSample> published_samples;
@@ -631,7 +627,7 @@ struct IoSignalSubsystem::State final {
                               Availability(signal, now) == IoSignalAvailability::kFresh};
       if (signal.latest) {
         if (signal.latest->publication.value)
-          std::get<0>(current) = *signal.latest->publication.value;
+          std::get<0>(current).emplace(std::in_place_type<bool>, *signal.latest->publication.value);
         std::get<1>(current) = signal.latest->publication.source;
       }
       auto [row, inserted] = published_samples.try_emplace(id, current);

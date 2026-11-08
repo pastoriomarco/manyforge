@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import hashlib
+from unittest.mock import patch
 from pathlib import Path
 import sqlite3
 from threading import Barrier, Thread
@@ -17,6 +18,89 @@ from manyforge_program_runner.cycle_journal import (
     ProgramCycleJournalVersionError,
     ProgramCycleStopWon,
 )
+
+
+def _history_snapshot(run: str, state: str, payload: str = "") -> dict:
+    return {"capture": {"program_run_id": run}, "run_revision": 1,
+            "state": state, "payload": payload}
+
+
+def test_finished_history_byte_budget_prunes_oldest_and_keeps_current_and_inflight(tmp_path: Path) -> None:
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.test",
+                                  maximum_finished_history_bytes=230)
+    journal.retain_run_snapshot(_history_snapshot("old.1", "succeeded", "é" * 12))
+    journal.retain_run_snapshot(_history_snapshot("old.2", "stopped", "é" * 12))
+    journal.retain_run_snapshot(_history_snapshot("inflight", "running", "x" * 250))
+    journal.transition(expected_generation=1, expected_states=("idle_after_reset",),
+                       state="terminal_awaiting_reset", program_run_id="current",
+                       run_snapshot=_history_snapshot("current", "failed", "z" * 20),
+                       terminal_reference="sha256:" + "b" * 64)
+    assert journal.read_run_snapshot("old.1") is None
+    assert journal.read_run_snapshot("old.2") is not None
+    assert journal.read_run_snapshot("current") is not None
+    assert journal.read_run_snapshot("inflight") is not None
+    assert journal._database.execute("PRAGMA journal_size_limit").fetchone()[0] == 230
+    journal.close()
+
+
+def test_oversize_current_is_retained_and_logged_once(tmp_path: Path) -> None:
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.test",
+                                  maximum_finished_history_bytes=40)
+    with patch("manyforge_program_runner.cycle_journal._LOGGER.warning") as warning:
+        journal.transition(expected_generation=1, expected_states=("idle_after_reset",),
+                           state="terminal_awaiting_reset", program_run_id="current",
+                           run_snapshot=_history_snapshot("current", "failed", "x" * 100),
+                           terminal_reference="sha256:" + "b" * 64)
+        journal.retain_run_snapshot(_history_snapshot("current", "failed", "x" * 100))
+    assert journal.read_run_snapshot("current") is not None
+    warning.assert_called_once()
+    journal.close()
+
+
+def test_finished_history_budget_is_applied_when_existing_journal_opens(tmp_path: Path) -> None:
+    path = tmp_path / "cycle.sqlite3"
+    journal = ProgramCycleJournal(path, owner_epoch="runner.test", maximum_finished_history_bytes=1000)
+    journal.retain_run_snapshot(_history_snapshot("old.1", "succeeded", "x" * 30))
+    journal.retain_run_snapshot(_history_snapshot("old.2", "succeeded", "x" * 30))
+    journal.close()
+    reopened = ProgramCycleJournal(path, owner_epoch="runner.test", maximum_finished_history_bytes=130)
+    assert reopened.read_run_snapshot("old.1") is None
+    assert reopened.read_run_snapshot("old.2") is not None
+    reopened.close()
+
+
+def test_history_budget_applies_when_inflight_snapshot_becomes_terminal(tmp_path: Path) -> None:
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.test",
+                                  maximum_finished_history_bytes=170)
+    journal.retain_run_snapshot(_history_snapshot("old", "succeeded", "x" * 20))
+    journal.retain_run_snapshot(_history_snapshot("run", "running", "y" * 40))
+    finished = _history_snapshot("run", "succeeded", "y" * 40)
+    finished["run_revision"] = 2
+    journal.retain_run_snapshot(finished)
+    assert journal.read_run_snapshot("old") is None
+    assert journal.read_run_snapshot("run") == finished
+    journal.close()
+
+
+def test_oversize_terminal_is_pruned_only_after_successful_reset(tmp_path: Path) -> None:
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.test",
+                                  maximum_finished_history_bytes=40)
+    journal.transition(expected_generation=1, expected_states=("idle_after_reset",),
+                       state="terminal_awaiting_reset", program_run_id="current",
+                       run_snapshot=_history_snapshot("current", "failed", "x" * 100),
+                       terminal_reference="sha256:" + "b" * 64)
+    journal.record_request(owner_epoch="caller.epoch", request_id="reset.1", kind="reset",
+                           intent={"expected_cycle_generation": 1}, cycle_generation=1)
+    with pytest.raises(RuntimeError, match="Reset in-flight command is absent"):
+        journal.publish_reset(expected_generation=1, owner_epoch="runner.test",
+                              request_owner_epoch="caller.epoch", request_id="missing",
+                              result={"idle_cycle_generation": 2})
+    assert journal.read_run_snapshot("current") is not None
+    journal.publish_reset(expected_generation=1, owner_epoch="runner.test",
+                          request_owner_epoch="caller.epoch", request_id="reset.1",
+                          result={"idle_cycle_generation": 2})
+    assert journal.read_run_snapshot("current") is None
+    journal.close()
 
 
 def _file_identity(
@@ -136,7 +220,7 @@ def test_absent_database_creates_only_current_schema_under_existing_parent(
         database.close()
 
 
-@pytest.mark.parametrize("found", [3, 4, 5, 6, SCHEMA_VERSION + 1])
+@pytest.mark.parametrize("found", [3, 4, 5, 6, SCHEMA_VERSION - 1, SCHEMA_VERSION + 1])
 def test_other_journal_versions_are_refused_unchanged_with_fresh_start_guidance(
     tmp_path: Path, found: int
 ) -> None:
@@ -174,6 +258,10 @@ def test_other_journal_versions_are_refused_unchanged_with_fresh_start_guidance(
     message = str(refused.value)
     assert f"version {found} is unsupported" in message
     assert f"only version {SCHEMA_VERSION}" in message
+    if found < SCHEMA_VERSION:
+        assert "Settle and Reset the run using the old version, or clean-start" in message
+    else:
+        assert "Settle and Reset the run using the version that created it, or clean-start" in message
     assert "compose-dev.sh stop" in message and "--keep-evidence" in message
     assert _database_file_identities(path) == before
     assert {entry.name for entry in tmp_path.iterdir()} == {path.name}

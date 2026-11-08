@@ -10,6 +10,7 @@ import {
 import { api, ApiError } from '../api/client';
 import { CommandRefusalError, commandRefusalCause } from '../state/commandRefusal';
 import { parseRuntimeScaleControlAccepted } from '../api/parsers';
+import { parseMotionPreviewDiagnostic } from '../api/parsers/execution';
 import {
   buildPreviewIntent,
   buildJointMotionIntent,
@@ -28,7 +29,11 @@ import {
 } from '../state/robotControl';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { ProgramCycleStatus, StructuredError } from '../types/api';
-import { CommandDeliveryUnconfirmedError, type HeadlessStateSource } from './useHeadlessState';
+import {
+  CommandDeliveryUnconfirmedError,
+  type ExecutionCommandReceipt,
+  type HeadlessStateSource,
+} from './useHeadlessState';
 import type {
   ManualCartesianDefaults,
   ManualMotionSettings,
@@ -112,9 +117,16 @@ function setTcpReceiptFence(result: unknown, status: ExecutionOwnerStatus,
   let display: string | null = null;
   if (entry !== null) {
     const wire = entry as Record<string, unknown>;
-    if (typeof wire.component_id !== 'string' || typeof wire.target_id !== 'string'
-      || typeof wire.frame_role_id !== 'string') throw new Error('Set TCP returned an invalid TCP entry.');
-    selected = { componentId: wire.component_id, targetId: wire.target_id, frameRoleId: wire.frame_role_id };
+    const target = wire.target;
+    const frame = wire.frame;
+    if (Object.keys(wire).length !== 2 || target === null || typeof target !== 'object' || Array.isArray(target)
+      || frame === null || typeof frame !== 'object' || Array.isArray(frame)) throw new Error('Set TCP returned an invalid TCP entry.');
+    const t = target as Record<string, unknown>;
+    const f = frame as Record<string, unknown>;
+    if (Object.keys(t).length !== 2 || Object.keys(f).length !== 2 || typeof t.component_id !== 'string'
+      || typeof t.command_target_id !== 'string' || typeof f.component_id !== 'string' || typeof f.frame_id !== 'string')
+      throw new Error('Set TCP returned an invalid TCP entry.');
+    selected = { componentId: t.component_id, targetId: t.command_target_id, frameComponentId: f.component_id, frameRoleId: f.frame_id };
     const descriptor = motion.targetDescriptor.tcps.find((tcp) => tcpEntryIdentityKey(tcp.entry) === tcpEntryIdentityKey(selected!));
     if (descriptor === undefined) throw new Error("Set TCP returned a TCP outside this robot's list.");
     display = descriptor.qualifiedName;
@@ -130,6 +142,20 @@ function requestId(): string {
     ?? `composer-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
+function acceptedOperationId(receipt: ExecutionCommandReceipt, expectedRequestId: string): string | null {
+  const result = receipt.result;
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return null;
+  const envelope = result as Record<string, unknown>;
+  const accepted = envelope.accepted;
+  if (envelope.ok !== true || envelope.command !== 'submit'
+    || accepted === null || typeof accepted !== 'object' || Array.isArray(accepted)) return null;
+  const identity = accepted as Record<string, unknown>;
+  return identity.request_id === expectedRequestId
+    && typeof identity.operation_id === 'string' && identity.operation_id !== ''
+    ? identity.operation_id
+    : null;
+}
+
 function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message.trim()
     ? error.message
@@ -143,9 +169,9 @@ export function runtimeScaleSelectorIdentity(selector: RuntimeScaleControlStatus
     return leftJson < rightJson ? -1 : leftJson > rightJson ? 1 : 0;
   };
   return selector.kind === 'singular'
-    ? JSON.stringify(['singular', selector.programBindingId, selector.componentRoleId, selector.targetRoleId])
+    ? JSON.stringify(['singular', selector.programBindingId, selector.componentId, selector.commandTargetId])
     : JSON.stringify(['group', selector.programBindingId, ...selector.groupTargets
-      .map((target) => [target.componentRoleId, target.targetRoleId])
+      .map((target) => [target.componentId, target.commandTargetId])
       .sort(compareTuples)]);
 }
 
@@ -153,6 +179,15 @@ export function runtimeScaleSelectorIdentity(selector: RuntimeScaleControlStatus
 export function previewTargetRejection(error: unknown): string | null {
   if (!(error instanceof ApiError)) return null;
   return motionPreviewRejectionMessage(error.structuredError);
+}
+
+/** Display only a backend-confirmed collision-disabled Cartesian failure. */
+export function cartesianDiagnosticRejection(detail: StructuredError | null): string | null {
+  if (detail?.details?.cartesian_collision_disabled_diagnostic !== 'failed') return null;
+  const plannerReason = detail.details.planner_error;
+  const reason = typeof plannerReason === 'string' && plannerReason.trim() !== ''
+    ? plannerReason : detail.message;
+  return `The planner found no straight path, even ignoring collisions: ${reason}.`;
 }
 
 /** The plain meaning of a native motion-preview rejection, if it is a known target result. */
@@ -195,8 +230,8 @@ export function runtimeScaleControlScopeFence(
 ): string {
   const memberScope = status.selector.kind === 'group'
     ? (status.groupMembers ?? []).map((member) => [
-      member.componentRoleId,
-      member.targetRoleId,
+      member.componentId,
+      member.commandTargetId,
       member.controlDomainId,
       member.controlDomainRevision,
       member.controlBindingId,
@@ -342,6 +377,7 @@ export interface RobotControlController {
   unappliedChanges?: boolean;
   controlSource?: HeadlessStateSource | null;
   setManualPanelVisible: (visible: boolean) => void;
+  manualPanelVisible?: boolean;
   controlPending: 'stop' | 'reset' | null;
   runtimeScaleStatus: RuntimeScaleControlStatus | null;
   runtimeScaleDraft: number;
@@ -355,6 +391,7 @@ export interface RobotControlController {
   tcpError: string | null;
   selectMode: (mode: RobotControlMode) => void;
   selectMoveToSource: (source: MoveToDraftSource) => void;
+  setMoveToPath: (path: 'free' | 'linear') => void;
   editMoveToOptions: (update: Partial<CartesianMoveDraftOptions>) => void;
   beginPoseDrag: () => boolean;
   finishPoseDrag: (pose: Pose3Value | null, discard?: PoseDragDiscard) => void;
@@ -370,12 +407,17 @@ export interface RobotControlController {
   stop: () => Promise<void>;
   dismissRuntimeScaleError: () => void;
   dismissError: () => void;
-  /** Reset the current terminal operation (never gated on unknown outputs, contract 66). */
+  /** Reset the current terminal operation (never gated on unknown outputs). */
   reset: () => Promise<void>;
   setRuntimeScale: (scale: number) => void;
   commitRuntimeScale: () => void;
   retry: () => void;
+  selectPreviewSample?: (index: number) => void;
 }
+
+export type ManualPreviewToNodeController = Pick<RobotControlController,
+  'state' | 'selectedStatus' | 'manualControlAllowed' | 'manualControlUnavailableReason'
+  | 'tcpApplying' | 'authoringPending' | 'currentStatus'>;
 
 export function useRobotControl(
   enabled: boolean,
@@ -431,7 +473,13 @@ export function useRobotControl(
   const [availability, setAvailability] = useState<{
     scope: string; result: ManualControlAvailability | null; error: string | null;
   } | null>(null);
-  const [manualPanelVisible, setManualPanelVisible] = useState(false);
+  const [manualPanelVisible, setManualPanelVisibleState] = useState(false);
+  const manualPanelVisibleRef = useRef(false);
+  const setManualPanelVisible = useCallback((visible: boolean) => {
+    manualPanelVisibleRef.current = visible;
+    setManualPanelVisibleState(visible);
+    if (!visible) dispatch({ type: 'preview_hidden' });
+  }, []);
   const observeManualAvailability = manualPanelVisible
     || robotControlHasLocalDraft(state) || state.operation !== null;
   const [availabilityRefresh, refreshAvailability] = useReducer((value: number) => value + 1, 0);
@@ -471,7 +519,7 @@ export function useRobotControl(
     const observed = ownerSelectedStatus.observedMotion;
     return { ...ownerSelectedStatus,
       directControl: { ...motion, activeTcp: tcpFence.value, tcpFrameRoleId: row?.frameRoleId ?? null,
-        tcpTargetRoleId: row?.targetRoleId ?? null, selectedTcpEntryKey: row === null ? undefined : tcpEntryIdentityKey(row.entry) },
+        selectedTcpEntryKey: row === null ? undefined : tcpEntryIdentityKey(row.entry) },
       observedMotion: observed === null ? null : { ...observed,
         currentTcpPose: row === null ? null : observed.tcpPoses[tcpEntryIdentityKey(row.entry)] ?? null },
     };
@@ -486,7 +534,7 @@ export function useRobotControl(
     && shell.transportError === null && shell.snapshot === headlessSnapshot;
   const freshStatus = tcpResumeFresh ? headlessSnapshot?.executionControlStatus ?? null : null;
   const tcpResumeCycle = tcpResumeFresh ? headlessSnapshot?.programCycle ?? null : null;
-  const tcpResumeStatus = freshStatus === null || !tcpApplying || tcpWaitOwner === null
+  const tcpResumeStatus = useMemo(() => freshStatus === null || !tcpApplying || tcpWaitOwner === null
     || freshStatus.ownerEpoch !== tcpWaitOwner.ownerEpoch
     || freshStatus.graphRevision !== tcpWaitOwner.graphRevision
     || freshStatus.retainedBundleId !== tcpWaitOwner.retainedBundleId
@@ -501,7 +549,7 @@ export function useRobotControl(
           return { ...row, activeTcp: null };
         return tcpAtLeast(row.activeTcp, tcpFence) ? row : { ...row, activeTcp: tcpFence.value };
       }),
-    };
+    }, [freshStatus, tcpApplying, tcpWaitOwner, tcpFence]);
 
   useEffect(() => {
     if (tcpFence === null) return;
@@ -657,6 +705,7 @@ export function useRobotControl(
     const previewStatus = previewStatusRef.current;
     if (
       !enabled
+      || !manualPanelVisible
       || tcpBlocksCartesian
       || !manualControlAllowed
       || state.phase !== 'planning'
@@ -668,6 +717,7 @@ export function useRobotControl(
       status: previewStatus,
       mode: state.mode,
       moveToKind: state.moveToKind,
+      moveToPath: state.moveToPath,
       draftPositionsRad: state.draftPositionsRad,
       draftPose: state.draftPose,
       draftGripperPosition: state.draftGripperPosition,
@@ -676,7 +726,7 @@ export function useRobotControl(
     const controller = new AbortController();
     let current = true;
     const timer = window.setTimeout(() => {
-      if (dragGeneration.current !== null) return;
+      if (!manualPanelVisibleRef.current || dragGeneration.current !== null) return;
       let intent: DirectControlOperationIntent;
       try {
         intent = buildPreviewIntent(previewDraft, requestId());
@@ -727,7 +777,7 @@ export function useRobotControl(
             return null;
           }
         }
-        if (!current) return null;
+        if (!current || !manualPanelVisibleRef.current) return null;
         dispatch({ type: 'preview_started', generation, intent });
         return intent.participants[0].payload.kind === 'motion'
           ? api.execution.previewMotion(intent, controller.signal)
@@ -735,19 +785,29 @@ export function useRobotControl(
       };
       void preparePreview()
         .then((receipt) => {
-          if (current && receipt !== null) {
+          if (current && manualPanelVisibleRef.current && receipt !== null) {
             dispatch({ type: 'preview_resolved', generation, receipt });
           }
         })
         .catch((error: unknown) => {
-          if (current && !controller.signal.aborted) {
+          if (current && manualPanelVisibleRef.current && !controller.signal.aborted) {
             dispatch({
               type: 'preview_rejected',
               generation,
               error: errorMessage(error, 'Motion preview failed.'),
               errorRefusal: commandRefusalCause(error),
-              targetRejection: previewTargetRejection(error),
+              targetRejection: ((previewDraft.mode === 'cartesian_path'
+                || (previewDraft.mode === 'move_to' && previewDraft.moveToKind === 'pose'
+                  && previewDraft.moveToPath === 'linear')) && error instanceof ApiError
+                ? cartesianDiagnosticRejection(error.structuredError) : null)
+                ?? previewTargetRejection(error),
             });
+            const diagnostic = error instanceof ApiError ? parseMotionPreviewDiagnostic(error.payload) : null;
+            const joints = previewDraft.status.directControl?.targetDescriptor.joints;
+            if (diagnostic !== null && joints !== undefined && joints.length === diagnostic.sourceJointNames.length
+                && joints.every((joint, index) => joint.sourceJointName === diagnostic.sourceJointNames[index])) {
+              dispatch({ type: 'preview_diagnostic', generation, diagnostic });
+            }
           }
         });
     }, ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS);
@@ -758,6 +818,7 @@ export function useRobotControl(
     };
   }, [
     enabled,
+    manualPanelVisible,
     tcpBlocksCartesian,
     observeProgramRun,
     manualControlAllowed,
@@ -770,6 +831,7 @@ export function useRobotControl(
     state.generation,
     state.mode,
     state.moveToKind,
+    state.moveToPath,
     state.phase,
     state.poseDragging,
     // The reducer advances generation when an owner/binding/scene fence changes.
@@ -804,12 +866,11 @@ export function useRobotControl(
       program_binding_id: motion.programBindingId, program_run_id: motion.programRunId,
       expected_graph_revision: status.graphRevision, expected_retained_bundle_id: status.retainedBundleId,
       expected_scene_revision: null, coordination_policy: 'independent',
-      participants: [{ component_role_id: motion.componentRoleId, target_role_id: motion.targetRoleId,
+      participants: [{ target: { component_id: motion.controllableComponentId, command_target_id: motion.commandTargetId },
         required_capability_id: motion.operationCapabilityId, action_span: null,
-        payload: { kind: 'set_tcp', tcp: { kind: 'entry', entry: {
-          component_id: tcp.entry.componentId, target_id: tcp.entry.targetId,
-          frame_role_id: tcp.entry.frameRoleId,
-        } } } }],
+        payload: { kind: 'set_tcp', tcp: { kind: 'entry', target: {
+          component_id: tcp.entry.componentId, command_target_id: tcp.entry.targetId,
+        }, frame: { component_id: tcp.entry.frameComponentId, frame_id: tcp.entry.frameRoleId } } } }],
     };
     const flight = { id, ownerEpoch: status.ownerEpoch };
     tcpInFlight.current = flight;
@@ -1049,13 +1110,13 @@ export function useRobotControl(
           selector: observed.selector.kind === 'group' ? {
             program_binding_id: observed.selector.programBindingId,
             group_targets: observed.selector.groupTargets.map((target) => ({
-              component_role_id: target.componentRoleId,
-              target_role_id: target.targetRoleId,
+              component_id: target.componentId,
+              command_target_id: target.commandTargetId,
             })),
           } : {
             program_binding_id: observed.selector.programBindingId,
-            component_role_id: observed.selector.componentRoleId,
-            target_role_id: observed.selector.targetRoleId,
+            component_id: observed.selector.componentId,
+            command_target_id: observed.selector.commandTargetId,
           },
           expected_control_generation: observed.controlGeneration,
           scale,
@@ -1192,6 +1253,9 @@ export function useRobotControl(
   const selectMoveToSource = useCallback((source: MoveToDraftSource) => {
     if (!manualControlBlocked.current) dispatch({ type: 'select_move_source', source });
   }, []);
+  const setMoveToPath = useCallback((path: 'free' | 'linear') => {
+    if (!manualControlBlocked.current) dispatch({ type: 'set_move_to_path', path });
+  }, []);
   const editMoveToOptions = useCallback((update: Partial<CartesianMoveDraftOptions>) => {
     if (!manualControlBlocked.current) dispatch({ type: 'edit_move_options', update });
   }, []);
@@ -1228,6 +1292,7 @@ export function useRobotControl(
   const approve = useCallback(async () => {
     if (
       approveInFlight.current !== null
+      || !manualPanelVisibleRef.current
       || tcpBlocksCartesian
       || (tcpInFlight.current !== null && cartesianMode)
       || dragGeneration.current !== null
@@ -1270,11 +1335,20 @@ export function useRobotControl(
         });
         checkCurrent();
       }
-      await controlSource.sendExecutionCommand(
+      const receipt = await controlSource.sendExecutionCommand(
         'operation_start',
         payload,
         state.intent.request_context.request_id,
       );
+      const operationId = acceptedOperationId(receipt, state.intent.request_context.request_id);
+      if (operationId !== null) dispatch({
+        type: 'operation_mode_accepted',
+        generation: state.generation,
+        ownerEpoch: state.status.ownerEpoch,
+        requestId: state.intent.request_context.request_id,
+        operationId,
+        mode: state.mode,
+      });
       // Receipt confirms transport handling only. The shared owner projection
       // moves this surface from Approving to Executing.
     } catch (error: unknown) {
@@ -1356,6 +1430,7 @@ export function useRobotControl(
     unappliedChanges,
     controlSource,
     setManualPanelVisible,
+    manualPanelVisible,
     controlPending,
     runtimeScaleStatus,
     runtimeScaleDraft,
@@ -1368,6 +1443,7 @@ export function useRobotControl(
     tcpError,
     selectMode,
     selectMoveToSource,
+    setMoveToPath,
     editMoveToOptions,
     beginPoseDrag,
     finishPoseDrag,
@@ -1387,6 +1463,7 @@ export function useRobotControl(
     setRuntimeScale,
     commitRuntimeScale,
     retry,
+    selectPreviewSample: (index: number) => dispatch({ type: 'select_preview_sample', index }),
   }), [
     approve,
     controlPending,
@@ -1404,6 +1481,7 @@ export function useRobotControl(
     runtimeScaleStatus,
     selectMode,
     selectMoveToSource,
+    setMoveToPath,
     editMoveToOptions,
     beginPoseDrag,
     finishPoseDrag,
@@ -1416,6 +1494,7 @@ export function useRobotControl(
     motionTargets,
     gripperTargets,
     manualControlAllowed,
+    manualPanelVisible,
     manualControlUnavailableReason,
     unappliedChanges,
     controlSource,
@@ -1431,5 +1510,6 @@ export function useRobotControl(
     tcpError,
     dismissRuntimeScaleError,
     dismissError,
+    setManualPanelVisible,
   ]);
 }

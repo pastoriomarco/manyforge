@@ -80,8 +80,7 @@ struct CollisionWorldLeaseRetentionStats {
   std::vector<ProjectionLeaseId> retained_ids_oldest_first;
 };
 
-/// Backend-agnostic publisher of `CollisionWorldSnapshot` (spec §3.8.1,
-/// defined by the kernel-architecture sprint P-2-impl-snapshot chunk).
+/// Backend-agnostic publisher of `CollisionWorldSnapshot`.
 ///
 /// Publishers expose the scene-state half of the (world, policy) pair
 /// that ICollisionQueryEngine workers consume. Each publisher has its
@@ -91,7 +90,7 @@ struct CollisionWorldLeaseRetentionStats {
 ///
 /// **Expected publishers:**
 ///   - RoboPlan-backed observed-state provider (today, transitional).
-///   - Isaac scene observer (Phase 2+).
+///   - Isaac scene observer (planned).
 ///   - Deterministic fixture publisher (tests + qualification).
 ///   - Composer's editable scene store (long-term, once scene-edit
 ///     authority moves out of the planner).

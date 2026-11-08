@@ -15,7 +15,7 @@ class CheckedIoCondition;
 /// Own desired-trip selection of one actual node, independent of global
 /// Deployment rules. Presence is required for production qualification.
 struct ProgramNodeIoRuleSemanticsDTO final {
-  TargetRoleId target_role_id;
+  ProgramTargetReferenceDTO target;
   MotionInterruptActivationMode activation_mode;
   MotionInterruptStopMode stop_mode;
   MotionInterruptNodeCategory node_category;

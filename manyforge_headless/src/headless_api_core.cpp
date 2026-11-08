@@ -19,6 +19,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <new>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/io_rule_outcome_codec.hpp>
 #include <manyforge_core/types/carried_object_lost.hpp>
@@ -28,6 +29,8 @@
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/prepared_activation_input.hpp>
 #include <manyforge_deployment/program_binding_outcome.hpp>
+#include <manyforge_deployment/program_reference_facts.hpp>
+#include <manyforge_deployment/retained_bundle.hpp>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -542,9 +545,9 @@ std::string ProductionWallText() {
 // this set against the Python runtime's FAILURE_DETAIL_KEYS.
 const std::set<std::string> kFailureDetailKeys{
     "component_id",     "input_problem",  "path",
-    "reason",           "reference_id",   "reference_type",
+    "reason",           "reference",      "reference_id",   "reference_type",
     "required_action",  "retryable",      "rule_id",
-    "source_kind",      "source_reference", "target_role_id"};
+    "source_kind",      "source_reference"};
 
 // Closed failure `details`/`origin` of a run record. Values pass through
 // unchanged; this only rejects shapes outside their bounds.
@@ -559,6 +562,37 @@ void ValidateFailureDetailsAndOrigin(const CanonicalValue &details,
     for (const auto &[key, value] : details.as_object()) {
       Require(kFailureDetailKeys.contains(key), code,
               "Failure detail key is not registered");
+      if (key == "reference") {
+        const auto *kind_value = details.find_object_member("reference_type");
+        const auto *kind = kind_value == nullptr ? nullptr : std::get_if<std::string>(&kind_value->storage());
+        const std::string_view member = kind == nullptr ? std::string_view{} :
+            *kind == "target" ? "command_target_id" :
+            *kind == "signal" ? "signal_name" :
+            *kind == "frame" ? "frame_id" :
+            *kind == "collision_body" ? "collision_body_id" : "";
+        Require(!member.empty() && value.is_object() && value.as_object().size() == 2U,
+                code, "Failure reference shape is invalid");
+        const auto *component_value = value.find_object_member("component_id");
+        const auto *identity_value = value.find_object_member(member);
+        const auto *component = component_value == nullptr ? nullptr : std::get_if<std::string>(&component_value->storage());
+        const auto *identity = identity_value == nullptr ? nullptr : std::get_if<std::string>(&identity_value->storage());
+        const auto portable = [](const std::string &text, bool first_lower) {
+          if (text.empty() || text.size() > 128U) return false;
+          const auto lower = [](char c) { return c >= 'a' && c <= 'z'; };
+          const auto upper = [](char c) { return c >= 'A' && c <= 'Z'; };
+          const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+          if (!(lower(text.front()) || (!first_lower && (upper(text.front()) || digit(text.front()))))) return false;
+          return std::all_of(text.begin() + 1, text.end(), [&](char c) {
+            return lower(c) || digit(c) || (!first_lower && upper(c)) || c == '_' || c == '.' || c == '-';
+          });
+        };
+        Require(component != nullptr && identity != nullptr && portable(*component, true) &&
+                    (member == "signal_name"
+                         ? !identity->empty() && identity->size() <= 512U && identity->find('\0') == std::string::npos
+                         : portable(*identity, false)),
+                code, "Failure reference identity is invalid");
+        continue;
+      }
       const auto *text = std::get_if<std::string>(&value.storage());
       Require(!value.is_object() && !value.is_array() &&
                   (text == nullptr || text->size() <= 256U),
@@ -1402,7 +1436,7 @@ const CanonicalValue &HeadlessApiCore::ActiveAppliedRecordLocked(
 
 namespace {
 
-/// The typed Program outcome of the active prepared activation (H1a): the
+/// The typed Program outcome of the active prepared activation: the
 /// binding id when bound, or the decoded non-executable result.
 using AppliedProgramOutcome = deployment::PreparedActivationProgramOutcomeDTO;
 
@@ -1433,15 +1467,9 @@ std::string NonExecutableMessage(
     const deployment::ProgramNonExecutableOutcomeDTO &outcome) {
   std::string message =
       "Applied Program is not executable in the active Deployment:";
-  for (const auto &row : outcome.unresolved_roles) {
-    message += row.target_role_id.has_value()
-                   ? " target role '" + row.target_role_id->value() +
-                         "' (component '" +
-                         row.controllable_component_id.value() + "', target '" +
-                         row.command_target_id->value() + "')"
-                   : " component role '" + row.component_role_id.value() +
-                         "' (component '" +
-                         row.controllable_component_id.value() + "')";
+  for (const auto &row : outcome.unresolved_targets) {
+    message += " target '" + row.target.command_target_id.value() +
+               "' (component '" + row.target.component_id.value() + "')";
     message += " is " + std::string(deployment::to_string(row.reason)) + ";";
   }
   message.pop_back();
@@ -1494,6 +1522,8 @@ CanonicalValue SimulationScene(const deployment::RetainedBundle &bundle) {
   });
 }
 
+
+
 } // namespace
 
 // Each assistant model alias names its component through
@@ -1528,7 +1558,7 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
   const auto &prepared = RequiredMember(record, "prepared_activation");
   // A Program that no longer binds in the active Deployment is preserved as
   // authored and refused by name for every consumer (Execute, runner, API);
-  // it is never replaced by another binding (H1a).
+  // it is never replaced by another binding.
   const auto outcome = ReadAppliedProgramOutcome(prepared);
   if (outcome.non_executable.has_value()) {
     CoreFail("program_applied_non_executable",
@@ -1554,8 +1584,13 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
   const auto binding_id = *outcome.program_binding_id;
   const auto program =
       program_repository_.get_verified(program_id, program_revision, *bundle);
-  const auto binding =
-      binding_repository_.get_verified(binding_id, *bundle, model_map);
+  std::shared_ptr<const deployment::ProgramBinding> binding;
+  try {
+    const deployment::FilesystemVerifiedCatalogArtifactSource catalog(config_.artifact_root);
+    binding = binding_repository_.get_verified(binding_id, *bundle, model_map, catalog);
+  } catch (const deployment::ProgramBindingError &) {
+    CoreFail("program_applied_selection_invalid", "active Program binding or catalog is unavailable");
+  }
   Require(program != nullptr, "program_applied_selection_invalid",
           "active Program is unavailable");
   Require(binding != nullptr, "program_applied_selection_invalid",
@@ -1564,6 +1599,22 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
               binding->value().program_revision == program_revision,
           "program_applied_selection_invalid",
           "active Program and binding are divergent");
+
+  // Keep one facts capture for the active Apply, under the existing core lock.
+  const auto record_digest = RequiredString(record, "intent_digest");
+  const bool same_facts = applied_program_frame_facts_ &&
+      applied_program_frame_facts_->first == record_digest &&
+      RequiredString(applied_program_frame_facts_->second, "program_binding_id") == binding_id.value() &&
+      RequiredString(applied_program_frame_facts_->second, "program_revision") == program_revision.value() &&
+      RequiredString(applied_program_frame_facts_->second, "retained_bundle_id") == active_bundle_id &&
+      RequiredString(applied_program_frame_facts_->second, "graph_revision") == active_graph_revision;
+  if (!same_facts) {
+    applied_program_frame_facts_ = std::make_pair(
+        record_digest, deployment::CaptureProgramFrameFacts(
+            program->value(), model_map, record_digest, binding_id.value(),
+            program_revision.value(), active_bundle_id, active_graph_revision));
+  }
+  const auto &program_frame_facts = applied_program_frame_facts_->second;
 
   // The retained assistant member plus `ai_models`: the AI model components
   // its Program model calls use.
@@ -1635,6 +1686,7 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
        RequiredMember(prepared, "prepared_activation_id")},
       {"program", program->normalized_program_root()},
       {"program_binding", binding->normalized_root()},
+      {"program_frame_facts", program_frame_facts},
       {"program_binding_id", CanonicalValue(binding_id.value())},
       {"program_id", CanonicalValue(program_id.value())},
       {"program_revision", CanonicalValue(program_revision.value())},
@@ -1664,6 +1716,72 @@ CanonicalValue HeadlessApiCore::AppliedProgramSelection() {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   return ActiveProgramSelectionLocked(RefreshLocked());
+}
+
+CanonicalValue HeadlessApiCore::LookupComponentFrame(const CanonicalValue &request) {
+  constexpr auto invalid = "component_frame_lookup_invalid";
+  Require(request.is_object() && request.as_object().size() == 4U, invalid,
+          "component frame lookup has an invalid closed shape");
+  for (const auto field : {"schema_version", "retained_bundle_id", "graph_revision", "frame"})
+    Require(request.find_object_member(field) != nullptr, invalid, "component frame lookup field is missing");
+  const auto string_field = [&](const CanonicalValue &object, std::string_view field) {
+    const auto *value = object.find_object_member(field);
+    const auto *text = value == nullptr ? nullptr : std::get_if<std::string>(&value->storage());
+    Require(text != nullptr && !text->empty(), invalid, "component frame lookup field must be text");
+    return *text;
+  };
+  Require(string_field(request, "schema_version") == "manyforge.component_frame_lookup.v1", invalid,
+          "component frame lookup version is unsupported");
+  const auto bundle_id = string_field(request, "retained_bundle_id");
+  const auto graph_revision = string_field(request, "graph_revision");
+  const auto &frame = *request.find_object_member("frame");
+  Require(frame.is_object() && frame.as_object().size() == 2U &&
+              frame.find_object_member("component_id") != nullptr && frame.find_object_member("frame_id") != nullptr,
+          invalid, "component frame reference has an invalid closed shape");
+  const auto component_id = string_field(frame, "component_id");
+  const auto frame_id = string_field(frame, "frame_id");
+  const auto valid_id = [](const std::string &id, bool component) {
+    if (id.empty() || id.size() > 128U) return false;
+    const auto lower = [](char c) { return c >= 'a' && c <= 'z'; };
+    const auto upper = [](char c) { return c >= 'A' && c <= 'Z'; };
+    const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+    return (lower(id.front()) || (!component && (upper(id.front()) || digit(id.front())))) &&
+           std::all_of(id.begin() + 1, id.end(), [&](char c) {
+             return lower(c) || digit(c) || (!component && upper(c)) || c == '.' || c == '_' || c == '-';
+           });
+  };
+  Require(valid_id(component_id, true) && valid_id(frame_id, false), invalid,
+          "component frame reference identity is invalid");
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const auto runtime = RefreshLocked();
+  const auto &record = ActiveAppliedRecordLocked(runtime);
+  const auto &prepared = RequiredMember(record, "prepared_activation");
+  Require(RequiredString(prepared, "retained_bundle_id") == bundle_id &&
+              RequiredString(prepared, "graph_revision") == graph_revision,
+          "component_frame_lookup_stale", "captured deployment is no longer active");
+  const auto bundle = retained_bundle_source_.get_verified(core::RetainedBundleId(bundle_id));
+  Require(bundle != nullptr, "program_applied_selection_invalid", "active retained bundle is unavailable");
+  const auto &components = bundle->value().cell_graph.controllable_components;
+  Require(std::any_of(components.begin(), components.end(), [&](const auto &component) {
+            return component.controllable_component_id.value() == component_id;
+          }), "component_reference_missing", "component is absent from the retained deployment");
+  const auto model_map = LoadActiveProgramModelMap(*bundle, retained_model_map_source_);
+  const deployment::CompositionComponentModelFrame *selected = nullptr;
+  for (const auto &path : model_map.frame_paths()) {
+    const auto *candidate = std::get_if<deployment::CompositionComponentModelFrame>(&path.terminal_frame);
+    if (candidate == nullptr || candidate->controllable_component_id.value() != component_id ||
+        candidate->frame_role_id.value() != frame_id) continue;
+    Require(selected == nullptr || *selected == *candidate, "frame_missing",
+            "component frame is ambiguous in the retained model");
+    selected = candidate;
+  }
+  Require(selected != nullptr, "frame_missing", "component frame is absent from the retained model");
+  return CanonicalValue(CanonicalValue::Object{
+      {"schema_version", CanonicalValue("manyforge.component_frame_lookup_result.v1")},
+      {"retained_bundle_id", CanonicalValue(bundle_id)},
+      {"graph_revision", CanonicalValue(graph_revision)},
+      {"frame", frame}, {"exists", CanonicalValue(true)}});
 }
 
 CanonicalValue HeadlessApiCore::AppliedProgramStatus() {
@@ -1787,20 +1905,62 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
   const auto &prepared = RequiredMember(record, "prepared_activation");
   const auto outcome = ReadAppliedProgramOutcome(prepared);
   CanonicalValue program(nullptr);
-  if (outcome.program_binding_id.has_value() ||
-      outcome.non_executable.has_value()) {
+  std::shared_ptr<const deployment::RetainedBundle> bundle;
+  std::shared_ptr<const deployment::ProgramBindingContract> authored;
+  if (outcome.program_binding_id.has_value() || outcome.non_executable.has_value()) {
     // Bound or not, the committed declarations are the authored Program's.
-    const auto bundle = retained_bundle_source_.get_verified(
+    bundle = retained_bundle_source_.get_verified(
         core::RetainedBundleId(RequiredString(prepared, "retained_bundle_id")));
     Require(bundle != nullptr, "program_applied_selection_invalid",
             "active retained bundle is unavailable");
-    const auto authored = program_repository_.get_verified(
+    authored = program_repository_.get_verified(
         core::ProgramId(RequiredString(prepared, "program_id")),
-        core::ProgramRevision(RequiredString(prepared, "program_revision")),
-        *bundle);
+        core::ProgramRevision(RequiredString(prepared, "program_revision")), *bundle);
     Require(authored != nullptr, "program_applied_selection_invalid",
             "active Program is unavailable");
     program = authored->normalized_program_root();
+  }
+  CanonicalValue program_frame_facts(nullptr);
+  if (outcome.program_binding_id.has_value() && !outcome.non_executable.has_value()) {
+    const auto record_digest = RequiredString(record, "intent_digest");
+    const auto revision = RequiredString(prepared, "program_revision");
+    const auto bundle_id = RequiredString(prepared, "retained_bundle_id");
+    const auto graph_revision = RequiredString(prepared, "graph_revision");
+    const bool same_facts = applied_program_frame_facts_ &&
+        applied_program_frame_facts_->first == record_digest &&
+        RequiredString(applied_program_frame_facts_->second, "program_binding_id") == outcome.program_binding_id->value() &&
+        RequiredString(applied_program_frame_facts_->second, "program_revision") == revision &&
+        RequiredString(applied_program_frame_facts_->second, "retained_bundle_id") == bundle_id &&
+        RequiredString(applied_program_frame_facts_->second, "graph_revision") == graph_revision;
+    if (!same_facts) {
+      // Missing frame evidence must not make unrelated persistent reads fail.
+      // Null facts cannot authorize a component frame at runtime.
+      try {
+        const auto model_map = LoadActiveProgramModelMap(*bundle, retained_model_map_source_);
+        const deployment::FilesystemVerifiedCatalogArtifactSource catalog(config_.artifact_root);
+        const auto binding = binding_repository_.get_verified(*outcome.program_binding_id, *bundle, model_map, catalog);
+        if (binding != nullptr &&
+            binding->value().program_id == core::ProgramId(RequiredString(prepared, "program_id")) &&
+            binding->value().program_revision == core::ProgramRevision(revision) &&
+            binding->value().retained_bundle_id == core::RetainedBundleId(bundle_id) &&
+            binding->value().graph_revision == core::GraphRevision(graph_revision)) {
+          applied_program_frame_facts_ = std::make_pair(
+              record_digest, deployment::CaptureProgramFrameFacts(
+                  authored->value(), model_map, record_digest,
+                  outcome.program_binding_id->value(), revision, bundle_id, graph_revision));
+        }
+      } catch (const std::bad_alloc &) {
+        throw;
+      } catch (const std::exception &) {
+        // Preserve the committed Program; only frame-dependent writes refuse.
+      }
+    }
+    if (applied_program_frame_facts_ && applied_program_frame_facts_->first == record_digest &&
+        RequiredString(applied_program_frame_facts_->second, "program_binding_id") == outcome.program_binding_id->value() &&
+        RequiredString(applied_program_frame_facts_->second, "program_revision") == revision &&
+        RequiredString(applied_program_frame_facts_->second, "retained_bundle_id") == bundle_id &&
+        RequiredString(applied_program_frame_facts_->second, "graph_revision") == graph_revision)
+      program_frame_facts = applied_program_frame_facts_->second;
   }
   const auto active = committed_apply(record);
   Require(std::binary_search(committed.begin(), committed.end(), active),
@@ -1813,6 +1973,11 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
       {"apply_id", CanonicalValue(apply_id)},
       {"committed_applies", CanonicalValue(std::move(committed_applies))},
       {"program", std::move(program)},
+      {"program_frame_facts", std::move(program_frame_facts)},
+      {"program_binding_id", outcome.program_binding_id.has_value()
+          ? CanonicalValue(outcome.program_binding_id->value()) : CanonicalValue(nullptr)},
+      {"retained_bundle_id", RequiredMember(prepared, "retained_bundle_id")},
+      {"graph_revision", RequiredMember(prepared, "graph_revision")},
       {"publication_generation",
        Number(publication_generation, "publication_generation")},
       {"record_digest", CanonicalValue(record_digest)},
@@ -2058,7 +2223,7 @@ CanonicalValue HeadlessApiCore::RecordClientIncident(
       "control_delayed",        "control_disconnected",
       "control_stale",          "history_detail_request_failed",
       "history_request_failed", "control_source_unavailable",
-      // Browser-only viewer conditions presented as errors (spec 450 §5.0.1):
+      // Browser-only viewer conditions presented as errors:
       // an unavailable/unverified view of the applied robot or Scene.
       "viewer_model_unavailable", "viewer_scene_unverified",
       "viewer_observation_stale", "viewer_geometry_unavailable"};
@@ -2193,7 +2358,7 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
             "Program diagnostic text is invalid");
     return value;
   };
-  Require(text("schema_version") == "manyforge.program_diagnostic.v3", code,
+  Require(text("schema_version") == "manyforge.program_diagnostic.v4", code,
           "Program diagnostic version is unsupported");
   text("program_run_id");
   const auto epoch = text("owner_epoch");
@@ -2644,7 +2809,7 @@ HeadlessApiCore::CommitProgramModelAttempt(CanonicalValue record) {
 
 namespace {
 
-// The current v8 common row carries one neutral addressed command identity.
+// The current v9 common row carries one neutral addressed command identity.
 // Optional rule evidence retains its existing typed validation.
 void ValidateParticipantExtensions(const CanonicalValue& state) {
   for (const auto& participant : RequiredArray(state, "participants")) {
@@ -2861,7 +3026,7 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
       record_kind == "stop_acceptance_projected";
   const bool stop_terminal_projection =
       record_kind == "stop_terminal_projected";
-  // Active TCP (M7, A2a-2): one History event per confirmed change (robot,
+  // Active TCP: one History event per confirmed change (robot,
   // old -> new entry, source, offset sent), carried in the journal payload.
   const bool active_tcp_projection = record_kind == "active_tcp_changed";
   const bool rule_state_projection =
@@ -2910,7 +3075,7 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
   if (active_tcp_projection) {
     Require(!request_id && !effect_pending &&
                 RequiredString(journal_payload, "api_version") ==
-                    "manyforge.active_tcp_change.v1" &&
+                    "manyforge.active_tcp_change.v2" &&
                 RequiredString(journal_payload, "owner_epoch") ==
                     source_owner_epoch &&
                 !RequiredString(journal_payload, "component_id").empty(),
@@ -3020,7 +3185,7 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
     stop_terminal_result = result;
   } else {
     const auto record_api = RequiredString(journal_payload, "api_version");
-    Require(record_api == "manyforge.operation_journal_record.v8" &&
+    Require(record_api == "manyforge.operation_journal_record.v9" &&
                 RequiredString(journal_payload, "owner_epoch") ==
                     source_owner_epoch &&
                 RequiredBool(journal_payload, "effect_pending") ==
@@ -3904,7 +4069,7 @@ void HeadlessApiCore::RefreshSceneAdapterLocked(
           {"event_id", CanonicalValue(event_id)},
           {"full_text", RequiredMember(loss, "full_text")},
       };
-      // The typed publication error of a fail-closed loss (SX-204).
+      // The typed publication error of a fail-closed loss.
       if (const auto *signal_error = loss.find_object_member("signal_error"))
         loss_fields.emplace_back("signal_error", *signal_error);
       const CanonicalValue loss_details(std::move(loss_fields));
@@ -4158,7 +4323,7 @@ void HeadlessApiCore::ReconcileOperationFaultLocked(
     Require(!resources.empty() &&
                 resources.size() <= kMaximumAlarmSubjectResources,
             "headless_operation_event_invalid",
-            "I6 operation fault scope must contain at most 16 exact resources");
+            "operation fault scope must contain at most 16 exact resources");
     subject = AlarmSubject{"operation", operation_id, std::move(resources)};
   } else {
     const auto found = active_operation_faults_.find(operation_id);

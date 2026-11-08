@@ -31,7 +31,7 @@ inline bool ExactMockResetMeasuredTarget(const core::ObservedStateSnapshotDTO& s
   return true;
 }
 
-// Isaac (RP-1b): one hardware command sample received after the writer's
+// Isaac: one hardware command sample received after the writer's
 // publication, newer than the pre-publication one, carrying exactly the
 // target acknowledges the write. Like Mock's loopback it proves the command
 // interface holds the target, not that the robot is there.

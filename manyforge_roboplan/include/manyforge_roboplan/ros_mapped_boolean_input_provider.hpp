@@ -16,8 +16,11 @@
 
 #include <manyforge_core/io_source_ingress_sender.hpp>
 #include <memory>
+#include <optional>
 #include <rclcpp/node.hpp>
 #include <rclcpp/qos.hpp>
+
+namespace manyforge::ros2_control_execution { class Ros2TransportResources; }
 
 namespace manyforge::roboplan_backend {
 
@@ -46,9 +49,26 @@ class RosMappedBooleanInputProvider final {
 public:
   static core::Result<std::unique_ptr<RosMappedBooleanInputProvider>> Create(
       rclcpp::Node::SharedPtr node,
-      std::shared_ptr<core::IIoSignalIngress> ingress, core::IClock &clock,
+      std::shared_ptr<core::IIoSignalIngress> ingress,
+      std::shared_ptr<core::IClock> clock,
       RosMappedBooleanInputBinding binding, const rclcpp::QoS &qos,
-      std::optional<std::uint64_t> prepared_driver_generation = std::nullopt);
+      std::optional<std::uint64_t> prepared_driver_generation = std::nullopt,
+      std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner = {});
+  // Lifecycle authority captures under the delivery barrier, stages outside
+  // that barrier, then verifies Matches and commits under the same barrier.
+  // Activate only after every consumer and the owner slot are committed.
+  struct TransportRecoverySnapshot;
+  struct TransportRecoveryStage;
+  [[nodiscard]] std::shared_ptr<const TransportRecoverySnapshot>
+  CaptureTransportRecovery() const;
+  [[nodiscard]] bool MatchesTransportRecovery(
+      const TransportRecoverySnapshot &snapshot) const noexcept;
+  [[nodiscard]] static core::Result<std::shared_ptr<TransportRecoveryStage>>
+  StageTransportRecovery(
+      std::shared_ptr<const TransportRecoverySnapshot> snapshot,
+      std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner);
+  void CommitTransportRecovery(TransportRecoveryStage &stage) noexcept;
+  static void ActivateTransportRecovery(TransportRecoveryStage &stage) noexcept;
   ~RosMappedBooleanInputProvider();
   RosMappedBooleanInputProvider(const RosMappedBooleanInputProvider &) = delete;
   RosMappedBooleanInputProvider &
@@ -61,17 +81,21 @@ public:
                 core::IoSourceIncarnation incarnation,
                 std::uint64_t driver_observation_generation);
   bool Pause(std::uint64_t driver_observation_generation);
+  /// A faulted or closing ROS owner throws its typed refusal before
+  /// creating a replacement subscription.
   bool Resume(std::uint64_t driver_observation_generation);
   /// IO-1: every received message records an arrival (none: no stream).
   void SetArrivalRecorder(std::shared_ptr<core::StreamRecorder> arrivals);
+  /// Compatible publishers observed for the current subscription.
+  std::optional<std::size_t> matched_publishers() const noexcept;
   void Shutdown();
 
 private:
   struct State;
   struct Entities;
   RosMappedBooleanInputProvider(std::shared_ptr<State> state,
-                                std::unique_ptr<Entities> entities);
+                                std::shared_ptr<Entities> entities);
   std::shared_ptr<State> state_;
-  std::unique_ptr<Entities> entities_;
+  std::shared_ptr<Entities> entities_;
 };
 } // namespace manyforge::roboplan_backend

@@ -1,4 +1,4 @@
-"""Client of the execution host's event subscription stream (contract §8.1).
+"""Client of the execution host's event subscription stream.
 
 One SEQPACKET connection to ``execution-events.sock`` carries one
 subscription: the client sends ``subscribe_events {after_cursor,
@@ -162,7 +162,7 @@ def open_event_subscription(
     request = rfc8785.dumps(
         {
             "after_cursor": after_cursor,
-            "api_version": "manyforge.execution_command.v1",
+            "api_version": "manyforge.execution_command.v3",
             "command": "subscribe_events",
             "owner_epoch": owner_epoch,
         }

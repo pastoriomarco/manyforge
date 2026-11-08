@@ -724,7 +724,7 @@ void validate_target(
 void validate_semantics(
     const core::ComponentTypeDTO& type,
     std::span<const QualifiedCapabilityDefinition> capabilities) {
-  // A machine owner (CONTRACTS §16, tag `machine`) has neither: it holds the
+  // A machine owner (tag `machine`) has neither: it holds the
   // machine's connection and process, its members the targets. Neither has
   // a sensor (tag `sensor`): it only observes.
   const bool target_less =

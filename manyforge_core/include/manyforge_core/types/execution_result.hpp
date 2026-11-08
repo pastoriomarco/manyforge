@@ -33,7 +33,7 @@ struct ExecutionSnapshot {
   std::string contact_policy_id;
 };
 
-/// Execution handle for tracking trajectory execution (spec 220 §4.2)
+/// Execution handle for tracking trajectory execution
 /// Provides phase-event feedback; exact delivery mechanism is implementation-defined.
 struct ExecutionHandle {
   ExecutionHandle() = default;
@@ -55,7 +55,7 @@ struct ExecutionHandle {
   /// cannot support generation-fenced runtime lookahead and admission must
   /// fail closed when lookahead is enabled.
   std::uint64_t execution_generation = 0;
-  /// Exact Kernel goal/prepared membership for the direct I8 dispatch path.
+  /// Exact Kernel goal/prepared membership for the direct dispatch path.
   /// All three fields are jointly present there and jointly absent on the
   /// historical trajectory-only path while that path is being removed.
   std::optional<ControllerGoalId> controller_goal_id;
@@ -63,7 +63,7 @@ struct ExecutionHandle {
   std::optional<ContentDigest> prepared_contract_digest;
 };
 
-/// Stop result (spec 220 §4.2)
+/// Stop result
 struct StopResultDTO {
   bool accepted = false;
   // Present when the stop command failed or completed through a degraded
@@ -71,7 +71,7 @@ struct StopResultDTO {
   std::optional<ErrorDTO> error;
 };
 
-/// Reset result (spec 220 §4.2)
+/// Reset result
 struct ResetResultDTO {
   bool accepted = false;
   std::optional<ErrorDTO> error;

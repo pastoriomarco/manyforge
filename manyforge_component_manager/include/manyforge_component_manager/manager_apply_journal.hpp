@@ -87,7 +87,7 @@ public:
   using ManagerApplyJournalError::ManagerApplyJournalError;
 };
 
-/// Exact UA2A prepared activation accepted by one named Apply.
+/// Exact prepared activation accepted by one named Apply.
 ///
 /// Every fact here is captured once before acceptance. The Manager records it
 /// in the durable intent and must never reopen a mutable Scenario/catalog
@@ -101,7 +101,7 @@ struct ManagerApplyPreparedActivationDTO final {
   manyforge::core::DeploymentArtifactId deployment_artifact_id;
   manyforge::core::DeploymentRevision deployment_revision;
   /// The candidate Program binding, or absent exactly when the prepared
-  /// activation's typed Program outcome is non-executable (H1a). The receipt
+  /// activation's typed Program outcome is non-executable. The receipt
   /// below carries that outcome; the Program itself is never rewritten.
   std::optional<manyforge::core::ProgramBindingId> program_binding_id;
   manyforge::core::ContentDigest prepared_activation_id;
@@ -376,7 +376,7 @@ struct PersistedManagerApplyStatus final {
 
 /// Whether New may release this failed Apply's held fence and claim: any
 /// failure (before effect or not) that still holds its accepted fence and
-/// published nothing (N7, CONTRACTS §15). The owner rechecks the Kernel.
+/// published nothing. The owner rechecks the Kernel.
 [[nodiscard]] bool FailedApplyNewReleaseEligible(
     const PersistedManagerApplyStatus &status) noexcept;
 

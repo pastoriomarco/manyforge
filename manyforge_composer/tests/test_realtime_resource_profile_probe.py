@@ -36,14 +36,13 @@ def _environment() -> dict[str, str]:
         "MANYFORGE_NRT_CPU_AFFINITY": "0-1",
         "MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY": "4",
         "MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY": "50",
-        "MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY": "true",
         "MANYFORGE_RT_SCHED_POLICY": "FIFO",
         "MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY": "45",
         "MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY": "2",
         "MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY": "40",
         "MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY": "3",
-        "MANYFORGE_RT_STOP_CONTROL_PRIORITY": "35",
-        "MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY": "2",
+        "MANYFORGE_RT_STOP_CONTROL_PRIORITY": "48",
+        "MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY": "5",
     }
 
 
@@ -52,7 +51,7 @@ def test_composer_probe_accepts_only_named_rt_threads_and_nrt_confinement():
     observation = probe.ProcessObservation(
         pid=1,
         command_line="python -m manyforge_composer",
-        locked_memory_bytes=0,
+        locked_memory_bytes=64 * 1024 * 1024,
         main_policy="SCHED_OTHER",
         main_priority=0,
         main_affinity=(0, 1),
@@ -60,7 +59,7 @@ def test_composer_probe_accepts_only_named_rt_threads_and_nrt_confinement():
             probe.ThreadObservation(1, "python", "SCHED_OTHER", 0, (0, 1)),
             probe.ThreadObservation(2, "mf_sched_ctrl", "SCHED_FIFO", 45, (2,)),
             probe.ThreadObservation(3, "mf_sched_safe", "SCHED_FIFO", 40, (3,)),
-            probe.ThreadObservation(4, "mf_sched_stop", "SCHED_FIFO", 35, (2,)),
+            probe.ThreadObservation(4, "mf_sched_stop", "SCHED_FIFO", 48, (5,)),
             probe.ThreadObservation(5, "worker", "SCHED_OTHER", 0, (0, 1)),
         ),
     )
@@ -84,7 +83,7 @@ def test_composer_probe_rejects_python_thread_on_rt_policy_or_reserved_cpu():
             probe.ThreadObservation(1, "python", "SCHED_OTHER", 0, (0, 1)),
             probe.ThreadObservation(2, "mf_sched_ctrl", "SCHED_FIFO", 45, (2,)),
             probe.ThreadObservation(3, "mf_sched_safe", "SCHED_FIFO", 40, (3,)),
-            probe.ThreadObservation(4, "mf_sched_stop", "SCHED_FIFO", 35, (2,)),
+            probe.ThreadObservation(4, "mf_sched_stop", "SCHED_FIFO", 48, (5,)),
             probe.ThreadObservation(5, "python", "SCHED_FIFO", 30, (2,)),
         ),
     )
@@ -94,6 +93,8 @@ def test_composer_probe_rejects_python_thread_on_rt_policy_or_reserved_cpu():
     assert evidence["passed"] is False
     assert any("unowned Composer RT threads" in item for item in evidence["failed_checks"])
     assert any("escaped the NRT CPU set" in item for item in evidence["failed_checks"])
+    # OD-59: the strict profile's execution host runs with locked memory.
+    assert any("VmLck is zero" in item for item in evidence["failed_checks"])
 
 
 def test_controller_probe_requires_one_highest_update_thread_and_memory_lock():

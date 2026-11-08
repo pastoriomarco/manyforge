@@ -67,7 +67,7 @@ def _program(*, metadata: dict | None = None) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, catalog)
 
@@ -80,7 +80,7 @@ def _program_with_instance_id(instance_id: str) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, catalog)
 
@@ -113,7 +113,7 @@ def _lite6_program_with_literal_tcp_limit(limit_mps: float = 0.14) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, catalog)
 
@@ -156,16 +156,22 @@ def test_prepared_program_replacement_is_deeply_immutable() -> None:
     )
 
 
+_ARM = {"component_id": "isaac_lite6_trocar_robot", "command_target_id": "arm"}
+_GRIPPER = {"component_id": "lite_gripper", "command_target_id": "gripper"}
+_GRIPPER_TCP = {"component_id": "lite_gripper", "frame_id": "tcp"}
+_ARM_BASE = {"component_id": "isaac_lite6_trocar_robot", "frame_id": "base"}
+
+
 def _pick_macro_arguments() -> dict:
     return {
         "macro_id": "pick_subtree",
         "scene_resource_id": "graspable",
-        "target_role": "arm",
-        "tool_target_role": "gripper",
-        "base_frame_role": "base",
+        "target": _ARM,
+        "tool_target": _GRIPPER,
+        "base_frame": _ARM_BASE,
         "tcp_endpoint": {"kind": "current"},
-        "carrier_frame_role": "tcp",
-        "touch_body_roles": ["gripper_collision"],
+        "carrier_frame_ref": _GRIPPER_TCP,
+        "touch_bodies": [{"component_id": "lite_gripper", "collision_body_id": "gripper_collision"}],
         "tool_position": {"kind": "linear_m", "value_m": 0.0},
         "contact_policy_id": "selected_object_grasp",
         "blackboard_namespace_id": "planning",
@@ -426,8 +432,8 @@ def test_pick_authoring_macro_expands_visible_nodes_and_declarations_once() -> N
         "motion.follow_cartesian_path",
     ]
     assert all(child["children"] == [] for child in inserted["children"])
-    assert inserted["children"][0]["parameters"]["target_role"] == "arm"
-    assert inserted["children"][4]["parameters"]["target_role"] == "gripper"
+    assert inserted["children"][0]["parameters"]["target"] == _ARM
+    assert inserted["children"][4]["parameters"]["target"] == _GRIPPER
     declaration = next(
         row
         for row in snapshot["authoring"]["blackboard"]["keys"]
@@ -448,9 +454,9 @@ def test_pick_authoring_macro_expands_visible_nodes_and_declarations_once() -> N
 @pytest.mark.parametrize("selector", [
     None,
     {"kind": "current"},
-    {"kind": "default_of_role", "role": "gripper"},
+    {"kind": "default_of_target", "target": _GRIPPER},
     # The arm declares no tcp frame since the TCP migration (REGEN-A2).
-    {"kind": "entry", "target_role": "gripper", "frame_role": "tcp"},
+    {"kind": "entry", "target": _GRIPPER, "frame": _GRIPPER_TCP},
 ])
 def test_pick_authoring_macro_forwards_selector_to_planner_and_moves(selector) -> None:
     session = ComposerDraftSession(_pick_program())
@@ -531,7 +537,7 @@ def test_place_authoring_macro_expands_the_matching_ordinary_subtree() -> None:
         approach_offset_m=[0.0, 0.0, 0.08],
     )
     arguments.pop("contact_policy_id")
-    arguments.pop("touch_body_roles")
+    arguments.pop("touch_bodies")
 
     result = _mutate(
         session,
@@ -584,7 +590,7 @@ def test_place_authoring_macro_expands_the_matching_ordinary_subtree() -> None:
             "motion.move_to_pose",
             "tcp_pose",
             {
-                "frame_ref": {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
+                "frame_ref": {"kind": "target_frame", "frame": _ARM_BASE},
                 "current_tcp_pose": {
                     "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
                     "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
@@ -592,7 +598,7 @@ def test_place_authoring_macro_expands_the_matching_ordinary_subtree() -> None:
             },
             {
                 "goal": {
-                    "frame_ref": {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
+                    "frame_ref": {"kind": "target_frame", "frame": _ARM_BASE},
                     "position_m": [0.1, 0.2, 0.3],
                     "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
                 }
@@ -612,8 +618,8 @@ def test_store_observed_move_updates_only_selected_node(
     node["node_id"] = node_id
     node["instance_id"] = "observed_target"
     node["parameters"] = {
-        "target_role": "arm",
-        "base_frame_role": "base",
+        "target": _ARM,
+        "base_frame": _ARM_BASE,
         "tcp_endpoint": {"kind": "current"},  # TCP migration: selectors carry a kind
         "goal": (
             [{"joint_name": "joint1", "position_rad": 0.0}]
@@ -635,7 +641,7 @@ def test_store_observed_move_updates_only_selected_node(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     session = ComposerDraftSession(Program.from_dict(document, catalog))
 
@@ -661,7 +667,7 @@ def test_store_observed_move_updates_only_selected_node(
 def test_store_observed_pose_replaces_old_goal_source_and_relative_target() -> None:
     session = ComposerDraftSession(_pick_program())
     observed = {
-        "frame_ref": {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
+        "frame_ref": {"kind": "target_frame", "frame": _ARM_BASE},
         "current_tcp_pose": {
             "position_m": {"x_m": 0.4, "y_m": 0.2, "z_m": 0.1},
             "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
@@ -1131,8 +1137,7 @@ def test_new_draft_is_fresh_empty_authoring_and_clears_saved_identity() -> None:
     assert authoring["program_id"].startswith("program-")
     assert len(authoring["program_id"]) == len("program-") + 32
     assert authoring["forest"] == []
-    assert authoring["component_roles"] == {}
-    assert authoring["target_roles"] == {}
+    assert "component_roles" not in authoring and "target_roles" not in authoring
     assert {
         row["parameter_id"]: row["default"] for row in authoring["parameters"]
     } == {
@@ -1578,9 +1583,7 @@ def test_relative_orientation_resolves_to_absolute_and_preserves_metadata() -> N
     resource["pose"] = {
         "frame_ref": {
             "kind": "component_frame",
-            "component_role": "robot",
-            "model_role": "arm_model",
-            "frame_role": "base",
+            "frame": {"component_id": "ur5_robot", "frame_id": "base"},
         },
         "position_m": [0.5, 0.0, 0.4],
         "rotate_local_rpy_deg": [0.0, 0.0, 90.0],
@@ -1627,9 +1630,7 @@ def test_every_source_local_relative_orientation_form_becomes_absolute(
     resource["pose"] = {
         "frame_ref": {
             "kind": "component_frame",
-            "component_role": "robot",
-            "model_role": "arm_model",
-            "frame_role": "base",
+            "frame": {"component_id": "ur5_robot", "frame_id": "base"},
         },
         "position_m": [0.5, 0.0, 0.4],
         **intent,
@@ -1886,39 +1887,14 @@ def test_tree_delete_removes_only_the_node_and_detaches_direct_children() -> Non
         assert instance_id in deleted_nested.snapshot["authoring"]["positions"]
 
 
-def test_program_role_requirements_replace_through_one_operator_mutation() -> None:
-    session = ComposerDraftSession(_program())
-    before = session.snapshot()
-    component_roles = deepcopy(before["authoring"]["component_roles"])
-    component_roles["inspection_tool"] = {
-        "required_component_type_tags": ["camera"]
-    }
-
-    replaced = _mutate(
-        session,
-        "program_draft_replace_roles",
-        {
-            "component_roles": component_roles,
-            "target_roles": before["authoring"]["target_roles"],
-        },
-    )
-
-    assert replaced.mutation in OPERATOR_DRAFT_MUTATIONS
-    assert replaced.details["component_role_count"] == len(component_roles)
-    assert replaced.snapshot["authoring"]["component_roles"] == {
-        key: component_roles[key] for key in sorted(component_roles)
-    }
-    assert replaced.snapshot["program"] is not None
-
-    retained = session.snapshot()
-    with pytest.raises(DraftSessionError) as invalid:
-        _mutate(
-            session,
-            "program_draft_replace_roles",
-            {"component_roles": [], "target_roles": {}},
+def test_removed_role_replacement_is_not_an_operator_mutation() -> None:
+    assert "program_draft_replace_roles" not in OPERATOR_DRAFT_MUTATIONS
+    with pytest.raises(DraftSessionError) as refused:
+        ComposerDraftSession()._edit(
+            {}, tool_id="program_draft_replace_roles", arguments={},
+            catalog=build_node_environment().catalog,
         )
-    assert invalid.value.code == "draft_arguments_invalid"
-    assert session.snapshot() == retained
+    assert refused.value.code == "composer_draft_tool_unsupported"
 
 
 def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
@@ -2061,8 +2037,8 @@ def test_new_cartesian_node_inherits_scenario_fidelity_defaults() -> None:
         "instance_id": "new_cartesian_move",
         "node_id": "motion.follow_cartesian_path",
         "parameters": {
-            "target_role": "arm",
-            "base_frame_role": "base",
+            "target": _LITE6_ARM,
+            "base_frame": _LITE6_BASE,
             "tcp_endpoint": {"kind": "current"},  # TCP migration: selectors carry a kind
             "translation_tol_m": 0.002,
             "blend_radius_m": 0.03,
@@ -2121,7 +2097,7 @@ def test_motion_settings_and_insert_follow_catalog_field_bindings_not_parameter_
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     session = ComposerDraftSession(Program.from_dict(document, catalog))
 
@@ -2588,6 +2564,10 @@ def test_every_generated_draft_mutation_has_a_valid_atomic_path() -> None:
     assert session.snapshot()["applied"] is False
 
 
+_LITE6_ARM = {"component_id": "lite6_robot", "command_target_id": "arm"}
+_LITE6_BASE = {"component_id": "lite6_robot", "frame_id": "base"}
+
+
 def _lite6_program() -> Program:
     return Program(_LITE6_PROGRAM_PATH, build_node_environment().catalog)
 
@@ -2615,7 +2595,7 @@ def test_new_motion_node_is_prefilled_with_the_default_tcp() -> None:
             "node": {
                 "node_id": "motion.move_to_pose",
                 "instance_id": "new_move",
-                "parameters": {"base_frame_role": "base"},
+                "parameters": {"base_frame": _LITE6_BASE},
                 "children": [],
             },
         },
@@ -2625,11 +2605,13 @@ def test_new_motion_node_is_prefilled_with_the_default_tcp() -> None:
     node = _find_node(authoring["forest"][0], "new_move")
     assert node is not None
     assert node["parameters"]["tcp_endpoint"] == {"kind": "current"}
-    # Current declares no frame role.
-    assert authoring["target_roles"]["arm"]["required_frame_roles"] == ["base"]
 
 
-def test_an_explicit_endpoint_is_kept_and_declared_on_insert() -> None:
+_LITE6_FLANGE_ENTRY = {"kind": "entry", "target": _LITE6_ARM,
+                       "frame": {"component_id": "lite6_robot", "frame_id": "flange"}}
+
+
+def test_an_explicit_endpoint_is_kept_on_insert() -> None:
     session = ComposerDraftSession(_lite6_program())
     result = _mutate(
         session,
@@ -2641,9 +2623,9 @@ def test_an_explicit_endpoint_is_kept_and_declared_on_insert() -> None:
                 "node_id": "motion.move_to_pose",
                 "instance_id": "flange_move",
                 "parameters": {
-                    "target_role": "arm",
-                    "base_frame_role": "base",
-                    "tcp_endpoint": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+                    "target": _LITE6_ARM,
+                    "base_frame": _LITE6_BASE,
+                    "tcp_endpoint": _LITE6_FLANGE_ENTRY,
                 },
                 "children": [],
             },
@@ -2651,18 +2633,17 @@ def test_an_explicit_endpoint_is_kept_and_declared_on_insert() -> None:
     )
     authoring = result.snapshot["authoring"]
     node = _find_node(authoring["forest"][0], "flange_move")
-    assert node["parameters"]["tcp_endpoint"] == {"kind": "entry", "target_role": "arm", "frame_role": "flange"}
-    assert authoring["target_roles"]["arm"]["required_frame_roles"] == ["base", "flange"]
+    assert node["parameters"]["tcp_endpoint"] == _LITE6_FLANGE_ENTRY
 
 
-def test_picking_an_undeclared_tcp_declares_it_in_the_same_edit() -> None:
-    """Design §3: picking a TCP adds its frame role to the target role."""
+def test_picking_a_tcp_entry_is_one_edit() -> None:
+    """Picking a TCP is one Draft edit carrying the direct reference."""
 
     session = ComposerDraftSession(_lite6_program())
     node = _find_node(session.snapshot()["program"]["tree"], "move_to_rest")
     assert node is not None
     parameters = {**node["parameters"],
-                  "tcp_endpoint": {"kind": "entry", "target_role": "arm", "frame_role": "pen"}}
+                  "tcp_endpoint": _LITE6_FLANGE_ENTRY}
     revision = session.revision
     result = _mutate(
         session,
@@ -2676,26 +2657,9 @@ def test_picking_an_undeclared_tcp_declares_it_in_the_same_edit() -> None:
         },
     )
     assert session.revision == revision + 1
-    program = result.snapshot["program"]
-    assert program["target_roles"]["arm"]["required_frame_roles"] == ["base", "pen"]
-    assert _find_node(program["tree"], "move_to_rest")["parameters"]["tcp_endpoint"] == {
-        "kind": "entry", "target_role": "arm", "frame_role": "pen",
-    }
-
-
-def test_tcp_entry_declaration_covers_set_tcp_and_keeps_other_selectors_symbolic() -> None:
-    from manyforge_composer.backend.draft_session import _declare_motion_endpoint
-
-    document = {"target_roles": {"tool": {"required_frame_roles": ["base"]}}}
-    _declare_motion_endpoint(document, {"tcp": {
-        "kind": "entry", "target_role": "tool", "frame_role": "tip",
-    }})
-    assert document["target_roles"]["tool"]["required_frame_roles"] == ["base", "tip"]
-    _declare_motion_endpoint(document, {"tcp_endpoint": {"kind": "current"}})
-    _declare_motion_endpoint(document, {"tcp_endpoint": {
-        "kind": "default_of_role", "role": "tool",
-    }})
-    assert document["target_roles"]["tool"]["required_frame_roles"] == ["base", "tip"]
+    authoring = result.snapshot["authoring"]
+    assert _find_node(authoring["forest"][0], "move_to_rest")["parameters"][
+        "tcp_endpoint"] == _LITE6_FLANGE_ENTRY
 
 
 @pytest.mark.parametrize("selector", [

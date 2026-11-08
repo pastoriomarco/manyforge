@@ -7,7 +7,7 @@ import logging
 import os
 from pathlib import Path
 import stat
-from typing import Any, Callable, NoReturn
+from typing import Any, NoReturn
 import uuid
 
 from fastapi import HTTPException
@@ -15,10 +15,12 @@ import yaml
 
 from manyforge_behavior.canonical_artifact import (
     MAX_DOCUMENT_BYTES, StrictArtifactError, load_strict_json_yaml,
-    verify_content_identity, compute_content_identity,
 )
 from manyforge_behavior.catalog import NodeCatalog
-from manyforge_behavior.program import Program, ProgramValidationError, TcpEndpointAliasAmbiguous
+from manyforge_behavior.program import (
+    Program, ProgramFormatUnsupported, ProgramValidationError,
+    require_program_format,
+)
 
 from .security import (
     SCENARIO_PROJECT_READ_ONLY_MESSAGE,
@@ -37,10 +39,12 @@ _LOGGER = logging.getLogger(__name__)
 class ProgramArtifactError(RuntimeError):
     """One bounded Program artifact operation failed."""
 
-    def __init__(self, code: str, message: str, *, status_code: int) -> None:
+    def __init__(self, code: str, message: str, *, status_code: int,
+                 details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+        self.details = details
 
 
 def _fail(code: str, message: str, *, status_code: int) -> NoReturn:
@@ -123,7 +127,6 @@ def load_program_artifact(
     *,
     allowed_roots: list[str],
     catalog: NodeCatalog,
-    legacy_attach_context: Callable[[], tuple[Any, Any]] | None = None,
 ) -> tuple[Program, str]:
     """Read and validate one Program through an attested no-follow descriptor."""
 
@@ -187,31 +190,15 @@ def load_program_artifact(
             # an `edited_outside_manyforge` warning, not a refusal, and a
             # compatible older catalog selector loads as the active one.
             raw = load_strict_json_yaml(f"/proc/self/fd/{descriptor}")
-            if (legacy_attach_context is not None and isinstance(raw, dict)
-                    and isinstance(raw.get("catalog"), dict)
-                    and raw["catalog"].get("content_version") == "2.8.0"
-                    and isinstance(raw.get("api_version"), str)
-                    and catalog.content_version == "2.9.0"):
-                from .legacy_attach_migration import migrate_legacy_attach
-                deployment, assignment = legacy_attach_context()
-                clean_identity = False
-                try:
-                    verify_content_identity(raw, own_field="program_revision",
-                                            identity_domain="program-revision",
-                                            api_version=raw["api_version"], label=str(resolved))
-                    clean_identity = True
-                except StrictArtifactError:
-                    pass
-                if migrate_legacy_attach(raw, deployment, assignment) and clean_identity:
-                    raw["program_revision"] = compute_content_identity(
-                        raw, own_field="program_revision", identity_domain="program-revision",
-                        api_version=raw["api_version"],
-                    )
+            require_program_format(raw, supported_api_version="manyforge.program.v3")
             loaded = Program.from_dict(raw, catalog, path=resolved, authoring_load=True)
+        except ProgramFormatUnsupported as error:
+            raise ProgramArtifactError(
+                error.code, str(error), status_code=400, details=error.details
+            ) from error
         except (ProgramValidationError, StrictArtifactError) as error:
             _fail(
-                error.code if isinstance(error, TcpEndpointAliasAmbiguous)
-                else "program_artifact_validation_failed",
+                "program_artifact_validation_failed",
                 str(error),
                 status_code=400,
             )

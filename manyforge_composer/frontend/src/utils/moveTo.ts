@@ -1,5 +1,5 @@
 import { Euler, Matrix4, Quaternion, Vector3 } from 'three';
-import type { ProgramBindingDocument } from '../types/api';
+import type { JsonValue, ProgramBindingDocument, ProgramFrameReference } from '../types/api';
 import type { PoseTuple } from './poseTransforms';
 import { rpyDegToXyzw } from './orientation';
 
@@ -15,8 +15,18 @@ export const DEFAULT_MOVE_TO_OPTIONS: CartesianMoveDraftOptions = {
   orientationMode: 'keep-current', offsetXyzM: [0, 0, 0], offsetRpyRad: [0, 0, 0],
 };
 
+export type MoveToReferenceProvenance =
+  | { kind: 'absolute' }
+  | {
+      kind: 'relative';
+      targetReference: JsonValue;
+      offsetReference?: JsonValue;
+      targetPose: PoseTuple;
+      offsetPose: PoseTuple;
+    };
+
 export type MoveToDraftSource =
-  | { id: string; kind: 'pose'; pose: PoseTuple }
+  | { id: string; kind: 'pose'; pose: PoseTuple; provenance?: MoveToReferenceProvenance }
   | { id: string; kind: 'joint'; positionsRad: number[] };
 
 export interface MoveToDraft {
@@ -27,10 +37,9 @@ export interface MoveToDraft {
 }
 
 export interface StoredPoseResolutionContext {
-  programTargetRoleId: string;
-  baseFrameRoleId: string;
+  baseFrame: ProgramFrameReference;
   sceneResourcePoses: ReadonlyMap<string, PoseTuple>;
-  frameRolePoses: ReadonlyMap<string, PoseTuple>;
+  framePoses: ReadonlyMap<string, PoseTuple>;
 }
 
 function finitePose(pose: PoseTuple | null): pose is PoseTuple {
@@ -52,21 +61,22 @@ function selectedOrientation(
     : null;
 }
 
-/** Return Program target roles bound to one exact addressed command target. */
-export function boundProgramTargetRoleIds(
+/** Check that the Applied Binding contains the exact addressed target. */
+export function hasBoundProgramTarget(
   binding: ProgramBindingDocument | null,
   controllableComponentId: string,
   commandTargetId: string,
-): string[] {
-  if (binding === null) return [];
-  return binding.target_role_bindings
-    .filter((row) => (
-      row.controllable_component_id === controllableComponentId
-      && row.command_target_id === commandTargetId
-    ))
-    .map((row) => row.target_role_id)
-    .sort();
+): boolean {
+  return binding !== null && binding.target_bindings.some((row) => (
+    row.target.component_id === controllableComponentId
+    && row.target.command_target_id === commandTargetId
+  ));
 }
+
+/** Direct IDs are portable identities and cannot contain the slash separator. */
+export const programFrameKey = (frame: ProgramFrameReference): string => (
+  `${frame.component_id}/${frame.frame_id}`
+);
 
 function recordAt(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -112,13 +122,36 @@ function referencePose(
       ? context.sceneResourcePoses.get(reference.scene_resource_id) ?? null
       : null;
   }
-  if (reference.type === 'frame_role') {
-    return typeof reference.frame_role_id === 'string'
-      ? context.frameRolePoses.get(reference.frame_role_id) ?? null
+  if (reference.type === 'component_frame') {
+    const frame = recordAt(reference.frame);
+    return typeof frame?.component_id === 'string' && typeof frame.frame_id === 'string'
+      ? context.framePoses.get(programFrameKey({ component_id: frame.component_id, frame_id: frame.frame_id })) ?? null
       : null;
   }
   if (reference.type === 'pose') return canonicalProgramPose(reference.pose);
   return null;
+}
+
+/** Capture the exact authored references and their poses before preview flattening. */
+export function storedMoveToProvenance(
+  parameters: Readonly<Record<string, unknown>>,
+  context: StoredPoseResolutionContext,
+): MoveToReferenceProvenance | null {
+  if ((parameters.target_mode ?? 'absolute') === 'absolute') return { kind: 'absolute' };
+  if (parameters.target_mode !== 'relative') return null;
+  const targetPose = referencePose(parameters.target_reference, context);
+  const offsetPose = parameters.offset_reference === undefined
+    ? targetPose : referencePose(parameters.offset_reference, context);
+  if (targetPose === null || offsetPose === null || parameters.target_reference == null) return null;
+  return {
+    kind: 'relative',
+    targetReference: structuredClone(parameters.target_reference) as JsonValue,
+    ...(parameters.offset_reference === undefined ? {} : {
+      offsetReference: structuredClone(parameters.offset_reference) as JsonValue,
+    }),
+    targetPose,
+    offsetPose,
+  };
 }
 
 /**
@@ -136,9 +169,10 @@ export function resolveStoredProgramPose(
     if (parameters.target_reference !== undefined
       || parameters.offset_reference !== undefined) return null;
     const frame = recordAt(recordAt(parameters.goal)?.frame_ref);
+    const selected = recordAt(frame?.frame);
     return frame?.kind === 'target_frame'
-      && frame.target_role === context.programTargetRoleId
-      && frame.frame_role === context.baseFrameRoleId
+      && selected?.component_id === context.baseFrame.component_id
+      && selected?.frame_id === context.baseFrame.frame_id
       ? goal
       : null;
   }

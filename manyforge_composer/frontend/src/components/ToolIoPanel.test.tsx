@@ -54,14 +54,14 @@ function reading(patch: Partial<IoSignalReading> = {}): IoSignalReading {
 
 function signal(patch: Partial<ToolIoSignal> = {}): ToolIoSignal {
   return {
-    programBindingId: BINDING_ID, controllableComponentId: 'station', targetId: 'io', targetRoleId: 'station',
-    resourceRoleId: 'part_present', signalName: 'part_present', direction: 'input',
+    programBindingId: BINDING_ID, controllableComponentId: 'station', targetId: 'io',
+    signalComponentId: 'station', signalName: 'part_present', direction: 'input',
     declared: { profile: 'mock', sourceId: 'station_mock', topic: null, liveness: 'in_process' },
     ...patch,
   };
 }
 
-const valve = signal({ resourceRoleId: 'valve', signalName: 'valve', direction: 'output',
+const valve = signal({ signalName: 'valve', direction: 'output',
   declared: { profile: 'ros_bool', sourceId: 'valve_src', topic: '/valve', liveness: 'periodic' } });
 
 function sample(signalId: string, patch: Partial<SignalSample> = {}): SignalSample {
@@ -92,18 +92,23 @@ afterEach(() => {
 });
 
 describe('ToolIoPanelView', () => {
-  it('shows generated system signals as read-only rows', () => {
+  it('shows generated system signals with their component as read-only rows', () => {
     const systemSignal: SystemSignalProjection = {
       controllableComponentId: 'robot', commandTargetId: 'gripper',
       signalName: 'carried_object_lost.gripper', sourceKind: 'system_carried_object',
       direction: 'input', valueType: 'bool', level: true,
     };
-    const html = view({ systemSignals: [systemSignal] });
-    expect(html).toContain('aria-label="System signals"');
+    const html = view({ signals: [valve], systemSignals: [systemSignal] });
+    expect(html).toContain('aria-label="robot system signals"');
+    expect(html).toContain('<strong>robot</strong><small>System signals · read only</small>');
+    expect(html).not.toContain('aria-label="System signals"');
+    expect(html.match(/class="runtime-control-section"/g)).toHaveLength(2);
     expect(html).toContain('data-system-signal="carried_object_lost.gripper"');
     expect(html).toContain('data-system-signal-level="true">true</strong>');
     expect(html).toContain('gripper · input · system');
-    expect(html).not.toContain('<button');
+    const systemSectionStart = html.indexOf('aria-label="robot system signals"');
+    const systemSectionEnd = html.indexOf('</section>', systemSectionStart);
+    expect(html.slice(systemSectionStart, systemSectionEnd)).not.toContain('<button');
   });
 
   it('hides bound and system rows when the panel is unavailable', () => {
@@ -129,12 +134,19 @@ describe('ToolIoPanelView', () => {
     expect(html).toContain('Declared source: ROS Bool topic · valve_src · /valve');
   });
 
-  it('marks a stale sample, a last write and a missing sample', () => {
-    const stale = view({ signals: [valve], samples: samplesOf(sample('station/valve', { fresh: false, source: 'last_write' })) });
+  it('marks a stale sample and a missing sample', () => {
+    const stale = view({ signals: [valve], samples: samplesOf(sample('station/valve', { fresh: false, source: 'device' })) });
     expect(stale).toContain('on (stale)');
-    expect(stale).toContain('last write');
-    expect(view({ signals: [valve] })).toContain('no sample');
+    expect(stale).toContain('device');
+    expect(view({ signals: [valve]})).toContain('no sample');
     expect(view({ signals: [valve], samples: null })).toContain('unavailable');
+  });
+
+  it('shows an output without read-back as not readable, never as its last write', () => {
+    const html = view({ signals: [valve], samples: samplesOf(sample('station/valve', { value: null, fresh: false, source: 'not_readable', age_ns: 0 })) });
+    expect(html).toContain('data-io-value="true">not readable');
+    expect(html).toContain('data-io-source="not_readable">no read-back');
+    expect(html).not.toContain('(stale)');
   });
 
   it('nests the changed outside mark under its output', () => {
@@ -160,7 +172,7 @@ describe('ToolIoPanelView', () => {
     expect(latched).toContain('Outputs: Cell latched: a component needs attention');
   });
 
-  it('disables output writes only while motion executes (§7)', () => {
+  it('disables output writes only while motion executes', () => {
     const executing = view({ signals: [valve], samples: samplesOf(sample('station/valve')), motionExecuting: true });
     expect(executing).toMatch(/disabled="" title="Motion is executing[^"]*" aria-label="Write valve on"/);
     expect(executing).toContain('Outputs: Motion is executing');
@@ -197,7 +209,7 @@ describe('ToolIoPanelView', () => {
   });
 
   it('offers the Mock toggle for Mock inputs only, with its receipt', () => {
-    const real = signal({ resourceRoleId: 'door', signalName: 'door',
+    const real = signal({ signalName: 'door',
       declared: { profile: 'ros_bool', sourceId: 'door_src', topic: '/door', liveness: 'periodic' } });
     const html = view({
       signals: [signal(), real],
@@ -222,18 +234,26 @@ function cellSource(state: CellState) {
 }
 
 describe('ToolIoPanel', () => {
+  const stationTarget = { component_id: 'station', command_target_id: 'io' };
   const binding = {
+    api_version: 'manyforge.program_binding.v3',
     program_binding_id: BINDING_ID,
     retained_bundle_id: 'bundle.1',
-    target_role_bindings: [{
-      target_role_id: 'station', controllable_component_id: 'station', command_target_id: 'io',
-      signal_role_bindings: [
-        { resource_role_id: 'part_present', signal_name: 'part_present', value_type: 'bool',
-          direction: 'input', transition_capability: 'sampled_only', signal_descriptor_digest: REVISION },
-        { resource_role_id: 'valve', signal_name: 'valve', value_type: 'bool',
-          direction: 'output', transition_capability: 'sampled_only', signal_descriptor_digest: REVISION },
+    target_bindings: [{
+      target: stationTarget,
+      signal_references: [
+        { component_id: 'station', signal_name: 'part_present' },
+        { component_id: 'station', signal_name: 'valve' },
       ],
     }],
+    signal_bindings: [
+      { reference: { component_id: 'station', signal_name: 'part_present' }, target: stationTarget,
+        runtime_unit_id: 'station', value_type: 'bool', direction: 'input', transition_capability: 'sampled_only',
+        signal_descriptor_digest: REVISION },
+      { reference: { component_id: 'station', signal_name: 'valve' }, target: stationTarget,
+        runtime_unit_id: 'station', value_type: 'bool', direction: 'output', transition_capability: 'sampled_only',
+        signal_descriptor_digest: REVISION },
+    ],
   } as unknown as ProgramBindingDocument;
   const row = (resource: string, direction: string, provider: Record<string, unknown>, extra: Record<string, unknown>) => ({
     controllable_component_id: 'station', command_target_id: 'io', resource_role_id: resource,
@@ -299,7 +319,7 @@ describe('ToolIoPanel', () => {
     try {
       await act(async () => { find((props) => props['aria-label'] === 'Set part_present true').onClick?.(); });
       expect(api.setMockIoInput).toHaveBeenCalledExactlyOnceWith({
-        ownerEpoch: 'owner.1', programBindingId: BINDING_ID, targetRoleId: 'station', resourceRoleId: 'part_present',
+        ownerEpoch: 'owner.1', programBindingId: BINDING_ID, componentId: 'station', signalName: 'part_present',
       }, '3', true);
       expect(find((props) => props['data-io-receipt'] === 'delivered')).toBeTruthy();
     } finally {
@@ -317,12 +337,12 @@ describe('ToolIoPanel', () => {
 });
 
 describe('parseIoSignalResponse', () => {
-  const selector = { ownerEpoch: 'owner.1', programBindingId: BINDING_ID, targetRoleId: 'station', resourceRoleId: 'part_present' };
+  const selector = { ownerEpoch: 'owner.1', programBindingId: BINDING_ID, componentId: 'station', signalName: 'part_present' };
   const response = (value: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
-    api_version: 'manyforge.execution_command_response.v1', ok: true, command: 'query_target',
+    api_version: 'manyforge.execution_command_response.v4', ok: true, command: 'query_target',
     target_observation: {
-      schema_version: 'manyforge.target_observation.v1', owner_epoch: 'owner.1', program_binding_id: BINDING_ID,
-      target_role_id: 'station', kind: 'io_signal', resource_role_id: 'part_present',
+      schema_version: 'manyforge.target_observation.v2', owner_epoch: 'owner.1', program_binding_id: BINDING_ID,
+      signal: { component_id: 'station', signal_name: 'part_present' }, kind: 'io_signal',
       evaluated_at_ns: 5000, value, ...extra,
     },
   });
@@ -339,7 +359,7 @@ describe('parseIoSignalResponse', () => {
     });
   });
 
-  it('keeps the host opaque sha256 source epoch; the sequence stays a counter (SX-2518)', () => {
+  it('keeps the host opaque sha256 source epoch; the sequence stays a counter', () => {
     const epoch = `sha256:${'5c'.repeat(32)}`;
     expect(parseIoSignalResponse(response({ ...value, source_epoch: epoch }), 'query_target', selector).sourceEpoch)
       .toBe(epoch);
@@ -353,14 +373,15 @@ describe('parseIoSignalResponse', () => {
       .toThrow();
   });
 
-  it('parses the descriptor liveness projection (SX-2194)', () => {
+  it('parses the descriptor liveness projection', () => {
     expect(parseIoSignalResponse(response({ ...value, liveness: { mode: 'change_only', warning: 'liveness_unproven' } }),
       'query_target', selector).liveness).toEqual({ mode: 'change_only', warning: 'liveness_unproven' });
     expect(parseIoSignalResponse(response({ ...value, liveness: null }), 'query_target', selector).liveness).toBeNull();
   });
 
   it.each([
-    ['another selector', response(value, { resource_role_id: 'other' })],
+    ['another selector', response(value, { signal: { component_id: 'station', signal_name: 'other' } })],
+    ['another component', response(value, { signal: { component_id: 'other', signal_name: 'part_present' } })],
     ['an unknown quality', response({ ...value, quality: 'ok' })],
     ['a fresh reading without a value', response({ ...value, quality: 'fresh', value: null })],
     ['an extra field', response(value, { source_epoch: '2' })],
@@ -376,7 +397,7 @@ describe('parseIoSignalResponse', () => {
 });
 
 describe('parseMockIoInputReceipt', () => {
-  const selector = { ownerEpoch: 'owner.1', programBindingId: BINDING_ID, targetRoleId: 'station', resourceRoleId: 'part_present' };
+  const selector = { ownerEpoch: 'owner.1', programBindingId: BINDING_ID, componentId: 'station', signalName: 'part_present' };
   const unavailable = {
     liveness: { mode: 'in_process', warning: null },
     signal_name: 'part_present', value_type: 'bool', value: null, quality: 'unavailable', source_id: 'station_mock',
@@ -387,10 +408,10 @@ describe('parseMockIoInputReceipt', () => {
     receipt_age_ns: 0, error: null };
   const cursor = { owner_epoch: 'owner.1', catalog_generation: '1', source_id: 'station_mock', record_sequence: '10' };
   const body = (value: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
-    api_version: 'manyforge.execution_command_response.v1', ok: true, command: 'set_mock_io_input',
+    api_version: 'manyforge.execution_command_response.v4', ok: true, command: 'set_mock_io_input',
     target_observation: {
-      schema_version: 'manyforge.target_observation.v1', owner_epoch: 'owner.1', program_binding_id: BINDING_ID,
-      target_role_id: 'station', kind: 'io_signal', resource_role_id: 'part_present', evaluated_at_ns: 5000, value,
+      schema_version: 'manyforge.target_observation.v2', owner_epoch: 'owner.1', program_binding_id: BINDING_ID,
+      signal: { component_id: 'station', signal_name: 'part_present' }, kind: 'io_signal', evaluated_at_ns: 5000, value,
     },
     model_value: true, published_cursor: cursor, ...extra,
   });
@@ -435,29 +456,31 @@ describe('parseMockIoInputReceipt', () => {
 });
 
 describe('ioSignalBindingsAt', () => {
-  const signalRow = (resource: string) => ({
-    resource_role_id: resource, signal_name: resource, value_type: 'bool', direction: 'input',
-    transition_capability: 'sampled_only', signal_descriptor_digest: REVISION,
+  const signalRow = (component: string, target: string) => (name: string) => ({
+    reference: { component_id: component, signal_name: name },
+    target: { component_id: component, command_target_id: target }, runtime_unit_id: component,
+    value_type: 'bool', direction: 'input', transition_capability: 'sampled_only', signal_descriptor_digest: REVISION,
   });
-  const row = (component: string, target: string, signals = [signalRow('a'), signalRow('b')]) => ({
-    program_binding_id: BINDING_ID, target_role_id: 'role', controllable_component_id: component,
-    command_target_id: target, signal_role_bindings: signals,
+  const row = (component: string, target: string, names = ['a', 'b'], signals = names.map(signalRow(component, target))) => ({
+    program_binding_id: BINDING_ID, target: { component_id: component, command_target_id: target },
+    signals, signal_sources: [],
   });
 
   it('parses canonical rows into the panel adapter shape', () => {
     const rows = ioSignalBindingsAt([row('a', 'io'), row('b', 'io')], 'rows');
-    expect(rows[1]).toMatchObject({ controllableComponentId: 'b', programBindingId: BINDING_ID,
-      signalRoleBindings: [{ resourceRoleId: 'a', signalDescriptorDigest: REVISION }, { resourceRoleId: 'b' }] });
+    expect(rows[1]).toMatchObject({ componentId: 'b', commandTargetId: 'io', programBindingId: BINDING_ID,
+      signals: [{ componentId: 'b', signalName: 'a', signalDescriptorDigest: REVISION }, { signalName: 'b' }] });
   });
 
   it.each([
     ['an empty array', []],
     ['an unordered array', [row('b', 'io'), row('a', 'io')]],
     ['a duplicate row', [row('a', 'io'), row('a', 'io')]],
-    ['unsorted signals', [row('a', 'io', [signalRow('b'), signalRow('a')])]],
+    ['unsorted signals', [row('a', 'io', ['b', 'a'])]],
     ['no signals', [row('a', 'io', [])]],
     ['an extra field', [{ ...row('a', 'io'), extra: 1 }]],
-    ['a non-bool signal', [row('a', 'io', [{ ...signalRow('a'), value_type: 'int' }])]],
+    ['a non-bool signal', [row('a', 'io', [], [{ ...signalRow('a', 'io')('a'), value_type: 'int' }])]],
+    ['a signal of another target', [row('a', 'io', [], [signalRow('a', 'other')('a')])]],
   ])('refuses %s', (_name, value) => {
     expect(() => ioSignalBindingsAt(value, 'rows')).toThrow();
   });
@@ -470,22 +493,25 @@ describe('execution targets io_signal_bindings', () => {
     schema_version: 'manyforge.execution_identity.v2',
   };
   const targets = (extra: Record<string, unknown>) => ({
-    api_version: 'manyforge.execution_command_response.v1', command: 'targets', ok: true, identity,
-    targets: { components: [], schema_version: 'manyforge.execution_targets.v3', ...extra },
+    api_version: 'manyforge.execution_command_response.v4', command: 'targets', ok: true, identity,
+    targets: { components: [], schema_version: 'manyforge.execution_targets.v4', ...extra },
   });
   const control = {
-    api_version: 'manyforge.execution_command_response.v1', command: 'control_state', ok: true, identity,
+    api_version: 'manyforge.execution_command_response.v4', command: 'control_state', ok: true, identity,
     control_state: {
       cell_stop_action: { available: false, expected_stop_generation: 1, latest_terminal: null,
         unavailable_reason: 'No motion target.' },
       manual_operations: [], observed_targets: [], runtime_scale_control: null,
-      schema_version: 'manyforge.execution_control_state.v6',
+      schema_version: 'manyforge.execution_control_state.v7',
     },
   };
+  const stationTarget = { component_id: 'station', command_target_id: 'io' };
   const rows = [{
-    program_binding_id: BINDING_ID, target_role_id: 'station', controllable_component_id: 'station',
-    command_target_id: 'io', signal_role_bindings: [{ resource_role_id: 'part_present', signal_name: 'part_present',
-      value_type: 'bool', direction: 'input', transition_capability: 'sampled_only', signal_descriptor_digest: REVISION }],
+    program_binding_id: BINDING_ID, target: stationTarget,
+    signals: [{ reference: { component_id: 'station', signal_name: 'part_present' }, target: stationTarget,
+      runtime_unit_id: 'station', value_type: 'bool', direction: 'input', transition_capability: 'sampled_only',
+      signal_descriptor_digest: REVISION }],
+    signal_sources: [] as unknown[],
   }];
 
   it('is optional, strict, and carried on the owner status', async () => {
@@ -523,15 +549,17 @@ describe('execution targets io_signal_bindings', () => {
   });
 
   it('accepts the host signal_sources projection and checks its shape', () => {
-    const withSources = [{ ...rows[0], signal_sources: [{ resource_role_id: 'part_present', source_kind: 'mock' }] }];
+    const source = { signal: { component_id: 'station', signal_name: 'part_present' }, source_kind: 'mock' };
+    const withSources = [{ ...rows[0], signal_sources: [source] }];
     expect(ioSignalBindingsAt(withSources, 'rows')).toEqual(ioSignalBindingsAt(rows, 'rows'));
     expect(() => ioSignalBindingsAt([{ ...rows[0], signal_sources: null }], 'rows')).toThrow();
     expect(() => ioSignalBindingsAt([{ ...rows[0], signal_sources: {} }], 'rows')).toThrow();
     expect(() => ioSignalBindingsAt(
-      [{ ...rows[0], signal_sources: [{ resource_role_id: 'part_present', source_kind: 'mock', manual_only: true }] }],
+      [{ ...rows[0], signal_sources: [{ ...source, manual_only: true }] }],
       'rows',
     )).toThrow();
-    expect(() => ioSignalBindingsAt([{ ...rows[0], signal_sources: [{ resource_role_id: 1, source_kind: 'mock' }] }], 'rows'))
+    expect(() => ioSignalBindingsAt([{ ...rows[0], signal_sources: [{ ...source,
+      signal: { component_id: 1, signal_name: 'part_present' } }] }], 'rows'))
       .toThrow();
   });
 });

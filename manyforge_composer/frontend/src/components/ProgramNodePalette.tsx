@@ -1,7 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Ref } from 'react';
-import type { ManualControlMotionDescriptor } from '../types/robotControl';
-import type { ResolvedTargetRole } from '../utils/targetRoleResolution';
+import type { ReferenceSelectorFacts } from '../utils/referenceValidation';
 
 import type {
   CatalogEntry,
@@ -32,8 +31,7 @@ interface ProgramCatalogIdentity {
 interface ProgramNodePaletteProps {
   roots: ProgramTreeNode[];
   program?: ProgramAuthoringDocument;
-  boundTargets?: readonly ResolvedTargetRole[];
-  motionDescriptors?: readonly ManualControlMotionDescriptor[];
+  selectorFacts?: ReferenceSelectorFacts | null;
   catalogEntries: CatalogEntry[];
   catalogIdentity: ProgramCatalogIdentity | null;
   environment: NodeEnvironmentResponse | null;
@@ -76,13 +74,14 @@ export function executionAvailability(
       note: `Authorable · unavailable · ${errorCatalogRow(typedReason.code)?.[0] ?? typedReason.message}${typeof typedReason.details?.capability === 'string' ? ` (${typedReason.details.capability})` : ''}`,
     };
   }
-  const gates = [...new Set(rows.flatMap((row) => row.restorationGates))];
+  // Restoration gates are internal codes: the note only says whether any apply.
+  const gated = rows.some((row) => row.restorationGates.length > 0);
   const reasons = [...new Set(rows.flatMap((row) => row.reasonCodes))];
   const boundedReason = reasons[0]?.replaceAll('_', ' ') ?? 'no current execution offer';
   return {
     available: false,
-    note: gates.length > 0
-      ? `Authorable · unavailable until ${gates.join(', ')} · ${boundedReason}`
+    note: gated
+      ? `Authorable · unavailable in this version · ${boundedReason}`
       : `Authorable · unavailable · ${boundedReason}`,
   };
 }
@@ -147,8 +146,7 @@ function PaletteChevron({ up, double = false }: { up: boolean; double?: boolean 
 export const ProgramNodePalette = memo(function ProgramNodePalette({
   roots,
   program,
-  boundTargets,
-  motionDescriptors,
+  selectorFacts,
   catalogEntries,
   catalogIdentity,
   environment,
@@ -327,8 +325,7 @@ export const ProgramNodePalette = memo(function ProgramNodePalette({
       {program && (
         <ProgramAuthoringTemplate
           program={program}
-          boundTargets={boundTargets}
-          motionDescriptors={motionDescriptors}
+          selectorFacts={selectorFacts}
           busy={busy}
           onMutate={onMutate}
           collapsed={templatesCollapsed}

@@ -27,15 +27,13 @@ const check: ProgramTreeNode = {
 
 function program(keys: BlackboardKeyDeclaration[]): ProgramAuthoringDocument {
   return {
-    api_version: 'manyforge.program.v2',
+    api_version: 'manyforge.program.v3',
     program_id: 'outcomes',
     program_profile: 'composable-cell-v1',
     name: 'Outcomes',
-    catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.6.0' },
-    component_roles: {},
-    target_roles: {},
+    catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '3.0.0' },
     blackboard: { namespaces: [{ namespace_id: 'cell', owner: 'program' }], keys },
-    schema_version: 'manyforge.composer_authoring_forest.v1',
+    schema_version: 'manyforge.composer_authoring_forest.v2',
     forest: [{ node_id: 'sequence', instance_id: 'main', parameters: {}, children: [move, check] }],
     positions: {},
   };
@@ -87,7 +85,7 @@ describe('blackboard key namespaces', () => {
       .map((choice) => choice.value)).toEqual(['total', 'cell.part']);
   });
 
-  it('offers the Deployment Draft global rules as read-only interrupt_state keys (contracts 63/64)', () => {
+  it('offers the Deployment Draft global rules as read-only interrupt_state keys', () => {
     const draft = program([key('total')]);
     const schema = checkEntry.parameters[0]!.schema;
     expect(programSemanticChoices(schema, check, checkEntry, 'key', draft, ['light_curtain'])
@@ -178,7 +176,7 @@ describe('blackboard key namespaces', () => {
   });
 });
 
-describe('reserved system names (contract 105(c))', () => {
+describe('reserved system names', () => {
   it('refuses the system namespaces as user key, namespace or parameter names', () => {
     for (const name of ['node_outcome', 'interrupt_state', 'node_outcome.pick', ' interrupt_state.guard']) {
       expect(reservedNameProblem(name, 'A parameter ID')).toContain('reserved for the system-owned');

@@ -1,14 +1,14 @@
-api_version: manyforge.program.v2
+api_version: manyforge.program.v3
 program_id: pick_and_place_ur10e_robotiq_demo
-program_revision: sha256:2314f15be6829a5742ca2d949de1c411d2156ea4d2db008aa428b4a990834afc
+program_revision: sha256:a696d0e82af2945ab363c961734956675fb4fc54bb6071348f1fa3971ca7ccac
 program_profile: composable-cell-v1
 name: pick_and_place_ur10e_robotiq_demo
 description: Pick-and-place demo for the source-local UR10e and Robotiq 2F-140 model. It preserves the
   approach, pick, carried-object, place, detach, retreat, and rest sequence together with the Robotiq
   finger-joint coordinate semantics.
 catalog:
-  api_version: manyforge.node_catalog.v2
-  content_version: 2.9.0
+  api_version: manyforge.node_catalog.v3
+  content_version: 3.0.0
 compatibility:
   lanes:
   - manyforge-only
@@ -19,66 +19,6 @@ compatibility:
   - pick-and-place
   - robotiq
   - ur10e
-component_roles:
-  robot:
-    required_component_type_tags:
-    - articulated-arm
-    required_model_roles:
-    - arm_model
-  tool:
-    required_component_type_tags:
-    - gripper
-target_roles:
-  arm:
-    component_role: robot
-    required_capabilities:
-    - capability_id: execution.feedback.phase_events
-      parameters: {}
-      disposition: required
-    - capability_id: execution.trajectory.execute
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.joint_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.trajectory.time_parameterized
-      parameters: {}
-      disposition: required
-    - capability_id: state.observed.current
-      parameters: {}
-      disposition: required
-    - capability_id: validation.trajectory.non_collision
-      parameters: {}
-      disposition: required
-    required_frame_roles:
-    - base
-    required_resource_roles:
-    - arm_joints
-    required_collision_body_roles:
-    - arm_collision
-    required_model_roles:
-    - arm_model
-  gripper:
-    component_role: tool
-    required_capabilities:
-    - capability_id: model.kinematics.fk
-      parameters: {}
-      disposition: required
-    - capability_id: tool.gripper.command
-      parameters: {}
-      disposition: required
-    - capability_id: tool.gripper.feedback
-      parameters: {}
-      disposition: required
-    required_frame_roles:
-    - tcp
-    required_resource_roles:
-    - fingers
-    required_collision_body_roles:
-    - gripper_collision
 scene:
 - scene_resource_id: graspable
   shape:
@@ -137,7 +77,9 @@ tree:
   - node_id: gripper.command_position
     instance_id: command_gripper
     parameters:
-      target_role: gripper
+      target:
+        component_id: robotiq_2f_140
+        command_target_id: gripper
       position:
         kind: angular_rad
         value_rad: 0.0
@@ -149,8 +91,12 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_pick_approach
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: ur10e_robot
+        command_target_id: arm
+      base_frame:
+        component_id: ur10e_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       target_mode: relative
@@ -177,8 +123,12 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_pick
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: ur10e_robot
+        command_target_id: arm
+      base_frame:
+        component_id: ur10e_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       target_mode: relative
@@ -205,7 +155,9 @@ tree:
   - node_id: gripper.command_position
     instance_id: close_gripper
     parameters:
-      target_role: gripper
+      target:
+        component_id: robotiq_2f_140
+        command_target_id: gripper
       position:
         kind: angular_rad
         value_rad: 0.66
@@ -218,23 +170,33 @@ tree:
     instance_id: attach_graspable
     parameters:
       scene_resource_id: graspable
-      target_role: gripper
-      carrier_frame_role: tcp
-      touch_body_roles:
-      - gripper_collision
+      target:
+        component_id: robotiq_2f_140
+        command_target_id: gripper
+      carrier_frame_ref:
+        component_id: robotiq_2f_140
+        frame_id: tcp
+      touch_bodies:
+      - component_id: robotiq_2f_140
+        collision_body_id: gripper_collision
     children: []
   - node_id: motion.move_to_pose
     instance_id: pick_retreat
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: ur10e_robot
+        command_target_id: arm
+      base_frame:
+        component_id: ur10e_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       target_mode: relative
       target_reference:
-        type: frame_role
-        frame_role_id: tcp
-        target_role: gripper
+        type: component_frame
+        frame:
+          component_id: robotiq_2f_140
+          frame_id: tcp
       goal:
         position_m:
         - 0.0
@@ -255,8 +217,12 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_drop_approach
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: ur10e_robot
+        command_target_id: arm
+      base_frame:
+        component_id: ur10e_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       target_mode: relative
@@ -265,8 +231,9 @@ tree:
         pose:
           frame_ref:
             kind: target_frame
-            target_role: arm
-            frame_role: base
+            frame:
+              component_id: ur10e_robot
+              frame_id: base
           position_m:
           - 0.3
           - 0.3
@@ -277,8 +244,10 @@ tree:
             - 0.0
             - -180.0
       offset_reference:
-        type: frame_role
-        frame_role_id: base
+        type: component_frame
+        frame:
+          component_id: ur10e_robot
+          frame_id: base
       goal:
         position_m:
         - 0.0
@@ -299,15 +268,20 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_drop
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: ur10e_robot
+        command_target_id: arm
+      base_frame:
+        component_id: ur10e_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       goal:
         frame_ref:
           kind: target_frame
-          target_role: arm
-          frame_role: base
+          frame:
+            component_id: ur10e_robot
+            frame_id: base
         position_m:
         - 0.3
         - 0.3
@@ -328,7 +302,9 @@ tree:
   - node_id: gripper.command_position
     instance_id: open_gripper
     parameters:
-      target_role: gripper
+      target:
+        component_id: robotiq_2f_140
+        command_target_id: gripper
       position:
         kind: angular_rad
         value_rad: 0.0
@@ -341,13 +317,19 @@ tree:
     instance_id: detach_graspable
     parameters:
       scene_resource_id: graspable
-      target_role: gripper
+      target:
+        component_id: robotiq_2f_140
+        command_target_id: gripper
     children: []
   - node_id: motion.move_to_pose
     instance_id: drop_retreat
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: ur10e_robot
+        command_target_id: arm
+      base_frame:
+        component_id: ur10e_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       target_mode: relative
@@ -356,8 +338,9 @@ tree:
         pose:
           frame_ref:
             kind: target_frame
-            target_role: arm
-            frame_role: base
+            frame:
+              component_id: ur10e_robot
+              frame_id: base
           position_m:
           - 0.3
           - 0.3
@@ -368,8 +351,10 @@ tree:
             - 0.0
             - -180.0
       offset_reference:
-        type: frame_role
-        frame_role_id: base
+        type: component_frame
+        frame:
+          component_id: ur10e_robot
+          frame_id: base
       goal:
         position_m:
         - 0.0
@@ -390,8 +375,12 @@ tree:
   - node_id: motion.move_to_joint_target
     instance_id: return_rest
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: ur10e_robot
+        command_target_id: arm
+      base_frame:
+        component_id: ur10e_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       goal:

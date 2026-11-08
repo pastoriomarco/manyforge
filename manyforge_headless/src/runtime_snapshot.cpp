@@ -67,7 +67,7 @@ bool RequiredBool(const CanonicalValue &root, const std::string_view name) {
   return *value;
 }
 
-// CP8 step 1: one closed `{controllable_component_id, simulator}` row per
+// One closed `{controllable_component_id, simulator}` row per
 // ROS-hosted component. Optional so older Manager publications stay readable.
 void ValidateComponentSimulatorDependencies(const CanonicalValue &rows) {
   Require(rows.is_array(),

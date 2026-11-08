@@ -420,7 +420,7 @@ source_files(const std::filesystem::path &directory) {
     }
   }
   std::sort(result.begin(), result.end());
-  // ADR-0026: extra records are harmless; each consumer below requires what
+  // Extra records are harmless; each consumer below requires what
   // it selects, so only an empty directory is refused here.
   if (result.empty()) {
     throw std::invalid_argument(
@@ -484,7 +484,7 @@ void verify_gripper_resource_semantics(
         "maintained gripper proof requires a controllable component");
   }
   const auto provider_only = [&](const auto &component) {
-    // CP8 step 1: an arm-only component type has no gripper target to prove.
+    // An arm-only component type has no gripper target to prove.
     if (component.component_type_id.value().ends_with(".arm_only.component"))
       return true;
     return component.model_role_bindings.empty() &&
@@ -502,7 +502,7 @@ void verify_gripper_resource_semantics(
   // Genuine qualified provider-only components have no physical gripper fact.
   if (physical_components == 0U)
     return;
-  // Merge 6: a split robot has no gripper (its mounted tool owns it, or it
+  // A split robot has no gripper (its mounted tool owns it, or it
   // has none). Every component that owns a gripper target proves its finger
   // resource.
   std::set<core::ControllableComponentId> gripper_components;
@@ -935,9 +935,9 @@ qualify_catalog(const std::filesystem::path &root,
     }
   }
   // One native component type per model family plus the fixed-scale ROS type
-  // of every family with an Isaac or offline mock controller profile
-  // (Q63-Q68), and the arm-only fixed-scale type of every family with a Real
-  // profile (CP8 step 1). E1: generated per family, so no fixed count; each
+  // of every family with an Isaac or offline mock controller profile,
+  // and the arm-only fixed-scale type of every family with a Real
+  // profile. Generated per family, so no fixed count; each
   // file is still fully qualified and must find every target capability it
   // selects (a missing one is refused by its qualification).
   for (const auto &path : source_files(catalog_root / "component_type")) {
@@ -1024,7 +1024,7 @@ qualify_catalog(const std::filesystem::path &root,
   // The lifecycle providers below must each be present once with their Stop
   // contract roles. Their offer lists are not counted: the compiler refuses a
   // capability binding no selected provider offers, and extra offers are
-  // harmless (ADR-0026).
+  // harmless.
   for (const auto &path : source_files(catalog_root / "provider_manifest")) {
     const std::string bytes = read_file(path);
     const auto reference =
@@ -1162,7 +1162,7 @@ PreparedActivationMaterialization materialize_prepared_activation(
   for (auto &prepared : prepare_activation_ai_model_types(
            intent, component_profiles, catalog.capabilities))
     io_types.push_back(std::move(prepared));
-  // Machine owners (CONTRACTS §16): a derived type without targets.
+  // Machine owners: a derived type without targets.
   for (auto &prepared :
        prepare_activation_machine_types(intent, component_profiles))
     io_types.push_back(std::move(prepared));

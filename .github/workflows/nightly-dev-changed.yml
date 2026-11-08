@@ -1,0 +1,40 @@
+name: nightly-dev-changed
+
+# Called first by every workflow with a nightly schedule. A scheduled run goes
+# ahead only if dev was pushed after the workflow's previous scheduled run
+# started (or there is no previous one); push, pull request, tag and manual
+# runs always go ahead. Callers grant `actions: read` to the calling job.
+on:
+  workflow_call:
+    outputs:
+      run:
+        description: "'true' when the calling workflow should run its jobs"
+        value: ${{ jobs.check.outputs.run }}
+
+jobs:
+  check:
+    name: dev pushed since the previous nightly
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            api="repos/$GITHUB_REPOSITORY"
+            workflow_id=$(gh api "$api/actions/runs/$GITHUB_RUN_ID" --jq .workflow_id)
+            previous=$(gh api "$api/actions/workflows/$workflow_id/runs?event=schedule&per_page=2" \
+              --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID)][0].created_at // empty")
+            pushed=$(gh api "$api/activity?ref=refs/heads/dev&per_page=1" --jq '.[0].timestamp')
+            # Both are UTC ISO 8601 timestamps, so they compare as strings.
+            if [ -n "$previous" ] && [[ ! "$pushed" > "$previous" ]]; then
+              run=false
+            fi
+            echo "dev last pushed ${pushed}; previous nightly ${previous:-none}; run=${run}"
+          fi
+          echo "run=${run}" >> "$GITHUB_OUTPUT"

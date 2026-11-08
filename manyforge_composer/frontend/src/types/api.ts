@@ -134,7 +134,7 @@ export interface CatalogEntry {
 }
 
 export interface CatalogResponse {
-  apiVersion: 'manyforge.node_catalog.v2';
+  apiVersion: 'manyforge.node_catalog.v3';
   contentVersion: string;
   catalogId: string;
   entries: CatalogEntry[];
@@ -181,13 +181,16 @@ export type ProgramSceneShape =
       mesh_scale?: Vector3Tuple;
     };
 
+export interface ProgramTargetReference { component_id: string; command_target_id: string }
+export interface ProgramSignalReference { component_id: string; signal_name: string }
+export interface ProgramFrameReference { component_id: string; frame_id: string }
+export interface ProgramCollisionBodyReference { component_id: string; collision_body_id: string }
+
 export type ProgramSceneFrameRef =
   | { kind: 'cell_frame' }
   | {
       kind: 'component_frame';
-      component_role: string;
-      model_role: string;
-      frame_role: string;
+      frame: ProgramFrameReference;
     };
 
 export interface ProgramScenePose {
@@ -207,9 +210,10 @@ export interface ProgramSceneResource {
 }
 
 export interface ProgramViewerMetadata {
-  frame_role_visibility?: Record<string, boolean>;
+  frame_visibility?: { frame: ProgramFrameReference; visible: boolean }[];
+  cell_frame_visible?: boolean;
+  scene_resource_visibility?: Record<string, boolean>;
   frame_gizmo_size_m?: number;
-  resource_role_visibility?: Record<string, boolean>;
   scene_resource_axes_visibility?: Record<string, boolean>;
   object_axes_gizmo_size_m?: number;
   /** Execution groups the Motion panel does not show (absent: default). */
@@ -297,7 +301,7 @@ export interface BlackboardFieldDeclaration {
 /** A pose frame a Program declares: the cell, a robot's frame role or a Scene object. */
 export type ProgramPoseFrame =
   | { kind: 'cell_frame' }
-  | { kind: 'target_frame'; target_role: string; frame_role: string }
+  | { kind: 'target_frame'; frame: ProgramFrameReference }
   | { kind: 'scene_resource'; scene_resource_id: string };
 
 export interface BlackboardKeyDeclaration {
@@ -319,20 +323,18 @@ export interface BlackboardKeyDeclaration {
 }
 
 export interface ProgramDocument {
-  api_version: 'manyforge.program.v2';
+  api_version: 'manyforge.program.v3';
   program_id: string;
   program_revision: string;
   program_profile: 'composable-cell-v1';
   name: string;
   description?: string;
   catalog: {
-    api_version: 'manyforge.node_catalog.v2';
+    api_version: 'manyforge.node_catalog.v3';
     content_version: string;
   };
   compatibility?: Record<string, JsonValue>;
   viewer?: ProgramViewerMetadata;
-  component_roles: Record<string, JsonValue>;
-  target_roles: Record<string, JsonValue>;
   scene?: ProgramSceneResource[];
   parameters?: ProgramParameterDeclaration[];
   blackboard?: {
@@ -348,7 +350,7 @@ export type ProgramAuthoringDocument = Omit<
   ProgramDocument,
   'program_revision' | 'tree'
 > & {
-  schema_version: 'manyforge.composer_authoring_forest.v1';
+  schema_version: 'manyforge.composer_authoring_forest.v2';
   forest: ProgramTreeNode[];
   positions: Record<string, { x: number; y: number }>;
 };
@@ -473,7 +475,6 @@ export interface AuthoringWorkspaceProjectFacts {
   documentDescription: string | null;
   sourceDiagnostics: ScenarioSourceDiagnostic[];
   sourceDocumentDigest: string | null;
-  programRoleAssignment: Record<string, JsonValue> | null;
   sourceProgramDigest: string | null;
   sourceDeploymentDigest: string | null;
 }
@@ -504,7 +505,7 @@ export interface AuthoringWorkspaceDeploymentDraft {
  * their existing owner projections.
  */
 export interface AuthoringWorkspaceSnapshot {
-  schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2';
+  schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v3';
   workspaceEpoch: string;
   workspaceRevision: number;
   program: {
@@ -584,7 +585,7 @@ export interface PreparedActivationOrigin {
 }
 
 export interface PreparedActivationInput {
-  schemaVersion: 'manyforge.prepared_activation_input.v6';
+  schemaVersion: 'manyforge.prepared_activation_input.v7';
   preparedActivationId: string;
   origin: PreparedActivationOrigin;
   capturedInputDigest: string;
@@ -595,7 +596,7 @@ export interface PreparedActivationInput {
   programId: string | null;
   programRevision: string | null;
   /** Null when no Program is selected or the preserved Program is non-executable in this
-   * candidate; the named references are in the preview impact (H1a). */
+   * candidate; the named references are in the preview impact. */
   programBindingId: string | null;
   nodeEnvironmentDigest: string;
   assistantMode: 'required' | 'optional' | 'forbidden';
@@ -604,9 +605,9 @@ export interface PreparedActivationInput {
 export interface DeploymentControlledStopProfile {
   stop_mode: 'soft_on_path' | 'spring_back_hold' | 'spring_back_fast';
   deceleration_time_s: number;
-  /** Q28/Q51 (`main`): this profile's controlled-Stop deadline from the Stop
+  /** This profile's controlled-Stop deadline from the Stop
    * request, to start braking; absent uses the deceleration time + 0.5 s.
-   * Once sent, the Stop trajectory finishes like a normal motion (M6). */
+   * Once sent, the Stop trajectory finishes like a normal motion. */
   max_stop_time_s?: number;
   /** Ordered fallbacks after `stop_mode`, strictly below it in the fixed order
    * (utils/stopFallbackSequence.ts); hard deceleration always follows and is
@@ -656,7 +657,7 @@ export interface CurrentScenarioResponse {
 }
 
 export interface AppliedProgramSelection {
-  schemaVersion: 'manyforge.applied_program_selection.v3';
+  schemaVersion: 'manyforge.applied_program_selection.v4';
   scenarioId: string;
   /** The Applied Scenario project folder; it scopes persistent values. */
   projectPath: string;
@@ -675,6 +676,15 @@ export interface AppliedProgramSelection {
   ownerIdentities: ProgramRunOwnerIdentity[];
   program: ProgramDocument;
   programBinding: ProgramBindingDocument;
+  programFrameFacts: {
+    appliedRecordDigest: string;
+    programBindingId: string;
+    programRevision: string;
+    retainedBundleId: string;
+    graphRevision: string;
+    components: string[];
+    frames: Array<{ reference: { componentId: string; frameId: string }; matchCount: 1 | 2 }>;
+  };
 }
 
 export type ProgramRunStateName =
@@ -695,8 +705,8 @@ export interface FailureOrigin {
   ownerApi: string | null;
 }
 
-/** Bounded flat failure details: one scalar value per registered key. */
-export type FailureDetails = Record<string, string | number | boolean | null>;
+/** Bounded failure details, including an optional qualified reference. */
+export type FailureDetails = Record<string, string | number | boolean | null | Record<string, string>>;
 
 /**
  * One failure as produced at its source: the stable code, the human message
@@ -751,7 +761,7 @@ export interface ProgramRunOperationFailure {
 }
 
 export interface ProgramRunStatus {
-  schemaVersion: 'manyforge.program_run_status.v3';
+  schemaVersion: 'manyforge.program_run_status.v4';
   ownerId: string;
   ownerEpoch: string;
   runRevision: number;
@@ -771,7 +781,7 @@ export interface ProgramRunStatus {
    */
   reason: StructuredError | null;
   message: string;
-  /** CONTRACTS §9: why the run ended; null while it has not. */
+  /** Why the run ended; null while it has not. */
   runEnd: ProgramRunEnd | null;
 }
 
@@ -803,7 +813,7 @@ export interface ProgramCycleStatus {
   causalClientSequence: string | null;
   currentCommandKind: string | null;
   failure: Record<string, JsonValue> | null;
-  /** CONTRACTS §9: why the cycle's last run ended (also on `run`). */
+  /** Why the cycle's last run ended (also on `run`). */
   runEnd?: ProgramRunEnd | null;
   resetPhase: string | null;
   resetOptions: ProgramResetSelection | null;
@@ -1235,7 +1245,7 @@ export interface SourceModelTarget {
   target_id: string;
 }
 
-/** One applied component and the parent interface it is mounted on (B6). */
+/** One applied component and the parent interface it is mounted on. */
 export interface SourceModelComponent {
   component_id: string;
   mounted_on: {
@@ -1690,7 +1700,7 @@ export type SceneTransactionRequest = SceneTransactionRequestBase & (
 );
 
 export interface SceneTransactionResponse {
-  api_version: 'manyforge.manager_command_response.v1';
+  api_version: 'manyforge.manager_command_response.v2';
   committed_projection_revision: ProjectionRevision;
   error: null;
   ok: true;
@@ -1750,7 +1760,7 @@ export interface ManagerDeploymentCandidateReceipt {
   receipt_digest: string;
 }
 
-/** One component's runtime decision in a Deployment Apply (H1a). */
+/** One component's runtime decision in a Deployment Apply. */
 export interface ManagerDeploymentImpactComponent {
   controllable_component_id: string;
   disposition: 'retain' | 'add' | 'remove' | 'replace';
@@ -1759,17 +1769,14 @@ export interface ManagerDeploymentImpactComponent {
   replacement_reasons: string[];
 }
 
-/** One authored Program role that no longer resolves in the candidate. */
+/** One authored Program target that no longer resolves in the candidate. */
 export interface ProgramUnresolvedReference {
-  component_role_id: string;
-  target_role_id: string | null;
-  controllable_component_id: string;
-  command_target_id: string | null;
+  target: ProgramTargetReference;
   reason: string;
   detail: string;
 }
 
-/** The Applied Program's derived status (H1a). A non-executable Program is
+/** The Applied Program's derived status. A non-executable Program is
  * preserved as authored; the backend refuses Execute by these references. */
 export interface AppliedProgramStatus {
   deploymentArtifactId: string;
@@ -1810,7 +1817,7 @@ export interface ManagerDeploymentRecordDiff {
 }
 
 export interface ManagerDeploymentCandidatePreviewResponse {
-  apiVersion: 'manyforge.manager_command_response.v1';
+  apiVersion: 'manyforge.manager_command_response.v2';
   candidateReceipt: ManagerDeploymentCandidateReceipt;
   converged: boolean;
   diff: Record<string, ManagerDeploymentRecordDiff>;
@@ -1950,7 +1957,7 @@ export interface ManagerApplyPreparedActivation {
   deploymentArtifactId: string;
   deploymentRevision: string;
   /** Null exactly when the Apply left the preserved Program non-executable;
-   * reported separately from the runtime outcome in `state` (H1a). */
+   * reported separately from the runtime outcome in `state`. */
   programBindingId: string | null;
   preparedActivationId: string;
 }
@@ -1977,7 +1984,7 @@ export interface ManagerApplyFailure {
 
 export interface ManagerApplyStatus {
   sceneInitialization: 'preserve' | 'initialize';
-  apiVersion: 'manyforge.manager_command_response.v1';
+  apiVersion: 'manyforge.manager_command_response.v2';
   applyGeneration: number;
   applyId: string;
   candidateProjectionRevision: ProjectionRevision | null;
@@ -2005,7 +2012,7 @@ export interface ManagerApplyAcknowledgementContext {
 }
 
 export interface ManagerApplyPendingResponse {
-  apiVersion: 'manyforge.manager_command_response.v1';
+  apiVersion: 'manyforge.manager_command_response.v2';
   applyGeneration: number;
   applyId: string;
   candidateProjectionRevision: null;
@@ -2018,7 +2025,7 @@ export interface ManagerApplyPendingResponse {
 }
 
 export interface ManagerApplySucceededResponse {
-  apiVersion: 'manyforge.manager_command_response.v1';
+  apiVersion: 'manyforge.manager_command_response.v2';
   applyGeneration: number;
   applyId: string;
   candidateProjectionRevision: ProjectionRevision;
@@ -2031,7 +2038,7 @@ export interface ManagerApplySucceededResponse {
 }
 
 export interface ManagerApplyTerminalFailureResponse {
-  apiVersion: 'manyforge.manager_command_response.v1';
+  apiVersion: 'manyforge.manager_command_response.v2';
   applyGeneration: number;
   applyId: string;
   candidateProjectionRevision: null;
@@ -2074,7 +2081,7 @@ export interface ProgramNodeCorrectionPreviewRequest {
  * It grants no Retry, Reset, Draft or Apply authority (D4).
  */
 export interface ProgramNodeCorrectionPreview {
-  schemaVersion: 'manyforge.program_node_correction_preview.v1';
+  schemaVersion: 'manyforge.program_node_correction_preview.v2';
   requestId: string;
   programRunId: string;
   programId: string;
@@ -2090,9 +2097,7 @@ export interface ProgramNodeCorrectionPreview {
   proposedPaths: string[];
   parametersDigest: string | null;
   target: {
-    targetRoleId: string;
-    componentRoleId: string;
-    controllableComponentId: string;
+    componentId: string;
     commandTargetId: string;
   } | null;
   unavailableReason: { code: string; message: string } | null;

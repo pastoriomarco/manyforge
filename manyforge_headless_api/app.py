@@ -1,4 +1,4 @@
-"""Independent FastAPI projection over the C++ H0 owner process."""
+"""Independent FastAPI projection over the C++ owner process."""
 
 from __future__ import annotations
 
@@ -61,9 +61,13 @@ from .models import (
     ApplyOutcomeRequest,
     ComponentActionRequest,
     ComponentGroupActionRequest,
+    RecoveryPreflightConfirmation,
+    RecoveryGroupRequest,
     SetOutputRequest,
     AcknowledgeAllAlarmsRequest,
     ActivationPreparationRequest,
+    ProgramReferenceValidationRequest,
+    ComponentFrameLookupRequest,
     FullStopIntentRequest,
     HistorianReconcileRequest,
     IoSignalReadRequest,
@@ -319,6 +323,12 @@ class RequestBodyLimitMiddleware:
 
 
 def _error_status(code: str) -> int:
+    if code == "draft_candidate_response_too_large":
+        return 413
+    if code == "component_frame_lookup_invalid":
+        return 400
+    if code in {"component_frame_lookup_stale", "component_reference_missing", "frame_missing"}:
+        return 409
     if code in {"program_run_started_then_failed", "program_run_superseded_by_stop"}:
         return 422
     if code == "full_stack_restart_required":
@@ -365,6 +375,7 @@ def _error_status(code: str) -> int:
             "program_not_selected",
             # Preparation runs before any claim or effect; it refuses the input.
             "activation_preparation_failed",
+            "program_reference_validation_failed",
             "prepared_activation_unverified",
             "authoring_not_ready",
             "program_run_stopped_before_start",
@@ -380,15 +391,15 @@ def _error_status(code: str) -> int:
             # Typed refusals before any effect: Close needs settled work.
             "cell_close_operation_nonterminal",
             "cell_close_containment_uncertain",
-            # Component model v2: refusals before dispatch (CONTRACTS §2, §5, §7, §8, §16).
+            # Component model v2: refusals before dispatch.
             "component_action_in_progress",
             "component_action_unsupported",
             "owner_not_prepared",
             "io_output_controller_owned",
-            # SIM-1 (RP-1b): a position reset while the simulation isn't playing.
+            # A position reset while the simulation isn't playing.
             "simulation_not_playing",
         }
-        # RunReadiness reasons and run refusals (CONTRACTS §10).
+        # RunReadiness reasons and run refusals.
         or code in RUN_REFUSAL_CODES
     ):
         return 409
@@ -857,7 +868,7 @@ def create_app(
     def runtime() -> dict[str, Any]:
         return service.runtime()
 
-    # Component model v2 (CONTRACTS §1, §2, §5, §7, §10). ------------------
+    # Component model v2. ------------------
 
     @app.get("/api/components")
     def components() -> list[Any]:
@@ -876,6 +887,20 @@ def create_app(
     ) -> dict[str, Any]:
         """Accepted action; its result arrives in `last_action`."""
         return service.component_action(component_id, body.action)
+
+    @app.get("/api/components/{component_id}/recover-enable/preflight")
+    def component_recovery_preflight(component_id: Annotated[str, Path(min_length=1, max_length=256)]) -> dict[str, Any]:
+        return service.component_recovery_preflight(component_id)
+
+    @app.post("/api/components/{component_id}/recover-enable", status_code=202)
+    def component_recover_enable(
+        component_id: Annotated[str, Path(min_length=1, max_length=256)], body: RecoveryPreflightConfirmation,
+    ) -> dict[str, Any]:
+        return service.component_recover_enable(component_id, body.model_dump(mode="json"))
+
+    @app.post("/api/components/recover-enable", status_code=202)
+    def component_recover_enable_group(body: RecoveryGroupRequest) -> dict[str, Any]:
+        return service.component_recover_enable_group(body.model_dump(mode="json")["targets"])
 
     @app.get("/api/cell/latch")
     def cell_latch() -> dict[str, Any]:
@@ -1407,6 +1432,19 @@ def create_app(
             )
         return JSONResponse(status_code=_error_status(code), content=response)
 
+    @app.post("/api/program/reference-validation")
+    def validate_program_references(request: ProgramReferenceValidationRequest) -> dict[str, Any]:
+        return service.validate_program_references(request)
+
+    @app.post("/api/program/component-frame-lookup")
+    def lookup_component_frame(request: ComponentFrameLookupRequest) -> dict[str, Any]:
+        payload = request.model_dump(mode="json")
+        result = service.core.lookup_component_frame(payload)
+        expected = {**payload, "schema_version": "manyforge.component_frame_lookup_result.v1", "exists": True}
+        if result != expected:
+            raise HeadlessApiError("headless_projection_response_invalid", "Component frame lookup returned an invalid result")
+        return result
+
     @app.post("/api/activation-preparations")
     def prepare_activation(request: ActivationPreparationRequest) -> dict[str, Any]:
         return service.prepare_activation(request)
@@ -1476,7 +1514,7 @@ def create_app(
     def manager_apply_release_for_new(
         request: ManagerApplyAcknowledgementRequest,
     ) -> JSONResponse:
-        """New (R3): release the fence and claim a failed Apply still holds,
+        """New: release the fence and claim a failed Apply still holds,
         whatever it changed; New's Apply then empties the cell."""
 
         response = service.manager_apply_release_for_new(request.request_context)
@@ -1792,10 +1830,10 @@ def create_app(
     def execution_get_runtime_scale_control(
         request: Request,
         program_binding_id: Annotated[str, Query(min_length=1, max_length=256)],
-        component_role_id: Annotated[
+        component_id: Annotated[
             str | None, Query(min_length=1, max_length=256)
         ] = None,
-        target_role_id: Annotated[
+        command_target_id: Annotated[
             str | None, Query(min_length=1, max_length=256)
         ] = None,
         group_targets: Annotated[
@@ -1804,8 +1842,8 @@ def create_app(
     ) -> JSONResponse:
         selector_keys = (
             "program_binding_id",
-            "component_role_id",
-            "target_role_id",
+            "component_id",
+            "command_target_id",
             "group_targets",
         )
         if any(len(request.query_params.getlist(key)) > 1 for key in selector_keys):
@@ -1815,11 +1853,11 @@ def create_app(
         if group_targets is None:
             payload = {
                 "program_binding_id": program_binding_id,
-                "component_role_id": component_role_id,
-                "target_role_id": target_role_id,
+                "component_id": component_id,
+                "command_target_id": command_target_id,
             }
         else:
-            if component_role_id is not None or target_role_id is not None:
+            if component_id is not None or command_target_id is not None:
                 raise HTTPException(422, "runtime-scale selector has mixed forms")
             try:
                 payload = {

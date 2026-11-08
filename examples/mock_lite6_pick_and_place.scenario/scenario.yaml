@@ -1,20 +1,18 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Mock UFACTORY Lite6 pick and place with the lite pneumatic gripper. Load and Execute the Program to see the arm pick the part and place it.",
   "members": {
-    "assignment.yaml": "sha256:93bdcf8158dba12c73f5703fd35335a0aaf83a240e71a6296aa87e7431659d17",
     "deployment.yaml": "sha256:740136bf20e79aebf847091ee144b536e0ad95b2de6ad0afe540f586b02863a3",
-    "program.yaml": "sha256:f64cab0e81ec9a009e66317f710a8790d66c65e6b538f9f63ac58ca222fdcee8"
+    "program.yaml": "sha256:bf8b410f08992f78237215147798881d3efe9aba976c9e2c165e0a1a749ede40"
   },
   "name": "mock_lite6_pick_and_place",
   "saved_status": {
-    "checked_content_digest": "sha256:169f2582e0f38d766199aff054e03de9969741f3431e92ad82a6e153b0e9a7c7",
-    "last_known_status": "ready",
+    "checked_content_digest": "sha256:fd8bd8ae099875290f5ca1e62e4b88ceac2e00029b6bca134331d89ae2eede04",
+    "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },
   "scenario_id": "mock_lite6_pick_and_place",

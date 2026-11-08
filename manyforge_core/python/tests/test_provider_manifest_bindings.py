@@ -1,4 +1,4 @@
-"""Parity tests for the immutable C0.2g provider-manifest boundary."""
+"""Parity tests for the immutable provider-manifest boundary."""
 
 from __future__ import annotations
 

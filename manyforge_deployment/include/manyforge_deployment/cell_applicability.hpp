@@ -348,10 +348,10 @@ using LogicalStopApplicabilityTemplate =
     std::variant<LogicalNotStoppableApplicabilityTemplate,
                  LogicalStoppableApplicabilityTemplate>;
 
-/// Immutable, non-caller-constructible C0.2n result.
+/// Immutable, non-caller-constructible cell applicability result.
 ///
 /// The value owns every exact semantic dependency and every derived logical
-/// template needed by I3. It contains no executable implementation,
+/// template needed by retention. It contains no executable implementation,
 /// generated transport endpoint, process/readiness fact, credential, active
 /// configuration, command, Stop effect, or runtime observation.
 class ApplicabilityQualifiedCellIr final {

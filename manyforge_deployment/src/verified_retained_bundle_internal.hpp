@@ -28,7 +28,7 @@ class RetainedModelMapVerificationAuthority final {
       std::string_view artifact_bytes);
 
   /// Borrow the existing sealed map through the exact retained artifact source.
-  /// DX820: the source context is established before cold control verification.
+  /// The source context is established before cold control verification.
   [[nodiscard]] static std::optional<VerifiedRetainedModelMap>
   verify(const RetainedBundle &bundle,
          const IVerifiedRetainedProductArtifactSource &artifact_source);

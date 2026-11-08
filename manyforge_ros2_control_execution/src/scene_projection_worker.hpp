@@ -194,10 +194,14 @@ class SceneProjectionWorker final {
   std::condition_variable drain_cv_;
   std::vector<Slot> slots_;
   bool in_flight_ = false;
+  bool stopping_ = false;
   bool exited_ = false;
+  bool joining_ = false;
+  bool joined_ = false;
   std::size_t suspension_count_ = 0;
   std::uint64_t next_sequence_ = 1;
   SceneProjectionWorkerMetrics metrics_;
+  std::mutex stop_mutex_;
   std::jthread worker_;
 };
 

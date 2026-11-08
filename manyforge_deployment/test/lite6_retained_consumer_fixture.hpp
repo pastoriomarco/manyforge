@@ -14,7 +14,7 @@
 
 namespace manyforge::deployment::test {
 
-/// Exact compiler/materializer product shared by the I3 consumer
+/// Exact compiler/materializer product shared by the retained consumer
 /// qualifications.
 ///
 /// This helper is test-only and deployment-owned. The generated consumer

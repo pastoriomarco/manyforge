@@ -385,6 +385,101 @@ describe('an absent motion-pose goal', () => {
       }
     },
   );
+
+  it.each([
+    [{ position_m: [0, 0, 0.1], orientation: { rpy_deg: [180, 0, 0] } }, false],
+    [{ position_m: [0, 0, 0.1], orientation: { rpy_deg: [180, 0, 0] }, frame_ref: { kind: 'cell_frame' } }, true],
+  ])('offers no goal frame on a relative node (%#)', async (goal, framed) => {
+    const { host, created } = stubDom();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    try {
+      await act(() => root.render(
+        <ProgramSchemaValueEditor schema={schema} value={goal as JsonValue} disabled={false}
+          context={{ entry: setValue, node: {
+            node_id: 'motion.move_to_pose', instance_id: 'move',
+            parameters: { target_mode: 'relative' }, children: [],
+          }, parameterId: 'goal', program }}
+          path="goal" onCommit={vi.fn()} />,
+      ));
+      const texts = created.map((element) => reactProps(element)?.children);
+      expect(texts).not.toContain('Add frame reference');
+      // An existing frame stays visible, so it can be removed.
+      expect(texts.includes('Remove frame reference')).toBe(framed);
+    } finally {
+      await act(() => root.unmount());
+    }
+  });
+
+  it.each([
+    ['motion.move_to_pose', 'relative', 'absolute', false],
+    ['motion.move_to_pose', 'absolute', 'relative', true],
+    ['motion.move_to_pose', undefined, 'relative', false],
+    ['motion.move_to_pose', undefined, 'absolute', true],
+    ['motion.follow_cartesian_path', 'relative', 'absolute', false],
+    ['motion.follow_cartesian_path', 'absolute', 'relative', true],
+    ['motion.follow_cartesian_path', undefined, 'relative', false],
+    ['motion.follow_cartesian_path', undefined, 'absolute', true],
+  ])('uses literal or catalog target mode for %s (%s, default %s)', async (
+    nodeId, literalMode, defaultMode, offersFrame,
+  ) => {
+    const { host, created } = stubDom();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    const waypoint = { position_m: [0, 0, 0.1], orientation: { rpy_deg: [180, 0, 0] } };
+    const isPath = nodeId === 'motion.follow_cartesian_path';
+    const entry: CatalogEntry = {
+      ...setValue,
+      id: nodeId,
+      parameters: [{ id: 'target_mode', required: false, schema: { type: 'string' },
+        schemaHash: 'target-mode', hasDefault: true, default: defaultMode }],
+    };
+    try {
+      await act(() => root.render(
+        <ProgramSchemaValueEditor schema={isPath ? { type: 'array', items: schema } : schema}
+          value={isPath ? [waypoint, waypoint] : waypoint} disabled={false}
+          context={{ entry, node: { node_id: nodeId, instance_id: 'move',
+            parameters: literalMode === undefined ? {} : { target_mode: literalMode }, children: [] },
+          parameterId: isPath ? 'path' : 'goal', program }}
+          path={isPath ? 'path' : 'goal'} onCommit={vi.fn()} />,
+      ));
+      const addButtons = created.filter((element) => element.tagName === 'BUTTON'
+        && reactProps(element)?.children === 'Add frame reference');
+      expect(addButtons).toHaveLength(offersFrame ? (isPath ? 2 : 1) : 0);
+    } finally {
+      await act(() => root.unmount());
+    }
+  });
+
+  it.each(['motion.move_to_pose', 'motion.follow_cartesian_path'])(
+    'removes an existing relative goal frame for %s', async (nodeId) => {
+      const { host, created } = stubDom();
+      const onCommit = vi.fn();
+      const { createRoot } = await import('react-dom/client');
+      const root = createRoot(host as unknown as Element);
+      const unframed = { position_m: [0, 0, 0.1], orientation: { rpy_deg: [180, 0, 0] } };
+      const framed = { ...unframed, frame_ref: { kind: 'cell_frame' } };
+      const isPath = nodeId === 'motion.follow_cartesian_path';
+      try {
+        await act(() => root.render(
+          <ProgramSchemaValueEditor schema={isPath ? { type: 'array', items: schema } : schema}
+            value={isPath ? [framed, unframed] : framed} disabled={false}
+            context={{ entry: setValue, node: { node_id: nodeId, instance_id: 'move',
+              parameters: { target_mode: 'relative' }, children: [] },
+            parameterId: isPath ? 'path' : 'goal', program }}
+            path={isPath ? 'path' : 'goal'} onCommit={onCommit} />,
+        ));
+        const remove = created.find((element) => element.tagName === 'BUTTON'
+          && reactProps(element)?.children === 'Remove frame reference');
+        expect(remove).toBeDefined();
+        await act(() => (reactProps(remove!)!.onClick as () => void)());
+        expect(onCommit).toHaveBeenCalledOnce();
+        expect(onCommit).toHaveBeenCalledWith(isPath ? [unframed, unframed] : unframed);
+      } finally {
+        await act(() => root.unmount());
+      }
+    },
+  );
 });
 
 describe('a mounted optional io wait timeout', () => {

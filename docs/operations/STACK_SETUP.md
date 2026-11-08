@@ -89,6 +89,11 @@ refused with `simulation_not_playing` (the node fails; the tree handles it).
 Play the simulation in Isaac, or from the Program with a **Set simulation
 state** node before its motion.
 
+If Isaac is not reachable when the workbench starts, the simulator component
+stays Offline with `simulator_unreachable` and a warning. Its state never
+latches the cell or blocks Execute; robot and tool health still follows their
+own reported states.
+
 For the multi-machine Lite6 trocar workflow with Isaac ROS
 YOLOv8/FoundationPose perception, use
 [`ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md`](ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md).

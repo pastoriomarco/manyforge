@@ -81,7 +81,7 @@ def test_program_diagnostic_values_reject_nonportable_json(value):
     with pytest.raises(ValidationError):
         ProgramDiagnosticRequest.model_validate(
             {
-                "schema_version": "manyforge.program_diagnostic.v3",
+                "schema_version": "manyforge.program_diagnostic.v4",
                 "program_run_id": "run.1",
                 "owner_epoch": "runner.1",
                 "program_revision": "sha256:" + "a" * 64,
@@ -106,8 +106,8 @@ _CONTRACT_FAILURE_DETAIL_KEYS = frozenset(
     {
         "reason",
         "reference_type",
+        "reference",
         "reference_id",
-        "target_role_id",
         "input_problem",
         "path",
         "source_kind",
@@ -154,7 +154,7 @@ def _caller() -> dict[str, object]:
 def _prepared_activation() -> dict[str, object]:
     activation = ManagerApplyPreparedActivation.model_validate(
         {
-            "schema_version": "manyforge.prepared_activation_input.v6",
+            "schema_version": "manyforge.prepared_activation_input.v7",
             "origin": {"kind": "scenario", "scenario_id": "scenario.1",
                        "source_document_digest": "sha256:" + "1" * 64,
                        "project_path": "/projects/scenario.1.scenario"},
@@ -184,7 +184,7 @@ def _planning_pose(z_m: float = 0.0) -> dict[str, object]:
 def test_no_program_activation_requires_exact_absence() -> None:
     value = {
         **_prepared_activation(),
-        "schema_version": "manyforge.prepared_activation_input.v6",
+        "schema_version": "manyforge.prepared_activation_input.v7",
         "program_id": None,
         "program_revision": None,
         "program_outcome": {"kind": "no_program"},
@@ -212,10 +212,10 @@ def _planning_motion(
     return {
         "kind": "motion",
         "move_id": move_id,
-        "base_frame_role_id": "frame-role:base",
+        "base_frame": {"component_id": "robot", "frame_id": "base"},
         "tcp_endpoint": {
-            "kind": "entry", "entry": {"component_id": "robot", "target_id": "arm",
-                                       "frame_role_id": "frame-role:tcp"}
+            "kind": "entry", "target": {"component_id": "robot", "command_target_id": "arm"},
+            "frame": {"component_id": "tool", "frame_id": "tcp"},
         },
         "tolerances": {
             "joint_position_tol_rad": 0.01,
@@ -267,8 +267,8 @@ def _planning_operation(
         },
         "participants": [
             {
-                "component_role_id": "tool" if tool else "arm",
-                "target_role_id": "gripper" if tool else "arm",
+                "target": {"component_id": "tool" if tool else "robot",
+                           "command_target_id": "gripper" if tool else "arm"},
                 "required_capability_id": (
                     "tool.gripper.command" if tool else "execution.trajectory.execute"
                 ),
@@ -413,15 +413,15 @@ def _pick_request() -> dict[str, object]:
         "sequence_id": "pick.1",
         "selected_object_id": "workpiece",
         "selected_runtime_object_id": "selected_object",
-        "carrier_frame_role_id": "frame-role:tcp",
+        "carrier_frame": {"component_id": "tool", "frame_id": "tcp"},
         "synthesis": {
             "pick_offset_reference": {
                 "type": "runtime_object",
                 "runtime_object_id": "selected_object",
             },
             "approach_offset_reference": {
-                "type": "frame_role",
-                "frame_role_id": "frame-role:tcp",
+                "type": "component_frame",
+                "frame": {"component_id": "tool", "frame_id": "tcp"},
             },
         },
         "approach_operation": _planning_operation(
@@ -450,10 +450,10 @@ def _pick_request() -> dict[str, object]:
 @pytest.mark.parametrize(
     "reference",
     [
-        {"type": "frame_role", "frame_role_id": "frame-role:wrist"},
+        {"type": "component_frame", "frame": {"component_id": "robot", "frame_id": "wrist"}},
         {
-            "type": "component_body_role",
-            "collision_body_role_id": "body-role:wrist",
+            "type": "component_body",
+            "body": {"component_id": "robot", "collision_body_id": "wrist"},
         },
         {"type": "scene_resource", "scene_resource_id": "workpiece"},
         {"type": "runtime_object", "runtime_object_id": "selected_object"},
@@ -462,13 +462,8 @@ def _pick_request() -> dict[str, object]:
         # the cell frame and another robot's frame.
         {"type": "cell_frame"},
         {
-            "type": "frame_role",
-            "frame_role_id": "frame-role:tcp",
-            "target": {
-                "target_role_id": "observer_arm",
-                "controllable_component_id": "observer.component",
-                "command_target_id": "observer.command",
-            },
+            "type": "component_frame",
+            "frame": {"component_id": "observer.component", "frame_id": "tcp"},
         },
     ],
 )
@@ -506,7 +501,7 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
     assert parsed.synthesis.pick_offset_reference is not None
     assert parsed.synthesis.pick_offset_reference.type == "runtime_object"
     assert parsed.synthesis.approach_offset_reference is not None
-    assert parsed.synthesis.approach_offset_reference.type == "frame_role"
+    assert parsed.synthesis.approach_offset_reference.type == "component_frame"
     assert parsed.descend_operation.participants[0].payload.contact_policy_id == (
         "pick.contact"
     )
@@ -547,7 +542,7 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
     place = {
         "sequence_id": "place.1",
         "selected_object_id": "workpiece",
-        "carrier_frame_role_id": "frame-role:tcp",
+        "carrier_frame": {"component_id": "tool", "frame_id": "tcp"},
         "approach_operation": _planning_operation(
             "place.approach",
             _planning_motion(
@@ -576,8 +571,8 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
 
 @pytest.mark.parametrize("selector", [
     {"kind": "current"},
-    {"kind": "default_of_role", "role": "tool"},
-    {"kind": "entry", "entry": {"component_id": "tool", "target_id": "gripper", "frame_role_id": "tcp"}},
+    {"kind": "default_of_target", "target": {"component_id": "tool", "command_target_id": "gripper"}},
+    {"kind": "entry", "target": {"component_id": "robot", "command_target_id": "arm"}, "frame": {"component_id": "tool", "frame_id": "tcp"}},
 ])
 def test_motion_tcp_endpoint_is_the_only_wire_form_and_round_trips(selector) -> None:
     payload = _planning_motion("tcp", {"kind": "pose_goal", "goal": _planning_pose()})
@@ -633,7 +628,7 @@ def test_motion_tcp_endpoint_rejects_missing_null_legacy_and_open_shapes(
 
 
 def test_set_tcp_payload_round_trips_and_rejects_legacy_shape() -> None:
-    selector = {"kind": "entry", "entry": {"component_id": "tool", "target_id": "gripper", "frame_role_id": "tcp"}}
+    selector = {"kind": "entry", "target": {"component_id": "robot", "command_target_id": "arm"}, "frame": {"component_id": "tool", "frame_id": "tcp"}}
     operation = _planning_operation("set-tcp", {"kind": "set_tcp", "tcp": selector})
     parsed = OperationIntentRequest.model_validate(operation)
     assert parsed.model_dump(mode="json")["participants"][0]["payload"] == {
@@ -644,21 +639,22 @@ def test_set_tcp_payload_round_trips_and_rejects_legacy_shape() -> None:
         OperationIntentRequest.model_validate(operation)
 
 
-@pytest.mark.parametrize("crossed_field", ["component_id", "target_id", "frame_role_id"])
-def test_pick_motion_phases_compare_the_exact_qualified_tcp(crossed_field: str) -> None:
+@pytest.mark.parametrize("section,crossed_field", [("target", "component_id"), ("target", "command_target_id"), ("frame", "frame_id")])
+def test_pick_motion_phases_compare_the_exact_qualified_tcp(section: str, crossed_field: str) -> None:
     request = _pick_request()
     for phase in ("approach_operation", "descend_operation", "retreat_operation"):
         payload = request[phase]["participants"][0]["payload"]
         payload["tcp_endpoint"] = {
-            "kind": "entry", "entry": {"component_id": "tool", "target_id": "gripper", "frame_role_id": "fingertip"},
+            "kind": "entry", "target": {"component_id": "robot", "command_target_id": "arm"},
+            "frame": {"component_id": "tool", "frame_id": "fingertip"},
         }
     parsed = PickSequencePlanningRequest.model_validate(request)
-    assert parsed.carrier_frame_role_id == "frame-role:tcp"
+    assert parsed.carrier_frame.frame_id == "tcp"
     wire = parsed.model_dump(mode="json")
     assert PickSequencePlanningRequest.model_validate_json(
         parsed.model_dump_json()
     ).model_dump(mode="json") == wire
-    request["retreat_operation"]["participants"][0]["payload"]["tcp_endpoint"]["entry"][crossed_field] = "other"
+    request["retreat_operation"]["participants"][0]["payload"]["tcp_endpoint"][section][crossed_field] = "other"
     with pytest.raises(ValidationError, match="share one target and frame set"):
         PickSequencePlanningRequest.model_validate(request)
 
@@ -697,20 +693,15 @@ def test_motion_payload_accepts_explicit_joint_contact_but_not_spatial_reference
 @pytest.mark.parametrize(
     "reference",
     [
-        {"type": "frame_role", "frame_role_id": "base"},
+        {"type": "component_frame", "frame": {"component_id": "robot", "frame_id": "base"}},
         {
-            "type": "frame_role",
-            "frame_role_id": "tcp",
-            "target": {
-                "target_role_id": "peer",
-                "controllable_component_id": "robot.2",
-                "command_target_id": "arm.command",
-            },
+            "type": "component_frame",
+            "frame": {"component_id": "robot.2", "frame_id": "tcp"},
         },
         {"type": "cell_frame"},
         {
-            "type": "component_body_role",
-            "collision_body_role_id": "wrist_collision",
+            "type": "component_body",
+            "body": {"component_id": "robot", "collision_body_id": "wrist_collision"},
         },
         {"type": "scene_resource", "scene_resource_id": "workpiece"},
         {"type": "pose", "pose": _planning_pose(0.2)},
@@ -739,13 +730,8 @@ def test_relative_motion_accepts_closed_portable_references(
         {"type": "cell_frame"},
         {"type": "scene_resource", "scene_resource_id": "fixture"},
         {
-            "type": "frame_role",
-            "frame_role_id": "tcp",
-            "target": {
-                "target_role_id": "peer",
-                "controllable_component_id": "robot.2",
-                "command_target_id": "arm.command",
-            },
+            "type": "component_frame",
+            "frame": {"component_id": "robot.2", "frame_id": "tcp"},
         },
     ],
 )
@@ -830,8 +816,8 @@ def test_motion_reference_shape_fails_closed_before_native_admission() -> None:
         {"kind": "pose_goal", "goal": _planning_pose()},
     )
     absolute_reference["target_reference"] = {
-        "type": "frame_role",
-        "frame_role_id": "base",
+        "type": "component_frame",
+        "frame": {"component_id": "robot", "frame_id": "base"},
     }
     with pytest.raises(ValidationError, match="absolute motion"):
         MotionParticipantRequest.model_validate(absolute_reference)
@@ -976,7 +962,7 @@ def test_direct_empty_scene_preparation_requires_publication_and_no_applied_dige
         ProgramScenePreparationRequest.model_validate({**body, "expected_applied_record_digest": "sha256:" + "a" * 64})
 
 
-def test_apply_requires_one_exact_ua2a_prepared_activation() -> None:
+def test_apply_requires_one_exact_prepared_activation() -> None:
     body = {
         **_caller(),
         "deployment_artifact_id": "deployment.1",
@@ -1065,7 +1051,7 @@ def test_apply_requires_one_exact_ua2a_prepared_activation() -> None:
         )
     assert "program_outcome" in str(captured.value)
 
-    # A non-executable outcome must name its unresolved references (H1a).
+    # A non-executable outcome must name its unresolved references.
     with pytest.raises(ValidationError) as captured:
         ManagerApplyRequest.model_validate(
             {
@@ -1279,7 +1265,7 @@ def test_apply_status_reports_one_exact_failure_disposition(
 
 
 def test_apply_status_reports_a_succeeded_apply_with_a_non_executable_program() -> None:
-    # H1a: the runtime transition succeeded; the preserved Program no longer
+    # The runtime transition succeeded; the preserved Program no longer
     # binds. Binding validity is reported separately from the terminal state.
     body = _status_body()
     body["prepared_activation"] = {
@@ -1527,8 +1513,8 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
         "request_context": context,
         "selector": {
             "program_binding_id": "binding-1",
-            "component_role_id": "robot",
-            "target_role_id": "arm",
+            "component_id": "robot",
+            "command_target_id": "arm",
         },
         "expected_control_generation": 0,
         "scale": 0.4,
@@ -1537,8 +1523,8 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
     group_selector = {
         "program_binding_id": "binding-1",
         "group_targets": [
-            {"component_role_id": "robot-a", "target_role_id": "arm"},
-            {"component_role_id": "robot-b", "target_role_id": "arm"},
+            {"component_id": "robot-a", "command_target_id": "arm"},
+            {"component_id": "robot-b", "command_target_id": "arm"},
         ],
     }
     group = RuntimeScaleControlRequest.model_validate(
@@ -1549,7 +1535,7 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
         RuntimeScaleControlRequest.model_validate(
             {
                 **scale_control,
-                "selector": {**group_selector, "component_role_id": "robot"},
+                "selector": {**group_selector, "component_id": "robot"},
             }
         )
     with pytest.raises(ValidationError):
@@ -1559,8 +1545,8 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
                 "selector": {
                     **group_selector,
                     "group_targets": [
-                        {"component_role_id": "robot-a", "target_role_id": "arm"},
-                        {"component_role_id": "robot-a", "target_role_id": "arm"},
+                        {"component_id": "robot-a", "command_target_id": "arm"},
+                        {"component_id": "robot-a", "command_target_id": "arm"},
                     ],
                 },
             }
@@ -1574,9 +1560,9 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
             {**scale_control, "selector": {"program_binding_id": "binding-1"}}
         )
     for field, value in (
-        ("component_role_id", ""),
-        ("target_role_id", "x" * 257),
-        ("component_role_id", "e\u0301"),
+        ("component_id", ""),
+        ("command_target_id", "x" * 257),
+        ("component_id", "e\u0301"),
     ):
         with pytest.raises(ValidationError):
             RuntimeScaleControlRequest.model_validate(
@@ -1584,17 +1570,17 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
                     **scale_control,
                     "selector": {
                         "program_binding_id": "binding-1",
-                        "component_role_id": (
-                            value if field == "component_role_id" else "robot"
+                        "component_id": (
+                            value if field == "component_id" else "robot"
                         ),
-                        "target_role_id": value if field == "target_role_id" else "arm",
+                        "command_target_id": value if field == "command_target_id" else "arm",
                     },
                 }
             )
     for field, value in (
-        ("component_role_id", ""),
-        ("target_role_id", "x" * 257),
-        ("target_role_id", "e\u0301"),
+        ("component_id", ""),
+        ("command_target_id", "x" * 257),
+        ("command_target_id", "e\u0301"),
     ):
         invalid_group = deepcopy(group_selector)
         invalid_group["group_targets"][0][field] = value
@@ -1606,8 +1592,7 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
 
 def test_gripper_command_requires_unit_tags_and_matching_nonnegative_effort() -> None:
     participant = {
-        "component_role_id": "robot",
-        "target_role_id": "gripper",
+        "target": {"component_id": "robot", "command_target_id": "gripper"},
         "required_capability_id": "tool.gripper.command",
         "action_span": None,
         "payload": {
@@ -1624,9 +1609,11 @@ def test_gripper_command_requires_unit_tags_and_matching_nonnegative_effort() ->
         },
     }
     parsed = OperationParticipantRequest.model_validate(participant)
+    assert parsed.target.component_id == "robot"
+    assert parsed.target.command_target_id == "gripper"
     assert parsed.payload.command_value.position.value_m == 0.004
 
-    # GRP-2: a bool option travels as value_bool; it is never coerced.
+    # A bool option travels as value_bool; it is never coerced.
     flagged = deepcopy(participant)
     flagged["payload"]["caller_options"].append(
         {"option_id": "wait_for_duration", "value_bool": True}
@@ -2128,3 +2115,17 @@ def test_gripper_command_requires_the_caller_deadline() -> None:
     gripper.pop("completion_timeout_s")
     with pytest.raises(ValidationError, match="completion_timeout_s"):
         CapabilityCommandParticipantRequest.model_validate(gripper)
+
+
+def test_run_failure_details_accept_qualified_signal_without_truncation() -> None:
+    from manyforge_headless_api.models import validate_failure_details_and_origin
+
+    origin = {"kind": "program_node", "node_instance_id": "node_1", "owner_api": None}
+    details = {"reference_type": "signal", "reference": {
+        "component_id": "robot", "signal_name": "é" * 256,
+    }}
+    validate_failure_details_and_origin(details, origin)
+    assert details["reference"]["signal_name"] == "é" * 256
+    details["reference"]["signal_name"] += "x"
+    with pytest.raises(ValueError):
+        validate_failure_details_and_origin(details, origin)

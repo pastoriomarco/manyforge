@@ -5,7 +5,7 @@ from __future__ import annotations
 from manyforge_ros import isaac_mesh_transfer
 
 
-def test_isaac_mesh_transfer_is_a_pre_effect_i9_boundary(capsys) -> None:
+def test_isaac_mesh_transfer_refuses_before_any_effect(capsys) -> None:
     assert isaac_mesh_transfer.main(["--output-path", "must-not-be-written"]) == 78
     assert capsys.readouterr().err.strip() == isaac_mesh_transfer.UNAVAILABLE_MESSAGE
     payload = isaac_mesh_transfer.unavailable_payload()

@@ -131,6 +131,10 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::acquire_cell_adm
     // refuses this claim and remains available for a later explicit retry.
     const auto retired = retire_preempted_motion_operations();
     if (!retired.ok()) return Result<CellAdmissionClaimDTO>::Err(retired.error());
+    if (const auto run = cell_admission_owner_->ProgramResetRunForCleanup(intent, *reset_proof)) {
+      const auto rebuilt = retire_rebuilt_motion_operations_for_program_reset(*run);
+      if (!rebuilt.ok()) return Result<CellAdmissionClaimDTO>::Err(rebuilt.error());
+    }
   }
   // Selected idle Reset mutates the whole cell. Serialize the physical work
   // check with every command submission, then retain the admission lock
@@ -146,7 +150,7 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::acquire_cell_adm
   std::unique_lock admission_lock(*admission_mutex_);
   timing.record->admission_wait += detail::AdmissionTiming::Clock::now() - admission_wait_start;
   if (intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle) {
-    // R1: a cell latch refuses a new Program run.
+    // A cell latch refuses a new Program run.
     std::lock_guard state_lock(state_mutex_);
     if (auto refusal = cell_latch_refusal_locked())
       return Result<CellAdmissionClaimDTO>::Err(std::move(*refusal));
@@ -433,7 +437,7 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_manual_operation_admiss
       }
     }
   }
-  // Q58: a Stop leaves the gripper's cancel in flight. Its Reset reopens the
+  // A Stop leaves the gripper's cancel in flight. Its Reset reopens the
   // gripper only on the controller's terminal for that goal, so retire the
   // Stopped operation once the controller reported it (next owner wake).
   for (const auto& [engine, target] : cancelled_commands)
@@ -606,7 +610,7 @@ ResourceAddressedExecutionKernel::PublishOperatorAlarmAttention(
               "operator-alarm attention projection names another cell",
               "operator_alarm_attention_cell_mismatch"));
   }
-  // Single-host precondition (spec 530 §11): owner incarnations are
+  // Single-host precondition: owner incarnations are
   // CLOCK_BOOTTIME stamps, comparable only within the Kernel's own host boot.
   // A projection from another host or boot is refused, never compared.
   if (config_.operator_alarm_attention.has_value() &&
@@ -619,7 +623,7 @@ ResourceAddressedExecutionKernel::PublishOperatorAlarmAttention(
   // A small bounded copy under the state lock that admission reads; Stop
   // acceptance never waits on any I/O here.
   //
-  // Fencing contract (spec 530 §11). Owner epochs are ordered by their
+  // Fencing contract. Owner epochs are ordered by their
   // incarnation alone, so the Kernel keeps no list of replaced epochs: a new
   // epoch is accepted only with a strictly greater incarnation than the
   // retained one; an equal incarnation under another epoch, or a smaller one,
@@ -694,8 +698,8 @@ std::vector<ResourceId> ResourceAddressedExecutionKernel::program_selection_reso
     for (const auto& effect : nodes[index].target_effects) {
       if (!effect.effectful) continue;
       // The exact sealed Program Binding names each target role's resources.
-      for (const auto& target : capture.binding->target_role_bindings) {
-        if (target.target_role_id != effect.target_role_id) continue;
+      for (const auto& target : capture.binding->target_bindings) {
+        if (target.target != effect.target) continue;
         for (const auto& role : target.resource_role_bindings) {
           resources.insert(role.resource_ids.begin(), role.resource_ids.end());
         }
@@ -921,27 +925,17 @@ ResourceAddressedExecutionKernel::StartProgramNodeMockSimulation(
   resolved.reserve(request.signals.size());
   for (std::size_t index = 0; index < request.signals.size(); ++index) {
     const auto& row = request.signals[index];
-    if (index != 0U) {
-      const auto& previous = request.signals[index - 1U];
-      if (!(previous.target_role_id < row.target_role_id ||
-            (previous.target_role_id == row.target_role_id && previous.resource_role_id < row.resource_role_id)))
-        return reject<ProgramNodeMockSimulationAcknowledgementDTO>(
-            "Mock simulation selectors must be sorted and unique", "mock_simulation_invalid", ErrorCode::kInvalidRequest);
-    }
-    const auto& targets = capture.binding->target_role_bindings;
-    const auto target = std::lower_bound(targets.begin(), targets.end(), row.target_role_id,
-        [](const auto& value, const auto& id) { return value.target_role_id < id; });
-    if (target == targets.end() || target->target_role_id != row.target_role_id)
+    if (index != 0U && !(request.signals[index - 1U].signal < row.signal))
       return reject<ProgramNodeMockSimulationAcknowledgementDTO>(
-          "Mock simulation target is unbound", "io_signal_unbound", ErrorCode::kInvalidRequest);
-    const auto& signals = target->signal_role_bindings;
-    const auto signal = std::lower_bound(signals.begin(), signals.end(), row.resource_role_id,
-        [](const auto& value, const auto& id) { return value.resource_role_id < id; });
-    if (signal == signals.end() || signal->resource_role_id != row.resource_role_id ||
+          "Mock simulation selectors must be sorted and unique", "mock_simulation_invalid", ErrorCode::kInvalidRequest);
+    const auto& signals = capture.binding->signal_bindings;
+    const auto signal = std::lower_bound(signals.begin(), signals.end(), row.signal,
+        [](const auto& value, const auto& id) { return value.reference < id; });
+    if (signal == signals.end() || signal->reference != row.signal ||
         signal->direction != IoSignalDirection::kInput || signal->value_type != IoSignalValueType::kBoolean)
       return reject<ProgramNodeMockSimulationAcknowledgementDTO>(
           "Mock simulation requires a bound boolean input", "io_signal_unbound", ErrorCode::kInvalidRequest);
-    const IoSignalId id{target->controllable_component_id, signal->signal_name};
+    const IoSignalId id{row.signal.component_id, row.signal.signal_name};
     const bool checked_condition_input = node_condition && node_condition->condition &&
         std::any_of(node_condition->condition->inputs().begin(), node_condition->condition->inputs().end(),
                     [&](const auto& input) {
@@ -950,7 +944,7 @@ ResourceAddressedExecutionKernel::StartProgramNodeMockSimulation(
                     });
     const bool direct_read_input = std::any_of(node->target_effects.begin(), node->target_effects.end(),
         [&](const auto& effect) {
-          return !effect.effectful && effect.target_role_id == row.target_role_id &&
+          return !effect.effectful && effect.target == signal->target &&
               (effect.capability_id.value() == "io.gpio.get_input" ||
                effect.capability_id.value() == "io.gpio.wait_for_input");
         });
@@ -987,38 +981,28 @@ Result<IoWatchRegistrationDTO> ResourceAddressedExecutionKernel::RegisterProgram
   const auto node = std::lower_bound(
       capture.table->nodes.begin(), capture.table->nodes.end(), request.node.node_instance_id,
       [](const auto& row, const auto& id) { return row.instance_id < id; });
+  // The caller supplies a direct signal reference. Resolve the exact retained
+  // signal before checking the node's qualified target capability.
+  const auto& name = request.signal.signal_name;
+  const bool changed_outside = name.size() > kChangedOutsideSignalSuffix.size() &&
+                               name.ends_with(kChangedOutsideSignalSuffix);
+  const ProgramSignalReferenceDTO base_signal{
+      request.signal.component_id,
+      changed_outside ? name.substr(0, name.size() - kChangedOutsideSignalSuffix.size()) : name};
+  const auto& signals = capture.binding->signal_bindings;
+  const auto signal = std::lower_bound(signals.begin(), signals.end(), base_signal,
+      [](const auto& row, const auto& id) { return row.reference < id; });
+  if (signal == signals.end() || signal->reference != base_signal) {
+    return reject<IoWatchRegistrationDTO>("I/O signal is absent from the captured binding",
+                                          "io_signal_unbound", ErrorCode::kInvalidRequest);
+  }
   if (node == capture.table->nodes.end() || node->instance_id != request.node.node_instance_id ||
-      !std::any_of(
-          node->target_effects.begin(), node->target_effects.end(), [&](const auto& effect) {
-            return effect.target_role_id == request.target_role_id &&
-                   effect.capability_id.value() == "io.gpio.wait_for_input" && !effect.effectful;
-          })) {
+      !std::any_of(node->target_effects.begin(), node->target_effects.end(), [&](const auto& effect) {
+        return effect.target == signal->target &&
+               effect.capability_id.value() == "io.gpio.wait_for_input" && !effect.effectful;
+      })) {
     return reject<IoWatchRegistrationDTO>("Captured node does not declare this I/O watch target",
                                           "io_watch_node_unsupported", ErrorCode::kInvalidRequest);
-  }
-  const auto target =
-      std::lower_bound(capture.binding->target_role_bindings.begin(),
-                       capture.binding->target_role_bindings.end(), request.target_role_id,
-                       [](const auto& row, const auto& id) { return row.target_role_id < id; });
-  if (target == capture.binding->target_role_bindings.end() ||
-      target->target_role_id != request.target_role_id) {
-    return reject<IoWatchRegistrationDTO>("I/O target is absent from the captured binding",
-                                          "io_signal_unbound", ErrorCode::kInvalidRequest);
-  }
-  // CONTRACTS §7: `<role>.changed_outside` watches the core-held signal of
-  // the output bound to `<role>`.
-  const auto& role = request.resource_role_id.value();
-  const bool changed_outside = role.size() > kChangedOutsideSignalSuffix.size() &&
-                               role.ends_with(kChangedOutsideSignalSuffix);
-  const ResourceRoleId base_role(
-      changed_outside ? role.substr(0, role.size() - kChangedOutsideSignalSuffix.size()) : role);
-  const auto signal =
-      std::lower_bound(target->signal_role_bindings.begin(), target->signal_role_bindings.end(),
-                       base_role,
-                       [](const auto& row, const auto& id) { return row.resource_role_id < id; });
-  if (signal == target->signal_role_bindings.end() || signal->resource_role_id != base_role) {
-    return reject<IoWatchRegistrationDTO>("I/O resource role is absent from the captured binding",
-                                          "io_signal_unbound", ErrorCode::kInvalidRequest);
   }
   if (changed_outside && signal->direction != IoSignalDirection::kOutput) {
     return reject<IoWatchRegistrationDTO>("changed_outside names an output signal",
@@ -1060,7 +1044,7 @@ Result<IoWatchRegistrationDTO> ResourceAddressedExecutionKernel::RegisterProgram
   }
   // The sealed binding pins the bound signal (the output, for a
   // changed_outside watch); the watch then reads the core-held signal.
-  const IoSignalId bound{target->controllable_component_id, signal->signal_name};
+  const IoSignalId bound{signal->reference.component_id, signal->reference.signal_name};
   const auto observation = io_signal_service_->ReadSignal(bound);
   if (!observation.ok()) return Result<IoWatchRegistrationDTO>::Err(observation.error());
   const auto digest = ComputeIoSignalDescriptorDigest(observation.value().descriptor);
@@ -1074,7 +1058,7 @@ Result<IoWatchRegistrationDTO> ResourceAddressedExecutionKernel::RegisterProgram
   if (changed_outside && !HoldsChangedOutside(observation.value().descriptor)) {
     return reject<IoWatchRegistrationDTO>(
         "The output has no changed_outside signal (no read-back, or controller owned)",
-        "io_signal_unbound", ErrorCode::kInvalidRequest);
+        "io_signal_changed_outside_unavailable", ErrorCode::kInvalidRequest);
   }
   const IoSignalId id = changed_outside ? ChangedOutsideSignalId(bound) : bound;
   // Reserve cancellation capacity before the service can schedule any Mock

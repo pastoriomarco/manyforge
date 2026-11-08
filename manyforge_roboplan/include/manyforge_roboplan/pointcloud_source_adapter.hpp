@@ -15,8 +15,8 @@
 
 namespace manyforge::roboplan_backend {
 
-/// The point-cloud source component (adapter family `pointcloud`, CONTRACTS
-/// §6): a vendor-neutral sensor whose own process (the point-cloud observer
+/// The point-cloud source component (adapter family `pointcloud`): a
+/// vendor-neutral sensor whose own process (the point-cloud observer
 /// bridge) forwards a PointCloud2 topic, in the cell frame, to the 3D view
 /// while a viewer is open. Display only. ROS-free here; the ROS side is
 /// RosPointCloudBridgeLink.
@@ -67,7 +67,7 @@ class IPointCloudBridgeLink {
 /// The component's state: no process → `not_prepared`; an exited process →
 /// `fault_process_exited` (Recover restarts it); else `enabled` while
 /// forwarding, `prepared` otherwise. Activity is always idle (no requests).
-/// The `pointcloud` stream is freshness only, never a fault (CONTRACTS §7):
+/// The `pointcloud` stream is freshness only, never a fault:
 /// `none` while the bridge isn't watching, `fresh` while the last cloud is
 /// within the budget, `stale` otherwise.
 [[nodiscard]] core::ComponentState PointCloudSourceState(
@@ -95,7 +95,7 @@ class PointCloudSourceAdapter final : public core::IComponentAdapter {
   ComponentProcessLauncher start_process_;
   std::shared_ptr<IPointCloudBridgeLink> link_;
   mutable std::mutex mutex_;
-  std::unique_ptr<IComponentProcess> process_;
+  std::shared_ptr<IComponentProcess> process_;
   bool forwarding_{};
 };
 

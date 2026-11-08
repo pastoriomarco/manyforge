@@ -1,4 +1,4 @@
-"""Global interrupt rule wire of the existing ``events`` reply (contract 64).
+"""Global interrupt rule wire of the existing ``events`` reply.
 
 The one parser of ``interrupt_rule_catalog``, ``interrupt_rule_state_baseline``
 and the sparse ``interrupt_rule_state_changed`` rows (see the Runner's
@@ -15,7 +15,7 @@ from typing import Any, Final
 
 
 STATE_EVENT_KIND: Final = "interrupt_rule_state_changed"
-# CONTRACTS §8: `inactive | clear | tripped`; `unknown` is an active rule
+# `inactive | clear | tripped`; `unknown` is an active rule
 # that can't watch its signals (its state key is withdrawn; it gates its scope).
 RULE_STATES: Final = frozenset({"inactive", "clear", "tripped", "unknown"})
 
@@ -139,7 +139,7 @@ class RuleCatalog:
     graph: str
     rule_ids: tuple[str, ...]
     referenced_program_blackboard_keys: tuple[str, ...]
-    # Rules waiting for a Program that declares their keys (decision 110):
+    # Rules waiting for a Program that declares their keys:
     # (rule_id, keys) rows sorted by rule id; all rules of a waiting catalog.
     waiting_for_program: tuple[tuple[str, tuple[str, ...]], ...] = ()
     notify_rule_ids: tuple[str, ...] = ()
@@ -150,13 +150,13 @@ class RuleCatalog:
 
     @property
     def context(self) -> tuple[str, int, str, str]:
-        """The full context a source compares (SX-2184)."""
+        """The full context a source compares."""
 
         return (self.owner_epoch, self.active_publication_generation, self.bundle, self.graph)
 
 
 def catalog_proves(catalog: RuleCatalog, context: RuleStateContext) -> bool:
-    """The catalog names exactly this state context (SX-2207)."""
+    """The catalog names exactly this state context."""
 
     return (
         catalog.owner_epoch == context.owner_epoch
@@ -258,7 +258,7 @@ def parse_catalog(value: Any) -> RuleCatalog | None:
     if type(generation) is not int or not 1 <= generation <= _MAX_SAFE:
         raise InterruptStateWireError("publication generation must be a positive safe integer")
     if row.get("status") == "waiting_for_program":
-        # Every rule of this product waits (decision 110): exact coverage.
+        # Every rule of this product waits: exact coverage.
         rule_ids = _nonempty_sorted_names(row["rule_ids"])
         waiting = _waiting_rows(row["waiting_for_program"], rule_ids)
         notify = _notify_ids(row, rule_ids)
@@ -356,7 +356,7 @@ class GlobalRuleStatusModel:
     overlay it (only the latest row per rule is kept). ``rows()`` is None
     while the catalog is unknown (never empty), otherwise one row per catalog
     rule: inactive/clear/tripped/unknown, ``waiting_for_program`` with the keys no
-    Program declares (decision 110), or ``pending`` while no state is known.
+    Program declares, or ``pending`` while no state is known.
     """
 
     def __init__(self) -> None:

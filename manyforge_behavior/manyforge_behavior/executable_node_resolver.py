@@ -102,7 +102,7 @@ class NodeAdapterBuildContext:
     operator_stop_hold_scope: str | None = None
     # The run's one Program clock: waits and the timer read time from it.
     program_clock: ProgramClock | None = None
-    # The owner's motion attention check of one captured node (spec 530 §11).
+    # The owner's motion attention check of one captured node.
     motion_attention: Callable[[str, str], None] | None = None
     # Receives each automatic retry's audit fact (the run's own audit list).
     audit_sink: Callable[[dict[str, Any]], None] | None = None
@@ -298,7 +298,7 @@ def _required_port(
 
 
 def _derived_active_tcp_key(node_id: str, parameters: Mapping[str, Any]) -> str | None:
-    """The fixed Current selector's role-scoped input, bound with the node."""
+    """The Current selector's component-and-target input, bound with the node."""
     if node_id == "motion.set_tcp":
         selector = parameters.get("tcp")
     elif node_id in MOTION_NODE_IDS or node_id in INTERRUPT_MOTION_NODE_IDS or node_id in {
@@ -309,10 +309,10 @@ def _derived_active_tcp_key(node_id: str, parameters: Mapping[str, Any]) -> str 
         return None
     if not isinstance(selector, Mapping) or selector.get("kind") != "current":
         return None
-    role = parameters.get("target_role")
-    if not isinstance(role, str) or not role:
-        raise ValueError("Current TCP requires a bound target role")
-    return active_tcp_key(role)
+    target = parameters.get("target")
+    if not isinstance(target, Mapping):
+        raise ValueError("Current TCP requires a bound target")
+    return active_tcp_key(target.get("component_id"), target.get("command_target_id"))
 
 
 def _owner_task_builder(

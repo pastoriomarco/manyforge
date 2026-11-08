@@ -1,19 +1,17 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Mock Lite6 global rule light_curtain (Deployment, all_motion, on_trip stop, after_stop hold). Toggle curtain_blocked during move_a (Stop on the rule's scope, then hold) and during idle_window (Run in flight, robot still: the trip holds the run like the operator's Stop; clear the curtain, then Resume). Watch interrupt_state.light_curtain in the key panel; curtain_clear_at_end checks it reads clear.",
   "members": {
-    "assignment.yaml": "sha256:f4dd3bfffcc14e0cb446f820e79e2405f4477ecbc470ca9fdc127dce17086e06",
     "deployment.yaml": "sha256:0f801b6a3fd0dff83831b39c5d705ed8f94973d26832f038577bd9e156045bb2",
-    "program.yaml": "sha256:bce9162a2d0651cfe94f3bf00fdd8267e2d270151068aa3e892f6bb728b07a60"
+    "program.yaml": "sha256:444a4aef310342f8fff5155d3e145d6d3744703e17b69beb8b38e7a48c34dd5b"
   },
   "name": "mock_lite6_light_curtain_rule",
   "saved_status": {
-    "checked_content_digest": "sha256:2044cc5045449db26c5ee9c5fb3d4a332413ee60cbfa3e2625a6801e4339075f",
+    "checked_content_digest": "sha256:b4b01d50eeb2120b23096846738ade1548c8b1e1efdcce2879a3291d94db6c02",
     "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },

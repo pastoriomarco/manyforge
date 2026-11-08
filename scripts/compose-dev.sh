@@ -232,19 +232,16 @@ capture_stopped_container() {
     echo "Container $container_ref is not confirmed stopped; capture/removal refused" >&2; return 69;
   }
   mounted_root=$(container_state_mount) || return 69
-  timestamp=$(date -u +%Y%m%dT%H%M%SZ.%N)
-  evidence_root=${MANYFORGE_DEV_EVIDENCE_ROOT:-"$cache_base/evidence"}
-  kind=legacy_state
-  if [[ -n "$mounted_root" ]]; then
-    mounted_root=$(python3 -c 'import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())' "$mounted_root") || return 69
-    evidence_root="$mounted_root/evidence"
-    prepare_options=(--state-root "$mounted_root")
-    kind=console_tail
-  fi
   if [[ -z "$mounted_root" ]]; then
-    evidence_root=$(python3 -c 'import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())' "$evidence_root") || return 69
-    prepare_options=(--legacy)
+    echo "Cannot capture stopped container without its /tmp/manyforge-state mount." >&2
+    echo "Container is stopped and retained: $container_ref; manually export or explicitly remove after investigation." >&2
+    return 69
   fi
+  mounted_root=$(python3 -c 'import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())' "$mounted_root") || return 69
+  timestamp=$(date -u +%Y%m%dT%H%M%SZ.%N)
+  evidence_root="$mounted_root/evidence"
+  prepare_options=(--state-root "$mounted_root")
+  kind=console_tail
   evidence_path="$evidence_root/$timestamp"
   if [[ -e "$evidence_path" ]]; then
     echo "Container is stopped, capture failed, container retained: $container_ref; destination exists: $evidence_path" >&2
@@ -272,27 +269,13 @@ print(json.dumps(row,separators=(",",":")))
     echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
     return 69
   fi
-  if [[ -z "$mounted_root" ]]; then
-    # Transitional unmounted containers may hold the only durable evidence.
-    if ! docker cp "$container_ref:/tmp/manyforge-state" - |
-        tar --extract --no-same-owner --directory "$partial_path" \
-          --exclude='manyforge-state/installed-targets' \
-          --exclude='manyforge-state/artifacts/raw-artifacts' \
-          --exclude='manyforge-state/artifacts/prepared-activations' \
-          --exclude='manyforge-state/execution-run/manyforge-retained-planning-*'; then
-      echo "Could not copy legacy runtime evidence. Partial evidence: $partial_path" >&2
-      echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
-      return 69
-    fi
-  fi
-  tail_path="$partial_path/docker.log"
-  [[ -z "$mounted_root" ]] || tail_path="$partial_path/.docker.log.next"
+  tail_path="$partial_path/.docker.log.next"
   if ! docker logs "$container_ref" 2>&1 | python3 "$retention_helper" tail "$tail_path"; then
     echo "Could not copy container logs. Partial evidence: $partial_path" >&2
     echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
     return 69
   fi
-  if [[ -n "$mounted_root" ]] && ! mv --no-target-directory "$tail_path" "$partial_path/docker.log"; then
+  if ! mv --no-target-directory "$tail_path" "$partial_path/docker.log"; then
     echo "Could not replace bounded console tail. Partial evidence: $partial_path" >&2
     echo "Container is stopped, capture failed, container retained: $container_ref; prior tail preserved" >&2
     return 69
@@ -349,8 +332,9 @@ fi
 case "$command" in
   build)
     (($# == 0)) || { usage; exit 64; }
-    # The full ROS Lyrical image: ManyForge toolchain, pinned controller
-    # overlay and xArm driver. Jetson hosts use NVIDIA's JetPack suite.
+    # The full ROS Lyrical image: ManyForge toolchain, ROS base (built from
+    # source by default; MANYFORGE_ROS_BASE=apt uses NVIDIA's mirror)
+    # and xArm driver. With the apt base, Jetson hosts use NVIDIA's JetPack suite.
     suite=noble
     [[ ! -e /etc/nv_tegra_release ]] || suite=noble-jetpack
     "$repo_root/scripts/setup-docker.sh" --prepare-only
@@ -587,6 +571,7 @@ case "$command" in
       "${operator_labels[@]}" \
       --network host \
       --init \
+      --ulimit memlock=-1:-1 \
       --log-opt max-size=50m \
       --log-opt max-file=3 \
       -e MANYFORGE_DEV_BUILD_JOBS="${MANYFORGE_DEV_BUILD_JOBS:-}" \

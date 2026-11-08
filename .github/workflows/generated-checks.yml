@@ -42,5 +42,9 @@ jobs:
         run: python3 scripts/ci/check-authority-port-alignment.py
       - name: Planner portability evidence
         run: python3 scripts/ci/check-planner-portability.py
+      # The RoboPlan example models (git-ignored .docker/roboplan) are model
+      # sources for maintained-sources and scenario-pins.
+      - name: Prepare pinned RoboPlan Docker context
+        run: ./scripts/setup-docker.sh --prepare-only
       - name: Generated outputs and pins are current
         run: python3 scripts/regen.py --check

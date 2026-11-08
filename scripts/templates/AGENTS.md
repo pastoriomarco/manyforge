@@ -32,8 +32,9 @@ It is disabled unless Composer starts with `--mcp-http`.
   `{"action":"source","body":{"authoring":<portable authoring forest>}}`.
 - Browse allowed artifact roots: `manyforge_files` with `{"action":"browse"}`.
 - Discover build-owned skills: `manyforge_skills` with `{"action":"catalog"}`.
-  `action: "expand"` takes the current environment digest, typed arguments,
-  explicit role maps and declaration-only `program_context`. It returns an
+  `action: "expand"` takes the current environment digest, typed arguments
+  and declaration-only `program_context`. Use the component-addressed
+  references required by the active catalog; do not invent identities. It returns an
   ordinary subtree and provenance without editing Draft or executing it.
   Insert through the normal authorized Draft workflow, then validate and
   compile the Program Binding. A logical-gripper template is not a physical

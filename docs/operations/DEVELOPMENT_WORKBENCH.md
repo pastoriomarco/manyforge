@@ -284,6 +284,14 @@ supplied `--project` still uses the ordinary startup Load path. Without it, Load
 the Saved Scenario in Composer when ready, or press New for an empty Untitled
 Scenario; no Activate, Execute or Reset is submitted automatically.
 
+For a backend rollout that requires a restart, run `./scripts/compose-dev.sh stop`
+and then `./scripts/compose-dev.sh start` from the rollout checkout, with the
+same site and state-root settings. The supported flow captures the stopped
+container and selects a new session; do not use `docker restart`
+or `docker start` on the previously claimed container. Start without
+`--project` when the rollout must not Load a Scenario. Frontend-only source
+updates use HMR and do not require a workbench restart.
+
 Runtime owners use `current/` below the mounted state root. Before they start,
 the launcher atomically moves the previous `current/` into
 `previous-sessions/<session-id>/`, preserving every journal and
@@ -358,9 +366,9 @@ A capture failure reports its reason and keeps the stopped container. If
 another failed capture would retain a second container, the launcher retries an
 older stopped container once, only when its partial summary matches its actual ID, image, mounts and this workspace. A mounted
 older container is removed after that retry, with the outcome reported.
-Unidentified historical containers and legacy unmounted containers whose retry
-fails stay protected: the warning names them and asks for manual export or
-explicit removal after investigation. Exit 69 after a capture failure means
+Unidentified historical containers and containers without their state mount
+stay protected: the warning names them and asks for manual export or explicit
+removal after investigation. Exit 69 after a capture failure means
 the container stopped, capture failed and the stopped container was retained;
 it does not mean shutdown failed. The launcher reuses the receipt-proven mounted
 partial in place. Do not store user files in ManyForge runtime folders: extra
@@ -371,16 +379,11 @@ pre-existing mount point inside a unit protects that unit and produces a warning
 Concurrent privileged mount changes are outside the supported operator scope. Unknown ownership and multiple matching historical partials
 retain their refusal and protection. Back up wanted evidence elsewhere.
 
-For transitional containers without the persistent-root mount, removal still
-uses the former full-state export under `MANYFORGE_DEV_EVIDENCE_ROOT` (default
-`.manyforge-dev/evidence/`), excluding reproducible installed binaries, model
-copies, prepared activations and unpacked planning meshes. Mounted containers
-always use their actual runtime root's evidence directory. A legacy
-replacement refuses a nonempty destination root; ordinary mounted replacements
-reuse their existing root. There is no automatic migration. Legacy retries
-replace the same `.legacy-<container-id>.partial` folder with a matching
-receipt instead of accumulating full-state partial copies. Unknown historical
-partials remain protected. The legacy export path can be removed once an inventory confirms that no unmounted containers remain.
+There is no automatic migration or state copy for a container without the
+`/tmp/manyforge-state` mount. Capture and replacement preserve that stopped
+container and require manual export/removal after investigation. A replacement
+also refuses a nonempty destination root; ordinary mounted replacements reuse
+their existing root.
 
 The launcher runs one bounded retention pass before a new container starts and after a
 confirmed stop, after checking that no running, paused or restarting container
@@ -414,7 +417,11 @@ all observed ROS sessions, while a limited deep inventory does not stop
 reclamation of independently qualified older sessions. The stable runtime-wide
 `current/execution-run/ros-home` preserves spawner lock coordination across controllers
 and epochs and is never rotated. Controller child logs retain their existing
-per-artifact `ros` directory. Running a ROS host outside the supported workbench
+per-artifact `ros` directory. The ROS 2 launch framework's `launch.log` is
+stored there and counted with its artifact epoch by pressure-based retention.
+External-library file logging is disabled for the simulated PLC, Program
+Runner rclpy node and managed-host rclcpp context; console output and `/rosout`
+remain enabled. Running a ROS host outside the supported workbench
 requires explicit owned `ROS_HOME` and `ROS_LOG_DIR` environment paths; the host
 provides no fallback path policy. Console chronology comes from
 the generated UTC capture name; artifact chronology comes from the write time
@@ -504,12 +511,13 @@ closure does not Stop the runtime, and an unconfirmed viewer pose must not be
 treated as current measured state.
 
 The ordinary authoring artifact is a Scenario project directory with fixed
-members: `scenario.yaml`, `deployment.yaml`, `program.yaml` and
-`assignment.yaml`, plus optional `sources/` and `assets/`. Open the project
+members: `scenario.yaml`, `deployment.yaml`, and `program.yaml`, plus optional
+`sources/` and `assets/`. Open the project
 directory to load those parts together. Program parameters always take their
 Program defaults: a former project with `overrides.yaml` (or a
 `manyforge.scenario.project.v1` manifest) is refused, not read; move any
-needed value into the Program default and recreate the project. Save updates
+needed value into the Program default and recreate the project. Older Scenario
+projects using assignments must be re-authored with direct references. Save updates
 authored intent and source references; Save As creates another project without
 copying referenced external sources. Missing/invalid sources block
 preparation, while changed compatible sources are reported for review rather
@@ -572,7 +580,10 @@ them is refused with `simulation_not_playing`: a Program node fails with that
 code and the tree handles it like any failed node. A Program can play the
 simulation itself with a **Set simulation state** node
 (`simulation.set_state`, `play`) before its motion. The same reason appears when the workbench
-cannot reach Isaac at all ([Troubleshooting](TROUBLESHOOTING.md#simulation-not-playing)).
+cannot reach Isaac at all. In that case the simulator component stays Offline
+with `simulator_unreachable` and a warning; its state does not latch the cell
+or block Execute. Robot and tool health still follows their own reported
+states ([Troubleshooting](TROUBLESHOOTING.md#simulation-not-playing)).
 
 ### Components and Deployment
 
@@ -626,7 +637,9 @@ current state. See [Observability](OBSERVABILITY.md#workbench-console).
   without changing anything. Apply sends that exact Draft once; when components
   are brought up, replaced or removed, Manager asks for one confirmation.
   When a finished or stopped run blocks Apply, **Reset and Apply** resets it
-  first.
+  first. Apply also refuses with `component_action_in_progress` when a
+  component it would replace or remove has a lifecycle action in progress;
+  retry after that action finishes.
 
 **Add component** (Components) adds components that already exist: the
 complete rows of the example Scenarios under `examples/` (machines, robots,

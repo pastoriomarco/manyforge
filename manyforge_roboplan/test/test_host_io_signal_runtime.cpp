@@ -1,4 +1,5 @@
 #include "host_io_signal_runtime.hpp"
+#include "bound_io_changed_outside.hpp"
 #include "io_provider_lifecycle_product.hpp"
 
 #include <chrono>
@@ -9,10 +10,12 @@
 #include <manyforge_core/execution_event_change_signal.hpp>
 #include <manyforge_core/io_condition_evaluator.hpp>
 #include <manyforge_core/io_signal_descriptor.hpp>
+#include <manyforge_core/io_signal_subsystem.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_roboplan/execution_host_support.hpp>
+#include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 #include <rclcpp/executors/single_threaded_executor.hpp>
 #include <set>
 #include <std_msgs/msg/bool.hpp>
@@ -81,6 +84,46 @@ core::IoSignalDescriptorDTO descriptor() {
           {},
           core::IoSignalLivenessMode::kInProcess};
 }
+
+TEST(HostBoundChangedOutsideTest, ReadsEligibleAndRefusesIneligibleOutputs) {
+  core::FakeClock clock;
+  auto output = descriptor();
+  output.signal_id.name = "clamp";
+  output.direction = core::IoSignalDirection::kOutput;
+  output.output_resource = core::ResourceId("output.clamp");
+  output.liveness.reset();
+  output.readback = true;
+  auto no_readback = output;
+  no_readback.signal_id.name = "no_readback";
+  no_readback.output_resource = core::ResourceId("output.no_readback");
+  no_readback.readback = false;
+  auto owned = output;
+  owned.signal_id.name = "owned";
+  owned.output_resource = core::ResourceId("output.owned");
+  owned.controller_owned = true;
+  const core::RequestOwnerEpoch owner("host.owner");
+  auto made = core::IoSignalSubsystem::Create(
+      {owner, 7U, {output, no_readback, owned}}, {3U, 4U, 4U, 8U, 512U, 1024U}, clock);
+  ASSERT_TRUE(made.ok()) << made.error().message;
+  auto &service = *made.value();
+  const auto base = service.ReadSignal(output.signal_id);
+  ASSERT_TRUE(base.ok()) << base.error().message;
+  const auto derived = ReadBoundChangedOutside(service, base.value(), owner, 7U);
+  ASSERT_TRUE(derived.ok()) << derived.error().message;
+  ASSERT_TRUE(derived.value().latest_sample);
+  EXPECT_EQ(derived.value().latest_sample->publication.value, std::optional(false));
+  for (const auto &id : {no_readback.signal_id, owned.signal_id}) {
+    const auto ineligible = service.ReadSignal(id);
+    ASSERT_TRUE(ineligible.ok()) << ineligible.error().message;
+    const auto result = ReadBoundChangedOutside(service, ineligible.value(), owner, 7U);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().code, "invalid_request");
+    EXPECT_EQ(result.error().details.at("reason"), "io_signal_changed_outside_unavailable");
+  }
+  const auto stale = ReadBoundChangedOutside(service, base.value(), owner, 8U);
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().code, "io_signal_catalog_stale");
+}
 core::IoLevelWatchRequestDTO watch(std::string node, bool expected = true,
                                    std::string run = "run") {
   return {{core::RequestOwnerEpoch("runner"),
@@ -93,7 +136,9 @@ class HostIoSignalRuntimeTest : public ::testing::Test {
 protected:
   void Build(bool initial = false, std::string occurrence = "installation.1",
              std::shared_ptr<core::IScheduler> runtime_scheduler = {},
-             bool with_echo = false) {
+             bool with_echo = false,
+             std::shared_ptr<ros2_control_execution::Ros2TransportResources>
+                 mixed_owner = {}) {
     initialized_simulation_runs.clear();
     deployment::IoSignalProviderConfiguration provider_config;
     provider_config.profile = "mock";
@@ -103,30 +148,54 @@ protected:
         core::RuntimeUnitId("runtime.io"), core::CommandTargetId("inputs"),
         core::ResourceRoleId("ready"), descriptor(),
         std::move(provider_config)};
-    driver = MakeDriver(row, std::move(occurrence));
+    driver = MakeDriver(row, std::move(occurrence), bool(mixed_owner));
     std::map<core::InterruptSourceId, HostIoSignalRuntime::SourceInput> sources;
-    sources.emplace(kSource,
-                    HostIoSignalRuntime::SourceInput{
-                        {row}, {}, driver->runtime_unit_epoch(), std::nullopt,
-                        driver});
+    sources.emplace(
+        kSource,
+        HostIoSignalRuntime::SourceInput{
+            {row}, {}, driver->runtime_unit_epoch(), std::nullopt, driver});
+    if (mixed_owner) {
+      auto ros_descriptor = descriptor();
+      ros_descriptor.signal_id.name = "ros";
+      ros_descriptor.source_id = core::InterruptSourceId("ros.inputs");
+      ros_descriptor.liveness = core::IoSignalLivenessMode::kChangeOnly;
+      deployment::IoSignalProviderConfiguration ros_provider;
+      ros_provider.profile = "ros_bool";
+      ros_provider.topic = "/test/mixed_recovery_input";
+      ros_provider.ingress_depth = 8U;
+      deployment::RetainedIoSignalConfiguration ros_row{
+          row.runtime_unit_id, row.command_target_id,
+          core::ResourceRoleId("ros"), ros_descriptor, std::move(ros_provider)};
+      sources.emplace(
+          ros_descriptor.source_id,
+          HostIoSignalRuntime::SourceInput{{ros_row},
+                                           mixed_owner->node(),
+                                           driver->runtime_unit_epoch(),
+                                           std::nullopt,
+                                           driver});
+    }
     runtime = HostIoSignalRuntime::Create(
         core::RequestOwnerEpoch("host"), 1, std::move(sources), clock,
         runtime_scheduler ? std::move(runtime_scheduler) : scheduler);
     if (with_echo) {
       auto made = MockBooleanOutputProvider::Create(
-          *clock, {core::ResourceId("output.valve"), "valve",
+          *clock, {core::ResourceId("output.valve"),
+                   "valve",
                    {{{core::ControllableComponentId("io"), "valve"},
-                     driver->occurrence(), 1U, driver}},
+                     driver->occurrence(),
+                     1U,
+                     driver}},
                    core::ActiveBundlePublicationGeneration(1U)});
       if (!made.ok())
         throw std::runtime_error(made.error().message);
-      echo_output = std::shared_ptr<MockBooleanOutputProvider>(std::move(made.value()));
+      echo_output =
+          std::shared_ptr<MockBooleanOutputProvider>(std::move(made.value()));
       runtime->AddMockEcho(echo_output, signal(), kDelay);
     }
     for (const auto &[actual, inputs] : runtime->driver_input_installations()) {
       auto delivery = actual->AcquireDelivery();
       const auto installed = actual->InstallResourcesLocked(
-          inputs, {}, runtime->cancellation_hook(actual));
+          delivery, inputs, {}, runtime->cancellation_hook(actual), {}, {}, mixed_owner);
       if (!installed.ok())
         throw std::runtime_error(installed.error().message);
     }
@@ -136,10 +205,12 @@ protected:
     const auto before_enable = Observe();
     if (before_enable.availability != core::IoSignalAvailability::kMissing ||
         before_enable.latest_sample)
-      throw std::runtime_error("unenabled fixture must have no reported sample");
+      throw std::runtime_error(
+          "unenabled fixture must have no reported sample");
     Step(core::ComponentAction::kPrepare);
     Step(core::ComponentAction::kEnable);
-    if (echo_output && !echo_output->Resume(driver->occurrence(), 2U, driver).ok())
+    if (echo_output &&
+        !echo_output->Resume(driver->occurrence(), 2U, driver).ok())
       throw std::runtime_error("echo output did not enable");
     const auto drained = runtime->DrainPending();
     if (!drained.ok())
@@ -150,7 +221,8 @@ protected:
         !enabled.latest_sample ||
         enabled.latest_sample->publication.value != initial ||
         enabled.latest_sample->publication.source_sequence != 1U)
-      throw std::runtime_error("actual Mock Enable did not publish its initial sample");
+      throw std::runtime_error(
+          "actual Mock Enable did not publish its initial sample");
   }
   void TearDown() override {
     if (runtime)
@@ -163,26 +235,29 @@ protected:
   }
   std::shared_ptr<IoProviderDriverRecord>
   MakeDriver(const deployment::RetainedIoSignalConfiguration &row,
-             std::string epoch) {
+             std::string epoch, bool mixed = false,
+             std::string provider_id = "io.provider") {
     const core::ContentDigest digest("sha256:" + std::string(64U, 'a'));
     const core::ProviderManifestId id{std::string(kIoProviderManifestId)};
     const core::ProviderManifestDTO manifest{
-        id, core::ProviderManifestRevision(digest.value()), {}, {}, std::nullopt};
+        id,
+        core::ProviderManifestRevision(digest.value()),
+        {},
+        {},
+        std::nullopt};
     const core::ControlDomainId domain("io.domain");
     const core::ControlDomainRevision revision(digest.value());
-    const core::ProviderInstanceId instance("io.provider");
+    const core::ProviderInstanceId instance(std::move(provider_id));
     const core::RuntimeEpoch runtime_epoch(std::move(epoch));
     core::ResolvedLifecycleControlDomainScopeDTO scope{
         domain, revision,
         core::ResolvedProviderDomainScopeDTO{
             {row.descriptor.signal_id.controllable_component_id,
-             row.runtime_unit_id,
-             instance,
-             id,
-             manifest.provider_manifest_revision,
-             digest,
-             digest,
-             {row.descriptor.signal_id.name},
+             row.runtime_unit_id, instance, id,
+             manifest.provider_manifest_revision, digest, digest,
+             mixed ? std::vector<std::string>{row.descriptor.signal_id.name,
+                                              "ros"}
+                   : std::vector<std::string>{row.descriptor.signal_id.name},
              30'000'000'000LL},
             runtime_epoch,
             std::nullopt,
@@ -233,7 +308,7 @@ protected:
              core::ProgramRunId(std::move(run)),
              {core::ProgramNodeInstanceId(std::move(node)), std::move(attempt)},
              index},
-            {{core::TargetRoleId("inputs"), core::ResourceRoleId("ready"),
+            {{{core::ControllableComponentId("inputs"), "ready"},
               start, change}}};
   }
   core::Result<void>
@@ -400,6 +475,53 @@ TEST_F(HostIoSignalRuntimeTest,
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 4U);
 }
 
+TEST_F(HostIoSignalRuntimeTest, DeliveryLockOrderUsesProviderThenExactRecord) {
+  deployment::IoSignalProviderConfiguration config;
+  config.profile = "mock";
+  config.initial_value = false;
+  config.ingress_depth = 64U;
+  deployment::RetainedIoSignalConfiguration row{
+      core::RuntimeUnitId("runtime.io"), core::CommandTargetId("inputs"),
+      core::ResourceRoleId("ready"), descriptor(), std::move(config)};
+  const auto a = MakeDriver(row, "a", false, "provider.a");
+  const auto b = MakeDriver(row, "b", false, "provider.b");
+  const auto another_a = MakeDriver(row, "c", false, "provider.a");
+  EXPECT_TRUE(DeliveryLockOrder(a, b));
+  EXPECT_FALSE(DeliveryLockOrder(b, a));
+  EXPECT_FALSE(DeliveryLockOrder(a, a));
+  EXPECT_EQ(DeliveryLockOrder(a, another_a),
+            std::less<const IoProviderDriverRecord *>{}(a.get(), another_a.get()));
+  EXPECT_NE(DeliveryLockOrder(a, another_a), DeliveryLockOrder(another_a, a));
+}
+
+TEST_F(HostIoSignalRuntimeTest,
+       RunningRuleEvidenceCallbackPinsRetiredRuntimeUntilReturn) {
+  Build();
+  std::promise<void> entered;
+  auto entered_future = entered.get_future();
+  std::promise<void> release;
+  auto release_future = release.get_future().share();
+  runtime->SetRuleEvidenceProcessor([&] {
+    entered.set_value();
+    release_future.wait();
+    return core::Result<bool>::Ok(false);
+  });
+  runtime->RequestRuleEvidenceProcessing();
+  std::weak_ptr<HostIoSignalRuntime> weak = runtime;
+  std::jthread worker([&] {
+    scheduler->advance_to(clock->now(), core::SchedulerPriority::RuntimeSafety);
+  });
+  const auto ready = entered_future.wait_for(std::chrono::seconds(5));
+  EXPECT_EQ(ready, std::future_status::ready);
+  runtime.reset();
+  if (ready == std::future_status::ready) {
+    EXPECT_FALSE(weak.expired());
+  }
+  release.set_value();
+  worker.join();
+  EXPECT_TRUE(weak.expired());
+}
+
 TEST_F(HostIoSignalRuntimeTest,
        ActualDriverAcquisitionAndDisableDrainWakeProcessorOutsideDeliveryLock) {
   Build();
@@ -465,7 +587,7 @@ TEST_F(HostIoSignalRuntimeTest,
   for (const auto &[actual, inputs] : runtime->driver_input_installations()) {
     auto delivery = actual->AcquireDelivery();
     ASSERT_TRUE(actual
-                    ->InstallResourcesLocked(inputs, {},
+                    ->InstallResourcesLocked(delivery, inputs, {},
                                              runtime->cancellation_hook(actual))
                     .ok());
   }
@@ -545,7 +667,7 @@ TEST_F(HostIoSignalRuntimeTest,
   EXPECT_EQ(Observe().latest_sample, baseline.latest_sample);
   // The same expiry turns the published sample stale: one refresh at that
   // moment (no periodic re-read) raises the event-stream change signal, so
-  // the stream sends the new `state` (CONTRACTS §7).
+  // the stream sends the new `state`.
   EXPECT_EQ(scheduler->pending_count(core::SchedulerPriority::Monitoring), 1U);
   const auto generation = core::execution_event_change_signal().Generation();
   scheduler->advance_to(*expiry.value(), core::SchedulerPriority::Monitoring);
@@ -667,6 +789,49 @@ TEST_F(HostIoSignalRuntimeTest,
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 1U);
   EXPECT_EQ(scheduler->pending_count(core::SchedulerPriority::RuntimeSafety),
             0U);
+}
+
+TEST_F(HostIoSignalRuntimeTest,
+       RosOwnerRecoveryCancelsMixedDriverScheduledMockChange) {
+  auto context = std::make_shared<rclcpp::Context>();
+  context->init(0, nullptr);
+  auto old = ros2_control_execution::Ros2TransportResources::create(
+      "mixed_recovery_old", "", 1U, [context] { return context; });
+  auto replacement =
+      ros2_control_execution::Ros2TransportResources::create(
+          "mixed_recovery_new", "", 1U, [context] { return context; });
+  Build(false, "installation.1", {}, false, old);
+  const auto started = StartSimulation(Simulation());
+  ASSERT_TRUE(started.ok());
+  ASSERT_GT(scheduler->pending_count(core::SchedulerPriority::RuntimeSafety),
+            0U);
+  auto closed = driver->CloseAndCaptureRosOwnerRecovery(old);
+  ASSERT_TRUE(closed.ok());
+  auto staged = IoProviderDriverRecord::StageRosOwnerRecovery(closed.value(),
+                                                              replacement);
+  ASSERT_TRUE(staged.ok());
+  {
+    auto lock = driver->AcquireDelivery();
+    ASSERT_TRUE(driver->MatchesRosOwnerRecoveryLocked(*closed.value()));
+    driver->CommitRosOwnerRecoveryLocked(*staged.value());
+  }
+  IoProviderDriverRecord::ActivateRosOwnerRecovery(*staged.value());
+  Step(core::ComponentAction::kEnable);
+  ASSERT_TRUE(runtime->DrainPending().ok());
+  const auto before = Observe().latest_sample;
+  ASSERT_TRUE(before);
+  ASSERT_EQ(before->publication.value, false);
+  Advance(kDelay);
+  EXPECT_EQ(Observe().latest_sample, before);
+  runtime->Shutdown();
+  driver->Shutdown();
+  staged.value().reset();
+  closed.value().reset();
+  runtime.reset();
+  driver.reset();
+  replacement.reset();
+  old.reset();
+  context->shutdown("mixed recovery test complete");
 }
 
 TEST_F(HostIoSignalRuntimeTest,
@@ -1094,8 +1259,8 @@ TEST_F(HostIoSignalRuntimeTest,
   request.signals.clear();
   for (std::size_t i = 0U; i < 17U; ++i)
     request.signals.push_back(
-        {core::TargetRoleId("alias." + std::to_string(100U + i)),
-         core::ResourceRoleId("ready"), false,
+        {{core::ControllableComponentId("alias." + std::to_string(100U + i)),
+          "ready"}, false,
          core::ProgramMockSimulationChangeDTO{250U, true}});
   const auto started = StartSimulation(request, 1U);
   ASSERT_TRUE(started.ok()) << started.error().message;

@@ -20,7 +20,7 @@ from manyforge_composer.backend.security import SecurityConfig
 
 def _status(*, sequence: int = 7, position: float = 0.25) -> dict[str, Any]:
     return {
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "command": "observation",
         "ok": True,
         "observation": {
@@ -97,7 +97,7 @@ def test_project_execution_observation_is_exact_and_compact() -> None:
 
 def test_owner_error_response_keeps_its_typed_code_and_message() -> None:
     refused = {
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "ok": False,
         "error": {
             "code": "execution_command_invalid",
@@ -130,7 +130,7 @@ def test_source_status_reports_the_owner_error_code() -> None:
             await _next_cursor(client)
             client.responses.put(
                 {
-                    "api_version": "manyforge.execution_command_response.v1",
+                    "api_version": "manyforge.execution_command_response.v4",
                     "ok": False,
                     "error": {
                         "code": "execution_owner_not_ready",

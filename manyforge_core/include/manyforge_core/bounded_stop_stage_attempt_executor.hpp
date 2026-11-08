@@ -69,17 +69,26 @@ enum class StopStageAttemptReleaseStatus : std::uint8_t {
   kReplenishmentFailed,
 };
 
+class BoundedStopStageAttemptExecutor;
+
 class IStopStageAttemptCompletionReceiver {
  public:
   virtual ~IStopStageAttemptCompletionReceiver() = default;
   /// Also wakes on a first spring point; TryTake remains the completion truth.
-  virtual void StageAttemptCompleted(StopStageAttemptHandle handle) noexcept = 0;
+  /// `source` is the executor that ran the attempt: an owner that replaces
+  /// its executor settles a retired executor's late attempts on that
+  /// executor, never on its successor.
+  virtual void StageAttemptCompleted(BoundedStopStageAttemptExecutor& source,
+                                     StopStageAttemptHandle handle) noexcept = 0;
 };
 
 /// Fixed-capacity isolation for already prepared Stop-stage attempts.
 /// Construction allocates every lane, cancellation source, and worker. A
 /// successful TryStart moves only prebuilt shared referents into a free lane;
 /// it performs no allocation and cannot fail after publishing kStarted.
+/// Handles are unique across every executor of the process: each executor
+/// starts its lane generations in its own range, so a handle of a retired
+/// executor is stale on its successor.
 ///
 /// Each port and request referent must outlive Release(handle), or successful
 /// CloseIngress()+DrainFor() during shutdown. Ports remain subject to the

@@ -20,7 +20,7 @@ enum class InterruptPreemptionAction {
   kCancelPlanning,
   kCancelValidation,
   kPreemptTrajectory,
-  /// Move-scoped non-fault completion (spec/260 §5.6). Reserved for
+  /// Move-scoped non-fault completion. Reserved for
   /// `scope_kind == kMove` node policies. Stops
   /// trajectory execution on a desired signal trip and produces a
   /// `MotionExecutionOutcomeDTO` with `terminal_cause = signal_trip`
@@ -40,7 +40,7 @@ enum class InterruptPostLatchDisposition {
   kFaultTerminal,
 };
 
-/// Activation modes for move-scoped policy bindings (spec/260 §2.6).
+/// Activation modes for move-scoped policy bindings.
 enum class MotionInterruptActivationMode {
   /// Default for touch probes: kernel samples the source at arm time;
   /// if active or unknown, the move is rejected before dispatch.
@@ -56,8 +56,7 @@ enum class MotionInterruptActivationMode {
 };
 
 /// Controlled-stop mode requested by a move-scoped interrupt scope
-/// (spec/260 §5.6 Stop-profile semantics; spec/210 §3.11
-/// `MotionInterruptStopProfileDTO`).
+/// (`MotionInterruptStopProfileDTO`).
 ///
 /// `kSpringBackHold` is the non-critical path-preserving return profile:
 /// forward decelerate on the accepted path, then return on the same path to the
@@ -71,13 +70,13 @@ enum class MotionInterruptStopMode {
   kSpringBackHold,
   kSoftOnPath,
   kHardDeceleration,
-  /// Q130: the active trajectory's passed points plus one zero-velocity point
+  /// The active trajectory's passed points plus one zero-velocity point
   /// at the trip position, sent at once with no planning or checks.
   kSpringBackFast,
 };
 
 /// Which backend/controller surface actually issued the controlled
-/// stop (spec/210 §3.11 `MotionTripOutcomeDTO.stop_command_source`).
+/// stop (`MotionTripOutcomeDTO.stop_command_source`).
 /// `kDiagnosticOther` is reserved for backends whose stop path does
 /// not match a named taxonomy and MUST carry a stable reason in the
 /// outcome's `diagnostics`.
@@ -93,8 +92,7 @@ enum class MotionInterruptStopCommandSource {
 
 /// Motion-node category metadata carried on a `MotionInterruptScopeDTO`.
 /// The kernel uses the category to enforce default fallback rules at
-/// arm time (spec/210 §3.11 conjunctive fallback rule; motion-scoped
-/// design doc §B.4 node-category defaults).
+/// arm time (conjunctive fallback rule; node-category defaults).
 enum class MotionInterruptNodeCategory {
   /// `MoveUntilSignal` and other generic search nodes. May accept any
   /// fallback the backend capability profile and policy allow.
@@ -107,7 +105,7 @@ enum class MotionInterruptNodeCategory {
 
 /// Whether a policy is always active (`kSession`) or only when armed by
 /// a `MotionInterruptScopeDTO` on the active `ExecuteRequestDTO`
-/// (`kMove`). Spec/260 §2.2.
+/// (`kMove`).
 enum class InterruptPolicyScopeKind {
   kSession,
   kMove,

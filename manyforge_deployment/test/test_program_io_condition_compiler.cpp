@@ -40,14 +40,14 @@ V signal_compare(V value) {
        V(V::Object{
            {"operand",
             V(V::Object{
-                {"signal", V(V::Object{{"target_role", V("inputs")},
-                                       {"resource_role", V("ready")}})}})},
+                {"signal", V(V::Object{{"component_id", V("device")},
+                                       {"signal_name", V("ready")}})}})},
            {"op", V("==")},
            {"value", std::move(value)}})}});
 }
 
 struct Context final {
-  std::vector<c::ProgramTargetRoleBindingDTO> targets;
+  std::vector<c::ProgramSignalBindingDTO> bindings;
   std::vector<c::ProgramBlackboardKeyDeclarationDTO> keys{
       {"ready", "bool", true},         {"count", "int64", true},
       {"measured", "float64", true},   {"label", "string", true},
@@ -56,7 +56,7 @@ struct Context final {
   std::vector<d::RetainedIoSignalConfiguration> signals;
 
   auto compile(const V &condition) const {
-    return d::detail::compile_authored_program_io_condition(condition, targets,
+    return d::detail::compile_authored_program_io_condition(condition, bindings,
                                                             keys, signals);
   }
 
@@ -75,17 +75,10 @@ struct Context final {
     auto digest = c::ComputeIoSignalDescriptorDigest(descriptor);
     if (!digest.ok())
       throw std::logic_error(digest.error().message);
-    targets.push_back({c::TargetRoleId("inputs"),
-                       c::ComponentRoleId("device"),
-                       c::ControllableComponentId("device"),
-                       c::CommandTargetId("gpio"),
-                       {},
-                       {},
-                       {},
-                       {},
-                       {{c::ResourceRoleId("ready"), "ready",
-                         descriptor.value_type, descriptor.direction,
-                         descriptor.transition_capability, digest.value()}}});
+    bindings.push_back({{c::ControllableComponentId("device"), "ready"},
+                        {c::ControllableComponentId("device"), c::CommandTargetId("gpio")},
+                        c::RuntimeUnitId("host"), descriptor.value_type,
+                        descriptor.direction, descriptor.transition_capability, digest.value()});
     signals.push_back({c::RuntimeUnitId("host"),
                        c::CommandTargetId("gpio"),
                        c::ResourceRoleId("ready"),
@@ -251,6 +244,39 @@ TEST(ProgramIoConditionCompilerTest,
   context.signals.front().descriptor.signal_id.name = "ready";
   context.signals.front().command_target_id = c::CommandTargetId("other");
   EXPECT_FALSE(context.compile(signal_compare(V(true))).ok());
+}
+
+TEST(ProgramIoConditionCompilerTest, PrebindingSignalComparisonUsesCoreTypeRules) {
+  Context context;
+  context.input();
+  const auto &descriptor = context.signals.front().descriptor;
+  EXPECT_TRUE(d::detail::check_program_signal_comparison(descriptor, V("=="), V(true)).ok());
+  const auto wrong_type = d::detail::check_program_signal_comparison(descriptor, V("=="), V(1.0));
+  ASSERT_FALSE(wrong_type.ok());
+  EXPECT_EQ(wrong_type.error().details.at("reason"), "io_signal_type_mismatch");
+  const auto wrong_order = d::detail::check_program_signal_comparison(descriptor, V("<"), V(true));
+  ASSERT_FALSE(wrong_order.ok());
+  EXPECT_EQ(wrong_order.error().details.at("reason"), "io_signal_type_mismatch");
+  const auto unknown_operator = d::detail::check_program_signal_comparison(descriptor, V("bad"), V(true));
+  ASSERT_FALSE(unknown_operator.ok());
+  EXPECT_EQ(unknown_operator.error().details.at("reason"), "interrupt_condition_invalid");
+}
+
+TEST(ProgramIoConditionCompilerTest, DirectSignalRequiresUniqueExactBindingAndRetainedSource) {
+  Context context;
+  context.input();
+  ASSERT_TRUE(context.compile(signal_compare(V(true))).ok());
+  context.bindings.push_back(context.bindings.front());
+  EXPECT_FALSE(context.compile(signal_compare(V(true))).ok());
+  context.bindings.pop_back();
+  context.signals.push_back(context.signals.front());
+  EXPECT_FALSE(context.compile(signal_compare(V(true))).ok());
+  context.signals.pop_back();
+  context.bindings.front().runtime_unit_id = c::RuntimeUnitId("other");
+  EXPECT_FALSE(context.compile(signal_compare(V(true))).ok());
+  const auto old_role_selector = d::parse_strict_json_model_yaml(
+      R"({"compare":{"operand":{"signal":{"target_role":"inputs","resource_role":"ready"}},"op":"==","value":true}})").root();
+  EXPECT_FALSE(context.compile(old_role_selector).ok());
 }
 
 TEST(ProgramIoConditionCompilerTest,
@@ -454,7 +480,7 @@ TEST(ProgramIoConditionCompilerTest,
   ASSERT_FALSE(outcome.ok());
   EXPECT_EQ(outcome.error().details.at("reason"),
             "interrupt_condition_key_refused");
-  // Spec 260 §2.7 (D7, contract 137): a condition's only limits are 64
+  // A condition's only limits are 64
   // authored nodes and depth 8; there is no separate input cap. One `all`
   // with 63 comparisons is 64 nodes and compiles; 64 comparisons exceed the
   // node bound and are refused.
@@ -490,29 +516,29 @@ TEST(ProgramIoConditionCompilerTest,
   const auto condition = d::parse_strict_json_model_yaml(R"({"all":[
     {"compare":{"operand":{"key":"ready"},"op":"==","value":true}},
     {"any":[
-      {"compare":{"operand":{"signal":{"target_role":"station","resource_role":"b"}},"op":"==","value":true}},
-      {"not":{"compare":{"operand":{"signal":{"target_role":"station","resource_role":"a"}},"op":"==","value":false}}}]}]})")
+      {"compare":{"operand":{"signal":{"component_id":"station","signal_name":"b"}},"op":"==","value":true}},
+      {"not":{"compare":{"operand":{"signal":{"component_id":"station","signal_name":"a"}},"op":"==","value":false}}}]}]})")
                              .root();
   for (const auto &id : {"motion.move_until_signal", "motion.probe_search"}) {
     const auto refs =
-        d::detail::collect_program_node_io_signal_roles(node(id, condition));
+        d::detail::collect_program_node_io_signal_references(node(id, condition));
     ASSERT_TRUE(refs.ok()) << refs.error().message;
     EXPECT_EQ(refs.value(),
-              (std::vector<d::detail::ProgramIoSignalRoleReference>{
-                  {c::TargetRoleId("station"), c::ResourceRoleId("a")},
-                  {c::TargetRoleId("station"), c::ResourceRoleId("b")}}));
+              (std::vector<d::detail::ProgramIoSignalReference>{
+                  {c::ControllableComponentId("station"), "a"},
+                  {c::ControllableComponentId("station"), "b"}}));
     auto dynamic = node(id, condition).as_object();
     dynamic.emplace_back(
         "value_sources",
-        V(V::Object{{"interrupt_condition.compare.operand.signal.resource_role",
+        V(V::Object{{"interrupt_condition.compare.operand.signal.signal_name",
                      V(V::Object{})}}));
     const auto refused =
-        d::detail::collect_program_node_io_signal_roles(V(dynamic));
+        d::detail::collect_program_node_io_signal_references(V(dynamic));
     ASSERT_FALSE(refused.ok());
     EXPECT_EQ(refused.error().details.at("reason"),
               "interrupt_condition_invalid");
   }
-  const auto malformed = d::detail::collect_program_node_io_signal_roles(
+  const auto malformed = d::detail::collect_program_node_io_signal_references(
       node("motion.move_until_signal", V(V::Object{{"not", V(V::Array{})}})));
   EXPECT_FALSE(malformed.ok());
   // Collection is not a declaration or initial-value exemption: full lowering
@@ -524,77 +550,57 @@ TEST(ProgramIoConditionCompilerTest,
             "interrupt_condition_key_refused");
 }
 
-TEST(ProgramIoConditionCompilerTest,
-     DependencySelectorsPreserveResolvedInputAliasCardinality) {
+TEST(ProgramIoConditionCompilerTest, DirectReferencesDeduplicateAndKeepDistinctInputs) {
   constexpr unsigned maximum_inputs = 64U - 1U;
-  Context aliases;
-  aliases.input();
-  const auto prototype = aliases.targets.front();
-  aliases.targets.clear();
+  Context duplicate;
+  duplicate.input();
+  V::Array repeated;
+  for (unsigned i = 0; i != maximum_inputs; ++i)
+    repeated.push_back(signal_compare(V(true)));
+  const V same(V::Object{{"all", V(repeated)}});
+  const auto same_result = duplicate.compile(same);
+  ASSERT_TRUE(same_result.ok()) << same_result.error().message;
+  EXPECT_EQ(same_result.value().condition->inputs().size(), 1U);
+  EXPECT_EQ(same_result.value().required_signal_sources.size(), 1U);
+
+  Context distinct;
   V::Array comparisons;
   for (unsigned i = 0; i != maximum_inputs; ++i) {
-    auto target = prototype;
-    target.target_role_id = c::TargetRoleId("alias_" + std::to_string(i));
-    comparisons.emplace_back(V::Object{
-        {"compare",
-         V(V::Object{
-             {"operand",
-              V(V::Object{
-                  {"signal", V(V::Object{{"target_role",
-                                          V(target.target_role_id.value())},
-                                         {"resource_role", V("ready")}})}})},
-             {"op", V("==")},
-             {"value", V(true)}})}});
-    aliases.targets.push_back(std::move(target));
+    Context item;
+    item.input();
+    const auto name = "device_" + std::to_string(i);
+    const c::ControllableComponentId component(name);
+    auto &descriptor = item.signals.front().descriptor;
+    descriptor.signal_id.controllable_component_id = component;
+    descriptor.source_id = c::InterruptSourceId("source_" + std::to_string(i));
+    const auto digest = c::ComputeIoSignalDescriptorDigest(descriptor);
+    ASSERT_TRUE(digest.ok()) << digest.error().message;
+    item.bindings.front().reference.component_id = component;
+    item.bindings.front().target.component_id = component;
+    item.bindings.front().signal_descriptor_digest = digest.value();
+    distinct.bindings.push_back(item.bindings.front());
+    distinct.signals.push_back(item.signals.front());
+    comparisons.emplace_back(V::Object{{"compare", V(V::Object{
+      {"operand", V(V::Object{{"signal", V(V::Object{{"component_id", V(name)}, {"signal_name", V("ready")}})}})},
+      {"op", V("==")}, {"value", V(true)}})}});
   }
   const V condition(V::Object{{"all", V(comparisons)}});
-  const V node(V::Object{
-      {"node_id", V("motion.move_until_signal")},
-      {"parameters", V(V::Object{{"interrupt_condition", condition}})}});
-  const auto discovered = d::detail::collect_program_node_io_signal_roles(node);
+  const V node(V::Object{{"node_id", V("motion.move_until_signal")},
+                         {"parameters", V(V::Object{{"interrupt_condition", condition}})}});
+  const auto discovered = d::detail::collect_program_node_io_signal_references(node);
   ASSERT_TRUE(discovered.ok()) << discovered.error().message;
   EXPECT_EQ(discovered.value().size(), maximum_inputs);
-  const auto checked = aliases.compile(condition);
+  const auto checked = distinct.compile(condition);
   ASSERT_TRUE(checked.ok()) << checked.error().message;
-  ASSERT_EQ(checked.value().condition->inputs().size(), 1U);
-  EXPECT_EQ(checked.value().required_signal_sources,
-            (std::vector<c::InterruptSourceId>{
-                c::InterruptSourceId("device.input")}));
-  EXPECT_TRUE(evaluate(*checked.value().condition, {true}));
-
-  // The same maximum legal authored shape resolves either to one actual
-  // aliased input or to 63 distinct real descriptors/sources. No selector
-  // spelling cap or separate alias resolver changes this cardinality.
-  Context distinct;
-  for (unsigned i = 0; i != maximum_inputs; ++i) {
-    Context actual;
-    actual.input();
-    const c::ControllableComponentId component("device_" + std::to_string(i));
-    actual.targets.front().target_role_id = aliases.targets[i].target_role_id;
-    actual.targets.front().controllable_component_id = component;
-    actual.signals.front().descriptor.signal_id.controllable_component_id = component;
-    actual.signals.front().descriptor.source_id =
-        c::InterruptSourceId("source_" + std::to_string(i));
-    const auto digest =
-        c::ComputeIoSignalDescriptorDigest(actual.signals.front().descriptor);
-    ASSERT_TRUE(digest.ok()) << digest.error().message;
-    actual.targets.front()
-        .signal_role_bindings.front()
-        .signal_descriptor_digest = digest.value();
-    distinct.targets.push_back(actual.targets.front());
-    distinct.signals.push_back(actual.signals.front());
-  }
-  const auto resolved = distinct.compile(condition);
-  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
-  EXPECT_EQ(resolved.value().condition->inputs().size(), maximum_inputs);
-  EXPECT_EQ(resolved.value().required_signal_sources.size(), maximum_inputs);
+  EXPECT_EQ(checked.value().condition->inputs().size(), maximum_inputs);
+  EXPECT_EQ(checked.value().required_signal_sources.size(), maximum_inputs);
   std::vector<c::IoConditionValueDTO> values(maximum_inputs, true);
-  EXPECT_TRUE(evaluate(*resolved.value().condition, values));
+  EXPECT_TRUE(evaluate(*checked.value().condition, values));
   values.back() = false;
-  EXPECT_FALSE(evaluate(*resolved.value().condition, values));
+  EXPECT_FALSE(evaluate(*checked.value().condition, values));
 }
 
-// CONTRACTS §7 (plan V2-7): a Deployment condition names the core-held
+// A Deployment condition names the core-held
 // `<output>.changed_outside` bool of an output with read-back that isn't
 // controller-owned; it resolves to the core's signal and source ids.
 c::IoSignalDescriptorDTO output_descriptor(std::string name, bool readback,
@@ -697,7 +703,7 @@ c::JsonValueDTO json(const V &value) {
       value.storage());
 }
 
-// CONTRACTS §7, §8, §16: a real xArm control-box input (e.g. a light curtain
+// A real xArm control-box input (e.g. a light curtain
 // on CI0) drives a global rule. The I/O member's rows come from the curated
 // Lite 6 models on the real lane; the input is periodic with the model's
 // sample-age budget, so a stale stream leaves the rule unable to watch.

@@ -3,10 +3,12 @@
 #include <atomic>
 #include <filesystem>
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/types/motion_preview.hpp>
 #include <manyforge_core/types/active_control_configuration.hpp>
 #include <manyforge_core/types/operation_intent.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_contract.hpp>
+#include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/active_tcp.hpp>
@@ -21,7 +23,7 @@ namespace manyforge::roboplan_backend {
 
 struct RetainedResolvedParticipant;
 
-/// Active TCP (M7, design 5.2): a robot's TCP list and Active TCP as its
+/// Active TCP: a robot's TCP list and Active TCP as its
 /// runtime owner holds them now; none when the robot has no runtime owner
 /// here. Robot control resolves its moves and Set TCP through it, and a
 /// Current selector reads the Active TCP from it.
@@ -80,16 +82,17 @@ public:
                            std::vector<core::ProgramBindingId>
                                additional_intrinsic_direct_bindings = {}) const;
 
-  /// Active TCP (M7): a motion's or a Set TCP's selector resolves through
+  /// Active TCP: a motion's or a Set TCP's selector resolves through
   /// one path for Programs and Robot control: the row of the moving robot's
   /// TCP list (the Program binding's, or the runtime owner's for Robot
   /// control; Current from `robot_tcps`, else the host's registered owners),
-  /// then `carries` (T-MQ7), then the endpoint with the owner's contact
+  /// then `carries`, then the endpoint with the owner's contact
   /// bodies.
   [[nodiscard]] core::Result<core::RuntimeParticipantBinding>
   Resolve(const core::OperationIntentDTO &operation,
           std::size_t participant_index,
-          const RobotTcpReader &robot_tcps = {}) const;
+          const RobotTcpReader &robot_tcps = {},
+          std::optional<core::PreviewTcpCapture> *preview_tcp_capture = nullptr) const;
 
   [[nodiscard]] core::Result<RetainedResolvedParticipant>
   ResolveExecutionParticipant(const core::OperationIntentDTO &operation,
@@ -112,14 +115,14 @@ public:
   /// verified authored or compiler-direct Binding. Grants no runtime admission.
   [[nodiscard]] core::Result<deployment::RuntimeProgramTargetBinding>
   ResolveBoundTarget(const deployment::ProgramBinding &binding,
-                     const core::TargetRoleId &target_role_id,
+                     const core::ProgramTargetReferenceDTO &target,
                      const core::CapabilityId &capability_id) const;
 
   /// Resolve a read against the same immutable product as admission. This
   /// neither creates an OperationIntent nor grants execution authority.
   [[nodiscard]] core::Result<ResolvedTargetObservation>
   ResolveObservationTarget(const core::ProgramBindingId &program_binding_id,
-                           const core::TargetRoleId &target_role_id,
+                           const core::ProgramTargetReferenceDTO &target,
                            const core::CapabilityId &capability_id,
                            const core::RuntimeParticipantBinding &physical,
                            std::span<const core::RuntimeParticipantBinding>
@@ -136,22 +139,25 @@ public:
   SelfAndMounted(const core::ControllableComponentId &robot) const;
   [[nodiscard]] core::Result<std::vector<core::CollisionBodyId>>
   ActiveTcpContactBodies(const core::RuntimeParticipantBinding &robot_binding,
-                         const std::optional<RobotTcp> &active) const;
+                         const std::optional<ActiveTcp> &active) const;
 
   /// Resolve the current TCP for a verified bound Scene holder.
   [[nodiscard]] core::Result<core::FrameRoleId> ResolveAttachActiveTcp(
-      const core::ProgramBindingId &binding_id, const core::TargetRoleId &holder_role,
-      const std::function<std::optional<RobotTcp>(const core::ControllableComponentId &)> &read) const;
+      const core::ProgramBindingId &binding_id, const core::ProgramTargetReferenceDTO &holder,
+      const std::function<std::optional<ActiveTcp>(const core::ControllableComponentId &)> &read) const;
+
+  [[nodiscard]] core::Result<core::ProgramFrameBindingDTO> ResolveObservationFrame(
+      const core::ProgramFrameReferenceDTO &reference) const;
 
   [[nodiscard]] bool FrameObservationCovered(
-      const core::ProgramFrameRoleBindingDTO &frame,
+      const core::ProgramFrameBindingDTO &frame,
       const core::RuntimeParticipantBinding &observed_binding) const;
 
   /// Resolve portable control scope from the verified Program Binding only.
   /// Operation identity and eligibility still come from the Kernel.
-  [[nodiscard]] core::Result<core::ProgramTargetRoleBindingDTO>
+  [[nodiscard]] core::Result<core::ProgramTargetBindingDTO>
   ResolveOperationTarget(const core::ProgramBindingId &program_binding_id,
-                         const core::TargetRoleId &target_role_id) const;
+                         const core::ProgramTargetReferenceDTO &target) const;
 
   /// Declarative qualified retained stages for the exact Applied bound route.
   /// No current readiness, preparation or execution authority is asserted.
@@ -187,17 +193,17 @@ private:
 
   [[nodiscard]] std::shared_ptr<const deployment::ProgramBinding>
   LoadProgramBinding(const core::ProgramBindingId &program_binding_id) const;
-  /// Active TCP (M7): the selector's row of `rows`, the `carries` check and
+  /// Active TCP: the selector's row of `rows`, the `carries` check and
   /// the endpoint (labelled with `role`, the owner's contact bodies).
   [[nodiscard]] core::Result<core::RuntimeMotionEndpointBindingDTO>
   ResolveRobotTcp(const core::TcpSelectorDTO &selector,
                   const core::ControllableComponentId &robot,
                   std::span<const RobotTcp> rows,
-                  const std::optional<core::TcpEntryDTO> &active,
-                  const std::function<std::optional<core::TcpEntryDTO>(
-                      const core::TargetRoleId &)> &default_tcp_of_role,
-                  const std::function<std::pair<core::ComponentRoleId, core::TargetRoleId>(
-                      const core::TcpEntryDTO &)> &role_of,
+                  const std::optional<core::TcpEntryReferenceDTO> &active,
+                  const std::function<std::optional<core::TcpEntryReferenceDTO>(
+                      const core::ProgramTargetReferenceDTO &)> &default_tcp_of_target,
+                  const std::function<std::optional<std::vector<core::CollisionBodyRoleId>>(
+                      const core::TcpEntryReferenceDTO &)> &contact_roles_of,
                   bool joint_goal = false) const;
   [[nodiscard]] std::shared_ptr<const deployment::ProgramBindingContract>
   LoadProgram(const core::ProgramId &program_id,
@@ -206,6 +212,7 @@ private:
   const std::filesystem::path package_root_;
   deployment::FilesystemVerifiedProgramSource programs_;
   deployment::FilesystemVerifiedProgramBindingSource bindings_;
+  deployment::FilesystemVerifiedCatalogArtifactSource catalog_;
   // Program Apply publishes immutable, content-addressed Programs and Bindings
   // outside the installed package. Exact point reads prefer that repository
   // and fall back to the installed baseline; neither source is enumerated.

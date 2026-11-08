@@ -48,13 +48,48 @@ MOTION_CONTROLLED_STOP_SCHEMA_ID: Final = (
 MOTION_CONTROLLED_STOP_SCHEMA_REVISION: Final = (
     "sha256:65e6f4462981225916834490d4e3cb4d42b70611a2287e1b76fdb1cbcabcb113"
 )
-# R7 D12: the xArm-family arm and gripper lifecycle providers.
+# The xArm-family arm and gripper lifecycle providers.
 XARM_LIFECYCLE_PROVIDER_ID: Final = "xarm_arm_provider"
 XARM_GRIPPER_LIFECYCLE_PROVIDER_ID: Final = "xarm_gripper_provider"
 LIFECYCLE_INTENTS: Final = ("disable", "enable", "observe", "prepare", "recover")
 ROS2_CONTROL_PROVIDER_ID: Final = "manyforge.provider.ros2_control"
 
 CAPABILITIES: Final = {
+    "simulator.control.step": (
+        "sha256:9fd7cae735d502dc7876c5e176f8dc134691476940c18a487ba04e27cf23cd33",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "execution.interrupt.resource_scoped": (
+        "sha256:ea0a625d949b1287de5b1eb0ed1e9d400d927f86c62c00b63c69898bdc58da36",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "execution.interrupt.contact_policy": (
+        "sha256:91fa92a90ddf807623ae9a42a97c37cd4d9628b1961e572b28a928e0da4dd98d",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "simulator.control.reset": (
+        "sha256:7ed06295945087622e96dcd91e390a402898be91e1f94233f5c93daa35dfe23a",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "simulator.control.pause": (
+        "sha256:155d3628cea7b682bd95c1126776aa7314e751fadf9b383e3e3730894fe7c9d3",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "simulator.control.play": (
+        "sha256:345e9790ff50444eb6c26ff685093fccd17fb98c9e631b6a4fc7e70c9ea16405",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "simulator.entity_state.set": (
+        "sha256:cd72b14a50066a268c347d524169ef26d675bf9ec425e6130b84a841b0c6ac79",
+        "cell_global",
+        "capability_provider_binding",
+    ),
     "io.gpio.set_output": (
         "sha256:b7f9e3ae6ed12dd59fd78193db902c6ad09528372ad0f5e2423f936833cb49f8",
         "target_binding",
@@ -551,7 +586,7 @@ def component_type_document(
 ) -> dict[str, Any]:
     """Return a component type of one model family.
 
-    Merge 6: a family without arm joints is a tool (its `gripper` target
+    A family without arm joints is a tool (its `gripper` target
     only, mounted through its root interface `mount`); a robot without
     gripper geometry offers its `flange` to one tool.
     """
@@ -566,7 +601,7 @@ def component_type_document(
     }
     frame_roles = {row["frame_role_id"] for row in semantics["frame_role_bindings"]}
     # A robot whose model carries no gripper geometry mounts its tool as a
-    # separate component on `flange`; its `tcp` is then the tool's (D1).
+    # separate component on `flange`; its `tcp` is then the tool's.
     offers_flange = "gripper_collision" not in collision_roles
     arm_collision_roles = [
         {
@@ -653,7 +688,7 @@ def component_type_document(
 def tool_component_type_document(
     family: dict[str, Any], *, runtime_scaling: bool = True
 ) -> dict[str, Any]:
-    """Return the component type of a tool family (merge 6).
+    """Return the component type of a tool family.
 
     One `gripper` target on model role `tool_model`; the component root and
     the `mount` interface are the tool's root frame, the robot flange plane.
@@ -735,7 +770,7 @@ def tool_component_type_document(
             }
         ],
     }
-    # TCP-A (merge 6): tag the tool's TCPs and its default.
+    # Tag the tool's TCPs and its default.
     with_tcps(value, family)
     return revisioned_document(
         value,
@@ -746,13 +781,13 @@ def tool_component_type_document(
 
 
 def with_tcps(value: dict[str, Any], family: dict[str, Any]) -> None:
-    """Tag the TCPs of one component type (merge 6, TCP-A).
+    """Tag the TCPs of one component type.
 
     The rows are rules over the family's frame roles:
 
     - ``arm`` (the motion target) exposes the asset's ``flange`` and tags it
       and its ``tcp`` (when exposed) as TCPs; the default is ``tcp``, else
-      ``flange``. With a tool mounted, D1 still resolves ``{arm, tcp}`` to the
+      ``flange``. With a tool mounted, ``{arm, tcp}`` still resolves to the
       tool's default TCP.
     - ``gripper`` tags its ``tcp``, its default.
     - An asset offset frame role (``pose_in_source_link``) is a TCP of the
@@ -1176,7 +1211,7 @@ def ros2_control_provider_manifest(
 
 
 def gripper_logical_cancel_stop_policy() -> dict[str, Any]:
-    # DX-755/Q58: command invalidation is logical evidence, not ROS ACK or rest.
+    # Command invalidation is logical evidence, not ROS ACK or rest.
     contract_ref = gripper_logical_cancel_provider_contract_ref()
     value = {
         "api_version": "manyforge.stop_evidence_policy.v2",
@@ -1223,7 +1258,7 @@ def gripper_logical_cancel_stop_policy() -> dict[str, Any]:
 
 
 def gripper_position_cancel_stop_policy() -> dict[str, Any]:
-    # DX-775: stock action cancellation holds; logical evidence claims no rest.
+    # Stock action cancellation holds; logical evidence claims no rest.
     value = gripper_logical_cancel_stop_policy()
     value.pop("stop_evidence_policy_revision")
     value["stop_evidence_policy_id"] = "manyforge.gripper_position_cancellation"
@@ -1571,6 +1606,17 @@ def catalog_sources(
         "io_signals": io_signal_manifest,
         "pose_source": pose_source_manifest,
         "ai_model": ai_model_manifest,
+        "simulator": provider_manifest(
+            "manyforge.provider.simulator",
+            ("simulator.control.pause", "simulator.control.play", "simulator.control.reset",
+             "simulator.control.step", "simulator.entity_state.set"),
+            [],
+        ),
+        "execution_core": provider_manifest(
+            "manyforge.provider.execution_core",
+            ("execution.interrupt.contact_policy", "execution.interrupt.resource_scoped"),
+            [],
+        ),
         "logical_scene": provider_manifest(
             "manyforge.provider.logical_scene",
             CELL_CAPABILITIES,
@@ -1652,7 +1698,7 @@ def catalog_sources(
     component_references: dict[str, dict[str, str]] = {}
     # Every family with a ROS controller profile (Isaac or offline mock, also
     # those only composed by generated multi-robot cells) has the fixed-scale
-    # ROS component type. Merge 6: every family has one.
+    # ROS component type. Every family has one.
     fixed_scale_families = {
         family["model_family_id"] for family in description["model_families"]
     }
@@ -1728,7 +1774,7 @@ def catalog_sources(
                 payload=payload,
             ),
         )
-    # R7 package 5 (2026-10-25): the build-owned C++ copy of the supervised
+    # The build-owned C++ copy of the supervised
     # Lite 6 lifecycle catalog was removed with the supervised mode;
     # manyforge_xarm_control mirrors the xArm plans above and tests the digest.
     lifecycle_outputs: list[tuple[Path, bytes, str]] = []
@@ -1878,10 +1924,10 @@ def generate(args: argparse.Namespace) -> None:
         "manyforge_deployment/resources/maintained/catalog/control_interface_contract/manyforge.native_arm_position.json",
         "manyforge_deployment/resources/maintained/catalog/control_interface_contract/manyforge.native_gripper_position.json",
         "manyforge_roboplan/resources/lifecycle/native_control.lifecycle_plan_catalog.json",
-        # R7 D12 (2026-10-25): renamed to xarm_arm_provider/xarm_gripper_provider.
+        # Renamed to xarm_arm_provider/xarm_gripper_provider.
         "manyforge_deployment/resources/maintained/catalog/provider_manifest/lite6_arm_provider.json",
         "manyforge_deployment/resources/maintained/catalog/provider_manifest/lite6_gripper_provider.json",
-        # Merge 6: the Real Lite 6 profile now selects the split `lite6` arm,
+        # The Real Lite 6 profile now selects the split `lite6` arm,
         # which needs no arm-only variant.
         "manyforge_deployment/resources/maintained/catalog/component_type/lite6_lite_gripper.fixed_scale.arm_only.component.json",
     ):

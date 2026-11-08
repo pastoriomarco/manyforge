@@ -1,14 +1,25 @@
 import { readFileSync } from 'node:fs';
+import { act, useReducer } from 'react';
+import { createRoot } from 'react-dom/client';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { RobotControlPanel, RobotControlPanelView } from './RobotControlPanel';
+import { formatClearanceDistanceMm, RobotControlPanel, RobotControlPanelView } from './RobotControlPanel';
+import { DraftInputResetProvider } from './common/DraftInputs';
 import { useRobotControl } from '../hooks/useRobotControl';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { LogicalSceneProjection } from '../types/api';
 import { buildGripperCommandIntent, initialRobotControlState, robotControlReducer, selectedStatusForState } from '../state/robotControl';
-import { gripperReceiptFixture, statusFixture } from '../testFixtures/robotControl';
+import { gripperReceiptFixture, readyState, statusFixture } from '../testFixtures/robotControl';
 import { tcpEntryIdentityKey } from '../types/robotControl';
+
+it('rounds clearance distances around 10 mm and preserves negative values', () => {
+  expect(formatClearanceDistanceMm(0.6133268110570969)).toBe('0.61 mm');
+  expect(formatClearanceDistanceMm(9.999)).toBe('10 mm');
+  expect(formatClearanceDistanceMm(10)).toBe('10.0 mm');
+  expect(formatClearanceDistanceMm(-0.6133268110570969)).toBe('-0.61 mm');
+  expect(formatClearanceDistanceMm(-10)).toBe('-10.0 mm');
+});
 
 const controller = vi.hoisted(() => ({
   state: {
@@ -22,11 +33,10 @@ const controller = vi.hoisted(() => ({
       directControl: {
         controllableComponentId: 'robot-1',
         commandTargetId: 'arm',
-        componentRoleId: 'controlled_component',
-        targetRoleId: 'command_target',
+        baseFrame: { componentId: 'robot-1', frameId: 'base' },
         baseFrameRoleId: 'base',
         tcpFrameRoleId: 'tcp',
-        activeTcp: { entry: { componentId: 'robot-1', targetId: 'arm', frameRoleId: 'tcp' }, display: 'robot-1.tcp',
+        activeTcp: { entry: { componentId: 'robot-1', targetId: 'arm', frameComponentId: 'robot-1', frameRoleId: 'tcp' }, display: 'robot-1.tcp',
           ownerEpoch: 'owner-1', registrationGeneration: 1, sequence: 0 },
         operationCapabilityId: 'execution.trajectory.execute',
         planningCapabilityIds: ['planning.motion.joint_goal'],
@@ -43,18 +53,16 @@ const controller = vi.hoisted(() => ({
           maxAccelerationRadS2: 3,
         }],
         targetDescriptor: {
-          schemaVersion: 'manyforge.manual_control_motion_descriptor.v6',
+          schemaVersion: 'manyforge.manual_control_motion_descriptor.v8',
           ordinaryJerk: null,
           controllableComponentId: 'robot-1', commandTargetId: 'arm',
           endEffectorComponentId: null,
-          componentRoleId: 'controlled_component', targetRoleId: 'command_target',
           frames: [
-            { frameRoleId: 'base', compiledFrameName: 'base_link', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
-            { frameRoleId: 'tcp', compiledFrameName: 'tool0', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
+            { frameComponentId: 'robot-1', frameRoleId: 'base', compiledFrameName: 'base_link', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
+            { frameComponentId: 'robot-1', frameRoleId: 'tcp', compiledFrameName: 'tool0', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
           ],
           tcps: [{
-            entry: { componentId: 'robot-1', targetId: 'arm', frameRoleId: 'tcp' },
-            targetRoleId: 'command_target', controllableComponentId: 'robot-1', commandTargetId: 'arm',
+            entry: { componentId: 'robot-1', targetId: 'arm', frameComponentId: 'robot-1', frameRoleId: 'tcp' }, controllableComponentId: 'robot-1', commandTargetId: 'arm',
             frameRoleId: 'tcp', qualifiedName: 'robot-1.tcp', compiledFrameName: 'tool0',
             modelInstanceId: 'robot-model', modelRevision: 'sha256:model', isDefault: true,
             mountedHere: true, mountedElsewhere: false, contactBodyRoleIds: [],
@@ -78,8 +86,6 @@ const controller = vi.hoisted(() => ({
       directControlGripper: {
         controllableComponentId: 'robot-1',
         commandTargetId: 'gripper',
-        componentRoleId: 'controlled_component',
-        targetRoleId: 'command_target',
         operationCapabilityId: 'tool.gripper.command',
         programId: 'manyforge.direct_control.gripper',
         programRevision: 'sha256:gripper-program',
@@ -93,8 +99,8 @@ const controller = vi.hoisted(() => ({
         minPosition: 0,
         maxPosition: 0.04,
         targetDescriptor: {
-          schemaVersion: 'manyforge.manual_control_gripper_descriptor.v3',
-          controllableComponentId: 'robot-1', commandTargetId: 'gripper', componentRoleId: 'controlled_component', targetRoleId: 'command_target',
+          schemaVersion: 'manyforge.manual_control_gripper_descriptor.v5',
+          controllableComponentId: 'robot-1', commandTargetId: 'gripper',
           description: 'Test gripper', commandKind: 'gripper_position',
           actuationKind: 'position_commanded', transportKind: 'resolved_binding',
           outputMode: 'commanded',
@@ -113,7 +119,6 @@ const controller = vi.hoisted(() => ({
         },
       },
       observedMotion: {
-        targetRoleId: 'arm',
         controllableComponentId: 'robot-1',
         commandTargetId: 'arm',
         sequence: 1,
@@ -209,7 +214,140 @@ vi.mock('../hooks/useRobotControl', () => ({
     manualControlAllowed: true, manualControlUnavailableReason: null }),
 }));
 
+function robotPanelHost() {
+  const elements: Record<string, unknown>[] = [];
+  const document: Record<string, unknown> = {
+    nodeType: 9, activeElement: null, defaultView: {},
+    addEventListener: () => undefined, removeEventListener: () => undefined,
+    createTextNode: (text: string) => ({ nodeType: 3, nodeValue: text, ownerDocument: document }),
+  };
+  const node = (tag: string) => {
+    const listeners = new Map<string, Array<(event: unknown) => void>>();
+    const element: Record<string, unknown> = {
+      nodeType: 1, nodeName: tag.toUpperCase(), tagName: tag.toUpperCase(),
+      namespaceURI: 'http://www.w3.org/1999/xhtml', ownerDocument: document, options: [],
+      style: { setProperty: () => undefined, removeProperty: () => undefined },
+      addEventListener: (type: string, listener: (event: unknown) => void) => {
+        listeners.set(type, [...(listeners.get(type) ?? []), listener]);
+      },
+      removeEventListener: (type: string, listener: (event: unknown) => void) => {
+        listeners.set(type, (listeners.get(type) ?? []).filter((candidate) => candidate !== listener));
+      },
+      dispatchEvent: (event: { type: string }) => {
+        for (const listener of listeners.get(event.type) ?? []) listener(event);
+        return true;
+      },
+      appendChild: () => undefined, insertBefore: () => undefined, removeChild: () => undefined,
+      setAttribute: () => undefined, removeAttribute: () => undefined,
+      querySelectorAll: () => [], matches: () => false,
+      focus: () => { document.activeElement = element; },
+      blur: () => { document.activeElement = null; },
+    };
+    elements.push(element);
+    return element;
+  };
+  document.createElement = node;
+  document.documentElement = node('html');
+  const window = { document, HTMLIFrameElement: class {} };
+  document.defaultView = window;
+  class Observer {
+    observe() {}
+    disconnect() {}
+  }
+  vi.stubGlobal('window', window);
+  vi.stubGlobal('document', document);
+  vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+  vi.stubGlobal('ResizeObserver', Observer);
+  vi.stubGlobal('MutationObserver', Observer);
+  vi.stubGlobal('requestAnimationFrame', (callback: () => void) => { callback(); return 0; });
+  vi.stubGlobal('cancelAnimationFrame', () => undefined);
+  const props = (element: Record<string, unknown>) => element[
+    Object.keys(element).find((key) => key.startsWith('__reactProps$')) ?? ''
+  ] as Record<string, unknown> | undefined;
+  const findElement = (label: string) => {
+    const found = elements.filter((element) => props(element)?.['aria-label'] === label).at(-1);
+    if (found === undefined) throw new Error(`Mounted Robot input not found: ${label}`);
+    return found;
+  };
+  const findButton = (label: string) => {
+    const found = elements.map((element) => ({ element, props: props(element) }))
+      .filter(({ props: candidate }) => candidate?.type === 'button' && candidate.children === label).at(-1);
+    if (found === undefined) throw new Error(`Mounted Robot button not found: ${label}`);
+    return found;
+  };
+  return { document, host: node('div'), findElement, findButton, props };
+}
+
+afterEach(() => vi.unstubAllGlobals());
+
 describe('RobotControlPanel layout', () => {
+  it('renders manual control modes in their intended order', () => {
+    const markup = renderToStaticMarkup(<RobotControlPanel enabled />);
+    const modeNav = markup.match(/<nav class="robot-control-modes dseg"[^>]*>([\s\S]*?)<\/nav>/)?.[1] ?? '';
+    const labels = Array.from(modeNav.matchAll(/<button[^>]*>([^<]+)<\/button>/g), (match) => match[1]);
+    expect(labels).toEqual(['Joint', 'Pose plan', 'Cartesian', 'Move To', 'Gripper']);
+  });
+
+  it('keeps RobotNumberInput local rebases and global Scenario resets independent without blurring', async () => {
+    const status = statusFixture();
+    const state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
+    const base = useRobotControl(true);
+    const panelController: ReturnType<typeof useRobotControl> = {
+      ...base,
+      state,
+      selectedStatus: selectedStatusForState(state),
+      motionTargets: [status.directControl!],
+      gripperTargets: [status.directControlGripper!],
+      manualControlAllowed: true,
+      manualControlUnavailableReason: null,
+      setManualPanelVisible: vi.fn(),
+      reportAuthoringPending: vi.fn(),
+    };
+    const host = robotPanelHost();
+    const root = createRoot(host.host as unknown as Element);
+    const render = (scenarioKey: string) => act(() => root.render(
+      <DraftInputResetProvider scope="scenario" resetKey={scenarioKey}>
+        <RobotControlPanelView enabled controller={panelController} />
+      </DraftInputResetProvider>,
+    ));
+    const inputLabel = 'Manual Velocity scale (%)';
+    const inputProps = () => host.props(host.findElement(inputLabel))!;
+    const typeInvalid = async () => {
+      const input = host.findElement(inputLabel);
+      (input.focus as () => void)();
+      await act(() => (inputProps().onFocus as (event: unknown) => void)({}));
+      (input as { value: string }).value = 'not-a-number';
+      await act(() => (input.dispatchEvent as (event: unknown) => boolean)({
+        type: 'input', inputType: 'insertText', isComposing: false,
+      }));
+    };
+    try {
+      await render('scenario-0');
+      const input = host.findElement(inputLabel);
+      await typeInvalid();
+      expect(inputProps().value).toBe('not-a-number');
+      expect(inputProps()['aria-invalid']).toBe(true);
+
+      const revert = host.findButton('Revert');
+      expect(revert.props?.disabled).not.toBe(true);
+      await act(() => (revert.props?.onClick as (() => void) | undefined)?.());
+      expect(host.findElement(inputLabel)).toBe(input);
+      expect(inputProps().value).toBe('100');
+      expect(inputProps()['aria-invalid']).not.toBe(true);
+
+      await typeInvalid();
+      expect(inputProps()['aria-invalid']).toBe(true);
+      await render('scenario-1');
+      expect(host.findElement(inputLabel)).toBe(input);
+      expect(host.document.activeElement).toBe(input);
+      expect(inputProps().value).toBe('100');
+      expect(inputProps()['aria-invalid']).not.toBe(true);
+    } finally {
+      await act(() => root.unmount());
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('TCP-C: lists the robot\'s and the mounted tool\'s TCPs, the default selected', () => {
     const status = statusFixture();
     const row = status.directControl!.targetDescriptor.tcps[0];
@@ -217,17 +355,14 @@ describe('RobotControlPanel layout', () => {
       { ...row, qualifiedName: 'lite_gripper.tcp' },
       { ...row, entry: { ...row.entry, frameRoleId: 'flange' }, frameRoleId: 'flange',
         qualifiedName: 'robot-a.flange', compiledFrameName: 'link_eef', isDefault: false },
-      { ...row, entry: { componentId: 'lite_gripper', targetId: 'gripper', frameRoleId: 'cup_edge' },
-        targetRoleId: 'mounted_tool_target', controllableComponentId: 'lite_gripper',
+      { ...row, entry: { componentId: 'lite_gripper', targetId: 'gripper', frameComponentId: 'lite_gripper', frameRoleId: 'cup_edge' }, controllableComponentId: 'lite_gripper',
         commandTargetId: 'gripper', frameRoleId: 'cup_edge', qualifiedName: 'lite_gripper.cup_edge',
         compiledFrameName: 'cup_edge_link', isDefault: false, mountedHere: true,
         mountedElsewhere: false },
-      { ...row, entry: { componentId: 'workbench_tool', targetId: 'tool', frameRoleId: 'tcp' },
-        targetRoleId: null, controllableComponentId: 'workbench_tool', commandTargetId: 'tool',
+      { ...row, entry: { componentId: 'workbench_tool', targetId: 'tool', frameComponentId: 'workbench_tool', frameRoleId: 'tcp' }, controllableComponentId: 'workbench_tool', commandTargetId: 'tool',
         frameRoleId: 'tcp', qualifiedName: 'workbench_tool.tcp', isDefault: false,
         mountedHere: false, mountedElsewhere: true },
-      { ...row, entry: { componentId: 'second_target', targetId: 'tool', frameRoleId: 'tcp' },
-        targetRoleId: null, controllableComponentId: 'second_target', commandTargetId: 'tool',
+      { ...row, entry: { componentId: 'second_target', targetId: 'tool', frameComponentId: 'second_target', frameRoleId: 'tcp' }, controllableComponentId: 'second_target', commandTargetId: 'tool',
         frameRoleId: 'tcp', qualifiedName: 'second_target.tcp', isDefault: false,
         mountedHere: true, mountedElsewhere: false },
     ];
@@ -242,9 +377,9 @@ describe('RobotControlPanel layout', () => {
       manualControlAllowed: true, manualControlUnavailableReason: null };
     const markup = renderToStaticMarkup(<RobotControlPanelView enabled controller={panelController} />);
     expect(markup).toContain('aria-label="Robot Control TCP"');
-    expect(markup).toContain('<option value="[&quot;robot-a&quot;,&quot;arm&quot;,&quot;tcp&quot;]" selected="">lite_gripper.tcp (default)</option>');
-    expect(markup).toContain('<option value="[&quot;robot-a&quot;,&quot;arm&quot;,&quot;flange&quot;]">robot-a.flange</option>');
-    expect(markup).toContain('<option value="[&quot;lite_gripper&quot;,&quot;gripper&quot;,&quot;cup_edge&quot;]">lite_gripper.cup_edge</option>');
+    expect(markup).toContain('<option value="[&quot;robot-a&quot;,&quot;arm&quot;,&quot;robot-a&quot;,&quot;tcp&quot;]" selected="">lite_gripper.tcp (default)</option>');
+    expect(markup).toContain('<option value="[&quot;robot-a&quot;,&quot;arm&quot;,&quot;robot-a&quot;,&quot;flange&quot;]">robot-a.flange</option>');
+    expect(markup).toContain('<option value="[&quot;lite_gripper&quot;,&quot;gripper&quot;,&quot;lite_gripper&quot;,&quot;cup_edge&quot;]">lite_gripper.cup_edge</option>');
     expect(markup).toContain('Show TCPs of tools mounted on other robots');
     expect(markup).not.toContain('workbench_tool.tcp');
   });
@@ -271,8 +406,7 @@ describe('RobotControlPanel layout', () => {
     const baseTcp = status.directControl!.targetDescriptor.tcps[0];
     const toolTcp = {
       ...baseTcp,
-      entry: { componentId: 'lite_gripper', targetId: 'gripper', frameRoleId: 'cup_edge' },
-      targetRoleId: 'mounted_tool_target',
+      entry: { componentId: 'lite_gripper', targetId: 'gripper', frameComponentId: 'lite_gripper', frameRoleId: 'cup_edge' },
       controllableComponentId: 'lite_gripper', commandTargetId: 'gripper',
       frameRoleId: 'cup_edge', qualifiedName: 'lite_gripper.cup_edge',
       compiledFrameName: 'cup_edge_link', isDefault: false,
@@ -290,7 +424,6 @@ describe('RobotControlPanel layout', () => {
     ))!;
     changedRow.mountedHere = false;
     changedRow.mountedElsewhere = true;
-    changedRow.targetRoleId = null;
     delete unmounted.observedMotion!.tcpPoses[key];
     state = robotControlReducer(state, { type: 'status_refreshed', status: unmounted });
     state = robotControlReducer(state, { type: 'select_mode', mode: 'cartesian_path' });
@@ -328,7 +461,6 @@ describe('RobotControlPanel layout', () => {
     const row = status.directControl!.targetDescriptor.tcps[0];
     row.mountedHere = false;
     row.mountedElsewhere = true;
-    row.targetRoleId = null;
     status.directControl!.selectedTcpEntryKey = tcpEntryIdentityKey(row.entry);
     status.observedMotion!.currentTcpPose = null;
     status.observedMotion!.tcpPoses = {};
@@ -340,6 +472,23 @@ describe('RobotControlPanel layout', () => {
     };
     const markup = renderToStaticMarkup(<RobotControlPanelView enabled controller={panelController} />);
     expect(markup).toMatch(/class="approve-button"(?![^>]*disabled)[^>]*>/);
+  });
+
+  it('gives a Linear Move To the Cartesian tab\'s straight-line settings', () => {
+    const status = statusFixture();
+    const controller = useRobotControl(true);
+    const ready = controller.state;
+    const render = (moveToPath: 'free' | 'linear') => {
+      const state = { ...ready, status, mode: 'move_to' as const, moveToKind: 'pose' as const, moveToPath };
+      const panelController: ReturnType<typeof useRobotControl> = {
+        ...controller, state, selectedStatus: status, motionTargets: [status.directControl!],
+        manualControlAllowed: true, manualControlUnavailableReason: null,
+      };
+      return renderToStaticMarkup(<RobotControlPanelView enabled controller={panelController} />);
+    };
+    expect(render('free')).not.toContain('Lin. Tol. (m)');
+    expect(render('linear')).toContain('Lin. Tol. (m)');
+    expect(render('linear')).toContain('TCP Ang. (deg/s)');
   });
 
   it('B1: without an end-effector TCP offers joint jog only, with a plain note', () => {
@@ -368,7 +517,7 @@ describe('RobotControlPanel layout', () => {
     }
     expect(markup).toContain('No TCP: joint jog only. Choose a TCP for Cartesian moves.');
     expect(markup).toContain('<option value="" disabled="" selected="">No End-effector TCP; choose one</option>');
-    expect(markup).toContain('<option value="[&quot;robot-a&quot;,&quot;arm&quot;,&quot;flange&quot;]">robot-a.flange</option>');
+    expect(markup).toContain('<option value="[&quot;robot-a&quot;,&quot;arm&quot;,&quot;robot-a&quot;,&quot;flange&quot;]">robot-a.flange</option>');
   });
 
   it('does not offer Set TCP when the robot has no owner status', () => {
@@ -455,10 +604,11 @@ describe('RobotControlPanel layout', () => {
     const state = controller.state as unknown as Record<string, unknown>;
     const previous = { ...state };
     const node = (id: string) => ({ instance_id: id, node_id: 'motion.move_to_joint_target',
-      parameters: { target_role: 'arm', goal: [{ joint_name: 'joint_1', position_rad: 0.2 }] }, children: [] });
+      parameters: { target: { component_id: 'robot-1', command_target_id: 'arm' },
+        goal: [{ joint_name: 'joint_1', position_rad: 0.2 }] }, children: [] });
     const applied = { graphRevision: 'sha256:graph', retainedBundleId: 'sha256:bundle',
-      program: { tree: node('applied-goal') }, programBinding: { target_role_bindings: [
-        { target_role_id: 'arm', controllable_component_id: 'robot-1', command_target_id: 'arm' },
+      program: { tree: node('applied-goal') }, programBinding: { target_bindings: [
+        { target: { component_id: 'robot-1', command_target_id: 'arm' } },
       ] } };
     const program = { state: { applied, controlPending: null } } as unknown as ProgramRuntimeController;
     try {
@@ -606,6 +756,8 @@ describe('RobotControlPanel layout', () => {
     expect(markup).not.toContain('Edits validate a no-motion preview after 150 ms.');
     expect(markup).toContain('>Approve</button>');
     expect(markup).toContain('>Stop operation</button>');
+    expect(markup).not.toContain('Use in node');
+    expect(markup).not.toContain('Use in node:');
     expect(markup).toContain('title="Discard only the local no-motion preview."');
     expect(markup).not.toContain('Revert only discards the local preview.');
   });
@@ -677,4 +829,193 @@ describe('RobotControlPanel layout', () => {
     expect(start).toBeGreaterThan(0);
     expect(key).not.toMatch(/scene|revision_id|content_hash/i);
   });
+});
+
+it('shows sampled diagnostic controls, the exact guidance, and no approval', () => {
+  const status = statusFixture();
+  const state = { ...initialRobotControlState, status, phase: 'blocked' as const,
+    diagnosticPreview: { sourceJointNames: ['joint'], pairs: [], samples: [
+      { timeFromStartS: 0, positionsRad: [0], contacts: [], status: 'unknown' as const },
+    ] }, previewSampleIndex: 0 };
+  const panelController = { ...useRobotControl(true), state, selectedStatus: status,
+    motionTargets: [status.directControl!], manualControlAllowed: true, manualControlUnavailableReason: null };
+  const markup = renderToStaticMarkup(<RobotControlPanelView enabled controller={panelController} />);
+  expect(markup).toContain('Play or drag along the planned path to see where parts touch.');
+  expect(markup).toContain('Blue: checked, no contact. Yellow: contact your settings allow. Orange: closer than clearance. Red: contact not allowed, or still touching at the end. Grey: unknown.');
+  expect(markup.match(/Approve is disabled\./g)).toHaveLength(1);
+  expect(markup).toContain('Approve is disabled. Check the preview details.');
+  expect(markup).toContain('aria-label="Preview sample"');
+});
+
+it('explains the shown sample contact using its resolved link and object', () => {
+  const status = statusFixture();
+  const state = { ...initialRobotControlState, status, phase: 'blocked' as const,
+    diagnosticPreview: { sourceJointNames: ['joint'], pairs: [
+      { bodyA: 'component/robot/model/model/body/arm/collision/0', bodyB: 'scene/part/shape/0' },
+    ], samples: [
+      { timeFromStartS: 0, positionsRad: [0], status: 'checked' as const, contacts: [] },
+      { timeFromStartS: 1, positionsRad: [0], status: 'checked' as const, contacts: [{ pairIndex: 0, disposition: 'refused' as const }] },
+    ] }, previewSampleIndex: 1 };
+  const panelController = { ...useRobotControl(true), state, selectedStatus: status,
+    motionTargets: [status.directControl!], manualControlAllowed: true, manualControlUnavailableReason: null };
+  const sourceModel = { targets: [{ component_id: 'robot', collision_bodies: [
+    { model_instance_id: 'model', collision_body_role_id: 'arm', source_link_names: ['link5'] },
+  ] }], occurrences: [{ component_id: 'robot', model_instance_id: 'model', links: [
+    { source_link_name: 'link5', viewer_link_name: 'mf1_link_abc123' },
+  ] }] } as unknown as import('../types/api').SourceModelProjection;
+  const objects = [{ scene_resource_id: 'part', collision_shapes: [{}] }] as unknown as import('../types/api').LogicalSceneObject[];
+  const markup = renderToStaticMarkup(<RobotControlPanelView enabled controller={panelController}
+    previewSourceModel={sourceModel} previewSceneObjects={objects} />);
+  expect(markup).toContain('robot · link5 ↔ part: collision (not allowed)');
+  expect(markup).toContain('title="mf1_link_abc123"');
+  expect(markup).not.toContain('mf1_link_abc123 ↔ part');
+  const unmappedMarkup = renderToStaticMarkup(<RobotControlPanelView enabled controller={panelController} previewSceneObjects={objects} />);
+  expect(unmappedMarkup).toContain('component/robot/model/model/body/arm/collision/0 ↔ part');
+  expect(unmappedMarkup).not.toContain('mf1_link_abc123');
+  expect(markup).toContain('Blue: clear · Yellow: allowed · Orange: too close · Red: collision · Grey: unknown');
+
+  const clearanceState = { ...state, diagnosticPreview: { ...state.diagnosticPreview,
+    schemaVersion: 'manyforge.motion_preview_diagnostic.v2' as const, kind: 'collision_disabled_path' as const,
+    reason: 'planning_failed', samples: [{ ...state.diagnosticPreview.samples[1], status: 'unknown' as const,
+      contacts: [], clearanceViolations: [{ pairIndex: 0, distanceM: 0.0006133268110570969, requiredClearanceM: .001 }] }] }, previewSampleIndex: 0 };
+  const clearanceMarkup = renderToStaticMarkup(<RobotControlPanelView enabled controller={{ ...panelController, state: clearanceState }}
+    previewSourceModel={sourceModel} previewSceneObjects={objects} />);
+  expect(clearanceMarkup).toContain('robot · link5 ↔ part: closer than clearance (0.61 mm &lt; 1 mm)');
+  expect(clearanceMarkup).toContain('title="mf1_link_abc123 · Exact distances: 0.6133268110570969 mm &lt; 1 mm"');
+  expect(clearanceMarkup).toContain('Lower the manual Clearance in Speed &amp; acceleration → Advanced, or use an offset.');
+  expect(clearanceMarkup).toContain('Approve is disabled');
+  expect(clearanceMarkup).not.toContain('it collides here');
+  const checkedClearance = { ...clearanceState, diagnosticPreview: { ...clearanceState.diagnosticPreview,
+    samples: [{ ...clearanceState.diagnosticPreview.samples[0], status: 'checked' as const }] } };
+  const checkedMarkup = renderToStaticMarkup(<RobotControlPanelView enabled controller={{ ...panelController, state: checkedClearance }}
+    previewSourceModel={sourceModel} previewSceneObjects={objects} />);
+  expect(checkedMarkup).toContain('robot · link5 ↔ part: closer than clearance');
+  expect(checkedMarkup).not.toContain('No contacts');
+  expect(checkedMarkup).not.toContain('shows no contacts');
+
+  const ikFallbackSamples = [
+    { ...clearanceState.diagnosticPreview.samples[0], timeFromStartS: 0, positionsRad: [0],
+      status: 'checked' as const, contacts: [], clearanceViolations: [] },
+    { ...clearanceState.diagnosticPreview.samples[0], timeFromStartS: 1, positionsRad: [0.1],
+      status: 'checked' as const, contacts: [{ pairIndex: 0, disposition: 'refused' as const }], clearanceViolations: [] },
+  ];
+  const ikFallback = { ...clearanceState, diagnosticPreview: { ...clearanceState.diagnosticPreview,
+    kind: 'collision_disabled_ik_path' as const, reason: 'ik_pose_collision', samples: ikFallbackSamples }, previewSampleIndex: 1 };
+  const ikFallbackMarkup = renderToStaticMarkup(<RobotControlPanelView enabled controller={{ ...panelController, state: ikFallback }}
+    previewSourceModel={sourceModel} previewSceneObjects={objects} />);
+  expect(ikFallbackMarkup).toContain('No collision-free pose: showing a path to the pose planned with collisions ignored; it collides here. (ik_pose_collision)');
+  expect(ikFallbackMarkup).toContain('robot · link5 ↔ part: collision (not allowed)');
+  expect(ikFallbackMarkup).toContain('aria-label="Preview sample"');
+  expect(ikFallbackMarkup).toMatch(/class="approve-button"[^>]*disabled=""/);
+  const ikFallbackFirstSample = { ...ikFallback, previewSampleIndex: 0 };
+  const firstSampleMarkup = renderToStaticMarkup(<RobotControlPanelView enabled controller={{ ...panelController, state: ikFallbackFirstSample }}
+    previewSourceModel={sourceModel} previewSceneObjects={objects} />);
+  expect(firstSampleMarkup).toContain('No collision-free pose: showing a path to the pose planned with collisions ignored; collision evidence is shown below. (ik_pose_collision)');
+  expect(firstSampleMarkup).toContain('No contacts');
+
+  const moreObjects = ['a', 'b', 'c', 'd', 'e', 'f'].map((scene_resource_id) => ({ scene_resource_id, collision_shapes: [{}] })) as unknown as import('../types/api').LogicalSceneObject[];
+  const many = { ...state, diagnosticPreview: { ...state.diagnosticPreview,
+    pairs: moreObjects.map((object) => ({
+      bodyA: 'component/robot/model/model/body/arm/collision/0', bodyB: `scene/${object.scene_resource_id}/shape/0`,
+    })),
+    samples: [state.diagnosticPreview.samples[0], { ...state.diagnosticPreview.samples[1],
+      contacts: moreObjects.map((_, pairIndex) => ({ pairIndex, disposition: pairIndex === 3 ? 'refused' as const : 'allowed' as const })) }],
+  } };
+  const manyMarkup = renderToStaticMarkup(<RobotControlPanelView enabled controller={{ ...panelController, state: many }}
+    previewSourceModel={sourceModel} previewSceneObjects={moreObjects} />);
+  expect(manyMarkup.indexOf('robot · link5 ↔ d: collision (not allowed)')).toBeLessThan(manyMarkup.indexOf('robot · link5 ↔ a: allowed contact'));
+  expect(manyMarkup).toContain('and 2 more');
+  expect(manyMarkup).not.toContain('robot · link5 ↔ e:');
+  expect(manyMarkup).not.toContain('robot · link5 ↔ f:');
+
+  many.previewSampleIndex = 0;
+  const clearMarkup = renderToStaticMarkup(<RobotControlPanelView enabled controller={{ ...panelController, state: many }} />);
+  expect(clearMarkup).toContain('No contacts');
+  const unknown = { ...many, diagnosticPreview: { ...many.diagnosticPreview, samples: [
+    { ...many.diagnosticPreview.samples[0], status: 'unknown' as const },
+  ] } };
+  const unknownMarkup = renderToStaticMarkup(<RobotControlPanelView enabled controller={{ ...panelController, state: unknown }} />);
+  expect(unknownMarkup).toContain('Not checked');
+  expect(unknownMarkup).not.toContain('No contacts');
+});
+
+
+it('warns on a changed Scene only for a successful sampled path', () => {
+  const ready = readyState();
+  if (ready.preview?.schemaVersion !== 'manyforge.direct_control_motion_preview.v4') throw new Error('expected motion fixture');
+  const state = { ...ready, preview: { ...ready.preview,
+    pathPreview: { sourceJointNames: ['joint'], pairs: [], samples: [
+      { timeFromStartS: 0, positionsRad: [0], contacts: [], status: 'checked' as const },
+    ] } } };
+  const panelController = { ...useRobotControl(true), state, selectedStatus: state.status,
+    motionTargets: [state.status!.directControl!], manualControlAllowed: true, manualControlUnavailableReason: null };
+  const scene = { snapshot: { revision: { ...state.preview.sceneRevision, revision_id: state.preview.sceneRevision.revision_id + 1 } } } as unknown as LogicalSceneProjection;
+  const render = (value: ReturnType<typeof useRobotControl>) => renderToStaticMarkup(<RobotControlPanelView enabled controller={value} runtimeScene={scene} />);
+  expect(render(panelController)).toContain('The Scene changed after this preview.');
+  const diagnostic = { ...panelController, state: { ...state, phase: 'blocked' as const,
+    preview: null, diagnosticPreview: state.preview.pathPreview } };
+  expect(render(diagnostic)).not.toContain('The Scene changed after this preview.');
+});
+
+
+it('starts at the final sample, and Play and replay restart from sample zero', async () => {
+  vi.useFakeTimers();
+  const ready = readyState();
+  const blocked = robotControlReducer(ready, { type: 'preview_rejected',
+    generation: ready.generation, error: 'refused' });
+  const path = { sourceJointNames: ['joint_1', 'joint_2'], pairs: [], samples: [
+    { timeFromStartS: 0, positionsRad: [0, 0], contacts: [], status: 'unknown' as const },
+    { timeFromStartS: 0.4, positionsRad: [0.1, 0.2], contacts: [], status: 'unknown' as const },
+    { timeFromStartS: 1, positionsRad: [0.25, 0.5], contacts: [], status: 'unknown' as const },
+  ] };
+  const initial = robotControlReducer(blocked, { type: 'preview_diagnostic',
+    generation: blocked.generation, diagnostic: path });
+  const base = useRobotControl(true);
+  const host = robotPanelHost();
+  const window = host.document.defaultView as { setTimeout: typeof setTimeout; clearTimeout: typeof clearTimeout };
+  window.setTimeout = setTimeout;
+  window.clearTimeout = clearTimeout;
+  const root = createRoot(host.host as unknown as Element);
+  function MountedPreview() {
+    const [state, dispatch] = useReducer(robotControlReducer, initial);
+    return <RobotControlPanelView enabled controller={{
+      ...base, state, selectedStatus: selectedStatusForState(state),
+      motionTargets: [state.status!.directControl!], manualControlAllowed: true,
+      manualControlUnavailableReason: null,
+      setManualPanelVisible: vi.fn(), reportAuthoringPending: vi.fn(),
+      selectPreviewSample: (index: number) => dispatch({ type: 'select_preview_sample', index }),
+    }} />;
+  }
+  const sample = () => host.props(host.findElement('Preview sample'))!;
+  const clickPlay = async () => {
+    const button = host.findButton('Play');
+    await act(() => (button.props?.onClick as () => void)());
+  };
+  try {
+    await act(() => root.render(<MountedPreview />));
+    expect(sample().value).toBe(2);
+    await clickPlay();
+    expect(sample().value).toBe(0);
+    // Restart while already playing sample zero: the old timer must be reset
+    // even though the selected index itself does not change.
+    await act(() => vi.advanceTimersByTime(200));
+    await clickPlay();
+    expect(sample().value).toBe(0);
+    await act(() => vi.advanceTimersByTime(399));
+    expect(sample().value).toBe(0);
+    await act(() => vi.advanceTimersByTime(1));
+    expect(sample().value).toBe(1);
+    // Restart from a later sample also immediately selects zero.
+    await clickPlay();
+    expect(sample().value).toBe(0);
+    await act(() => vi.advanceTimersByTime(400));
+    expect(sample().value).toBe(1);
+    await act(() => (sample().onChange as (event: unknown) => void)({ target: { value: '2' } }));
+    expect(sample().value).toBe(2);
+    await act(() => vi.advanceTimersByTime(1000));
+    expect(sample().value).toBe(2);
+  } finally {
+    await act(() => root.unmount());
+    vi.useRealTimers();
+  }
 });

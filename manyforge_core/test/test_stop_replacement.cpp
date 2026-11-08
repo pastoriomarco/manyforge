@@ -102,7 +102,7 @@ TrajectoryDTO Continuation(const TrajectoryDTO& active, double origin_s, double 
   return continuation;
 }
 
-// --- Q42 closed-form brake ---------------------------------------------------
+// --- Closed-form brake -------------------------------------------------------
 
 ControlledHardStopBrakeInputDTO BrakeInput(double factor) {
   return ControlledHardStopBrakeInputDTO{
@@ -235,7 +235,7 @@ TEST(ControlledHardStopBrakeTest, RejectsUnusableInputs) {
   EXPECT_FALSE(plan_controlled_hard_stop_brake(size).ok());
 }
 
-// --- Q20 join ------------------------------------------------------------------
+// --- Join ----------------------------------------------------------------------
 
 TEST(StopReplacementJoinTest, KeepsPastPointsWithNegativeTimesThenTheContinuation) {
   const auto active = Linear();  // t = 0, 0.5, 1, 1.5, 2
@@ -444,7 +444,7 @@ TEST(StopReplacementJoinTest, RefusesATripPointOutsideTheActivePathOrWithoutARam
   EXPECT_EQ(no_ramp.error().details.at("reason"), "stop_join_continuation_elapsed");
 }
 
-// --- Q26 elapsed and Q22 lead-in rule -----------------------------------------
+// --- Elapsed time and lead-in rule --------------------------------------------
 
 TEST(StopJoinElapsedTest, AdvancesTheSampleCursorAtTheFrozenFactor) {
   const auto scaled = compute_stop_join_elapsed_s({1.0, 0.5, 0.01, 0.02, std::nullopt});
@@ -495,7 +495,7 @@ TEST(StopReplacementStartTest, AlignsControllerHeaderAndCurveOriginTogetherAtThe
     EXPECT_EQ(start.value().scheduled->binding_epoch, sample.binding_epoch);
     EXPECT_EQ(start.value().scheduled->controller_start_stamp_ns, 9'030'000'000);
     EXPECT_NEAR(start.value().elapsed_path_s, 1.0 + factor * 0.03, 1e-12);
-    if (factor == 0.0) continue;  // Stop itself retains Q45's cancel-only path.
+    if (factor == 0.0) continue;  // Stop itself retains the cancel-only path.
     const auto active = Curved();
     const auto continuation = Continuation(active, 1.0, factor, 0.2);
     const auto joined = build_stop_replacement_join(active, start.value().elapsed_path_s,
@@ -913,7 +913,7 @@ TEST(ScheduledFastSpringBackTest, ProfileDifferenceAgainstTheZeroStampShape) {
   }
 }
 
-// --- Q17/Q38 path-time conversion ----------------------------------------------
+// --- Path-time conversion ------------------------------------------------------
 
 TEST(StopPathTimeConversionTest, ReproducesTheWallTimeMotionAtTheFrozenFactor) {
   TrajectoryDTO wall;

@@ -137,7 +137,7 @@ class GeometricContactInputProviderTest : public ::testing::Test {
 protected:
   void Build(bool gripper_sample = true, std::size_t depth = 8,
              core::Duration age = 25) {
-    clock.set(100);
+    clock->set(100);
     motion = publication("arm_joint", "motion", 90, 0.4);
     gripper = publication("finger_joint", "gripper", 95, 0.2,
                           gripper_sample);
@@ -145,7 +145,7 @@ protected:
     engine = std::make_shared<Engine>();
     auto subsystem = core::IoSignalSubsystem::Create(
         {core::RequestOwnerEpoch("host"), 1, {descriptor(age)}, {}},
-        {1, 1, depth, 4, 128, 1024}, clock);
+        {1, 1, depth, 4, 128, 1024}, *clock);
     ASSERT_TRUE(subsystem.ok()) << subsystem.error().message;
     signals = std::shared_ptr<core::IoSignalSubsystem>(
         std::move(subsystem.value()));
@@ -239,7 +239,7 @@ protected:
       std::shared_ptr<core::IoSignalIngress> &next_ingress) {
     auto created = core::IoSignalSubsystem::Create(
         {core::RequestOwnerEpoch("host"), 2, {descriptor()}, {}},
-        {1, 1, 8, 4, 128, 1024}, clock);
+        {1, 1, 8, 4, 128, 1024}, *clock);
     ASSERT_TRUE(created.ok()) << created.error().message;
     next_signals = std::shared_ptr<core::IoSignalSubsystem>(
         std::move(created.value()));
@@ -251,7 +251,7 @@ protected:
         std::shared_ptr<core::IoSignalIngress>(std::move(queued.value()));
   }
 
-  core::FakeClock clock;
+  std::shared_ptr<core::FakeClock> clock = std::make_shared<core::FakeClock>();
   core::ManualScheduler scheduler;
   std::vector<core::CollisionBodyId> selected_bodies{kEndpoint};
   std::optional<core::ErrorDTO> selection_error;
@@ -279,7 +279,7 @@ TEST_F(GeometricContactInputProviderTest, ImmediateContactUsesBothReportedStates
             (std::vector<std::string>{"arm_joint", "finger_joint"}));
   EXPECT_EQ(engine->positions, (std::vector<double>{0.4, 0.2}));
   EXPECT_EQ(engine->state_time, 90);
-  clock.set(126);
+  clock->set(126);
   EXPECT_EQ(signals->ReadSignal(kSignal).value().availability,
             core::IoSignalAvailability::kStale);
 }
@@ -296,7 +296,7 @@ TEST_F(GeometricContactInputProviderTest, ActiveTcpChangeSelectsCurrentBodiesEve
   EXPECT_EQ(observed.latest_sample->publication.value, std::optional<bool>(true));
 
   selected_bodies = {kRobotBody};
-  clock.set(110);
+  clock->set(110);
   scheduler.advance_to(110, core::SchedulerPriority::Monitoring);
   ASSERT_TRUE(ingress->Drain(8).ok());
   observed = signals->ReadSignal(kSignal).value();
@@ -306,7 +306,7 @@ TEST_F(GeometricContactInputProviderTest, ActiveTcpChangeSelectsCurrentBodiesEve
   EXPECT_EQ(engine->queries, 2U);
 
   selected_bodies = {kEndpoint};
-  clock.set(120);
+  clock->set(120);
   scheduler.advance_to(120, core::SchedulerPriority::Monitoring);
   ASSERT_TRUE(ingress->Drain(8).ok());
   observed = signals->ReadSignal(kSignal).value();
@@ -330,7 +330,7 @@ TEST_F(GeometricContactInputProviderTest, StaticAndUnknownBodiesAreUnavailableTh
   EXPECT_EQ(engine->queries, 0U);
 
   body_classes[kEndpoint] = std::nullopt;
-  clock.set(110);
+  clock->set(110);
   scheduler.advance_to(110, core::SchedulerPriority::Monitoring);
   ASSERT_TRUE(ingress->Drain(8).ok());
   observed = signals->ReadSignal(kSignal).value();
@@ -341,7 +341,7 @@ TEST_F(GeometricContactInputProviderTest, StaticAndUnknownBodiesAreUnavailableTh
   EXPECT_EQ(engine->queries, 0U);
 
   body_classes[kEndpoint] = false;
-  clock.set(120);
+  clock->set(120);
   scheduler.advance_to(120, core::SchedulerPriority::Monitoring);
   ASSERT_TRUE(ingress->Drain(8).ok());
   observed = signals->ReadSignal(kSignal).value();
@@ -352,7 +352,7 @@ TEST_F(GeometricContactInputProviderTest, StaticAndUnknownBodiesAreUnavailableTh
 
   selected_bodies = {kEndpoint, kRobotBody};
   body_classes[kRobotBody] = true;
-  clock.set(130);
+  clock->set(130);
   scheduler.advance_to(130, core::SchedulerPriority::Monitoring);
   ASSERT_TRUE(ingress->Drain(8).ok());
   observed = signals->ReadSignal(kSignal).value();
@@ -465,7 +465,7 @@ TEST_F(GeometricContactInputProviderTest,
 TEST_F(GeometricContactInputProviderTest,
        StaleReportedStateAndUnresolvedGeometryRemainUnavailable) {
   Build();
-  clock.set(151);
+  clock->set(151);
   auto baseline = provider->Resume(2);
   ASSERT_TRUE(baseline.ok()) << baseline.error().message;
   ASSERT_TRUE(ingress->Drain(8).ok());
@@ -499,7 +499,7 @@ TEST_F(GeometricContactInputProviderTest,
 TEST_F(GeometricContactInputProviderTest, ResumeRefusesAnUnenqueuedBaseline) {
   Build(true, 1);
   ASSERT_TRUE(ingress->TryEnqueue(
-      {kSource, kIncarnation, 1, clock.now(),
+      {kSource, kIncarnation, 1, clock->now(),
        {{kSignal, core::IoSampleValidity::kUnavailable, std::nullopt,
          core::ErrorDTO{"io_source_unavailable", "old", {}}}}}));
   const auto baseline = provider->Resume(2);
@@ -507,20 +507,20 @@ TEST_F(GeometricContactInputProviderTest, ResumeRefusesAnUnenqueuedBaseline) {
   EXPECT_EQ(baseline.error().details.at("reason"),
             "initial_acquisition_not_enqueued");
   EXPECT_EQ(engine->queries, 1U);
-  clock.set(1'000);
-  scheduler.advance_to(clock.now(), core::SchedulerPriority::Monitoring);
+  clock->set(1'000);
+  scheduler.advance_to(clock->now(), core::SchedulerPriority::Monitoring);
   EXPECT_EQ(engine->queries, 1U);
 }
 
 TEST_F(GeometricContactInputProviderTest, LateQuerySkipsCatchupDeadlines) {
   Build();
-  engine->clock = &clock;
+  engine->clock = clock.get();
   engine->duration = 25;
   ASSERT_TRUE(provider->Resume(2).ok());
-  EXPECT_EQ(clock.now(), 125);
+  EXPECT_EQ(clock->now(), 125);
   scheduler.advance_to(129, core::SchedulerPriority::Monitoring);
   EXPECT_EQ(engine->queries, 1U);
-  clock.set(130);
+  clock->set(130);
   scheduler.advance_to(130, core::SchedulerPriority::Monitoring);
   EXPECT_EQ(engine->queries, 2U);
   EXPECT_EQ(scheduler.pending_count(core::SchedulerPriority::Monitoring), 1U);

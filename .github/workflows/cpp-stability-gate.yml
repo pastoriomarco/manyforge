@@ -17,8 +17,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dev-changed:
+    uses: ./.github/workflows/nightly-dev-changed.yml
+    permissions:
+      contents: read
+      actions: read
+
   manyforge-core-stability:
     name: manyforge_core repeat-under-load stability
+    needs: dev-changed
+    if: needs.dev-changed.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:

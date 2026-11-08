@@ -1,8 +1,7 @@
 """Headless operator-alarm attention publication on the real core and Kernel.
 
-Spec 530 §11 publication timing in the composed process stack. Attention is
-published, never a gate: acknowledgement never gates work (Component model v2
-core rule 5).
+Publication timing in the composed process stack. Attention is
+published, never a gate: acknowledgement never gates work.
 """
 
 from __future__ import annotations
@@ -44,13 +43,13 @@ from manyforge_headless_api.process_tests.test_process_stack import (
     _read_only_tree,
     _required_path,
 )
-from manyforge_headless_api.process_tests.test_ui6i_grouped_execution import (
+from manyforge_headless_api.process_tests.test_dual_robot_grouped_execution import (
     ADMISSION_FILENAME,
     CELL_ID,
 )
 
 
-# --- Real-path publication timing qualification (spec 530 §11) -------------
+# --- Real-path publication timing qualification -------------
 
 _PUBLISH_COMMAND = b'"command":"cell_admission_publish_operator_alarm_attention"'
 
@@ -192,7 +191,7 @@ def _native_host_stack() -> Iterator[ProcessStack]:
     with TemporaryDirectory(prefix="mf-oaq-") as temporary_root:
         root = Path(temporary_root)
         bootstrap = root / "cell-bootstrap"
-        shutil.copytree(_required_path("MANYFORGE_UI6I_CELL_BOOTSTRAP_ROOT"), bootstrap)
+        shutil.copytree(_required_path("MANYFORGE_DUAL_ROBOT_CELL_BOOTSTRAP_ROOT"), bootstrap)
         stack_root = root / "stack"
         stack_root.mkdir()
         with _read_only_tree(bootstrap):

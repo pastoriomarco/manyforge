@@ -1,14 +1,14 @@
-api_version: manyforge.program.v2
+api_version: manyforge.program.v3
 program_id: isaac_manipulator_scene_light
-program_revision: sha256:ef6b4dc6dace18cb936c860d6fc1c0148b87a3b381142c30549aa2676ecd1dcb
+program_revision: sha256:edaa9a8a73943cebc17404fd4c684050abcffaababba9d0d486a6e5518f8d581
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light
 description: Retained Isaac Sim light-scene pick-and-place Program for the UR10e and Robotiq 2F-140. It
   preserves the exact authored meshes and poses, typed simulator play/reset/pause lifecycle, observed-scene
   planning, physical gripper commands, carried-object transitions, and retained-world rest pose.
 catalog:
-  api_version: manyforge.node_catalog.v2
-  content_version: 2.9.0
+  api_version: manyforge.node_catalog.v3
+  content_version: 3.0.0
 compatibility:
   lanes:
   - isaac-sim
@@ -21,66 +21,6 @@ compatibility:
   - pick-and-place
   - robotiq
   - ur10e
-component_roles:
-  robot:
-    required_component_type_tags:
-    - articulated-arm
-    required_model_roles:
-    - arm_model
-  tool:
-    required_component_type_tags:
-    - gripper
-target_roles:
-  arm:
-    component_role: robot
-    required_capabilities:
-    - capability_id: execution.feedback.phase_events
-      parameters: {}
-      disposition: required
-    - capability_id: execution.trajectory.execute
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.joint_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.trajectory.time_parameterized
-      parameters: {}
-      disposition: required
-    - capability_id: state.observed.current
-      parameters: {}
-      disposition: required
-    - capability_id: validation.trajectory.non_collision
-      parameters: {}
-      disposition: required
-    required_frame_roles:
-    - base
-    required_resource_roles:
-    - arm_joints
-    required_collision_body_roles:
-    - arm_collision
-    required_model_roles:
-    - arm_model
-  gripper:
-    component_role: tool
-    required_capabilities:
-    - capability_id: model.kinematics.fk
-      parameters: {}
-      disposition: required
-    - capability_id: tool.gripper.command
-      parameters: {}
-      disposition: required
-    - capability_id: tool.gripper.feedback
-      parameters: {}
-      disposition: required
-    required_frame_roles:
-    - tcp
-    required_resource_roles:
-    - fingers
-    required_collision_body_roles:
-    - gripper_collision
 scene:
 - scene_resource_id: isaac_cheese_box
   shape:
@@ -239,7 +179,9 @@ tree:
   - node_id: gripper.command_position
     instance_id: open_gripper_start
     parameters:
-      target_role: gripper
+      target:
+        component_id: robotiq_2f_140
+        command_target_id: gripper
       position:
         kind: angular_rad
         value_rad: 0.0
@@ -251,8 +193,12 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_pick_approach
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_ur10e_light_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_ur10e_light_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       target_mode: relative
@@ -260,8 +206,10 @@ tree:
         type: scene_resource
         scene_resource_id: isaac_cheese_box
       offset_reference:
-        type: frame_role
-        frame_role_id: base
+        type: component_frame
+        frame:
+          component_id: isaac_ur10e_light_robot
+          frame_id: base
       goal:
         position_m:
         - 0.0
@@ -283,8 +231,12 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_pick
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_ur10e_light_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_ur10e_light_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       target_mode: relative
@@ -292,8 +244,10 @@ tree:
         type: scene_resource
         scene_resource_id: isaac_cheese_box
       offset_reference:
-        type: frame_role
-        frame_role_id: base
+        type: component_frame
+        frame:
+          component_id: isaac_ur10e_light_robot
+          frame_id: base
       goal:
         position_m:
         - 0
@@ -319,7 +273,9 @@ tree:
     - node_id: gripper.command_position
       instance_id: close_gripper
       parameters:
-        target_role: gripper
+        target:
+          component_id: robotiq_2f_140
+          command_target_id: gripper
         position:
           kind: angular_rad
           value_rad: 0.55
@@ -337,23 +293,33 @@ tree:
       instance_id: attach_cheese_box
       parameters:
         scene_resource_id: isaac_cheese_box
-        target_role: gripper
-        carrier_frame_role: tcp
-        touch_body_roles:
-        - gripper_collision
+        target:
+          component_id: robotiq_2f_140
+          command_target_id: gripper
+        carrier_frame_ref:
+          component_id: robotiq_2f_140
+          frame_id: tcp
+        touch_bodies:
+        - component_id: robotiq_2f_140
+          collision_body_id: gripper_collision
       children: []
   - node_id: motion.move_to_pose
     instance_id: pick_retreat
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_ur10e_light_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_ur10e_light_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       target_mode: relative
       target_reference:
-        type: frame_role
-        frame_role_id: tcp
-        target_role: gripper
+        type: component_frame
+        frame:
+          component_id: robotiq_2f_140
+          frame_id: tcp
       goal:
         position_m:
         - 0.0
@@ -375,8 +341,12 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_drop_approach
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_ur10e_light_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_ur10e_light_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       target_mode: relative
@@ -384,8 +354,10 @@ tree:
         type: scene_resource
         scene_resource_id: isaac_small_klt
       offset_reference:
-        type: frame_role
-        frame_role_id: base
+        type: component_frame
+        frame:
+          component_id: isaac_ur10e_light_robot
+          frame_id: base
       goal:
         position_m:
         - 0.0
@@ -407,8 +379,12 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: move_to_drop
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_ur10e_light_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_ur10e_light_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       target_mode: relative
@@ -416,8 +392,10 @@ tree:
         type: scene_resource
         scene_resource_id: isaac_small_klt
       offset_reference:
-        type: frame_role
-        frame_role_id: base
+        type: component_frame
+        frame:
+          component_id: isaac_ur10e_light_robot
+          frame_id: base
       goal:
         position_m:
         - 0.0
@@ -445,7 +423,9 @@ tree:
       instance_id: detach_cheese_box
       parameters:
         scene_resource_id: isaac_cheese_box
-        target_role: gripper
+        target:
+          component_id: robotiq_2f_140
+          command_target_id: gripper
       children: []
     - node_id: timer
       instance_id: wait_after_detach
@@ -455,7 +435,9 @@ tree:
     - node_id: gripper.command_position
       instance_id: open_gripper_release
       parameters:
-        target_role: gripper
+        target:
+          component_id: robotiq_2f_140
+          command_target_id: gripper
         position:
           kind: angular_rad
           value_rad: 0.0
@@ -467,8 +449,12 @@ tree:
   - node_id: motion.move_to_pose
     instance_id: drop_retreat
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_ur10e_light_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_ur10e_light_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       target_mode: relative
@@ -476,8 +462,10 @@ tree:
         type: scene_resource
         scene_resource_id: isaac_small_klt
       offset_reference:
-        type: frame_role
-        frame_role_id: base
+        type: component_frame
+        frame:
+          component_id: isaac_ur10e_light_robot
+          frame_id: base
       goal:
         position_m:
         - 0.0
@@ -499,8 +487,12 @@ tree:
   - node_id: motion.move_to_joint_target
     instance_id: return_rest
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: isaac_ur10e_light_robot
+        command_target_id: arm
+      base_frame:
+        component_id: isaac_ur10e_light_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       goal:

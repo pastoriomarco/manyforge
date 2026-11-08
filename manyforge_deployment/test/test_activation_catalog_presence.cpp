@@ -17,9 +17,12 @@
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/closed_schema.hpp>
+#include <manyforge_deployment/prepared_catalog_source.hpp>
+#include <manyforge_deployment/program_binding_compiler.hpp>
 
 #include "activation_deployment_intent_internal.hpp"
 #include "content_identity_internal.hpp"
+#include "maintained_activation_fixture.hpp"
 #include "prepared_activation_materialization_internal.hpp"
 
 namespace {
@@ -30,7 +33,7 @@ namespace deployment = manyforge::deployment;
 namespace detail = manyforge::deployment::detail;
 using deployment::CanonicalValue;
 
-// The Apply path qualifies the maintained catalog by presence (ADR-0026):
+// The Apply path qualifies the maintained catalog by presence:
 // extra records and extra offers are accepted, while each required lifecycle
 // provider must still carry its Stop contract roles. Each test runs the normal
 // activation materializer against a private copy of the catalog resources.
@@ -130,6 +133,43 @@ MaterializeEmptyCell(const fs::path &root) {
       detail::parse_activation_deployment_intent(intent_value, {});
   return detail::materialize_prepared_activation(
       root, {}, intent, core::CellId("catalog_presence_cell"), {});
+}
+
+TEST(ActivationCatalogPresence, CellsWithComponentsHaveQualifiedExecutionInterruptProvidersAndEmptyCellsNone) {
+  const CatalogCopy copy("execution_interrupt_provider");
+  // The maintained Lite6 Scenario gives the cell components, so the normal
+  // activation path adds the execution-core provider rows for it.
+  const auto materialized =
+      deployment::test::MaterializeMaintainedInterruptDeployment(
+          copy.root(),
+          deployment::parse_strict_json_model_yaml(
+              R"({"interrupt_rules":[]})")
+              .root());
+  ASSERT_NE(materialized.bundle, nullptr);
+  const detail::PreparedCatalogSource catalog(materialized.catalog_artifacts);
+  for (const std::string_view id : {"execution.interrupt.resource_scoped",
+                                    "execution.interrupt.contact_policy"}) {
+    const auto *definition = core::find_builtin_capability_definition(id);
+    ASSERT_NE(definition, nullptr);
+    const core::ProgramCapabilityRequirementDTO requirement{
+        core::CapabilityId(std::string(id)),
+        core::CapabilityDefinitionRevision(std::string(definition->capability_definition_revision)),
+        core::ProgramCapabilityDisposition::kRequired};
+    EXPECT_TRUE(deployment::probe_program_cell_capability(
+        requirement, *materialized.bundle, catalog)) << id;
+    const auto &rows = materialized.bundle->value().capability_provider_bindings;
+    EXPECT_EQ(std::count_if(rows.begin(), rows.end(), [&](const auto &row) {
+      return row.capability_id.value() == id &&
+             row.provider_manifest_id.value() == "manyforge.provider.execution_core" &&
+             row.scope == core::CapabilityScope::kCellGlobal;
+    }), 1);
+  }
+
+  // An empty cell is infrastructure-only: it carries no capability or
+  // provider rows at all.
+  const auto empty = MaterializeEmptyCell(copy.root());
+  ASSERT_NE(empty.bundle, nullptr);
+  EXPECT_TRUE(empty.bundle->value().capability_provider_bindings.empty());
 }
 
 constexpr std::string_view kRos2ControlManifest =

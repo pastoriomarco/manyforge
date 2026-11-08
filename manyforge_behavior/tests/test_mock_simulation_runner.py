@@ -1,4 +1,4 @@
-"""Node Mock simulation (decision 133, slice S2): the Runner's node-start hook,
+"""Node Mock simulation: the Runner's node-start hook,
 its port and its private wire command.
 
 Fakes only: the action ports, the Mock simulation port and the native
@@ -35,6 +35,8 @@ from manyforge_behavior.orchestration_ports import (
 from manyforge_behavior.production_ports import NativeKernelProgramPort
 from manyforge_behavior.program_clock import ProgramClock
 
+from .v3_fixtures import signal, target_binding
+
 # The Runner's execution transport timeout handed to owner task nodes.
 _TRANSPORT_TIMEOUT_S = 30.0
 
@@ -48,9 +50,9 @@ _C = "sha256:" + "c" * 64
 _D = "sha256:" + "d" * 64
 
 _ROWS = [
-    {"signal": {"target_role": "arm", "resource_role": "ready"}, "start_value": False,
+    {"signal": signal("io.1", "ready"), "start_value": False,
      "change": {"after_ms": 100, "value": True}},
-    {"signal": {"target_role": "arm", "resource_role": "door"}, "start_value": True},
+    {"signal": signal("io.1", "door"), "start_value": True},
 ]
 
 
@@ -92,8 +94,8 @@ class _MockPort:
             "node_start_index": request["node_start_index"],
             "started_at_ns": "1000000",
             "signals": [
-                {"signal": {"target_role": "arm", "resource_role": "door"}, "status": "inactive"},
-                {"signal": {"target_role": "arm", "resource_role": "ready"}, "status": "applied"},
+                {"signal": signal("io.1", "door"), "status": "inactive"},
+                {"signal": signal("io.1", "ready"), "status": "applied"},
             ],
         }
 
@@ -120,7 +122,7 @@ def _resolver() -> SimpleNamespace:
 
 
 def _common(node_id: str, mock: _MockPort | None, events: list, rows=_ROWS) -> dict[str, Any]:
-    parameters: dict[str, Any] = {"target_role": "arm", "resource_role": "ready"}
+    parameters: dict[str, Any] = {"signal": signal("io.1", "ready")}
     if rows is not None:
         parameters["mock_simulation"] = rows
     return dict(
@@ -251,8 +253,8 @@ def test_one_send_per_attempt_before_the_action(kind: str) -> None:
         "node_attempt_id": "attempt.1",
         "node_start_index": "1",
         "started_at_ns": "1000000",
-        "applied": [{"target_role": "arm", "resource_role": "ready"}],
-        "inactive": [{"target_role": "arm", "resource_role": "door"}],
+        "applied": [signal("io.1", "ready")],
+        "inactive": [signal("io.1", "door")],
     }]
 
 
@@ -478,8 +480,7 @@ _FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mock_simulation"
 
 
 def _fixture(name: str) -> dict[str, Any]:
-    """Track 2's frozen examples, unchanged (simulation133 interface01,
-    node-end135, run-pause135 interface01; digest-corrected)."""
+    """The frozen example fixtures, unchanged (digest-corrected)."""
 
     return json.loads((_FIXTURES / name).read_text(encoding="utf-8"))
 
@@ -497,7 +498,7 @@ _OCCURRENCE = (
     "program_run_id", "node_instance_id", "node_attempt_id", "node_start_index",
 )
 _END = _END_EXAMPLE["request"]
-_RESPONSE = "manyforge.execution_command_response.v1"
+_RESPONSE = "manyforge.execution_command_response.v4"
 _LOST = "lost"
 
 
@@ -534,14 +535,7 @@ class _Host:
 
 
 def _context() -> ProgramRunPortContext:
-    target = {
-        "target_role_id": "arm",
-        "component_role_id": "io_module",
-        "controllable_component_id": "io.1",
-        "command_target_id": "io.command",
-        "capability_bindings": [],
-        "resource_role_bindings": [],
-    }
+    io_target = target_binding("io.1", "io.command", [])
     return ProgramRunPortContext(
         program_run_id="run.1", applied_record_digest=_D, scenario_id="s",
         source_document_digest=_A, program_id="p", program_revision=_A,
@@ -550,7 +544,7 @@ def _context() -> ProgramRunPortContext:
         program_binding={
             "program_binding_id": _BINDING, "program_id": "p", "program_revision": _A,
             "retained_bundle_id": _B, "graph_revision": _C,
-            "target_role_bindings": [target],
+            "target_bindings": [io_target], "signal_bindings": [],
         },
         program={},
     )
@@ -648,7 +642,7 @@ def test_wire_error_keeps_its_code_and_details(monkeypatch, tmp_path) -> None:
         {"node_start_index": "0"},  # Not positive.
         {"node_start_index": "01"},  # Not canonical.
         {"node_start_index": str(2**64)},  # Beyond uint64.
-        {"signals": [{"signal": {"target_role": "arm", "resource_role": "ready"},
+        {"signals": [{"signal": signal("io.1", "ready"),
                       "start_value": False}]},  # change must be explicit.
         {"signals": []},
     ],
@@ -710,13 +704,13 @@ def test_native_port_builds_the_canonical_request_with_a_decimal_index(
     request = port.mock_simulation.request(_IDENTITY, 2**64 - 1, _ROWS)
     assert request == {
         **{key: _START["request"][key] for key in _OCCURRENCE},
-        "schema_version": "manyforge.mock_io_node_start.v1",
+        "schema_version": "manyforge.mock_io_node_start.v2",
         "node_start_index": "18446744073709551615",
         # Canonical selector order; an omitted change is an explicit null.
         "signals": [
-            {"signal": {"target_role": "arm", "resource_role": "door"},
+            {"signal": signal("io.1", "door"),
              "start_value": True, "change": None},
-            {"signal": {"target_role": "arm", "resource_role": "ready"},
+            {"signal": signal("io.1", "ready"),
              "start_value": False, "change": {"after_ms": 100, "value": True}},
         ],
     }
@@ -1081,7 +1075,7 @@ def test_a_lost_end_fails_unbind_until_the_next_unbind_gets_its_ack(
     assert ends == [_END] * 3
 
 
-# --- S2b: held-node detection (wire pending Track 2) ------------------------
+# --- Held-node detection --------------------------------------------------
 
 
 class _HeldState:

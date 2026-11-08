@@ -15,8 +15,8 @@ namespace manyforge::roboplan_backend {
 
 // Pure/bounded contract recovered from roboplan_cartesian_path_adapter.* and
 // roboplan_cartesian_trajectory_dynamics.cpp at parent
-// c4b075fa6dfb69e463c61f3efa8cfce8de681e8a (deleted by 0822218). The future
-// I6 planning adapter must integrate these helpers. This header deliberately
+// c4b075fa6dfb69e463c61f3efa8cfce8de681e8a (deleted by 0822218). A planning
+// adapter must integrate these helpers. This header deliberately
 // excludes the former request-planning body and therefore restores no scene,
 // planner, or execution owner.
 struct CartesianPlanningControl {

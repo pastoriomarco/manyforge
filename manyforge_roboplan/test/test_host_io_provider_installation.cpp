@@ -1,10 +1,18 @@
 #include "host_io_provider_installation.hpp"
+#include "retired_composition_release.hpp"
+#include "execution_host_responses.hpp"
 #include "host_io_signal_runtime.hpp"
 #include "io_provider_lifecycle_product.hpp"
 #include <manyforge_roboplan/passive_component_adapter.hpp>
+#include <manyforge_roboplan/component_stream_sample_bridge.hpp>
+#include <manyforge_roboplan/adapter_transport_consumer.hpp>
+#include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
+#include <diagnostic_msgs/msg/diagnostic_status.hpp>
+#include <future>
 
 #include "../../manyforge_deployment/test/io_retained_fixture.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <control_msgs/msg/dynamic_interface_group_values.hpp>
@@ -18,12 +26,14 @@
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <rclcpp/executors/single_threaded_executor.hpp>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 #include <variant>
@@ -299,6 +309,252 @@ protected:
   std::unique_ptr<Composition> current;
 };
 
+TEST_F(HostIoProviderInstallationTest, ApplySnapshotGuardKeepsReusedQualifiedIoOnSuccessAndUnwind) {
+  Build();
+  ASSERT_TRUE(Prepare(*current).ok());
+  ASSERT_NE(current->io_signal_runtime, nullptr);
+  current->io_signal_runtime->Start();
+  Step(core::ComponentAction::kPrepare);
+  Step(core::ComponentAction::kEnable);
+  auto retained_snapshot = [&] {
+    return RetainedComponentSnapshot{
+        current->runtime, current->gripper_runtime, current->stage,
+        current->bundle->value().compiled_products.planning_collision_model,
+        current->direct_control_joint_limits, current->direct_control_motion_descriptor,
+        current->direct_control_gripper_descriptor, current->ros2_control_runtime_handle,
+        current->controller_process, current->io_provider_drivers, current->component_runtime_pins,
+        current->component_adapter, current->owner_component, current->owner_handle,
+        current->owner_family, current->owner_id, current->member_role,
+        current->adapter_transport_consumers};
+  };
+  std::vector<PendingDiscard> pending;
+  const auto registrations = [](const Composition &view) {
+    EXPECT_FALSE(view.runtime);
+    EXPECT_FALSE(view.gripper_runtime);
+    return std::set<core::IResolvedParticipantExecutionEngine *>{};
+  };
+  const auto collect = [&](const PendingDiscard &entry, auto &pins, auto &engines) {
+    CollectRetainedPendingProtection(entry, pins, engines, registrations);
+  };
+  const std::function<void(std::vector<PendingDiscard> &)> settle = [&](auto &snapshots) {
+    SettleApplyPendingSnapshots(snapshots, pending, {current.get(), nullptr, nullptr, nullptr},
+        [&] { return &cell->addressed_kernel(); }, registrations, collect);
+  };
+  const auto *original = drivers.get();
+  const std::weak_ptr<const IoProviderDriverGroup> weak = drivers;
+  {
+    ApplyPendingSnapshotCleanup guard{{}, settle};
+    guard.snapshots.push_back(PendingDiscard{nullptr, {retained_snapshot()}, "io-owner", false});
+  }
+  EXPECT_TRUE(pending.empty());
+  EXPECT_EQ(current->io_provider_drivers.get(), original);
+  EXPECT_FALSE(weak.expired());
+  try {
+    ApplyPendingSnapshotCleanup guard{{}, settle};
+    guard.snapshots.push_back(PendingDiscard{nullptr, {retained_snapshot()}, "io-owner", false});
+    if (Write("lamp", true) != core::ActionOutcome::kSucceeded)
+      throw std::runtime_error("fixture-write-failed");
+    throw std::runtime_error("original-apply-failure");
+  } catch (const std::runtime_error &error) {
+    EXPECT_STREQ(error.what(), "original-apply-failure");
+  }
+  EXPECT_TRUE(pending.empty());
+  EXPECT_EQ(current->io_provider_drivers.get(), original);
+  EXPECT_FALSE(weak.expired());
+  EXPECT_EQ(Mock(*current)->model_value(), std::optional<bool>(true));
+
+  // The local snapshot may settle while another pending entry and the final
+  // root both retain the same qualified I/O provider owners.
+  pending.push_back(PendingDiscard{nullptr, {retained_snapshot()}, "other-pending", false});
+  {
+    ApplyPendingSnapshotCleanup guard{{}, settle};
+    guard.snapshots.push_back(PendingDiscard{nullptr, {retained_snapshot()}, "io-owner", false});
+  }
+  ASSERT_EQ(pending.size(), 1U);
+  ASSERT_EQ(pending.front().snapshots.size(), 1U);
+  EXPECT_EQ(pending.front().snapshots.front().io_provider_drivers.get(), original);
+  EXPECT_EQ(current->io_provider_drivers.get(), original);
+  EXPECT_FALSE(weak.expired());
+}
+
+TEST(HostTransportAdmission, ApplyFirstRefusesRecoveryWithoutBlockingOtherEffects) {
+  ExecutionCompositionAccess access;
+  auto apply = access.TryTransportEffect();
+  ASSERT_TRUE(apply);
+  auto other_effect = access.TryTransportEffect();
+  ASSERT_TRUE(other_effect);
+  EXPECT_FALSE(access.TryTransportRecovery());
+  apply.reset();
+  EXPECT_FALSE(access.TryTransportRecovery());
+  other_effect.reset();
+  EXPECT_TRUE(access.TryTransportRecovery());
+}
+
+TEST(HostTransportAdmission, RecoveryFirstRefusesApplyAndOtherEffects) {
+  ExecutionCompositionAccess access;
+  auto recovery = access.TryTransportRecovery();
+  ASSERT_TRUE(recovery);
+  EXPECT_FALSE(access.TryTransportEffect());
+  EXPECT_FALSE(access.TryTransportRecovery());
+  recovery.reset();
+  EXPECT_TRUE(access.TryTransportEffect());
+}
+
+TEST(HostTransportAdmission, FailedRecoveryReleasesOnEveryExit) {
+  ExecutionCompositionAccess access;
+  EXPECT_THROW(([&] {
+    auto recovery = access.TryTransportRecovery();
+    ASSERT_TRUE(recovery);
+    throw std::runtime_error("injected rebuild failure");
+  }()), std::runtime_error);
+  EXPECT_TRUE(access.TryTransportEffect());
+  EXPECT_TRUE(access.TryTransportRecovery());
+}
+
+TEST_F(HostIoProviderInstallationTest, ArmRecoveryRefusesAllMemberResetBeforeEffect) {
+  Build();
+  const auto first = current->controllable_component_id;
+  auto peer = View(publication->publication_generation, drivers);
+  peer->controllable_component_id = core::ControllableComponentId("other.arm");
+  current->ros2_control_runtime_handle = RetainedRos2ControlRuntimeHandle::Create();
+  peer->ros2_control_runtime_handle = RetainedRos2ControlRuntimeHandle::Create();
+  current->ros2_control_runtime_handle->InstallActiveTcp(first, {}, {}, false);
+  peer->ros2_control_runtime_handle->InstallActiveTcp(peer->controllable_component_id, {}, {}, false);
+  int reset_claims = 0;
+  current->ros2_control_runtime_handle->InstallTransportEffectClaim([&] {
+    ++reset_claims;
+    return core::Result<std::shared_ptr<void>>::Ok(nullptr);
+  });
+  const auto before = current->ros2_control_runtime_handle->ReadActiveTcp();
+  const auto peer_before = peer->ros2_control_runtime_handle->ReadActiveTcp();
+  auto retained = std::make_shared<InstalledRetainedTransportMembership>();
+  retained->entries.push_back({peer->controllable_component_id.value(), peer->ros2_control_runtime_handle, {}});
+  current->participant_compositions.push_back(std::move(peer));
+  ExecutionCompositionAccess access;
+  access.enter_transport_effect = [&](const std::string &id) {
+    return EnterInstalledTransportEffect(access, id, nullptr, nullptr, retained);
+  };
+  auto recovery = access.TryTransportRecovery();
+  ASSERT_TRUE(recovery);
+  const auto result = ResetCompositionActiveTcps(*current, access);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "component_action_in_progress");
+  EXPECT_EQ(result.error().details.at("effect_disposition"), "known_no_effect");
+  EXPECT_EQ(reset_claims, 0);
+  EXPECT_EQ(current->ros2_control_runtime_handle->ReadActiveTcp().sequence, before.sequence);
+  EXPECT_EQ(current->participant_compositions.front()->ros2_control_runtime_handle->ReadActiveTcp().sequence,
+            peer_before.sequence);
+}
+
+TEST_F(HostIoProviderInstallationTest, AdmittedResetDoesNotReenterTransportClaim) {
+  Build();
+  current->ros2_control_runtime_handle = RetainedRos2ControlRuntimeHandle::Create();
+  current->ros2_control_runtime_handle->InstallActiveTcp(current->controllable_component_id, {}, {}, false);
+  int claims = 0;
+  current->ros2_control_runtime_handle->InstallTransportEffectClaim([&] {
+    ++claims;
+    return core::Result<std::shared_ptr<void>>::Err({"component_busy", "duplicate claim", {}});
+  });
+  auto retained = std::make_shared<InstalledRetainedTransportMembership>();
+  retained->entries.push_back({current->controllable_component_id.value(),
+                               current->ros2_control_runtime_handle, {}});
+  ExecutionCompositionAccess access;
+  access.enter_transport_effect = [&](const std::string &id) {
+    return EnterInstalledTransportEffect(access, id, nullptr, nullptr, retained);
+  };
+  EXPECT_TRUE(ResetCompositionActiveTcps(*current, access).ok());
+  EXPECT_EQ(claims, 0);
+  EXPECT_TRUE(access.TryTransportRecovery());
+}
+
+TEST_F(HostIoProviderInstallationTest, ResetMemberRefusalMapsToTypedApiError) {
+  Build();
+  current->ros2_control_runtime_handle = RetainedRos2ControlRuntimeHandle::Create();
+  current->ros2_control_runtime_handle->InstallActiveTcp(current->controllable_component_id, {}, {}, false);
+  int first_claims = 0;
+  current->ros2_control_runtime_handle->InstallTransportEffectClaim([&] {
+    ++first_claims;
+    return core::Result<std::shared_ptr<void>>::Ok(nullptr);
+  });
+  auto peer = View(publication->publication_generation, drivers);
+  peer->controllable_component_id = core::ControllableComponentId("other.arm");
+  peer->ros2_control_runtime_handle = RetainedRos2ControlRuntimeHandle::Create();
+  peer->ros2_control_runtime_handle->InstallActiveTcp(peer->controllable_component_id, {}, {}, false);
+  const auto before = peer->ros2_control_runtime_handle->ReadActiveTcp();
+  peer->ros2_control_runtime_handle->InstallTransportEffectClaim([] {
+    return core::Result<std::shared_ptr<void>>::Err(
+        {"component_busy", "member refused", {{"effect_disposition", "known_no_effect"}}});
+  });
+  current->participant_compositions.push_back(std::move(peer));
+  ExecutionCompositionAccess access;
+  const auto result = ResetCompositionActiveTcps(*current, access);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(first_claims, 1);
+  const auto response = ErrorResponse(result.error().code, result.error().message, result.error().details);
+  const auto *ok = response.find_object_member("ok");
+  const auto *error = response.find_object_member("error");
+  ASSERT_NE(ok, nullptr);
+  EXPECT_FALSE(ok->as_bool());
+  ASSERT_NE(error, nullptr);
+  EXPECT_EQ(error->find_object_member("code")->as_string(), "component_busy");
+  EXPECT_EQ(error->find_object_member("message")->as_string(), "member refused");
+  EXPECT_EQ(error->find_object_member("details")->find_object_member("effect_disposition")->as_string(),
+            "known_no_effect");
+  EXPECT_EQ(current->participant_compositions.front()->ros2_control_runtime_handle->ReadActiveTcp().sequence,
+            before.sequence);
+}
+
+TEST_F(HostIoProviderInstallationTest, AdapterRecoveryStagesSharedConsumerOnceBeforeCommit) {
+  struct Consumer final : AdapterTransportConsumer {
+    int staged{};
+    int committed{};
+    bool valid{true};
+    Gate gate;
+    std::shared_ptr<void> Stage(const std::shared_ptr<Owner> &,
+                                const std::shared_ptr<Owner> &, Gate active) override {
+      ++staged;
+      gate = std::move(active);
+      return std::make_shared<int>(1);
+    }
+    bool Validate(const std::shared_ptr<void> &) const override { return valid; }
+    void Commit(const std::shared_ptr<void> &) noexcept override { ++committed; }
+  };
+  auto context = std::make_shared<rclcpp::Context>();
+  context->init(0, nullptr);
+  const auto provider = [context] { return context; };
+  auto old_owner = ros2_control_execution::Ros2TransportResources::create(
+      "adapter_recovery_old", "", 1U, provider);
+  auto new_owner = ros2_control_execution::Ros2TransportResources::create(
+      "adapter_recovery_new", "", 1U, provider);
+  old_owner->quiesce();
+  auto shared = std::make_shared<Consumer>();
+  auto other = std::make_shared<Consumer>();
+  std::vector<std::pair<std::string, std::shared_ptr<AdapterTransportConsumer>>> rows{
+      {"machine", shared}, {"arm", shared}, {"sensor", other}};
+  auto staged = StageAdapterTransportRecovery(rows, old_owner, new_owner);
+  ASSERT_TRUE(staged.ok());
+  EXPECT_EQ(shared->staged, 1);
+  EXPECT_EQ(other->staged, 1);
+  EXPECT_FALSE(shared->gate->load());
+  EXPECT_EQ(shared->gate, other->gate);
+  EXPECT_FALSE(ActivateAdapterTransportRecovery(*staged.value(), new_owner).ok());
+  new_owner->start();
+  other->valid = false;
+  EXPECT_FALSE(CommitAdapterTransportRecovery(*staged.value()).ok());
+  EXPECT_EQ(shared->committed, 0);
+  EXPECT_EQ(other->committed, 0);
+  other->valid = true;
+  ASSERT_TRUE(CommitAdapterTransportRecovery(*staged.value()).ok());
+  EXPECT_EQ(shared->committed, 1);
+  EXPECT_EQ(other->committed, 1);
+  EXPECT_FALSE(shared->gate->load());
+  EXPECT_FALSE(ActivateAdapterTransportRecovery(*staged.value(), old_owner).ok());
+  ASSERT_TRUE(ActivateAdapterTransportRecovery(*staged.value(), new_owner).ok());
+  EXPECT_TRUE(shared->gate->load());
+  new_owner->quiesce();
+  context->shutdown("adapter recovery stage test complete");
+}
+
 TEST_F(HostIoProviderInstallationTest, CommonProductViewBorrowsTheActualCompositionStorage) {
   Build();
   ExecutionCompositionAccess access;
@@ -321,7 +577,7 @@ TEST_F(HostIoProviderInstallationTest, CommonProductViewBorrowsTheActualComposit
   }
 }
 
-// CONTRACTS §16: the owner of a machine with its arm deactivated is a view of
+// The owner of a machine with its arm deactivated is a view of
 // its own (its adapter and its `owner_component` are the same): it is
 // coordinated once, as an owner, and its I/O members carry it.
 TEST_F(HostIoProviderInstallationTest, AnOwnerViewIsCoordinatedOnceAsTheOwner) {
@@ -444,7 +700,7 @@ TEST_F(HostIoProviderInstallationTest, TcpRegistryFollowsSelectedComposition) {
 
   // The production staged reader owns only a weak ROS handle.
   candidate->ros2_control_runtime_handle = RetainedRos2ControlRuntimeHandle::Create();
-  candidate->ros2_control_runtime_handle->InstallActiveTcp(first, {}, false);
+  candidate->ros2_control_runtime_handle->InstallActiveTcp(first, {}, {}, false);
   candidate->StageRobotTcpReader();
   select(candidate.get());
   ASSERT_TRUE(ReadHostRobotTcps(first));
@@ -545,7 +801,7 @@ TEST_F(HostIoProviderInstallationTest,
 
 TEST_F(HostIoProviderInstallationTest,
        MockOutputWriteIsPublishedBackAsItsSampleWithItsOutsideChangeSignal) {
-  // CONTRACTS §7 (D2): a Mock output reports its written value back, source
+  // A Mock output reports its written value back, source
   // `manyforge_write`, and has the core-held `changed_outside` signal.
   Build();
   ASSERT_TRUE(Prepare(*current).ok());
@@ -719,42 +975,135 @@ TEST_F(HostIoProviderInstallationTest,
 }
 
 TEST_F(HostIoProviderInstallationTest,
+       RetainedRosOutputRejectsDifferentOwnerBeforeRebind) {
+  Build(false, true, false, false, "ros2_control_gpio");
+  auto context = std::make_shared<rclcpp::Context>();
+  context->init(0, nullptr);
+  auto owner = ros2_control_execution::Ros2TransportResources::create(
+      "io_metadata_owner", "", 1U, [context] { return context; });
+  auto other = ros2_control_execution::Ros2TransportResources::create(
+      "io_metadata_other", "", 1U, [context] { return context; });
+  ASSERT_TRUE(PrepareCompositionIoProviderResources(*current, *cell,
+                                                    owner->node(), {}, owner)
+                  .ok());
+  ASSERT_FALSE(drivers->empty());
+  EXPECT_EQ(drivers->front()->RosOwner(), owner);
+  auto predecessors = Capture(*current);
+  auto candidate = View(NewPublication(), drivers);
+  const auto result = PrepareCompositionIoProviderResources(
+      *candidate, *cell, other->node(), predecessors, other);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "io_ros_owner_mismatch");
+  EXPECT_EQ(drivers->front()->RosOwner(), owner);
+  for (const auto &driver : *drivers)
+    driver->Shutdown();
+  candidate.reset();
+  current.reset();
+  predecessors.clear();
+  drivers.reset();
+  other.reset();
+  owner.reset();
+  context->shutdown("I/O owner metadata fixture complete");
+}
+
+TEST_F(HostIoProviderInstallationTest, FaultedGenericOwnerRebuildsInstalledGpioDriver) {
+  Build(false, true, false, false, "ros2_control_gpio");
+  auto context = std::make_shared<rclcpp::Context>();
+  context->init(0, nullptr);
+  const auto provider = [context] { return context; };
+  auto old_owner = ros2_control_execution::Ros2TransportResources::create(
+      "gpio_recovery_old", "", 1U, provider);
+  ASSERT_TRUE(PrepareCompositionIoProviderResources(*current, *cell, old_owner->node(), {}, old_owner).ok());
+  auto faulted = std::make_shared<std::promise<void>>();
+  auto observed = faulted->get_future();
+  old_owner->set_owner_notification([] { throw std::runtime_error("injected GPIO owner failure"); });
+  old_owner->set_executor_fault_observer([faulted](std::string_view) { faulted->set_value(); });
+  old_owner->start();
+  ASSERT_TRUE(old_owner->notify_owner());
+  ASSERT_EQ(observed.wait_for(std::chrono::seconds(3)), std::future_status::ready);
+  const std::array<const Composition *, 1> roots{current.get()};
+  auto snapshot = CaptureCompositionIoOwnerRecovery(roots, old_owner);
+  ResolveCompositionIoOwnerRecoveryServed(*snapshot);
+  ASSERT_FALSE(CompositionIoOwnerRecoveryServed(*snapshot).empty());
+  ASSERT_TRUE(CloseCompositionIoOwnerRecovery(*snapshot).ok());
+  std::shared_ptr<CompositionIoOwnerRecoveryStage> stage;
+  std::shared_ptr<ros2_control_execution::Ros2TransportResources> candidate;
+  candidate = ros2_control_execution::Ros2TransportResources::rebuild_faulted(
+      *old_owner, std::chrono::steady_clock::now() + std::chrono::seconds(2), [] {}, [&] {
+        candidate = ros2_control_execution::Ros2TransportResources::create(
+            "gpio_recovery_new", "", 1U, provider);
+        return candidate;
+      }, [&](auto &fresh) {
+        auto staged = StageCompositionIoOwnerRecovery(snapshot, candidate);
+        ASSERT_TRUE(staged.ok());
+        stage = std::move(staged.value());
+        fresh.start();
+      });
+  ASSERT_TRUE(stage);
+  ASSERT_TRUE(old_owner->joined());
+  ASSERT_TRUE(CommitCompositionIoOwnerRecovery(*stage).ok());
+  ActivateCompositionIoOwnerRecovery(*stage);
+  ASSERT_FALSE(drivers->empty());
+  EXPECT_EQ(drivers->front()->RosOwner(), candidate);
+  EXPECT_EQ(Lifecycle(*drivers->front()), core::ComponentLifecycle::kPrepared);
+  for (const auto &driver : *drivers) driver->Shutdown();
+  stage.reset();
+  snapshot.reset();
+  current.reset();
+  drivers.reset();
+  candidate->quiesce();
+  candidate.reset();
+  old_owner.reset();
+  context->shutdown("GPIO owner recovery test complete");
+}
+
+TEST_F(HostIoProviderInstallationTest,
        QualifiedGpioRemovalKeepsTopicAndRefusedPreparationPreservesOldTables) {
   Build(false, true, true, false, "ros2_control_gpio");
   using Message = control_msgs::msg::DynamicInterfaceGroupValues;
   auto ros_context = std::make_shared<rclcpp::Context>();
   ros_context->init(0, nullptr);
-  rclcpp::NodeOptions options;
-  options.context(ros_context);
-  options.use_global_arguments(false);
-  auto node = std::make_shared<rclcpp::Node>("gpio_installation", options);
-  rclcpp::ExecutorOptions executor_options;
-  executor_options.context = ros_context;
-  rclcpp::executors::SingleThreadedExecutor executor(executor_options);
-  executor.add_node(node);
-  std::vector<Message> messages;
+  const auto context_provider = [ros_context] { return ros_context; };
+  // Qualified GPIO drivers are installed through a ROS transport owner, as in
+  // the other GPIO installation tests; its node is the generic node.
+  auto owner = ros2_control_execution::Ros2TransportResources::create(
+      "gpio_installation", "", 1U, context_provider);
+  // The owner adds its node to its own executor at construction and spins it
+  // after start(); the node is never added to a second executor here.
+  auto node = owner->node();
+  std::mutex messages_mutex;
+  std::vector<Message> messages;  // guarded by messages_mutex
   auto subscriber = node->create_subscription<Message>(
       "/io_device/commands", rclcpp::SystemDefaultsQoS(),
-      [&](const Message& message) { messages.push_back(message); });
+      [&](const Message& message) {
+        std::lock_guard lock(messages_mutex);
+        messages.push_back(message);
+      });
+  const auto received_messages = [&] {
+    std::lock_guard lock(messages_mutex);
+    return messages;
+  };
   const auto spin_until = [&](const auto& ready) {
     const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!ready() && std::chrono::steady_clock::now() < limit)
-      executor.spin_once(std::chrono::milliseconds(5));
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
     return ready();
   };
-  ASSERT_TRUE(Prepare(*current, {}, node).ok());
+  ASSERT_TRUE(PrepareCompositionIoProviderResources(*current, *cell, node, {}, owner).ok());
+  owner->start();
   ASSERT_EQ(current->io_output_channels.size(), 2U);
   ASSERT_TRUE(spin_until([&] { return subscriber->get_publisher_count() == 1U; }));
   Step(core::ComponentAction::kPrepare);
   Step(core::ComponentAction::kEnable);
   ASSERT_EQ(Write("lamp", true), core::ActionOutcome::kSucceeded);
-  ASSERT_TRUE(spin_until([&] { return messages.size() == 1U; }));
+  ASSERT_TRUE(spin_until([&] { return received_messages().size() == 1U; }));
   ASSERT_EQ(Write("lamp_other", false), core::ActionOutcome::kSucceeded);
-  ASSERT_TRUE(spin_until([&] { return messages.size() == 2U; }));
-  ASSERT_EQ(messages.back().interface_groups.size(), 1U);
-  ASSERT_EQ(messages.back().interface_values.size(), 1U);
-  EXPECT_EQ(messages.back().interface_groups.front(), "digital_outputs");
-  const auto& payload = messages.back().interface_values.front();
+  ASSERT_TRUE(spin_until([&] { return received_messages().size() == 2U; }));
+  const auto received = received_messages();
+  ASSERT_EQ(received.back().interface_groups.size(), 1U);
+  ASSERT_EQ(received.back().interface_values.size(), 1U);
+  EXPECT_EQ(received.back().interface_groups.front(), "digital_outputs");
+  const auto& payload = received.back().interface_values.front();
   EXPECT_EQ(payload.interface_names, (std::vector<std::string>{"lamp", "lamp_other"}));
   EXPECT_EQ(payload.values, (std::vector<double>{1.0, 0.0}));
 
@@ -817,13 +1166,13 @@ TEST_F(HostIoProviderInstallationTest,
 
   auto wrong_predecessor = predecessor;
   wrong_predecessor.front().bundle = bundle;  // actual product, wrong Entry provenance
-  EXPECT_FALSE(Prepare(*candidate, wrong_predecessor, node).ok());
+  EXPECT_FALSE(PrepareCompositionIoProviderResources(*candidate, *cell, node, wrong_predecessor, owner).ok());
   EXPECT_TRUE(candidate->io_output_channels.empty());
   same_table(retained_provider->ReadAliasState(), retained_before);
   same_table(removed_provider->ReadAliasState(), removed_before);
-  EXPECT_EQ(messages.size(), 2U);
+  EXPECT_EQ(received_messages().size(), 2U);
 
-  ASSERT_TRUE(Prepare(*candidate, predecessor, node).ok());
+  ASSERT_TRUE(PrepareCompositionIoProviderResources(*candidate, *cell, node, predecessor, owner).ok());
   ASSERT_EQ(candidate->io_output_channels.size(), 1U);
   EXPECT_EQ(candidate->io_output_channels.front(), retained_entry);
   EXPECT_EQ(retained_provider->gpio_topic(), removed_provider->gpio_topic());
@@ -834,15 +1183,74 @@ TEST_F(HostIoProviderInstallationTest,
                    ->Resume(original_driver->occurrence(),
                             std::numeric_limits<std::uint64_t>::max(), original_driver)
                    .ok());
-  EXPECT_EQ(messages.size(), 2U);  // preparation/retirement never resends
+  EXPECT_EQ(received_messages().size(), 2U);  // preparation/retirement never resends
   // Candidate stays paused: its new driver is not prepared, and no
   // post-Apply dispatch/physical-effect claim is made.
   EXPECT_EQ(Lifecycle(*replacement_drivers->front()), core::ComponentLifecycle::kNotPrepared);
   candidate.reset();
   for (const auto& driver : *replacement_drivers) driver->Shutdown();
   for (const auto& driver : *drivers) driver->Shutdown();
-  executor.remove_node(node);
+  owner->quiesce();
+  owner.reset();
   ros_context->shutdown("GPIO installer integration complete");
+}
+
+TEST_F(HostIoProviderInstallationTest, OwnedStreamBridgeRetainsSubscriptionUntilForeignDrop) {
+  Build();
+  auto context = std::make_shared<rclcpp::Context>();
+  context->init(0, nullptr);
+  rclcpp::NodeOptions options;
+  options.context(context);
+  options.use_global_arguments(false);
+  auto publisher_node = std::make_shared<rclcpp::Node>("bridge_test_publisher", options);
+  rclcpp::ExecutorOptions executor_options;
+  executor_options.context = context;
+  rclcpp::executors::SingleThreadedExecutor executor(executor_options);
+  executor.add_node(publisher_node);
+  auto transport = ros2_control_execution::Ros2TransportResources::create(
+      "bridge_test_owner", "", 1U, [context] { return context; });
+  auto health = std::make_shared<core::ComponentStreamHealth>(clock, *scheduler);
+  const core::ControllableComponentId component("bridge.component");
+  auto declared = health->Declare(component, {"inputs", 10'000'000'000LL});
+  ASSERT_TRUE(declared.ok());
+  auto recorder = std::move(declared.value());
+  auto bridge = InstallComponentStreamSampleBridge(transport->node(), health, transport);
+  ASSERT_TRUE(bridge);
+  auto copy = bridge;
+  transport->start();
+  auto publisher = publisher_node->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(
+      "/manyforge/component_stream_samples", rclcpp::QoS(rclcpp::KeepLast(64)).reliable());
+  diagnostic_msgs::msg::DiagnosticStatus message;
+  message.hardware_id = component.value();
+  message.name = "inputs";
+  message.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+  diagnostic_msgs::msg::KeyValue stamp;
+  stamp.key = "stamp_ns";
+  stamp.value = "0";
+  message.values.push_back(stamp);
+  auto drop = std::async(std::launch::async, [&] { bridge.reset(); });
+  drop.get();
+  const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < until) {
+    publisher->publish(message);
+    health->Evaluate();
+    const auto current = health->Read(component);
+    if (!current.empty() && current.front().state == core::StreamLivenessStateDTO::kLive)
+      break;
+    executor.spin_once(std::chrono::milliseconds(5));
+  }
+  const auto current = health->Read(component);
+  ASSERT_EQ(current.size(), 1U);
+  EXPECT_EQ(current.front().state, core::StreamLivenessStateDTO::kLive);
+  copy.reset();
+  transport->quiesce();
+  publisher.reset();
+  executor.remove_node(publisher_node);
+  publisher_node.reset();
+  transport.reset();
+  recorder.reset();
+  health.reset();
+  context->shutdown("stream bridge test complete");
 }
 
 } // namespace

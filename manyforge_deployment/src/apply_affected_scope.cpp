@@ -150,7 +150,7 @@ constexpr std::array<std::string_view, 12> kHostComponentRowTables{
 struct HostConfigurations final {
   core::JsonObjectDTO shared;
   std::map<core::ControllableComponentId, core::JsonObjectDTO> components;
-  // CONTRACTS §16: a machine owner's members (their identity includes it).
+  // A machine owner's members (their identity includes it).
   std::map<core::ControllableComponentId, std::set<core::ControllableComponentId>>
       members;
 };
@@ -371,7 +371,7 @@ ProviderSources(const core::RetainedBundleDTO &bundle) {
     if (!provider)
       continue;
     ProviderFenceSource source{&domain, {}};
-    // CP9 pose sources and AI models: members are stream ids, no I/O signal
+    // Pose sources and AI models: members are stream ids, no I/O signal
     // or output.
     if (provider->provider_manifest_id.value() ==
             kPoseSourceProviderManifestId ||
@@ -596,7 +596,7 @@ derive_apply_configuration_fence_scope_verified_values(
                                       affected_resources))
       affected_runtime_units.erase(old_unit.runtime_unit_id);
   }
-  // N17 R4: an own construction override is spec `adapter` data, so its
+  // An own construction override is spec `adapter` data, so its
   // edit replaces that component (outside the host configuration rows).
   for (const auto &component : construction_override_changes) {
     MarkComponent(old_graph, component, affected_resources);

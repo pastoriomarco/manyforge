@@ -1,4 +1,4 @@
-"""GENERATED FILE -- program_binding_transport.v1.json; DO NOT EDIT."""
+"""GENERATED FILE -- program_binding_transport.v3.json; DO NOT EDIT."""
 
 from __future__ import annotations
 
@@ -79,6 +79,24 @@ def _sorted_unique(rows: list[Mapping[str, Any]], key, path: str) -> None:
         _fail(path, "expected canonical sorted unique keys")
 
 
+def _reference(value: object, kind: str, path: str) -> tuple[str, str]:
+    """Validate a closed qualified identity without resolving or repairing it."""
+    fields = {
+        "target": "command_target_id", "frame": "frame_id",
+        "body": "collision_body_id", "signal": "signal_name",
+    }
+    member = fields[kind]
+    row = _record(value, _FIELDS[f"{kind}_reference"], path)
+    component = _identity(row["component_id"], f"{path}.component_id")
+    if kind == "signal":
+        identity = _string(row[member], f"{path}.{member}", 512)
+        if "\x00" in identity:
+            _fail(f"{path}.{member}", "signal name must not contain NUL")
+    else:
+        identity = _identity(row[member], f"{path}.{member}")
+    return component, identity
+
+
 def _id_array(value: object, path: str, *, text: bool = False) -> list[str]:
     rows = _array(value, path, minimum=1)
     result = [
@@ -143,179 +161,166 @@ def validate_program_binding(value: object, *, label: str = "program_binding") -
     _digest(env["catalog_digest"], f"{label}.node_environment.catalog_digest")
     _digest(env["environment_digest"], f"{label}.node_environment.environment_digest")
 
-    components = _array(root["component_role_bindings"], f"{label}.component_role_bindings", maximum=_ROLE_MAX)
-    component_by_role: dict[str, Mapping[str, Any]] = {}
-    for index, item in enumerate(components):
-        path = f"{label}.component_role_bindings[{index}]"
-        row = _record(item, _FIELDS["component"], path)
-        for field in ("component_role_id", "controllable_component_id", "component_type_id"):
+    components = _array(root["component_bindings"], f"{label}.component_bindings", maximum=_ROLE_MAX)
+    component_by_id: dict[str, Mapping[str, Any]] = {}
+    for index, raw in enumerate(components):
+        path = f"{label}.component_bindings[{index}]"
+        row = _record(raw, _FIELDS["component"], path)
+        for field in ("component_id", "component_type_id"):
             _identity(row[field], f"{path}.{field}")
         _digest(row["component_type_revision"], f"{path}.component_type_revision")
-        models = _array(row["model_role_bindings"], f"{path}.model_role_bindings")
-        for mi, model_item in enumerate(models):
-            mp = f"{path}.model_role_bindings[{mi}]"
-            model = _record(model_item, _FIELDS["model"], mp)
+        models = _array(row["model_bindings"], f"{path}.model_bindings")
+        for mi, raw_model in enumerate(models):
+            mp = f"{path}.model_bindings[{mi}]"
+            model = _record(raw_model, _FIELDS["model"], mp)
             _identity(model["model_role_id"], f"{mp}.model_role_id")
             _identity(model["model_instance_id"], f"{mp}.model_instance_id")
             _digest(model["model_revision"], f"{mp}.model_revision")
-        _sorted_unique(models, lambda x: x["model_role_id"], f"{path}.model_role_bindings")
-        component_by_role[row["component_role_id"]] = row
-    _sorted_unique(components, lambda x: x["component_role_id"], f"{label}.component_role_bindings")
+        _sorted_unique(models, lambda x: x["model_role_id"], f"{path}.model_bindings")
+        component_by_id[row["component_id"]] = row
+    _sorted_unique(components, lambda x: x["component_id"], f"{label}.component_bindings")
 
-    targets = _array(root["target_role_bindings"], f"{label}.target_role_bindings", maximum=_ROLE_MAX)
-    target_by_role: dict[str, Mapping[str, Any]] = {}
-    for index, item in enumerate(targets):
-        path = f"{label}.target_role_bindings[{index}]"
-        target = _record(item, _FIELDS["target"], path, optional=_OPTIONAL_FIELDS["target"])
-        for field in ("target_role_id", "component_role_id", "controllable_component_id", "command_target_id"):
-            _identity(target[field], f"{path}.{field}")
-        component = component_by_role.get(target["component_role_id"])
-        if component is None or component["controllable_component_id"] != target["controllable_component_id"]:
-            _fail(path, "target must resolve through component binding")
-        if "default_tcp" in target:
-            dp = f"{path}.default_tcp"
-            default_tcp = _record(target["default_tcp"], _FIELDS["tcp_entry"], dp)
-            for field in ("component_id", "target_id", "frame_role_id"):
-                _identity(default_tcp[field], f"{dp}.{field}")
-        if "robot_tcps" in target:
-            tcp_path = f"{path}.robot_tcps"
-            robot_tcps = _array(target["robot_tcps"], tcp_path)
-            for ti, item2 in enumerate(robot_tcps):
-                rp = f"{tcp_path}[{ti}]"
-                tcp = _record(item2, _FIELDS["robot_tcp"], rp)
-                entry_path = f"{rp}.entry"
-                entry = _record(tcp["entry"], _FIELDS["tcp_entry"], entry_path)
-                for field in ("component_id", "target_id", "frame_role_id"):
-                    _identity(entry[field], f"{entry_path}.{field}")
-                frame_path = f"{rp}.frame"
-                frame = _record(tcp["frame"], _FIELDS["frame"], frame_path,
-                                optional=_OPTIONAL_FIELDS["frame"])
-                _identity(frame["frame_role_id"], f"{frame_path}.frame_role_id")
-                _identity(frame["model_instance_id"], f"{frame_path}.model_instance_id")
-                _digest(frame["model_revision"], f"{frame_path}.model_revision")
-                _string(frame["compiled_frame_name"], f"{frame_path}.compiled_frame_name")
-                if frame["frame_role_id"] != entry["frame_role_id"]:
-                    _fail(rp, "TCP entry/frame role correspondence")
-                if "contact_body_role_ids" in frame:
-                    body_roles = _array(frame["contact_body_role_ids"],
-                                        f"{frame_path}.contact_body_role_ids")
-                    for role in body_roles:
-                        _identity(role, f"{frame_path}.contact_body_role_ids")
-                    _sorted_unique(body_roles, lambda role: role,
-                                   f"{frame_path}.contact_body_role_ids")
-                if type(tcp["end_effector"]) is not bool or type(tcp["component_default"]) is not bool:
-                    _fail(rp, "TCP marks must be boolean")
-            _sorted_unique(robot_tcps,
-                           lambda row: (row["entry"]["component_id"],
-                                        row["entry"]["target_id"],
-                                        row["entry"]["frame_role_id"]),
-                           tcp_path)
-        frames = _array(target["frame_role_bindings"], f"{path}.frame_role_bindings")
-        for fi, item2 in enumerate(frames):
-            fp = f"{path}.frame_role_bindings[{fi}]"
-            frame = _record(item2, _FIELDS["frame"], fp, optional=_OPTIONAL_FIELDS["frame"])
-            _identity(frame["frame_role_id"], f"{fp}.frame_role_id")
-            _identity(frame["model_instance_id"], f"{fp}.model_instance_id")
-            _digest(frame["model_revision"], f"{fp}.model_revision")
-            _string(frame["compiled_frame_name"], f"{fp}.compiled_frame_name")
-            if "contact_body_role_ids" in frame:
-                roles = _array(frame["contact_body_role_ids"], f"{fp}.contact_body_role_ids")
-                for role in roles:
-                    _identity(role, f"{fp}.contact_body_role_ids")
-                _sorted_unique(roles, lambda x: x, f"{fp}.contact_body_role_ids")
-        _sorted_unique(frames, lambda x: x["frame_role_id"], f"{path}.frame_role_bindings")
+    def geometry(kind: str, row: object, path: str) -> tuple[tuple[str, str], Mapping[str, Any]]:
+        binding = _record(row, _FIELDS[kind], path)
+        ref = _reference(binding["reference"], "frame" if kind == "frame" else "body", f"{path}.reference")
+        _identity(binding["model_instance_id"], f"{path}.model_instance_id")
+        _digest(binding["model_revision"], f"{path}.model_revision")
+        if kind == "frame":
+            _string(binding["compiled_frame_name"], f"{path}.compiled_frame_name")
+        else:
+            _id_array(binding["compiled_collision_body_names"], f"{path}.compiled_collision_body_names", text=True)
+        return ref, binding
+
+    frames: dict[tuple[str, str], Mapping[str, Any]] = {}
+    body_bindings: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for field, kind, lookup in (("frame_bindings", "frame", frames), ("collision_body_bindings", "collision", body_bindings)):
+        rows = _array(root[field], f"{label}.{field}", maximum=_ROLE_MAX)
+        for index, raw in enumerate(rows):
+            ref, binding = geometry(kind, raw, f"{label}.{field}[{index}]")
+            lookup[ref] = binding
+        _sorted_unique(rows, lambda x: (x["reference"]["component_id"], x["reference"]["frame_id" if kind == "frame" else "collision_body_id"]), f"{label}.{field}")
+
+    signals: dict[tuple[str, str], Mapping[str, Any]] = {}
+    signal_rows = _array(root["signal_bindings"], f"{label}.signal_bindings", maximum=_ROLE_MAX)
+    for index, raw in enumerate(signal_rows):
+        path = f"{label}.signal_bindings[{index}]"
+        signal = _record(raw, _FIELDS["signal"], path)
+        ref = _reference(signal["reference"], "signal", f"{path}.reference")
+        selected_target = _reference(signal["target"], "target", f"{path}.target")
+        if ref[0] != selected_target[0]: _fail(path, "signal and target component must match")
+        _identity(signal["runtime_unit_id"], f"{path}.runtime_unit_id")
+        _digest(signal["signal_descriptor_digest"], f"{path}.signal_descriptor_digest")
+        if signal["value_type"] != "bool" or signal["direction"] not in ("input", "output") or signal["transition_capability"] not in ("sampled_only", "captured"):
+            _fail(path, "invalid signal declaration")
+        signals[ref] = signal
+    _sorted_unique(signal_rows, lambda x: (x["reference"]["component_id"], x["reference"]["signal_name"]), f"{label}.signal_bindings")
+
+    targets = _array(root["target_bindings"], f"{label}.target_bindings", maximum=_ROLE_MAX)
+    target_by_ref: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for index, raw in enumerate(targets):
+        path = f"{label}.target_bindings[{index}]"
+        target = _record(raw, _FIELDS["target"], path, optional=_OPTIONAL_FIELDS["target"])
+        target_ref = _reference(target["target"], "target", f"{path}.target")
+        if target_ref[0] not in component_by_id:
+            _fail(path, "target has no component binding")
+        target_by_ref[target_ref] = target
+        inventories: dict[str, list[tuple[str, str]]] = {}
+        for field, kind, lookup in (("frame_references", "frame", frames), ("collision_body_references", "body", body_bindings), ("signal_references", "signal", signals)):
+            refs = _array(target[field], f"{path}.{field}")
+            keys = [_reference(ref, kind, f"{path}.{field}[{i}]") for i, ref in enumerate(refs)]
+            if keys != sorted(set(keys)) or any(key not in lookup for key in keys):
+                _fail(f"{path}.{field}", "references must be sorted unique and resolve")
+            if kind == "signal" and any(_reference(signals[key]["target"], "target", path) != target_ref for key in keys):
+                _fail(f"{path}.{field}", "signal must resolve through the exact target")
+            inventories[field] = keys
+        associations = _array(target["frame_associations"], f"{path}.frame_associations")
+        assoc_keys = []
+        for ai, raw_assoc in enumerate(associations):
+            ap = f"{path}.frame_associations[{ai}]"
+            assoc = _record(raw_assoc, _FIELDS["frame_association"], ap)
+            ref = _reference(assoc["frame"], "frame", f"{ap}.frame")
+            assoc_keys.append(ref)
+            roles = _array(assoc["contact_body_role_ids"], f"{ap}.contact_body_role_ids")
+            for role in roles: _identity(role, f"{ap}.contact_body_role_ids")
+            _sorted_unique(roles, lambda x: x, f"{ap}.contact_body_role_ids")
+            for role in roles:
+                body = body_bindings.get((ref[0], role))
+                frame = frames.get(ref)
+                if body is None or frame is None or body["model_instance_id"] != frame["model_instance_id"] or body["model_revision"] != frame["model_revision"]:
+                    _fail(ap, "contact body must resolve through target and frame model")
+        if assoc_keys != inventories["frame_references"]:
+            _fail(path, "frame associations must match frame references")
         resources = _array(target["resource_role_bindings"], f"{path}.resource_role_bindings")
-        for ri, item2 in enumerate(resources):
+        for ri, raw_resource in enumerate(resources):
             rp = f"{path}.resource_role_bindings[{ri}]"
-            resource = _record(item2, _FIELDS["resource"], rp)
+            resource = _record(raw_resource, _FIELDS["resource"], rp)
             _identity(resource["resource_role_id"], f"{rp}.resource_role_id")
             ids = _id_array(resource["resource_ids"], f"{rp}.resource_ids")
             names = _id_array(resource["compiled_resource_names"], f"{rp}.compiled_resource_names", text=True)
-            if len(ids) != len(names):
-                _fail(rp, "resource correspondence vectors must have equal length")
+            if len(ids) != len(names): _fail(rp, "resource correspondence vectors must have equal length")
         _sorted_unique(resources, lambda x: x["resource_role_id"], f"{path}.resource_role_bindings")
-        if "signal_role_bindings" in target:
-            signals = _array(target["signal_role_bindings"], f"{path}.signal_role_bindings", minimum=1)
-            coordinate_roles = {row["resource_role_id"] for row in resources}
-            for si, item2 in enumerate(signals):
-                sp = f"{path}.signal_role_bindings[{si}]"
-                signal = _record(item2, _FIELDS["signal"], sp)
-                _identity(signal["resource_role_id"], f"{sp}.resource_role_id")
-                _identity(signal["signal_name"], f"{sp}.signal_name")
-                _digest(signal["signal_descriptor_digest"], f"{sp}.signal_descriptor_digest")
-                if signal["value_type"] != "bool" or signal["direction"] not in ("input", "output") or signal["transition_capability"] not in ("sampled_only", "captured"):
-                    _fail(sp, "invalid signal declaration")
-                if signal["resource_role_id"] in coordinate_roles:
-                    _fail(sp, "resource role cannot resolve to both coordinate and signal")
-            _sorted_unique(signals, lambda x: x["resource_role_id"], f"{path}.signal_role_bindings")
-        collisions = _array(target["collision_body_role_bindings"], f"{path}.collision_body_role_bindings")
-        for ci, item2 in enumerate(collisions):
-            cp = f"{path}.collision_body_role_bindings[{ci}]"
-            collision = _record(item2, _FIELDS["collision"], cp)
-            _identity(collision["collision_body_role_id"], f"{cp}.collision_body_role_id")
-            _identity(collision["model_instance_id"], f"{cp}.model_instance_id")
-            _digest(collision["model_revision"], f"{cp}.model_revision")
-            _id_array(collision["compiled_collision_body_names"], f"{cp}.compiled_collision_body_names", text=True)
-        _sorted_unique(collisions, lambda x: x["collision_body_role_id"], f"{path}.collision_body_role_bindings")
-        collision_by_role = {row["collision_body_role_id"]: row for row in collisions}
-        for frame in frames:
-            for role in frame.get("contact_body_role_ids", []):
-                body = collision_by_role.get(role)
-                if body is None or body["model_instance_id"] != frame["model_instance_id"] or body["model_revision"] != frame["model_revision"]:
-                    _fail(path, "endpoint body must resolve through the same target and model")
         capabilities = _array(target["capability_bindings"], f"{path}.capability_bindings")
-        for ci, item2 in enumerate(capabilities):
+        for ci, raw_cap in enumerate(capabilities):
             cp = f"{path}.capability_bindings[{ci}]"
-            cap = _record(item2, _FIELDS["capability"], cp)
+            cap = _record(raw_cap, _FIELDS["capability"], cp)
             _identity(cap["capability_id"], f"{cp}.capability_id")
             _digest(cap["capability_definition_revision"], f"{cp}.capability_definition_revision")
-            specs = (
-                ("control_binding", "control"),
-                ("capability_provider_binding", "provider"),
-                ("command_schema", "command_schema"),
-            )
-            for field, record_name in specs:
-                nested = cap[field]
-                if nested is not None:
-                    keys = _FIELDS[record_name]
-                    ref = _record(nested, keys, f"{cp}.{field}")
+            for field, name in (("control_binding", "control"), ("capability_provider_binding", "provider"), ("command_schema", "command_schema")):
+                if cap[field] is not None:
+                    keys = _FIELDS[name]
+                    ref = _record(cap[field], keys, f"{cp}.{field}")
                     _identity(ref[keys[0]], f"{cp}.{field}.{keys[0]}")
                     _digest(ref[keys[1]], f"{cp}.{field}.{keys[1]}")
-            if cap["control_binding"] is None and cap["capability_provider_binding"] is None:
-                _fail(cp, "expected control or provider resolution")
+            if cap["control_binding"] is None and cap["capability_provider_binding"] is None: _fail(cp, "expected control or provider resolution")
         _sorted_unique(capabilities, lambda x: x["capability_id"], f"{path}.capability_bindings")
-        target_by_role[target["target_role_id"]] = target
-    _sorted_unique(targets, lambda x: x["target_role_id"], f"{label}.target_role_bindings")
-
+    _sorted_unique(targets, lambda x: (x["target"]["component_id"], x["target"]["command_target_id"]), f"{label}.target_bindings")
     for index, target in enumerate(targets):
-        if "pneumatic_io" not in target:
-            continue
-        path = f"{label}.target_role_bindings[{index}].pneumatic_io"
-        route = _record(target["pneumatic_io"], _FIELDS["pneumatic_io"], path)
+        path = f"{label}.target_bindings[{index}]"
+        def tcp_entry(raw: object, where: str) -> tuple[tuple[str, str], tuple[str, str]]:
+            entry = _record(raw, _FIELDS["tcp_entry"], where)
+            return (_reference(entry["target"], "target", f"{where}.target"),
+                    _reference(entry["frame"], "frame", f"{where}.frame"))
+        if "default_tcp" in target: tcp_entry(target["default_tcp"], f"{path}.default_tcp")
+        tcps = _array(target.get("robot_tcps", []), f"{path}.robot_tcps")
+        entries = []
+        for ti, raw_tcp in enumerate(tcps):
+            tp = f"{path}.robot_tcps[{ti}]"
+            tcp = _record(raw_tcp, _FIELDS["robot_tcp"], tp)
+            entry = tcp_entry(tcp["entry"], f"{tp}.entry")
+            frame_ref, _ = geometry("frame", tcp["frame"], f"{tp}.frame")
+            if frame_ref != entry[1]: _fail(tp, "TCP entry/frame correspondence")
+            roles = _array(tcp["contact_body_role_ids"], f"{tp}.contact_body_role_ids")
+            for role in roles: _identity(role, f"{tp}.contact_body_role_ids")
+            _sorted_unique(roles, lambda x: x, f"{tp}.contact_body_role_ids")
+            if type(tcp["end_effector"]) is not bool or type(tcp["component_default"]) is not bool:
+                _fail(tp, "TCP marks must be boolean")
+            entries.append(entry)
+        if entries != sorted(set(entries)): _fail(path, "TCP entries must be sorted unique")
+        if "pneumatic_io" not in target: continue
+        rp = f"{path}.pneumatic_io"
+        route = _record(target["pneumatic_io"], _FIELDS["pneumatic_io"], rp)
         if not any(cap["capability_id"] == "tool.gripper.command" for cap in target["capability_bindings"]):
-            _fail(path, "requires a gripper command target")
-        outputs = _array(route["outputs"], f"{path}.outputs", minimum=1, maximum=2)
-        inputs = _array(route["inputs"], f"{path}.inputs", maximum=4)
+            _fail(rp, "requires a gripper command target")
+        outputs = _array(route["outputs"], f"{rp}.outputs", minimum=1, maximum=2)
+        inputs = _array(route["inputs"], f"{rp}.inputs", maximum=4)
+        output_keys = []
         for rows, kind in ((outputs, "output"), (inputs, "input")):
-            for ri, raw in enumerate(rows):
-                rp = f"{path}.{kind}s[{ri}]"
-                row = _record(raw, _FIELDS[f"pneumatic_{kind}"], rp)
-                _identity(row["target_role_id"], f"{rp}.target_role_id")
-                _identity(row["resource_role_id"], f"{rp}.resource_role_id")
-                if kind == "output":
-                    if type(row["open_value"]) is not bool or type(row["close_value"]) is not bool:
-                        _fail(rp, "output levels must be boolean")
-                elif row["input"] not in ("open", "closed", "pressure", "workpiece_grasped"):
-                    _fail(rp, "unknown pneumatic input")
-                selected = target_by_role.get(row["target_role_id"])
-                signal = next((item for item in selected.get("signal_role_bindings", ())
-                               if item["resource_role_id"] == row["resource_role_id"]), None) if selected else None
+            for ri, raw_row in enumerate(rows):
+                sp = f"{rp}.{kind}s[{ri}]"
+                row = _record(raw_row, _FIELDS[f"pneumatic_{kind}"], sp)
+                signal_ref = _reference(row["signal"], "signal", f"{sp}.signal")
+                signal = signals.get(signal_ref)
+                selected = target_by_ref.get(_reference(signal["target"], "target", f"{sp}.target")) if signal else None
                 capability = "io.gpio.set_output" if kind == "output" else "io.gpio.get_input"
-                if (selected is None or signal is None or signal["direction"] != kind
-                    or not any(cap["capability_id"] == capability for cap in selected["capability_bindings"])):
-                    _fail(rp, "signal does not resolve through its exact bound I/O target")
-        _sorted_unique(outputs, lambda x: (x["target_role_id"], x["resource_role_id"]), f"{path}.outputs")
-        _sorted_unique(inputs, lambda x: x["input"], f"{path}.inputs")
+                if signal is None or selected is None or signal["direction"] != kind or not any(_reference(ref, "signal", sp) == signal_ref for ref in selected["signal_references"]) or not any(cap["capability_id"] == capability for cap in selected["capability_bindings"]):
+                    _fail(sp, "signal does not resolve through its exact bound I/O target")
+                if kind == "output":
+                    if type(row["open_value"]) is not bool or type(row["close_value"]) is not bool: _fail(sp, "output levels must be boolean")
+                    output_keys.append(signal_ref)
+                elif row["input"] not in ("open", "closed", "pressure", "workpiece_grasped"):
+                    _fail(sp, "unknown pneumatic input")
+        if output_keys != sorted(set(output_keys)): _fail(f"{rp}.outputs", "expected sorted unique outputs")
+        _sorted_unique(inputs, lambda x: x["input"], f"{rp}.inputs")
 
     node_policies = _array(
         root["node_policies"], f"{label}.node_policies",
@@ -370,44 +375,32 @@ def validate_program_binding(value: object, *, label: str = "program_binding") -
         for bi, item2 in enumerate(bodies):
             bp = f"{pp}.allowed_body_bindings[{bi}]"
             body = _record(item2, _FIELDS["contact_body"], bp)
-            for field in ("component_role_id", "target_role_id", "controllable_component_id",
-                          "command_target_id", "collision_body_role_id", "model_instance_id"):
-                _identity(body[field], f"{bp}.{field}")
+            ref = _reference(body["body"], "body", f"{bp}.body")
+            _identity(body["model_instance_id"], f"{bp}.model_instance_id")
             if body["model_role_id"] is not None:
                 _identity(body["model_role_id"], f"{bp}.model_role_id")
             _digest(body["model_revision"], f"{bp}.model_revision")
             ids = _id_array(body["collision_body_ids"], f"{bp}.collision_body_ids", text=True)
             expected = [_COLLISION_BODY_ID.format(
-                controllable_component_id=body["controllable_component_id"],
-                model_instance_id=body["model_instance_id"],
-                collision_body_role_id=body["collision_body_role_id"],
-                index=i,
+                controllable_component_id=ref[0], model_instance_id=body["model_instance_id"],
+                collision_body_role_id=ref[1], index=i,
             ) for i in range(len(ids))]
             if ids != expected:
                 _fail(bp, "collision body IDs differ from generated scope")
-            target = target_by_role.get(body["target_role_id"])
-            if target is None or any(target[field] != body[field] for field in
-                    ("component_role_id", "controllable_component_id", "command_target_id")):
-                _fail(bp, "contact body has no exact target")
-            collisions = [x for x in target["collision_body_role_bindings"]
-                if x["collision_body_role_id"] == body["collision_body_role_id"]]
-            if len(collisions) != 1 or collisions[0]["model_instance_id"] != body["model_instance_id"] or \
-                    collisions[0]["model_revision"] != body["model_revision"] or \
-                    len(collisions[0]["compiled_collision_body_names"]) != len(ids):
+            collision = body_bindings.get(ref)
+            if collision is None or collision["model_instance_id"] != body["model_instance_id"] or collision["model_revision"] != body["model_revision"] or len(collision["compiled_collision_body_names"]) != len(ids):
                 _fail(bp, "contact body differs from collision binding")
             if body["model_role_id"] is not None:
-                models = component_by_role[body["component_role_id"]]["model_role_bindings"]
-                if sum(x["model_role_id"] == body["model_role_id"] and
-                       x["model_instance_id"] == body["model_instance_id"] and
-                       x["model_revision"] == body["model_revision"] for x in models) != 1:
+                component = component_by_id.get(ref[0])
+                models = component["model_bindings"] if component else []
+                if sum(x["model_role_id"] == body["model_role_id"] and x["model_instance_id"] == body["model_instance_id"] and x["model_revision"] == body["model_revision"] for x in models) != 1:
                     _fail(bp, "contact body differs from model binding")
-        _sorted_unique(bodies, lambda x: (x["component_role_id"], x["target_role_id"],
-            (0, "") if x["model_role_id"] is None else (1, x["model_role_id"]),
-            x["collision_body_role_id"]), f"{pp}.allowed_body_bindings")
+        _sorted_unique(bodies, lambda x: (x["body"]["component_id"], x["body"]["collision_body_id"],
+            (0, "") if x["model_role_id"] is None else (1, x["model_role_id"])), f"{pp}.allowed_body_bindings")
     _sorted_unique(contacts, lambda x: x["contact_policy_id"], f"{label}.contact_grasp_bindings")
 
     provenance = _record(root["provenance"], _FIELDS["provenance"], f"{label}.provenance")
-    for field in ("binding_compiler_contract_digest", "role_assignment_digest"):
+    for field in ("binding_compiler_contract_digest",):
         _digest(provenance[field], f"{label}.provenance.{field}")
     for field in ("source_records", "resolved_output_records"):
         records = _array(provenance[field], f"{label}.provenance.{field}", maximum=_PROVENANCE_MAX)

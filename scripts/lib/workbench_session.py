@@ -148,7 +148,7 @@ def _seal_archive(folder: Path) -> None:
 
 
 def _readonly_database(path: Path) -> sqlite3.Connection:
-    """Q99 rule: never pretend immutable main contains an uncheckpointed WAL."""
+    """Never pretend immutable main contains an uncheckpointed WAL."""
     _safe_path(path, path.parent)
     row = path.stat(follow_symlinks=False)
     if not stat.S_ISREG(row.st_mode):
@@ -163,7 +163,7 @@ def _readonly_database(path: Path) -> sqlite3.Connection:
 def _effect_observations(folder: Path) -> tuple[str, list[str], list[str]]:
     """Bounded scalar diagnostics only; never decode opaque owner formats.
 
-    Source predicates: DX1003 journal-terminal-predicates.md. Unknown formats
+    Unknown formats
     and missing/native-WAL evidence remain unknown, independently of shutdown.
     The schema version is the journal's own metadata (user_version, or the
     Program metadata row); it is read, not pinned. A predicate that does not

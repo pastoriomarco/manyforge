@@ -790,7 +790,7 @@ TEST(DeploymentApplicabilityCodec,
   // Specs currently define these substrate collections by complete typed
   // identity. Whether two revisions under one stable ID are stale/extra
   // occurrence inputs is deliberately resolved against the graph/provider
-  // closure in the later C0.2n qualifier.
+  // closure in the later applicability qualifier.
   const auto candidate = decode(minimal_document(
       "[" + desired_configuration("domain", kZeroDigest) + "," +
           desired_configuration("domain", kOneDigest) + "]",
@@ -970,7 +970,7 @@ TEST(DeploymentApplicabilityCodec,
 }
 
 TEST(DeploymentApplicabilityCodec, PerBindingStopTimingIsNoLongerAPolicyField) {
-  // Q51/Q53: each robot's Stop timing lives in its own controlled-Stop profile
+  // Each robot's Stop timing lives in its own controlled-Stop profile
   // (`max_stop_time_s`); the cell-wide per-binding timing table is gone and
   // an older document carrying it is refused, not converted.
   auto policies = policy_envelope();
@@ -1202,7 +1202,7 @@ TEST(DeploymentApplicabilityCodec,
   expect_decode_error_containing(document_for("[" + row_prefix + "}]"),
                                  "$.policies.component_streams[0]: missing "
                                  "required field 'budget_ns'");
-  // CONTRACTS §7: severity and recovery are gone; budget_ns stays.
+  // Severity and recovery are gone; budget_ns stays.
   expect_decode_error_containing(
       document_for("[" + row_prefix + R"(,"budget_ns":5,"severity":"fault"}])"),
       "unknown field 'severity'");
@@ -1409,7 +1409,7 @@ TEST(DeploymentApplicabilityCodecTest, GlobalRuleOnTripAfterStopAndActiveAtStart
     return value == nullptr ? std::string("<absent>") : value->as_string();
   };
   // on_trip is required; after_stop defaults to hold (stop only) and
-  // active_at_start to false (CONTRACTS §8).
+  // active_at_start to false.
   const CanonicalValue::Object stop_fields{{"on_trip", CanonicalValue("stop")},
                                            {"after_stop", CanonicalValue("hold")},
                                            {"active_at_start", CanonicalValue(false)}};

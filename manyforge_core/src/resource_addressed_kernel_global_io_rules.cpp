@@ -368,7 +368,7 @@ Result<void> ResourceAddressedExecutionKernel::install_global_io_rule_catalog_lo
   for (std::size_t index = 0; index < rule_count; ++index) {
     const auto& candidate = *catalog;
     const auto& rule = candidate.rules[index];
-    // Load starts every rule at its `active_at_start` (CONTRACTS §8, §11).
+    // Load starts every rule at its `active_at_start`.
     GlobalIoRuleRuntime row{{rule.policy_id, rule.active_at_start ? IoGlobalRuleState::kClear
                                                                   : IoGlobalRuleState::kInactive},
                             std::nullopt, std::nullopt, std::nullopt, rule.active_at_start, false,
@@ -656,7 +656,7 @@ std::vector<ErrorDTO> ResourceAddressedExecutionKernel::ReadRuleHolds() const {
     auto hold = global_io_rule_hold_locked(index, false);
     if (!hold) continue;
     // The rule's scope, so readiness blocks Execute/Resume only when it meets
-    // the Program's components (CONTRACTS §8, §10).
+    // the Program's components.
     const auto& scope = global_io_rule_catalog_->rules[index].scope;
     if (std::holds_alternative<IoActivationEverythingScopeDTO>(scope)) {
       hold->details["scope"] = "everything";
@@ -820,7 +820,7 @@ Result<bool> ResourceAddressedExecutionKernel::global_io_rule_supersedes_node_lo
   return Result<bool>::Ok(false);
 }
 
-// CONTRACTS §8. Per active rule:
+// Per active rule:
 // - can't watch (source loss, evaluation error, setup failed): the operator's
 //   Stop on the rule's scope for motion moving in it, then withdraw the key
 //   and gate until a fresh rearm;
@@ -828,7 +828,7 @@ Result<bool> ResourceAddressedExecutionKernel::global_io_rule_supersedes_node_lo
 //   on the rule's scope (if motion in scope is executing), publishes
 //   `tripped`, and gates while the condition holds;
 // - condition false after a trip: renew the registration, publish `clear`.
-// Paused while the cell is latched (R1). One Stop handoff per call.
+// Paused while the cell is latched. One Stop handoff per call.
 Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_locked(
     StopWorkHandoff& handoff, const OperationId* dispatch_boundary) {
   if (!global_io_rule_catalog_ || cell_latched_locked()) return Result<void>::Ok();
@@ -1050,7 +1050,7 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
       set_global_io_rule_state_locked(index, IoGlobalRuleState::kTripped, acquisition);
       continue;
     }
-    // AUD-6: `hold` is the operator's Stop: the run is held too (below, or
+    // `hold` is the operator's Stop: the run is held too (below, or
     // on the next step when this one used its Stop handoff).
     row.hold_run = policy.after_stop == IoRuleAfterStopDTO::kHold;
     const auto stopped = stop_scope(candidate_order, false);
@@ -1070,7 +1070,7 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
   return Result<void>::Ok();
 }
 
-// AUD-6: `stop` + `hold` is the operator's Stop. The run is held at once,
+// `stop` + `hold` is the operator's Stop. The run is held at once,
 // whatever moves, as the Stop button holds it (group `all`), also when nothing
 // in the rule's scope moves; Resume and Execute then wait for the rule
 // (`rule_holds`). `fail_node` leaves the run going: its next motion in scope
@@ -1245,7 +1245,7 @@ Result<void> ResourceAddressedExecutionKernel::admit_output_write(
     refusal->details.emplace("signal_name", output.name);
     return Result<void>::Err(std::move(*refusal));
   }
-  // CONTRACTS §7 (IO-MAN): a manual write waits only while motion executes
+  // A manual write waits only while motion executes
   // in the cell: an operation (arm motion or gripper command) dispatching,
   // executing or stopping, or a running immediate step. A queued, planning or
   // prepared operation has not moved yet; last write wins otherwise.

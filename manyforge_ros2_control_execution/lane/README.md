@@ -53,7 +53,7 @@ gripper command backend does not cancel when the finger position is already
 within this tolerance of the commanded target; it lets the goal finish and
 settles on the controller's result. Further away it cancels, and the
 controller's acceptance of the cancel ends the command: the stock
-`GripperActionController` holds the current position before it accepts, and a
+`parallel_gripper_action_controller/GripperActionController` holds the current position before it accepts, and a
 cancel that arrives after it finished the goal but before `realtime_tools`
 sent the success result is accepted and never answered (no result follows).
 The tolerance is wide on purpose (about 5% of the stroke) so the Stop

@@ -142,7 +142,7 @@ VerifyRuntimeProducts(
     const auto product = manyforge::deployment::verify_runtime_unit_product(
         bundle, runtime_unit.runtime_unit_id, artifact_source);
     if (!product.has_value()) {
-      Fail("runtime unit has no I3-qualified I4 process adapter product: " +
+      Fail("runtime unit has no qualified process adapter product: " +
            runtime_unit.runtime_unit_id.value());
     }
     if (product->operating_system() != operating_system) {
@@ -228,8 +228,7 @@ CompatibleRuntimeSuccessor(const RuntimeUnitConvergencePlanRowDTO &predecessor,
           RuntimeUnitCandidateDisposition::kAdded;
     } else if (!CompatibleRuntimeSuccessor(predecessor_row->second,
                                            candidate_row)) {
-      Fail("runtime-unit replacement is not qualified by the current I4 "
-           "checkpoint: " +
+      Fail("runtime-unit replacement is not qualified: " +
            runtime_id);
     }
     result.push_back(std::move(candidate_row));

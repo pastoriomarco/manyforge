@@ -21,7 +21,7 @@
 
 namespace manyforge::roboplan_backend {
 
-/// TOOLCTX: what a robot's tool context is made of in its retained
+/// What a robot's tool context is made of in its retained
 /// Deployment, in compiled frame names of the composed cell URDF.
 struct RetainedToolContextFrames final {
   /// (component, command target, frame role) of an attachment's carrier.
@@ -54,15 +54,15 @@ struct RetainedToolContextFrames final {
     const core::ControllableComponentId &robot,
     const core::CommandTargetId &motion_target);
 
-/// TOOLCTX: one robot's tool context, vendor-neutral, from its retained
+/// One robot's tool context, vendor-neutral, from its retained
 /// Deployment and the current scene. Built once per bind; `Compose` runs at
 /// Enable and before every new motion goal.
 ///
 /// - TCP: the given TCP frame (the robot's Active TCP: any frame of the
 ///   robot or of a tool mounted on it), else the End-effector TCP, as
 ///   T_flange_tcp, along the composed cell URDF's fixed joints up to the
-///   robot's flange. With neither (no TCP at all), the flange: a zero offset
-///   (B-run-1); whatever needs a TCP is refused before it gets here (C-P2).
+///   robot's flange. With neither (no TCP at all), the flange: a zero offset;
+/// whatever needs a TCP is refused before it gets here.
 /// - Payload: each mounted tool's model payload at its mount, plus every
 ///   carried object attached to the robot or a mounted tool with a
 ///   `mass_kg`, as a point mass at its attach pose.

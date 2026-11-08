@@ -18,12 +18,12 @@ export type IoSignalQuality = 'missing' | 'fresh' | 'stale' | 'invalid' | 'unava
 export interface IoSignalSelector {
   ownerEpoch: string;
   programBindingId: string;
-  targetRoleId: string;
-  resourceRoleId: string;
+  componentId: string;
+  signalName: string;
 }
 
 /**
- * An input's declared liveness (SX-2194, contracts 76/81), from the canonical
+ * An input's declared liveness, from the canonical
  * descriptor and present before the first value: `liveness_unproven` exactly
  * for a change-only source. Never inferred from quality or timestamps.
  */
@@ -80,7 +80,7 @@ export interface IoSourceCursor {
 }
 
 /**
- * One `set_mock_io_input` receipt (SX-2094): the model accepted
+ * One `set_mock_io_input` receipt: the model accepted
  * `modelValue`; `publishedCursor` names the record it was delivered as
  * through the real source, or is null while the source is not publishing
  * (e.g. Disabled: the model is kept and delivered on Enable). Only
@@ -144,33 +144,37 @@ function observationAt(
   selector: IoSignalSelector,
   path: string,
 ): IoSignalReading {
-  if (envelope.api_version !== 'manyforge.execution_command_response.v1'
+  if (envelope.api_version !== 'manyforge.execution_command_response.v4'
     || envelope.command !== command || envelope.ok !== true) {
     return fail(path, `a successful ${command} response`);
   }
   const observation = objectAt(envelope.target_observation, `${path}.target_observation`);
-  exactKeysAt(observation, ['schema_version', 'owner_epoch', 'program_binding_id', 'target_role_id',
-    'kind', 'resource_role_id', 'evaluated_at_ns', 'value'], `${path}.target_observation`);
+  exactKeysAt(observation, ['schema_version', 'owner_epoch', 'program_binding_id', 'signal',
+    'kind', 'evaluated_at_ns', 'value'], `${path}.target_observation`);
+  const signal = objectAt(observation.signal, `${path}.target_observation.signal`);
+  exactKeysAt(signal, ['component_id', 'signal_name'], `${path}.target_observation.signal`);
   // The owner evaluation time (receiver clock): required, not displayed.
-  receiptAgeAt(observation.evaluated_at_ns, `${path}.target_observation.evaluated_at_ns`)
-    ?? fail(`${path}.target_observation.evaluated_at_ns`, 'a nonnegative int64');
-  if (observation.schema_version !== 'manyforge.target_observation.v1'
+  if (receiptAgeAt(observation.evaluated_at_ns, `${path}.target_observation.evaluated_at_ns`) === null) {
+    fail(`${path}.target_observation.evaluated_at_ns`, 'a nonnegative int64');
+  }
+  if (observation.schema_version !== 'manyforge.target_observation.v2'
     || observation.kind !== 'io_signal'
     || observation.owner_epoch !== selector.ownerEpoch
     || observation.program_binding_id !== selector.programBindingId
-    || observation.target_role_id !== selector.targetRoleId
-    || observation.resource_role_id !== selector.resourceRoleId) {
+    || signal.component_id !== selector.componentId
+    || signal.signal_name !== selector.signalName) {
     return fail(`${path}.target_observation`, 'the I/O signal observation of this exact selector');
   }
   const at = `${path}.target_observation.value`;
   const reading = objectAt(observation.value, at);
   exactKeysAt(reading, ['liveness', 'signal_name', 'value_type', 'value', 'quality', 'source_id', 'source_epoch',
     'source_sequence', 'receipt_age_ns', 'continuity_loss_generation', 'error'], at);
+  if (reading.signal_name !== selector.signalName) return fail(`${at}.signal_name`, 'the selected signal');
   if (reading.value_type !== 'bool') return fail(`${at}.value_type`, 'bool');
   const quality = reading.quality as IoSignalQuality;
   if (!QUALITIES.includes(quality)) return fail(`${at}.quality`, QUALITIES.join(' | '));
   const signalValue = reading.value === null ? null : booleanAt(reading.value, `${at}.value`);
-  // The opaque source incarnation (spec 260 §2.3), not a counter.
+  // The opaque source incarnation, not a counter.
   const sourceEpoch = reading.source_epoch === null
     ? null
     : sourceEpochAt(reading.source_epoch, `${at}.source_epoch`);
@@ -224,22 +228,20 @@ function livenessAt(value: unknown, path: string): IoSignalLiveness | null {
 
 export function ioSignalReadBody(selector: IoSignalSelector) {
   return {
-    schema_version: 'manyforge.target_observation_query.v1',
+    schema_version: 'manyforge.target_observation_query.v2',
     owner_epoch: selector.ownerEpoch,
     program_binding_id: selector.programBindingId,
-    target_role_id: selector.targetRoleId,
     kind: 'io_signal',
-    resource_role_id: selector.resourceRoleId,
+    signal: { component_id: selector.componentId, signal_name: selector.signalName },
   } as const;
 }
 
 export function mockIoInputBody(selector: IoSignalSelector, expectedSourceEpoch: string, value: boolean) {
   return {
-    schema_version: 'manyforge.mock_io_input_request.v1',
+    schema_version: 'manyforge.mock_io_input_request.v2',
     owner_epoch: selector.ownerEpoch,
     program_binding_id: selector.programBindingId,
-    target_role_id: selector.targetRoleId,
-    resource_role_id: selector.resourceRoleId,
+    signal: { component_id: selector.componentId, signal_name: selector.signalName },
     expected_source_epoch: expectedSourceEpoch,
     value,
   } as const;
@@ -248,11 +250,10 @@ export function mockIoInputBody(selector: IoSignalSelector, expectedSourceEpoch:
 /** One target's bound signals: the `targets.io_signal_bindings` row shape. */
 export interface IoSignalBinding {
   programBindingId: string;
-  targetRoleId: string;
-  controllableComponentId: string;
+  componentId: string;
   commandTargetId: string;
-  signalRoleBindings: Array<{
-    resourceRoleId: string;
+  signals: Array<{
+    componentId: string;
     signalName: string;
     valueType: 'bool';
     direction: 'input' | 'output';
@@ -321,110 +322,83 @@ const MAXIMUM_IO_SIGNAL_BINDING_ROWS = 4096;
  * order, each with its sorted, non-empty signal rows.
  */
 export function ioSignalBindingsAt(value: unknown, path: string): IoSignalBinding[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > MAXIMUM_IO_SIGNAL_BINDING_ROWS) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAXIMUM_IO_SIGNAL_BINDING_ROWS)
     return fail(path, `a non-empty array of at most ${MAXIMUM_IO_SIGNAL_BINDING_ROWS} rows`);
-  }
   const rows = value.map((entry, index): IoSignalBinding => {
     const at = `${path}[${index}]`;
     const row = objectAt(entry, at);
-    allowedKeysAt(row, ['program_binding_id', 'target_role_id', 'controllable_component_id',
-      'command_target_id', 'signal_role_bindings'], ['signal_sources'], at);
-    // Host-owned provider projection (SX/DX-1494): validated for shape, not consumed.
-    const sources = row.signal_sources === undefined ? [] : row.signal_sources;
-    if (!Array.isArray(sources)) return fail(`${at}.signal_sources`, 'an array');
-    sources.forEach((item, sourceIndex) => {
-      const sp = `${at}.signal_sources[${sourceIndex}]`;
-      const source = objectAt(item, sp);
-      exactKeysAt(source, ['resource_role_id', 'source_kind'], sp);
-      stringAt(source.resource_role_id, `${sp}.resource_role_id`);
-      stringAt(source.source_kind, `${sp}.source_kind`);
-    });
-    const signals = row.signal_role_bindings;
-    if (!Array.isArray(signals) || signals.length === 0) return fail(`${at}.signal_role_bindings`, 'a non-empty array');
-    const signalRoleBindings = signals.map((item, signalIndex) => {
-      const sp = `${at}.signal_role_bindings[${signalIndex}]`;
-      const signal = objectAt(item, sp);
-      exactKeysAt(signal, ['resource_role_id', 'signal_name', 'value_type', 'direction',
-        'transition_capability', 'signal_descriptor_digest'], sp);
-      if (signal.value_type !== 'bool') return fail(`${sp}.value_type`, 'bool');
-      if (signal.direction !== 'input' && signal.direction !== 'output') return fail(`${sp}.direction`, 'input | output');
-      if (signal.transition_capability !== 'sampled_only' && signal.transition_capability !== 'captured') {
-        return fail(`${sp}.transition_capability`, 'sampled_only | captured');
-      }
-      const digest = stringAt(signal.signal_descriptor_digest, `${sp}.signal_descriptor_digest`);
-      if (!/^sha256:[0-9a-f]{64}$/.test(digest)) return fail(`${sp}.signal_descriptor_digest`, 'a sha256 digest');
-      return {
-        resourceRoleId: stringAt(signal.resource_role_id, `${sp}.resource_role_id`),
-        signalName: stringAt(signal.signal_name, `${sp}.signal_name`),
-        valueType: 'bool' as const,
-        direction: signal.direction as 'input' | 'output',
-        transitionCapability: signal.transition_capability as 'sampled_only' | 'captured',
-        signalDescriptorDigest: digest,
-      };
-    });
-    signalRoleBindings.forEach((signal, signalIndex) => {
-      if (signalIndex > 0 && !(signalRoleBindings[signalIndex - 1].resourceRoleId < signal.resourceRoleId)) {
-        fail(`${at}.signal_role_bindings`, 'unique rows sorted by resource_role_id');
-      }
-    });
+    exactKeysAt(row, ['program_binding_id', 'target', 'signals', 'signal_sources'], at);
+    const target = objectAt(row.target, `${at}.target`);
+    exactKeysAt(target, ['component_id', 'command_target_id'], `${at}.target`);
+    const componentId = nonEmptyStringAt(target.component_id, `${at}.target.component_id`);
+    const commandTargetId = nonEmptyStringAt(target.command_target_id, `${at}.target.command_target_id`);
     const programBindingId = stringAt(row.program_binding_id, `${at}.program_binding_id`);
     if (!/^sha256:[0-9a-f]{64}$/.test(programBindingId)) return fail(`${at}.program_binding_id`, 'a sha256 digest');
-    return {
-      programBindingId,
-      targetRoleId: stringAt(row.target_role_id, `${at}.target_role_id`),
-      controllableComponentId: stringAt(row.controllable_component_id, `${at}.controllable_component_id`),
-      commandTargetId: stringAt(row.command_target_id, `${at}.command_target_id`),
-      signalRoleBindings,
-    };
-  });
-  const order = (row: IoSignalBinding) => [row.controllableComponentId, row.commandTargetId,
-    row.targetRoleId, row.programBindingId];
-  rows.forEach((row, index) => {
-    if (index === 0) return;
-    const previous = order(rows[index - 1]);
-    const current = order(row);
-    const compared = previous.findIndex((item, part) => item !== current[part]);
-    if (compared === -1 || !(previous[compared] < current[compared])) {
-      fail(path, 'unique rows in component/command target/target role/binding order');
+    if (!Array.isArray(row.signals) || row.signals.length === 0) return fail(`${at}.signals`, 'a non-empty array');
+    const signals = row.signals.map((item, signalIndex) => {
+      const sp = `${at}.signals[${signalIndex}]`;
+      const signal = objectAt(item, sp);
+      exactKeysAt(signal, ['reference', 'target', 'runtime_unit_id', 'value_type', 'direction',
+        'transition_capability', 'signal_descriptor_digest'], sp);
+      const ref = objectAt(signal.reference, `${sp}.reference`);
+      exactKeysAt(ref, ['component_id', 'signal_name'], `${sp}.reference`);
+      const selected = objectAt(signal.target, `${sp}.target`);
+      exactKeysAt(selected, ['component_id', 'command_target_id'], `${sp}.target`);
+      if (selected.component_id !== componentId || selected.command_target_id !== commandTargetId
+          || ref.component_id !== componentId) return fail(sp, 'the exact selected target and component');
+      nonEmptyStringAt(signal.runtime_unit_id, `${sp}.runtime_unit_id`);
+      if (signal.value_type !== 'bool') return fail(`${sp}.value_type`, 'bool');
+      if (signal.direction !== 'input' && signal.direction !== 'output') return fail(`${sp}.direction`, 'input | output');
+      if (signal.transition_capability !== 'sampled_only' && signal.transition_capability !== 'captured')
+        return fail(`${sp}.transition_capability`, 'sampled_only | captured');
+      const digest = stringAt(signal.signal_descriptor_digest, `${sp}.signal_descriptor_digest`);
+      if (!/^sha256:[0-9a-f]{64}$/.test(digest)) return fail(`${sp}.signal_descriptor_digest`, 'a sha256 digest');
+      return { componentId: nonEmptyStringAt(ref.component_id, `${sp}.reference.component_id`),
+        signalName: nonEmptyStringAt(ref.signal_name, `${sp}.reference.signal_name`), valueType: 'bool' as const,
+        direction: signal.direction as 'input' | 'output',
+        transitionCapability: signal.transition_capability as 'sampled_only' | 'captured', signalDescriptorDigest: digest };
+    });
+    for (let i = 1; i < signals.length; i++) {
+      if (!(signals[i - 1].signalName < signals[i].signalName)) return fail(`${at}.signals`, 'unique sorted signals');
     }
+    if (!Array.isArray(row.signal_sources)) return fail(`${at}.signal_sources`, 'an array');
+    row.signal_sources.forEach((item, sourceIndex) => {
+      const sp = `${at}.signal_sources[${sourceIndex}]`;
+      const source = objectAt(item, sp);
+      exactKeysAt(source, ['signal', 'source_kind'], sp);
+      const ref = objectAt(source.signal, `${sp}.signal`);
+      exactKeysAt(ref, ['component_id', 'signal_name'], `${sp}.signal`);
+      nonEmptyStringAt(ref.component_id, `${sp}.signal.component_id`);
+      nonEmptyStringAt(ref.signal_name, `${sp}.signal.signal_name`);
+      nonEmptyStringAt(source.source_kind, `${sp}.source_kind`);
+    });
+    return { programBindingId, componentId, commandTargetId, signals };
   });
+  for (let i = 1; i < rows.length; i++) {
+    const a = JSON.stringify([rows[i - 1].componentId, rows[i - 1].commandTargetId, rows[i - 1].programBindingId]);
+    const b = JSON.stringify([rows[i].componentId, rows[i].commandTargetId, rows[i].programBindingId]);
+    if (!(a < b)) return fail(path, 'unique rows in component/command target/binding order');
+  }
   return rows;
 }
 
-/**
- * Interim source of the same rows: one Program binding document's
- * `signal_role_bindings`, adapted to the projection shape.
- */
-export function ioSignalBindingsFromProgramBinding(binding: {
-  program_binding_id: string;
-  target_role_bindings: Array<{
-    target_role_id: string;
-    controllable_component_id: string;
-    command_target_id: string;
-    signal_role_bindings?: Array<{
-      resource_role_id: string;
-      signal_name: string;
-      value_type: 'bool';
-      direction: 'input' | 'output';
-      transition_capability: 'sampled_only' | 'captured';
-      signal_descriptor_digest: string;
-    }>;
-  }>;
-}): IoSignalBinding[] {
-  return binding.target_role_bindings.flatMap((target) => (
-    (target.signal_role_bindings ?? []).length === 0 ? [] : [{
-      programBindingId: binding.program_binding_id,
-      targetRoleId: target.target_role_id,
-      controllableComponentId: target.controllable_component_id,
-      commandTargetId: target.command_target_id,
-      signalRoleBindings: target.signal_role_bindings!.map((row) => ({
-        resourceRoleId: row.resource_role_id,
-        signalName: row.signal_name,
-        valueType: row.value_type,
-        direction: row.direction,
-        transitionCapability: row.transition_capability,
-        signalDescriptorDigest: row.signal_descriptor_digest,
-      })),
-    }]
-  ));
+/** Project exact signal references through one already validated Applied Binding. */
+export function ioSignalBindingsFromProgramBinding(
+  binding: import('../../types/programBindingTransport.generated').ProgramBindingDocument,
+): IoSignalBinding[] {
+  return binding.target_bindings.flatMap((target) => {
+    const signals = target.signal_references.map((reference) => {
+      const rows = binding.signal_bindings.filter((row) => row.reference.component_id === reference.component_id
+        && row.reference.signal_name === reference.signal_name
+        && row.target.component_id === target.target.component_id
+        && row.target.command_target_id === target.target.command_target_id);
+      if (rows.length !== 1) throw new Error('Applied Binding signal reference has no exact target resolution');
+      const row = rows[0];
+      return { componentId: row.reference.component_id, signalName: row.reference.signal_name,
+        valueType: row.value_type, direction: row.direction, transitionCapability: row.transition_capability,
+        signalDescriptorDigest: row.signal_descriptor_digest };
+    });
+    return signals.length === 0 ? [] : [{ programBindingId: binding.program_binding_id,
+      componentId: target.target.component_id, commandTargetId: target.target.command_target_id, signals }];
+  });
 }

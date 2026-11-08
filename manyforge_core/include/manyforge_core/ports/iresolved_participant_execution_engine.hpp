@@ -121,6 +121,19 @@ class IResolvedParticipantExecutionEngine {
       const ResolvedRuntimeScaleCommandDTO& command) = 0;
   virtual Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
       const OperationId& operation_id, const ControlBindingId& control_binding_id) const = 0;
+  /// OD-72: the operator's speed setting for this participant's binding,
+  /// idle or moving: it overwrites the participant's ramp target (latest
+  /// `sequence` wins), which a starting motion reads when it registers its
+  /// ramp. Never refused; engines without runtime scaling ignore it. Called
+  /// with no addressed-owner lock held.
+  virtual void store_runtime_scale_setting(double /*scale*/, std::uint64_t /*sequence*/) {}
+  /// Lock-free, non-waiting read of whether the mechanism can scale now. The
+  /// addressed owner calls it under its state lock, so it MUST NOT take a lock
+  /// shared with backend calls or wait on another thread.
+  [[nodiscard]] virtual RuntimeScaleMechanismAvailability runtime_scale_availability()
+      const noexcept {
+    return RuntimeScaleMechanismAvailability::kAvailable;
+  }
 
   /// Read-only selected target actuation. Existing non-gripper engines retain
   /// their position/motion behavior; the genuine gripper owner supplies its
@@ -137,6 +150,14 @@ class IResolvedParticipantExecutionEngine {
   virtual GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) = 0;
   virtual Result<void> validate_gripper_command(const GripperCommandRequestDTO& request) const = 0;
   virtual GripperCommandStatusDTO get_gripper_status(const std::string& gripper_id) const = 0;
+  /// Exact command whose old failed owner was replaced; never infers outcome.
+  virtual bool rebuilt_gripper_unknown_pending(const std::string&, std::uint64_t,
+                                                std::uint64_t) const { return false; }
+  /// The addressed owner calls this only after journaling the exact uncertain fact.
+  virtual void notify_gripper_owner_loss_recorded(const std::string&, std::uint64_t,
+                                                   std::uint64_t) {}
+  virtual bool notify_exact_gripper_owner_loss_recorded(const std::string&, std::uint64_t,
+                                                        std::uint64_t) { return false; }
   /// Cancel or reset the exact subordinate gripper generation without routing
   /// through the motion state machine. Reset is invoked only after the
   /// addressed owner has either observed an ordinary terminal generation or

@@ -200,7 +200,7 @@ StopTerminalStatusRestDTO TerminalStopStatusRest(const StopStatusDTO& status) {
                                    status.terminal_projection};
 }
 
-// I0 (lean Stop record): slice B owns this definition and its tests.
+// Lean Stop record: the terminal Stop status from its certificate.
 StopStatusDTO TerminalStopStatusFromCertificate(const StopTerminalStatusRestDTO& rest,
                                                 const StopCertificateDTO& certificate) {
   const auto state = [&] {

@@ -23,14 +23,14 @@ from .catalog_schema import parse_schema, validate_value
 from .value_path import ValuePathError, parse_value_path
 
 
-SKILL_API_VERSION = "manyforge.skill.v1"
+SKILL_API_VERSION = "manyforge.skill.v2"
 MAX_SKILLS = 64
 MAX_SKILL_BYTES = 65_536
 MAX_EXPANDED_NODES = 256
 MAX_EXPANDED_BYTES = 262_144
 MAX_SKILL_DEPTH = 2
 _ID = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
-_REFERENCE = re.compile(r"^\$\{(param|component|target):([a-z][a-z0-9_.-]*)\}$")
+_REFERENCE = re.compile(r"^\$\{(param):([a-z][a-z0-9_.-]*)\}$")
 _FIELDS = {
     "api_version",
     "skill_id",
@@ -38,8 +38,6 @@ _FIELDS = {
     "name",
     "description",
     "compatible_profiles",
-    "component_roles",
-    "target_roles",
     "parameters",
     "requires",
     "provides",
@@ -99,23 +97,13 @@ def _bounded_document(value: Any) -> None:
     _require(len(canonical_json_bytes(value)) <= MAX_SKILL_BYTES, "skill exceeds byte bound")
 
 
-def _covers(required: Any, actual: Any) -> bool:
-    if type(required) is dict:
-        return type(actual) is dict and all(
-            key in actual and _covers(value, actual[key]) for key, value in required.items()
-        )
-    if type(required) is list:
-        return type(actual) is list and all(value in actual for value in required)
-    return type(required) is type(actual) and required == actual
-
-
 def _identified_program(value: dict[str, Any]) -> dict[str, Any]:
     value["program_revision"] = "sha256:" + "0" * 64
     value["program_revision"] = compute_content_identity(
         value,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return value
 
@@ -173,20 +161,6 @@ class SkillCatalog:
                 set(artifact.get("requires_tools", [])) <= tool_ids,
                 "skill requires an unknown tool",
             )
-            for field in ("component_roles", "target_roles"):
-                _require(
-                    type(artifact[field]) is dict and len(artifact[field]) <= 32,
-                    f"invalid skill {field}",
-                )
-                for role, declaration in artifact[field].items():
-                    _identifier(role)
-                    _require(type(declaration) is dict, "invalid skill role declaration")
-                    if field == "target_roles":
-                        _require(
-                            type(declaration.get("component_role")) is str
-                            and declaration["component_role"] in artifact["component_roles"],
-                            "skill target requires a declared component role",
-                        )
             parameters = artifact["parameters"]
             _require(
                 type(parameters) is list and len(parameters) <= 32,
@@ -240,7 +214,7 @@ class SkillCatalog:
                 "invalid skill example declarations",
             )
             host = {
-                "api_version": "manyforge.program.v2",
+                "api_version": "manyforge.program.v3",
                 "program_id": "skill_example",
                 "program_revision": "sha256:" + "0" * 64,
                 "program_profile": "composable-cell-v1",
@@ -249,8 +223,6 @@ class SkillCatalog:
                     "api_version": catalog.api_version,
                     "content_version": catalog.content_version,
                 },
-                "component_roles": deepcopy(artifact["component_roles"]),
-                "target_roles": deepcopy(artifact["target_roles"]),
                 "parameters": [],
                 "scene": [],
                 **deepcopy(declarations),
@@ -258,8 +230,6 @@ class SkillCatalog:
             self._expand_checked(
                 skill_id,
                 example["arguments"],
-                {key: key for key in artifact["component_roles"]},
-                {key: key for key in artifact["target_roles"]},
                 "example",
                 host,
             )
@@ -273,18 +243,12 @@ class SkillCatalog:
         budget[0] -= 1
         _require(budget[0] >= 0 and type(node) is dict, "invalid or oversized skill body")
         _identifier(node.get("instance_id"))
-        artifact = self._skills[skill_id]
-
         def check_reference(value: Any) -> None:
             if type(value) is str and "${" in value:
                 match = _REFERENCE.fullmatch(value)
                 _require(match is not None, "skill substitutions must occupy the whole value")
                 kind, key = match.groups()
-                declared = {
-                    "param": self._parameters[skill_id],
-                    "component": artifact["component_roles"],
-                    "target": artifact["target_roles"],
-                }[kind]
+                declared = self._parameters[skill_id]
                 _require(key in declared, "skill template references an undeclared value")
             elif type(value) is dict:
                 for item in value.values():
@@ -301,8 +265,6 @@ class SkillCatalog:
                     "skill_id",
                     "instance_id",
                     "arguments",
-                    "component_roles",
-                    "target_roles",
                 },
                 "invalid nested skill invocation",
             )
@@ -369,8 +331,6 @@ class SkillCatalog:
         *,
         skill_id: str,
         arguments: dict[str, Any],
-        component_roles: dict[str, str],
-        target_roles: dict[str, str],
         instance_prefix: str,
         program_context: dict[str, Any],
     ) -> dict[str, Any]:
@@ -387,22 +347,18 @@ class SkillCatalog:
                 "schema_version",
             }
             & set(program_context)
-            and type(program_context.get("component_roles")) is dict
-            and type(program_context.get("target_roles")) is dict
             and program_context.get("program_profile") == "composable-cell-v1",
             "skill expansion requires portable Program declarations, not a tree or binding",
         )
         host = deepcopy(program_context)
         return self._expand_checked(
-            skill_id, arguments, component_roles, target_roles, instance_prefix, host
+            skill_id, arguments, instance_prefix, host
         )
 
     def _expand_checked(
         self,
         skill_id: str,
         arguments: dict,
-        component_roles: dict,
-        target_roles: dict,
         prefix: str,
         host: dict,
     ) -> dict[str, Any]:
@@ -411,8 +367,6 @@ class SkillCatalog:
         _bounded_document(
             {
                 "arguments": arguments,
-                "component_roles": component_roles,
-                "target_roles": target_roles,
                 "prefix": prefix,
             }
         )
@@ -455,8 +409,6 @@ class SkillCatalog:
         def expand_skill(
             identity: str,
             values: dict,
-            components: dict,
-            targets: dict,
             scope: str,
             stack: tuple[str, ...],
         ) -> dict:
@@ -487,28 +439,7 @@ class SkillCatalog:
                     f"invalid skill argument {key}",
                 )
                 effective[key] = value  # copied only when emitted, under the shared output budget
-            for field, mapping in (
-                ("component_roles", components),
-                ("target_roles", targets),
-            ):
-                _require(
-                    type(mapping) is dict and set(mapping) == set(artifact[field]),
-                    "skill role mapping must be exact",
-                )
-                for local, mapped in mapping.items():
-                    _identifier(mapped)
-                    requirement = deepcopy(artifact[field][local])
-                    if field == "target_roles":
-                        requirement["component_role"] = components[requirement["component_role"]]
-                    _require(
-                        mapped in host[field] and _covers(requirement, host[field][mapped]),
-                        f"incompatible mapped skill role {local}",
-                    )
-            substitutions = {
-                "param": effective,
-                "component": components,
-                "target": targets,
-            }
+            substitutions = {"param": effective}
             created = []
 
             def expand_node(template: dict) -> dict:
@@ -525,8 +456,6 @@ class SkillCatalog:
                     expanded = expand_skill(
                         node["skill_id"],
                         node["arguments"],
-                        node["component_roles"],
-                        node["target_roles"],
                         instance,
                         (*stack, identity),
                     )
@@ -560,8 +489,7 @@ class SkillCatalog:
                 "skill_id": identity,
                 "version": artifact["version"],
                 "artifact_digest": raw_sha256_digest(canonical_json_bytes(artifact)),
-                "component_roles": deepcopy(components),
-                "target_roles": deepcopy(targets),
+                "arguments": deepcopy(effective),
                 "instance_ids": sorted(created),
             }
             subtree.setdefault("metadata", {}).setdefault("skill_expansions", []).append(
@@ -570,12 +498,12 @@ class SkillCatalog:
             trace.append(copy_value(provenance))
             return subtree
 
-        tree = expand_skill(skill_id, arguments, component_roles, target_roles, prefix, ())
+        tree = expand_skill(skill_id, arguments, prefix, ())
         candidate = deepcopy(host)
         candidate["tree"] = tree
         Program.from_dict(_identified_program(candidate), self._catalog)
         return {
-            "schema_version": "manyforge.skill_expansion.v1",
+            "schema_version": "manyforge.skill_expansion.v2",
             "tree": tree,
             "trace": trace,
         }

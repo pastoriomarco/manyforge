@@ -20,9 +20,9 @@ struct RetainedTrajectoryPrefixValidationOptionsDTO final {
   std::string tcp_frame_role_id{};  // portable role of tcp_frame; empty for a cell frame
 };
 
-/// Validation options for trajectory validation (spec §3.8)
+/// Validation options for trajectory validation
 struct ValidationOptionsDTO {
-  double max_tcp_linear_speed_mps = 0.0;  // > 0: effective TCP speed limit to enforce (ADR-0015)
+  double max_tcp_linear_speed_mps = 0.0;  // > 0: effective TCP speed limit to enforce
   std::string tcp_frame;                  // frame for TCP speed measurement
   std::string base_frame;                 // reference frame for TCP speed measurement
   // When false, validate_trajectory() must run non-collision validation only
@@ -78,7 +78,7 @@ struct MovingReplacementValidationEvidenceDTO final {
                          const MovingReplacementValidationEvidenceDTO&) = default;
 };
 
-/// Validation result (spec §3.8)
+/// Validation result
 struct ValidationResultDTO {
   ValidationResultDTO() = default;
   ValidationResultDTO(
@@ -96,12 +96,12 @@ struct ValidationResultDTO {
   std::optional<MovingReplacementValidationEvidenceDTO> moving_replacement{};
 };
 
-/// Collision check request (spec §3.8)
+/// Collision check request
 struct CollisionCheckRequestDTO {
   RobotStateDTO robot_state;
 };
 
-/// Collision check result (spec §3.8)
+/// Collision check result
 struct CollisionCheckResultDTO {
   CollisionCheckResultDTO() = default;
   CollisionCheckResultDTO(bool in_collision_,
@@ -122,14 +122,14 @@ struct CollisionCheckResultDTO {
   std::optional<double> estimated_force_n;    // optional: estimated contact force
 };
 
-/// Forward kinematics request (spec §3.8)
+/// Forward kinematics request
 struct FkRequestDTO {
   RobotStateDTO robot_state;
   std::string target_frame;  // link/frame to compute pose for
   std::string base_frame;    // frame in which the result is expressed
 };
 
-/// Joint limits (spec §3.8)
+/// Joint limits
 struct JointLimitsDTO {
   std::vector<std::string> joint_names;
   std::vector<double> position_lower_rad;

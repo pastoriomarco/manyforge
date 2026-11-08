@@ -1,4 +1,4 @@
-import { act } from 'react';
+import { act, useLayoutEffect } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -8,11 +8,13 @@ import { reactPropsHost } from '../test/reactPropsHost';
 import type { ComponentState, RunBlockedReason, RunReadiness } from '../types/components';
 import { useActivateExecute, type ActivateExecuteController } from './useActivateExecute';
 
-const api = vi.hoisted(() => ({ groupAction: vi.fn() }));
+const api = vi.hoisted(() => ({ groupAction: vi.fn(), recoverEnablePreflight: vi.fn(), recoverEnable: vi.fn() }));
 
 vi.mock('../api/client', async (original) => ({
   ...(await original<typeof import('../api/client')>()),
-  api: { components: { groupAction: api.groupAction } },
+  api: { components: {
+    groupAction: api.groupAction, recoverEnablePreflight: api.recoverEnablePreflight, recoverEnable: api.recoverEnable,
+  } },
 }));
 
 afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks(); });
@@ -44,14 +46,17 @@ async function mount(states: ComponentState[], readiness: RunReadiness, stopGene
   const root = createRoot(host as unknown as Element);
   const execute = vi.fn(async () => undefined);
   let controller: ActivateExecuteController | null = null;
-  function Probe(props: { states: ComponentState[]; readiness: RunReadiness; stopGeneration: number | null }) {
-    controller = useActivateExecute(props.states, props.readiness, execute, props.stopGeneration);
+  function Probe(props: { states: ComponentState[]; readiness: RunReadiness; stopGeneration: number | null; execute: () => Promise<void> }) {
+    const value = useActivateExecute(props.states, props.readiness, props.execute, props.stopGeneration);
+    useLayoutEffect(() => { controller = value; }, [value]);
     return null;
   }
   let stop = stopGeneration;
-  const render = (next: ComponentState[], nextReadiness: RunReadiness = readiness, nextStop: number | null = stop) => act(() => {
+  let currentExecute: () => Promise<void> = execute;
+  const render = (next: ComponentState[], nextReadiness: RunReadiness = readiness, nextStop: number | null = stop, nextExecute: () => Promise<void> = currentExecute) => act(() => {
     stop = nextStop;
-    root.render(<Probe states={next} readiness={nextReadiness} stopGeneration={nextStop} />);
+    currentExecute = nextExecute;
+    root.render(<Probe states={next} readiness={nextReadiness} stopGeneration={nextStop} execute={nextExecute} />);
   });
   await render(states);
   return {
@@ -78,8 +83,11 @@ describe('Activate and execute: when it is offered', () => {
     expect(activationOffered({ ...blocked, blocked_reasons: holds }, enabled)).toBe(false);
     // Offline for its own reason (e.g. after an execution host restart): Prepare all prepares it.
     expect(activationOffered(blocked, [down[0]!, state('lite6_robot', 'offline', member), down[2]!])).toBe(true);
-    // A faulted component isn't something Activate brings up; a latch isn't either.
+    // A fault without a cause isn't something Activate brings up; a latch isn't either.
     expect(activationOffered(blocked, [down[0]!, state('lite6_robot', 'fault', member), down[2]!])).toBe(false);
+    // A fault or e-stop Recover and enable may clear is (OD-54); the dialog shows the causes.
+    const fault = { code: 'fault_collision', message: 'Collision', clearable: true, operator_action: 'recover' as const, since_ns: 1 };
+    expect(activationOffered(blocked, [down[0]!, state('lite6_robot', 'fault', { ...member, fault }), down[2]!])).toBe(true);
     expect(activationOffered({ ...blocked, blocked_reasons: [
       ...blocked.blocked_reasons, { code: 'cell_latched', message: 'lite6_robot: offline' },
     ] }, down)).toBe(false);
@@ -99,11 +107,12 @@ describe('Activate and execute', () => {
       expect(mounted.controller.available).toBe(true);
       await mounted.act((value) => value.open());
       expect(mounted.controller.flow).toEqual({
-        phase: 'offered', componentIds: ['lite6', 'lite6_robot', 'lite_gripper'], failures: [],
+        phase: 'offered', componentIds: ['lite6', 'lite6_robot', 'lite_gripper'], failures: [], recovery: {},
       });
       const dialog = renderToStaticMarkup(<ActivateExecuteDialog activation={mounted.controller} />);
       expect(dialog).toContain('Activate components and execute?');
-      expect(dialog).toContain('Activate prepares and enables every active component of the Deployment, then executes the Program once.');
+      expect(dialog).toContain('Activate prepares and enables these components, then executes the Program once.');
+      expect(dialog).toContain('It never starts the simulator');
       expect(dialog).toContain('lite6_robot (Offline · through lite6: Not prepared)');
       await mounted.act((value) => value.confirm());
       expect(api.groupAction).toHaveBeenLastCalledWith('prepare', ['lite6', 'lite6_robot']);
@@ -123,6 +132,61 @@ describe('Activate and execute', () => {
       // Later pushes (readiness still can_execute before the run shows): no second Execute.
       await mounted.render([...enabled], { ...ready });
       await mounted.render(enabled, { ...ready });
+      expect(mounted.execute).toHaveBeenCalledOnce();
+    } finally { await mounted.unmount(); }
+  });
+
+  it('uses the latest Execute callback after a committed rerender', async () => {
+    api.groupAction.mockResolvedValue({ action: 'accepted' });
+    const mounted = await mount(down, blocked);
+    const replacement = vi.fn(async () => undefined);
+    try {
+      await mounted.act((value) => value.open());
+      await mounted.act((value) => value.confirm());
+      await mounted.render(prepared, blocked, null, replacement);
+      await mounted.render(enabled, ready);
+      expect(mounted.execute).not.toHaveBeenCalled();
+      expect(replacement).toHaveBeenCalledOnce();
+    } finally { await mounted.unmount(); }
+  });
+
+  it('omits both paused and offline simulators from activation targets without blocking Execute', async () => {
+    api.groupAction.mockResolvedValue({ action: 'accepted' });
+    const offlineRobot = state('lite6_robot', 'offline', {
+      ...member, reason: { code: 'owner_unavailable', message: 'through lite6' },
+    });
+    const pausedSimulator = state('isaac_sim', 'prepared', { capabilities: ['sim_reset'] });
+    const offlineSimulator = state('offline_sim', 'offline', { capabilities: ['sim_reset'] });
+    const initial = [prepared[0]!, offlineRobot, prepared[2]!, pausedSimulator, offlineSimulator];
+    const robotBlocked: RunReadiness = {
+      ...blocked,
+      blocked_reasons: [{ code: 'component_unhealthy', message: 'lite6_robot is offline', component_id: 'lite6_robot' }],
+    };
+    const mounted = await mount(initial, robotBlocked);
+    try {
+      await mounted.act((value) => value.open());
+      await mounted.act((value) => value.confirm());
+      expect(api.groupAction).toHaveBeenCalledExactlyOnceWith('prepare', ['lite6_robot']);
+
+      const robotPrepared = state('lite6_robot', 'prepared', { ...member, last_action: {
+        action: 'prepare', outcome: 'succeeded', started_at_ns: 5, finished_at_ns: 6,
+      } });
+      await mounted.render([prepared[0]!, robotPrepared, prepared[2]!, pausedSimulator, offlineSimulator]);
+      expect(api.groupAction).toHaveBeenLastCalledWith('enable', ['lite6_robot', 'lite_gripper']);
+
+      const completed = [
+        prepared[0]!,
+        state('lite6_robot', 'enabled', { ...member, last_action: {
+          action: 'enable', outcome: 'succeeded', started_at_ns: 7, finished_at_ns: 8,
+        } }),
+        state('lite_gripper', 'enabled', { last_action: {
+          action: 'enable', outcome: 'succeeded', started_at_ns: 7, finished_at_ns: 8,
+        } }),
+        pausedSimulator,
+        offlineSimulator,
+      ];
+      await mounted.render(completed, ready);
+      expect(mounted.controller.flow).toBeNull();
       expect(mounted.execute).toHaveBeenCalledOnce();
     } finally { await mounted.unmount(); }
   });
@@ -319,6 +383,113 @@ describe('Activate and execute', () => {
       await mounted.render(enabled, ready);
       expect(api.groupAction).toHaveBeenCalledOnce();
       expect(mounted.execute).not.toHaveBeenCalled();
+    } finally { await mounted.unmount(); }
+  });
+});
+
+const stop = { code: 'estop' as const, message: 'E-stop pressed or not yet cleared', since_ns: 1, vendor_code: 'C2' };
+const estopped = [
+  state('lite6', 'prepared', { stop }),
+  state('lite6_robot', 'prepared', { ...member, reason: { code: 'stopped_by_estop', message: '' } }),
+  state('lite_gripper', 'prepared', { owner_id: 'lite6', role: 'tool', reason: { code: 'stopped_by_estop', message: '' } }),
+];
+const estopBlocked: RunReadiness = { ...blocked, blocked_reasons: [
+  { code: 'component_unhealthy', message: 'lite6 e-stop', component_id: 'lite6' },
+  { code: 'component_not_enabled', message: 'not enabled', component_id: 'lite6_robot' },
+  { code: 'component_not_enabled', message: 'not enabled', component_id: 'lite_gripper' },
+] };
+const ownerRow = { component_id: 'lite6', owner_id: null, stop, eligibility: 'recover' as const,
+  cause: { code: 'estop', message: 'E-stop', vendor_code: 'C2', vendor_text: null, clearable: true,
+    operator_action: 'recover' as const, concerns: ['lite6_robot', 'lite_gripper'] } };
+const memberRow = (component_id: string, eligibility: 'unknown' | 'ready' = 'unknown') => (
+  { component_id, owner_id: 'lite6', cause: null, stop: null, eligibility });
+const flush = () => act(async () => { await new Promise((resolve) => { setTimeout(resolve, 0); }); });
+
+describe('Activate and execute: Recover and enable first (OD-54)', () => {
+  it('shows what needs recovery, recovers and enables one at a time, enables the rest, then executes', async () => {
+    api.recoverEnable.mockResolvedValue({ action: 'enable' });
+    api.recoverEnablePreflight.mockImplementation(async (id: string) => ({ snapshot_id: `s-${id}`,
+      components: [ownerRow, memberRow(id)] }));
+    const mounted = await mount(estopped, estopBlocked);
+    try {
+      expect(mounted.controller.available).toBe(true);
+      await mounted.act((value) => value.open());
+      await flush();
+      expect(mounted.controller.recoveryReady).toBe(true);
+      const dialog = renderToStaticMarkup(<ActivateExecuteDialog activation={mounted.controller} />);
+      expect(dialog).toContain('Needs recovery:');
+      expect(dialog).toContain('lite6: E-stop pressed or not yet cleared (C2)');
+      expect(dialog).toContain('Recover, enable and execute');
+      expect(dialog).toContain('neither runs a Program motion');
+      await mounted.act((value) => value.confirm());
+      await flush();
+      expect(api.recoverEnable).toHaveBeenLastCalledWith('lite6_robot', { snapshot_id: 's-lite6_robot', confirmed: [
+        { component_id: 'lite6', cause_code: 'estop', vendor_code: 'C2', stop_code: 'estop', stop_vendor_code: 'C2', eligibility: 'recover' },
+        { component_id: 'lite6_robot', cause_code: null, vendor_code: null, stop_code: null, stop_vendor_code: null, eligibility: 'unknown' },
+      ] });
+      expect(mounted.controller.flow?.phase).toBe('recover');
+      // The machine recovered with the arm: the gripper now has nothing to recover, so it stays within what was confirmed.
+      api.recoverEnablePreflight.mockImplementation(async (id: string) => ({ snapshot_id: `t-${id}`,
+        components: [{ ...ownerRow, stop: null, cause: null, eligibility: 'ready' }, memberRow(id, 'ready')] }));
+      const armDone = [state('lite6', 'prepared'),
+        state('lite6_robot', 'enabled', { ...member, last_action: { action: 'enable', outcome: 'succeeded', started_at_ns: 5, finished_at_ns: 6,
+          phases: [{ component_id: 'lite6', action: 'recover', outcome: 'succeeded' }, { component_id: 'lite6_robot', action: 'enable', outcome: 'succeeded' }] } }),
+        state('lite_gripper', 'prepared', { owner_id: 'lite6', role: 'tool' })];
+      await mounted.render(armDone);
+      await flush();
+      expect(api.recoverEnable).toHaveBeenLastCalledWith('lite_gripper', expect.objectContaining({ snapshot_id: 't-lite_gripper' }));
+      const allDone = [armDone[0]!, armDone[1]!, state('lite_gripper', 'enabled', { owner_id: 'lite6', role: 'tool',
+        last_action: { action: 'enable', outcome: 'succeeded', started_at_ns: 7, finished_at_ns: 8 } })];
+      // Readiness not pushed yet: only a reason Activate clears remains.
+      await mounted.render(allDone, { ...estopBlocked, blocked_reasons: [estopBlocked.blocked_reasons[2]!] });
+      await flush();
+      expect(api.groupAction).not.toHaveBeenCalled();
+      expect(mounted.controller.flow?.failures).toEqual([]);
+      expect(mounted.controller.flow?.phase).toBe('waiting');
+      await mounted.render(allDone, ready);
+      expect(mounted.execute).toHaveBeenCalledOnce();
+    } finally { await mounted.unmount(); }
+  });
+
+  it('stops before the next component when its causes changed since the confirmation', async () => {
+    api.recoverEnable.mockResolvedValue({ action: 'enable' });
+    api.recoverEnablePreflight.mockImplementation(async (id: string) => ({ snapshot_id: `s-${id}`,
+      components: [ownerRow, memberRow(id)] }));
+    const mounted = await mount(estopped, estopBlocked);
+    try {
+      await mounted.act((value) => value.open());
+      await flush();
+      // Before the arm is sent, a new fault appears on it.
+      api.recoverEnablePreflight.mockResolvedValue({ snapshot_id: 'u', components: [ownerRow,
+        { component_id: 'lite6_robot', owner_id: 'lite6', stop: null, eligibility: 'recover',
+          cause: { code: 'fault_collision', message: 'Collision', vendor_code: 'C31', vendor_text: null,
+            clearable: true, operator_action: 'recover', concerns: [] } }] });
+      await mounted.act((value) => value.confirm());
+      await flush();
+      expect(api.recoverEnable).not.toHaveBeenCalled();
+      expect(mounted.controller.flow?.phase).toBe('failed');
+      expect(mounted.controller.flow?.failures[0]?.text).toContain('The causes changed since you confirmed them');
+      expect(mounted.controller.flow?.failures[0]?.text).toContain('(C31)');
+      expect(mounted.execute).not.toHaveBeenCalled();
+    } finally { await mounted.unmount(); }
+  });
+
+  it('lists a cause it cannot recover with its required action and keeps the button disabled', async () => {
+    api.recoverEnablePreflight.mockResolvedValue({ snapshot_id: 's', components: [
+      { ...ownerRow, eligibility: 'blocked', stop: null,
+        cause: { ...ownerRow.cause, code: 'fault_drive', message: 'Servo error', vendor_code: 'C21', clearable: false, operator_action: 'none' } },
+      memberRow('lite6_robot')] });
+    const mounted = await mount(estopped, estopBlocked);
+    try {
+      await mounted.act((value) => value.open());
+      await flush();
+      expect(mounted.controller.recoveryReady).toBe(false);
+      const dialog = renderToStaticMarkup(<ActivateExecuteDialog activation={mounted.controller} />);
+      expect(dialog).toContain("This can&#x27;t be recovered from here:");
+      expect(dialog).toMatch(/class="transport-run"[^>]*disabled=""[^>]*>Recover, enable and execute/);
+      await mounted.act((value) => value.confirm());
+      expect(api.recoverEnable).not.toHaveBeenCalled();
+      expect(api.groupAction).not.toHaveBeenCalled();
     } finally { await mounted.unmount(); }
   });
 });

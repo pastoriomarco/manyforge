@@ -21,12 +21,12 @@ public:
   using std::invalid_argument::invalid_argument;
 };
 
-/// Effect-free launch admission for the one I3 reference runtime product.
+/// Effect-free launch admission for the one reference runtime product.
 ///
 /// The value contains only contract-fixed process inputs derived from an
 /// independently verified retained product. It has no executable path,
 /// environment map, process handle, start/stop operation, or runtime status
-/// claim. I4 later owns trusted artifact materialization and process effects.
+/// claim. A later owner handles trusted artifact materialization and process effects.
 class ReferenceRuntimeUnitAdmission final {
 public:
   ReferenceRuntimeUnitAdmission(const ReferenceRuntimeUnitAdmission &) =
@@ -196,7 +196,7 @@ private:
       std::string_view, std::string_view);
 };
 
-/// Admit the exact I3 reference runtime product for one host platform.
+/// Admit the exact reference runtime product for one host platform.
 ///
 /// Missing runtime-unit coordinates return no value. Any present but
 /// unverifiable product or incompatible host rejects before a process,

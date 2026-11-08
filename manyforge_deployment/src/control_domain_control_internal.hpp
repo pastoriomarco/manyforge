@@ -37,7 +37,7 @@ inline constexpr std::size_t kMaxControlDomainControlBytes = 16U * 1024U * 1024U
 
 /// Emit the closed semantic reference control product for one domain.
 ///
-/// The current profile maps I2-qualified direct and two-controller chained
+/// The current profile maps compiler-qualified direct and two-controller chained
 /// topologies to exact offline controller implementation/configuration rows.
 /// It performs no runtime lookup, installation, activation, or ROS effect.
 [[nodiscard]] std::string emit_control_domain_control(
@@ -45,7 +45,7 @@ inline constexpr std::size_t kMaxControlDomainControlBytes = 16U * 1024U * 1024U
     const core::ControlDomainId& control_domain_id);
 
 /// Parse and independently verify one canonical closed artifact.
-/// DX817: only an exact strict source graph can qualify pneumatic no-floor;
+/// Only an exact strict source graph can qualify pneumatic no-floor;
 /// absence preserves the historical physical/default hard-floor requirement.
 [[nodiscard]] CanonicalValue parse_and_verify_control_domain_control(
     std::string_view canonical_bytes,
@@ -60,7 +60,7 @@ struct ControlDomainControlArtifactClosure final {
 };
 
 /// Require byte-for-byte semantic equality with the projection independently
-/// derived from the final non-caller-constructible I2 value.
+/// derived from the final non-caller-constructible compiler value.
 void require_control_domain_control_matches(std::string_view canonical_bytes,
                                             const CompilerQualifiedCellIr& compiler_ir,
                                             const core::ControlDomainId& control_domain_id);

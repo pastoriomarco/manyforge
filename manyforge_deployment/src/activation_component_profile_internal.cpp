@@ -202,7 +202,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
       parse_strict_json_model_yaml(read_description(capability_root));
   const auto &root = parsed.root();
   // `component_models`: the descriptors of models without a model family
-  // (machines and model-form I/O devices, CONTRACTS §16; sensors).
+  // (machines and model-form I/O devices; sensors).
   if (root.find_object_member("component_models") != nullptr)
     require_fields(root, {"api_version", "component_models", "model_families"},
                    "description");
@@ -289,7 +289,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
       if (kind != "machine" && kind != "io_device" && kind != "sensor")
         fail("component model " + model_id +
              " must be a machine, an I/O device or a sensor");
-      // A sensor has no lanes (PC-1): one adapter row on every lane.
+      // A sensor has no lanes: one adapter row on every lane.
       if (kind != "sensor")
         static_cast<void>(object(member(descriptor.root(), "lanes", "component model"),
                                  "component model lanes"));
@@ -318,7 +318,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
         return &row;
     return nullptr;
   };
-  // CONTRACTS §16 slot checks per owner, over its active and inactive members.
+  // Slot checks per owner, over its active and inactive members.
   {
     std::map<std::string, std::set<std::string, std::less<>>, std::less<>> roles;
     const auto check_member = [&](std::string_view component_id,
@@ -352,7 +352,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
     for (const auto &inactive : intent.inactive_members)
       check_member(inactive.component_id, inactive.component_profile_id,
                    inactive.owner, inactive.role);
-    // AUD-5b revised: a machine's members come from its model and are
+    // A machine's members come from its model and are
     // always all present; a member is only deactivated, never removed.
     for (const auto &component : intent.components) {
       const auto machine = models.find(component.component_profile_id);
@@ -373,7 +373,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
       }
     }
   }
-  // AUD-5: a machine's member model (its arm, an I/O bank) is placed only as
+  // A machine's member model (its arm, an I/O bank) is placed only as
   // a member of that machine, on every lane.
   for (const auto &[machine_id, machine] : models) {
     if (model_kind(machine.descriptor) != "machine") continue;
@@ -448,7 +448,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
       if (const auto *ref = owner_row->configuration.find_object_member(
               "device_address_ref"))
         profile.owner_device_address_ref = *ref;
-      // CONTRACTS §16: on a lane where the machine has a process, a
+      // On a lane where the machine has a process, a
       // deactivated arm (the member with a description) still gives it its
       // lane row, description and joints.
       for (const auto &inactive : intent.inactive_members) {
@@ -527,7 +527,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
     }
     // The authored lane picks one of the model's `lanes` rows; only a
     // pneumatic tool may name none (lane-free). A member runs on its
-    // owner's lane (CONTRACTS §16).
+    // owner's lane.
     const auto &descriptor = model->second.descriptor;
     const auto &lanes = member(descriptor, "lanes", "component model");
     const auto *owner_row =
@@ -631,7 +631,7 @@ void expand_activation_machine_members(
         row.emplace_back("transition_capability", CanonicalValue("sampled_only"));
         // Real: the bank reports its inputs once per stream period, so they
         // carry the model's sample-age budget; a stale input leaves a rule
-        // unable to watch it (CONTRACTS §7, §8).
+        // unable to watch it.
         Object freshness{{"mode", CanonicalValue("provider_validity")}};
         if (adapter)
           freshness = {

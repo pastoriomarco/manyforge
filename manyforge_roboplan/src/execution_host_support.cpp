@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -12,7 +13,10 @@
 #include <thread>
 
 #ifdef __linux__
+#include <malloc.h>
 #include <pthread.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace manyforge::roboplan_backend {
@@ -163,6 +167,35 @@ bool cpu_affinities_overlap(const std::vector<int>& lhs,
   });
 }
 
+#ifdef __linux__
+// OD-59: the bounded part of a priority worker's stack touched before it
+// reports startup (its default stack is 8 MiB; the worker's frames use far
+// less).
+constexpr std::size_t kWorkerStackPrefaultBytes = 256U * 1024U;
+
+[[gnu::noinline]] void prefault_worker_stack() {
+  volatile unsigned char stack[kWorkerStackPrefaultBytes];
+  const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  for (std::size_t offset = 0; offset < sizeof(stack); offset += page) stack[offset] = 0;
+  stack[sizeof(stack) - 1U] = 0;
+}
+#endif
+
+// OD-59 (strict profile): an empty string on success, else the reason.
+std::string lock_process_memory() {
+#ifndef __linux__
+  return "process memory locking is supported only on Linux";
+#else
+  if (::mallopt(M_TRIM_THRESHOLD, -1) != 1)
+    return "mallopt(M_TRIM_THRESHOLD, -1) failed";
+  if (::mallopt(M_MMAP_MAX, 0) != 1) return "mallopt(M_MMAP_MAX, 0) failed";
+  if (::mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0)
+    return std::string("mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) failed: ") +
+           std::strerror(errno) + " (the strict profile needs an unlimited memlock limit)";
+  return {};
+#endif
+}
+
 std::string apply_worker_os_config(const SchedulerWorkerOsConfig& config) {
   if (!config.requested()) {
     return {};
@@ -287,39 +320,35 @@ SimpleSchedulerConfig SimpleSchedulerConfig::from_environment(
   const auto configure_role = [&](core::SchedulerPriority role,
                                   const std::string& priority_key,
                                   int default_priority,
-                                  const std::string& affinity_key,
-                                  const std::optional<std::string>& fallback) {
+                                  const std::string& affinity_key) {
     auto& worker = config.workers[core::scheduler_priority_index(role)];
     worker.policy = policy;
     worker.priority = parse_bounded_integer(
         environment_value(environment, priority_key)
             .value_or(std::to_string(default_priority)),
         priority_key, 1, 99);
-    auto affinity = environment_value(environment, affinity_key);
-    if (!affinity) {
-      affinity = fallback;
-    }
+    const auto affinity = environment_value(environment, affinity_key);
     if (!affinity) {
       throw std::invalid_argument(affinity_key +
                                   " is required by the strict RT profile");
     }
     worker.cpu_affinity = parse_cpu_affinity(*affinity, affinity_key);
     worker.required = true;
+    worker.prefault_stack = true;
   };
+  config.lock_memory = true;
 
-  const auto controller_affinity = environment_value(
-      environment, "MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY");
+  // OD-58: StopControl is the highest-priority lane and has its own CPUs
+  // (no default share with ControllerCommand).
   configure_role(core::SchedulerPriority::ControllerCommand,
                  "MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY", 45,
-                 "MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY",
-                 std::nullopt);
+                 "MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY");
   configure_role(core::SchedulerPriority::RuntimeSafety,
                  "MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY", 40,
-                 "MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY", std::nullopt);
+                 "MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY");
   configure_role(core::SchedulerPriority::StopControl,
-                 "MANYFORGE_RT_STOP_CONTROL_PRIORITY", 35,
-                 "MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY",
-                 controller_affinity);
+                 "MANYFORGE_RT_STOP_CONTROL_PRIORITY", 48,
+                 "MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY");
 
   const auto& controller =
       config.workers[core::scheduler_priority_index(
@@ -330,11 +359,11 @@ SimpleSchedulerConfig SimpleSchedulerConfig::from_environment(
   const auto& stop =
       config.workers[core::scheduler_priority_index(
           core::SchedulerPriority::StopControl)];
-  if (!(controller.priority > safety.priority &&
-        safety.priority > stop.priority)) {
+  if (!(stop.priority > controller.priority &&
+        controller.priority > safety.priority)) {
     throw std::invalid_argument(
         "strict native scheduler priorities must satisfy "
-        "controller_command > runtime_safety > stop_control");
+        "stop_control > controller_command > runtime_safety");
   }
   if (cpu_affinities_overlap(controller.cpu_affinity,
                              safety.cpu_affinity) ||
@@ -373,9 +402,20 @@ SimpleScheduler::SimpleScheduler(SimpleSchedulerConfig config) {
       return "mf_sched";
     }();
   }
-  // A strict profile is an admission contract, not a best-effort hint. Start
-  // every requested worker now so a rejected policy/affinity aborts kernel
-  // construction before any controller or safety callback can be admitted.
+  // A strict profile is an admission contract, not a best-effort hint. Lock
+  // the process memory, then start every requested worker now so a refused
+  // lock, policy or affinity aborts kernel construction before any
+  // controller or safety callback can be admitted.
+  if (config.lock_memory) {
+    const auto error = lock_process_memory();
+    std::cerr << "manyforge_scheduler_memory_lock accepted="
+              << (error.empty() ? "true" : "false");
+    if (!error.empty()) std::cerr << " error=\"" << error << '"';
+    std::cerr << std::endl;
+    if (!error.empty())
+      throw std::runtime_error("native scheduler strict profile rejected its memory lock: " +
+                               error);
+  }
   for (auto& worker : workers_) {
     if (worker.os_config.required) {
       std::lock_guard<std::mutex> lock(worker.mutex);
@@ -429,10 +469,9 @@ core::ScheduleHandle SimpleScheduler::schedule(
     core::SchedulerPriority priority) {
   auto handle = next_handle_.fetch_add(1);
   Worker& w = worker_for(priority);
-  {
-    std::lock_guard<std::mutex> registry_lock(registry_mutex_);
-    handle_to_priority_[handle] = priority;
-  }
+  std::unique_lock<std::mutex> registry_lock(registry_mutex_);
+  if (admission_closed_) throw std::runtime_error("scheduler admission is closed");
+  handle_to_priority_[handle] = priority;
   try {
     std::lock_guard<std::mutex> lock(w.mutex);
     w.ensure_started_locked(&w);
@@ -442,12 +481,30 @@ core::ScheduleHandle SimpleScheduler::schedule(
     // A strict worker can reject construction before accepting a callback, and
     // allocation can fail while inserting the task. Neither path may leave a
     // phantom handle that cancel()/diagnostics still consider live.
-    std::lock_guard<std::mutex> registry_lock(registry_mutex_);
     handle_to_priority_.erase(handle);
     throw;
   }
+  registry_lock.unlock();
   w.cv.notify_all();
   return handle;
+}
+
+void SimpleScheduler::close_admission_and_discard() {
+  std::array<std::map<core::ScheduleHandle, ScheduledTask>, core::kSchedulerPriorityCount>
+      discarded;
+  {
+    std::lock_guard<std::mutex> registry_lock(registry_mutex_);
+    admission_closed_ = true;
+    for (std::size_t i = 0; i < workers_.size(); ++i) {
+      auto& worker = workers_[i];
+      std::lock_guard<std::mutex> worker_lock(worker.mutex);
+      discarded[i].swap(worker.tasks);
+      ++worker.queue_generation;
+    }
+    handle_to_priority_.clear();
+  }
+  for (auto& worker : workers_) worker.cv.notify_all();
+  // Captured owners are released here, outside all scheduler locks.
 }
 
 void SimpleScheduler::cancel(core::ScheduleHandle handle) {
@@ -466,16 +523,16 @@ bool SimpleScheduler::cancel_before_dequeue(core::ScheduleHandle handle) {
     handle_to_priority_.erase(it);
   }
   Worker& w = worker_for(priority);
-  bool removed = false;
+  decltype(w.tasks)::node_type removed;
   {
     std::lock_guard<std::mutex> lock(w.mutex);
     ++w.queue_generation;
     // Zero when the worker already dequeued it (the registry entry is erased
     // only after the dequeue), so a running callback is never reported removed.
-    removed = w.tasks.erase(handle) == 1U;
+    removed = w.tasks.extract(handle);
   }
   w.cv.notify_all();
-  return removed;
+  return !removed.empty();
 }
 
 void SimpleScheduler::set_safety_path_fault_sink(
@@ -526,9 +583,19 @@ void SimpleScheduler::drain_all() {
 }
 
 bool SimpleScheduler::drain_all_for(std::chrono::nanoseconds timeout) {
+  const auto start = std::chrono::steady_clock::now();
+  const auto maximum = std::chrono::steady_clock::time_point::max() - start;
+  const auto bounded = std::max(std::chrono::nanoseconds::zero(), timeout);
+  const auto deadline = bounded >= maximum
+                            ? std::chrono::steady_clock::time_point::max()
+                            : start + bounded;
   bool drained = true;
   for (auto& worker : workers_) {
-    drained = worker.drain_for(timeout) && drained;
+    const auto now = std::chrono::steady_clock::now();
+    const auto remaining = now < deadline
+        ? std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now)
+        : std::chrono::nanoseconds::zero();
+    drained = worker.drain_for(remaining) && drained;
   }
   return drained;
 }
@@ -541,6 +608,9 @@ void SimpleScheduler::Worker::worker_loop(std::stop_token st) {
 #endif
   const auto os_error = apply_worker_os_config(os_config);
   const bool startup_failed = !os_error.empty() && os_config.required;
+#ifdef __linux__
+  if (!startup_failed && os_config.prefault_stack) prefault_worker_stack();
+#endif
   if (os_config.requested()) {
     std::cerr << "manyforge_scheduler_os_profile"
               << " role=" << core::scheduler_priority_name(priority)

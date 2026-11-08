@@ -320,7 +320,7 @@ describe('Program Object inspector detach action', () => {
 describe('mounted Program Object inspector detach action', () => {
   it('mounts the shared action only when attachment ID and revision match the live placement', async () => {
     const { host } = stubDom();
-    const onDetach = vi.fn(async (_attachment: CarriedObjectAttachment) => {});
+    const onDetach = vi.fn(async (_attachment: CarriedObjectAttachment) => { void _attachment; });
     const getReason = (attachment: CarriedObjectAttachment) => (
       sceneDetachUnavailableReason(
         heldRunSnapshot,
@@ -368,7 +368,7 @@ describe('mounted Program Object inspector detach action', () => {
 
   it('lets a held run confirm detach and submits the latest revision after a routine attachment update', async () => {
     const { host } = stubDom();
-    const onDetach = vi.fn(async (_attachment: CarriedObjectAttachment) => {});
+    const onDetach = vi.fn(async (_attachment: CarriedObjectAttachment) => { void _attachment; });
     let sceneAttachment = currentAttachment;
     const getReason = (attachment: CarriedObjectAttachment) => (
       sceneDetachUnavailableReason(
@@ -396,7 +396,7 @@ describe('mounted Program Object inspector detach action', () => {
         props.children === 'Detach part from arm / gripper at its current pose?'
       ))).toBe(true);
 
-      // DX3323 keeps confirmation identity bound to the part and holder, not
+      // Confirmation identity stays bound to the part and holder, not
       // the internal attachment revision. The backend still receives the
       // latest revision and fences the detach against that exact value.
       const revisedAttachment: CarriedObjectAttachment = {
@@ -426,7 +426,7 @@ describe('mounted Program Object inspector detach action', () => {
 
   it('requires a fresh confirmation when the attachment ID changes', async () => {
     const { host } = stubDom();
-    const onDetach = vi.fn(async (_attachment: CarriedObjectAttachment) => {});
+    const onDetach = vi.fn(async (_attachment: CarriedObjectAttachment) => { void _attachment; });
     let sceneAttachment = currentAttachment;
     const getReason = (attachment: CarriedObjectAttachment) => (
       sceneDetachUnavailableReason(
@@ -477,7 +477,7 @@ describe('mounted Program Object inspector detach action', () => {
 
   it('disables the held-run action when transport or semantic sources are stale', async () => {
     const { host } = stubDom();
-    const onDetach = vi.fn(async (_attachment: CarriedObjectAttachment) => {});
+    const onDetach = vi.fn(async (_attachment: CarriedObjectAttachment) => { void _attachment; });
     const staleControls = [
       {
         ...currentControl,

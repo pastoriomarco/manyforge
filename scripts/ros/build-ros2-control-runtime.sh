@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the I9 ros2_control execution product and its mechanical ROS overlay.
+# Build the ros2_control execution product and its mechanical ROS overlay.
 #
 # This is deliberately narrower than a cell launcher: it neither starts a
 # Manager nor touches Isaac.  The build roots are persistent so an Orin image
@@ -83,12 +83,12 @@ for required in \
     "${WORKSPACE}/manyforge_isaac_adapter/CMakeLists.txt" \
     "${WORKSPACE}/manyforge_ros_bringup/package.xml"; do
     if [[ ! -f "${required}" ]]; then
-        printf 'I9 ros2_control source is incomplete: %s\n' "${required}" >&2
+        printf 'ros2_control source is incomplete: %s\n' "${required}" >&2
         exit 2
     fi
 done
 if [[ ! -w "$(dirname "${BUILD_ROOT}")" && ! -w "${BUILD_ROOT}" ]]; then
-    printf 'I9 ros2_control build root is not writable: %s\n' "${BUILD_ROOT}" >&2
+    printf 'ros2_control build root is not writable: %s\n' "${BUILD_ROOT}" >&2
     exit 2
 fi
 
@@ -138,7 +138,7 @@ PINOCCHIO_CMAKE_DIR=$(
         -printf '%h\n' 2>/dev/null | head -1 || true
 )
 if [[ -z "${PINOCCHIO_CMAKE_DIR}" ]]; then
-    printf 'pinocchioConfig.cmake not found; cannot build the I9 runtime.\n' >&2
+    printf 'pinocchioConfig.cmake not found; cannot build the ros2_control runtime.\n' >&2
     exit 2
 fi
 PINOCCHIO_PREFIX=$(dirname "$(dirname "$(dirname "${PINOCCHIO_CMAKE_DIR}")")")

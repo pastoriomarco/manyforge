@@ -83,8 +83,7 @@ dependency-internal changes are carried:
    exist (0.8 reassigns it in `refreshCollisionData`). Remove after a released
    upstream source supplies equivalent defined construction and the focused
    Scene, mutation, lifetime, sanitizer, binding, and performance evidence
-   passes without it. The 0.6 reproduction remains in:
-   `upstream/roboplan-060-scene-scratch-construction-ubsan.md`.
+   passes without it.
 2. `0011-bound-roboplan-080-toppra-output-samples.patch`
    rejects non-finite solver output and proves the output cardinality bound
    before integer conversion or allocation. It bounds TOPP-RA only: RoboPlan
@@ -92,15 +91,13 @@ dependency-internal changes are carried:
    patched: the planning deadline bounds it (the worker process is killed)
    and ManyForge rejects any result above `maximum_trajectory_samples`. Remove after an upstream release supplies the
    same derived-output guard and the finite/extreme-input, allocation, TOPPRA,
-   binding, sanitizer, and containment evidence passes without it. Dossier:
-   `upstream/roboplan-060-toppra-output-sample-bound.md`.
+   binding, sanitizer, and containment evidence passes without it.
 3. `0013-direct-initialize-roboplan-080-pose-constraint-scratch.patch`
    directly initializes PoseConstraint Pinocchio scratch (moved to
    `roboplan_core` in 0.8) instead of assigning into default-created state.
    Remove after an upstream release supplies equivalent construction and the
    constrained/unconstrained RRT, sanitizer, binding, and conformance evidence
-   passes without it. Historical dossier:
-   `upstream/roboplan-060-pinocchio-scratch-direct-initialization.md`.
+   passes without it.
 4. `0014-describe-image-owned-native-dependencies.patch`
    removes three wheel-level `cmeel` requirements whose native libraries are
    deliberately supplied by the image's verified closure instead: system
@@ -119,7 +116,7 @@ dependency-internal changes are carried:
 6. `0016-toppra-velocity-bound-hook.patch` adds
    `TOPPRAOptions::max_path_velocity`, an optional per-grid-point bound on the
    TOPP-RA path speed, so ManyForge holds the TCP at 0.98 of its speed limit
-   inside the time-scaling (RP-3). Remove after an upstream release provides
+   inside the time-scaling. Remove after an upstream release provides
    an equivalent bound or extra-constraint hook and the focused TOPP-RA and
    candidate-computer rows pass without it. Dossier:
    `upstream/roboplan-080-toppra-path-velocity-bound.md`.
@@ -138,7 +135,7 @@ dependency-internal changes are carried:
    `CartesianPlannerOptions::toppra_max_path_velocity`, forwarded to 0016's
    `TOPPRAOptions::max_path_velocity` in TimeOptimal mode, so ManyForge
    `time_optimal` Cartesian moves hold the TCP at 0.98 of its speed limit
-   (CT-1, RP-3). Remove after an upstream release provides an equivalent
+   too. Remove after an upstream release provides an equivalent
    option and the candidate-computer time_optimal rows pass without it.
    Dossier: `upstream/roboplan-080-cartesian-time-optimal-path-velocity-bound.md`.
 9. `0019-bounded-cartesian-curvature-speed-cap.patch` makes Bounded Cartesian
@@ -146,7 +143,7 @@ dependency-internal changes are carried:
    `max_linear_acceleration`. Each sample's path speed is capped from the
    curvature of the circle through its neighbouring waypoints, with the same
    half-limit split as the joint q'' term, so only the curved part of a run
-   slows down. RP-2 rounded corners then no longer stretch the whole move.
+   slows down. Rounded corners (blend radius) then no longer stretch the whole move.
    Remove after an upstream release bounds curvature acceleration in Bounded
    timing and the RoboPlan curve test and the candidate-computer
    constant_speed rounded-corner rows pass without it. Dossier:
@@ -156,10 +153,7 @@ Patches 0010, 0011, 0013, 0015, 0016, 0017, 0018 and 0019 are offered upstream. 
 (same numbers, `070` names) and the retired 0012 DynoTree initialization patch
 (RoboPlan 0.8 replaced DynoTree with nanoflann) are bound to their exact Git
 blobs by the external-delta ledger. Patches 0010 through 0013 descend from the
-retired 0.6 series 0005, 0006, 0008 and 0009, likewise bound in the ledger;
-byte-identical E1 evidence copies remain under
-`verification/composable_cell_e1/patches/` for the frozen 0.6 restoration
-closure.
+retired 0.6 series 0005, 0006, 0008 and 0009, likewise bound in the ledger.
 
 Each dossier freezes the clean reproduction, impact, smallest patch,
 compatibility risk, focused evidence, intended upstream contract, and
@@ -170,11 +164,11 @@ objective removal predicate.
 The former 0.5.1 production series—patches 0001 through 0007, including the
 already-retired build-helper patch 0004—remains exactly traceable in Git at
 ManyForge commit `ec2d17baa0d5f5b6d8126b608b82814371d758ee` and in
-`verification/composable_cell_e1/external_delta_ledger.v1.json`. It is not a
+`third_party/external_delta_ledger.v1.json`. It is not a
 second selectable dependency generation.
 
 - Scene clone/replacement becomes fresh native-scene reconstruction per exact
-  retained projection generation at the I6 adapter boundary.
+  retained projection generation at the planning adapter boundary.
 - Cancellation/progress uses a qualified cooperative hook when available and
   otherwise a warmed, bounded, killable generation-private worker process.
 - Collision contexts and every borrowed native object stay private to a worker
@@ -184,12 +178,11 @@ second selectable dependency generation.
 - The serialized collision-view optimization is retired. Its isolated 0.5.1
   A/B reduced allocation calls by 6.6% and bytes by 17.6%, but changed p50 by
   only -0.45% and throughput by +0.74%; exact 0.6 exposed no safe reuse hook
-  and stayed within E1 memory and containment bounds. I6 retains ordinary
+  and stayed within the measured memory and containment bounds. The adapter keeps ordinary
   allocation, latency, throughput, and memory regression gates without
   recreating that lifetime-bearing dependency API.
 
-Historical tests and behavior mappings remain acceptance input for I6; the old
-patch bodies are not kept as dormant compatibility code. Changing selected
+The old patch bodies are not kept as dormant compatibility code. Changing selected
 source, dependency content, patch content, digest, or order requires rotating
 the exact closure identity and rerunning every affected native and ROS/Isaac
 qualification row.

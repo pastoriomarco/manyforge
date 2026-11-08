@@ -62,7 +62,7 @@ returns an error and changes nothing.
 
 ## Sanitizer evidence
 
-Pending the M9 build; the patch adds no allocation or index arithmetic beyond
+Pending a build; the patch adds no allocation or index arithmetic beyond
 `findCollisionPair`, whose out-of-range result is skipped.
 
 ## Compatibility risk

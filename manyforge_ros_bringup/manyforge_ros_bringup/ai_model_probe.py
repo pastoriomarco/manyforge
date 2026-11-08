@@ -1,4 +1,4 @@
-"""Reachability probe of one ManyForge ``ai_model`` component (CP9 stream).
+"""Reachability probe of one ManyForge ``ai_model`` component (stream health).
 
 The execution host writes the site document from the Deployment row and
 supervises ``ai_model.launch.py``. Every probe period this process GETs

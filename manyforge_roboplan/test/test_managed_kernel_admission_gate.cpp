@@ -105,7 +105,7 @@ struct OwnerFixture final {
             : canonical_empty
                 ? std::filesystem::path(
                       MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE_ROOT)
-                : std::filesystem::path(MANYFORGE_I6_NATIVE_FIXTURE_ROOT) /
+                : std::filesystem::path(MANYFORGE_NATIVE_EXECUTION_FIXTURE_ROOT) /
                       "retained-package"),
         bundle(io_provider
                    ? deployment::test::materialize_boolean_io_retained_fixture(retained_root).bundle
@@ -115,7 +115,7 @@ struct OwnerFixture final {
       const auto manifest = deployment::parse_strict_json_model_yaml(ReadFile(
           canonical_empty
               ? retained_root / "canonical-empty-admission.json"
-              : std::filesystem::path(MANYFORGE_I6_NATIVE_FIXTURE_ROOT) /
+              : std::filesystem::path(MANYFORGE_NATIVE_EXECUTION_FIXTURE_ROOT) /
                     "manifest.json"));
       bundle = bundle_source.get_verified(core::RetainedBundleId(
           TextMember(manifest.root(), "retained_bundle_id")));
@@ -754,7 +754,7 @@ TEST(ManagedKernelApplyFenceOwner,
 
 TEST(ManagedKernelApplyFenceOwner,
      BeforeEffectReleaseNeedsNoConfigurationForDomainsNewToTheCell) {
-  // The execution host refused the Apply before any effect (H1): the Manager
+  // The execution host refused the Apply before any effect: the Manager
   // releases with the held status, which must equal the predecessor rows the
   // fence pinned. Domains new to the cell have no active configuration and
   // nothing to restore, so they must not block the release.
@@ -823,7 +823,7 @@ TEST(ManagedKernelApplyFenceOwner,
   }
 }
 
-// R3: the durable fence ledger is bounded by eviction, never refusal. One
+// The durable fence ledger is bounded by eviction, never refusal. One
 // fence stays held while 256 + 8 further Apply fences are acquired and
 // released: every Acquire succeeds, the oldest released fences are evicted,
 // and the held fence survives.

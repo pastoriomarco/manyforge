@@ -691,7 +691,7 @@ struct ConfigurationFenceStatusQueryDTO final {
                          const ConfigurationFenceStatusQueryDTO&) = default;
 };
 
-/// Private Q91 parent proof carried to a narrowly delegated component or
+/// Private parent proof carried to a narrowly delegated component or
 /// Scene operation. Shape validation grants no effects: the original live
 /// continuation must verify the full claim and exact fence are still held.
 /// Manager owns the full immutable plan; this value does not duplicate it.
@@ -761,7 +761,7 @@ struct ConfigurationFenceStatusDTO final {
 };
 
 /// Exact durable Manager attempt used to reconcile a lost Acquire response,
-/// or to observe the original Q101 held fence before candidate installation.
+/// or to observe the original held fence before candidate installation.
 /// The latter read grants no retry, acceptance write or rehydration authority.
 ///
 /// The complete immutable intent is included deliberately: request identity
@@ -804,7 +804,7 @@ enum class ApplyFenceAcquireAttemptReconcileState {
 }
 
 /// Closed read-only result for an exact Manager acquire-attempt query.
-/// Q101 also reads an already accepted original attempt before installation;
+/// Product adoption also reads an already accepted original attempt before installation;
 /// that observation does not enter the lost-Acquire recovery workflow.
 ///
 /// `kNotSeen` is the sole state that permits retrying the exact persisted

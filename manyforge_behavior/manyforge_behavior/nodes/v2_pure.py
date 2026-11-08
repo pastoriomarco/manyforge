@@ -125,7 +125,7 @@ class _SnapshotAdapter(py_trees.behaviour.Behaviour):
             self._blackboard_inputs = snapshot.blackboard
         except (KeyError, ProgramValueError, TypeError, ValueError) as exc:
             # The inputs fail before the node's own work starts, whatever
-            # outcomes its catalog entry declares (spec 440 §4.6).
+            # outcomes its catalog entry declares.
             self._input_error = str(exc)
             self._fail(
                 input_failure_reason(exc),

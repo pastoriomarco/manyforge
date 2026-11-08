@@ -527,7 +527,7 @@ StructurallyQualifiedCellGraph qualify_cell_structure(
 
   using EndpointKey = std::pair<std::string, std::string>;
   std::map<EndpointKey, std::uint64_t> endpoint_use_count;
-  // B5 (C-P1): per parent interface, the tools (components tagged `tool`),
+  // Per parent interface, the tools (components tagged `tool`),
   // all primary marks, and the primary marks on tools.
   std::map<EndpointKey, std::uint64_t> tool_count;
   std::map<EndpointKey, std::uint64_t> primary_count;
@@ -602,7 +602,7 @@ StructurallyQualifiedCellGraph qualify_cell_structure(
           attachment.child.attachment_interface_id, child_interface.frame},
          attachment.child_interface_pose_in_parent_interface});
   }
-  // B5 (C-P1): two or more tools on one parent interface need exactly one
+  // Two or more tools on one parent interface need exactly one
   // primary mark there, on one of the tools. Other components sharing the
   // interface (a camera without the `tool` tag) need none.
   for (const auto& [parent_key, tools] : tool_count) {

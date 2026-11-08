@@ -217,7 +217,7 @@ class _PendingObservation:
 
 
 def pose_source_stream_id(binding: ObservationBinding) -> str:
-    """CP9 stream of one binding: ``poses/<object_id>`` for an object link
+    """Stream of one binding: ``poses/<object_id>`` for an object link
     (``policy_id == "scene"``), else ``poses/<object_id>/<policy_id>``
     (robot overlays). Same rule as the C++ ``PoseSourceStreamId``.
     """
@@ -527,7 +527,7 @@ def unknown_observation_intent(
 
 
 def manager_source_epoch_factory(base: str) -> Callable[[], str]:
-    """DX285: one Manager-owned process base, existing in-process rotation."""
+    """One Manager-owned process base, existing in-process rotation."""
     base = _text(base, label="source_epoch_base", maximum=256)
     # Reserve the full existing rotation counter before any process opens.
     _text(f"{base}.{MAXIMUM_SAFE_INTEGER}", label="source_epoch", maximum=256)

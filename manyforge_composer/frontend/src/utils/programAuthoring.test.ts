@@ -8,16 +8,15 @@ import type {
   ProgramTreeNode,
 } from '../types/api';
 import {
+  catalogParameterSourceable,
   collectProgramBindingCandidates,
   collectProgramParameterUsages,
-  collectComponentRoleUsages,
   deriveProgramMotionConfiguration,
   nextProgramInstanceId,
   programDiagnosticNodeId,
   programSemanticChoices,
   programSemanticExpectedAccess,
   programSemanticExpectedType,
-  removeGuardTitle,
   resolveProgramParameterLiteralValue,
 } from './programAuthoring';
 
@@ -50,7 +49,6 @@ const entry: CatalogEntry = {
   parameters: [
     parameter('velocity_scale', 'number'),
     parameter('max_tcp_linear_speed_mps', 'number'),
-    parameter('move_id', 'string', 'target_role'),
   ],
   requiredCapabilities: [],
   execution: { blocking: true, cancellable: true, ownerApi: 'kernel.operation' },
@@ -102,6 +100,19 @@ describe('Program parameter binding continuity', () => {
   it('excludes type-mismatched and semantic selector fields', () => {
     const stringDeclaration = { ...declaration, type: 'string' };
     expect(collectProgramBindingCandidates(tree(), [entry], stringDeclaration)).toEqual([]);
+
+    const targetSelectorEntry: CatalogEntry = {
+      ...entry,
+      id: 'motion.move_to_joint_target',
+      parameters: [parameter('target', 'object')],
+      requiredCapabilities: [{
+        capabilityId: 'execution.trajectory.execute',
+        scope: 'target_binding',
+        effectful: true,
+        targetParameter: 'target',
+      }],
+    };
+    expect(catalogParameterSourceable(targetSelectorEntry, 'target')).toBe(false);
   });
 
   it('retains the v1 declared-scene-resource value-source exception', () => {
@@ -146,7 +157,7 @@ describe('Program parameter binding continuity', () => {
       parameter_id: 'home',
       type: 'stored_pose',
       default: {
-        frame_ref: { kind: 'target_frame', target_role_id: 'arm', frame_role: 'tcp' },
+        frame_ref: { kind: 'target_frame', frame: { component_id: 'robot', frame_id: 'tcp' } },
         position_m: [0, 0, 0],
         orientation: { xyzw: [0, 0, 0, 1] },
       },
@@ -197,68 +208,6 @@ describe('Program parameter binding continuity', () => {
     );
   });
 
-  it('reports every Draft reference that keeps a component role', () => {
-    const grip: CatalogEntry = {
-      ...entry,
-      id: 'grip',
-      parameters: [parameter('component_id', 'string', 'component_role')],
-    };
-    const program: ProgramAuthoringDocument = {
-      api_version: 'manyforge.program.v2',
-      program_id: 'role_usage',
-      program_profile: 'composable-cell-v1',
-      name: 'Role usage',
-      catalog: {
-        api_version: 'manyforge.node_catalog.v2',
-        content_version: '2.4.0',
-      },
-      component_roles: { robot: {}, tool: {}, spare: {} },
-      target_roles: { arm: { component_role: 'robot', required_capabilities: [] } },
-      scene: [{
-        scene_resource_id: 'table',
-        shape: { type: 'box', box_dimensions_m: [1, 1, 0.1] },
-        pose: {
-          frame_ref: {
-            kind: 'component_frame',
-            component_role: 'tool',
-            model_role: 'tool_model',
-            frame_role: 'tcp',
-          },
-          position_m: [0, 0, 0],
-          orientation: { xyzw: [0, 0, 0, 1] },
-        },
-      }],
-      schema_version: 'manyforge.composer_authoring_forest.v1',
-      forest: [
-        tree({ node_id: 'grip', parameters: { component_id: 'robot' } }),
-        tree({ node_id: 'grip', instance_id: 'n2', parameters: { component_id: 'robot' } }),
-      ],
-      positions: {},
-      contact_policies: [{
-        api_version: 'manyforge.contact_policy.v1',
-        policy_id: 'grasp',
-        mode: 'contact_grasp',
-        zones: [{
-          zone_id: 'pad',
-          body_pairs: [{
-            body_a: { kind: 'component_model_body', component_role_id: 'spare', collision_body_role_id: 'pad' },
-            body_b: { kind: 'runtime_object', runtime_object_id: 'cube' },
-          }],
-        }],
-      }],
-    };
-
-    const usages = collectComponentRoleUsages(program, [grip]);
-    expect(usages.get('robot')).toEqual(['node n1', 'node n2', 'target role arm']);
-    expect(usages.get('tool')).toEqual(['scene frame table']);
-    // A contact policy still naming the role keeps it.
-    expect(usages.get('spare')).toEqual(['contact policy grasp']);
-    expect(usages.get('free')).toBeUndefined();
-    expect(removeGuardTitle(usages.get('robot') ?? [], 'Remove component role'))
-      .toBe('node n1, node n2, target role arm');
-    expect(removeGuardTitle([], 'Remove component role')).toBe('Remove component role');
-  });
-
   it('projects backend diagnostic paths onto retained node identities', () => {
     const root = tree({
       children: [{
@@ -275,76 +224,29 @@ describe('Program parameter binding continuity', () => {
     expect(programDiagnosticNodeId([root], 'program.compatibility')).toBeNull();
   });
 
-  it('derives compatible semantic choices from only the current Draft and declared scope', () => {
+  it('derives compatible blackboard choices alongside direct target references', () => {
     const semanticEntry: CatalogEntry = {
       ...entry,
-      parameters: [
-        parameter('target_role', 'string', 'target_role'),
-        {
-          ...parameter('touch_body_roles', 'array'),
-          schema: {
-            type: 'array',
-            items: {
-              type: 'string',
-              'x-manyforge-semantic-type': 'collision_body_role',
-              'x-manyforge-semantic-scope-parameter': 'target_role',
-            },
-          },
-        },
-        parameter('output_key', 'string', 'blackboard_key'),
-      ],
+      parameters: [parameter('output_key', 'string', 'blackboard_key')],
       blackboard: {
         reads: [],
         writes: [{ keyParameter: 'output_key', valueType: 'scene_selection_result' }],
       },
     };
-    const selected = tree({ parameters: { target_role: 'gripper' } });
+    const selected = tree({ parameters: { target: { component_id: 'robot', command_target_id: 'arm' } } });
     const program: ProgramAuthoringDocument = {
-      api_version: 'manyforge.program.v2',
-      program_id: 'semantic_test',
-      program_profile: 'composable-cell-v1',
-      name: 'Semantic test',
-      catalog: {
-        api_version: 'manyforge.node_catalog.v2',
-        content_version: '2.4.0',
-      },
-      component_roles: { robot: {}, tool: {} },
-      target_roles: {
-        arm: { required_collision_body_roles: ['arm_collision'] },
-        gripper: { required_collision_body_roles: ['finger', 'gripper_collision'] },
-      },
-      blackboard: {
-        namespaces: [],
-        keys: [
-          { key: 'selection', type: 'scene_selection_result', access: 'read_write', persistence: 'run' },
-          { key: 'input_only', type: 'scene_selection_result', access: 'read', persistence: 'run' },
-          { key: 'wrong_type', type: 'bool', access: 'read_write', persistence: 'run' },
-        ],
-      },
-      schema_version: 'manyforge.composer_authoring_forest.v1',
-      forest: [selected],
-      positions: {},
+      api_version: 'manyforge.program.v3', program_id: 'semantic_test',
+      program_profile: 'composable-cell-v1', name: 'Semantic test',
+      catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '3.0.0' },
+      blackboard: { namespaces: [], keys: [
+        { key: 'selection', type: 'scene_selection_result', access: 'write', persistence: 'run' },
+        { key: 'wrong_type', type: 'bool', access: 'write', persistence: 'run' },
+      ] },
+      schema_version: 'manyforge.composer_authoring_forest.v2', forest: [selected], positions: {},
     };
-
-    expect(programSemanticChoices(
-      semanticEntry.parameters[1]!.schema.items!,
-      selected,
-      semanticEntry,
-      'touch_body_roles',
-      program,
-    ).map((choice) => choice.value)).toEqual(['finger', 'gripper_collision']);
-    expect(programSemanticChoices(
-      semanticEntry.parameters[2]!.schema,
-      selected,
-      semanticEntry,
-      'output_key',
-      program,
-    ).map((choice) => choice.value)).toEqual(['selection']);
-    expect(programSemanticExpectedType(
-      semanticEntry,
-      'output_key',
-      'blackboard_key',
-    )).toBe('scene_selection_result');
+    expect(programSemanticChoices(semanticEntry.parameters[0]!.schema, selected,
+      semanticEntry, 'output_key', program).map((choice) => choice.value)).toEqual(['selection']);
+    expect(programSemanticExpectedType(semanticEntry, 'output_key', 'blackboard_key')).toBe('scene_selection_result');
     expect(programSemanticExpectedAccess(semanticEntry, 'output_key')).toBe('write');
   });
 
@@ -359,13 +261,11 @@ describe('Program parameter binding continuity', () => {
       parameters: { on_grasp_lost: { raise_alarm: false, stop_motion: false, set_key: null, detach: true } },
     });
     const program: ProgramAuthoringDocument = {
-      api_version: 'manyforge.program.v2',
+      api_version: 'manyforge.program.v3',
       program_id: 'grasp_lost_test',
       program_profile: 'composable-cell-v1',
       name: 'Grasp lost test',
-      catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.7.0' },
-      component_roles: {},
-      target_roles: {},
+      catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '3.0.0' },
       blackboard: {
         namespaces: [],
         keys: [
@@ -376,7 +276,7 @@ describe('Program parameter binding continuity', () => {
           { key: 'sink', type: 'bool', access: 'write', persistence: 'run' },
         ],
       },
-      schema_version: 'manyforge.composer_authoring_forest.v1',
+      schema_version: 'manyforge.composer_authoring_forest.v2',
       forest: [selected],
       positions: {},
     };
@@ -402,23 +302,21 @@ describe('Program parameter binding continuity', () => {
       ],
     };
     const program = {
-      api_version: 'manyforge.program.v2',
+      api_version: 'manyforge.program.v3',
       program_id: 'bound_motion',
       program_profile: 'composable-cell-v1',
       name: 'Bound motion',
       catalog: {
-        api_version: 'manyforge.node_catalog.v2',
+        api_version: 'manyforge.node_catalog.v3',
         content_version: '2.4.0',
       },
-      component_roles: {},
-      target_roles: {},
       parameters: [
         { ...declaration, parameter_id: 'cycle_velocity', default: 0.35 },
         { ...declaration, parameter_id: 'cycle_acceleration', default: 0.7 },
         { ...declaration, parameter_id: 'path_tolerance', default: 0.005 },
         { ...declaration, parameter_id: 'path_blend', default: 0.01 },
       ],
-      schema_version: 'manyforge.composer_authoring_forest.v1',
+      schema_version: 'manyforge.composer_authoring_forest.v2',
       forest: [tree({
         value_sources: {
           velocity_scale: {
@@ -485,18 +383,16 @@ describe('Program parameter binding continuity', () => {
       ],
     };
     const program = {
-      api_version: 'manyforge.program.v2',
+      api_version: 'manyforge.program.v3',
       program_id: 'incomplete_motion',
       program_profile: 'composable-cell-v1',
       name: 'Incomplete motion',
       catalog: {
-        api_version: 'manyforge.node_catalog.v2',
+        api_version: 'manyforge.node_catalog.v3',
         content_version: '2.4.0',
       },
-      component_roles: {},
-      target_roles: {},
       parameters: [declaration],
-      schema_version: 'manyforge.composer_authoring_forest.v1',
+      schema_version: 'manyforge.composer_authoring_forest.v2',
       forest: [tree({
         value_sources: {
           velocity_scale: { kind: 'program_parameter', reference: 'vscale' },
@@ -528,23 +424,21 @@ describe('Program parameter binding continuity', () => {
       translation_tol_m: 0.005,
     };
     const program = {
-      api_version: 'manyforge.program.v2',
+      api_version: 'manyforge.program.v3',
       program_id: 'joint_only_motion',
       program_profile: 'composable-cell-v1',
       name: 'Joint-only motion',
       catalog: {
-        api_version: 'manyforge.node_catalog.v2',
+        api_version: 'manyforge.node_catalog.v3',
         content_version: '2.4.0',
       },
-      component_roles: {},
-      target_roles: {},
       parameters: [
         ...Object.entries(fields).map(([parameter_id, defaultValue]) => ({
           ...declaration, parameter_id, default: defaultValue,
         })),
         { ...declaration, parameter_id: 'blend_radius_m', default: 0.01 },
       ],
-      schema_version: 'manyforge.composer_authoring_forest.v1',
+      schema_version: 'manyforge.composer_authoring_forest.v2',
       forest: [tree({
         value_sources: Object.fromEntries(Object.keys(fields).map((field) => [field, {
           kind: 'program_parameter' as const,

@@ -19,8 +19,8 @@
   "files": [
     {
       "path": "README.md",
-      "sha256": "28aab648204971c0cf7e65dc88c6879c100a9df32a0e7d23ec3fe1b3c89daa51",
-      "size_bytes": 2047
+      "sha256": "a251859c1109b5b33d1ad5e189d9e3a73732ec639154b65a8df1f6d84bd3b855",
+      "size_bytes": 2337
     },
     {
       "path": "licenses/Universal_Robots_ROS2_Description.LICENSE",

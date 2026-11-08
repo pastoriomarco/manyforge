@@ -99,12 +99,11 @@ protected:
   }
   void BindProgram() {
     auto value = d::parse_strict_json_model_yaml(R"({
-      "api_version":"manyforge.program.v2","program_id":"catalog_projection",
+      "api_version":"manyforge.program.v3","program_id":"catalog_projection",
       "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "program_profile":"composable-cell-v1","name":"Catalog projection fixture",
-      "catalog":{"api_version":"manyforge.node_catalog.v2","content_version":"0.0.0"},
-      "component_roles":{},"target_roles":{},
-      "blackboard":{"namespaces":[],"keys":[{"key":"ready","type":"bool",
+      "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
+        "blackboard":{"namespaces":[],"keys":[{"key":"ready","type":"bool",
         "access":"read_write","persistence":"run","initial":false}]},
       "tree":{"node_id":"sequence","instance_id":"root","parameters":{},"children":[]}})")
                      .root();
@@ -115,10 +114,8 @@ protected:
     value = d::normalize_program_authoring(value);
     value = replace(value, "program_revision",
                     V(d::detail::compute_content_identity(
-                        value, {"program-revision", "manyforge.program.v2",
+                        value, {"program-revision", "manyforge.program.v3",
                                 "program_revision"})));
-    program =
-        d::verify_program_binding_contract(d::canonical_json(value), *bundle);
     if (bundle->value().compiled_products.symbol_role_maps.size() != 1U)
       throw std::logic_error("genuine sole retained model-map product missing");
     d::FilesystemVerifiedRetainedModelMapSource maps(root);
@@ -130,7 +127,9 @@ protected:
     if (!map)
       throw std::logic_error("genuine retained model map missing");
     d::FilesystemCatalogArtifactStore artifacts(root);
-    binding = d::compile_program_binding(*program, {}, *bundle, *map,
+    program = d::verify_program_binding_contract(
+        d::canonical_json(value), *bundle, *map, artifacts);
+    binding = d::compile_program_binding(*program, *bundle, *map,
                                          artifacts);
   }
   std::shared_ptr<c::IoSignalSubsystem>
@@ -212,7 +211,7 @@ TEST_F(AppliedGlobalIoRuleInstallationTest,
   const auto fixture = deployment::test::LoadMaintainedInterruptProgram(
       MANYFORGE_PROGRAM_CAPTURE_PACKAGE_ROOT, root);
   const auto target = d::resolve_runtime_program_target(
-      *fixture.binding, c::TargetRoleId("arm"),
+      *fixture.binding, fixture.binding->value().target_bindings.front().target,
       c::CapabilityId("execution.trajectory.execute"), *fixture.bundle,
       fixture.model_map);
   ASSERT_TRUE(target.control_binding());
@@ -264,7 +263,7 @@ TEST_F(AppliedGlobalIoRuleInstallationTest,
   EXPECT_EQ(node.node_instance_id, c::ProgramNodeInstanceId("move"));
   ASSERT_NE(node.condition, nullptr);
   ASSERT_TRUE(node.node_rule);
-  EXPECT_EQ(node.node_rule->target_role_id, c::TargetRoleId("arm"));
+  EXPECT_EQ(node.node_rule->target, target.target_binding().target);
   EXPECT_EQ(node.node_rule->activation_mode,
             c::MotionInterruptActivationMode::kRequireInactiveAtArm);
   EXPECT_EQ(node.node_rule->stop_mode,

@@ -63,6 +63,8 @@ from manyforge_behavior.program_runtime import (
     _presented_node_status,
 )
 
+from .v3_fixtures import frame, signal, target
+
 # The Runner's execution transport timeout handed to owner task nodes.
 _TRANSPORT_TIMEOUT_S = 30.0
 
@@ -80,7 +82,7 @@ def _identified(document: dict[str, Any]) -> dict[str, Any]:
         result,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return result
 
@@ -90,7 +92,6 @@ def _minimal_document() -> dict[str, Any]:
         _ROOT / "examples/pick_and_place_minimal.program.yaml",
         _catalog(),
     ).to_dict()
-    document["target_roles"]["arm"]["required_frame_roles"] = ["base", "tcp"]  # TCP migration: arm keeps tcp frame role in this fixture
     return document
 
 
@@ -181,11 +182,7 @@ class _InvocationPort:
 
 def _portable_pose() -> dict[str, Any]:
     return {
-        "frame_ref": {
-            "kind": "target_frame",
-            "target_role": "arm",
-            "frame_role": "base",
-        },
+        "frame_ref": {"kind": "target_frame", "frame": frame("ur5_robot", "base")},
         "position_m": [0.4, 0.0, 0.2],
         "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
     }
@@ -291,15 +288,15 @@ def _fake_port_run(**kwargs: Any) -> ExecutableProgramRun:
     endpoint convention, not a captured deployment binding.
     """
     kwargs.setdefault("transport_timeout_s", _TRANSPORT_TIMEOUT_S)
+    kwargs.setdefault("program_binding", {"program_binding_id": kwargs["capture"].program_binding_id,
+                                           "target_bindings": [], "signal_bindings": [],
+                                           "frame_bindings": [], "collision_body_bindings": []})
     run = ExecutableProgramRun(**kwargs)
     for key in kwargs["program"].blackboard_keys:
-        if key.startswith("active_tcp."):
-            role = key.removeprefix("active_tcp.")
-            run.value_store.write_active_tcp(role, {
-                "component_id": f"{role}.component",
-                "target_id": role,
-                "frame_role_id": "tcp",
-            })
+        if key.startswith("active_tcp/"):
+            component, command = key.removeprefix("active_tcp/").split("/", 1)
+            run.value_store.write_active_tcp(component, command, {
+                "target": target(component, command), "frame": frame(component, "tcp")})
     return run
 
 
@@ -327,7 +324,7 @@ def _capture(program: Program, *, binding_id: str = _DIGEST_A) -> ProgramRunCapt
 
 
 def test_rule_activation_outside_change_and_output_are_immediate_kernel_invocations() -> None:
-    """CONTRACTS §7, §9: each is one immediate Kernel call."""
+    """Each is one immediate Kernel call."""
 
     resolver = build_executable_node_resolver(build_node_environment())
     nodes = {"rules.set_active", "io.clear_outside_change", "io.set_output"}
@@ -398,13 +395,13 @@ def test_deferred_adapter_parser_reads_empty_and_nonempty_initializers() -> None
     ) == {}
     nonempty = (
         "constexpr std::array<DeferredAdapter, 2U> kDeferredAdapters{{\n"
-        '    {"io.get_input", "reason_a", "I11",\n     "T"},\n'
-        '    {"motion.probe_search", "reason_b", "I8", "P5"},\n'
+        '    {"io.get_input", "reason_a", "gate_a",\n     "gate_b"},\n'
+        '    {"motion.probe_search", "reason_b", "gate_c", "gate_d"},\n'
         "}};\nint y{{2}};"
     )
     assert _deferred_adapters(nonempty) == {
-        "io.get_input": ("reason_a", "I11", "T"),
-        "motion.probe_search": ("reason_b", "I8", "P5"),
+        "io.get_input": ("reason_a", "gate_a", "gate_b"),
+        "motion.probe_search": ("reason_b", "gate_c", "gate_d"),
     }
     for malformed in (
         nonempty.replace("2U>", "3U>"),
@@ -493,7 +490,7 @@ def test_simulation_row_uses_the_focused_cancellable_task_owner() -> None:
 @pytest.mark.parametrize("outcome", [OwnerTaskState.SUCCEEDED, OwnerTaskState.FAILED])
 def test_recovery_row_uses_the_exact_control_port_and_does_not_retry(outcome) -> None:
     document = _minimal_document()
-    parameters = {"target_role": "arm", "recovery_action": "acknowledge_and_continue"}
+    parameters = {"target": target("ur5_robot", "arm"), "recovery_action": "acknowledge_and_continue"}
     document["tree"] = {
         "node_id": "recovery.apply_offered_action",
         "instance_id": "recover_arm",
@@ -1125,7 +1122,7 @@ def test_set_value_and_offset_pose_name_run_node_and_attempt_in_the_persistent_e
     assert register.edits[0]["node_attempt_id"] != register.edits[1]["node_attempt_id"]
 
 
-_TCP = {"kind": "target_frame", "target_role": "arm", "frame_role": "tcp"}
+_TCP = {"kind": "target_frame", "frame": frame("ur5_robot", "tcp")}
 _TABLE = {"kind": "scene_resource", "scene_resource_id": "table"}
 
 
@@ -1135,23 +1132,6 @@ def _two_robot_program(
     """The minimal Program plus a second robot `peer` with base and flange."""
 
     document = _minimal_document()
-    arm = document["target_roles"]["arm"]
-    declared = {row["capability_id"] for row in arm["required_capabilities"]}
-    arm["required_capabilities"] = sorted(
-        [
-            *arm["required_capabilities"],
-            *(
-                {"capability_id": capability, "parameters": {}, "disposition": "required"}
-                for capability in ("planning.motion.cartesian_path", "planning.motion.pose_goal")
-                if capability not in declared
-            ),
-        ],
-        key=lambda row: row["capability_id"],
-    )
-    document["target_roles"]["peer"] = {
-        **deepcopy(arm),
-        "required_frame_roles": ["base", "flange"],
-    }
     document["blackboard"] = {"namespaces": [], "keys": sorted(keys, key=lambda row: row["key"])}
     document["tree"] = {
         "node_id": "sequence",
@@ -1159,7 +1139,17 @@ def _two_robot_program(
         "parameters": {},
         "children": list(children) or [_idle()],
     }
-    return Program.from_dict(_identified(document), _catalog())
+    return _with_frame_facts(Program.from_dict(_identified(document), _catalog()))
+
+
+def _with_frame_facts(program: Program) -> Program:
+    from types import MappingProxyType
+    from manyforge_behavior.program_frame_facts import ProgramFrameFacts
+    return program.with_program_frame_facts(ProgramFrameFacts(
+        frozenset({"ur5_robot", "peer.robot"}), MappingProxyType({
+            ("ur5_robot", "base"): 1, ("ur5_robot", "tcp"): 1,
+            ("peer.robot", "flange"): 1, ("peer.robot", "ambiguous"): 2,
+        })))
 
 
 @pytest.mark.parametrize(
@@ -1177,9 +1167,9 @@ def _two_robot_program(
             _key(
                 "p",
                 "stored_pose",
-                allowed_frames=[{"kind": "target_frame", "target_role": "peer", "frame_role": "tcp"}],
+                allowed_frames=[{"kind": "target_frame", "frame": {"component_id": "peer.robot"}}],
             ),
-            "is not required by the selected target role",
+            "missing required fields",
         ),
         (
             _key(
@@ -1219,7 +1209,7 @@ def test_allowed_frames_restricts_every_value_of_a_pose_key() -> None:
     open_program = _two_robot_program([_key("place", "stored_pose")])
     open_program.validate_key_value(
         "place",
-        {**_cell_pose(), "frame_ref": {"kind": "target_frame", "target_role": "peer", "frame_role": "flange"}},
+        {**_cell_pose(), "frame_ref": {"kind": "target_frame", "frame": frame("peer.robot", "flange")}},
         path="node",
     )
 
@@ -1238,8 +1228,8 @@ def test_poses_inside_structured_values_name_declared_frames() -> None:
         ]
     )
     store = ProgramValueStore.from_program(program)
-    flange = {"kind": "target_frame", "target_role": "peer", "frame_role": "flange"}
-    undeclared = {"kind": "target_frame", "target_role": "peer", "frame_role": "tcp"}
+    flange = {"kind": "target_frame", "frame": frame("peer.robot", "flange")}
+    undeclared = {"kind": "target_frame", "frame": frame("peer.robot", "tcp")}
     moon = {"kind": "scene_resource", "scene_resource_id": "moon"}
     framed = {**_cell_pose(), "frame_ref": flange}
     unframed = {"position_m": [0.0, 0.0, 0.1], "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]}}
@@ -1266,8 +1256,8 @@ def _relative_move(reference: dict[str, Any], **goal_frame: Any) -> dict[str, An
     return _leaf(
         "motion.move_to_pose",
         "move",
-        target_role="arm",
-        base_frame_role="base",
+        target=target("ur5_robot", "arm"),
+        base_frame=frame("ur5_robot", "base"),
         tcp_endpoint={"kind": "current"},  # TCP migration: old selector without kind; missing/current = own TCP
         goal={"position_m": [0.0, 0.0, 0.1], "orientation": {"rpy_deg": [0.0, 0.0, 0.0]}, **goal_frame},
         target_mode="relative",
@@ -1275,45 +1265,32 @@ def _relative_move(reference: dict[str, Any], **goal_frame: Any) -> dict[str, An
     )
 
 
-def test_reference_frames_pair_their_robot_and_frame_role() -> None:
-    # Another robot's frame, named robot plus frame.
-    _two_robot_program(
-        [], _relative_move({"type": "frame_role", "frame_role_id": "flange", "target_role": "peer"})
-    )
-    _two_robot_program([], _relative_move({"type": "cell_frame"}))
-    with pytest.raises(ProgramValidationError, match="required by target role 'peer'"):
-        _two_robot_program(
-            [], _relative_move({"type": "frame_role", "frame_role_id": "tcp", "target_role": "peer"})
-        )
-    # The unqualified form stays the moving robot's own frame.
-    with pytest.raises(ProgramValidationError, match="required by target role 'arm'"):
-        _two_robot_program([], _relative_move({"type": "frame_role", "frame_role_id": "flange"}))
-    # A pose frame pairs its target and frame role too.
-    with pytest.raises(ProgramValidationError, match="required by target role 'peer'"):
-        _two_robot_program(
-            [],
-            _leaf(
-                "geometry.check_pose_bounds",
-                "bounds",
-                pose={**_cell_pose(), "frame_ref": {"kind": "target_frame", "target_role": "peer", "frame_role": "tcp"}},
-                frame_ref={"kind": "cell_frame"},
-                min_position_m=[0.0, 0.0, 0.0],
-                max_position_m=[1.0, 1.0, 1.0],
-            ),
-        )
+def test_direct_frames_are_checked_against_captured_facts() -> None:
+    from manyforge_behavior.program import ProgramFrameReferenceError
+
+    program = _two_robot_program([_key("place", "stored_pose")],
+                                 _relative_move({"type": "component_frame", "frame": frame("peer.robot", "flange")}))
+    for ref, code in ((frame("peer.robot", "tcp"), "frame_missing"),
+                      (frame("ur5_robot", "flange"), "frame_missing"),
+                      (frame("peer.robot", "ambiguous"), "reference_ambiguous")):
+        with pytest.raises(ProgramFrameReferenceError) as refused:
+            program.validate_key_value("place", {**_cell_pose(), "frame_ref": {"kind": "target_frame", "frame": ref}}, path="node")
+        assert refused.value.code == code
+    # Literal node/allowed-frame references are checked by the shared Apply
+    # validator; see ProgramContractTest.KeyTypedStoredPoseMissingFrameIsRefusedBeforeCapture.
 
 
 def test_relative_goal_and_cartesian_waypoints_keep_one_owner_resolvable_frame() -> None:
     with pytest.raises(ProgramValidationError, match="relative goal is stated in the moving robot"):
         _two_robot_program([], _relative_move({"type": "cell_frame"}, frame_ref={"kind": "cell_frame"}))
-    base = {"kind": "target_frame", "target_role": "arm", "frame_role": "base"}
+    base = {"kind": "target_frame", "frame": frame("ur5_robot", "base")}
     _two_robot_program([], _relative_move({"type": "cell_frame"}, frame_ref=base))
     pose = {"position_m": [0.0, 0.0, 0.1], "orientation": {"rpy_deg": [0.0, 0.0, 0.0]}}
     path = _leaf(
         "motion.follow_cartesian_path",
         "path",
-        target_role="arm",
-        base_frame_role="base",
+        target=target("ur5_robot", "arm"),
+        base_frame=frame("ur5_robot", "base"),
         tcp_endpoint={"kind": "current"},  # TCP migration: old selector without kind; missing/current = own TCP
         path=[{**pose, "frame_ref": {"kind": "cell_frame"}}, {**pose, "frame_ref": base}],
     )
@@ -1470,9 +1447,9 @@ def test_program_run_reuses_thin_ports_and_preserves_portable_inputs() -> None:
     assert run.tick_once() is py_trees.common.Status.SUCCESS
     assert len(task.starts) == len(task.acknowledgements) == 1
     assert task.starts[0][0] == "motion.move_to_joint_target"
-    assert task.starts[0][2].parameters["target_role"] == "arm"
-    assert task.starts[0][2].blackboard["active_tcp"] == {
-        "component_id": "arm.component", "target_id": "arm", "frame_role_id": "tcp",
+    assert task.starts[0][2].parameters["target"] == target("ur5_robot", "arm")
+    assert task.starts[0][2].blackboard["active_tcp/ur5_robot/arm"] == {
+        "target": target("ur5_robot", "arm"), "frame": frame("ur5_robot", "tcp"),
     }
     assert task.starts[0][2].parameters["velocity_scale"] == 0.5
     assert invocation.invocations[0][0] == "scene.remove_object"
@@ -1489,7 +1466,7 @@ def test_all_maintained_program_node_forms_execute_through_the_closed_runner() -
             for path in (_ROOT / "examples").glob("*.program.yaml")
             if not path.name.startswith("ur5e_lite6_wall_")
             and path.read_text(encoding="utf-8").startswith(
-                "api_version: manyforge.program.v2\n"
+                "api_version: manyforge.program.v3\n"
             )
         )
     )
@@ -1711,7 +1688,7 @@ def test_every_cancellable_leaf_adapter_reports_interrupted_and_no_other_does() 
             continue
         parameters = {"duration_s": 1.0}
         if entry.category == "motion":
-            parameters["target_role"] = "arm"
+            parameters["target"] = target("ur5_robot", "arm")
         adapter = resolver.instantiate(
             disposition.row,
             NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
@@ -2091,12 +2068,11 @@ def test_set_value_writes_values_typed_by_the_key_from_every_source() -> None:
                     **_portable_pose(),
                     "frame_ref": {
                         "kind": "target_frame",
-                        "target_role": "arm",
-                        "frame_role": "camera",
+                        "frame": {"component_id": "ur5_robot"},
                     },
                 },
             ),
-            "is not required by the selected target role",
+            "must be a value of one of the key types",
         ),
         (
             _key("count", "int64"),
@@ -2520,8 +2496,9 @@ def _set_tcp_stop_run(*, policy: str, task: _TaskPort) -> ExecutableProgramRun:
             {
                 "node_id": "motion.set_tcp", "instance_id": instance,
                 "parameters": {
-                    "target_role": "arm",
-                    "tcp": {"kind": "entry", "target_role": "arm", "frame_role": "tcp"},
+                    "target": target("ur5_robot", "arm"),
+                    "tcp": {"kind": "entry", "target": target("ur5_robot", "arm"),
+                            "frame": frame("ur5_robot", "tcp")},
                 },
                 "operator_stop_policy": policy, "children": [],
             }
@@ -3115,7 +3092,7 @@ class _FramePort(_InvocationPort):
 
     _IN_CELL = {
         "cell_frame": ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]),
-        "arm.base": ([1.0, 0.0, 0.0], [0.0, 0.0, 0.5**0.5, 0.5**0.5]),
+        "ur5_robot.base": ([1.0, 0.0, 0.0], [0.0, 0.0, 0.5**0.5, 0.5**0.5]),
         "table": ([0.0, 0.0, 0.5], [0.0, 0.0, 0.0, 1.0]),
     }
 
@@ -3130,7 +3107,7 @@ class _FramePort(_InvocationPort):
             return cls._IN_CELL["cell_frame"]
         if frame["kind"] == "scene_resource":
             return cls._IN_CELL[frame["scene_resource_id"]]
-        return cls._IN_CELL[f"{frame['target_role']}.{frame['frame_role']}"]
+        return cls._IN_CELL[f"{frame['frame']['component_id']}.{frame['frame']['frame_id']}"]
 
     def express_pose(self, identity, pose, target_frame):
         from manyforge_behavior.geometry import (
@@ -3161,7 +3138,7 @@ class _FramePort(_InvocationPort):
         )
         return FrameTransformResult(
             pose={
-                "frame_ref": dict(target_frame),
+                "frame_ref": _plain(target_frame),
                 "position_m": position,
                 "orientation": {
                     "xyzw": quat_mul(inverse, quat_mul(source_q, quaternion))
@@ -3346,7 +3323,7 @@ def test_check_pose_bounds_refuses_an_empty_box_and_an_undeclared_frame_pair() -
                 **{**bounds, "min_position_m": [0.0, 2.0, 0.0]},
             ),
         )
-    with pytest.raises(ProgramValidationError, match="does not name a frame_role"):
+    with pytest.raises(ProgramValidationError, match="frame_id: is required"):
         _typed_program(
             [],
             _leaf(
@@ -3357,8 +3334,7 @@ def test_check_pose_bounds_refuses_an_empty_box_and_an_undeclared_frame_pair() -
                     **bounds,
                     "frame_ref": {
                         "kind": "target_frame",
-                        "target_role": "arm",
-                        "frame_role": "camera",
+                        "frame": {"component_id": "ur5_robot"},
                     },
                 },
             ),
@@ -3426,7 +3402,7 @@ def test_get_object_pose_in_another_frame_is_one_owner_transform() -> None:
         ports=NodeAdapterPorts(scene_transactions=scene, model_queries=frames),
     )
 
-    assert run.tick_once() is py_trees.common.Status.SUCCESS
+    assert run.tick_once() is py_trees.common.Status.SUCCESS, run.terminal_failure()
     assert scene.invocations == []
     [(_identity, pose, target)] = frames.transforms
     assert pose["frame_ref"] == {"kind": "scene_resource", "scene_resource_id": "table"}
@@ -3696,17 +3672,18 @@ def test_key_writes_and_loads_use_the_full_declared_type_check() -> None:
         ],
         _idle(),
     )
+    program = _with_frame_facts(program)
     store = ProgramValueStore.from_program(
         program, project_path=_PROJECT, register=_Register()
     )
     with pytest.raises(ProgramValueError, match="does not name a declared scene resource"):
         store.write("object", "not_in_scene")
-    with pytest.raises(ProgramValueError, match="does not name a declared target role"):
+    with pytest.raises(ProgramValueError, match="frame_missing"):
         store.write(
             "place",
             {
                 **_cell_pose(),
-                "frame_ref": {"kind": "target_frame", "target_role": "ghost", "frame_role": "tcp"},
+                "frame_ref": {"kind": "target_frame", "frame": frame("ghost", "tcp")},
             },
         )
     with pytest.raises(ProgramValueError, match="missing required fields"):
@@ -3740,7 +3717,7 @@ def _stop_parity_node(
         "node_id": node_id,
         "instance_id": instance_id,
         "parameters": (
-            {"target_role": "gripper", "position": {"kind": "linear_m", "value_m": 0.01}}
+            {"target": target("lite_gripper", "gripper"), "position": {"kind": "linear_m", "value_m": 0.01}}
             if node_id == "gripper.command_position" else {}
         ),
         "children": list(children),
@@ -3763,13 +3740,6 @@ def _stop_parity_run(
             document["execution_groups"] = {
                 name: {"execution_policy": "independent"} for name in group_ids
             }
-        document["target_roles"]["gripper"] = {
-            "component_role": "robot",
-            "required_capabilities": [
-                {"capability_id": capability, "parameters": {}, "disposition": "required"}
-                for capability in ("tool.gripper.command", "tool.gripper.feedback")
-            ],
-        }
     program = Program.from_dict(_identified(document), _catalog())
     return _fake_port_run(
         program=program,
@@ -3797,7 +3767,7 @@ def test_behavior_stop_policy_oracle_for_partial_and_whole_subtrees(
     # ticking the real resolver-built tree, including its Hold decorator.
     child = _stop_parity_node("a_child", "gripper.command_position", "continue")
     child["parameters"] = {
-        "target_role": "gripper", "position": {"kind": "linear_m", "value_m": 0.01}
+        "target": target("lite_gripper", "gripper"), "position": {"kind": "linear_m", "value_m": 0.01}
     }
     child["execution_groups"] = ["child_only", "mixed", "whole"]
     sibling = _stop_parity_node("b_sibling", "gripper.command_position", "continue")
@@ -3955,20 +3925,13 @@ def test_behavior_stop_policy_oracle_for_inherited_leaf_root_default() -> None:
     assert state.snapshot().held_nodes == frozenset({"root"})
 
 
-# DX825/827/838 source-only tests. The original pre-oracle bodies and four
-# oracle selectors remain; D approved the narrow policy matrix refinement above.
+# Source-only tests. The original pre-oracle bodies and four oracle selectors
+# remain, with the narrow policy matrix refinement above.
 # These use actual Behavior runs
 # with Python fake owner observations; they are not Kernel/backend proof.
 def _program_dwell_run(now, *, dwell=2.0, mode=None, policy="hold", task=None):
     document = _minimal_document()
-    document["target_roles"]["gripper"] = {
-        "component_role": "robot",
-        "required_capabilities": [
-            {"capability_id": capability, "parameters": {}, "disposition": "required"}
-            for capability in ("tool.gripper.command", "tool.gripper.feedback")
-        ],
-    }
-    parameters = {"target_role": "gripper", "position": {"kind": "linear_m", "value_m": 0.008}}
+    parameters = {"target": target("lite_gripper", "gripper"), "position": {"kind": "linear_m", "value_m": 0.008}}
     if mode is not None:
         parameters["dwell_while_held"] = mode
     document["tree"] = {"node_id": "gripper.command_position", "instance_id": "command",
@@ -4104,7 +4067,7 @@ def test_program_stop_invalidates_dwell_and_retry_has_fresh_attempt():
 
 @pytest.mark.parametrize("saturated", [False, True])
 def test_failed_stop_nonstopping_projection_needs_new_owner_revision(saturated):
-    # Contract139/DX1488: normal terminal Faulted expansion advances the
+    # Normal terminal Faulted expansion advances the
     # existing owner revision. At its bounded maximum the unchanged Runner
     # guard visibly refuses the contradictory same-revision projection.
     maximum = 2**53 - 1

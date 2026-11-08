@@ -5,7 +5,7 @@ from __future__ import annotations
 from manyforge_ros import inspect_isaac_scene
 
 
-def test_inspect_isaac_scene_is_a_pre_effect_i9_boundary(capsys) -> None:
+def test_inspect_isaac_scene_refuses_before_any_effect(capsys) -> None:
     assert inspect_isaac_scene.main(["--include-subtree", "must-not-be-read"]) == 78
     assert capsys.readouterr().err.strip() == inspect_isaac_scene.UNAVAILABLE_MESSAGE
     payload = inspect_isaac_scene.unavailable_payload()

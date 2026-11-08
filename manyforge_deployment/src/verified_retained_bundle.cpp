@@ -503,7 +503,7 @@ parse_retained_product(const CanonicalValue &value, std::string_view field,
     }
   }
   const bool has_execution_runtime = !execution_runtime_units.empty();
-  // CONTRACTS §16: a machine owner is model-free; its execution unit lists it
+  // A machine owner is model-free; its execution unit lists it
   // under `machines`.
   std::set<std::string> machine_owners;
   for (const auto &unit : graph.runtime_units) {
@@ -1345,7 +1345,7 @@ verify_structural_applicability_projection(
   return verified;
 }
 
-// CP9 stream parameter overrides: the exact normalized, non-empty Deployment
+// Stream parameter overrides: the exact normalized, non-empty Deployment
 // table whose rows name retained controllable components.
 void verify_retained_component_streams(const CanonicalValue &value,
                                        const core::CellGraphDTO &graph) {

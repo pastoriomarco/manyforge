@@ -39,7 +39,7 @@ struct ResolvedPassiveModelFrameDTO final {
                          const ResolvedPassiveModelFrameDTO&) = default;
 };
 
-/// Closed internal frame identity from spec 210 section 1.2. Public program
+/// Closed internal frame identity. Public program
 /// intent carries logical frame roles; generated names appear only after exact
 /// retained-graph resolution.
 using ResolvedFrameDTO =

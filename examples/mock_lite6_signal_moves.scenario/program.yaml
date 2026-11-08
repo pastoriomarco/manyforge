@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.program.v2",
+  "api_version": "manyforge.program.v3",
   "blackboard": {
     "keys": [
       {
@@ -18,8 +18,8 @@
     ]
   },
   "catalog": {
-    "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.9.0"
+    "api_version": "manyforge.node_catalog.v3",
+    "content_version": "3.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
@@ -31,22 +31,6 @@
       "lite6",
       "r5-live-trial"
     ]
-  },
-  "component_roles": {
-    "robot": {
-      "required_component_type_tags": [
-        "articulated-arm"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ]
-    },
-    "station": {},
-    "tool": {
-      "required_component_type_tags": [
-        "gripper"
-      ]
-    }
   },
   "contact_policies": [
     {
@@ -119,7 +103,10 @@
           "instance_id": "start_rest",
           "node_id": "motion.move_to_joint_target",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "lite6_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 30.0,
             "goal": [
               {
@@ -148,10 +135,16 @@
               }
             ],
             "planning_timeout_s": 5.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "lite6_robot"
+            },
             "tcp_endpoint": {
-              "kind": "default_of_role",
-              "role": "gripper"
+              "kind": "default_of_target",
+              "target": {
+                "command_target_id": "gripper",
+                "component_id": "lite_gripper"
+              }
             },
             "velocity_scale": 0.4
           }
@@ -162,8 +155,10 @@
           "node_id": "io.check_input",
           "parameters": {
             "expected_value": false,
-            "resource_role": "edge_sensor",
-            "target_role": "station"
+            "signal": {
+              "component_id": "station_io",
+              "signal_name": "edge_sensor"
+            }
           }
         },
         {
@@ -171,12 +166,17 @@
           "instance_id": "search_trip",
           "node_id": "motion.move_until_signal",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "lite6_robot",
+              "frame_id": "base"
+            },
             "goal": {
               "frame_ref": {
-                "frame_role": "base",
-                "kind": "target_frame",
-                "target_role": "arm"
+                "frame": {
+                  "component_id": "lite6_robot",
+                  "frame_id": "base"
+                },
+                "kind": "target_frame"
               },
               "orientation": {
                 "rpy_deg": [
@@ -196,8 +196,8 @@
                 "op": "==",
                 "operand": {
                   "signal": {
-                    "resource_role": "probe_contact",
-                    "target_role": "station"
+                    "component_id": "station_io",
+                    "signal_name": "probe_contact"
                   }
                 },
                 "value": true
@@ -210,18 +210,24 @@
                   "value": true
                 },
                 "signal": {
-                  "resource_role": "probe_contact",
-                  "target_role": "station"
+                  "component_id": "station_io",
+                  "signal_name": "probe_contact"
                 },
                 "start_value": false
               }
             ],
             "on_signal": "success",
             "stop_mode": "soft_on_path",
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "lite6_robot"
+            },
             "tcp_endpoint": {
-              "kind": "default_of_role",
-              "role": "gripper"
+              "kind": "default_of_target",
+              "target": {
+                "command_target_id": "gripper",
+                "component_id": "lite_gripper"
+              }
             }
           }
         },
@@ -239,12 +245,17 @@
           "instance_id": "search_no_trip",
           "node_id": "motion.move_until_signal",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "lite6_robot",
+              "frame_id": "base"
+            },
             "goal": {
               "frame_ref": {
-                "frame_role": "base",
-                "kind": "target_frame",
-                "target_role": "arm"
+                "frame": {
+                  "component_id": "lite6_robot",
+                  "frame_id": "base"
+                },
+                "kind": "target_frame"
               },
               "orientation": {
                 "rpy_deg": [
@@ -264,8 +275,8 @@
                 "op": "==",
                 "operand": {
                   "signal": {
-                    "resource_role": "edge_sensor",
-                    "target_role": "station"
+                    "component_id": "station_io",
+                    "signal_name": "edge_sensor"
                   }
                 },
                 "value": true
@@ -274,17 +285,23 @@
             "mock_simulation": [
               {
                 "signal": {
-                  "resource_role": "edge_sensor",
-                  "target_role": "station"
+                  "component_id": "station_io",
+                  "signal_name": "edge_sensor"
                 },
                 "start_value": false
               }
             ],
             "stop_mode": "soft_on_path",
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "lite6_robot"
+            },
             "tcp_endpoint": {
-              "kind": "default_of_role",
-              "role": "gripper"
+              "kind": "default_of_target",
+              "target": {
+                "command_target_id": "gripper",
+                "component_id": "lite_gripper"
+              }
             }
           }
         },
@@ -302,14 +319,19 @@
           "instance_id": "probe_no_trip",
           "node_id": "motion.probe_search",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "lite6_robot",
+              "frame_id": "base"
+            },
             "contact_policy_id": "probe_contact_policy",
             "execution_timeout_s": 30.0,
             "goal": {
               "frame_ref": {
-                "frame_role": "base",
-                "kind": "target_frame",
-                "target_role": "arm"
+                "frame": {
+                  "component_id": "lite6_robot",
+                  "frame_id": "base"
+                },
+                "kind": "target_frame"
               },
               "orientation": {
                 "rpy_deg": [
@@ -329,8 +351,8 @@
                 "op": "==",
                 "operand": {
                   "signal": {
-                    "resource_role": "edge_sensor",
-                    "target_role": "station"
+                    "component_id": "station_io",
+                    "signal_name": "edge_sensor"
                   }
                 },
                 "value": true
@@ -340,18 +362,24 @@
             "mock_simulation": [
               {
                 "signal": {
-                  "resource_role": "edge_sensor",
-                  "target_role": "station"
+                  "component_id": "station_io",
+                  "signal_name": "edge_sensor"
                 },
                 "start_value": false
               }
             ],
             "on_no_signal": "success",
             "stop_mode": "soft_on_path",
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "lite6_robot"
+            },
             "tcp_endpoint": {
-              "kind": "default_of_role",
-              "role": "gripper"
+              "kind": "default_of_target",
+              "target": {
+                "command_target_id": "gripper",
+                "component_id": "lite_gripper"
+              }
             }
           },
           "value_sources": {
@@ -375,7 +403,10 @@
           "instance_id": "end_rest",
           "node_id": "motion.move_to_joint_target",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "lite6_robot",
+              "frame_id": "base"
+            },
             "contact_policy_id": "withdrawal_contact_policy",
             "execution_timeout_s": 30.0,
             "goal": [
@@ -405,10 +436,16 @@
               }
             ],
             "planning_timeout_s": 5.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "lite6_robot"
+            },
             "tcp_endpoint": {
-              "kind": "default_of_role",
-              "role": "gripper"
+              "kind": "default_of_target",
+              "target": {
+                "command_target_id": "gripper",
+                "component_id": "lite_gripper"
+              }
             },
             "velocity_scale": 0.4
           },
@@ -488,100 +525,5 @@
       }
     }
   ],
-  "schema_version": "manyforge.composer_authoring_forest.v1",
-  "target_roles": {
-    "arm": {
-      "component_role": "robot",
-      "required_capabilities": [
-        {
-          "capability_id": "execution.feedback.phase_events",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "execution.trajectory.execute",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.motion.joint_goal",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.motion.pose_goal",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.trajectory.time_parameterized",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "state.observed.current",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "validation.trajectory.non_collision",
-          "disposition": "required",
-          "parameters": {}
-        }
-      ],
-      "required_collision_body_roles": [
-        "arm_collision"
-      ],
-      "required_frame_roles": [
-        "base"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ],
-      "required_resource_roles": [
-        "arm_joints"
-      ]
-    },
-    "gripper": {
-      "component_role": "tool",
-      "required_capabilities": [
-        {
-          "capability_id": "model.kinematics.fk",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "tool.gripper.command",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "tool.gripper.feedback",
-          "disposition": "required",
-          "parameters": {}
-        }
-      ],
-      "required_collision_body_roles": [],
-      "required_frame_roles": [],
-      "required_model_roles": [],
-      "required_resource_roles": []
-    },
-    "station": {
-      "component_role": "station",
-      "required_capabilities": [
-        {
-          "capability_id": "io.gpio.get_input",
-          "disposition": "required",
-          "parameters": {}
-        }
-      ],
-      "required_collision_body_roles": [],
-      "required_frame_roles": [],
-      "required_model_roles": [],
-      "required_resource_roles": [
-        "edge_sensor",
-        "probe_contact"
-      ]
-    }
-  }
+  "schema_version": "manyforge.composer_authoring_forest.v2"
 }

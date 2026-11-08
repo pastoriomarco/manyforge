@@ -32,10 +32,13 @@ from manyforge_behavior.orchestration_ports import (
 from manyforge_behavior.production_ports import (
     IoSignalRefusedError,
     NativeKernelProgramPort,
+    ProductionPortError,
 )
 from manyforge_behavior.program import Program, ProgramValidationError
 from manyforge_behavior.program_clock import ProgramClock
 
+
+from .v3_fixtures import signal, target, target_binding, program_document
 
 _ROOT = Path(__file__).resolve().parents[2]
 _A = "sha256:" + "a" * 64
@@ -52,34 +55,21 @@ class _OwnerError(RuntimeError):
         self.details = dict(details or {})
 
 
-def _signal_row(**overrides: str) -> dict[str, str]:
-    return {
-        "resource_role_id": "part_present",
-        "signal_name": "di_0",
-        "value_type": "bool",
-        "direction": "input",
-        "transition_capability": "sampled_only",
-        "signal_descriptor_digest": _E,
-        **overrides,
+def _signal_row(**overrides: str) -> dict[str, Any]:
+    row = {
+        "reference": signal("io.1", "di_0"),
+        "target": target("io.1", "io.command"),
+        "value_type": "bool", "direction": "input",
+        "transition_capability": "sampled_only", "signal_descriptor_digest": _E,
     }
+    row.update(overrides)
+    return row
 
 
 def _context(signal_rows=None, *, coordinate_roles=(), tree=None) -> ProgramRunPortContext:
-    target: dict[str, Any] = {
-        "target_role_id": "cell_io",
-        "component_role_id": "io_module",
-        "controllable_component_id": "io.1",
-        "command_target_id": "io.command",
-        "capability_bindings": [
-            {"capability_id": "io.gpio.get_input", "command_schema": None},
-        ],
-        "resource_role_bindings": [
-            {"resource_role_id": role, "resource_ids": [], "compiled_resource_names": []}
-            for role in coordinate_roles
-        ],
-    }
-    if signal_rows is not None:
-        target["signal_role_bindings"] = signal_rows
+    io_target = target_binding("io.1", "io.command", [
+        {"capability_id": "io.gpio.get_input", "command_schema": None},
+    ])
     program = {}
     if tree is not None:
         program = {"program_id": "io_program", "program_revision": _A, "tree": tree}
@@ -100,7 +90,8 @@ def _context(signal_rows=None, *, coordinate_roles=(), tree=None) -> ProgramRunP
             "program_revision": _A,
             "retained_bundle_id": _B,
             "graph_revision": _C,
-            "target_role_bindings": [target],
+            "target_bindings": [io_target],
+            "signal_bindings": signal_rows or [],
         },
         program=program,
     )
@@ -178,7 +169,7 @@ class _Transport:
             "ok": True,
             "target_observation": {
                 **query,
-                "schema_version": "manyforge.target_observation.v1",
+                "schema_version": "manyforge.target_observation.v2",
                 "value": deepcopy(self.value),
             },
         }
@@ -256,7 +247,7 @@ def _read(port, node_id: str, **parameters):
         node_id,
         _identity(),
         OwnerNodeInputs(
-            parameters={"target_role": "cell_io", "resource_role": "part_present", **parameters}
+            parameters={"signal": signal("io.1", "di_0"), **parameters}
         ),
     )
 
@@ -285,12 +276,11 @@ def test_fresh_get_input_returns_the_exact_boolean(value: bool) -> None:
     assert result.output is value
     assert result.metadata["quality"] == "fresh"
     assert transport.queries == [{
-        "schema_version": "manyforge.target_observation_query.v1",
+        "schema_version": "manyforge.target_observation_query.v2",
         "owner_epoch": "kernel.epoch.7",
         "program_binding_id": _A,
-        "target_role_id": "cell_io",
         "kind": "io_signal",
-        "resource_role_id": "part_present",
+        "signal": signal("io.1", "di_0"),
     }]
 
 
@@ -317,7 +307,7 @@ def test_non_fresh_quality_fails_and_is_never_false(node_id: str, quality: str) 
     assert result.output is None
     assert result.reason_code == "io_input_unavailable"
     assert result.details["reason"] == "io_input_unavailable"
-    assert result.details["reference_id"] == "part_present"
+    assert result.details["reference"]["signal_name"] == "di_0"
     assert quality in result.message
 
 
@@ -346,9 +336,7 @@ def test_a_transport_failure_is_not_turned_into_an_input_value() -> None:
     [
         (None, (), "io_signal_unbound"),
         ([], (), "io_signal_unbound"),
-        ([_signal_row(resource_role_id="other")], (), "io_signal_unbound"),
-        ([_signal_row(), _signal_row(signal_name="di_1")], (), "io_signal_unbound"),
-        ([_signal_row()], ("part_present",), "io_signal_unbound"),
+        ([_signal_row(reference=signal("io.1", "other"))], (), "io_signal_unbound"),
         ([_signal_row(direction="output")], (), "io_signal_direction_mismatch"),
         ([_signal_row(value_type="int")], (), "io_signal_type_mismatch"),
         ([_signal_row(transition_capability="edge_only")], (), "io_signal_transition_unsupported"),
@@ -363,8 +351,7 @@ def test_signal_references_refuse_at_run_preparation(rows, coordinate_roles, cod
             "node_id": "io.check_input",
             "instance_id": "check",
             "parameters": {
-                "target_role": "cell_io",
-                "resource_role": "part_present",
+                "signal": signal("io.1", "di_0"),
                 "expected_value": True,
             },
             "children": [],
@@ -382,13 +369,23 @@ def test_signal_references_refuse_at_run_preparation(rows, coordinate_roles, cod
     assert transport.queries == []
 
 
+@pytest.mark.parametrize("with_node", [False, True])
+def test_duplicate_exact_signal_binding_is_refused_before_use(with_node: bool) -> None:
+    tree = {"node_id": "io.check_input", "instance_id": "check", "children": [],
+            "parameters": {"signal": signal("io.1", "di_0"), "expected_value": True}}
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    with pytest.raises(ProductionPortError, match="signal binding repeats"):
+        port.bind(_context([_signal_row(), _signal_row()], tree=tree if with_node else None))
+    assert transport.queries == []
+
+
 def test_an_edge_wait_is_refused_at_run_preparation() -> None:
     tree = {
         "node_id": "io.wait_for_input",
         "instance_id": "wait",
         "parameters": {
-            "target_role": "cell_io",
-            "resource_role": "part_present",
+            "signal": signal("io.1", "di_0"),
             "expected_value": True,
             "edge": "rising",
         },
@@ -401,36 +398,27 @@ def test_an_edge_wait_is_refused_at_run_preparation() -> None:
 
 
 def _wait_program(edge: str | None, *, timeout_s: float | None = None) -> dict[str, Any]:
-    document = load_strict_json_yaml(_ROOT / "examples/pick_and_place_minimal.program.yaml")
-    arm = document["target_roles"]["arm"]
-    arm["required_capabilities"] = sorted(
-        [
-            *arm["required_capabilities"],
-            {"capability_id": "io.gpio.wait_for_input", "parameters": {}, "disposition": "required"},
-        ],
-        key=lambda row: row["capability_id"],
-    )
+    catalog = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
     parameters: dict[str, Any] = {
-        "target_role": "arm",
-        "resource_role": "arm_joints",
+        "signal": signal("io.1", "di_0"),
         "expected_value": True,
     }
     if edge is not None:
         parameters["edge"] = edge
     if timeout_s is not None:
         parameters["timeout_s"] = timeout_s
-    document["tree"] = {
+    tree = {
         "node_id": "io.wait_for_input",
         "instance_id": "wait_part",
         "parameters": parameters,
         "children": [],
     }
+    document = program_document(catalog, tree, program_id="io_program", name="I/O wait")
+    document["program_revision"] = _A
     document["program_revision"] = compute_content_identity(
-        document,
-        own_field="program_revision",
-        identity_domain="program-revision",
-        api_version="manyforge.program.v2",
-    )
+        document, own_field="program_revision", identity_domain="program-revision",
+        api_version="manyforge.program.v3")
+
     return document
 
 
@@ -447,73 +435,9 @@ def test_program_validation_accepts_level_waits(edge, timeout_s) -> None:
     Program.from_dict(_wait_program(edge, timeout_s=timeout_s), catalog)
 
 
-def _gripper_check_program(resource_roles: tuple[str, ...], *, role_reads_input: bool) -> dict[str, Any]:
-    """A gripper role read by Check Input (contract §8.3, SX-269).
-
-    The Program role declares what its nodes need; whether the bound target
-    must also provide ``io.gpio.get_input`` is decided per operand at binding
-    (a compiled system signal such as ``carried_object_lost`` serves itself).
-    """
-    document = load_strict_json_yaml(_ROOT / "examples/pick_and_place_minimal.program.yaml")
-    capabilities = ["tool.gripper.command"]
-    if role_reads_input:
-        capabilities.insert(0, "io.gpio.get_input")
-    document["target_roles"]["gripper"] = {
-        "component_role": "robot",
-        "required_capabilities": [
-            {"capability_id": capability, "parameters": {}, "disposition": "required"}
-            for capability in capabilities
-        ],
-        "required_resource_roles": sorted({"carried_object_lost", *resource_roles}),
-    }
-    document["tree"] = {
-        "node_id": "sequence",
-        "instance_id": "root",
-        "parameters": {},
-        "children": [
-            {
-                "node_id": "io.check_input",
-                "instance_id": f"check_{role}",
-                "parameters": {
-                    "target_role": "gripper",
-                    "resource_role": role,
-                    "expected_value": True,
-                },
-                "children": [],
-            }
-            for role in resource_roles
-        ],
-    }
-    document["program_revision"] = compute_content_identity(
-        document,
-        own_field="program_revision",
-        identity_domain="program-revision",
-        api_version="manyforge.program.v2",
-    )
-    return document
-
-
-@pytest.mark.parametrize(
-    "resource_roles", [("carried_object_lost",), ("carried_object_lost", "fingers")]
-)
-def test_program_validation_accepts_check_input_on_the_gripper_system_signal(
-    resource_roles,
-) -> None:
-    catalog = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
-    Program.from_dict(
-        _gripper_check_program(resource_roles, role_reads_input=True), catalog
-    )
-
-
-@pytest.mark.parametrize("resource_role", ["carried_object_lost", "fingers"])
-def test_program_validation_still_requires_the_role_input_capability(
-    resource_role: str,
-) -> None:
-    catalog = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
-    with pytest.raises(ProgramValidationError, match="io.gpio.get_input"):
-        Program.from_dict(
-            _gripper_check_program((resource_role,), role_reads_input=False), catalog
-        )
+# The old Program role-capability declarations no longer exist in v3.
+# Qualified system-signal and per-node capability coverage lives in the
+# deployment validator matrix and prepared-candidate Python binding tests.
 
 
 # --- Native watch port ------------------------------------------------------
@@ -521,8 +445,7 @@ def test_program_validation_still_requires_the_role_input_capability(
 
 def _wait_inputs(**parameters) -> OwnerNodeInputs:
     return OwnerNodeInputs(parameters={
-        "target_role": "cell_io",
-        "resource_role": "part_present",
+        "signal": signal("io.1", "di_0"),
         "expected_value": True,
         "edge": "level",
         **parameters,
@@ -535,7 +458,7 @@ def test_watch_registers_exact_attempt_reads_and_releases_the_exact_token() -> N
     task = port.io_watches.start("io.wait_for_input", identity, _wait_inputs())
     assert task.state is OwnerTaskState.ACTIVE
     assert transport.registrations == [{
-        "schema_version": "manyforge.io_watch_request.v1",
+        "schema_version": "manyforge.io_watch_request.v2",
         "owner_epoch": "kernel.epoch.7",
         "program_binding_id": _A,
         "program_runner_owner_epoch": "runner.epoch.3",
@@ -543,8 +466,7 @@ def test_watch_registers_exact_attempt_reads_and_releases_the_exact_token() -> N
         "program_run_id": "run.1",
         "node_instance_id": "io_node",
         "node_attempt_id": "attempt.1",
-        "target_role_id": "cell_io",
-        "resource_role_id": "part_present",
+        "signal": signal("io.1", "di_0"),
         "condition": {"kind": "level", "expected_value": True},
     }]
     token = transport.register_io_watch(transport.registrations[0])["registration"]
@@ -704,8 +626,7 @@ def _waiter(timeout_s: float | None = None, *, port: Any = None):
     clock = [100.0]
     program_clock = ProgramClock(lambda: clock[0])
     parameters: dict[str, Any] = {
-        "target_role": "cell_io",
-        "resource_role": "part_present",
+        "signal": signal("io.1", "di_0"),
         "expected_value": True,
         "edge": "level",
     }
@@ -1031,22 +952,15 @@ def test_actual_unknown_registration_fails_and_releases_the_attempt_scope(
     assert sent[3]["scope_request"]["node_attempt_id"] == "attempt.2"
 
 
-def _changed_outside_wait(resource_role: str) -> dict[str, Any]:
-    document = _wait_program(None)
-    document["tree"]["parameters"]["resource_role"] = resource_role
-    document["program_revision"] = compute_content_identity(
-        document,
-        own_field="program_revision",
-        identity_domain="program-revision",
-        api_version="manyforge.program.v2",
-    )
-    return document
-
-
-def test_a_wait_may_name_the_core_held_changed_outside_signal_of_a_declared_role() -> None:
-    """CONTRACTS §7: `<output role>.changed_outside` reads like any signal."""
-
-    catalog = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
-    Program.from_dict(_changed_outside_wait("arm_joints.changed_outside"), catalog)
-    with pytest.raises(ProgramValidationError, match="resource_role"):
-        Program.from_dict(_changed_outside_wait("undeclared.changed_outside"), catalog)
+def test_changed_outside_requires_a_bound_output_base() -> None:
+    derived = signal("io.1", "di_0.changed_outside")
+    tree = {"node_id": "io.wait_for_input", "instance_id": "wait", "children": [],
+            "parameters": {"signal": derived, "expected_value": True, "edge": "level"}}
+    valid = NativeKernelProgramPort(KernelClient(_Transport()))
+    valid.bind(_context([_signal_row(direction="output")], tree=tree))
+    for rows, code in (([_signal_row(direction="input")], "io_signal_direction_mismatch"),
+                       ([], "io_signal_unbound")):
+        port = NativeKernelProgramPort(KernelClient(_Transport()))
+        with pytest.raises(IoSignalRefusedError) as refused:
+            port.bind(_context(rows, tree=tree))
+        assert refused.value.code == code

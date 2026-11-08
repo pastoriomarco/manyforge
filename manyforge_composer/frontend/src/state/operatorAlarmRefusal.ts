@@ -1,6 +1,6 @@
 /**
- * Operator guidance for the Kernel's operator-alarm motion-attention refusals
- * (spec 450 §5.2). The Kernel is the enforcement point; Composer only tells
+ * Operator guidance for the Kernel's operator-alarm motion-attention refusals.
+ * The Kernel is the enforcement point; Composer only tells
  * the operator which remedy releases the refused Run, Resume or recovery.
  */
 
@@ -44,7 +44,7 @@ export function refusalMembershipConditionIds(value: unknown): string[] {
 
 /**
  * The operator message for an attention refusal, or null for any other code.
- * Acknowledgement never gates motion (V2-5): only an alarm condition
+ * Acknowledgement never gates motion: only an alarm condition
  * interlock or unavailable alarm state refuses it.
  */
 export function operatorAlarmRefusalMessage(

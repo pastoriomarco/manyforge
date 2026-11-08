@@ -573,7 +573,7 @@ describe('refreshTransientResourcesOnManagerReadiness', () => {
     expect(retryCatalog).toHaveBeenCalledTimes(2);
 
     // Returning to the first active identity cannot reopen its exhausted budget.
-    attempts = refreshTransientResourcesOnManagerReadiness(
+    refreshTransientResourcesOnManagerReadiness(
       attempts,
       firstKey,
       { ...transientFailure, failureRequestId: 3, latestRequestId: 3 },

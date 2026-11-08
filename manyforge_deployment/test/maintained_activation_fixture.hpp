@@ -100,7 +100,7 @@ MaterializeMaintainedInterruptDeployment(
     authored_mapper(members);
     authored = CanonicalValue(std::move(members));
   }
-  // Since the M6 tool split a maintained Scenario has one model component per
+  // Since the tool split a maintained Scenario has one model component per
   // physical model (arm, mounted tool), each with its own prepared root.
   std::vector<detail::CapturedComponentModelSource> captured;
   for (const auto &component : Member(authored, "components").as_array()) {

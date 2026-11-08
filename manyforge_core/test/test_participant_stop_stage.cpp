@@ -14,7 +14,7 @@ namespace {
 
 [[nodiscard]] std::string GoldenBytes() {
   const auto path =
-      std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
+      std::filesystem::path(MANYFORGE_CORE_TEST_GOLDEN_DIR) / "resolved_stop_base_plan.v1.json";
   std::ifstream stream(path, std::ios::binary);
   std::ostringstream bytes;
   bytes << stream.rdbuf();
@@ -71,8 +71,6 @@ namespace {
       ProgramBindingId("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
       base.retained_bundle_id,
       base.graph_revision,
-      ComponentRoleId("robot"),
-      TargetRoleId("arm"),
       ControllableComponentId("robot.1"),
       ComponentTypeId("robot.type"),
       ComponentTypeRevision("robot.type.revision"),
@@ -83,7 +81,7 @@ namespace {
       {ProgramModelRoleBindingDTO{ModelRoleId("body"), ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision")}},
       {},
-      {ProgramFrameRoleBindingDTO{FrameRoleId("base"), ModelInstanceId("robot.model"),
+      {ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("base")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision"), "robot_base"}},
       {RuntimeResourceBindingDTO{ResourceRoleId("joint.1"), ResourceId("joint.1"),
                                  std::string("joint_1"), "joint_1", CoordinateKind::kAngular},
@@ -154,7 +152,7 @@ namespace {
          StopContainmentCommandKind::kMotionControlledStop;
 }
 
-// Q51: only this robot's own Stop-time values; a controlled deadline only for
+// Only this robot's own Stop-time values; a controlled deadline only for
 // a controlled-Stop command.
 [[nodiscard]] RemainingStopBudgetDTO Budget(const ResolvedParticipantStopStageDTO& stage,
                                             std::int64_t elapsed = 0) {
@@ -288,7 +286,7 @@ TEST(ParticipantStopStageTest, AcceptsRegisteredControlPathProviderWithoutCapabi
   const auto fixture = Fixture(stage_index);
   EXPECT_FALSE(fixture.stage.capability_provider_binding_id.has_value());
   EXPECT_TRUE(ValidateStage(fixture, fixture.stage, Budget(fixture.stage)).ok());
-  // Q51/Q57: a controlled deadline belongs to a controlled-Stop command only.
+  // A controlled deadline belongs to a controlled-Stop command only.
   auto controlled = Budget(fixture.stage);
   controlled.remaining_controlled_deadline_ns = 1'000'000'000LL;
   EXPECT_FALSE(ValidateStage(fixture, fixture.stage, controlled).ok());

@@ -35,10 +35,29 @@ class IRoboPlanCandidateClient {
   [[nodiscard]] virtual core::Result<core::TrajectoryDTO> compute(
       const RoboPlanCandidateRequestDTO& request) = 0;
 
+  // The optional qualified target is internal phase evidence for preview only.
+  [[nodiscard]] virtual core::Result<core::TrajectoryDTO> compute_with_target(
+      const RoboPlanCandidateRequestDTO& request,
+      std::optional<core::ControlledStateDTO>* target) {
+    if (target) target->reset();
+    if (request.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled)
+      return core::Result<core::TrajectoryDTO>::Err(core::ErrorDTO{
+          "unsupported_capability", "Diagnostic planning is unavailable", {}});
+    return compute(request);
+  }
+
   [[nodiscard]] virtual core::Result<std::vector<double>> solve_ik(
       const core::Pose3DTO& goal, const core::ResolvedFrameDTO& base_frame,
       const core::ResolvedFrameDTO& tcp_frame, const core::ControlledStateDTO& seed_state,
       double timeout_s) = 0;
+
+  [[nodiscard]] virtual core::Result<std::vector<double>> solve_ik_diagnostic(
+      const core::Pose3DTO&, const core::ResolvedFrameDTO&,
+      const core::ResolvedFrameDTO&, const core::ControlledStateDTO&, double,
+      const std::optional<core::TolerancesDTO>&) {
+    return core::Result<std::vector<double>>::Err(core::ErrorDTO{
+        "unsupported_capability", "Diagnostic IK is unavailable", {}});
+  }
 
   /// True only for production clients whose worker scene is selected from the
   /// exact Kernel-retained projection before planning or IK.

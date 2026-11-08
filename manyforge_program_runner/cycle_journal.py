@@ -8,6 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import sqlite3
@@ -27,9 +28,11 @@ from .liveness import RetainedLiveness
 # Development-only cutover: this runner creates and opens exactly this
 # journal version. Older and newer journals are refused unchanged, before any
 # write; their run history is not migrated or reinterpreted.
-SCHEMA_VERSION: Final = 8
+SCHEMA_VERSION: Final = 9
 # How many of the most recent completed persistent-value requests are kept.
 MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS: Final = 16_384
+MAXIMUM_FINISHED_HISTORY_BYTES: Final = 256 * 1024 * 1024
+_LOGGER = logging.getLogger(__name__)
 _REQUIRED_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
     "program_cycle_metadata": (
         ("singleton", "INTEGER", 0, 1),
@@ -281,11 +284,17 @@ class ProgramCycleJournalVersionError(RuntimeError):
 
     def __init__(self, found_version: int) -> None:
         self.found_version = found_version
+        recovery = (
+            "Settle and Reset the run using the old version, or clean-start. "
+            if found_version < SCHEMA_VERSION
+            else "Settle and Reset the run using the version that created it, or clean-start. "
+        )
         super().__init__(
             f"Program-cycle journal schema version {found_version} is "
             f"unsupported; this Program runner opens only version "
             f"{SCHEMA_VERSION} and does not migrate earlier run history. The "
-            "journal was left unchanged. Stop the development workbench "
+            f"journal was left unchanged. {recovery}"
+            "To clean-start, stop the development workbench "
             "(./scripts/compose-dev.sh stop, or stop --keep-evidence to keep "
             "an incident bundle) and start it again for fresh runtime state."
         )
@@ -941,6 +950,7 @@ class ProgramCycleJournal:
         owner_epoch: str,
         maximum_inflight_commands: int = 4_096,
         maximum_retained_runs: int = 4_096,
+        maximum_finished_history_bytes: int = MAXIMUM_FINISHED_HISTORY_BYTES,
         maximum_completed_persistent_value_requests: int = (
             MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS
         ),
@@ -963,6 +973,10 @@ class ProgramCycleJournal:
         if not 1 <= maximum_retained_runs <= 4_096:
             raise ValueError("maximum_retained_runs must be in [1, 4096]")
         self._maximum_retained_runs = maximum_retained_runs
+        if type(maximum_finished_history_bytes) is not int or maximum_finished_history_bytes < 1:
+            raise ValueError("maximum_finished_history_bytes must be a positive integer")
+        self._maximum_finished_history_bytes = maximum_finished_history_bytes
+        self._oversize_current_run_logged: str | None = None
         if (
             not owner_epoch
             or unicodedata.normalize("NFC", owner_epoch) != owner_epoch
@@ -1122,6 +1136,7 @@ class ProgramCycleJournal:
         try:
             self._database.execute("PRAGMA foreign_keys=ON")
             self._database.execute("PRAGMA journal_mode=WAL")
+            self._database.execute(f"PRAGMA journal_size_limit={maximum_finished_history_bytes}")
             self._database.execute("PRAGMA synchronous=FULL")
             if new_database:
                 self._database.executescript(_SCHEMA_SQL)
@@ -1205,6 +1220,7 @@ class ProgramCycleJournal:
                     self._database.execute(
                         "DELETE FROM program_cycle_inflight_commands"
                     )
+                self._prune_finished_history_locked()
         except BaseException:
             self._database.close()
             os.close(self._parent_descriptor)
@@ -1789,7 +1805,9 @@ class ProgramCycleJournal:
                     DELETE FROM program_run_history
                     WHERE rowid=(
                       SELECT rowid FROM program_run_history
-                      WHERE terminal=1 ORDER BY rowid LIMIT 1
+                      WHERE terminal=1 AND program_run_id IS NOT (
+                        SELECT program_run_id FROM program_cycle WHERE singleton=1
+                      ) ORDER BY rowid LIMIT 1
                     )
                     """
                 ).rowcount
@@ -1801,6 +1819,7 @@ class ProgramCycleJournal:
                 "INSERT INTO program_run_history VALUES(?,?,?,?)",
                 (program_run_id, revision, encoded, int(terminal)),
             )
+            self._prune_finished_history_locked()
             return
         if existing[2] and encoded != existing[1]:
             raise RuntimeError("terminal Program-run history is immutable")
@@ -1814,6 +1833,31 @@ class ProgramCycleJournal:
                 "WHERE program_run_id=?",
                 (revision, encoded, int(terminal), program_run_id),
             )
+        self._prune_finished_history_locked()
+
+    def _prune_finished_history_locked(self) -> None:
+        """Bound finished snapshot payloads without deleting the current run."""
+        current = self._database.execute(
+            "SELECT program_run_id FROM program_cycle WHERE singleton=1"
+        ).fetchone()
+        current_id = current[0] if current else None
+        total = self._database.execute(
+            "SELECT COALESCE(SUM(length(CAST(snapshot_json AS BLOB))),0) "
+            "FROM program_run_history WHERE terminal=1"
+        ).fetchone()[0]
+        while total > self._maximum_finished_history_bytes:
+            oldest = self._database.execute(
+                "SELECT rowid,length(CAST(snapshot_json AS BLOB)) "
+                "FROM program_run_history WHERE terminal=1 AND program_run_id IS NOT ? "
+                "ORDER BY rowid LIMIT 1", (current_id,)
+            ).fetchone()
+            if oldest is None:
+                if current_id is not None and self._oversize_current_run_logged != current_id:
+                    _LOGGER.warning("Current Program run history exceeds the finished-history budget: %s", current_id)
+                    self._oversize_current_run_logged = current_id
+                break
+            self._database.execute("DELETE FROM program_run_history WHERE rowid=?", (oldest[0],))
+            total -= oldest[1]
 
     def retain_run_snapshot(self, snapshot: Mapping[str, Any]) -> None:
         with self._transaction():
@@ -2629,7 +2673,7 @@ class ProgramCycleJournal:
         run_snapshot: Mapping[str, Any],
         advance_execution_control: bool = False,
     ) -> None:
-        """Atomically retain one C2 result and its exact updated run view.
+        """Atomically retain one runtime-control result and its exact updated run view.
 
         ``advance_execution_control`` advances the execution-control revision
         once in the same transaction; an accepted release of a failure hold
@@ -2723,6 +2767,7 @@ class ProgramCycleJournal:
                 """,
                 (expected_generation,),
             )
+            self._prune_finished_history_locked()
 
     def close(self) -> None:
         with self._lock:

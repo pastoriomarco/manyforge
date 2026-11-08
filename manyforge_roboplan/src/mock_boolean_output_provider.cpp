@@ -23,11 +23,10 @@
 namespace manyforge::roboplan_backend {
 namespace {
 
+// The specific refusal code is the typed error code, as on the ROS lane.
 template <class T>
 core::Result<T> reject(std::string reason, std::string message) {
-  return core::Result<T>::Err({"io_output_rejected",
-                               std::move(message),
-                               {{"reason", std::move(reason)}}});
+  return core::Result<T>::Err({std::move(reason), std::move(message), {}});
 }
 
 bool portable_channel(std::string_view value) {

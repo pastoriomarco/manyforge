@@ -14,7 +14,7 @@ public:
   using std::runtime_error::runtime_error;
 };
 
-/// Sends the Apply's one host call (CONTRACTS §15) to the execution host that
+/// Sends the Apply's one host call to the execution host that
 /// holds the Apply's configuration fence, then records the private
 /// materialization the publication binds to. A host refusal is thrown as a
 /// typed error with the host's code; a lost or failed exchange is thrown as

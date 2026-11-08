@@ -11,7 +11,7 @@
 
 namespace manyforge::core {
 
-/// Kernel event types (spec §6.1)
+/// Kernel event types
 enum class KernelEventType {
   kStateTransition,  // state machine transition
   kPlanStarted,      // planning phase started
@@ -41,14 +41,14 @@ enum class KernelEventType {
   kInterventionAcknowledged,
   kErrorRaised,        // error occurred
   kCollisionDetected,  // collision detected during execution
-  // Motion-scoped interrupt outcomes (spec/260 §7).
+  // Motion-scoped interrupt outcomes.
   // `motion_interrupt_scope_armed` / `motion_interrupt_scope_reaped`
   // surface the binding lifecycle. `motion_interrupt_queued_update_dropped`
   // and `motion_trip_secondary_signal` come from the manager. Arm-time
   // failures emit `kMotionInterruptArmFailed` (kernel-owned, not
   // surfaced by the manager because the kernel decides not to dispatch).
   // `kMotionExecutionOutcomeRecorded` is the terminal record event
-  // referenced by spec/210 §3.11; details carry the outcome's
+  // of a motion execution; details carry the outcome's
   // `terminal_cause`, plus `execution_id`, `move_id`, and any
   // trip-specific identifiers when present.
   kMotionInterruptScopeArmed,
@@ -59,7 +59,7 @@ enum class KernelEventType {
   kMotionTripFailed,
   kMotionTripCompleted,
   kMotionExecutionOutcomeRecorded,
-  // RT-8B recovery authority evidence (spec/200 §recovery, spec/230 §3.7.1).
+  // Recovery authority evidence.
   kStopCertificatePublished,
   kRecoveryAssessmentChanged,
   kRecoveryActionAccepted,
@@ -71,7 +71,7 @@ enum class KernelEventType {
   kContactPolicyViolation,
 };
 
-/// Kernel event structure (spec §6.1)
+/// Kernel event structure
 struct KernelEvent {
   KernelEventType type;
   uint64_t execution_id;
@@ -89,7 +89,7 @@ struct KernelEvent {
 
   /// Monotonic, contiguous dispatch-order sequence assigned by the kernel at
   /// dispatch time (1-based; 0 = not yet dispatched). Consumers use gaps to
-  /// detect event loss anywhere in the pipeline (spec 520 §2.2). Declared
+  /// detect event loss anywhere in the pipeline. Declared
   /// last so the ubiquitous positional aggregate initializers stay valid.
   uint64_t sequence = 0;
 

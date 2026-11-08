@@ -33,7 +33,7 @@ export function errorPresentation(error: StructuredError): ErrorPresentation {
   return { text: compact, detail: full === '' ? producerText : `${full} ${producerText}` };
 }
 
-/** CONTRACTS §8: a global rule holds its scope (details `rule_id`). */
+/** A global rule holds its scope (details `rule_id`). */
 export const RULE_HOLDS = 'rule_holds';
 
 /** The operator text of a `rule_holds` refusal, naming the rule when known. */

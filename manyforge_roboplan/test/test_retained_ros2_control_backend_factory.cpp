@@ -1,3 +1,6 @@
+#include "retired_composition_release.hpp"
+#include <manyforge_core/testing/heap_resource_addressed_kernel.hpp>
+#include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
@@ -11,11 +14,16 @@
 #include <manyforge_core/observed_robot_state_publication.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <limits>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
-#include <cstdlib>
+#include <functional>
+#include <filesystem>
+#include <unistd.h>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -28,7 +36,16 @@
 #include <vector>
 
 namespace manyforge::roboplan_backend {
+class RetainedRos2ControlRuntimeHandleTestAccess final {
+ public:
+  static bool Closing(const RetainedRos2ControlRuntimeHandle &h) {
+    std::lock_guard lock(h.mutex_);
+    return h.closing_;
+  }
+};
 namespace {
+
+constexpr core::Duration kTestLifecycleCommandTimeoutNs = 1'000'000'000;
 
 /// The maintained provider manifest's catalog anchor
 /// (resources/maintained/catalog/provider_manifest/manyforge.provider.ros2_control.json).
@@ -56,17 +73,17 @@ public:
   }
 };
 
-[[nodiscard]] std::unique_ptr<ros2_control_execution::Ros2TransportResources>
+[[nodiscard]] std::shared_ptr<ros2_control_execution::Ros2TransportResources>
 make_test_transport_resources(
     const std::string &name,
     const std::shared_ptr<core::IExecutionStateSink> &sink,
     core::IClock &clock) {
-  return std::make_unique<ros2_control_execution::Ros2TransportResources>(
+  return ros2_control_execution::Ros2TransportResources::create(
       name, "/", 1U, sink, "arm", clock);
 }
 
 /// Arbitrary explicit timing inputs for the isolated participant fixtures;
-/// builder tests below check the production Q55 lane values.
+/// builder tests below check the production lane values.
 [[nodiscard]] core::ExecutionPortParticipantConfig test_participant_config() {
   core::ExecutionPortParticipantConfig config;
   config.stop.trip_authority = core::StateAuthorityClass::kCommanded;
@@ -84,6 +101,7 @@ test_arm_transport(const std::string &prefix) {
   arm.adapter.action_name = prefix + "/arm_controller/follow_joint_trajectory";
   arm.adapter.state_topic = prefix + "/arm_controller/controller_state";
   arm.adapter.scale_topic = prefix + "/arm_controller/speed_scaling_input";
+  arm.adapter.lifecycle_command_timeout_ns = kTestLifecycleCommandTimeoutNs;
   arm.adapter.lane_facts.joint_names = {"source_joint_1"};
   arm.adapter.lane_facts.supports_scale = true;
   arm.adapter.lane_facts.state_rate_hz = 100.0;
@@ -105,9 +123,7 @@ commanded_binding(std::string component_id = "robot_1",
       core::ProgramBindingId("program-binding"),
       core::RetainedBundleId("bundle"),
       core::GraphRevision("graph"),
-      core::ComponentRoleId("robot"),
-      core::TargetRoleId("arm"),
-      core::ControllableComponentId(std::move(component_id)),
+      core::ControllableComponentId(component_id),
       core::ComponentTypeId("robot.type"),
       core::ComponentTypeRevision("robot-type-revision"),
       core::CommandTargetId("arm.target"),
@@ -121,8 +137,8 @@ commanded_binding(std::string component_id = "robot_1",
                                          core::ModelInstanceId("robot.model"),
                                          "arm",
                                          {"joint_1"}}},
-      {core::ProgramFrameRoleBindingDTO{
-          core::FrameRoleId("tcp"), core::ModelInstanceId("robot.model"),
+      {core::ProgramFrameBindingDTO{
+          {core::ControllableComponentId(component_id), core::FrameRoleId("tcp")}, core::ModelInstanceId("robot.model"),
           core::ModelRevision("model-revision"), "tcp"}},
       {core::RuntimeResourceBindingDTO{
           core::ResourceRoleId("joint_1"), core::ResourceId("robot.joint.1"),
@@ -166,7 +182,7 @@ commanded_binding(std::string component_id = "robot_1",
   return std::move(sealed.value());
 }
 
-/// CP8 step 1: a Real arm's binding (measured authority).
+/// A Real arm's binding (measured authority).
 [[nodiscard]] core::RuntimeParticipantBinding measured_binding() {
   return commanded_binding("robot_1", core::StateAuthorityClass::kMeasured);
 }
@@ -179,9 +195,7 @@ commanded_gripper_binding(std::string component_id = "robot_1") {
       core::ProgramBindingId("program-binding"),
       core::RetainedBundleId("bundle"),
       core::GraphRevision("graph"),
-      core::ComponentRoleId("robot"),
-      core::TargetRoleId("gripper"),
-      core::ControllableComponentId(std::move(component_id)),
+      core::ControllableComponentId(component_id),
       core::ComponentTypeId("robot.type"),
       core::ComponentTypeRevision("robot-type-revision"),
       core::CommandTargetId("gripper.target"),
@@ -195,8 +209,8 @@ commanded_gripper_binding(std::string component_id = "robot_1") {
           core::ModelGroupRoleId("gripper_group"),
           core::ModelInstanceId("robot.model"), "gripper",
           {"gripper_joint"}}},
-      {core::ProgramFrameRoleBindingDTO{
-          core::FrameRoleId("tcp"), core::ModelInstanceId("robot.model"),
+      {core::ProgramFrameBindingDTO{
+          {core::ControllableComponentId(component_id), core::FrameRoleId("tcp")}, core::ModelInstanceId("robot.model"),
           core::ModelRevision("model-revision"), "tcp"}},
       {core::RuntimeResourceBindingDTO{
           core::ResourceRoleId("fingers"),
@@ -349,18 +363,179 @@ test_projector(const core::RuntimeParticipantBinding &binding,
 [[nodiscard]] std::shared_ptr<RetainedObservedStateChannel>
 test_projected_channel(const core::RuntimeParticipantBinding &binding,
                        RetainedObservedStateChannelConfig config,
-                       core::IClock &clock) {
+                       std::shared_ptr<core::IClock> clock) {
   // The factory fixtures bind a retained model coordinate, so their channel
   // needs the matching model projection even though no executor is started.
   auto projector = test_projector(binding, config.freshness_budget_ns);
   return std::make_shared<RetainedObservedStateChannel>(
-      binding, std::move(projector), std::move(config), &clock);
+      binding, std::move(projector), std::move(config), std::move(clock));
 }
+
+struct FactoryTeardownObservation final {
+  std::atomic<bool> scheduler_destroyed{false};
+  std::atomic<bool> owner_expired_at_scheduler_destruction{false};
+  std::atomic<bool> callback_active_at_scheduler_destruction{false};
+  std::atomic<bool> callback_ran{false};
+  std::atomic<bool> callback_failed{false};
+  std::atomic<bool> cancel_saw_dequeued_callback{false};
+};
+
+/// Holds a real factory-scheduled callback after dequeue so owner teardown
+/// must drain it before the gripper adapter and transport can be released.
+class HeldCallbackScheduler final : public core::IScheduler {
+public:
+  explicit HeldCallbackScheduler(
+      std::shared_ptr<FactoryTeardownObservation> observation)
+      : observation_(std::move(observation)) {}
+
+  ~HeldCallbackScheduler() override {
+    {
+      std::lock_guard lock(mutex_);
+      release_callback_ = true;
+      run_callback_ = false;
+      condition_.notify_all();
+      observation_->owner_expired_at_scheduler_destruction.store(
+          owner_.expired(), std::memory_order_release);
+      observation_->callback_active_at_scheduler_destruction.store(
+          in_flight_ || pending_.has_value(), std::memory_order_release);
+    }
+    if (worker_.joinable())
+      worker_.join();
+    observation_->scheduler_destroyed.store(true, std::memory_order_release);
+  }
+
+  core::ScheduleHandle schedule(core::TimePoint,
+                                std::function<void()> callback,
+                                core::SchedulerPriority priority) override {
+    std::lock_guard lock(mutex_);
+    if (priority != core::SchedulerPriority::ControllerCommand ||
+        pending_.has_value() || in_flight_) {
+      throw std::logic_error("factory teardown fixture expected one controller callback");
+    }
+    const auto handle = next_handle_++;
+    pending_ = Task{handle, std::move(callback)};
+    return handle;
+  }
+
+  void cancel(core::ScheduleHandle handle) override {
+    static_cast<void>(cancel_before_dequeue(handle));
+  }
+
+  [[nodiscard]] bool
+  cancel_before_dequeue(core::ScheduleHandle handle) override {
+    std::lock_guard lock(mutex_);
+    if (pending_ && pending_->handle == handle) {
+      pending_.reset();
+      return true;
+    }
+    if (in_flight_)
+      observation_->cancel_saw_dequeued_callback.store(
+          true, std::memory_order_release);
+    return false;
+  }
+
+  void drain(core::SchedulerPriority priority) override {
+    static_cast<void>(drain_for(priority, std::chrono::seconds(5)));
+  }
+
+  [[nodiscard]] bool drain_for(
+      core::SchedulerPriority priority,
+      std::chrono::nanoseconds timeout) override {
+    if (priority != core::SchedulerPriority::ControllerCommand)
+      return true;
+    std::unique_lock lock(mutex_);
+    drain_entered_ = true;
+    condition_.notify_all();
+    return condition_.wait_for(lock, timeout, [this] { return !in_flight_; });
+  }
+
+  void ObserveOwner(
+      const std::shared_ptr<ros2_control_execution::Ros2TransportResources> &owner) {
+    std::lock_guard lock(mutex_);
+    owner_ = owner;
+  }
+
+  [[nodiscard]] bool DequeueOneAndHold() {
+    std::lock_guard lock(mutex_);
+    if (!pending_ || in_flight_ || worker_.joinable())
+      return false;
+    auto callback = std::move(pending_->callback);
+    pending_.reset();
+    in_flight_ = true;
+    release_callback_ = false;
+    run_callback_ = false;
+    worker_ = std::thread([this, callback = std::move(callback)]() mutable {
+      {
+        std::unique_lock worker_lock(mutex_);
+        condition_.wait(worker_lock, [this] { return release_callback_; });
+        if (!run_callback_) {
+          in_flight_ = false;
+          condition_.notify_all();
+          return;
+        }
+      }
+      try {
+        callback();
+        observation_->callback_ran.store(true, std::memory_order_release);
+      } catch (...) {
+        observation_->callback_failed.store(true, std::memory_order_release);
+      }
+      {
+        std::lock_guard worker_lock(mutex_);
+        in_flight_ = false;
+      }
+      condition_.notify_all();
+    });
+    return true;
+  }
+
+  [[nodiscard]] bool WaitForDrain(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return condition_.wait_for(lock, timeout,
+                               [this] { return drain_entered_; });
+  }
+
+  void ReleaseDequeuedCallback(bool run_callback) {
+    std::lock_guard lock(mutex_);
+    run_callback_ = run_callback;
+    release_callback_ = true;
+    condition_.notify_all();
+  }
+
+  [[nodiscard]] bool WaitForCallback(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return condition_.wait_for(lock, timeout,
+                               [this] { return !in_flight_; });
+  }
+
+  void JoinWorker() {
+    if (worker_.joinable())
+      worker_.join();
+  }
+
+private:
+  struct Task final {
+    core::ScheduleHandle handle{};
+    std::function<void()> callback;
+  };
+
+  std::shared_ptr<FactoryTeardownObservation> observation_;
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  std::optional<Task> pending_;
+  std::weak_ptr<ros2_control_execution::Ros2TransportResources> owner_;
+  std::thread worker_;
+  core::ScheduleHandle next_handle_{1};
+  bool in_flight_{};
+  bool drain_entered_{};
+  bool release_callback_{};
+  bool run_callback_{};
+};
 
 TEST(RetainedRos2ControlBackendFactoryTest,
      MeasuredLaneRefusesMissingOrForeignClockBeforeTransportAndBind) {
   const auto motion = commanded_binding();
-  core::FakeClock clock;
+  auto clock = std::make_shared<core::FakeClock>();
   core::ManualScheduler scheduler;
   for (const bool foreign_owner : {false, true}) {
     auto config = test_factory_config(true);
@@ -388,9 +563,9 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
-     LegacyLaneWithoutMeasuredSourceStillAcceptsBorrowedClock) {
+     LegacyLaneWithoutMeasuredSourceRetainsTheSharedClock) {
   const auto motion = commanded_binding();
-  core::FakeClock clock;
+  auto clock = std::make_shared<core::FakeClock>();
   core::ManualScheduler scheduler;
   auto config = test_factory_config(false);
   const auto motion_channel = test_projected_channel(
@@ -401,6 +576,48 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   const auto backend = factory(motion, motion_channel, clock, scheduler);
   ASSERT_TRUE(backend.execution);
   EXPECT_TRUE(handle->OwnsBackend(backend.execution.get(), motion, std::nullopt));
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     MotionFactoryQuiescesTransportOwnersBeforeBorrowedSchedulerLeavesScope) {
+  auto clock = std::make_shared<core::FakeClock>();
+  core::ManualScheduler scheduler;
+  const auto motion = commanded_binding();
+  auto config = test_factory_config(false);
+  config.measured_receiver_clock = clock;
+  const auto motion_channel = test_projected_channel(
+      motion, retained_ros2_control_motion_state_config(config), clock);
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
+  const std::weak_ptr<RetainedRos2ControlRuntimeHandle> handle_lifetime = handle;
+  auto factory = make_retained_ros2_control_backend_factory(
+      std::move(config), handle);
+  auto backends = factory(motion, motion_channel, clock, scheduler);
+  auto owners = handle->TransportOwnerSnapshot();
+  ASSERT_NE(owners.machine, nullptr);
+  ASSERT_NE(owners.epoch, nullptr);
+  const std::weak_ptr<ros2_control_execution::Ros2TransportResources>
+      machine_lifetime = owners.machine;
+  const std::weak_ptr<ros2_control_execution::Ros2TransportResources>
+      epoch_lifetime = owners.epoch;
+
+  // The factory and route rebinder also retain the handle. Drop those owners
+  // before releasing the aliased execution port, as the production host does.
+  factory = {};
+  backends.rebind_motion_route = {};
+  backends.set_tcp.reset();
+  handle.reset();
+  backends.execution.reset();
+
+  EXPECT_TRUE(handle_lifetime.expired());
+  EXPECT_TRUE(owners.machine->joined());
+  EXPECT_TRUE(owners.epoch->joined());
+  EXPECT_EQ(scheduler.pending_count(core::SchedulerPriority::ControllerCommand),
+            0U);
+  owners = {};
+  EXPECT_TRUE(machine_lifetime.expired());
+  EXPECT_TRUE(epoch_lifetime.expired());
+  // `scheduler` remains live through the entire teardown above and is released
+  // only after both transport owners have joined.
 }
 
 [[nodiscard]] RetainedRos2ControlBackendConfig measured_factory_config() {
@@ -473,11 +690,11 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   auto config = measured_factory_config();
   config.measured_receiver_clock = clock;
   const auto motion_channel = test_projected_channel(
-      motion, retained_ros2_control_motion_state_config(config), *clock);
+      motion, retained_ros2_control_motion_state_config(config), clock);
   auto handle = RetainedRos2ControlRuntimeHandle::Create();
   auto factory =
       make_retained_ros2_control_backend_factory(std::move(config), handle);
-  const auto backend = factory(motion, motion_channel, *clock, scheduler);
+  const auto backend = factory(motion, motion_channel, clock, scheduler);
   ASSERT_TRUE(backend.execution);
   EXPECT_EQ(motion_channel->query_context().state_authority_class,
             core::StateAuthorityClass::kMeasured);
@@ -542,13 +759,14 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 TEST(RetainedRos2ControlBackendFactoryTest,
      BindRefusesForeignClockOwnerBeforeParticipantConstruction) {
   core::FakeClock clock;
+  core::ManualScheduler scheduler;
   const auto sink = std::make_shared<NullExecutionStateSink>();
   auto resources = make_test_transport_resources(
       "manyforge_bind_clock_fixture", sink, clock);
   auto handle = RetainedRos2ControlRuntimeHandle::Create();
   bool participant_constructed = false;
   const auto bound = handle->Bind(
-      std::move(resources), clock, test_arm_transport("/manyforge/robot_1"),
+      std::move(resources), clock, scheduler, test_arm_transport("/manyforge/robot_1"),
       [&](std::shared_ptr<core::IExecutionPort>) {
         participant_constructed = true;
         return std::shared_ptr<core::ExecutionPortParticipant>{};
@@ -568,7 +786,8 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 // controller is started by these tests.
 struct InitialRosInstallationFixture final {
   bool include_gripper;
-  core::FakeClock clock;
+  std::shared_ptr<core::FakeClock> clock_owner = std::make_shared<core::FakeClock>();
+  core::FakeClock &clock = *clock_owner;
   core::ManualScheduler scheduler;
   std::shared_ptr<NullExecutionStateSink> sink =
       std::make_shared<NullExecutionStateSink>();
@@ -603,23 +822,26 @@ struct InitialRosInstallationFixture final {
         throw std::logic_error(sealed.error().message);
       tool = std::move(sealed.value());
     }
-    auto resources = make_test_transport_resources(
-        "manyforge_initial_install_fixture", sink, clock);
+    std::shared_ptr<ros2_control_execution::Ros2TransportResources> resources =
+        make_test_transport_resources("manyforge_initial_install_fixture", sink, clock);
     auto owned_gripper =
         std::make_unique<ros2_control_execution::Ros2GripperCommandBackend>(
-            *resources, sink, clock, scheduler, true);
+            resources, sink, clock, scheduler, true);
     ros2_control_execution::Ros2GripperActionConfig gripper_config;
     gripper_config.state_freshness_timeout_s = 1.0;
     gripper_config.group_id = "gripper";
     gripper_config.joint_name = "gripper_joint";
     owned_gripper->configure_gripper_action(
-        tool.value().command_target_id.value(), gripper_config);
+        tool.value().command_target_id.value(), gripper_config,
+        kTestLifecycleCommandTimeoutNs);
     auto *engine_backend = owned_gripper.get();
     gripper = include_gripper ? engine_backend : nullptr;
     if (!include_gripper)
       engine_backend_owner = std::move(owned_gripper);
+    const auto timeout = handle->SetOwnerShutdownTimeout(kTestLifecycleCommandTimeoutNs);
+    if (!timeout.ok()) throw std::logic_error(timeout.error().message);
     const auto bound = handle->Bind(
-        std::move(resources), clock,
+        std::move(resources), clock, scheduler,
         test_arm_transport("/initial_install_fixture"),
         [this](std::shared_ptr<core::IExecutionPort> port) {
           return std::make_shared<core::ExecutionPortParticipant>(
@@ -630,7 +852,7 @@ struct InitialRosInstallationFixture final {
               test_participant_config());
         },
         std::move(owned_gripper), motion,
-        include_gripper ? std::optional(tool) : std::nullopt);
+        include_gripper ? std::optional(tool) : std::nullopt, clock_owner);
     if (!bound.ok())
       throw std::logic_error("initial ROS fixture binding failed: " +
                              bound.error().message);
@@ -662,6 +884,289 @@ struct InitialRosInstallationFixture final {
   }
 };
 
+TEST(RetainedCompositionReleaseTest, SharedBackendDistinctEnginesRefuseInUseAndAcceptExactAbsent) {
+  using host_detail::Composition;
+  InitialRosInstallationFixture fixture;
+  auto backend = std::shared_ptr<core::IGripperCommandBackend>(fixture.handle, fixture.gripper);
+  auto scheduler_owner = std::make_shared<core::ManualScheduler>();
+  auto channel = test_projected_channel(
+      fixture.tool, retained_ros2_control_gripper_state_config(fixture.tool), fixture.clock_owner);
+  auto make_runtime = [&] {
+    return std::make_shared<RetainedGripperRuntime>(RetainedGripperRuntimeInput{
+        fixture.tool, backend, fixture.clock_owner, channel, nullptr, std::nullopt,
+        false, {}, scheduler_owner, std::nullopt});
+  };
+  auto discarded_runtime = make_runtime();
+  auto remaining_runtime = make_runtime();
+  ASSERT_NE(discarded_runtime->participant_engine(), remaining_runtime->participant_engine());
+  EXPECT_EQ(discarded_runtime->backend_owner().get(), remaining_runtime->backend_owner().get());
+  auto view = [](const std::string &name) {
+    return std::make_unique<Composition>(
+        core::ControllableComponentId(name), nullptr, nullptr, nullptr, nullptr, nullptr,
+        std::nullopt, std::nullopt, std::nullopt, host_detail::CanonicalValue(nullptr),
+        host_detail::CanonicalValue(nullptr), nullptr, nullptr, core::ProjectionRevisionDTO{},
+        core::ActiveBundlePublicationGeneration(1U), std::nullopt, std::nullopt);
+  };
+  auto discarded = view("discarded");
+  discarded->gripper_runtime = discarded_runtime;
+  auto remaining = view("remaining");
+  remaining->gripper_runtime = remaining_runtime;
+  const auto database = std::filesystem::temp_directory_path() /
+      ("manyforge-discard-engine-" + std::to_string(::getpid()) + ".sqlite");
+  core::SqliteOperationJournal journal(database, core::CellId("discard-engine"), 16U);
+  const auto discarded_registration = discarded_runtime->registration();
+  core::ResourceAddressedExecutionKernelConfig registered_config{
+      core::RequestOwnerEpoch("discard-registered"), core::CellId("discard-engine"), 16U};
+  // A participant-backed Kernel must carry the bootstrap graph of its registrations.
+  registered_config.graph_revision = discarded_registration.binding.value().graph_revision;
+  auto registered_kernel = core::testing::make_heap_resource_addressed_kernel(
+      {discarded_registration}, fixture.clock, fixture.scheduler, journal, registered_config);
+  const auto snapshot = [](const Composition &v) {
+    std::set<core::IResolvedParticipantExecutionEngine *> result;
+    if (v.gripper_runtime)
+      for (const auto &registration : v.gripper_runtime->registrations())
+        result.insert(registration.engine);
+    return result;
+  };
+  const std::array<const Composition *, 4> roots{remaining.get(), nullptr, nullptr, nullptr};
+  const auto *original = discarded.get();
+  const std::weak_ptr<RetainedGripperRuntime> discarded_pin = discarded_runtime;
+  discarded_runtime.reset();
+  const auto refused = host_detail::ReleaseDiscardedCompositionSubscriptions(
+      *registered_kernel, discarded.get(), roots, snapshot);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "retired_participant_engine_in_use");
+  EXPECT_EQ(discarded.get(), original);
+  EXPECT_FALSE(discarded_pin.expired());
+  EXPECT_FALSE(RetainedRos2ControlRuntimeHandleTestAccess::Closing(*fixture.handle));
+  EXPECT_EQ(fixture.gripper->get_gripper_status(fixture.tool.value().command_target_id.value()).state,
+            core::GripperCommandState::kIdle);
+  // A separate empty Kernel has no subscription for this exact engine: only
+  // the helper's typed absent-subscription case is accepted as a no-op.
+  registered_kernel.reset();
+  core::ResourceAddressedExecutionKernelConfig empty_config{
+      core::RequestOwnerEpoch("discard-empty"), core::CellId("discard-engine"), 16U};
+  empty_config.empty_runtime_retained_bundle_id = core::RetainedBundleId("discard-bundle");
+  empty_config.empty_runtime_graph_revision = core::GraphRevision("discard-graph");
+  auto empty_kernel = core::testing::make_heap_resource_addressed_kernel(
+      {}, fixture.clock, fixture.scheduler, journal, empty_config);
+  const auto absent_direct = empty_kernel->release_retired_engine(
+      discarded->gripper_runtime->participant_engine());
+  ASSERT_FALSE(absent_direct.ok());
+  EXPECT_EQ(absent_direct.error().code, "missing_reference");
+  EXPECT_EQ(absent_direct.error().details.at("reason"),
+            "retired_participant_engine_subscription_absent");
+  const auto absent = host_detail::ReleaseDiscardedCompositionSubscriptions(
+      *empty_kernel, discarded.get(), roots, snapshot);
+  EXPECT_TRUE(absent.ok());
+  EXPECT_EQ(discarded.get(), original);
+  empty_kernel.reset();
+  journal.Close();
+  std::error_code ignored;
+  std::filesystem::remove(database, ignored);
+  std::filesystem::remove(database.string() + "-wal", ignored);
+  std::filesystem::remove(database.string() + "-shm", ignored);
+}
+
+TEST(RetainedCompositionReleaseTest, FailedHandleKeepsSharedBackendGroupPending) {
+  using host_detail::Composition;
+  using Handle = RetainedRos2ControlRuntimeHandle;
+  InitialRosInstallationFixture first;
+  InitialRosInstallationFixture second;
+  auto shared_backend = std::shared_ptr<core::IGripperCommandBackend>(first.handle, first.gripper);
+  auto scheduler_owner = std::make_shared<core::ManualScheduler>();
+  auto channel = test_projected_channel(first.tool,
+      retained_ros2_control_gripper_state_config(first.tool), first.clock_owner);
+  const auto make_runtime = [&] {
+    return std::make_shared<RetainedGripperRuntime>(RetainedGripperRuntimeInput{
+        first.tool, shared_backend, first.clock_owner, channel, nullptr, std::nullopt,
+        false, {}, scheduler_owner, std::nullopt});
+  };
+  auto first_runtime = make_runtime();
+  auto second_runtime = make_runtime();
+  ASSERT_NE(first_runtime->participant_engine(), second_runtime->participant_engine());
+  auto independent = Handle::Create();
+  ASSERT_TRUE(independent->SetOwnerShutdownTimeout(kTestLifecycleCommandTimeoutNs).ok());
+  const auto make_snapshot = [](std::shared_ptr<Handle> handle,
+                                std::shared_ptr<RetainedGripperRuntime> gripper) {
+    return host_detail::RetainedComponentSnapshot{
+        nullptr, std::move(gripper), nullptr,
+        {core::ProductId("fixture-product"), core::RetainedProductKind::kPlanningCollisionModel,
+         core::ProductContractId("fixture-contract"), core::ProductContractRevision("fixture-revision"), {}},
+        std::nullopt, host_detail::CanonicalValue(nullptr), host_detail::CanonicalValue(nullptr), std::move(handle), nullptr};
+  };
+  std::vector<host_detail::PendingDiscard> local;
+  local.push_back({nullptr, {make_snapshot(first.handle, first_runtime)}, "group-first", false});
+  local.push_back({nullptr, {make_snapshot(second.handle, second_runtime)}, "group-second", false});
+  local.push_back({nullptr, {make_snapshot(independent, nullptr)}, "independent", false});
+  std::vector<host_detail::PendingDiscard> pending;
+  const auto database = std::filesystem::temp_directory_path() /
+      ("manyforge-pending-group-" + std::to_string(::getpid()) + ".sqlite");
+  core::SqliteOperationJournal journal(database, core::CellId("pending-group"), 16U);
+  const auto first_registration = first_runtime->registration();
+  core::ResourceAddressedExecutionKernelConfig pending_config{
+      core::RequestOwnerEpoch("pending-group-epoch"), core::CellId("pending-group"), 16U};
+  pending_config.graph_revision = first_registration.binding.value().graph_revision;
+  auto kernel = core::testing::make_heap_resource_addressed_kernel(
+      {first_registration}, first.clock, first.scheduler, journal, pending_config);
+  const auto registrations = [](const Composition &v) {
+    std::set<core::IResolvedParticipantExecutionEngine *> result;
+    if (v.gripper_runtime)
+      for (const auto &registration : v.gripper_runtime->registrations()) result.insert(registration.engine);
+    return result;
+  };
+  const auto collect = [&](const host_detail::PendingDiscard &entry, auto &pins, auto &engines) {
+    host_detail::CollectRetainedPendingProtection(entry, pins, engines, registrations);
+  };
+  int first_calls = 0, second_calls = 0, independent_calls = 0;
+  bool fail_first = true;
+  const host_detail::PendingHandleSettle injected = [&](const auto &handle, auto deadline) {
+    if (handle == first.handle) {
+      ++first_calls;
+      return fail_first
+          ? Handle::HostQuiesceResult{Handle::HostQuiesceOutcome::kUnresolved,
+                                      "leaf", "component_owner_stalled"}
+          : Handle::HostQuiesceResult{Handle::HostQuiesceOutcome::kSettled, "", ""};
+    }
+    if (handle == second.handle) {
+      ++second_calls;
+      return Handle::HostQuiesceResult{Handle::HostQuiesceOutcome::kSettled, "", ""};
+    }
+    if (handle == independent) ++independent_calls;
+    return handle->QuiesceForHostShutdown(deadline);
+  };
+  ::testing::internal::CaptureStderr();
+  host_detail::SettleApplyPendingSnapshots(
+      local, pending, {nullptr, nullptr, nullptr, nullptr}, [&] { return kernel.get(); },
+      registrations, collect, &injected);
+  const auto logs = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(first_calls, 1);
+  EXPECT_EQ(second_calls, 0); // same failed backend-owner group
+  EXPECT_EQ(independent_calls, 1);
+  EXPECT_FALSE(RetainedRos2ControlRuntimeHandleTestAccess::Closing(*first.handle));
+  EXPECT_FALSE(RetainedRos2ControlRuntimeHandleTestAccess::Closing(*second.handle));
+  EXPECT_TRUE(RetainedRos2ControlRuntimeHandleTestAccess::Closing(*independent));
+  ASSERT_EQ(pending.size(), 2U);
+  EXPECT_EQ(pending[0].snapshots.front().gripper_runtime.get(), first_runtime.get());
+  EXPECT_EQ(pending[1].snapshots.front().gripper_runtime.get(), second_runtime.get());
+  EXPECT_NE(logs.find("component_owner_stalled"), std::string::npos);
+  const auto still_registered = kernel->release_retired_engine(first_runtime->participant_engine());
+  ASSERT_FALSE(still_registered.ok());
+  EXPECT_EQ(still_registered.error().details.at("reason"), "retired_participant_engine_in_use");
+  EXPECT_EQ(first.gripper->get_gripper_status(first.tool.value().command_target_id.value()).state,
+            core::GripperCommandState::kIdle);
+
+  // Host persistent retry moves the whole batch into the same grouped settle.
+  std::vector<host_detail::PendingDiscard> retry;
+  retry.swap(pending);
+  ::testing::internal::CaptureStderr();
+  host_detail::SettleApplyPendingSnapshots(
+      retry, pending, {nullptr, nullptr, nullptr, nullptr}, [&] { return kernel.get(); },
+      registrations, collect, &injected);
+  const auto retry_logs = ::testing::internal::GetCapturedStderr();
+  EXPECT_TRUE(retry_logs.empty());
+  ASSERT_EQ(pending.size(), 2U);
+  EXPECT_EQ(first_calls, 2);
+  EXPECT_EQ(second_calls, 0);
+  EXPECT_EQ(pending[0].snapshots.front().gripper_runtime.get(), first_runtime.get());
+  EXPECT_EQ(pending[1].snapshots.front().gripper_runtime.get(), second_runtime.get());
+  const auto still_registered_after_retry = kernel->release_retired_engine(first_runtime->participant_engine());
+  ASSERT_FALSE(still_registered_after_retry.ok());
+  EXPECT_EQ(still_registered_after_retry.error().details.at("reason"), "retired_participant_engine_in_use");
+  EXPECT_FALSE(RetainedRos2ControlRuntimeHandleTestAccess::Closing(*first.handle));
+  EXPECT_FALSE(RetainedRos2ControlRuntimeHandleTestAccess::Closing(*second.handle));
+
+  // Empty Kernel covers injected success + typed absent no-op only.
+  kernel.reset();
+  core::ResourceAddressedExecutionKernelConfig empty_runtime_config{
+      core::RequestOwnerEpoch("pending-empty-epoch"), core::CellId("pending-group"), 16U};
+  empty_runtime_config.empty_runtime_retained_bundle_id = core::RetainedBundleId("pending-empty-bundle");
+  empty_runtime_config.empty_runtime_graph_revision = core::GraphRevision("pending-empty-graph");
+  auto empty_kernel = core::testing::make_heap_resource_addressed_kernel(
+      {}, first.clock, first.scheduler, journal, empty_runtime_config);
+  fail_first = false;
+  retry.clear();
+  retry.swap(pending);
+  host_detail::SettleApplyPendingSnapshots(
+      retry, pending, {nullptr, nullptr, nullptr, nullptr}, [&] { return empty_kernel.get(); },
+      registrations, collect, &injected);
+  EXPECT_TRUE(pending.empty());
+  EXPECT_EQ(first_calls, 3);
+  EXPECT_EQ(second_calls, 1);
+  empty_kernel.reset();
+  journal.Close();
+  std::error_code ignored;
+  std::filesystem::remove(database, ignored);
+  std::filesystem::remove(database.string() + "-wal", ignored);
+  std::filesystem::remove(database.string() + "-shm", ignored);
+}
+
+TEST(RetainedCompositionReleaseTest, SyntheticTwoHopProtectsThirdRealHandle) {
+  using host_detail::Composition;
+  InitialRosInstallationFixture fixture;
+  InitialRosInstallationFixture fixture2;
+  auto view = [](const std::string &name) {
+    return std::make_unique<Composition>(
+        core::ControllableComponentId(name), nullptr, nullptr, nullptr, nullptr, nullptr,
+        std::nullopt, std::nullopt, std::nullopt, host_detail::CanonicalValue(nullptr),
+        host_detail::CanonicalValue(nullptr), nullptr, nullptr, core::ProjectionRevisionDTO{},
+        core::ActiveBundlePublicationGeneration(1U), std::nullopt, std::nullopt);
+  };
+  auto active = view("active");
+  active->ros2_control_runtime_handle = fixture.handle;
+  std::unique_ptr<Composition> prepared, failed;
+  auto retired = view("retired");
+  const auto second = fixture2.handle;
+  auto third = RetainedRos2ControlRuntimeHandle::Create();
+  ASSERT_TRUE(third->SetOwnerShutdownTimeout(kTestLifecycleCommandTimeoutNs).ok());
+  // Synthetic crossed-owner topology tests fixed-point behavior only; it is
+  // not asserted to be an authored or reachable production composition.
+  auto indirect = view("indirect");
+  indirect->ros2_control_runtime_handle = third;
+  indirect->runtime = std::make_shared<RetainedExecutionHost>(fixture2.motion);
+  indirect->runtime->execution = std::shared_ptr<core::IExecutionBackend>(fixture2.handle, fixture2.backend);
+  retired->participant_compositions.push_back(std::move(indirect));
+  auto bridge = view("bridge");
+  bridge->ros2_control_runtime_handle = second;
+  bridge->runtime = std::make_shared<RetainedExecutionHost>(fixture.motion);
+  bridge->runtime->execution = std::shared_ptr<core::IExecutionBackend>(fixture.handle, fixture.backend);
+  retired->participant_compositions.push_back(std::move(bridge));
+  const auto path = std::filesystem::temp_directory_path() /
+      ("manyforge-retired-alias-" + std::to_string(::getpid()) + ".sqlite");
+  core::SqliteOperationJournal journal(path, core::CellId("retired-alias"), 16U);
+  core::ResourceAddressedExecutionKernelConfig alias_config{
+      core::RequestOwnerEpoch("alias-epoch"), core::CellId("retired-alias"), 16U};
+  alias_config.empty_runtime_retained_bundle_id = core::RetainedBundleId("alias-empty-bundle");
+  alias_config.empty_runtime_graph_revision = core::GraphRevision("alias-empty-graph");
+  auto kernel = core::testing::make_heap_resource_addressed_kernel(
+      {}, fixture.clock, fixture.scheduler, journal, alias_config);
+  std::mutex mutex;
+  std::set<core::IResolvedParticipantExecutionEngine *> engines;
+  const Composition *logged = nullptr;
+  int reclaimed = 0;
+  host_detail::TryReleaseRetiredComposition(
+      mutex, active, prepared, failed, retired, engines, logged, [&] { return kernel.get(); },
+      [](const Composition &) { return std::set<core::IResolvedParticipantExecutionEngine *>{}; },
+      [](const Composition &v) { return std::vector<std::pair<int, const Composition *>>{{0, &v}}; },
+      [](const auto &) { ADD_FAILURE() << "unexpected process"; return true; },
+      [&] { ++reclaimed; },
+      [](bool ok, const char *message) { if (!ok) throw std::runtime_error(message); });
+  EXPECT_FALSE(retired);
+  EXPECT_EQ(reclaimed, 1);
+  EXPECT_FALSE(RetainedRos2ControlRuntimeHandleTestAccess::Closing(*fixture.handle));
+  EXPECT_FALSE(RetainedRos2ControlRuntimeHandleTestAccess::Closing(*second));
+  EXPECT_FALSE(RetainedRos2ControlRuntimeHandleTestAccess::Closing(*third));
+  EXPECT_EQ(fixture.backend->get_execution_snapshot().state, core::ExecutionState::kIdle);
+  EXPECT_EQ(fixture2.backend->get_execution_snapshot().state, core::ExecutionState::kIdle);
+  kernel.reset();
+  journal.Close();
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
+  std::filesystem::remove(path.string() + "-wal", ignored);
+  std::filesystem::remove(path.string() + "-shm", ignored);
+}
+
+
 [[nodiscard]] RetainedRos2ControlBackendConfig gripper_only_factory_config(
     const std::string &component = "robot_1") {
   RetainedRos2ControlBackendConfig config;
@@ -669,6 +1174,7 @@ struct InitialRosInstallationFixture final {
   config.node_namespace = "/manyforge/" + component;
   config.executor_thread_count = 1U;
   config.defer_ros_start = true;
+  config.gripper_lifecycle_timeout_ns = kTestLifecycleCommandTimeoutNs;
   config.arm.gripper_controller = RetainedRos2ControlArmController{
       config.node_namespace + "/controller_manager", "gripper_controller", "TestSystem"};
   ros2_control_execution::Ros2GripperActionConfig gripper;
@@ -691,12 +1197,13 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   core::ManualScheduler scheduler;
   const auto binding = commanded_gripper_binding();
   auto channel = test_projected_channel(
-      binding, retained_ros2_control_gripper_state_config(binding), *clock);
+      binding, retained_ros2_control_gripper_state_config(binding), clock);
   auto handle = RetainedRos2ControlRuntimeHandle::Create();
+  static_cast<void>(handle->SetOwnerShutdownTimeout(1'000'000'000));
   auto config = gripper_only_factory_config();
   config.measured_receiver_clock = clock;
   auto backend = make_retained_ros2_control_gripper_backend(
-      config, binding, channel, *clock, scheduler, handle);
+      config, binding, channel, clock, scheduler, handle);
   const std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner = handle;
   const std::weak_ptr<core::IClock> clock_lifetime = clock;
   config.measured_receiver_clock.reset();
@@ -713,6 +1220,117 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
+     GripperFactoryDrainsDequeuedCallbackBeforeReleasingTransportAndScheduler) {
+  auto observation = std::make_shared<FactoryTeardownObservation>();
+  auto scheduler = std::make_unique<HeldCallbackScheduler>(observation);
+  auto clock = std::make_shared<core::FakeClock>();
+  const auto binding = commanded_gripper_binding();
+  auto channel = test_projected_channel(
+      binding, retained_ros2_control_gripper_state_config(binding), clock);
+  const std::array initial_position{0.0}, initial_velocity{0.0};
+  ASSERT_TRUE(channel->publish_state(initial_position, initial_velocity,
+                                    clock->now(), clock->now())
+                  .applied());
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
+  static_cast<void>(handle->SetOwnerShutdownTimeout(1'000'000'000));
+  const std::weak_ptr<RetainedRos2ControlRuntimeHandle> handle_lifetime = handle;
+  auto config = gripper_only_factory_config();
+  config.arm.gripper_controller.reset();
+  config.measured_receiver_clock = clock;
+  config.gripper->actuation_kind =
+      core::GripperActuationKind::kPositionCommanded;
+  config.gripper->transport_kind = "isaac_joint_state_effort";
+  config.gripper->action_name.clear();
+  static std::atomic<std::uint64_t> topic_counter{0};
+  config.gripper->command_topic =
+      "/manyforge_factory_teardown_" +
+      std::to_string(topic_counter.fetch_add(1, std::memory_order_relaxed));
+  config.gripper->command_joint_names = {"gripper_joint"};
+  config.gripper->completion_policy = "dwell_elapsed";
+  config.gripper->open_position = 0.0;
+  config.gripper->closed_position = 0.1;
+  config.gripper->open_effort = 1.0;
+  config.gripper->close_effort = -1.0;
+
+  auto backend = make_retained_ros2_control_gripper_backend(
+      config, binding, channel, clock, *scheduler, handle);
+  auto resource = handle->TransportOwnerSnapshot().machine;
+  ASSERT_NE(resource, nullptr);
+  scheduler->ObserveOwner(resource);
+  const std::weak_ptr<ros2_control_execution::Ros2TransportResources>
+      resource_lifetime = resource;
+
+  core::GripperCommandRequestDTO request;
+  request.gripper_id = binding.value().command_target_id.value();
+  request.group_id = "gripper";
+  request.joint_name = "gripper_joint";
+  request.target_position = 0.1;
+  request.transport_kind = "isaac_joint_state_effort";
+  request.duration_s = 0.1;
+  request.completion_policy = "dwell_elapsed";
+  request.state_authority = "sim_observed";
+  const auto receipt = backend->command_gripper(request);
+  ASSERT_TRUE(receipt.accepted)
+      << (receipt.error ? receipt.error->message : "");
+  EXPECT_EQ(backend->get_gripper_status(request.gripper_id).state,
+            core::GripperCommandState::kExecuting);
+  ASSERT_TRUE(scheduler->DequeueOneAndHold());
+
+  handle.reset();
+  channel.reset();
+  config.measured_receiver_clock.reset();
+  auto release_backend = std::async(
+      std::launch::async,
+      [owned_backend = std::move(backend)]() mutable { owned_backend.reset(); });
+
+  const bool drain_entered = scheduler->WaitForDrain(std::chrono::seconds(2));
+  EXPECT_TRUE(drain_entered);
+  if (!drain_entered) {
+    scheduler->ReleaseDequeuedCallback(false);
+    release_backend.wait();
+    scheduler->JoinWorker();
+    ADD_FAILURE() << "factory teardown did not drain the controller callback";
+    return;
+  }
+  const auto before_callback_release = release_backend.wait_for(
+      std::chrono::milliseconds(0));
+  EXPECT_EQ(before_callback_release, std::future_status::timeout);
+  if (before_callback_release != std::future_status::timeout) {
+    scheduler->ReleaseDequeuedCallback(false);
+    release_backend.wait();
+    scheduler->JoinWorker();
+    ADD_FAILURE() << "factory owner returned while its callback was dequeued";
+    return;
+  }
+
+  scheduler->ReleaseDequeuedCallback(true);
+  EXPECT_TRUE(scheduler->WaitForCallback(std::chrono::seconds(2)));
+  EXPECT_EQ(release_backend.wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+  release_backend.get();
+  scheduler->JoinWorker();
+
+  EXPECT_TRUE(observation->callback_ran.load(std::memory_order_acquire));
+  EXPECT_FALSE(observation->callback_failed.load(std::memory_order_acquire));
+  EXPECT_TRUE(observation->cancel_saw_dequeued_callback.load(
+      std::memory_order_acquire));
+  EXPECT_TRUE(handle_lifetime.expired());
+  EXPECT_TRUE(resource->joined());
+  EXPECT_FALSE(resource_lifetime.expired());
+  resource.reset();
+  EXPECT_TRUE(resource_lifetime.expired());
+
+  // The factory borrows its scheduler. The owner and its queued callback are
+  // fully retired before the caller releases that scheduler.
+  scheduler.reset();
+  EXPECT_TRUE(observation->scheduler_destroyed.load(std::memory_order_acquire));
+  EXPECT_TRUE(observation->owner_expired_at_scheduler_destruction.load(
+      std::memory_order_acquire));
+  EXPECT_FALSE(observation->callback_active_at_scheduler_destruction.load(
+      std::memory_order_acquire));
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
      ProductResealPreservesGripperOccurrenceAndChecksCandidateStateAuthority) {
   // This gate test needs an addressed channel, without retained-model geometry.
   // Construct a genuinely component-local gripper before binding its owner.
@@ -725,7 +1343,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
         RetainedObservedStateChannelConfig{
             core::ObservedStateSourceKind::kCommandedState, "gripper.commanded",
             250'000'000, 1U},
-        &fixture.clock);
+        fixture.clock_owner);
   };
   auto value = fixture.tool.value();
   value.retained_bundle_id = core::RetainedBundleId("candidate.bundle");
@@ -828,7 +1446,7 @@ namespace {
 
 TEST(RetainedRos2ControlBackendFactoryTest,
      PneumaticNoneFactoryRetainsExactIdentityAndCommandedRequirements) {
-  core::FakeClock clock;
+  auto clock = std::make_shared<core::FakeClock>();
   core::ManualScheduler scheduler;
   const auto tool = commanded_gripper_binding();
   const auto foreign = commanded_gripper_binding("robot_foreign");
@@ -866,7 +1484,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
                std::invalid_argument);
 }
 
-// Merge 6 (D4): a lane-free pneumatic tool has no controller profile and no
+// A lane-free pneumatic tool has no controller profile and no
 // streams; its I/O-mapped gripper is the no-output logical owner.
 TEST(RetainedRos2ControlBackendFactoryTest,
      LaneFreePneumaticToolIsAStreamlessNoOutputOwner) {
@@ -887,7 +1505,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_FALSE(config.arm.gripper_controller.has_value());
 }
 
-// CONTRACTS §16: a machine whose arm member is deactivated has no arm
+// A machine whose arm member is deactivated has no arm
 // composition to build its owner, so the host builds that owner on its own
 // (running the machine's process where it has one); a machine with an arm
 // member keeps its owner on the arm's composition.

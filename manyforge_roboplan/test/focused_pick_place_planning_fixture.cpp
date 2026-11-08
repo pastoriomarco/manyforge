@@ -63,13 +63,13 @@ BoxObject(std::string id, SceneObjectPlacementDTO placement) {
 }
 
 [[nodiscard]] RuntimeParticipantBindingDTO ArmBinding() {
-  std::vector<ProgramFrameRoleBindingDTO> frames{
-      {FrameRoleId("frame-role:base"), ModelInstanceId("model:test"),
+  std::vector<ProgramFrameBindingDTO> frames{
+      {{ControllableComponentId("component:test"), FrameRoleId("frame-role:base")}, ModelInstanceId("model:test"),
        ModelRevision("model-revision:test"), "base"},
-      {FrameRoleId("frame-role:tcp"), ModelInstanceId("model:test"),
+      {{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")}, ModelInstanceId("model:test"),
        ModelRevision("model-revision:test"), "tcp"}};
-  std::vector<ProgramCollisionBodyRoleBindingDTO> collision_bodies{
-      {CollisionBodyRoleId("collision-body-role:tool"),
+  std::vector<ProgramCollisionBodyBindingDTO> collision_bodies{
+      {{ControllableComponentId("component:test"), CollisionBodyRoleId("collision-body-role:tool")},
        ModelInstanceId("model:test"),
        ModelRevision("model-revision:test"),
        {"tcp"}}};
@@ -78,12 +78,8 @@ BoxObject(std::string id, SceneObjectPlacementDTO placement) {
        ContactPolicyRevision("contact-policy-revision:1"),
        RuntimeObjectId("selected_object"),
        {ProgramContactGraspBodyBindingDTO{
-           ComponentRoleId("component-role:tool"),
-           TargetRoleId("target-role:tool"),
-           ControllableComponentId("component:test"),
-           CommandTargetId("target:test"),
+           {ControllableComponentId("component:test"), CollisionBodyRoleId("collision-body-role:tool")},
            ModelRoleId("tool"),
-           CollisionBodyRoleId("collision-body-role:tool"),
            ModelInstanceId("model:test"),
            ModelRevision("model-revision:test"),
            {CollisionBodyId("body:tool")}}},
@@ -93,8 +89,6 @@ BoxObject(std::string id, SceneObjectPlacementDTO placement) {
           ProgramBindingId("program-binding:test"),
           RetainedBundleId("bundle:test"),
           GraphRevision("graph:test"),
-          ComponentRoleId("component-role:arm"),
-          TargetRoleId("target-role:test"),
           ControllableComponentId("component:test"),
           ComponentTypeId("component-type:test"),
           ComponentTypeRevision("component-type-revision:test"),
@@ -116,8 +110,6 @@ BoxObject(std::string id, SceneObjectPlacementDTO placement) {
 
 [[nodiscard]] RuntimeParticipantBindingDTO CarrierBinding() {
   auto value = ArmBinding();
-  value.component_role_id = ComponentRoleId("component-role:tool");
-  value.target_role_id = TargetRoleId("target-role:tool");
   value.capability_id = CapabilityId("tool.gripper.command");
   return value;
 }
@@ -210,7 +202,9 @@ public:
   preview_motion(OperationIntentDTO operation,
                  CollisionWorldLeaseInventory projection_inventory,
                  RobotStateDTO start_state, std::uint32_t,
-                 std::stop_token) override {
+                 std::stop_token,
+                 std::optional<MotionPathPreview>* path_preview) override {
+    if (path_preview != nullptr) path_preview->reset();
     auto prepared = prepare_motion(operation);
     if (!prepared.ok()) {
       return Result<MotionPreviewResultDTO>::Err(prepared.error());

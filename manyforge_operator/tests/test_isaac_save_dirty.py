@@ -29,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _collector():
-    path = REPO_ROOT / "scripts/qualification/source_identity.py"
+    path = REPO_ROOT / "scripts/lib/source_identity.py"
     spec = importlib.util.spec_from_file_location("isaac_save_source_identity", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

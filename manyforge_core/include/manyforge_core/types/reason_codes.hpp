@@ -53,7 +53,7 @@ inline constexpr char kTrackingSampleInvalid[] = "tracking_sample_invalid";
 inline constexpr char kTerminalPublicationInProgress[] =
     "terminal_publication_in_progress";
 
-// Recovery assessment/admission (spec/230 §3.7.1, spec/210 §3.12).
+// Recovery assessment/admission.
 inline constexpr char kRecoveryNoneActive[] = "no_recovery_active";
 inline constexpr char kRecoveryStopNotCertified[] = "stop_not_certified";
 inline constexpr char kRecoveryStopCertified[] = "stop_certified";

@@ -472,7 +472,7 @@ class MockSimulationRefusedError(RuntimeError):
 
 
 class MockSimulationPort(Protocol):
-    """Decision 133: one node attempt's literal Mock simulation start.
+    """One node attempt's literal Mock simulation start.
 
     ``request`` builds the exact wire request once per attempt (the node then
     resends that same request until it is answered); ``start`` sends it and
@@ -492,7 +492,7 @@ class MockSimulationPort(Protocol):
     def start(self, request: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
     def end(self, start_request: Mapping[str, Any]) -> None:
-        """Decision 135: the attempt of this exact start ended (once per
+        """The attempt of this exact start ended (once per
         attempt; never for a Halt). An unknown reply keeps that exact END
         pending until ``resend_unknown_ends`` gets its ACK."""
         ...
@@ -520,8 +520,8 @@ def describe_owner_failure(message: str, details: object) -> str:
 
     Owner rejections carry the precise cause in ``details.reason``; a missing
     or ambiguous reference also names the failed reference in
-    ``details.reference_type`` and ``details.reference_id`` (and
-    ``details.target_role_id`` for another robot's frame). The human message
+    ``details.reference_type`` and its direct identity in ``details.reference``.
+    The human message
     alone is often generic, so it names them too, where the failure is
     described; the same bounded details travel separately as the failure's
     ``details`` and are never re-parsed from this text.
@@ -539,9 +539,24 @@ def describe_owner_failure(message: str, details: object) -> str:
         reference_id = details.get("reference_id")
         if isinstance(reference_id, str) and reference_id:
             reference += f" {reference_id[:256]!r}"
-        target_role_id = details.get("target_role_id")
-        if isinstance(target_role_id, str) and target_role_id:
-            reference += f" of target role {target_role_id[:256]!r}"
+        direct = details.get("reference")
+        if isinstance(direct, Mapping):
+            values = []
+            for key in ("component_id", "command_target_id", "signal_name", "frame_id", "collision_body_id"):
+                value = direct.get(key)
+                if not isinstance(value, str) or not value:
+                    continue
+                try:
+                    fits = len(value.encode("utf-8")) <= (512 if key == "signal_name" else 128)
+                except UnicodeEncodeError:
+                    fits = False
+                if fits:
+                    values.append(f"{key}={value!r}")
+            if values:
+                reference += " " + ", ".join(values)
+        component_id = details.get("component_id")
+        if isinstance(component_id, str) and component_id:
+            reference += f" of component {component_id[:256]!r}"
         notes.append(f"reference {reference}")
     return f"{message} ({'; '.join(notes)})" if notes else message
 
@@ -891,7 +906,7 @@ class NodeAdapterPorts:
     # watches (`io.wait_for_input`) on the native execution owner.
     io_signals: OwnerInvocationPort | None = None
     io_watches: OwnerTaskPort | None = None
-    # Decision 133: per-node Mock simulation starts of signal-reading nodes.
+    # Per-node Mock simulation starts of signal-reading nodes.
     mock_simulation: MockSimulationPort | None = None
     model_queries: ModelQueryPort | None = None
     assistant_requests: OwnerTaskPort | None = None
@@ -903,7 +918,7 @@ class NodeAdapterPorts:
     persistent_keys: PersistentKeyRegisterPort | None = None
 
 
-# The Kernel execution states of a failure and of an interruption (spec 230).
+# The Kernel execution states of a failure and of an interruption.
 FAILED_EXECUTION_STATES: Final = frozenset(
     {ExecutionState.FAILED.value, ExecutionState.INTERVENTION_REQUIRED.value}
 )

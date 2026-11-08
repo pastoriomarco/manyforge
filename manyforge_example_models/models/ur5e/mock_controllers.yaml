@@ -4,7 +4,7 @@
 # per joint, the row's arrival tolerance as `goal` and the Deployment's
 # operator Stop deceleration. Values: the plain UR JTC configuration of
 # ManyMove manymove_bringup/config/ur/ur_with_robotiq_controllers.yaml, with
-# the retained Isaac UR rates (100/100) and Q64's 20 Hz Mock action monitor.
+# the retained Isaac UR rates (100/100) and a 20 Hz Mock action monitor.
 /**/controller_manager:
   ros__parameters:
     update_rate: 100

@@ -41,7 +41,7 @@ struct Ros2ControlExecutionBackendConfig {
       "controller_state", "joint_state", "action_feedback"};
   std::string observed_state_authority_profile_id;
 
-  // RT-3: ROS2 controller command/progress callbacks use a dedicated action
+  // ROS2 controller command/progress callbacks use a dedicated action
   // callback group, state subscriptions use a dedicated state group, and
   // non-critical callbacks remain on the default group. Three executor threads
   // is the safe minimum that lets those groups make progress independently.
@@ -72,7 +72,7 @@ struct Ros2ControlExecutionBackendConfig {
   bool disable_controller_path_tolerances = false;
   std::string execution_state_source_mode = "observed_robot";
   std::vector<double> initial_joint_positions_rad;
-  // Phase 2.7A physical-controller admission. No contract means the existing
+  // Physical-controller admission. No contract means the existing
   // non-physical/static action binding remains in use. A present contract
   // enables event-invalidated, NRT controller-manager verification.
   std::optional<ControllerBindingContract> controller_binding;
@@ -88,13 +88,12 @@ struct Ros2ControlExecutionBackendConfig {
   // the replacement stop trajectory and violate wall-time deceleration_time_s.
   bool enable_jtc_speed_scaling_input = true;
 
-  // kHardDeceleration capability evidence (spec/260 §5.6 +
-  // ROS2_CONTROL_EXECUTION_ADAPTER_PLAN.md). The backend only
+  // kHardDeceleration capability evidence. The backend only
   // advertises `kHardDeceleration` to the kernel when ALL THREE of
   // the following preconditions hold; deployments whose controller
   // configuration does not meet them MUST leave these fields at
-  // their defaults so the capability gate fails closed. Spec/260
-  // §5.6 explicitly forbids hard_deceleration substitution on a
+  // their defaults so the capability gate fails closed. A hard_deceleration
+  // substitution is forbidden on a
   // controller that lacks the underlying deceleration mechanism.
   //
   // 1) `decelerate_on_cancel` mirrors the JTC `constraints.decelerate_on_cancel`
@@ -136,7 +135,7 @@ struct Ros2ControlExecutionBackendConfig {
   // spring_back_hold through explicit fallback gating.
   bool enable_soft_on_path_experimental = false;
 
-  /// Exact sealed participant binding for the I8 Prepare/Dispatch boundary.
+  /// Exact sealed participant binding for the Prepare/Dispatch boundary.
   /// Absence keeps the legacy backend observable but makes direct prepared
   /// admission fail closed until product composition supplies the referent.
   std::optional<core::RuntimeParticipantBinding> prepared_participant_binding;

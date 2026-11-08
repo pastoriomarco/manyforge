@@ -1,13 +1,16 @@
 #include "prepared_command_session_internal.hpp"
 #include <algorithm>
+#include <condition_variable>
 #include <limits>
 #include <manyforge_core/execution_recovery_support.hpp>
+#include <manyforge_core/execution_kernel.hpp>
 #include <manyforge_core/gripper_participant_engine.hpp>
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/types/error_code_mapping.hpp>
 #include <manyforge_core/types/reason_codes.hpp>
 #include <stdexcept>
+#include <tuple>
 
 namespace manyforge::core {
 namespace {
@@ -68,19 +71,42 @@ namespace {
 }
 }  // namespace
 struct GripperParticipantEngine::PreparedCapabilityCommandSession final
-    : detail::PreparedCommandSessionLifecycle {
+    : detail::PreparedCommandSessionLifecycle, GripperPreparedSessionPin {
   explicit PreparedCapabilityCommandSession(
       ResolvedPreparedCapabilityCommandExecutionRequestDTO supplied)
       : authority(std::move(supplied)) {}
 
   ResolvedPreparedCapabilityCommandExecutionRequestDTO authority;
+  // This session cannot be replaced while DispatchRequested is resident.
+  // Publish its admission before the synchronous backend call and revoke it
+  // before leaving that state, so the transport leaf can check one atomic.
+  std::atomic<std::uint64_t> admission_token{0};
+  std::weak_ptr<const void> engine_owner;
+  std::shared_ptr<GripperLateCancelSlot> late_cancel_slot =
+      std::make_shared<GripperLateCancelSlot>();
   GripperActuationKind actuation{GripperActuationKind::kPositionCommanded};
   std::uint64_t owner_lifecycle_generation{};
   std::optional<PrepareParticipantResultDTO> backend_prepare_result;
   std::optional<AddressedParticipantStopSettlementDTO> stop_settlement;
   bool stop_recovery_consumed{};
   std::optional<ParticipantStopStageResultDTO> translated_stop;
+  // A Stop attempt is between its checks and its recorded result, with the
+  // mutex released for the backend calls. Another attempt waits on
+  // stop_translation_done (as it used to wait on the mutex); the fence and
+  // other readers don't read it.
+  bool stop_translating{};
+  std::condition_variable stop_translation_done;
   mutable std::optional<KernelRecoveryAssessmentDTO> close_assessment;
+  bool owner_loss_recorded{};
+  bool owner_retirement_in_flight{};
+  bool owner_retired{};
+  std::string owner_retirement_reason;
+  std::shared_ptr<const void> owner_proof_identity;
+  std::optional<GripperOwnerRecoveryProofMode> owner_proof_mode;
+  std::optional<std::uint64_t> owner_first_sequence;
+  std::string owner_joint_order_token;
+  std::optional<ObservedStateEvidenceDTO> owner_observed_evidence;
+  ObservedReadinessTracker owner_rest_tracker;
 
   KernelRecoveryAssessmentDTO assess_close(const std::optional<GripperCommandStatusDTO>& observed,
                                            const std::int64_t now,
@@ -125,6 +151,28 @@ struct GripperParticipantEngine::PreparedCapabilityCommandSession final
         !ordinary_result_acknowledged && (no_effect || completed || settled_failure);
     assessment.reason_code =
         assessment.eligible_close ? "operation_close_ready" : "operation_close_unavailable";
+    if (owner_retired && dispatch_result && dispatch_result->command_id != 0U) {
+      assessment.execution_id = dispatch_result->command_id;
+      assessment.execution_state = ExecutionState::kInterventionRequired;
+      assessment.recovery_class = RecoveryClass::kUnknownFault;
+      assessment.status = RecoveryAssessmentStatus::kResetRequired;
+      assessment.eligible_close = !ordinary_result_acknowledged;
+      assessment.reason_code = owner_retirement_reason;
+      if (owner_observed_evidence) {
+        const auto& sample = *owner_observed_evidence;
+        assessment.observed_state_available = true;
+        assessment.observed_state_sequence = sample.sequence;
+        assessment.observed_state_source_id = sample.source_identity;
+        assessment.observed_state_authority_profile = sample.authority_profile;
+        assessment.observed_state_measured = sample.measured_authority;
+        assessment.observed_state_fresh = sample.sampled_at_ns >= 0 && now >= sample.sampled_at_ns &&
+            sample.freshness_budget_ns > 0 && now - sample.sampled_at_ns < sample.freshness_budget_ns;
+        assessment.observed_state_at_rest = assessment.observed_state_fresh && sample.at_rest;
+        if (sample.freshness_budget_ns > 0 && sample.sampled_at_ns >= 0 &&
+            sample.sampled_at_ns <= std::numeric_limits<std::int64_t>::max() - sample.freshness_budget_ns)
+          assessment.observed_state_valid_until_ns = sample.sampled_at_ns + sample.freshness_budget_ns;
+      }
+    }
     assessment.assessment_revision = close_assessment ? close_assessment->assessment_revision : 1U;
     if (close_assessment && recovery_assessment_semantically_differs(*close_assessment, assessment))
       ++assessment.assessment_revision;
@@ -134,8 +182,141 @@ struct GripperParticipantEngine::PreparedCapabilityCommandSession final
 };
 
 GripperParticipantEngine::GripperParticipantEngine(IGripperCommandBackend& backend, IClock& clock)
-    : backend_(backend), clock_(clock) {}
+    : backend_(backend), clock_(clock) {
+  // Share the existing production recovery readiness policy. Gripper-specific
+  // velocity thresholds remain the exact typed Stop values in its source.
+  const ExecutionKernelConfig config;
+  owner_recovery_policy_ = RecoveryReadinessPolicy{config.recovery_require_measured_observation,
+      config.recovery_ready_dwell_ns, config.recovery_ready_min_samples};
+}
 GripperParticipantEngine::~GripperParticipantEngine() = default;
+
+void GripperParticipantEngine::InstallGripperOwnerRecoverySource(GripperOwnerRecoverySource source) {
+  std::lock_guard lock(owner_recovery_source_mutex_);
+  if (!source || owner_recovery_source_)
+    throw std::invalid_argument("gripper owner recovery source must be installed once");
+  owner_recovery_source_ = std::move(source);
+}
+
+void GripperParticipantEngine::notify_gripper_owner_loss_recorded(
+    const std::string& id, std::uint64_t command_id, std::uint64_t generation) {
+  (void)notify_exact_gripper_owner_loss_recorded(id, command_id, generation);
+}
+
+bool GripperParticipantEngine::notify_exact_gripper_owner_loss_recorded(
+    const std::string& id, std::uint64_t command_id, std::uint64_t generation) {
+  auto pins = backend_.tracked_gripper_prepared_sessions();
+  if (auto active = active_prepared_command_session_.load()) pins.push_back(active);
+  std::vector<const PreparedCapabilityCommandSession*> seen;
+  bool matched = false;
+  for (const auto& pin : pins) {
+    const auto session = std::dynamic_pointer_cast<PreparedCapabilityCommandSession>(pin);
+    if (!session || session->engine_owner.lock() != recovery_identity_) continue;
+    if (std::find(seen.begin(), seen.end(), session.get()) != seen.end()) continue;
+    seen.push_back(session.get());
+    {
+      std::lock_guard lock(session->mutex);
+      if (!session->dispatch_result || session->dispatch_result->command_id != command_id ||
+          session->dispatch_result->generation != generation ||
+          session->authority.gripper().command_request.gripper_id != id) continue;
+      session->owner_loss_recorded = true;
+      matched = true;
+    }
+    AdvanceGripperOwnerRecoveryFor(session);
+  }
+  return matched;
+}
+
+void GripperParticipantEngine::AdvanceGripperOwnerRecovery() const {
+  auto pins = backend_.tracked_gripper_prepared_sessions();
+  if (auto active = active_prepared_command_session_.load()) pins.push_back(active);
+  std::vector<const PreparedCapabilityCommandSession*> seen;
+  for (const auto& pin : pins) {
+    const auto session = std::dynamic_pointer_cast<PreparedCapabilityCommandSession>(pin);
+    if (!session || session->engine_owner.lock() != recovery_identity_ ||
+        std::find(seen.begin(), seen.end(), session.get()) != seen.end()) continue;
+    seen.push_back(session.get());
+    AdvanceGripperOwnerRecoveryFor(session);
+  }
+}
+
+void GripperParticipantEngine::AdvanceGripperOwnerRecoveryFor(
+    const std::shared_ptr<PreparedCapabilityCommandSession>& session) const {
+  if (!session) return;
+  std::string id;
+  std::uint64_t command_id = 0, generation = 0;
+  {
+    std::lock_guard lock(session->mutex);
+    if (!session->owner_loss_recorded || session->owner_retired || session->owner_retirement_in_flight ||
+        !session->dispatch_result || session->dispatch_result->command_id == 0U) return;
+    id = session->authority.gripper().command_request.gripper_id;
+    command_id = session->dispatch_result->command_id;
+    generation = session->dispatch_result->generation;
+  }
+  GripperOwnerRecoverySource source;
+  {
+    std::lock_guard lock(owner_recovery_source_mutex_);
+    source = owner_recovery_source_;
+  }
+  if (!source) return;
+  const auto owner = backend_.rebuilt_unknown_owner(id, command_id, generation);
+  if (!owner) return;
+  std::optional<GripperOwnerRecoveryEvidence> evidence;
+  try { evidence = source(id, command_id, generation, owner); } catch (...) {}
+  if (!evidence || !evidence->owner || evidence->owner != owner) {
+    std::lock_guard lock(session->mutex);
+    if (!session->owner_retired) session->owner_rest_tracker.reset();
+    return;
+  }
+  bool qualified = false;
+  {
+    std::lock_guard lock(session->mutex);
+    if (!session->owner_loss_recorded || session->owner_retired || session->owner_retirement_in_flight ||
+        !session->dispatch_result || session->dispatch_result->command_id != command_id ||
+        session->dispatch_result->generation != generation) return;
+    if (session->owner_proof_identity != owner) {
+      session->owner_proof_identity = owner;
+      session->owner_proof_mode.reset();
+      session->owner_first_sequence.reset();
+      session->owner_joint_order_token.clear();
+      session->owner_rest_tracker.reset();
+    }
+    if (session->owner_proof_mode && *session->owner_proof_mode != evidence->mode) return;
+    if (!session->owner_proof_mode) session->owner_proof_mode = evidence->mode;
+    if (evidence->mode == GripperOwnerRecoveryProofMode::kNoFeedback) {
+      qualified = true;
+    } else {
+      if (evidence->first_sequence == 0U) return;
+      if (session->owner_first_sequence &&
+          (*session->owner_first_sequence != evidence->first_sequence ||
+           session->owner_joint_order_token != evidence->joint_order_token)) return;
+      session->owner_first_sequence = evidence->first_sequence;
+      session->owner_joint_order_token = evidence->joint_order_token;
+      if (!evidence->sample || evidence->sample->sequence < evidence->first_sequence) {
+        session->owner_rest_tracker.reset();
+        return;
+      }
+      qualified = session->owner_rest_tracker.update(*evidence->sample, evidence->joint_order_token,
+                                                      owner_recovery_policy_, clock_.now());
+    }
+    if (!qualified) return;
+    session->owner_retirement_in_flight = true;
+  }
+  Result<void> retired = Result<void>::Err(ErrorDTO{"recovery_unavailable", "Gripper retirement failed", {}});
+  try { retired = backend_.retire_rebuilt_unknown(id, command_id, generation, owner); } catch (...) {}
+  {
+    std::lock_guard lock(session->mutex);
+    session->owner_retirement_in_flight = false;
+    if (retired.ok() && session->dispatch_result && session->dispatch_result->command_id == command_id &&
+        session->dispatch_result->generation == generation) {
+      session->owner_retired = true;
+      if (evidence->mode == GripperOwnerRecoveryProofMode::kMeasured)
+        session->owner_observed_evidence = evidence->sample;
+      session->owner_retirement_reason = evidence->mode == GripperOwnerRecoveryProofMode::kMeasured
+          ? std::string(kOwnerRebuildObservedAtRest) : std::string(kOwnerRebuildNoFeedback);
+    }
+  }
+}
 
 ErrorDTO GripperParticipantEngine::unsupported_error() {
   return {kErrorUnsupportedCapability,
@@ -184,6 +365,7 @@ AcknowledgeCompletedResultDTO GripperParticipantEngine::acknowledge_completed(
   if (session->state == ResolvedPreparedCapabilityCommandStateDTO::kDispatched &&
       session->dispatch_result && session->dispatch_result->accepted &&
       !session->dispatch_result->error) {
+    // Lock order: session mutex -> backend status/map leaf lock (never the reverse).
     const auto status = backend_.get_gripper_status(session->authority.gripper().command_request.gripper_id);
     final = status.command_id == session->dispatch_result->command_id &&
             status.generation == session->dispatch_result->generation &&
@@ -207,7 +389,12 @@ Result<void> GripperParticipantEngine::validate_gripper_command(
   return backend_.validate_gripper_command(request);
 }
 GripperCommandStatusDTO GripperParticipantEngine::get_gripper_status(const std::string& id) const {
+  try { AdvanceGripperOwnerRecovery(); } catch (...) { /* Recovery remains pending. */ }
   return backend_.get_gripper_status(id);
+}
+bool GripperParticipantEngine::rebuilt_gripper_unknown_pending(
+    const std::string& id, std::uint64_t command_id, std::uint64_t generation) const {
+  return backend_.rebuilt_unknown_pending(id, command_id, generation);
 }
 Result<std::uint64_t> GripperParticipantEngine::stop_gripper(const std::string& id,
                                                              const std::uint64_t command_id,
@@ -321,6 +508,7 @@ Result<std::uint64_t> GripperParticipantEngine::PrepareCapabilityCommand(
                  {{"reason", "prepared_command_session_allocation_failed"}}});
   }
   session->actuation = actuation;
+  session->engine_owner = recovery_identity_;
   session->state = ResolvedPreparedCapabilityCommandStateDTO::kPrepared;
   session->backend_prepare_result = std::move(prepared.value());
 
@@ -331,13 +519,18 @@ Result<std::uint64_t> GripperParticipantEngine::PrepareCapabilityCommand(
         return value.authority.participant
                    ? &value.authority.participant->prepared_contract_digest : nullptr;
       },
-      [&](const auto& prior) {
+      [](const auto& prior)
+          -> std::optional<std::tuple<std::string, std::uint64_t, std::uint64_t>> {
         if (prior.state != ResolvedPreparedCapabilityCommandStateDTO::kDispatched ||
-            !prior.dispatch_result || !prior.dispatch_result->accepted) return false;
-        const auto status = get_gripper_status(prior.authority.participant->command_target_id.value());
+            !prior.dispatch_result || !prior.dispatch_result->accepted) return std::nullopt;
+        return std::tuple{prior.authority.participant->command_target_id.value(),
+                          prior.dispatch_result->command_id, prior.dispatch_result->generation};
+      },
+      [&](const auto& effect) {
+        const auto& [target, command_id, generation] = effect;
+        const auto status = get_gripper_status(target);
         return status.state == GripperCommandState::kExecuting &&
-               status.command_id == prior.dispatch_result->command_id &&
-               status.generation == prior.dispatch_result->generation;
+               status.command_id == command_id && status.generation == generation;
       });
 }
 
@@ -391,17 +584,26 @@ Result<GripperCommandResultDTO> GripperParticipantEngine::DispatchPreparedCapabi
         session->authority.participant ? &session->authority.participant->prepared_contract_digest : nullptr,
         prepared_contract_digest, controller_goal_id, controller_goal_generation,
         [&] {
+          // Lock order: session mutex -> backend status/map leaf lock (never the reverse).
           if (session->actuation == GripperActuationKind::kPneumatic)
             session->owner_lifecycle_generation = backend_.get_gripper_status(
                 session->authority.gripper().command_request.gripper_id).lifecycle_generation;
         });
     if (!begun.ok()) return Result<GripperCommandResultDTO>::Err(begun.error());
     if (begun.value()) return Result<GripperCommandResultDTO>::Ok(*begun.value());
+    session->admission_token.store(1, std::memory_order_release);
   }
 
   GripperCommandResultDTO dispatched;
   try {
     auto command_request = session->authority.gripper().command_request;
+    command_request.late_cancel_slot = session->late_cancel_slot;
+    command_request.prepared_session_pin = session;
+    {
+      std::lock_guard lock(session->late_cancel_slot->mutex);
+      session->late_cancel_slot->preparation_id = preparation_id;
+      session->late_cancel_slot->target = session->authority.participant->command_target_id;
+    }
     command_request.addressed_identity =
         AddressedGripperCommandIdentityDTO{session->authority.participant->operation_id,
                                            session->authority.participant->operation_revision,
@@ -409,6 +611,9 @@ Result<GripperCommandResultDTO> GripperParticipantEngine::DispatchPreparedCapabi
                                            controller_goal_id, controller_goal_generation};
     if (session->actuation == GripperActuationKind::kPneumatic) {
       command_request.owner_lifecycle_generation = session->owner_lifecycle_generation;
+      command_request.admission_token =
+          std::shared_ptr<const std::atomic<std::uint64_t>>(session, &session->admission_token);
+      command_request.admission_token_expected = 1;
       command_request.committed_owner_is_current = [this, session](const auto& identity) {
         // Provider calls this only during the same synchronous command call.
         // No engine/session mutex is acquired under backend authority; the
@@ -443,6 +648,8 @@ Result<GripperCommandResultDTO> GripperParticipantEngine::DispatchPreparedCapabi
   }
   {
     std::lock_guard lock(session->mutex);
+    session->admission_token.store(2, std::memory_order_release);
+    dispatched.late_cancel_slot = session->late_cancel_slot;
     session->RecordDispatch(dispatched);
   }
   return Result<GripperCommandResultDTO>::Ok(std::move(dispatched));
@@ -490,7 +697,10 @@ ParticipantStopStageResultDTO GripperParticipantEngine::TranslateStopStage(
   };
   if (!session)
     return refuse("gripper_stop_session_missing", "Gripper Stop has no resident preparation");
-  std::lock_guard lock(session->mutex);
+  std::unique_lock lock(session->mutex);
+  session->stop_translation_done.wait(lock, [&] { return !session->stop_translating; });
+  // authority (and participant) are immutable after admission; the session is
+  // pinned, so these stay valid after the mutex is released below.
   const auto& authority = session->authority;
   const auto& participant = authority.participant;
   if (!participant ||
@@ -543,20 +753,46 @@ ParticipantStopStageResultDTO GripperParticipantEngine::TranslateStopStage(
                   }))
     return refuse("gripper_stop_policy_mismatch", "Gripper Stop requires its logical-cancellation policy");
   const auto& id = authority.gripper().command_request.gripper_id;
+  // Capture what the backend checks need, mark this attempt in progress and
+  // release the session mutex: no engine lock is held across the backend
+  // status reads or the invalidation (which sends the ROS cancel). Kernel
+  // Stop acceptance (fence_addressed_participant_stop) takes this mutex
+  // only briefly and never waits for the cancel.
+  const auto dispatch_result = session->dispatch_result;
+  session->stop_translating = true;
+  lock.unlock();
+  struct TranslationMark {
+    PreparedCapabilityCommandSession& session;
+    bool active{true};
+    void finish(const ParticipantStopStageResultDTO* recorded) {
+      {
+        std::lock_guard relock(session.mutex);
+        // Attempts are serialized on stop_translating, so this attempt's
+        // capture is still current: record it.
+        if (recorded != nullptr) session.translated_stop = *recorded;
+        session.stop_translating = false;
+      }
+      active = false;
+      session.stop_translation_done.notify_all();
+    }
+    ~TranslationMark() {
+      if (active) finish(nullptr);
+    }
+  } mark{*session};
   const auto started = clock_.now();
   const auto before = backend_.get_gripper_status(id);
   if (before.gripper_id != id)
     return refuse("gripper_stop_target_unavailable", "Gripper Stop target status is unavailable");
-  if (!pneumatic && session->dispatch_result &&
-      (!session->dispatch_result->accepted || session->dispatch_result->error ||
-       before.command_id != session->dispatch_result->command_id ||
-       before.generation != session->dispatch_result->generation))
+  if (!pneumatic && dispatch_result &&
+      (!dispatch_result->accepted || dispatch_result->error ||
+       before.command_id != dispatch_result->command_id ||
+       before.generation != dispatch_result->generation))
     return refuse("gripper_stop_backend_command_mismatch", "Gripper Stop target names another backend command");
 
   // The maintained ROS backend's status locks are leaf map/runtime locks;
-  // invalidation drops them before scheduler/cancel calls, whose callbacks
-  // do not enter this engine. No arbitrary backend implementation is assumed.
-  // Q58/Q70: close the genuine command generation and request cancel, without
+  // invalidation drops them before its cancel call, whose callbacks do not
+  // enter this engine. No arbitrary backend implementation is assumed.
+  // Close the genuine command generation and request cancel, without
   // awaiting its transport reply or the still-returning command dispatch.
   backend_.invalidate_gripper_commands(GripperInvalidationReason::kStop);
   result.attempt_disposition = StopStageAttemptDispositionDTO::kDispatched;
@@ -571,7 +807,7 @@ ParticipantStopStageResultDTO GripperParticipantEngine::TranslateStopStage(
   if (after.gripper_id != id || !fenced || after.revision == 0U || observed < started) {
     auto failed = refuse("gripper_stop_generation_unavailable",
                          "Gripper command target did not publish its generation fence");
-    session->translated_stop = failed;
+    mark.finish(&failed);
     return failed;
   }
   JsonObjectDTO facts{
@@ -584,7 +820,7 @@ ParticipantStopStageResultDTO GripperParticipantEngine::TranslateStopStage(
       {"admission_generation", JsonValueDTO{std::to_string(after.admission_generation)}},
       {"no_further_commands", JsonValueDTO{true}},
       {"admitted_transaction_preserved", JsonValueDTO{pneumatic}},
-      {"dispatch_result_available", JsonValueDTO{session->dispatch_result.has_value()}},
+      {"dispatch_result_available", JsonValueDTO{dispatch_result.has_value()}},
       {"cancel_dispatch", JsonValueDTO{std::string("unavailable")}},
       {"cancel_dispatch_reason", JsonValueDTO{std::string("backend_does_not_publish_cancel_dispatch_status")}},
   };
@@ -611,7 +847,7 @@ ParticipantStopStageResultDTO GripperParticipantEngine::TranslateStopStage(
     result.outcome = ParticipantStopStageOutcomeDTO::kFailed;
     result.error = checked.error();
   }
-  session->translated_stop = result;
+  mark.finish(&result);
   return result;
 }
 
@@ -736,7 +972,7 @@ GripperParticipantEngine::settle_addressed_participant_stop(
       if (!closed.ok()) {
         return Result<AddressedParticipantStopSettlementDTO>::Err(closed.error());
       }
-      // Q58: the Stop's cancel is fire-and-forget, so a ROS action goal's
+      // The Stop's cancel is fire-and-forget, so a ROS action goal's
       // cancel terminal normally arrives after this settlement. The command
       // is already fenced (new idle generation), so the Stop is settled.
       // Until that terminal the backend refuses to reopen admission; the
@@ -785,6 +1021,7 @@ GripperParticipantEngine::settle_addressed_participant_stop(
 }
 
 KernelRecoveryAssessmentDTO GripperParticipantEngine::get_recovery_assessment() const {
+  try { AdvanceGripperOwnerRecovery(); } catch (...) { /* Recovery remains pending. */ }
   std::shared_ptr<PreparedCapabilityCommandSession> command_session;
   {
     std::lock_guard lock(prepared_command_session_mutex_);
@@ -848,7 +1085,7 @@ KernelRecoveryActionResultDTO GripperParticipantEngine::apply_recovery_action(
                            : backend_.try_authorize_gripper_commands();
                    !reopened.ok()) {
           // A dispatched command's Stop settlement may not have reopened
-          // admission before its cancel terminal (Q58). Consuming that Stop
+          // admission before its cancel terminal. Consuming that Stop
           // (Resume/replan or close) is the next reopen point; until the
           // terminal, refuse cleanly with the backend's typed reason.
           rejection = reopened.error();

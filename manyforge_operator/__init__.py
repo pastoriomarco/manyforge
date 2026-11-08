@@ -1,6 +1,6 @@
-"""Frozen O1.2 ManyForge operator-launch machine contracts.
+"""Frozen ManyForge operator-launch machine contracts.
 
-This package is the strict contract layer of the O1 operator-launch
+This package is the strict contract layer of the operator-launch
 correction: bounded identity, configuration, status, and command DTOs,
 the deterministic contract schema, and the pure lifecycle/start
 decisions.  It performs no I/O at import time and exports no launcher,

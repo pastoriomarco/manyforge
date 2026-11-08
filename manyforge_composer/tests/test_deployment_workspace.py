@@ -983,9 +983,6 @@ def test_deployment_preview_and_apply_are_orchestrated_server_side(
     state.authoring_workspace.remember_project(
         document={
             "scenario_id": "mock_lite6_pick_and_place",
-            "program_role_assignment": json.loads(
-                (project / "assignment.yaml").read_text(encoding="utf-8")
-            ),
         },
         document_path=str(project),
         source_document_digest="sha256:" + "6" * 64,
@@ -1056,7 +1053,9 @@ def test_deployment_preview_and_apply_are_orchestrated_server_side(
     CandidateHeadless.components = _components  # type: ignore[attr-defined]
     CandidateHeadless.component_action = _component_action  # type: ignore[attr-defined]
     CandidateHeadless.program_cycle_status = lambda _self: dict(cycle)  # type: ignore[attr-defined]
-    CandidateHeadless.authoring_admission = lambda _self: {"admission_generation": 3}  # type: ignore[attr-defined]
+    CandidateHeadless.authoring_admission = lambda _self: {  # type: ignore[attr-defined]
+        "authoring_allowed": True, "admission_generation": 3,
+    }
     CandidateHeadless.manager_apply_status = (  # type: ignore[attr-defined]
         lambda _self, apply_id, generation: {"ok": True, "state": "succeeded"}
     )
@@ -1161,14 +1160,13 @@ def test_deployment_preview_and_apply_are_orchestrated_server_side(
     }
 
     # Nothing changed since Applied: refused before the finished run's Reset
-    # or any disable, as in M7 (409 deployment_apply_nothing_to_apply).
+    # or any disable (409 deployment_apply_nothing_to_apply).
     from manyforge_composer.backend.deployment_defaults import with_defaults
 
     document = with_defaults(state.deployment_draft_session.retained_state()["document"])
     applied_context = {
         "deployment": document,
         "model_source_closure": capture_sources(state, document),
-        "program_role_assignment": deepcopy(state.scenario_program_role_assignment),
         "source_document_digest": state.scenario_source_document_digest,
         "scenario_id": state.scenario_document_id,
         "scenario_project_path": state.scenario_project_path,
@@ -1286,8 +1284,6 @@ def _scenario_revert_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     state.authoring_workspace.remember_project(
         document={
             "scenario_id": "mock_lite6_pick_and_place",
-            "program_role_assignment": json.loads(
-                (project / "assignment.yaml").read_text(encoding="utf-8")),
         },
         document_path=str(project),
         source_document_digest="sha256:" + "6" * 64,
@@ -1341,7 +1337,7 @@ def _scenario_revert_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             return []
 
         def authoring_admission(self):
-            return {"admission_generation": 1}
+            return {"authoring_allowed": True, "admission_generation": 1}
 
     state.headless_client = CandidateHeadless()  # type: ignore[assignment]
     effects: list[dict[str, Any]] = []
@@ -1453,7 +1449,7 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
         "candidate_graph_revision": "sha256:" + "5" * 64,
     }
     prepared_activation = {
-        "schema_version": "manyforge.prepared_activation_input.v6",
+        "schema_version": "manyforge.prepared_activation_input.v7",
         "origin": {"kind": "scenario", "scenario_id": "scenario-a",
                    "source_document_digest": "sha256:" + "7" * 64,
                    "project_path": "/projects/scenario-a.scenario"},
@@ -1581,7 +1577,7 @@ def test_only_typed_preacceptance_rejection_becomes_definite_manager_refusal() -
                 status_code=400,
                 details=details,
                 response={
-                    "api_version": "manyforge.manager_command_response.v1",
+                    "api_version": "manyforge.manager_command_response.v2",
                     "ok": False,
                     "error": {
                         "code": "apply_rejected",
@@ -2135,11 +2131,11 @@ def test_only_program_start_rejects_unapplied_deployment_before_transport(comman
             "program_binding_id": _DIGEST, "program_run_id": "manual-run",
             "expected_graph_revision": _DIGEST, "expected_retained_bundle_id": _DIGEST,
             "expected_scene_revision": {"scene_id": _DIGEST, "revision_id": 1, "content_hash": _DIGEST},
-            "participants": [{"component_role_id": "robot", "target_role_id": "arm",
+            "participants": [{"target": {"component_id": "robot", "command_target_id": "arm"},
                               "required_capability_id": "execution.trajectory.execute", "action_span": None,
                               "payload": {
                                   "kind": "motion", "move_id": "manual-move",
-                                  "base_frame_role_id": "base",
+                                  "base_frame": {"component_id": "robot", "frame_id": "base"},
                                   "tcp_endpoint": {"kind": "current"},
                                   "tolerances": {"joint_position_tol_rad": 0.05, "translation_tol_m": 0.005,
                                                  "rotation_tol_rad": 0.05},
@@ -2274,7 +2270,7 @@ def _configuration_preparation(tmp_path: Path):
     digest = "sha256:" + "a" * 64
     current = {"retained_bundle_id": "bundle.current", "graph_revision": "graph.current"}
     prepared_activation = {
-        "schema_version": "manyforge.prepared_activation_input.v6",
+        "schema_version": "manyforge.prepared_activation_input.v7",
         "prepared_activation_id": digest, "origin": {"kind": "scenario", "scenario_id": "cell",
         "source_document_digest": digest, "project_path": "/projects/cell.scenario"},
         "captured_input_digest": digest,
@@ -2285,7 +2281,7 @@ def _configuration_preparation(tmp_path: Path):
         "node_environment_digest": digest, "assistant_mode": "forbidden",
     }
     preview = {
-        "api_version": "manyforge.manager_command_response.v1", "ok": True,
+        "api_version": "manyforge.manager_command_response.v2", "ok": True,
         "converged": False,
         "diff": {kind: {"added": [], "changed": [], "removed": []} for kind in (
             "component_attachments", "controllable_components", "control_bindings",
@@ -2612,7 +2608,7 @@ def _scenario_robot_and_tool() -> dict[str, Any]:
 
 
 def test_grasp_confirmation_edit_enters_a_scenario_draft(tmp_path: Path) -> None:
-    """B2: a Settings edit on a Scenario component is a Draft edit, not a refusal."""
+    """A Settings edit on a Scenario component is a Draft edit, not a refusal."""
 
     client, state = _client(tmp_path)
     _seed_existing_deployment(

@@ -1,6 +1,15 @@
 #!/bin/bash
 set -e
 
+# OD-59: the strict real-time profile locks the process memory (mlockall);
+# it needs an unlimited memlock limit (`docker run --ulimit memlock=-1:-1`,
+# compose `ulimits: memlock: -1`). Refuse to start without it.
+if [ "${MANYFORGE_RT_RESOURCE_PROFILE:-off}" = "strict" ] && [ "$(ulimit -l)" != "unlimited" ]; then
+    echo "manyforge_rt_profile_refused reason=rt_memlock_limit_not_unlimited limit=$(ulimit -l):" \
+         "the strict real-time profile needs an unlimited memlock limit" >&2
+    exit 1
+fi
+
 # Add Python packages to PYTHONPATH
 # manyforge_behavior lives at /workspace/manyforge_behavior/manyforge_behavior/
 # manyforge_ros lives at /workspace/manyforge_ros/manyforge_ros/

@@ -175,9 +175,8 @@ struct RuntimeCollisionQueryResultView {
 /// Cancellation token observed by collision engines and by the
 /// CollisionValidationCoordinator / ParallelCollisionValidationWorkerPool.
 ///
-/// The kernel-native interrupt model
-/// ([`docs/spec/260-kernel-native-interrupts.md`](docs/spec/260-kernel-native-interrupts.md)
-/// §8) requires that mid-pass cancellation propagate to every worker so
+/// The kernel-native interrupt model requires that mid-pass cancellation
+/// propagate to every worker so
 /// the coordinator can produce a deterministic post-cancel
 /// `CollisionValidationDecisionBundle`. Engines MUST observe this token at
 /// waypoint boundaries and at every blocking I/O wait; an engine that
@@ -233,8 +232,8 @@ class CollisionCancellationToken {
   std::string reason_;
 };
 
-/// Backend-agnostic collision-query engine port (kernel-architecture
-/// sprint P-2-design, consuming the P-2-impl-snapshot DTO).
+/// Backend-agnostic collision-query engine port, consuming the
+/// `CollisionWorldSnapshot` DTO.
 ///
 /// The `CollisionValidationCoordinator` and the
 /// `ParallelCollisionValidationWorkerPool` consume implementations of
@@ -266,8 +265,7 @@ class CollisionCancellationToken {
 /// The concrete `CollisionWorldSnapshot` DTO lives in
 /// `<manyforge_core/types/collision_world_snapshot.hpp>`; publisher
 /// implementations remain behind
-/// `ICollisionWorldSnapshotPublisher`. This port shape is defined in
-/// spec/210 §3.8.2.
+/// `ICollisionWorldSnapshotPublisher`.
 class ICollisionQueryEngine {
  public:
   virtual ~ICollisionQueryEngine() = default;

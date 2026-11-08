@@ -459,11 +459,11 @@ private:
   SecondAdapter &second_;
 };
 
-std::unique_ptr<Ros2TransportResources> test_transport_resources(
+std::shared_ptr<Ros2TransportResources> test_transport_resources(
     std::shared_ptr<core::IExecutionStateSink> sink, core::IClock& clock,
     const std::string& group) {
   // Transport host setup is independent of adapter config validation tests.
-  return std::make_unique<Ros2TransportResources>("manyforge_transport_test_" + unique_suffix(),
+  return Ros2TransportResources::create("manyforge_transport_test_" + unique_suffix(),
                                                   "/", 3, std::move(sink), group, clock);
 }
 } // namespace

@@ -164,45 +164,29 @@ std::vector<double> NumberArray(const CanonicalValue &root,
                           Number(orientation, "z"), Number(orientation, "w")}};
 }
 
-/// Decode one portable reference. `frame_role` may carry an exact robot
-/// qualifier `target` ({target_role_id, controllable_component_id,
-/// command_target_id}); its Program-Binding agreement is checked at admission
-/// by `VerifyReferenceTargets`, never inferred here.
+/// Decode a direct component reference or one of the existing scene forms.
 [[nodiscard]] core::ReferenceDTO
-DecodeReference(const CanonicalValue &value, const bool allow_robot_target) {
+DecodeReference(const CanonicalValue &value) {
   Require(value.is_object(), "motion reference must be an object");
   const auto type = Text(value, "type");
   if (type == "cell_frame") {
     RequireExactObjectSize(value, 1U, "cell-frame reference");
-    return core::ReferenceDTO(core::ReferenceDTO::Type::kCellFrame,
-                              std::string{});
-  }
-  if (type == "frame_role") {
-    const auto *target = value.find_object_member("target");
-    if (target == nullptr) {
-      RequireExactObjectSize(value, 2U, "motion reference");
-      return core::ReferenceDTO(core::ReferenceDTO::Type::kFrameRole,
-                                Text(value, "frame_role_id"));
-    }
-    Require(allow_robot_target,
-            "robot-qualified frame reference is unsupported here");
-    RequireExactObjectSize(value, 3U, "robot frame reference");
-    RequireExactObjectSize(*target, 3U, "robot frame reference target");
-    core::ReferenceDTO reference(
-        core::FrameRoleId(Text(value, "frame_role_id")),
-        core::ReferenceTargetDTO{
-            core::TargetRoleId(Text(*target, "target_role_id")),
-            core::ControllableComponentId(
-                Text(*target, "controllable_component_id")),
-            core::CommandTargetId(Text(*target, "command_target_id"))});
-    Require(core::reference_identity_matches_type(reference),
-            "robot frame reference is incomplete");
-    return reference;
+    return core::ReferenceDTO(core::ReferenceDTO::Type::kCellFrame, std::string{});
   }
   RequireExactObjectSize(value, 2U, "motion reference");
-  if (type == "component_body_role") {
-    return core::ReferenceDTO(core::ReferenceDTO::Type::kComponentBodyRole,
-                              Text(value, "collision_body_role_id"));
+  if (type == "component_frame") {
+    const auto &frame = Member(value, "frame");
+    RequireExactObjectSize(frame, 2U, "component frame reference");
+    return core::ReferenceDTO(core::ProgramFrameReferenceDTO{
+        core::ControllableComponentId(Text(frame, "component_id")),
+        core::FrameRoleId(Text(frame, "frame_id"))});
+  }
+  if (type == "component_body") {
+    const auto &body = Member(value, "body");
+    RequireExactObjectSize(body, 2U, "component body reference");
+    return core::ReferenceDTO(core::ProgramCollisionBodyReferenceDTO{
+        core::ControllableComponentId(Text(body, "component_id")),
+        core::CollisionBodyRoleId(Text(body, "collision_body_id"))});
   }
   if (type == "scene_resource") {
     return core::ReferenceDTO(core::ReferenceDTO::Type::kSceneResource,
@@ -219,13 +203,12 @@ DecodeReference(const CanonicalValue &value, const bool allow_robot_target) {
 }
 
 [[nodiscard]] std::optional<core::ReferenceDTO>
-DecodeOptionalReference(const CanonicalValue &root, const std::string_view name,
-                        const bool allow_robot_target) {
+DecodeOptionalReference(const CanonicalValue &root, const std::string_view name) {
   const auto &value = Member(root, name);
   if (std::holds_alternative<std::nullptr_t>(value.storage())) {
     return std::nullopt;
   }
-  return DecodeReference(value, allow_robot_target);
+  return DecodeReference(value);
 }
 
 [[nodiscard]] core::MotionSpecDTO
@@ -431,7 +414,7 @@ DecodeMotionPayload(const CanonicalValue &value) {
   Require(Text(value, "kind") == "motion",
           "operation payload kind is unsupported");
 
-  // Active TCP (M7, T-MQ17): the three-form selector; the pre-M7
+  // Active TCP: the three-form selector; the older
   // `{target_role_id, frame_role_id}` endpoint is refused typed.
   auto endpoint = core::DecodeTcpSelector(Member(value, "tcp_endpoint"));
   Require(endpoint.ok(), endpoint.ok() ? std::string{} : endpoint.error().message);
@@ -466,15 +449,15 @@ DecodeMotionPayload(const CanonicalValue &value) {
     Fail("motion target mode is unsupported");
   }
   auto target_reference =
-      DecodeOptionalReference(value, "target_reference", true);
+      DecodeOptionalReference(value, "target_reference");
   auto offset_reference =
-      DecodeOptionalReference(value, "offset_reference", true);
+      DecodeOptionalReference(value, "offset_reference");
   auto goal_frame_reference =
       has_goal_frame_member
-          ? DecodeOptionalReference(value, "goal_frame_reference", true)
+          ? DecodeOptionalReference(value, "goal_frame_reference")
           : std::nullopt;
   Require(Array(value, "motion_interrupt_scopes").empty(),
-          "native motion cannot carry I8 interrupt scopes");
+          "native motion cannot carry interrupt scopes");
 
   const auto &motion = Member(value, "motion");
   auto decoded_motion = DecodeMotionSpec(motion);
@@ -540,9 +523,12 @@ DecodeMotionPayload(const CanonicalValue &value) {
     Require(inserted, "joint dynamics map repeats one name");
   }
 
+  const auto &base_frame = Member(value, "base_frame");
+  RequireExactObjectSize(base_frame, 2U, "motion base frame");
   return core::MotionParticipantIntentDTO{
       core::MoveId(Text(value, "move_id")),
-      core::FrameRoleId(Text(value, "base_frame_role_id")),
+      {core::ControllableComponentId(Text(base_frame, "component_id")),
+       core::FrameRoleId(Text(base_frame, "frame_id"))},
       std::move(endpoint.value()),
       core::TolerancesDTO{Number(tolerances, "joint_position_tol_rad"),
                           Number(tolerances, "translation_tol_m"),
@@ -646,7 +632,7 @@ DecodeParticipantPayload(const CanonicalValue &value) {
     return DecodeCapabilityCommandPayload(value);
   }
   if (kind == "set_tcp") {
-    // Active TCP (M7, T-MQ15): `{"kind": "set_tcp", "tcp": <selector>}`.
+    // Active TCP: `{"kind": "set_tcp", "tcp": <selector>}`.
     RequireExactObjectSize(value, 2U, "Set TCP payload");
     auto tcp = core::DecodeTcpSelector(Member(value, "tcp"));
     Require(tcp.ok(), tcp.ok() ? std::string{} : tcp.error().message);
@@ -712,7 +698,7 @@ DecodeOperation(const CanonicalValue &value,
     auto execution_scope =
         DecodeProgramExecutionScope(participant, attribution);
     RequireExactObjectSize(participant,
-                           5U + (execution_scope.has_value() ? 1U : 0U),
+                           4U + (execution_scope.has_value() ? 1U : 0U),
                            "operation participant");
     std::optional<core::ActionSpanDTO> action_span;
     const auto &span = Member(participant, "action_span");
@@ -721,9 +707,11 @@ DecodeOperation(const CanonicalValue &value,
     }
     auto payload = DecodeParticipantPayload(Member(participant, "payload"));
     core::CapabilityId capability(Text(participant, "required_capability_id"));
+    const auto &target = Member(participant, "target");
+    RequireExactObjectSize(target, 2U, "operation target");
     participants.push_back(core::OperationParticipantIntentDTO{
-        core::ComponentRoleId(Text(participant, "component_role_id")),
-        core::TargetRoleId(Text(participant, "target_role_id")),
+        {core::ControllableComponentId(Text(target, "component_id")),
+         core::CommandTargetId(Text(target, "command_target_id"))},
         std::move(capability), std::move(action_span), std::move(payload),
         std::move(execution_scope)});
   }
@@ -799,8 +787,8 @@ DecodePickSynthesis(const CanonicalValue &value) {
   return core::PickCandidateSynthesisIntentDTO{
       DecodePickEnvelope(Member(value, "pick_offset_envelope")),
       DecodePickEnvelope(Member(value, "approach_offset_envelope")),
-      DecodeOptionalReference(value, "pick_offset_reference", true),
-      DecodeOptionalReference(value, "approach_offset_reference", true),
+      DecodeOptionalReference(value, "pick_offset_reference"),
+      DecodeOptionalReference(value, "approach_offset_reference"),
       DecodeTriple(value, "base_tool_orientation_rpy_deg"),
       translation_step,
       rotation_step,
@@ -814,11 +802,14 @@ DecodePickSynthesis(const CanonicalValue &value) {
 DecodePickPlanningIntent(const CanonicalValue &value,
                          const core::RequestAttributionDTO &attribution) {
   RequireExactObjectSize(value, 9U, "pick planning intent");
+  const auto &carrier = Member(value, "carrier_frame");
+  RequireExactObjectSize(carrier, 2U, "pick carrier frame");
   return core::PickSequencePlanningIntentDTO{
       Text(value, "sequence_id"),
       core::SceneResourceId(Text(value, "selected_object_id")),
       core::RuntimeObjectId(Text(value, "selected_runtime_object_id")),
-      core::FrameRoleId(Text(value, "carrier_frame_role_id")),
+      {core::ControllableComponentId(Text(carrier, "component_id")),
+       core::FrameRoleId(Text(carrier, "frame_id"))},
       DecodePickSynthesis(Member(value, "synthesis")),
       DecodeOperation(Member(value, "approach_operation"), attribution),
       DecodeOperation(Member(value, "descend_operation"), attribution),
@@ -830,10 +821,13 @@ DecodePickPlanningIntent(const CanonicalValue &value,
 DecodePlacePlanningIntent(const CanonicalValue &value,
                           const core::RequestAttributionDTO &attribution) {
   RequireExactObjectSize(value, 7U, "place planning intent");
+  const auto &carrier = Member(value, "carrier_frame");
+  RequireExactObjectSize(carrier, 2U, "place carrier frame");
   return core::PlaceSequencePlanningIntentDTO{
       Text(value, "sequence_id"),
       core::SceneResourceId(Text(value, "selected_object_id")),
-      core::FrameRoleId(Text(value, "carrier_frame_role_id")),
+      {core::ControllableComponentId(Text(carrier, "component_id")),
+       core::FrameRoleId(Text(carrier, "frame_id"))},
       DecodeOperation(Member(value, "approach_operation"), attribution),
       DecodeOperation(Member(value, "descend_operation"), attribution),
       DecodeOperation(Member(value, "tool_operation"), attribution),
@@ -963,8 +957,8 @@ DecodeRuntimeScaleControlSelector(const CanonicalValue &value) {
     RequireExactObjectSize(value, 3U, "runtime-scale control selector");
     return core::RuntimeScaleControlSelectorDTO{
         core::ProgramBindingId(Text(value, "program_binding_id")),
-        core::ComponentRoleId(Text(value, "component_role_id")),
-        core::TargetRoleId(Text(value, "target_role_id"))};
+        core::ControllableComponentId(Text(value, "component_id")),
+        core::CommandTargetId(Text(value, "command_target_id"))};
   }
   RequireExactObjectSize(value, 2U, "runtime-scale group selector");
   const auto &targets = Array(value, "group_targets");
@@ -976,8 +970,8 @@ DecodeRuntimeScaleControlSelector(const CanonicalValue &value) {
   for (const auto &target : targets) {
     RequireExactObjectSize(target, 2U, "runtime-scale group target");
     core::RuntimeScaleControlTargetDTO item{
-        core::ComponentRoleId(Text(target, "component_role_id")),
-        core::TargetRoleId(Text(target, "target_role_id"))};
+        core::ControllableComponentId(Text(target, "component_id")),
+        core::CommandTargetId(Text(target, "command_target_id"))};
     Require(std::none_of(decoded.begin(), decoded.end(),
                          [&](const auto &prior) { return prior == item; }),
             "runtime-scale group selector contains duplicate targets");
@@ -985,7 +979,7 @@ DecodeRuntimeScaleControlSelector(const CanonicalValue &value) {
   }
   return core::RuntimeScaleControlSelectorDTO{
       core::ProgramBindingId(Text(value, "program_binding_id")),
-      core::ComponentRoleId(""), core::TargetRoleId(""), std::move(decoded)};
+      core::ControllableComponentId(""), core::CommandTargetId(""), std::move(decoded)};
 }
 
 [[nodiscard]] core::RuntimeScaleControlRequestDTO
@@ -1084,6 +1078,7 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
 /// beside Stop on the independent control socket, never on the ordinary one.
 [[nodiscard]] bool IsStopLaneRead(const CommandKind kind) noexcept {
   return kind == CommandKind::kReadStop || kind == CommandKind::kReadComponentModel ||
+         kind == CommandKind::kComponentRecoveryPreflight ||
          kind == CommandKind::kComponentAction;
 }
 
@@ -1278,12 +1273,11 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
       change = core::ProgramMockSimulationChangeDTO{Counter(value, "after_ms", 0U), Boolean(value, "value")};
     }
     core::ProgramMockSimulationSignalDTO next{
-        core::TargetRoleId(Text(selector, "target_role")),
-        core::ResourceRoleId(Text(selector, "resource_role")), Boolean(row, "start_value"), change};
+        {core::ControllableComponentId(Text(selector, "component_id")),
+         Text(selector, "signal_name")}, Boolean(row, "start_value"), change};
     if (!result.empty()) {
       const auto& previous = result.back();
-      Require(previous.target_role_id < next.target_role_id ||
-                  (previous.target_role_id == next.target_role_id && previous.resource_role_id < next.resource_role_id),
+      Require(previous.signal < next.signal,
               "Mock simulation selectors must be sorted and unique");
     }
     result.push_back(std::move(next));
@@ -1356,7 +1350,7 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     const auto& request = Member(root, "request");
     const bool ending = command == "end_mock_io_node_simulation";
     RequireExactObjectSize(request, ending ? 9U : 10U, "Node Mock simulation request");
-    Require(Text(request, "schema_version") == (ending ? "manyforge.mock_io_node_end.v1" : "manyforge.mock_io_node_start.v1"),
+    Require(Text(request, "schema_version") == (ending ? "manyforge.mock_io_node_end.v1" : "manyforge.mock_io_node_start.v2"),
             "Node Mock simulation schema is unsupported");
     core::ProgramNodeExecutionScopeDTO node{core::ProgramNodeInstanceId(Text(request, "node_instance_id")),
                                            Text(request, "node_attempt_id")};
@@ -1383,22 +1377,25 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
                 !attribution.principal_id.has_value(),
             "Mock input commands require internal owner attribution");
     const auto &request = Member(root, "request");
-    RequireExactObjectSize(request, 7U, "Mock input request");
-    Require(Text(request, "schema_version") == "manyforge.mock_io_input_request.v1",
+    RequireExactObjectSize(request, 6U, "Mock input request");
+    Require(Text(request, "schema_version") == "manyforge.mock_io_input_request.v2",
             "Mock input request schema is unsupported");
     // Validate before nested aggregate construction so refusal unwinds only
     // independent owning locals, preserving the original field order.
     auto owner = core::RequestOwnerEpoch(Text(request, "owner_epoch"));
     auto binding = core::ProgramBindingId(Text(request, "program_binding_id"));
-    auto target = core::TargetRoleId(Text(request, "target_role_id"));
-    auto resource = core::ResourceRoleId(Text(request, "resource_role_id"));
+    const auto &signal = Member(request, "signal");
+    RequireExactObjectSize(signal, 2U, "Mock input signal");
+    core::ProgramSignalReferenceDTO reference{
+        core::ControllableComponentId(Text(signal, "component_id")),
+        Text(signal, "signal_name")};
     auto source_epoch =
         core::IoSourceIncarnation(Text(request, "expected_source_epoch"));
     const auto value = Boolean(request, "value");
     Command decoded{CommandKind::kSetMockIoInput};
     decoded.mock_io_input_set = MockIoInputSetRequest{
-        {std::move(owner), std::move(binding), std::move(target), {}, {}, {},
-         std::move(resource)},
+        {std::move(owner), std::move(binding), std::nullopt, {}, {}, {},
+         std::move(reference)},
         std::move(source_epoch), value};
     return decoded;
   }
@@ -1457,11 +1454,12 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
       return decoded;
     }
     const auto &request = Member(root, "request");
-    RequireExactObjectSize(request, 11U, "I/O watch request");
-    Require(Text(request, "schema_version") == "manyforge.io_watch_request.v1",
+    RequireExactObjectSize(request, 10U, "I/O watch request");
+    Require(Text(request, "schema_version") == "manyforge.io_watch_request.v2",
             "I/O watch request schema is unsupported");
     const auto& condition = Member(request, "condition");
     RequireExactObjectSize(condition, 2U, "I/O watch condition");
+    RequireExactObjectSize(Member(request, "signal"), 2U, "I/O watch signal");
     core::ProgramNodeExecutionScopeDTO node{
         core::ProgramNodeInstanceId(Text(request, "node_instance_id")),
         Text(request, "node_attempt_id")};
@@ -1474,8 +1472,8 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
         core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
         core::CellAdmissionClaimGeneration(Counter(request, "claim_generation", 1U)),
         core::ProgramRunId(Text(request, "program_run_id")), std::move(node),
-        core::TargetRoleId(Text(request, "target_role_id")),
-        core::ResourceRoleId(Text(request, "resource_role_id")),
+        {core::ControllableComponentId(Text(Member(request, "signal"), "component_id")),
+         Text(Member(request, "signal"), "signal_name")},
         Boolean(condition, "expected_value")};
     return decoded;
   }
@@ -1635,7 +1633,11 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     RequireExactObjectSize(root, 4U, "attach Active TCP query");
     Command decoded{CommandKind::kResolveAttachActiveTcp};
     decoded.attach_binding_id = core::ProgramBindingId(Text(root, "program_binding_id"));
-    decoded.attach_holder_role = core::TargetRoleId(Text(root, "target_role_id"));
+    const auto &target = Member(root, "target");
+    RequireExactObjectSize(target, 2U, "attach holder target");
+    decoded.attach_holder = core::ProgramTargetReferenceDTO{
+        core::ControllableComponentId(Text(target, "component_id")),
+        core::CommandTargetId(Text(target, "command_target_id"))};
     return decoded;
   }
   if (command == "read_active_tcp") {
@@ -1662,7 +1664,7 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     if (kind == "frame_transform") {
       RequireExactObjectSize(query, 7U, "frame transform query");
       Require(Text(query, "schema_version") ==
-                  "manyforge.target_observation_query.v1",
+                  "manyforge.target_observation_query.v2",
               "target observation query schema is unsupported");
       const auto &pose = Member(query, "pose");
       const auto &source = Member(query, "source_frame");
@@ -1671,24 +1673,28 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
       decoded.target_query = TargetObservationQuery{
           core::RequestOwnerEpoch(Text(query, "owner_epoch")),
           core::ProgramBindingId(Text(query, "program_binding_id")),
-          core::TargetRoleId(std::string{}),
           std::nullopt,
           std::nullopt,
-          FrameTransformQuery{DecodePose(pose), DecodeReference(source, true),
-                              DecodeReference(target, true), pose, source,
+          std::nullopt,
+          FrameTransformQuery{DecodePose(pose), DecodeReference(source),
+                              DecodeReference(target), pose, source,
                               target}};
       return decoded;
     }
     if (kind == "io_signal") {
-      RequireExactObjectSize(query, 6U, "I/O signal query");
-      Require(Text(query, "schema_version") == "manyforge.target_observation_query.v1",
+      RequireExactObjectSize(query, 5U, "I/O signal query");
+      Require(Text(query, "schema_version") == "manyforge.target_observation_query.v2",
               "target observation query schema is unsupported");
+      const auto &signal = Member(query, "signal");
+      RequireExactObjectSize(signal, 2U, "I/O signal reference");
       Command decoded{CommandKind::kQueryTarget};
       decoded.target_query = TargetObservationQuery{
           core::RequestOwnerEpoch(Text(query, "owner_epoch")),
           core::ProgramBindingId(Text(query, "program_binding_id")),
-          core::TargetRoleId(Text(query, "target_role_id")), {}, {}, {},
-          core::ResourceRoleId(Text(query, "resource_role_id"))};
+          std::nullopt, {}, {}, {},
+          core::ProgramSignalReferenceDTO{
+              core::ControllableComponentId(Text(signal, "component_id")),
+              Text(signal, "signal_name")}};
       return decoded;
     }
     Require(kind == "frame_pose" || kind == "gripper_status",
@@ -1700,25 +1706,31 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
       RequireExactObjectSize(query, 5U, "target observation query");
     }
     Require(Text(query, "schema_version") ==
-                "manyforge.target_observation_query.v1",
+                "manyforge.target_observation_query.v2",
             "target observation query schema is unsupported");
     const auto relative_frame =
         std::find_if(query.as_object().begin(), query.as_object().end(),
                      [](const auto &member) {
-                       return member.first == "relative_to_frame_role_id";
+                       return member.first == "relative_to_frame";
                      });
     Command decoded{CommandKind::kQueryTarget};
+    const auto &target = Member(query, "target");
+    RequireExactObjectSize(target, 2U, "observation target");
+    const auto decode_frame = [&](const CanonicalValue &frame) {
+      RequireExactObjectSize(frame, 2U, "observation frame");
+      return core::ProgramFrameReferenceDTO{
+          core::ControllableComponentId(Text(frame, "component_id")),
+          core::FrameRoleId(Text(frame, "frame_id"))};
+    };
     decoded.target_query = TargetObservationQuery{
         core::RequestOwnerEpoch(Text(query, "owner_epoch")),
         core::ProgramBindingId(Text(query, "program_binding_id")),
-        core::TargetRoleId(Text(query, "target_role_id")),
-        kind == "frame_pose"
-            ? std::optional(core::FrameRoleId(Text(query, "frame_role_id")))
-            : std::nullopt,
+        core::ProgramTargetReferenceDTO{
+            core::ControllableComponentId(Text(target, "component_id")),
+            core::CommandTargetId(Text(target, "command_target_id"))},
+        kind == "frame_pose" ? std::optional(decode_frame(Member(query, "frame"))) : std::nullopt,
         kind == "frame_pose" && relative_frame != query.as_object().end()
-            ? std::optional(
-                  core::FrameRoleId(Text(query, "relative_to_frame_role_id")))
-            : std::nullopt};
+            ? std::optional(decode_frame(Member(query, "relative_to_frame"))) : std::nullopt};
     return decoded;
   }
   if (command == "query_operation") {
@@ -1726,14 +1738,17 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     const auto &query = Member(root, "query");
     RequireExactObjectSize(query, 5U, "Program operation query");
     Require(Text(query, "schema_version") ==
-                "manyforge.program_operation_query.v1",
+                "manyforge.program_operation_query.v2",
             "Program operation query schema is unsupported");
     Command decoded{CommandKind::kQueryOperation};
+    const auto &target = Member(query, "target");
+    RequireExactObjectSize(target, 2U, "operation query target");
     decoded.operation_query = ProgramOperationQuery{
         core::RequestOwnerEpoch(Text(query, "owner_epoch")),
         core::ProgramBindingId(Text(query, "program_binding_id")),
         core::ProgramRunId(Text(query, "program_run_id")),
-        core::TargetRoleId(Text(query, "target_role_id"))};
+        {core::ControllableComponentId(Text(target, "component_id")),
+         core::CommandTargetId(Text(target, "command_target_id"))}};
     return decoded;
   }
   if (command == "control_state") {
@@ -1937,15 +1952,46 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     RequireExactObjectSize(root, 2U, "component model query command");
     return Command{CommandKind::kReadComponentModel};
   }
+  if (command == "component_recovery_preflight") {
+    RequireExactObjectSize(root, 3U, "component recovery preflight command");
+    const auto &request = Member(root, "request");
+    RequireExactObjectSize(request, 1U, "component recovery preflight request");
+    Command decoded{CommandKind::kComponentRecoveryPreflight};
+    decoded.component_id = Text(request, "component_id");
+    return decoded;
+  }
   if (command == "component_action") {
     RequireExactObjectSize(root, 3U, "component action command");
     const auto &request = Member(root, "request");
-    RequireExactObjectSize(request, 2U, "component action request");
+    const auto *confirmation = request.find_object_member("recovery_preflight");
+    RequireExactObjectSize(request, confirmation ? 3U : 2U, "component action request");
     Command decoded{CommandKind::kComponentAction};
     decoded.component_id = Text(request, "component_id");
     const auto action = core::parse_component_action(Text(request, "action"));
     Require(action.has_value(), "component action is not a known action");
     decoded.component_action = *action;
+    if (confirmation) {
+      Require(*action == core::ComponentAction::kEnable,
+              "recovery preflight is only valid for Enable");
+      RequireExactObjectSize(*confirmation, 2U, "component recovery confirmation");
+      ComponentRecoveryConfirmation selected;
+      selected.snapshot_id = Text(*confirmation, "snapshot_id");
+      const auto &rows = Member(*confirmation, "confirmed");
+      Require(rows.is_array() && !rows.as_array().empty() && rows.as_array().size() <= 2U,
+              "recovery confirmation must name the member and optional owner");
+      for (const auto &row : rows.as_array()) {
+        RequireExactObjectSize(row, 6U, "component recovery fact");
+        core::ComponentRecoveryFact fact{Text(row, "component_id"), OptionalText(row, "cause_code"),
+                                         OptionalText(row, "vendor_code"), Text(row, "eligibility")};
+        fact.stop_code = OptionalText(row, "stop_code");
+        fact.stop_vendor_code = OptionalText(row, "stop_vendor_code");
+        Require(fact.eligibility == "ready" || fact.eligibility == "recover" ||
+                    fact.eligibility == "blocked" || fact.eligibility == "unknown" ||
+                    fact.eligibility == "excluded", "unknown component recovery eligibility");
+        selected.confirmed.push_back(std::move(fact));
+      }
+      decoded.recovery_preflight = std::move(selected);
+    }
     return decoded;
   }
   if (command == "set_rule_active") {
@@ -1968,7 +2014,7 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     return decoded;
   }
   if (command == "set_io_output") {
-    // CONTRACTS §7: `signal_id` is `<component_id>/<signal_name>`.
+    // `signal_id` is `<component_id>/<signal_name>`.
     RequireExactObjectSize(root, 3U, "set I/O output command");
     const auto &request = Member(root, "request");
     RequireExactObjectSize(request, 3U, "set I/O output request");

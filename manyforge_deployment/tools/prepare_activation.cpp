@@ -16,11 +16,13 @@
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/initial_scene_projection.hpp>
 #include <manyforge_deployment/prepared_activation_input.hpp>
+#include <manyforge_deployment/activation_content_collection.hpp>
 #include <manyforge_deployment/prepared_activation_repository.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_io_stop_response_validation.hpp>
 #include <manyforge_deployment/program_contract.hpp>
+#include <manyforge_deployment/program_reference_diagnostics.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <manyforge_deployment/scenario_program_admission.hpp>
@@ -33,44 +35,40 @@
 #include "activation_prepared_model_closure_internal.hpp"
 #include "activation_prepared_model_internal.hpp"
 #include "prepared_activation_materialization_internal.hpp"
+#include "prepared_catalog_source_internal.hpp"
 
 namespace {
 
 namespace core = manyforge::core;
 namespace deployment = manyforge::deployment;
 
+// Headless enforces the same stdout bound, including the trailing newline.
+constexpr std::size_t kReferenceRefusalOutputBytes = 1024U * 1024U;
+
+class ProgramReferenceRefusal final : public std::exception {
+ public:
+  explicit ProgramReferenceRefusal(
+      const std::vector<deployment::ProgramReferenceDiagnostic> &diagnostics)
+      : output_(encode(diagnostics)) {}
+  [[nodiscard]] const char *what() const noexcept override {
+    return "Program references are invalid for the candidate Deployment";
+  }
+  [[nodiscard]] const std::string &output() const noexcept { return output_; }
+
+ private:
+  static std::string encode(
+      const std::vector<deployment::ProgramReferenceDiagnostic> &diagnostics) {
+    return deployment::bounded_program_reference_refusal(
+        diagnostics, kReferenceRefusalOutputBytes);
+  }
+  std::string output_;
+};
+
 struct Options final {
   std::filesystem::path input;
   std::filesystem::path capability_root;
   std::filesystem::path activation_root;
   bool publish_canonical_empty{false};
-};
-
-class PreparedCatalogSource final
-    : public deployment::ICatalogArtifactSource {
- public:
-  explicit PreparedCatalogSource(
-      const std::vector<deployment::detail::PreparedActivationArtifact> &values)
-      : values_(values) {}
-
-  [[nodiscard]] std::optional<std::string> get_verified(
-      const core::ContentAddressedStoreKey &key,
-      const core::ContentDigest &digest,
-      std::optional<std::uint64_t> size) const override {
-    const auto found = std::find_if(values_.begin(), values_.end(),
-                                    [&](const auto &value) {
-      return value.content_addressed_store_key == key;
-    });
-    if (found == values_.end() || found->content_digest != digest ||
-        (size.has_value() && found->bytes.size() != *size) ||
-        deployment::sha256_digest(found->bytes) != digest.value()) {
-      return std::nullopt;
-    }
-    return found->bytes;
-  }
-
- private:
-  const std::vector<deployment::detail::PreparedActivationArtifact> &values_;
 };
 
 [[nodiscard]] Options parse_options(int argc, char **argv) {
@@ -168,9 +166,10 @@ void materialize_activation(
           "prepared Program binding has no retained model map");
     }
     deployment::FilesystemProgramBindingRepository store(activation_root);
+    deployment::FilesystemCatalogArtifactStore catalogs(activation_root);
     static_cast<void>(store.put_if_absent(
         closure.program_binding, *closure.retained_bundle,
-        *closure.retained_model_map));
+        *closure.retained_model_map, catalogs));
   }
 }
 
@@ -299,17 +298,16 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
           deployment::kMaxActivationPreparationRequestBytes);
   const auto &root = request.root();
   if (text(member(root, "schema_version", "request"), "schema_version") !=
-      "manyforge.activation_preparation_request.v3") {
+      "manyforge.activation_preparation_request.v4") {
     throw std::invalid_argument(
-        "unsupported activation preparation request version (only v3; "
-        "launch-time typed_parameter_overrides were removed)");
+        "unsupported activation preparation request version (only v4)");
   }
   require_exact_fields(root,
                        {"schema_version", "runtime_cell_id",
                         "source_document_digest", "scenario_id", "project_path",
                         "captured_input_digest", "deployment",
                         "model_source_closure", "prepared_model_closure",
-                        "program", "program_role_assignment"},
+                        "program"},
                        "activation preparation request");
   const auto &source_digest =
       text(member(root, "source_document_digest", "request"),
@@ -350,17 +348,17 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
   const auto &prepared_model_closure =
       member(root, "prepared_model_closure", "request");
   const auto &program_value = member(root, "program", "request");
-  const auto &assignment_value =
-      member(root, "program_role_assignment", "request");
   static_cast<void>(object(deployment_value, "deployment"));
   static_cast<void>(object(model_source_closure, "model_source_closure"));
   static_cast<void>(object(prepared_model_closure, "prepared_model_closure"));
-  if (!program_value.is_null()) static_cast<void>(object(program_value, "program"));
+  if (!program_value.is_null()) {
+    static_cast<void>(object(program_value, "program"));
+    deployment::require_supported_program_format(program_value);
+  }
   const deployment::CanonicalValue captured(deployment::CanonicalValue::Object{
       {"deployment", deployment_value},
       {"model_source_closure", model_source_closure},
       {"program", program_value},
-      {"program_role_assignment", assignment_value},
       {"scenario_id", deployment::CanonicalValue(scenario_id)},
       {"project_path", deployment::CanonicalValue(project_path)},
       {"source_document_digest", deployment::CanonicalValue(source_digest)},
@@ -369,57 +367,32 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
       captured_digest) {
     throw std::invalid_argument("captured_input_digest does not match request");
   }
-  auto captured_sources =
-      deployment::detail::parse_activation_model_source_closure(
-          model_source_closure);
-  auto deployment_intent =
-      deployment::detail::parse_activation_deployment_intent(
-          deployment_value, std::move(captured_sources));
-  const auto component_profiles =
-      deployment::detail::resolve_activation_component_profiles(
-          options.capability_root, deployment_intent);
-  // CONTRACTS §16: I/O members become ordinary I/O device rows.
-  deployment::detail::expand_activation_machine_members(deployment_intent,
-                                                        component_profiles);
-  auto prepared_sources =
-      deployment::detail::parse_activation_prepared_model_closure(
-          prepared_model_closure);
-  std::vector<deployment::detail::ActivationPreparedModel> prepared_models;
-  try {
-    prepared_models = deployment::detail::qualify_activation_prepared_models(
-        deployment_intent, component_profiles, std::move(prepared_sources));
-  } catch (const std::length_error &error) {
-    throw std::runtime_error(
-        std::string("prepared-model qualification produced an invalid size: ") +
-        error.what());
-  }
-
-  const auto materialized = deployment::detail::materialize_prepared_activation(
-      options.capability_root, std::move(prepared_models),
-      deployment_intent, runtime_cell_id, component_profiles, options.publish_canonical_empty);
+  const auto candidate = deployment::detail::build_prepared_activation_candidate(
+      options.capability_root, deployment_value, model_source_closure,
+      prepared_model_closure, runtime_cell_id, options.publish_canonical_empty);
+  const auto &materialized = *candidate;
   std::shared_ptr<const deployment::ProgramBindingContract> program;
   const auto mode = program_value.is_null()
                         ? deployment::ScenarioAssistantMode::kOptional
                         : assistant_mode(program_value);
-  const PreparedCatalogSource catalog_store(materialized.catalog_artifacts);
-  // Bind the preserved authored Program to this candidate. A Program whose
-  // roles no longer resolve is prepared as explicitly non-executable (H1a);
-  // malformed input or unexpected failures still abort here.
+  const deployment::detail::PreparedCatalogSource catalog_store(materialized.catalog_artifacts);
+  // Bind the preserved authored Program to this candidate. Malformed input
+  // and unexpected failures abort preparation before publication.
   deployment::ProgramBindingOutcome outcome;
   if (!program_value.is_null()) {
     program = deployment::verify_program_binding_contract(
-        deployment::canonical_json(program_value), *materialized.bundle);
+        deployment::canonical_json(program_value), *materialized.bundle,
+        materialized.model_map, catalog_store);
     deployment::verify_scenario_program_admission(
         program->normalized_program_root(), materialized.bundle->value(),
         materialized.deployment_compatibility, mode);
     outcome = deployment::compile_program_binding_outcome(
-        *program, deployment::parse_program_role_assignment(assignment_value),
-        *materialized.bundle, materialized.model_map, catalog_store);
+        *program, *materialized.bundle, materialized.model_map, catalog_store);
   }
   const auto &binding = outcome.binding;
   auto raw_artifact_rows = artifact_rows(materialized.raw_artifacts);
   // The complete assembled input is independently verified below, including
-  // strict absence of identities and assignments for no_program.
+  // strict absence of identities for no_program.
   deployment::CanonicalValue program_outcome(nullptr);
   deployment::CanonicalValue program_binding_payload(nullptr);
   if (program == nullptr) {
@@ -433,7 +406,7 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
     }
     const auto reverified_binding = deployment::reload_verified_program_binding(
         binding->canonical_bytes(), *materialized.bundle,
-        *materialized.model_map);
+        *materialized.model_map, catalog_store);
     if (reverified_binding == nullptr ||
         reverified_binding->program_binding_id() !=
             binding->program_binding_id()) {
@@ -466,7 +439,7 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
     }
     // Refuse rather than drop an authored Scene object that needs a binding.
     static_cast<void>(deployment::project_resolved_initial_scene(
-        *program, *outcome.resolved_roles,
+        *program, *outcome.resolved_references,
         materialized.bundle->value().cell_graph.cell_id));
     program_outcome = deployment::CanonicalValue(deployment::CanonicalValue::Object{
         {"kind", deployment::CanonicalValue("non_executable")},
@@ -486,7 +459,6 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
                            ? program->normalized_program_root()
                            : deployment::CanonicalValue(nullptr)},
            {"program_binding", std::move(program_binding_payload)},
-           {"program_role_assignment", assignment_value},
            {"raw_artifacts", deployment::prepared_activation_artifact_rows(
                                  std::move(raw_artifact_rows))},
            {"retained_bundle", materialized.bundle->normalized_root()},
@@ -530,6 +502,11 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
   auto prepared = deployment::parse_prepared_activation_input(result);
   // The recorded Program outcome must be exactly what recompilation yields.
   deployment::verify_prepared_program_outcome(prepared);
+  // Hold the writer lock from the first content write until everything it
+  // wrote is named by a published prepared activation or admission: the
+  // Manager's content collection never runs in between.
+  const deployment::ActivationContentWriterLock writing(
+      options.activation_root);
   materialize_activation(prepared, options.activation_root);
   // Publish the whole prepared value last, after everything it references:
   // the Manager accepts an Apply only for a stored, reverified value.
@@ -592,6 +569,27 @@ int main(int argc, char **argv) {
         std::filesystem::canonical(options.activation_root);
     std::cout << deployment::canonical_json(prepare(options)) << '\n';
     return 0;
+  } catch (const ProgramReferenceRefusal &error) {
+    std::cout << error.output() << '\n';
+    return 2;
+  } catch (const deployment::ProgramReferenceValidationRefusal &error) {
+    std::cout << deployment::bounded_program_reference_refusal(
+        error.diagnostics(), kReferenceRefusalOutputBytes) << '\n';
+    return 2;
+  } catch (const deployment::ProgramContractError &error) {
+    if (error.unsupported_format()) {
+      const auto &format = *error.unsupported_format();
+      const deployment::CanonicalValue refusal(deployment::CanonicalValue::Object{
+          {"code", deployment::CanonicalValue(error.code())},
+          {"details", deployment::CanonicalValue(deployment::CanonicalValue::Object{
+              {"actual_api_version", deployment::CanonicalValue(format.actual_api_version)},
+              {"supported_api_version", deployment::CanonicalValue(format.supported_api_version)},
+          })},
+      });
+      std::cout << deployment::canonical_json(refusal) << '\n';
+    }
+    std::cerr << "manyforge_prepare_activation: " << error.what() << '\n';
+    return 2;
   } catch (const core::TypedError &error) {
     // A typed refusal: its catalog code on stdout (nothing else is written
     // there on failure) for the preparer; the same text on stderr.

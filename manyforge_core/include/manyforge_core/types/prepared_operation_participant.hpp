@@ -23,7 +23,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kPreparedOperationParticipantApiVersion =
-    "manyforge.prepared_operation_participant.v2";
+    "manyforge.prepared_operation_participant.v3";
 inline constexpr std::string_view kPreparedOperationParticipantIdentityDomain =
     "prepared-operation-participant-contract-digest";
 
@@ -178,7 +178,7 @@ struct PreparedOperationParticipantDTO final {
   CapabilityId capability_id;
   CapabilityDefinitionRevision capability_definition_revision;
   std::vector<ProgramModelRoleBindingDTO> model_bindings;
-  std::vector<ProgramFrameRoleBindingDTO> frame_bindings;
+  std::vector<ProgramFrameBindingDTO> frame_bindings;
   ParticipantBindingIdentityDTO binding_identity;
   std::vector<ResourceId> resources;
   std::vector<RuntimeUnitEpochBindingDTO> runtime_unit_epochs;
@@ -197,7 +197,7 @@ struct PreparedOperationParticipantDTO final {
       CommandTargetId command_target_id, CapabilityId capability_id,
       CapabilityDefinitionRevision capability_definition_revision,
       std::vector<ProgramModelRoleBindingDTO> model_bindings,
-      std::vector<ProgramFrameRoleBindingDTO> frame_bindings, ControlDomainId control_domain_id,
+      std::vector<ProgramFrameBindingDTO> frame_bindings, ControlDomainId control_domain_id,
       ControlDomainRevision control_domain_revision, ControlBindingId control_binding_id,
       ControlBindingRevision control_binding_revision,
       ControlInterfaceContractId control_interface_contract_id,
@@ -263,18 +263,19 @@ struct PreparedOperationParticipantDTO final {
   }
 };
 
-/// Active TCP (M7): the TCP entry of a prepared motion, for the lane's TCP
+/// Active TCP: the TCP entry of a prepared motion, for the lane's TCP
 /// step (`ExecutionPortParticipantConfig::apply_tool_context`): its
-/// endpoint's target and frame role, owned by the component the Kernel
-/// stamped on the request's TCP frame (B7). Absent without a motion endpoint.
-[[nodiscard]] inline std::optional<TcpEntryDTO> prepared_motion_tcp_entry(
+/// endpoint's exact captured target and frame reference. Absent without a
+/// motion endpoint.
+[[nodiscard]] inline std::optional<TcpEntryReferenceDTO> prepared_motion_tcp_entry(
     const PreparedOperationParticipantDTO& participant) {
   const auto* motion = std::get_if<PreparedMotionExecutionDTO>(&participant.payload);
   const auto* tcp = motion == nullptr ? nullptr
                                       : std::get_if<ResolvedComponentModelFrameDTO>(
                                             &motion->plan_request.tcp_frame);
   if (tcp == nullptr || !participant.motion_endpoint) return std::nullopt;
-  return tcp_entry_of(*participant.motion_endpoint, tcp->controllable_component_id);
+  return TcpEntryReferenceDTO{participant.motion_endpoint->target,
+                              participant.motion_endpoint->frame.reference};
 }
 
 }  // namespace manyforge::core

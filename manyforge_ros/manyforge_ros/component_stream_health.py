@@ -1,4 +1,4 @@
-"""CP9 component stream health: adapter-side sample sink.
+"""Component stream health: adapter-side sample sink.
 
 ``ComponentStreamSink`` forwards samples and fault events of one stream from an adapter process to the execution host,
 which records them into the stream the host-side adapter declared.

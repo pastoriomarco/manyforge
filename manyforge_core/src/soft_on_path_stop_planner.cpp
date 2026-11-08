@@ -30,7 +30,7 @@ std::optional<double> spring_back_return_start_s(double forward_end_s, double ph
   return start_s;
 }
 
-// Jerk limits for one Stop phase (Q36, as main 1073-1086 and 1491-1499):
+// Jerk limits for one Stop phase (as main):
 // an authored (deployment) jerk is used verbatim; a joint without one gets
 // main's default from its acceleration limit and this phase's own duration
 // (`reference_s`: soft ramp = deceleration time - lead-in, spring-back return
@@ -120,8 +120,8 @@ std::optional<std::map<std::string, double>> angular_deceleration_limits(
   return limits;
 }
 
-// Every trajectory a Stop is planned for carries its prepared time-law bounds
-// (item 6): the spring-back return cap reads them.
+// Every trajectory a Stop is planned for carries its prepared time-law bounds:
+// the spring-back return cap reads them.
 std::optional<std::pair<std::string, std::string>> runtime_scale_bounds_error(
     const TrajectoryDTO& trajectory) {
   if (!trajectory.runtime_scale_bounds) {
@@ -1037,7 +1037,7 @@ Result<ResolvedStopInitialState> resolve_stop_initial_state(
   const double path_start_s = accepted_trajectory.waypoints.front().time_from_start_s;
   const double path_end_s = accepted_trajectory.waypoints.back().time_from_start_s;
 
-  // As main (item 24): the command-frame lead-in sits inside the deceleration
+  // As main: the command-frame lead-in sits inside the deceleration
   // time, so the ramp itself lasts deceleration_time_s - stop_traj_delta_s.
   const double effective_ramp_s = *stop_profile.deceleration_time_s - config.stop_traj_delta_s;
   if (effective_ramp_s <= kEpsilon) {
@@ -1094,7 +1094,7 @@ Result<ResolvedStopInitialState> resolve_stop_initial_state(
         "soft_on_path requires measured velocity unless model fallback is authorized");
   }
 
-  // Seam cursor (TARGET §4.8 authority): the lead-in and ramp anchor here, so it
+  // Seam cursor: the lead-in and ramp anchor here, so it
   // MUST be the command frame, not the lagging measured-position projection —
   // anchoring on the projection re-issues points the controller's command has
   // already passed. Model/command authority uses the active command cursor
@@ -1283,7 +1283,7 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
     }
   }
 
-  // As main (Q38): the speed factor is frozen at the Stop request, so the
+  // As main: the speed factor is frozen at the Stop request, so the
   // lead-in continues at that constant rate and the ramp starts from it with
   // zero path acceleration.
   const double handoff_path_time = seam_cursor_s + path_time_rate * config.stop_traj_delta_s;
@@ -1293,7 +1293,7 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
         {"projected_time_from_start_s", format_double(projection.time_from_start_s)},
         {"stop_path_time_s", format_double(stop_path_time)},
         {"trajectory_end_time_s", format_double(path_end_s)}};
-    // main's natural-completion predicate (item 2): the ramp overruns the
+    // main's natural-completion predicate: the ramp overruns the
     // accepted path end. Decided here, once; spring-back does not re-check it.
     if (stop_profile.allow_natural_completion_on_short_path) {
       details["recommended_disposition"] = interrupt_structured_string("natural_completion");
@@ -1305,7 +1305,7 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
                           std::move(details));
   }
 
-  // Q36: authored jerk verbatim, else main's default for this ramp, derived
+  // Authored jerk verbatim, else main's default for this ramp, derived
   // from the deceleration time minus this lane's lead-in.
   const auto phase_jerk = detail::stop_phase_jerk_limits(
       accepted_trajectory, per_joint_max_deceleration_rad_s2, config, effective_ramp_s);
@@ -1347,7 +1347,7 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   plan.diagnostics["jerk_limit_source"] = plan.jerk_limit_source;
 
   plan.replacement_trajectory.joint_names = accepted_trajectory.joint_names;
-  // Command-frame lead-in seam (TARGET §5.4): open the replacement with the
+  // Command-frame lead-in seam: open the replacement with the
   // in-flight accepted trajectory itself, resampled at the current command rate
   // from the trip cursor for the lead-in budget D_lead (config.stop_traj_delta_s),
   // then the decel ramp. The lead-in IS the backend command, so the seam
@@ -1602,7 +1602,7 @@ Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
                {{"recommended_disposition", "hard_stop"}});
   }
   // As main: the deceleration time is required here. Its default is filled
-  // in once, when the profile is loaded (item 24), not by the planner.
+  // in once, when the profile is loaded, not by the planner.
   if (!stop_profile.deceleration_time_s || !finite_positive(*stop_profile.deceleration_time_s)) {
     return err("spring_back_deceleration_time_required",
                "spring_back_hold requires a positive deceleration_time_s",
@@ -1651,7 +1651,7 @@ Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
   // The spring-back planner is itself a fallback/stop mode. If the forward
   // half cannot be generated, fail closed and let the kernel/backend hard-stop
   // floor decide; do not recursively fall back to spring_back_hold. Natural
-  // completion was decided once, before spring-back (item 2): any forward
+  // completion was decided once, before spring-back: any forward
   // failure below, including a short path, ends in the hard stop.
   forward_profile.fallback_stop_modes.clear();
   auto forward =
@@ -1673,7 +1673,7 @@ Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
                {{"recommended_disposition", "hard_stop"}});
   }
 
-  // At-rest join (item 6, fixes main's overlap of the two halves): braking
+  // At-rest join (fixes main's overlap of the two halves): braking
   // must end at rest. A retimer that settles early holds that rest until the
   // half boundary; one that ends late starts the return after it, as long as
   // the whole Stop still fits its deadline.
@@ -1745,7 +1745,7 @@ Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
                  {{"recommended_disposition", "hard_stop"}, {"joint", joint_name}});
     }
   }
-  // Q36: the return half uses main's own default reference, the half time.
+  // The return half uses main's own default reference, the half time.
   const auto return_jerk = detail::stop_phase_jerk_limits(
       accepted_trajectory, per_joint_max_deceleration_rad_s2, config, phase_time_s);
   const auto& jerk_limits = return_jerk.limits;
@@ -1781,7 +1781,7 @@ Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
 
   // Return to the trip point in the same half-time. main's quintic peaks at
   // 1.875 d/T; when that exceeds the trajectory's certified Stop path rate,
-  // the return ramps up to that rate, cruises, and ramps down instead (item 6).
+  // the return ramps up to that rate, cruises, and ramps down instead.
   const double max_stop_path_rate = accepted_trajectory.runtime_scale_bounds->max_stop_path_rate;
   const double quintic_peak_rate = 1.875 * return_distance_s / phase_time_s;
   const bool capped_return = quintic_peak_rate > max_stop_path_rate + kEpsilon;
@@ -2623,7 +2623,7 @@ Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
   };
 
   // main's closed-form straight-path S-curve, tried before the generic search
-  // (restored with the removal of the affine shortcut, decision Q23).
+  // (restored with the removal of the affine shortcut).
   auto straight_scurve_candidate = [&]() -> std::optional<JerkLimitedStopProfileDTO> {
     if (std::abs(start_path_rate_accel) > kTerminalTolerance) {
       return std::nullopt;

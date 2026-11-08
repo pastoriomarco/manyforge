@@ -3,6 +3,7 @@
 #include "applied_program_blackboard_installation.hpp"
 #include "applied_program_owner_reader.hpp"
 #include "selected_program_products.hpp"
+#include "direct_control_target.hpp"
 #include "host_io_provider_installation.hpp"
 #include "host_component_runtime.hpp"
 #include "host_io_signal_runtime.hpp"
@@ -42,6 +43,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -55,11 +57,13 @@
 #include <variant>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_component_manager/site_settings.hpp>
+#include <manyforge_component_manager/execution_host_exit.hpp>
 #include <manyforge_component_manager/manager_named_apply_coordinator.hpp>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
+#include <manyforge_core/execution_recovery_support.hpp>
 #include <manyforge_core/io_signal_ingress.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
@@ -72,6 +76,7 @@
 #include <manyforge_core/pick_place_planning_owner.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/stop_journal_projection_codec.hpp>
+#include <manyforge_core/tcp_selector_codec.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
@@ -106,6 +111,7 @@
 #include <manyforge_roboplan/component_stream_sample_bridge.hpp>
 #include <manyforge_roboplan/retained_ros2_control_lane_config.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
+#include <manyforge_roboplan/retained_observed_state_channel.hpp>
 #include <manyforge_roboplan/retained_planner_scene_projection.hpp>
 #include <manyforge_roboplan/retained_tool_context.hpp>
 #include <manyforge_roboplan/retained_planning_model_stage.hpp>
@@ -142,6 +148,8 @@
 #include "execution_host_responses.hpp"
 #include "execution_host_scene_bridge.hpp"
 #include "execution_host_surface.hpp"
+#include "host_shutdown_watchdog.hpp"
+#include "retired_composition_release.hpp"
 #include "ros_host_composition.hpp"
 #include <manyforge_roboplan/retained_gripper_route_publication_owner.hpp>
 
@@ -288,17 +296,59 @@ void LogAdmissionTiming(std::string_view command, std::string_view request_id,
 
 namespace scene = manyforge::scene;
 
-// Active TCP (M7): the robot's TCP list, TCP-A1's `robot_tcps` of its
-// direct-control binding's robot row (design 1.2).
-[[nodiscard]] std::vector<RobotTcp>
-DirectControlRobotTcps(const deployment::ProgramBinding &binding) {
-  for (const auto &target : binding.value().target_role_bindings)
-    if (target.target_role_id.value() == deployment::kDirectControlTargetRoleId)
-      return target.robot_tcps.value_or(std::vector<RobotTcp>{});
-  return {};
+[[nodiscard]] const core::ProgramTargetBindingDTO &
+DirectControlTarget(const deployment::ProgramBinding &binding,
+                    const core::ProgramTargetReferenceDTO &expected,
+                    std::string_view capability_id) {
+  const auto selected = host_detail::SelectDirectControlTarget(
+      binding.value().target_bindings, expected, capability_id);
+  using Status = host_detail::DirectControlTargetStatus;
+  if (selected.status == Status::kAmbiguous)
+    throw core::TypedError("direct_control_primary_target_ambiguous",
+                           "The direct-control primary target is ambiguous");
+  if (selected.status != Status::kFound)
+    throw core::TypedError("direct_control_primary_target_missing",
+                           "The direct-control primary target or its capability is missing");
+  return *selected.target;
 }
 
-// CONTRACTS §12: one component's model lane row as the Deployment compiled
+// Active TCP: the robot's TCP list, the `robot_tcps` of its
+// direct-control binding's robot row.
+[[nodiscard]] std::vector<RobotTcp>
+DirectControlRobotTcps(const deployment::ProgramBinding &binding,
+                       const core::ProgramTargetReferenceDTO &target) {
+  return DirectControlTarget(binding, target, "execution.trajectory.execute").robot_tcps.value_or(std::vector<RobotTcp>{});
+}
+
+[[nodiscard]] const core::ProgramTargetReferenceDTO &
+DirectControlInventoryTarget(const deployment::ProgramBinding &binding,
+    const std::vector<deployment::DirectControlProgramBindingEntry> &entries) {
+  const core::ProgramTargetReferenceDTO *target = nullptr;
+  for (const auto &entry : entries) {
+    if (entry.binding.get() != &binding) continue;
+    if (target)
+      throw core::TypedError("direct_control_primary_target_ambiguous",
+                             "The direct-control inventory target is ambiguous");
+    target = &entry.target;
+  }
+  if (!target)
+    throw core::TypedError("direct_control_primary_target_missing",
+                           "The direct-control inventory target is missing");
+  return *target;
+}
+
+[[nodiscard]] std::vector<TcpFrameAssociation>
+DirectControlTcpAssociations(const std::vector<deployment::DirectControlTcp> &tcps) {
+  std::vector<TcpFrameAssociation> result;
+  for (const auto &tcp : tcps) {
+    if (!tcp.mounted_here) continue;
+    for (const auto &association : tcp.frame_associations)
+      result.push_back({{association.target, association.frame}, association.contact_body_role_ids});
+  }
+  return result;
+}
+
+// One component's model lane row as the Deployment compiled
 // it (`controller_profiles[].lane_row`, canonical JSON of the model's
 // `lanes.<lane>` object), typed as 3b's ModelLaneRow. Scalar keys other than
 // the typed ones are adapter keys (YAML scalar text); non-scalar keys (e.g.
@@ -360,7 +410,7 @@ struct ComponentLane final {
 }
 
 /// The component's own streams as the host's stream registry reports them
-/// (CONTRACTS §1 `streams[]`).
+/// (`streams[]`).
 [[nodiscard]] Ros2ControlComponentAdapter::StreamsFn
 ComponentStreams(const core::ControllableComponentId &component) {
   return [component](std::int64_t) {
@@ -681,7 +731,7 @@ EmptyScene(const core::CellId &cell_id, const core::SceneRevision &revision) {
               snapshot) == revision.content_hash &&
               snapshot.locally_valid(),
           "active scene revision is not the exact canonical empty scene; "
-          "live scene consumption starts at N5");
+          "live scene consumption is not available");
   return snapshot;
 }
 
@@ -691,7 +741,7 @@ ActiveFacts(const deployment::RuntimeProgramTargetBinding &primary,
             const core::RuntimeEpoch &runtime_epoch,
             core::ActiveControlConfigurationId active_configuration_id) {
   Require(primary.desired_route().has_value(),
-          "runtime binding has no desired I6 route");
+          "runtime binding has no desired route");
   std::set<core::RuntimeUnitId> runtime_units(
       primary.component().runtime_unit_ids.begin(),
       primary.component().runtime_unit_ids.end());
@@ -752,19 +802,19 @@ BuildControlBindingRepresentatives(
   Require(primary.control_path.has_value(),
           "direct-control primary has no exact control path");
   const auto &primary_path = *primary.control_path;
-  const auto &targets = direct_control_binding.value().target_role_bindings;
+  const auto &targets = direct_control_binding.value().target_bindings;
   const auto target =
       std::find_if(targets.begin(), targets.end(), [&](const auto &candidate) {
-        return candidate.controllable_component_id ==
+        return candidate.target.component_id ==
                    primary.controllable_component_id &&
-               candidate.command_target_id == primary.command_target_id;
+               candidate.target.command_target_id == primary.command_target_id;
       });
   Require(target != targets.end() &&
               std::find_if(std::next(target), targets.end(),
                            [&](const auto &candidate) {
-                             return candidate.controllable_component_id ==
+                             return candidate.target.component_id ==
                                         primary.controllable_component_id &&
-                                    candidate.command_target_id ==
+                                    candidate.target.command_target_id ==
                                         primary.command_target_id;
                            }) == targets.end(),
           "direct-control physical target is absent or ambiguous");
@@ -779,7 +829,7 @@ BuildControlBindingRepresentatives(
       continue;
     }
     const auto resolved = deployment::resolve_runtime_program_target(
-        direct_control_binding, target->target_role_id,
+        direct_control_binding, target->target,
         capability.capability_id, bundle, model_map);
     auto sealed = core::verify_runtime_participant_binding(
         deployment::build_runtime_participant_binding_dto(
@@ -1072,7 +1122,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
         named_presets.contains(authored_configuration->open_state_ref) &&
             named_presets.contains(authored_configuration->closed_state_ref),
         "authored gripper state reference is not a retained SRDF preset");
-    // Merge 6 (TCP-D): a link of the gripper's own model or, when it has
+    // A link of the gripper's own model or, when it has
     // none of that name, of a tool mounted on the gripper's component.
     const auto require_source_link = [&](const std::string &source_name,
                                          const std::string_view field) {
@@ -1089,7 +1139,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
       const auto own = links_on([&](const core::ModelInstanceId &instance) {
         return instance == *gripper_model_instance_id;
       });
-      // B4: the model's owner and the mounts come from the cell kinematic
+      // The model's owner and the mounts come from the cell kinematic
       // index.
       const auto &index = model_map.kinematic_index();
       Require(own == 1 ||
@@ -1168,7 +1218,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
       {"command_target_id", CanonicalValue(gripper.command_target_id.value())},
       {"command_duration_s", CanonicalNullableNumber(command_duration_s)},
       {"command_kind", CanonicalValue("gripper_position")},
-      {"component_role_id", CanonicalValue(gripper.component_role_id.value())},
+
       {"completion_policy", CanonicalValue(actuation_kind == "pneumatic"
           ? (output_mode == "none" || (has_authored_configuration && authored_configuration->pneumatic_io)
                  ? "no_output" : "output_delivery")
@@ -1193,7 +1243,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
       {"named_presets", CanonicalValue(std::move(presets))},
       {"open_state_ref", CanonicalNullableText(open_state_ref)},
       {"schema_version",
-       CanonicalValue("manyforge.manual_control_gripper_descriptor.v3")},
+       CanonicalValue("manyforge.manual_control_gripper_descriptor.v5")},
       {"source_coordinate_name",
        CanonicalValue(resource.source_joint_name.has_value()
                           ? *resource.source_joint_name
@@ -1204,7 +1254,9 @@ CanonicalNullableText(const std::optional<std::string> &value) {
                                          : "component_local")},
       {"state_authority_class", CanonicalNullableText(state_authority_class)},
       {"state_authority_id", CanonicalNullableText(state_authority_id)},
-      {"target_role_id", CanonicalValue(gripper.target_role_id.value())},
+      {"target", CanonicalValue(CanonicalValue::Object{
+          {"component_id", CanonicalValue(gripper.controllable_component_id.value())},
+          {"command_target_id", CanonicalValue(gripper.command_target_id.value())}})},
       {"tcp_frame", CanonicalNullableText(tcp_frame)},
       {"touch_links", CanonicalValue(std::move(touch_links))},
       {"transport_kind", CanonicalValue("resolved_binding")},
@@ -1252,45 +1304,39 @@ CanonicalNullableText(const std::optional<std::string> &value) {
   for (const auto &frame : motion.frame_bindings) {
     frames.emplace_back(CanonicalValue::Object{
         {"compiled_frame_name", CanonicalValue(frame.compiled_frame_name)},
-        {"frame_role_id", CanonicalValue(frame.frame_role_id.value())},
+        {"reference", CanonicalValue(CanonicalValue::Object{
+                          {"component_id", CanonicalValue(frame.reference.component_id.value())},
+                          {"frame_id", CanonicalValue(frame.reference.frame_id.value())}})},
         {"model_instance_id", CanonicalValue(frame.model_instance_id.value())},
         {"model_revision", CanonicalValue(frame.model_revision.value())},
     });
   }
-  // TCP-C: the TCPs Robot Control can move at (deployment computes the
+  // The TCPs Robot Control can move at (deployment computes the
   // default, owner names and one row per compiled frame).
   CanonicalValue::Array tcps;
   tcps.reserve(motion_tcps.size());
   for (const auto &tcp : motion_tcps) {
-    const auto &entry = tcp.binding.entry;
     const auto &frame = tcp.binding.frame;
     CanonicalValue::Array contact_body_roles;
-    contact_body_roles.reserve(frame.contact_body_role_ids.size());
-    for (const auto &role : frame.contact_body_role_ids)
+    contact_body_roles.reserve(tcp.binding.contact_body_role_ids.size());
+    for (const auto &role : tcp.binding.contact_body_role_ids)
       contact_body_roles.emplace_back(role.value());
     CanonicalValue::Object tcp_row{
         {"default", CanonicalValue(tcp.binding.end_effector)},
         {"display", CanonicalValue(tcp.display)},
-        {"entry", CanonicalValue(CanonicalValue::Object{
-                      {"component_id", CanonicalValue(entry.component_id.value())},
-                      {"target_id", CanonicalValue(entry.target_id.value())},
-                      {"frame_role_id", CanonicalValue(entry.frame_role_id.value())},
-                  })},
+        {"entry", core::EncodeTcpEntryReference(TcpReference(tcp.binding))},
         {"frame", CanonicalValue(CanonicalValue::Object{
                       {"compiled_frame_name", CanonicalValue(frame.compiled_frame_name)},
-                      {"frame_role_id", CanonicalValue(frame.frame_role_id.value())},
+                      {"reference", CanonicalValue(CanonicalValue::Object{
+                          {"component_id", CanonicalValue(frame.reference.component_id.value())},
+                          {"frame_id", CanonicalValue(frame.reference.frame_id.value())}})},
                       {"model_instance_id", CanonicalValue(frame.model_instance_id.value())},
                       {"model_revision", CanonicalValue(frame.model_revision.value())},
-                      {"contact_body_role_ids", CanonicalValue(std::move(contact_body_roles))},
                   })},
+        {"contact_body_role_ids", CanonicalValue(std::move(contact_body_roles))},
         {"mounted_elsewhere", CanonicalValue(tcp.mounted_elsewhere)},
         {"mounted_here", CanonicalValue(tcp.mounted_here)},
     };
-    // Interim legacy endpoint role for exact rows already carried by the
-    // direct-control binding; A4 removes it with the old endpoint selector.
-    if (tcp.target_role_id.has_value())
-      tcp_row.emplace_back("target_role_id",
-                           CanonicalValue(tcp.target_role_id->value()));
     tcps.emplace_back(CanonicalValue(std::move(tcp_row)));
   }
   CanonicalValue::Array joints;
@@ -1452,7 +1498,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
   }
   CanonicalValue motion_descriptor(CanonicalValue::Object{
       {"command_target_id", CanonicalValue(motion.command_target_id.value())},
-      {"component_role_id", CanonicalValue(motion.component_role_id.value())},
+
       {"contracts", ManualControlContractValue(motion)},
       {"controllable_component_id",
        CanonicalValue(motion.controllable_component_id.value())},
@@ -1476,8 +1522,10 @@ CanonicalNullableText(const std::optional<std::string> &value) {
                   CanonicalValue(std::move(ordinary_jerk_joints))}})
            : CanonicalValue(nullptr)},
       {"schema_version",
-       CanonicalValue("manyforge.manual_control_motion_descriptor.v6")},
-      {"target_role_id", CanonicalValue(motion.target_role_id.value())},
+       CanonicalValue("manyforge.manual_control_motion_descriptor.v8")},
+      {"target", CanonicalValue(CanonicalValue::Object{
+          {"component_id", CanonicalValue(motion.controllable_component_id.value())},
+          {"command_target_id", CanonicalValue(motion.command_target_id.value())}})},
       {"tcps", CanonicalValue(std::move(tcps))},
   });
 
@@ -1486,7 +1534,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
 
 
 
-/// A view whose component is only its adapter (CONTRACTS §6: e.g. a sensor
+/// A view whose component is only its adapter (e.g. a sensor
 /// whose family runs its own process): no execution runtime, gripper or I/O
 /// driver, so no Kernel registration, backend or collision resources.
 [[nodiscard]] bool IsAdapterOnlyView(const Composition &view) {
@@ -1594,7 +1642,7 @@ struct VerifiedLocalNoneProcessOwner final {
         "stop_port");
   // Its Stop readiness is sealed when its route opens (Enable): a prepared,
   // not yet enabled gripper has none, and is still this installed owner (a
-  // New or Load right after a Load must inventory it, R3).
+  // New or Load right after a Load must inventory it).
   check(!registration.stop_readiness.has_value() ||
             registration.stop_readiness->value().expected_controller_domain.physical_expectation ==
                 core::ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone,
@@ -1615,7 +1663,7 @@ struct VerifiedLocalNoneProcessOwner final {
               logical.output_mode == core::GripperOutputMode::kNone,
           "local None process occurrence has no current configured logical backend");
   const auto& path = *value.control_path;
-  // CONTRACTS §15: its route opens only after Enable; the occurrence is the
+  // Its route opens only after Enable; the occurrence is the
   // installed logical owner itself.
   component_manager::ManagerComponentProcessOccurrenceDTO occurrence{
       value.controllable_component_id, {}, 0, component_manager::ProcessPresenceState::kAbsent,
@@ -1700,33 +1748,8 @@ CachedControllerLaunchReadinessSource(
 }
 
 
-struct RetainedComponentSnapshot final {
-  std::shared_ptr<RetainedExecutionHost> runtime;
-  std::shared_ptr<RetainedGripperRuntime> gripper_runtime;
-  std::shared_ptr<const RetainedPlanningModelStage> stage;
-  // The cell planning-model product `stage` was staged from.
-  core::RetainedProductDTO planning_model_product;
-  std::optional<core::JointLimitsDTO> joint_limits;
-  CanonicalValue motion_descriptor;
-  CanonicalValue gripper_descriptor;
-  std::shared_ptr<RetainedRos2ControlRuntimeHandle> ros2_control_runtime_handle;
-  std::shared_ptr<ControllerLaunchProcess> controller_process;
-  std::shared_ptr<const IoProviderDriverGroup> io_provider_drivers{};
-  std::shared_ptr<const ComponentRuntimePins> component_runtime_pins{};
-  /// CONTRACTS §15: a retained component keeps its adapter (state, action
-  /// in progress, `last_action`).
-  std::shared_ptr<core::IComponentAdapter> component_adapter{};
-  /// CONTRACTS §16: an arm member keeps its owner (built with it) and the
-  /// owner's handle and family for its I/O members.
-  std::optional<core::CoordinatedComponent> owner_component{};
-  std::shared_ptr<void> owner_handle{};
-  const ComponentAdapterFamily *owner_family{};
-  std::optional<std::string> owner_id{};
-  std::optional<std::string> member_role{};
-};
-
 /// A retained component keeps its membership and, on an arm member, its
-/// owner (CONTRACTS §15, §16).
+/// owner.
 void CarryRetainedMembership(Composition &composition,
                              const RetainedComponentSnapshot &predecessor) {
   composition.owner_component = predecessor.owner_component;
@@ -1734,9 +1757,10 @@ void CarryRetainedMembership(Composition &composition,
   composition.owner_family = predecessor.owner_family;
   composition.owner_id = predecessor.owner_id;
   composition.member_role = predecessor.member_role;
+  composition.adapter_transport_consumers = predecessor.adapter_transport_consumers;
 }
 
-// CP9: the host's stream registry follows the installed product's
+// The host's stream registry follows the installed product's
 // Deployment overrides and logs its edge-triggered transitions.
 void ApplyComponentStreamOverrides(const deployment::RetainedBundle *bundle) {
   const auto health = host_component_stream_health();
@@ -1764,8 +1788,9 @@ MakeHostRosContextProvider() {
     std::lock_guard lock(state->mutex);
     if (!state->context) {
       auto context = std::make_shared<rclcpp::Context>();
-      int argc = 0;
-      char **argv = nullptr;
+      int argc = 3;
+      const char *argv[] = {"manyforge_ros_managed_host", "--ros-args",
+                            "--disable-external-lib-logs"};
       context->init(argc, argv);
       // Publish only a successfully initialized context. No reset, global
       // cache, domain merge or background retry exists here.
@@ -1775,7 +1800,7 @@ MakeHostRosContextProvider() {
   };
 }
 
-/// CONTRACTS §15: one Manager `HostApplyRequest` with what the host derives
+/// One Manager `HostApplyRequest` with what the host derives
 /// for it: the Apply fence it holds, the public predecessor and both
 /// products' per-component delta.
 struct HostApplySelection final {
@@ -1804,7 +1829,7 @@ struct HostApplySelection final {
 /// The participation path's input (planning model and scene, Program
 /// bindings, runtime participant bindings, route open and re-seal): the
 /// bundle, model map and package root live here only. A component build
-/// function gets a ComponentBuildInput (ComponentBuildInputOf) instead (FP-2).
+/// function gets a ComponentBuildInput (ComponentBuildInputOf) instead.
 struct CompositionBuildInput final {
   std::filesystem::path package_root;
   std::filesystem::path execution_run_root;
@@ -1821,8 +1846,8 @@ struct CompositionBuildInput final {
   std::vector<core::RuntimeParticipantBinding> motion_program_aliases;
   std::shared_ptr<const deployment::ProgramBindingContract> status_program;
   std::shared_ptr<const deployment::ProgramBinding> status_program_binding;
-  std::optional<core::TargetRoleId> status_motion_target_role_id;
-  std::optional<core::TargetRoleId> status_gripper_target_role_id;
+  std::optional<core::ProgramTargetReferenceDTO> status_motion_target;
+  std::optional<core::ProgramTargetReferenceDTO> status_gripper_target;
   std::shared_ptr<WallClock> shared_clock;
   std::shared_ptr<SimpleScheduler> shared_scheduler;
   std::filesystem::path manager_run_root;
@@ -1855,18 +1880,21 @@ struct CompositionBuildInput final {
   ros2_control_execution::Ros2TransportResources::ContextProvider ros_context_provider{};
   std::shared_ptr<ros2_control_execution::VolatileMotionTrace> motion_trace{};
   std::vector<core::RuntimeRouteConfigurationReadbackDTO> retained_routes{};
-  // CP8 step 1: the machine's site facts (`manyforge.site.v1`); a Real
+  // The machine's site facts (`manyforge.site.v1`); a Real
   // component resolves its robot address here at activation.
   std::optional<component_manager::SiteSettings> site_settings{};
-  // CONTRACTS §6: the installed adapter families, the host node their
+  // The installed adapter families, the host node their
   // adapters use, and the host entries a family's adapters call: the
   // driver restart of a component (its controller launch) and the I/O
   // ingress of the families' I/O updates.
   const ComponentAdapterRegistry *adapter_registry{};
   rclcpp::Node::SharedPtr adapter_node{};
+  std::shared_ptr<ros2_control_execution::Ros2TransportResources> adapter_owner{};
   std::function<core::Result<void>(const std::string &component_id, std::stop_token)>
       restart_driver{};
   ComponentIoUpdateSink io_updates{};
+  std::function<core::Result<std::shared_ptr<void>>(const std::string &)>
+      enter_transport_effect{};
 };
 
 [[nodiscard]] core::CellAdmissionSettlementValidator
@@ -1998,8 +2026,8 @@ struct NativePhysicalBindingSet final {
   std::optional<core::RuntimeParticipantBinding> motion;
   std::optional<core::RuntimeParticipantBinding> gripper;
   std::vector<core::RuntimeParticipantBinding> representatives;
-  std::optional<core::TargetRoleId> status_motion_role;
-  std::optional<core::TargetRoleId> status_gripper_role;
+  std::optional<core::ProgramTargetReferenceDTO> status_motion_target;
+  std::optional<core::ProgramTargetReferenceDTO> status_gripper_target;
 };
 
 template <typename PhysicalBindingInput>
@@ -2011,11 +2039,11 @@ template <typename PhysicalBindingInput>
   const auto select_optional_binding =
       [&](const auto &bindings, const std::string_view capability_id) {
         std::shared_ptr<const deployment::ProgramBinding> selected;
-        for (const auto &binding : bindings) {
+        for (const auto &entry : bindings) {
+          const auto &binding = entry.binding;
           const auto target = deployment::resolve_runtime_program_target(
               *binding,
-              core::TargetRoleId(
-                  std::string(deployment::kDirectControlTargetRoleId)),
+              DirectControlTarget(*binding, entry.target, capability_id).target,
               core::CapabilityId(std::string(capability_id)), *input.bundle,
               input.model_map);
           if (input.selected_component_id.has_value() &&
@@ -2034,8 +2062,7 @@ template <typename PhysicalBindingInput>
   if (motion_program != nullptr) {
     motion_target = deployment::resolve_runtime_program_target(
         *motion_program,
-        core::TargetRoleId(
-            std::string(deployment::kDirectControlTargetRoleId)),
+        DirectControlTarget(*motion_program, DirectControlInventoryTarget(*motion_program, inventory.motion), "execution.trajectory.execute").target,
         core::CapabilityId("execution.trajectory.execute"), *input.bundle,
         input.model_map);
   }
@@ -2045,7 +2072,7 @@ template <typename PhysicalBindingInput>
   if (gripper_program != nullptr) {
     gripper_target = deployment::resolve_runtime_program_target(
         *gripper_program,
-        core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
+        DirectControlTarget(*gripper_program, DirectControlInventoryTarget(*gripper_program, inventory.gripper), "tool.gripper.command").target,
         core::CapabilityId("tool.gripper.command"), *input.bundle,
         input.model_map);
   }
@@ -2061,19 +2088,19 @@ template <typename PhysicalBindingInput>
                                         *input.selected_component_id),
       "selected native component has no supported direct-control capability");
 
-  std::optional<core::TargetRoleId> status_motion_role;
-  std::optional<core::TargetRoleId> status_gripper_role;
+  std::optional<core::ProgramTargetReferenceDTO> status_motion_target;
+  std::optional<core::ProgramTargetReferenceDTO> status_gripper_target;
   if (input.status_program_binding != nullptr) {
     const auto selected_target_for =
-        [&](const std::optional<core::TargetRoleId> &role,
+        [&](const std::optional<core::ProgramTargetReferenceDTO> &role,
                                          const std::string_view capability_id)
         -> std::optional<deployment::RuntimeProgramTargetBinding> {
       if (!role.has_value()) return std::nullopt;
       const auto found = std::find_if(
-          input.status_program_binding->value().target_role_bindings.begin(),
-          input.status_program_binding->value().target_role_bindings.end(),
+          input.status_program_binding->value().target_bindings.begin(),
+          input.status_program_binding->value().target_bindings.end(),
           [&](const auto &target) {
-            return target.target_role_id == *role &&
+            return target.target == *role &&
                    std::any_of(target.capability_bindings.begin(),
                                target.capability_bindings.end(),
                                [&](const auto &capability) {
@@ -2082,7 +2109,7 @@ template <typename PhysicalBindingInput>
                                });
           });
       if (found ==
-          input.status_program_binding->value().target_role_bindings.end()) {
+          input.status_program_binding->value().target_bindings.end()) {
         return std::nullopt;
       }
       return deployment::resolve_runtime_program_target(
@@ -2090,20 +2117,20 @@ template <typename PhysicalBindingInput>
           core::CapabilityId(std::string(capability_id)), *input.bundle,
           input.model_map);
     };
-    const auto status_role_for = [&](const auto &physical_target,
+    const auto status_target_for = [&](const auto &physical_target,
                                      const auto &selected_target,
-                                     const std::optional<core::TargetRoleId>
-                                         &selected_role,
+                                     const std::optional<core::ProgramTargetReferenceDTO>
+                                         &selected_reference,
                                      const std::string_view capability_name)
-        -> std::optional<core::TargetRoleId> {
+        -> std::optional<core::ProgramTargetReferenceDTO> {
       if (!physical_target.has_value())
         return std::nullopt;
       const auto &physical_owner =
           physical_target->component().controllable_component_id;
       const auto &physical_command_target =
-          physical_target->target_role().command_target_id;
+          physical_target->target_binding().target.command_target_id;
       if (!selected_target.has_value())
-        return core::TargetRoleId(physical_command_target.value());
+        return core::ProgramTargetReferenceDTO{physical_owner, physical_command_target};
       const bool selection_addresses_this_component =
           selected_target->component().controllable_component_id ==
               (input.selected_component_id.has_value()
@@ -2113,55 +2140,52 @@ template <typename PhysicalBindingInput>
         // The selected Program may legitimately use this capability on a
         // different independently owned component. Keep this component's
         // direct-control status address tied to its own verified target.
-        return core::TargetRoleId(physical_command_target.value());
+        return core::ProgramTargetReferenceDTO{physical_owner, physical_command_target};
       }
       Require(selected_target->component().controllable_component_id ==
                   physical_owner &&
-                  selected_role.has_value() &&
-                  selected_target->target_role().command_target_id ==
+                  selected_reference.has_value() &&
+                  selected_target->target_binding().target.command_target_id ==
                       physical_command_target,
               "selected Program " + std::string(capability_name) +
                   " target does not match its native component capability");
-      return *selected_role;
+      return *selected_reference;
     };
     const auto selected_motion_target = selected_target_for(
-        input.status_motion_target_role_id, "execution.trajectory.execute");
-    status_motion_role = status_role_for(
+        input.status_motion_target, "execution.trajectory.execute");
+    status_motion_target = status_target_for(
         motion_target, selected_motion_target,
-        input.status_motion_target_role_id, "motion");
+        input.status_motion_target, "motion");
     const auto selected_gripper_target = selected_target_for(
-        input.status_gripper_target_role_id, "tool.gripper.command");
-    status_gripper_role = status_role_for(
+        input.status_gripper_target, "tool.gripper.command");
+    status_gripper_target = status_target_for(
         gripper_target, selected_gripper_target,
-        input.status_gripper_target_role_id, "gripper");
+        input.status_gripper_target, "gripper");
   } else {
     if (motion_target.has_value()) {
-      status_motion_role = core::TargetRoleId(
-          motion_target->target_role().command_target_id.value());
+      status_motion_target = motion_target->target_binding().target;
     }
     if (gripper_target.has_value()) {
-      status_gripper_role = core::TargetRoleId(
-          gripper_target->target_role().command_target_id.value());
+      status_gripper_target = gripper_target->target_binding().target;
     }
   }
 
   std::optional<core::RuntimeParticipantBinding> motion;
   if (motion_target.has_value()) {
     std::vector<deployment::RuntimeProgramTargetBinding> motion_support;
-    const auto &target_role = motion_program->value().target_role_bindings.front();
+    const auto &direct_target = DirectControlTarget(*motion_program, DirectControlInventoryTarget(*motion_program, inventory.motion), "execution.trajectory.execute");
     for (const std::string_view capability_id :
          {std::string_view("planning.motion.cartesian_path"),
           std::string_view("planning.motion.joint_goal"),
           std::string_view("planning.motion.pose_goal")}) {
-      if (std::any_of(target_role.capability_bindings.begin(),
-                      target_role.capability_bindings.end(),
+      if (std::any_of(direct_target.capability_bindings.begin(),
+                      direct_target.capability_bindings.end(),
                       [&](const auto &capability) {
                         return capability.capability_id.value() == capability_id;
                       })) {
         motion_support.push_back(deployment::resolve_runtime_program_target(
             *motion_program,
-            core::TargetRoleId(
-                std::string(deployment::kDirectControlTargetRoleId)),
+            direct_target.target,
             core::CapabilityId(std::string(capability_id)), *input.bundle,
             input.model_map));
       }
@@ -2262,13 +2286,14 @@ template <typename PhysicalBindingInput>
     });
   return {std::move(motion_program), std::move(gripper_program),
           std::move(motion), std::move(gripper),
-          std::move(representatives), std::move(status_motion_role),
-          std::move(status_gripper_role)};
+          std::move(representatives), std::move(status_motion_target),
+          std::move(status_gripper_target)};
 }
 
 struct StagedRetainedTcpRebind final {
   std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle;
   std::vector<RobotTcp> rows;
+  std::vector<TcpFrameAssociation> associations;
   core::ProgramBindingId direct_binding;
   std::shared_ptr<const RetainedToolContextSource> source;
   std::shared_ptr<RetainedPlannerSceneProjection> scene_projection;
@@ -2281,7 +2306,8 @@ StageRetainedTcpRebinds(const CompositionBuildInput &input) {
                    input.retained_component_snapshots.end(), [](const auto &row) {
         return row.second.runtime && row.second.ros2_control_runtime_handle;
       })) return result;
-  const deployment::FilesystemVerifiedCatalogArtifactSource catalogs(input.package_root);
+  const deployment::FilesystemVerifiedCatalogArtifactSource catalogs(
+      input.program_artifact_root.empty() ? input.package_root : input.program_artifact_root);
   const auto inventory = deployment::compile_direct_control_program_binding_inventory(
       *input.bundle, input.model_map, catalogs);
   const deployment::FilesystemVerifiedRetainedPlanningModelSource models(input.package_root);
@@ -2319,8 +2345,12 @@ StageRetainedTcpRebinds(const CompositionBuildInput &input) {
           [weak] { const auto locked = weak.lock();
                    return locked ? locked->logical_snapshot() : nullptr; });
     }
+    auto associations = DirectControlTcpAssociations(deployment::direct_control_motion_tcps(
+        *physical.motion_program, inventory, *input.bundle, input.model_map));
     result.push_back({predecessor.ros2_control_runtime_handle,
-                      DirectControlRobotTcps(*physical.motion_program),
+                      DirectControlRobotTcps(*physical.motion_program,
+                          DirectControlInventoryTarget(*physical.motion_program, inventory.motion)),
+                      std::move(associations),
                       physical.motion_program->program_binding_id(), std::move(source),
                       std::move(projection)});
   }
@@ -2547,7 +2577,7 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
     Require(predecessor->second.runtime == nullptr,
             "retained native component has two controller owners");
     const deployment::FilesystemVerifiedCatalogArtifactSource catalog_store(
-        input.package_root);
+        input.program_artifact_root.empty() ? input.package_root : input.program_artifact_root);
     const auto inventory =
         deployment::compile_direct_control_program_binding_inventory(
             *input.bundle, input.model_map, catalog_store);
@@ -2654,7 +2684,7 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
         std::move(gripper_stage), nullptr,
         std::move(input.projection_revision),
         input.publication_generation, std::nullopt,
-        physical.status_gripper_role);
+        physical.status_gripper_target);
     composition->gripper_runtime = predecessor->second.gripper_runtime;
     composition->ros2_control_runtime_handle = predecessor->second.ros2_control_runtime_handle;
     composition->component_adapter = predecessor->second.component_adapter;
@@ -2683,14 +2713,14 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
     return composition;
   }
   const deployment::FilesystemVerifiedCatalogArtifactSource catalog_store(
-      input.package_root);
+      input.program_artifact_root.empty() ? input.package_root : input.program_artifact_root);
   const auto inventory =
       deployment::compile_direct_control_program_binding_inventory(
           *input.bundle, input.model_map, catalog_store);
   auto physical = ResolveNativePhysicalBindings(
       input, inventory, input.retained_routes);
   Require(physical.motion.has_value() &&
-              physical.status_motion_role.has_value(),
+              physical.status_motion_target.has_value(),
           "retained native controller changed its physical capability set");
   auto candidate_registrations =
       ResealRetainedCandidateRegistrations(
@@ -2811,7 +2841,7 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
       predecessor->second.joint_limits, predecessor->second.motion_descriptor,
       CanonicalValue(nullptr), std::move(planning_stage),
       predecessor->second.runtime, std::move(input.projection_revision),
-      input.publication_generation, std::move(*physical.status_motion_role),
+      input.publication_generation, std::move(*physical.status_motion_target),
       std::nullopt);
   Require(predecessor->second.ros2_control_runtime_handle != nullptr,
           "retained ROS component has no physical handle owner");
@@ -2888,7 +2918,7 @@ RoutePublicationSource(const core::StateAuthorityClass authority) {
   throw std::invalid_argument("unknown retained state-authority class");
 }
 
-/// CONTRACTS §6, §15 (`open_routes`): after a component's successful
+/// `open_routes`: after a component's successful
 /// `enable`, publish the route of every control domain it owns, built from
 /// the bundle's compiled routes (`desired_control_configurations`) and the
 /// cell's installed registrations. No route-selection transaction. Each
@@ -2962,7 +2992,7 @@ template <typename RouteOwner>
                 });
       configuration.kinematic_resource_source_projections.push_back(std::move(projection));
     }
-    // One resolved Stop base plan per selected binding (M7 readiness), sealed
+    // One resolved Stop base plan per selected binding, sealed
     // for the component's one lifecycle generation (1, as the host reports
     // in `component_lifecycles`).
     const auto physical = route_owner.ReadCurrentPhysicalParticipants(configuration);
@@ -3154,7 +3184,7 @@ MockResetPositionPhaseCallback MockResetPhase(const MockResetPositionComponent& 
 }
 
 // Every motion arm of `composition`, each an enabled arm whose controller
-// and writer are ready and whose simulation plays (SIM-1); refuses before the
+// and writer are ready and whose simulation plays; refuses before the
 // first effect.
 core::Result<std::vector<MockResetPositionComponent>>
 CaptureMockResetPositionComponents(Composition& composition,
@@ -3185,7 +3215,7 @@ CaptureMockResetPositionComponents(Composition& composition,
     });
     if (state == states.end() || state->lifecycle != core::ComponentLifecycle::kEnabled)
       return unavailable("reset_position_arm_inactive", "Every Deployment arm must already be enabled to reset its position.");
-    // SIM-1: the write can't take effect while the simulation isn't playing.
+    // The write can't take effect while the simulation isn't playing.
     if (state->reason && state->reason->code == "simulation_not_playing")
       return unavailable("simulation_not_playing", "The simulation is not playing.");
     const auto port = arm.value().handle->current_port();
@@ -3262,9 +3292,9 @@ MeasuredJointsOf(const std::shared_ptr<RetainedExecutionHost> &arm) {
   };
 }
 
-/// CONTRACTS §6: the adapter family a component's model lane row names
+/// The adapter family a component's model lane row names
 /// (`adapter`), from the installed registry.
-/// CONTRACTS §6: the adapter families installed in the ament resource index.
+/// The adapter families installed in the ament resource index.
 [[nodiscard]] ComponentAdapterRegistry LoadInstalledAdapterRegistry() {
   auto loaded = ComponentAdapterRegistry::LoadInstalled();
   Require(loaded.ok(), loaded.ok() ? std::string{} : loaded.error().message);
@@ -3283,14 +3313,14 @@ MeasuredJointsOf(const std::shared_ptr<RetainedExecutionHost> &arm) {
   return *family;
 }
 
-/// CONTRACTS §6, §16: the adapters of one ros2_control component, made by its
+/// The adapters of one ros2_control component, made by its
 /// family through the registry around the ros2_control lane adapter. A
 /// family's tool-context hook goes on the component's ros2_control
 /// connection with the robot's tool context sources (`tool_context_source`);
 /// its display joint source drives the arm's display channel.
 ///
 /// An arm member (`profile.owner_component_id`) runs its machine's process,
-/// so its owner is built here first (BOUNDARY §4): with the machine's lane
+/// so its owner is built here first: with the machine's lane
 /// row by that row's family (the owner's handle then goes to the arm and the
 /// I/O members), or, on a lane where the machine model has no row, as the
 /// host's passive adapter (the arm then is built owner-less).
@@ -3304,17 +3334,18 @@ MeasuredJointsOf(const std::shared_ptr<RetainedExecutionHost> &arm) {
   return text;
 }
 
-/// FP-2 (N17 S4): the host handles a component build function is given: the
+/// The host handles a component build function is given: the
 /// installed adapter families and the host entries their adapters call, the
 /// shared clock and ROS context, the run roots, the runtime identity and the
 /// bring-up bound. No bundle, model map or package root.
 struct ComponentBuildHost final {
-  /// CONTRACTS §6: the installed adapter families, the host node their
+  /// The installed adapter families, the host node their
   /// adapters use, and the host entries a family's adapters call: the driver
   /// restart of a component (its controller launch) and the I/O ingress of
   /// the families' I/O updates.
   const ComponentAdapterRegistry *adapter_registry{};
   rclcpp::Node::SharedPtr adapter_node;
+  std::shared_ptr<ros2_control_execution::Ros2TransportResources> adapter_owner;
   std::function<core::Result<void>(const std::string &component_id, std::stop_token)>
       restart_driver;
   ComponentIoUpdateSink io_updates;
@@ -3333,14 +3364,17 @@ struct ComponentBuildHost final {
   std::chrono::nanoseconds launch_settle_bound{};
   /// A Manager-selected Apply composition starts its ROS backends at install.
   bool defer_ros_start{false};
-  /// R5: a generic I/O provider's lifecycle catalog record (its provider
+  /// A generic I/O provider's lifecycle catalog record (its provider
   /// manifest), the installed record the spec's `providers` pin.
   std::function<std::optional<deployment::QualifiedProviderManifest>(
       const core::ProviderManifestId &, const core::ProviderManifestRevision &)>
       provider_manifest;
+  std::function<core::Result<std::shared_ptr<void>>(const std::string &)>
+      enter_transport_effect;
+  std::shared_ptr<RetainedObservationWake> observation_wake;
 };
 
-/// FP-2 (N17 S4): everything a component build function (launch, adapters,
+/// Everything a component build function (launch, adapters,
 /// backend configuration, owner process, I/O, sensors) reads: the component's
 /// spec, an arm member's owner's spec (whose fingerprint is in the member's
 /// spec) and the host handles. The bundle, model map and package root stay on
@@ -3354,7 +3388,7 @@ struct ComponentBuildInput final {
   ComponentBuildHost host;
 };
 
-/// M7's bring-up bound (the Manager's `HostApplyTimeout`): the sum of the
+/// The bring-up bound (the Manager's `HostApplyTimeout`): the sum of the
 /// lifecycle command times of the components this composition installs or
 /// removes (every component at start-up); one default when it changes none.
 [[nodiscard]] std::chrono::nanoseconds LaunchSettleBound(const CompositionBuildInput &input) {
@@ -3380,6 +3414,7 @@ struct ComponentBuildInput final {
   ComponentBuildHost host{
       input.adapter_registry,
       input.adapter_node,
+      input.adapter_owner,
       input.restart_driver,
       input.io_updates,
       input.shared_clock,
@@ -3395,7 +3430,7 @@ struct ComponentBuildInput final {
       input.controller_request_context,
       LaunchSettleBound(input),
       input.managed_component_delta.has_value(),
-      {}};
+      {}, {}, input.observation_wake};
   host.provider_manifest = [manifests = std::make_shared<
                                 const deployment::FilesystemVerifiedRetainedProviderManifestSource>(
                                 input.package_root),
@@ -3404,6 +3439,7 @@ struct ComponentBuildInput final {
                                const core::ProviderManifestRevision &revision) {
     return manifests->get_verified({bundle, id, revision});
   };
+  host.enter_transport_effect = input.enter_transport_effect;
   return host;
 }
 
@@ -3448,7 +3484,7 @@ struct DiscardUnadoptedLaunch final {
 using PendingLaunch = std::unique_ptr<ControllerLaunchSupervisor::Ensured, DiscardUnadoptedLaunch>;
 
 /// The adapters of one ros2_control component and, on an arm member, its
-/// owner (CONTRACTS §6, §16), for its composition to adopt.
+/// owner, for its composition to adopt.
 struct Ros2ControlComponentAdapters final {
   std::shared_ptr<core::IComponentAdapter> component_adapter;
   std::optional<std::string> owner_id;
@@ -3456,6 +3492,8 @@ struct Ros2ControlComponentAdapters final {
   std::optional<core::CoordinatedComponent> owner_component;
   std::shared_ptr<void> owner_handle;
   const ComponentAdapterFamily *owner_family{};
+  std::vector<std::pair<std::string, std::shared_ptr<AdapterTransportConsumer>>>
+      transport_consumers;
 };
 
 void AdoptRos2ControlComponentAdapters(Composition &composition,
@@ -3466,9 +3504,10 @@ void AdoptRos2ControlComponentAdapters(Composition &composition,
   if (adapters.owner_component) composition.owner_component = std::move(adapters.owner_component);
   if (adapters.owner_handle) composition.owner_handle = std::move(adapters.owner_handle);
   if (adapters.owner_family) composition.owner_family = adapters.owner_family;
+  composition.adapter_transport_consumers = std::move(adapters.transport_consumers);
 }
 
-/// From the component's build input only (FP-2), on its ros2_control
+/// From the component's build input only, on its ros2_control
 /// connection (`handle`) and, for an arm, its runtime (display joints,
 /// measured joints); an arm member also from its owner's spec.
 [[nodiscard]] Ros2ControlComponentAdapters MakeRos2ControlComponentAdapters(
@@ -3514,7 +3553,7 @@ void AdoptRos2ControlComponentAdapters(Composition &composition,
                                   false,
                                   lifecycle_timeout,
                                   spec.cell_id.value(),
-                                  {}};
+                                  {}, input.adapter_owner};
   Ros2ControlComponentAdapters result;
   const auto *profile = deployment::ros2_control_execution_runtime_contract::
       find_controller_profile(spec.host_configuration, component);
@@ -3546,6 +3585,9 @@ void AdoptRos2ControlComponentAdapters(Composition &composition,
               "owner " + *profile->owner_component_id + " returned no handle for its members");
       result.owner_component =
           core::CoordinatedComponent{*profile->owner_component_id, made_owner.value().component};
+      if (made_owner.value().ros_transport_consumer)
+        result.transport_consumers.emplace_back(*profile->owner_component_id,
+                                                made_owner.value().ros_transport_consumer);
       result.owner_handle = made_owner.value().owner_handle;
       result.owner_family = &ComponentFamily(input.adapter_registry, owner_lane);
       context.role = *profile->member_role;
@@ -3574,17 +3616,20 @@ void AdoptRos2ControlComponentAdapters(Composition &composition,
   if (made.value().display_joints)
     handle->InstallDisplayJointSource(*made.value().display_joints, runtime->motion_state_channel);
   result.component_adapter = std::move(made.value().component);
+  if (made.value().ros_transport_consumer)
+    result.transport_consumers.emplace_back(component.value(),
+                                            std::move(made.value().ros_transport_consumer));
   return result;
 }
 
-/// CONTRACTS §16, BOUNDARY §4: the adapter of a real-lane I/O member (its
+/// The adapter of a real-lane I/O member (its
 /// signals are `component_adapter` rows): made by its owner's family with the
 /// owner's handle from the arm composition that built the owner, and its
 /// declared signals and bank as its row (`{adapter, bank, inputs, outputs}`).
-/// From the member's build input only (FP-2): its device row and its signal
+/// From the member's build input only: its device row and its signal
 /// rows; with its owner's handle and family (the owner's fingerprint is in
 /// the member's spec).
-[[nodiscard]] std::shared_ptr<core::IComponentAdapter> MakeIoMemberAdapter(
+[[nodiscard]] ComponentAdapters MakeIoMemberAdapter(
     const ComponentBuildInput &build, std::shared_ptr<void> owner_handle,
     const ComponentAdapterFamily &owner_family) {
   const auto &spec = build.spec;
@@ -3639,11 +3684,11 @@ void AdoptRos2ControlComponentAdapters(Composition &composition,
                                   false,
                                   std::chrono::nanoseconds(device.lifecycle_command_timeout_ns),
                                   {},
-                                  {}};
+                                  {}, input.adapter_owner};
   Require(input.adapter_registry != nullptr, "the host has no adapter registry");
   auto made = input.adapter_registry->Make(context);
   if (!made.ok()) throw core::TypedError(made.error(), "execution_host");
-  return std::move(made.value().component);
+  return std::move(made.value());
 }
 
 /// What a machine owner's process installation leaves for its view.
@@ -3654,9 +3699,10 @@ struct MachineOwnerProcess final {
   std::shared_ptr<core::IComponentAdapter> component_adapter;
   std::shared_ptr<void> owner_handle;
   const ComponentAdapterFamily *owner_family{};
+  std::shared_ptr<AdapterTransportConsumer> transport_consumer;
 };
 
-/// CONTRACTS §16: the owner of a machine whose arm is deactivated runs the
+/// The owner of a machine whose arm is deactivated runs the
 /// machine's process itself, on the same ros2_control launch path as an arm:
 /// the arm's description and the family's launch contribution without the
 /// arm (no arm controllers, hardware left inactive, frames off the cell's
@@ -3665,7 +3711,7 @@ struct MachineOwnerProcess final {
 /// connection as its lane adapter, and its handle and family serve its I/O
 /// members. The view keeps the process, so the owner's driver restart finds
 /// it.
-/// From the owner's build input only (FP-2): its machine row, address and
+/// From the owner's build input only: its machine row, address and
 /// lifecycle command time.
 [[nodiscard]] MachineOwnerProcess MakeMachineOwnerProcess(const ComponentBuildInput &build) {
   const auto &spec = build.spec;
@@ -3714,8 +3760,10 @@ struct MachineOwnerProcess final {
             << " pid=" << ensured.process->pid() << std::endl;
 
   auto handle = RetainedRos2ControlRuntimeHandle::Create();
+  const auto owner_timeout = handle->SetOwnerShutdownTimeout(spec.lifecycle_command_timeout_ns);
+  Require(owner_timeout.ok(), "ROS machine owner shutdown timeout is invalid");
   const auto bound = handle->BindProcessOnly(
-      std::make_unique<ros2_control_execution::Ros2TransportResources>(
+      ros2_control_execution::Ros2TransportResources::create(
           "manyforge_ros2_control_execution_backend", written.runtime_namespace, 1U,
           input.ros_context_provider),
       *input.shared_clock,
@@ -3732,7 +3780,7 @@ struct MachineOwnerProcess final {
             ProjectControllerLaunchFault(process->ReadCachedFaultState()));
       });
   const std::chrono::nanoseconds timeout(spec.lifecycle_command_timeout_ns);
-  // Its launch starts within the owner's lifecycle command time (M7's
+  // Its launch starts within the owner's lifecycle command time (the
   // bring-up bound for one component): until then its Prepare awaits the
   // driver's first report instead of restarting it.
   handle->InstallControllerLaunchSettle(
@@ -3764,12 +3812,13 @@ struct MachineOwnerProcess final {
                                   true,
                                   timeout,
                                   spec.cell_id.value(),
-                                  {}};
+                                  {}, input.adapter_owner};
   auto owner = input.adapter_registry->Make(context);
   if (!owner.ok()) throw core::TypedError(owner.error(), "execution_host");
   Require(owner.value().owner_handle != nullptr,
           "owner " + id + " returned no handle for its members");
   result.component_adapter = owner.value().component;
+  result.transport_consumer = std::move(owner.value().ros_transport_consumer);
   result.owner_handle = owner.value().owner_handle;
   result.owner_family = &ComponentFamily(input.adapter_registry, owner_lane);
   return result;
@@ -3782,11 +3831,14 @@ void AdoptMachineOwnerProcess(Composition &view, MachineOwnerProcess process,
   view.prepared_controller_launch = std::move(process.prepared_controller_launch);
   view.ros2_control_runtime_handle = std::move(process.handle);
   view.component_adapter = std::move(process.component_adapter);
+  if (process.transport_consumer)
+    view.adapter_transport_consumers.emplace_back(view.controllable_component_id.value(),
+                                                  std::move(process.transport_consumer));
   view.owner_handle = std::move(process.owner_handle);
   view.owner_family = process.owner_family;
 }
 
-/// CONTRACTS §6 component process: a component's own `ros2 launch` under the
+/// Component process: a component's own `ros2 launch` under the
 /// host's supervisor (lane kComponent), started by its adapter family.
 /// Destroying it stops the process.
 class HostComponentProcess final : public IComponentProcess {
@@ -3833,11 +3885,11 @@ class HostComponentProcess final : public IComponentProcess {
   };
 }
 
-/// The adapter of one sensor (its `sensors` row), from its build input only (FP-2):
+/// The adapter of one sensor (its `sensors` row), from its build input only:
 /// made by the family its model's adapter row names, with the row's
 /// Deployment settings set over the adapter row (the effective values). A
 /// sensor has no lane (`context.lane` empty).
-[[nodiscard]] std::shared_ptr<core::IComponentAdapter> MakeSensorAdapter(
+[[nodiscard]] ComponentAdapters MakeSensorAdapter(
     const ComponentBuildInput &build) {
   const auto &spec = build.spec;
   const auto &input = build.host;
@@ -3881,11 +3933,12 @@ class HostComponentProcess final : public IComponentProcess {
                                   spec.cell_id.value(),
                                   HostComponentProcessLauncher(
                                       id, input.execution_run_root /
-                                              "controller-launch-artifacts" / id)};
+                                              "controller-launch-artifacts" / id),
+                                  input.adapter_owner};
   Require(input.adapter_registry != nullptr, "the host has no adapter registry");
   auto made = input.adapter_registry->Make(context);
   if (!made.ok()) throw core::TypedError(made.error(), "execution_host");
-  return std::move(made.value().component);
+  return std::move(made.value());
 }
 
 /// The composition of one component in the installed cell (the root or a
@@ -3899,7 +3952,7 @@ class HostComponentProcess final : public IComponentProcess {
   return nullptr;
 }
 
-/// CONTRACTS §6 driver-restart entry: stops the component's controller launch
+/// Driver-restart entry: stops the component's controller launch
 /// (which runs its driver) and starts it again on the same command; the
 /// component's ros2_control connection then reads the new process's exit.
 [[nodiscard]] core::Result<void> RestartComponentDriver(ExecutionCompositionAccess &access,
@@ -3947,22 +4000,40 @@ class HostComponentProcess final : public IComponentProcess {
   return core::Result<void>::Ok();
 }
 
-/// CONTRACTS §6 I/O update sink: an adapter family's I/O updates enter the
-/// installed cell's I/O ingress.
-void PublishComponentIoUpdates(const ExecutionCompositionAccess &access,
+/// The installed product's I/O runtime, mirrored for adapter owner callbacks
+/// so they never take the composition lock, which Apply holds exclusively.
+/// Weak: the runtime's lifetime stays with its product.
+using InstalledIoSignalRuntimeSlot = std::atomic<std::weak_ptr<HostIoSignalRuntime>>;
+
+/// Declared right after an exclusive `access.mutex` lock: on leaving that
+/// critical section (normally or by a throw) it publishes the then-installed
+/// product's I/O runtime, so callbacks see the old runtime until the new
+/// product is committed, as under the shared lock before.
+struct InstalledIoSignalRuntimePublication final {
+  const ExecutionCompositionAccess &access;
+  InstalledIoSignalRuntimeSlot &slot;
+  ~InstalledIoSignalRuntimePublication() {
+    // `access.product()` without its conflict check (a destructor must not
+    // throw); the composition's own mutators enforce the exclusivity.
+    const ExecutionProduct *product = access.current != nullptr
+        ? static_cast<const ExecutionProduct *>(access.current)
+        : access.logical_product.get();
+    slot.store(product != nullptr ? std::weak_ptr(product->io_signal_runtime)
+                                  : std::weak_ptr<HostIoSignalRuntime>());
+  }
+};
+
+/// I/O update sink: an adapter family's I/O updates enter the
+/// installed cell's I/O ingress. Runs on adapter owner threads: lock-free.
+void PublishComponentIoUpdates(const InstalledIoSignalRuntimeSlot &slot,
                                const std::string &component_id,
                                const std::vector<core::IoSignalUpdateDTO> &updates,
                                const std::int64_t received_at_ns) {
-  std::shared_ptr<HostIoSignalRuntime> runtime;
-  {
-    std::shared_lock lock(access.mutex);
-    const auto *product = access.product();
-    if (product != nullptr) runtime = product->io_signal_runtime;
-  }
-  if (runtime) runtime->PublishAdapterUpdates(component_id, updates, received_at_ns);
+  if (const auto runtime = slot.load(std::memory_order_acquire).lock())
+    runtime->PublishAdapterUpdates(component_id, updates, received_at_ns);
 }
 
-/// CONTRACTS §12: one arm's launch instance, from its spec only (FP-2) and
+/// One arm's launch instance, from its spec only and
 /// its resolved address. Its controller profile row carries the compiled
 /// description (with the static frames the model URDF lacks: offset frames,
 /// custom TCPs, mounted tools, so robot_state_publisher publishes them on
@@ -3984,7 +4055,7 @@ void PublishComponentIoUpdates(const ExecutionCompositionAccess &access,
   // reports its own state and gets no seed.
   if (family.lane != nullptr && family.lane->seeds_initial_pose)
     instance.initial_joint_positions_rad = initial_joint_positions_rad;
-  // Q48: the Deployment's operator Stop deceleration per arm joint (every lane).
+  // The Deployment's operator Stop deceleration per arm joint (every lane).
   instance.max_deceleration_on_cancel_rad_s2 = profile->max_deceleration_on_cancel_rad_s2;
   instance.address = address;
   instance.frame_prefix = profile->frame_prefix;
@@ -3992,8 +4063,8 @@ void PublishComponentIoUpdates(const ExecutionCompositionAccess &access,
   return instance;
 }
 
-/// An arm's launch choices, from its build input only (FP-2): its controller
-/// profile, its lane row, the family that row names (CONTRACTS §6, §12: a lane
+/// An arm's launch choices, from its build input only: its controller
+/// profile, its lane row, the family that row names (a lane
 /// family, Mock or Isaac, brings its own execution configuration; a vendor
 /// driver on the generic Real configuration reports its own state) and its
 /// resolved address.
@@ -4014,7 +4085,7 @@ struct ArmLaunchSelection final {
   arm.lane = SelectedComponentLane(*arm.profile);
   arm.family = &ComponentFamily(build.host.adapter_registry, arm.lane);
   if (arm.profile->device_address_ref.has_value()) {
-    // CP8 step 1: the robot's address is a site fact, resolved in its spec.
+    // The robot's address is a site fact, resolved in its spec.
     const auto address =
         component_manager::ResolveSpecDeviceAddress(build.spec, *arm.profile->device_address_ref);
     if (!address.ok()) throw host_detail::SiteAddressRefusal(address.error(), component.value());
@@ -4023,7 +4094,7 @@ struct ArmLaunchSelection final {
   return arm;
 }
 
-/// CONTRACTS §12: an arm's launch, written per activation and component from
+/// An arm's launch, written per activation and component from
 /// its model lane row (`components[].lane` selects the model's
 /// `lanes.<lane>`), the lane or vendor adapter's contribution and the
 /// instance values, with its evidence record.
@@ -4046,7 +4117,7 @@ struct ArmLaunchSelection final {
   return written;
 }
 
-/// An arm's written launch, started (or kept, Q21) before its backend binds.
+/// An arm's written launch, started (or kept) before its backend binds.
 [[nodiscard]] PendingLaunch EnsureArmLaunch(const ComponentBuildInput &build,
                                             const ControllerLaunchArtifacts &written) {
   const auto &host = build.host;
@@ -4068,9 +4139,9 @@ struct ArmLaunchSelection final {
 }
 
 /// An arm's ros2_control execution configuration, from its build input
-/// (FP-2) and its participant binding (R8): its lane family's, else the
+/// and its participant binding: its lane family's, else the
 /// generic Real one, with the operator Stop decelerations its JTC launches
-/// with (Q48) and its own `measured_joints` override (CP9, the spec's stream
+/// with and its own `measured_joints` override (the spec's stream
 /// overrides) as the in-motion staleness check.
 [[nodiscard]] RetainedRos2ControlBackendConfig ArmBackendConfig(
     const ComponentBuildInput &build, const ArmLaunchSelection &arm,
@@ -4086,14 +4157,15 @@ struct ArmLaunchSelection final {
                                                            motion, cancel_by_source_joint,
                                                            build.spec.stream_overrides);
   config.ros_context_provider = build.host.ros_context_provider;
+  config.arm.adapter.lifecycle_command_timeout_ns = build.spec.lifecycle_command_timeout_ns;
   config.arm.adapter.motion_trace = build.host.motion_trace;
   config.defer_ros_start = build.host.defer_ros_start;
   return config;
 }
 
-/// A tool's launch choices, from its build input only (FP-2): whether it has
-/// no output (lane-free, D4: no lane row needed) and otherwise its controller
-/// profile, lane row and the family whose tool hook (CONTRACTS §6) runs its
+/// A tool's launch choices, from its build input only: whether it has
+/// no output (lane-free: no lane row needed) and otherwise its controller
+/// profile, lane row and the family whose tool hook runs its
 /// launch, gripper transport and measured lane.
 struct ToolLaunchSelection final {
   const deployment::ros2_control_execution_runtime_contract::Configuration::ControllerProfile
@@ -4120,7 +4192,7 @@ struct ToolLaunchSelection final {
   tool.no_output = authored->output_mode == core::GripperOutputMode::kNone || authored->pneumatic_io;
   Require(!tool.no_output || authored->actuation_kind == "pneumatic",
           "No output requires its strict pneumatic gripper target");
-  // A no-output tool is lane-free (D4): it needs no lane row.
+  // A no-output tool is lane-free: it needs no lane row.
   Require(tool.no_output || tool.profile != nullptr,
           "ROS gripper-only component has no lane row in its runtime unit");
   if (!tool.no_output) {
@@ -4141,7 +4213,7 @@ struct ToolLaunch final {
   std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle;
 };
 
-/// From the tool's build input (FP-2), its participant binding (R8), its
+/// From the tool's build input, its participant binding, its
 /// projected initial gripper position (seeds simulated hardware) and the
 /// runtime unit that runs it.
 [[nodiscard]] ToolLaunch LaunchTool(const ComponentBuildInput &build,
@@ -4185,6 +4257,9 @@ struct ToolLaunch final {
   }
   const auto &launch = result.launch;
   auto handle = RetainedRos2ControlRuntimeHandle::Create();
+  handle->InstallOwnerFaultWake([wake = host.observation_wake] {
+    if (wake) wake->notify();
+  });
   if (launch) handle->InstallControllerProcessFaultSource(
       ControllerLaunchSupervisor::fault_source(launch->process, CachedControllerLaunchReadinessSource(handle)),
       [process = launch->process] { return core::Result<std::optional<std::string>>::Ok(
@@ -4203,7 +4278,7 @@ struct ToolLaunch final {
 [[nodiscard]] std::unique_ptr<Composition>
 BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBindingSet physical) {
   Require(!physical.motion && physical.gripper && physical.gripper_program &&
-              physical.status_gripper_role && input.shared_clock && input.shared_scheduler,
+              physical.status_gripper_target && input.shared_clock && input.shared_scheduler,
           "ROS gripper-only component requires its exact physical target and stable cell time");
   const auto binding = *physical.gripper;
   const auto& value = binding.value();
@@ -4211,7 +4286,7 @@ BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBi
               value.resources.front().source_joint_name && value.control_path,
           "ROS gripper-only component requires one genuine model-backed scalar joint");
   const auto local = input.runtime_unit_id.value_or(value.runtime_unit_epochs.front().runtime_unit_id);
-  // FP-2: the tool is built from its build input; its rows of the host's
+  // The tool is built from its build input; its rows of the host's
   // configuration are its own only.
   const auto component = ComponentBuildInputOf(input, value.controllable_component_id);
   const auto &configuration = component.spec.host_configuration;
@@ -4232,7 +4307,7 @@ BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBi
   const RetainedGripperPositionLimits limits{value.resources.front().coordinate_kind,
       joint->limits.min_position[0], joint->limits.max_position[0]};
   auto channel = std::make_shared<RetainedObservedStateChannel>(binding, projected.state_projector,
-      std::move(state_config), input.shared_clock.get(), input.observation_wake);
+      std::move(state_config), input.shared_clock, input.observation_wake);
   Require(channel->initialize_from_projection(input.shared_clock->now()).applied(),
           "ROS gripper-only component could not seed its genuine model projection");
   const auto observed = projected.state_projector->current_state(
@@ -4244,12 +4319,16 @@ BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBi
       ? std::get<core::AngularPositionDTO>(position).value_rad : std::get<core::LinearPositionDTO>(position).value_m;
   auto launched = LaunchTool(component, tool, binding, initial, local);
   auto &handle = launched.handle;
-  // CP9: the tool's own `measured_joints` stream row, set by its lane (an
+  // The tool's own `measured_joints` stream row, set by its lane (an
   // Isaac tool reads its joints from the shared Isaac joint states). A
-  // lane-free tool (D4) declares no streams and has no measured lane.
+  // lane-free tool declares no streams and has no measured lane.
   const auto measured_lane = launched.config.arm.measured_joint_state_lane;
+  const auto shutdown_timeout = handle->SetOwnerShutdownTimeout(
+      component.spec.lifecycle_command_timeout_ns);
+  Require(shutdown_timeout.ok(), "ROS gripper shutdown timeout is invalid");
+  launched.config.gripper_lifecycle_timeout_ns = component.spec.lifecycle_command_timeout_ns;
   auto backend = make_retained_ros2_control_gripper_backend(std::move(launched.config), binding, channel,
-      *input.shared_clock, *input.shared_scheduler, handle);
+      input.shared_clock, *input.shared_scheduler, handle);
   RetainedGripperRuntimeInput gripper_input{
       binding, std::move(backend), input.shared_clock, channel, nullptr, {}, true,
       [handle](const auto& target, const auto& state, const auto&) {
@@ -4275,11 +4354,40 @@ BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBi
     core::RobotMeasuredStateSourceView sources{current.value().controllable_component_id, {}};
     for (std::size_t index = 0; index < publication->descriptors().size(); ++index)
       sources.sources.push_back({publication->descriptors()[index], publication->readers()[index]});
+    const std::weak_ptr<RetainedRos2ControlRuntimeHandle> transport = handle;
     return Result::Ok(std::make_shared<const RetainedPreparedRobotMeasuredSources>(
-        RetainedPreparedRobotMeasuredSources{std::move(sources), [publication] { publication->EnablePublication(); }}));
+        RetainedPreparedRobotMeasuredSources{std::move(sources), [publication] { publication->EnablePublication(); }, publication,
+          [transport, publication] {
+            const auto current = transport.lock();
+            return current && current->OwnsPreparedMeasuredSource(publication);
+          }, MakeOwnerRebuildBoundaryReader(publication)}));
   };
   gripper_input.control_binding_representatives = physical.representatives;
   auto owner = std::make_shared<RetainedGripperRuntime>(std::move(gripper_input));
+  const std::weak_ptr<RetainedGripperRuntime> measured_owner = owner;
+  owner->participant_engine()->InstallGripperOwnerRecoverySource(
+      [measured_owner, measured_lane = bool(measured_lane)](
+          const std::string &target, std::uint64_t, std::uint64_t,
+          const std::shared_ptr<const void> &transport_owner)
+          -> std::optional<core::GripperOwnerRecoveryEvidence> {
+        const auto current = measured_owner.lock();
+        return current ? current->GripperOwnerRecoveryEvidence(measured_lane, target, transport_owner)
+                       : std::nullopt;
+      });
+  handle->InstallMeasuredSourceRecoveryHooks(
+      [measured_owner] {
+        const auto current = measured_owner.lock();
+        return current ? current->SnapshotPreparedMeasuredSources() : nullptr;
+      },
+      [measured_owner](const auto &expected) {
+        const auto current = measured_owner.lock();
+        return current && current->MatchesPreparedMeasuredSources(expected);
+      });
+  handle->InstallMeasuredSourceCommitHook(
+      [measured_owner](const auto &expected, void (*commit)(void *) noexcept, void *context) {
+        const auto current = measured_owner.lock();
+        return current && current->WithExactPreparedMeasuredSources(expected, commit, context);
+      });
   const auto srdf = model->srdf_bytes();
   const auto documents = deployment::parse_model_documents_for_projection(model->urdf_bytes(),
       srdf.empty() ? std::optional<std::string_view>{} : std::optional<std::string_view>{srdf});
@@ -4303,7 +4411,7 @@ BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBi
       input.status_program, input.status_program_binding, nullptr, physical.gripper_program,
       std::nullopt, binding, std::nullopt, CanonicalValue(nullptr), std::move(descriptor),
       stage, nullptr, input.projection_revision, input.publication_generation, std::nullopt,
-      physical.status_gripper_role);
+      physical.status_gripper_target);
   composition->gripper_runtime = std::move(owner);
   composition->ros2_control_runtime_handle = std::move(handle);
   composition->measured_joint_state_lane = measured_lane;
@@ -4321,7 +4429,7 @@ BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBi
   composition->planner_scene_projection = std::move(input.planner_scene_projection);
   composition->candidate_control_representatives = std::move(physical.representatives);
   composition->required_projection_pins = std::move(input.required_projection_pins);
-  // CONTRACTS §6: a lane-free tool (no output) runs no process; the host's
+  // A lane-free tool (no output) runs no process; the host's
   // passive adapter makes it a component that can be enabled.
   if (tool.lane)
     AdoptRos2ControlComponentAdapters(
@@ -4362,7 +4470,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
           "product");
   const auto &products = input.bundle->value().compiled_products;
   const deployment::FilesystemVerifiedCatalogArtifactSource catalog_store(
-      input.package_root);
+      input.program_artifact_root.empty() ? input.package_root : input.program_artifact_root);
   auto direct_control_inventory =
       deployment::compile_direct_control_program_binding_inventory(
           *input.bundle, input.model_map, catalog_store);
@@ -4371,14 +4479,14 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   if (!physical_bindings.motion && physical_bindings.gripper)
     return BuildGripperOnlyProductComposition(std::move(input), std::move(physical_bindings));
   Require(physical_bindings.motion.has_value() &&
-              physical_bindings.status_motion_role.has_value(),
+              physical_bindings.status_motion_target.has_value(),
           "motion-backed native composition has no motion target");
   auto direct_control_binding = std::move(physical_bindings.motion_program);
   auto direct_control_motion_binding = std::move(physical_bindings.motion);
   auto control_binding_representatives =
       std::move(physical_bindings.representatives);
-  input.status_motion_target_role_id =
-      std::move(*physical_bindings.status_motion_role);
+  input.status_motion_target =
+      std::move(*physical_bindings.status_motion_target);
   Require(input.runtime_unit_id.has_value(),
           "native execution has no local runtime unit");
   const auto local_runtime_unit_id = input.runtime_unit_id;
@@ -4395,7 +4503,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   Require(contains_local_runtime(direct_control_motion_binding.value()),
           "native execution local runtime is absent from its exact "
           "participant bindings");
-  // FP-2: the component is built from its build input (its spec, and an arm
+  // The component is built from its build input (its spec, and an arm
   // member also its owner's, whose fingerprint is in the member's spec); its
   // rows of the host's configuration are its own only.
   const auto component = ComponentBuildInputOf(
@@ -4408,11 +4516,11 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   std::optional<double> deployment_motion_target_limit;
   std::vector<core::ControlBindingDTO> motion_limit_bindings;
   motion_limit_bindings.reserve(direct_control_inventory.motion.size());
-  for (const auto &binding : direct_control_inventory.motion) {
+  for (const auto &entry : direct_control_inventory.motion) {
+    const auto &binding = entry.binding;
     const auto target = deployment::resolve_runtime_program_target(
         *binding,
-        core::TargetRoleId(
-            std::string(deployment::kDirectControlTargetRoleId)),
+        DirectControlTarget(*binding, entry.target, "execution.trajectory.execute").target,
         core::CapabilityId("execution.trajectory.execute"), *input.bundle,
         input.model_map);
     Require(target.control_binding().has_value(),
@@ -4651,9 +4759,9 @@ BuildSingleProductComposition(CompositionBuildInput input) {
           : std::make_shared<RetainedObservationWake>();
   runtime_input.deployment_maximum_tcp_linear_speed_mps =
       deployment_motion_target_limit;
-  // V2-9: RoboPlan times ordinary moves within the authored jerk limits.
+  // RoboPlan times ordinary moves within the authored jerk limits.
   runtime_input.ordinary_motion_jerk = motion_limit->ordinary_motion_jerk;
-  // Q37 (as main): the Deployment-authored fault Stop profile is the motion
+  // The Deployment-authored fault Stop profile is the motion
   // target's fault profile, read directly; absent means none.
   runtime_input.fault_stop_profile_from_deployment = true;
   for (const auto &authored :
@@ -4672,7 +4780,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
             input.bundle->value().cell_graph.graph_revision,
             input.publication_generation, publisher);
   }
-  // CONTRACTS §12: this component's launch, then started (or kept, Q21)
+  // This component's launch, then started (or kept)
   // before the backend binds.
   std::shared_ptr<const RetainedToolContextSource> tool_context_source;
   const auto &motion_value = direct_control_motion_binding.value().value();
@@ -4680,7 +4788,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   const auto &family = *arm.family;
   const auto written = WriteArmLaunch(component, arm, selected_initial_joint_positions);
   if (family.lane == nullptr) {
-    // TOOLCTX: the robot's TCP and payload, which its vendor family's
+    // The robot's TCP and payload, which its vendor family's
     // tool-context hook applies at Enable and before each new motion.
     const std::weak_ptr scene_projection{input.planner_scene_projection};
     tool_context_source = std::make_shared<const RetainedToolContextSource>(
@@ -4701,12 +4809,19 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   auto controller_process = prepared_launch->process;
   auto ros2_control_runtime_handle =
       RetainedRos2ControlRuntimeHandle::Create();
-  // Active TCP (M7, design 2): the robot's TCP list and the checkbox (M6b:
-  // the Deployment's "Send TCP offset to controller"), on every lane; unknown
-  // at this start, so the End-effector TCP (T-MQ3).
+  ros2_control_runtime_handle->InstallOwnerFaultWake([wake = runtime_input.observation_wake] {
+    if (wake) wake->notify();
+  });
+  // Active TCP: the robot's TCP list and the checkbox (the
+  // Deployment's "Send TCP offset to controller"), on every lane; unknown
+  // at this start, so the End-effector TCP.
   ros2_control_runtime_handle->InstallActiveTcp(
       motion_value.controllable_component_id,
-      DirectControlRobotTcps(*direct_control_binding), arm.profile->controller_tcp_offset_sync,
+      DirectControlRobotTcps(*direct_control_binding,
+          DirectControlInventoryTarget(*direct_control_binding, direct_control_inventory.motion)),
+      DirectControlTcpAssociations(deployment::direct_control_motion_tcps(
+          *direct_control_binding, direct_control_inventory, *input.bundle, input.model_map)),
+      arm.profile->controller_tcp_offset_sync,
       direct_control_binding->program_binding_id());
   if (input.planner_scene_projection) {
     const std::weak_ptr scene_projection{input.planner_scene_projection};
@@ -4798,10 +4913,15 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       sources.sources.push_back(
           {staged.value()->descriptors()[row], staged.value()->readers()[row]});
     auto publication = std::move(staged.value());
+    const std::weak_ptr<RetainedRos2ControlRuntimeHandle> transport = ros2_control_runtime_handle;
     return Result::Ok(std::make_shared<const RetainedPreparedRobotMeasuredSources>(
         RetainedPreparedRobotMeasuredSources{
             std::move(sources),
-            [publication] { publication->EnablePublication(); }}));
+            [publication] { publication->EnablePublication(); }, publication,
+            [transport, publication] {
+              const auto current = transport.lock();
+              return current && current->OwnsPreparedMeasuredSource(publication);
+            }, MakeOwnerRebuildBoundaryReader(publication)}));
   };
   // The lane's bound for a goal's result after its expected end
   // (`hard_stop_completion_timeout_s`): the arm's activity is `unknown` once
@@ -4873,6 +4993,42 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   auto runtime = create_retained_execution_host_participants(
       std::move(runtime_input), std::move(runtime_config),
       measured_receiver_clock, std::move(receiver_scheduler));
+  const std::weak_ptr<RetainedExecutionHost> measured_owner = runtime;
+  ros2_control_runtime_handle->InstallMeasuredSourceRecoveryHooks(
+      [measured_owner] {
+        const auto current = measured_owner.lock();
+        return current ? current->SnapshotPreparedMeasuredSources() : nullptr;
+      },
+      [measured_owner](const auto &expected) {
+        const auto current = measured_owner.lock();
+        return current && current->MatchesPreparedMeasuredSources(expected);
+      });
+  ros2_control_runtime_handle->InstallMeasuredSourceCommitHook(
+      [measured_owner](const auto &expected, void (*commit)(void *) noexcept, void *context) {
+        const auto current = measured_owner.lock();
+        return current && current->WithExactPreparedMeasuredSources(expected, commit, context);
+      });
+  Require(runtime->participant_engine != nullptr,
+          "ROS motion component has no participant recovery owner");
+  const std::weak_ptr<core::ExecutionKernel> recovery_engine = runtime->participant_engine;
+  ros2_control_runtime_handle->InstallOwnerRecoveryHooks(
+      [recovery_engine] {
+        if (const auto engine = recovery_engine.lock()) engine->NotifyOwnerRebuilt();
+      },
+      [recovery_engine](const std::uint64_t execution_id,
+                        const std::uint64_t baseline_sequence) {
+        const auto engine = recovery_engine.lock();
+        if (!engine) return false;
+        const auto assessment = engine->get_recovery_assessment();
+        return assessment.execution_id == execution_id &&
+               assessment.observed_state_sequence >= baseline_sequence &&
+               assessment.reason_code == core::kOwnerRebuildObservedAtRest;
+      });
+  if (component.host.enter_transport_effect) {
+    ros2_control_runtime_handle->InstallTransportEffectClaim(
+        [enter = component.host.enter_transport_effect,
+         id = component.spec.controllable_component_id.value()] { return enter(id); });
+  }
   runtime->collision_monitor_period_ns = collision_monitor_period_ns;
   runtime->runtime_collision_immediate_query_budget_ns =
       runtime_collision_immediate_query_budget_ns;
@@ -4919,7 +5075,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       std::make_shared<const RetainedPlanningModelStage>(std::move(stage)),
       std::move(runtime), std::move(input.projection_revision),
       input.publication_generation,
-      std::move(input.status_motion_target_role_id), std::nullopt);
+      std::move(input.status_motion_target), std::nullopt);
   composition->ros2_control_runtime_handle =
       std::move(ros2_control_runtime_handle);
   composition->StageRobotTcpReader();
@@ -4961,12 +5117,12 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   return composition;
 }
 
-// The simulated PLC plan of a component, from its spec only (FP-2): whether
+// The simulated PLC plan of a component, from its spec only: whether
 // the host its I/O rows run on is simulated, and those rows (ROS-free
 // selection in plan_simulated_plc).
 [[nodiscard]] std::optional<SimulatedPlcPlan> SimulatedPlcPlanFor(
     const deployment::ComponentSpec &spec) {
-  // CP8 step 1 (the cell-wide `mode` is deleted): a ROS unit is simulated
+  // A ROS unit is simulated
   // unless one of the components it hosts has measured (real) state authority.
   if (!spec.io_host_simulated) return std::nullopt;
   std::vector<SimulatedPlcRow> rows;
@@ -4988,7 +5144,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   return deployment::component_spec(bundle, site_facts, component);
 }
 
-// D4 (keep like external hardware): a rebuilt device keeps its running PLC
+// Kept like external hardware: a rebuilt device keeps its running PLC
 // process when the candidate's launch identity is unchanged.
 [[nodiscard]] bool SimulatedPlcSurvivesRebuild(
     const std::shared_ptr<ControllerLaunchProcess> &process,
@@ -4999,7 +5155,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       process.get(), candidate ? SimulatedPlcPlanFor(*candidate) : std::nullopt);
 }
 
-// sim-plc-peer-design-02/03 §4: a pure generic ROS I/O device in a
+// A pure generic ROS I/O device in a
 // simulated unit (no hosted real component) gets a Manager-owned PLC process, started
 // before Prepare by the same supervisor as the mock robot. Equal launch
 // identity keeps it (and its values); a changed one restarts it; its exit is
@@ -5056,8 +5212,8 @@ void EnsureSimulatedPlc(
             << " config_dir=" << plan->config_dir.string() << std::endl;
 }
 
-// CP9: the observer plan of a `pose_source` or `ai_model` component, from its
-// spec only (FP-2), or none when the component has neither row.
+// The observer plan of a `pose_source` or `ai_model` component, from its
+// spec only, or none when the component has neither row.
 [[nodiscard]] std::optional<PoseSourcePlan> PoseSourcePlanFor(
     const deployment::ComponentSpec &spec, const std::filesystem::path &execution_run_root,
     const std::filesystem::path &manager_run_root) {
@@ -5091,7 +5247,7 @@ void EnsureSimulatedPlc(
                                : std::nullopt);
 }
 
-// CP9 pose source / AI model: a model-free component whose provider driver
+// Pose source / AI model: a model-free component whose provider driver
 // has no I/O members. A fresh driver is installed here with its declared
 // streams (`warning` + `auto`; Deployment overrides apply): one per pose
 // binding (budget = binding lifetime, message stamps), or the AI model's one
@@ -5190,7 +5346,7 @@ void EnsurePoseSource(
             << " site_config=" << plan.site_config_path.string() << std::endl;
 }
 
-// The generic I/O drivers of a component, from its build input only (FP-2):
+// The generic I/O drivers of a component, from its build input only:
 // one per control domain it provides, with that domain's output resources; a
 // retained component (`previous`) keeps its exact installed ones.
 [[nodiscard]] IoProviderDriverGroup MakeIoProviderDrivers(
@@ -5266,7 +5422,7 @@ BuildProductComposition(CompositionBuildInput input) {
   }
 
   const deployment::FilesystemVerifiedCatalogArtifactSource catalog_store(
-      input.package_root);
+      input.program_artifact_root.empty() ? input.package_root : input.program_artifact_root);
   const auto inventory =
       deployment::compile_direct_control_program_binding_inventory(
           *input.bundle, input.model_map, catalog_store);
@@ -5282,9 +5438,9 @@ BuildProductComposition(CompositionBuildInput input) {
   for (const auto& domain : input.bundle->value().cell_graph.control_domains)
     if (domain.provider()) io_component_ids.push_back(domain.provider()->controllable_component_id);
   // A sensor (`sensors` row) is a standalone component like an I/O device:
-  // its own view, whose adapter its family makes (CONTRACTS §6).
+  // its own view, whose adapter its family makes.
   std::vector<deployment::ros2_control_execution_runtime_contract::Configuration::Sensor> sensors;
-  // CONTRACTS §16: a machine whose arm is deactivated has no arm composition
+  // A machine whose arm is deactivated has no arm composition
   // to build its owner; its owner is a view of its own, like a sensor.
   std::vector<deployment::ros2_control_execution_runtime_contract::Configuration::Machine>
       armless_machines;
@@ -5300,7 +5456,7 @@ BuildProductComposition(CompositionBuildInput input) {
     io_component_ids.push_back(machine.controllable_component_id);
   std::sort(io_component_ids.begin(), io_component_ids.end());
   io_component_ids.erase(std::unique(io_component_ids.begin(), io_component_ids.end()), io_component_ids.end());
-  // FP-2: each view's component is built from its build input only.
+  // Each view's component is built from its build input only.
   const auto site_facts = component_manager::SiteFactsOf(input.site_settings);
   const auto with_io_bindings = [bindings = inventory.io,
       sensors, armless_machines, site_facts, host = ComponentBuildHostOf(input),
@@ -5347,9 +5503,16 @@ BuildProductComposition(CompositionBuildInput input) {
             return row.controllable_component_id == view->controllable_component_id;
           });
           sensor != sensors.end()) {
-        view->component_adapter = previous != snapshots.end()
-            ? previous->second.component_adapter
-            : MakeSensorAdapter(component);
+        if (previous != snapshots.end()) {
+          view->component_adapter = previous->second.component_adapter;
+          view->adapter_transport_consumers = previous->second.adapter_transport_consumers;
+        } else {
+          auto made = MakeSensorAdapter(component);
+          view->component_adapter = std::move(made.component);
+          if (made.ros_transport_consumer)
+            view->adapter_transport_consumers.emplace_back(
+                view->controllable_component_id.value(), std::move(made.ros_transport_consumer));
+        }
         Require(view->component_adapter != nullptr, "retained sensor lost its adapter");
         continue;
       }
@@ -5383,7 +5546,7 @@ BuildProductComposition(CompositionBuildInput input) {
                                        view->component_adapter};
         continue;
       }
-      // CONTRACTS §16: an I/O member carries its owner and role; on the real
+      // An I/O member carries its owner and role; on the real
       // lane (`component_adapter` signals) its owner's family serves it
       // through the owner's connection, with no generic I/O driver.
       const auto& device = spec.io_device;
@@ -5397,6 +5560,7 @@ BuildProductComposition(CompositionBuildInput input) {
         Require(device.has_value(), "I/O member has no device row");
         if (previous != snapshots.end()) {
           view->component_adapter = previous->second.component_adapter;
+          view->adapter_transport_consumers = previous->second.adapter_transport_consumers;
         } else {
           // Its owner's view, which built the owner with a lane adapter.
           const Composition* owner = nullptr;
@@ -5408,8 +5572,11 @@ BuildProductComposition(CompositionBuildInput input) {
           Require(owner != nullptr && owner->owner_handle != nullptr && owner->owner_family != nullptr,
                   "I/O member " + view->controllable_component_id.value() +
                       " has no owner built with a lane adapter");
-          view->component_adapter =
-              MakeIoMemberAdapter(component, owner->owner_handle, *owner->owner_family);
+          auto made = MakeIoMemberAdapter(component, owner->owner_handle, *owner->owner_family);
+          view->component_adapter = std::move(made.component);
+          if (made.ros_transport_consumer)
+            view->adapter_transport_consumers.emplace_back(
+                view->controllable_component_id.value(), std::move(made.ros_transport_consumer));
         }
         Require(view->component_adapter != nullptr, "retained I/O member lost its adapter");
         continue;
@@ -5446,11 +5613,11 @@ BuildProductComposition(CompositionBuildInput input) {
                                         const std::string_view capability_id) {
     std::vector<core::ControllableComponentId> component_ids;
     component_ids.reserve(bindings.size());
-    for (const auto &binding : bindings) {
+    for (const auto &entry : bindings) {
+      const auto &binding = entry.binding;
       const auto target = deployment::resolve_runtime_program_target(
           *binding,
-          core::TargetRoleId(
-              std::string(deployment::kDirectControlTargetRoleId)),
+          DirectControlTarget(*binding, entry.target, capability_id).target,
           core::CapabilityId(std::string(capability_id)), *input.bundle,
           input.model_map);
       component_ids.push_back(target.component().controllable_component_id);
@@ -5593,9 +5760,9 @@ BuildProductComposition(CompositionBuildInput input) {
   intrinsic_direct_bindings.reserve(inventory.motion.size() +
                                     inventory.gripper.size());
   for (const auto &binding : inventory.motion)
-    intrinsic_direct_bindings.push_back(binding->program_binding_id());
+    intrinsic_direct_bindings.push_back(binding.binding->program_binding_id());
   for (const auto &binding : inventory.gripper)
-    intrinsic_direct_bindings.push_back(binding->program_binding_id());
+    intrinsic_direct_bindings.push_back(binding.binding->program_binding_id());
   std::sort(intrinsic_direct_bindings.begin(), intrinsic_direct_bindings.end());
   intrinsic_direct_bindings.erase(std::unique(intrinsic_direct_bindings.begin(),
                                               intrinsic_direct_bindings.end()),
@@ -6059,11 +6226,62 @@ NativeCellComponentRegistrations(const Composition &cell) {
   return result;
 }
 
+struct ComponentStreamBridgeSlot final {
+  std::weak_ptr<ros2_control_execution::Ros2TransportResources> owner;
+  std::weak_ptr<void> bridge;
+};
+
+struct GenericIoRecoveryAttempt final {
+  std::atomic<bool> started{false};
+};
+
+struct GenericIoFaultState final {
+  std::atomic<std::shared_ptr<ros2_control_execution::Ros2TransportResources>> authoritative_owner;
+  std::atomic<std::shared_ptr<const core::Fault>> fault;
+  std::atomic<std::shared_ptr<GenericIoRecoveryAttempt>> attempt;
+  std::atomic<std::shared_ptr<CompositionIoOwnerRecoverySnapshot>> rebuilt_snapshot;
+  std::atomic<std::shared_ptr<ros2_control_execution::Ros2TransportResources>> rebuilt_owner;
+};
+
+void PublishGenericIoFault(
+    const std::shared_ptr<ros2_control_execution::Ros2TransportResources> &owner,
+    const std::shared_ptr<GenericIoFaultState> &state,
+    const std::shared_ptr<RetainedObservationWake> &wake) noexcept {
+  try {
+    if (!owner || !state || state->authoritative_owner.load() != owner) return;
+    const auto detail = owner->executor_fault();
+    if (!detail) return;
+    state->fault.store(std::make_shared<const core::Fault>(core::Fault{
+        core::FaultCode::kProcessExited,
+        "ROS transport executor thread failed: " + *detail + " (owner " +
+            owner->owner_name() + ")",
+        true, core::FaultOperatorAction::kRecover, std::nullopt, std::nullopt, {},
+        WallClock{}.now()}));
+    if (wake) wake->notify();
+  } catch (...) {
+    // The observer runs on the failed executor and cannot propagate.
+  }
+}
+
+void InstallGenericIoFaultObserver(
+    const std::shared_ptr<ros2_control_execution::Ros2TransportResources> &owner,
+    const std::shared_ptr<GenericIoFaultState> &state,
+    const std::shared_ptr<RetainedObservationWake> &wake) {
+  const std::weak_ptr weak_owner = owner;
+  const std::weak_ptr weak_state = state;
+  owner->set_executor_fault_observer([weak_owner, weak_state, wake](std::string_view) noexcept {
+    PublishGenericIoFault(weak_owner.lock(), weak_state.lock(), wake);
+  });
+}
+
 // Paused resource construction precedes Kernel registration. The caller
 // holds the same existing Apply/composition mutation pin as installation.
 void PrepareCompositionIoResources(Composition &composition,
     RetainedCellRuntime &cell,
     std::shared_ptr<ros2_control_execution::Ros2TransportResources> &shared_transport,
+    ComponentStreamBridgeSlot &bridge_slot,
+    const std::shared_ptr<GenericIoFaultState> &fault_state,
+    const std::shared_ptr<RetainedObservationWake> &observation_wake,
     const ros2_control_execution::Ros2TransportResources::ContextProvider &ros_context_provider,
     std::span<const CompositionIoResourcePredecessor> existing = {}) {
   const auto rows = deployment::ResolveRetainedIoSignalCatalog(composition.bundle->value().cell_graph);
@@ -6089,39 +6307,42 @@ void PrepareCompositionIoResources(Composition &composition,
   auto transport = shared_transport;
   const bool created_transport = needs_ros && !transport;
   if (created_transport) {
-    transport = std::make_shared<ros2_control_execution::Ros2TransportResources>(
-        "manyforge_generic_io", "/", 3U, ros_context_provider);
-    // No component health reads this host-wide transport: its executor fault
-    // contains the cell like any other safety-path callback throw.
-    transport->set_executor_fault_observer(
-        [scheduler = cell.scheduler()](const std::string_view reason_code) {
-          scheduler->contain_safety_path_fault(reason_code);
-        });
+    transport = ros2_control_execution::Ros2TransportResources::create(
+        "manyforge_generic_io", "/", 1U, ros_context_provider);
+    // OD-66: interrupt inputs run on this owner's time-critical thread.
+    transport->enable_time_critical_callbacks();
+    InstallGenericIoFaultObserver(transport, fault_state, observation_wake);
   }
   composition.io_transport = transport;
   const auto prepared = PrepareCompositionIoProviderResources(composition, cell,
-      transport ? transport->node() : nullptr, existing);
+      transport ? transport->node() : nullptr, existing, transport);
   if (!prepared.ok())
     throw core::TypedError(prepared.error().code,
                            "actual I/O resource preparation failed: " +
                                prepared.error().message,
                            prepared.error().details);
   if (stream_observer) {
-    // One bridge per host process: Python observer sinks push samples
-    // into the streams their host-side driver declared.
-    static std::mutex bridge_mutex;
-    static std::weak_ptr<void> installed_bridge;
-    std::lock_guard bridge_lock(bridge_mutex);
-    auto bridge = installed_bridge.lock();
+    if (const auto failure = transport->executor_fault())
+      throw core::TypedError("ros_transport_executor_failed",
+                             "ROS transport executor thread failed: " + *failure +
+                                 " (owner " + transport->owner_name() + ")");
+    // The slot belongs to this host and is protected by the existing
+    // composition mutation pin. A bridge can only be reused with the exact
+    // transport whose node owns its subscription.
+    auto bridge = bridge_slot.owner.lock() == transport ? bridge_slot.bridge.lock() : nullptr;
     if (!bridge) {
-      bridge = InstallComponentStreamSampleBridge(transport->node(),
-                                                  host_component_stream_health());
-      installed_bridge = bridge;
+      bridge = InstallComponentStreamSampleBridge(
+          transport->node(), host_component_stream_health(), transport);
+      bridge_slot.owner = transport;
+      bridge_slot.bridge = bridge;
     }
     composition.component_stream_sample_bridge = std::move(bridge);
   }
   if (created_transport) {
     transport->start();
+    fault_state->authoritative_owner.store(transport);
+    if (transport->executor_failure_started())
+      PublishGenericIoFault(transport, fault_state, observation_wake);
     // Publish only a successfully prepared, running host transport. Later
     // compositions reuse its executor without starting it a second time.
     shared_transport = std::move(transport);
@@ -6267,7 +6488,7 @@ CellControlBindingRepresentatives(const Composition &composition) {
   return representatives;
 }
 
-/// The route publication owner of a cell without an arm runtime (M7's
+/// The route publication owner of a cell without an arm runtime (the
 /// gripper-only cell port): the first gripper is the root, the others its
 /// peers by domain. A reconciled publication replaces the gripper's rows in
 /// the cell's installed registration set and resolves participants with the
@@ -6307,7 +6528,7 @@ MakeGripperOnlyCellRouteOwner(std::vector<std::shared_ptr<RetainedGripperRuntime
   for (auto &gripper : grippers) {
     const auto domain = gripper->binding().value().control_path->control_domain_id;
     auto owner = std::make_shared<RetainedGripperRoutePublicationOwner>(
-        std::move(gripper), *cell.clock(), cell.addressed_kernel(), candidate, &cell);
+        std::move(gripper), cell.clock(), cell.addressed_kernel(), candidate, &cell);
     if (!root) root = std::move(owner);
     else peers.emplace(domain, std::move(owner));
   }
@@ -6318,7 +6539,7 @@ MakeGripperOnlyCellRouteOwner(std::vector<std::shared_ptr<RetainedGripperRuntime
 void ConfigureProgramResetPositionAccess(ExecutionCompositionAccess& access,
                                         const core::RequestOwnerEpoch& owner_epoch) {
   // Callers install callbacks before ingress. Component states come from the
-  // cell's component runtime (R4), never a second lifecycle owner.
+  // cell's component runtime, never a second lifecycle owner.
   access.reset_robot_position_capability = [&access](Composition& composition) {
     using Result = core::Result<ProgramResetPositionCapability>;
     try {
@@ -6583,8 +6804,8 @@ TryBuildCurrentManagedCompositionInput(
       {},
       {},
       {},
-      core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
-      core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
+      std::nullopt,
+      std::nullopt,
       {},
       {},
       config.manager_run_root,
@@ -6769,8 +6990,8 @@ struct ManagedBootstrapStopProduct final {
       {},
       {},
       {},
-      core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
-      core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
+      std::nullopt,
+      std::nullopt,
       std::move(shared_clock),
       std::move(shared_scheduler),
       config.manager_run_root,
@@ -6793,7 +7014,7 @@ struct ManagedBootstrapStopProduct final {
   const auto selected_program = detail::ReadSelectedProgramProducts(
       config.manager_state_root, core::CellId(config.cell_id), *input.origin_named_apply,
       *input.bundle, input.model_map, input.package_root, input.program_artifact_root);
-  Require(selected_program.ok(), "candidate selected Program products are unavailable");
+  if (!selected_program.ok()) throw core::TypedError(selected_program.error(), "execution_host");
   input.selected_program_products = selected_program.value();
   return input;
 }
@@ -6919,6 +7140,14 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   using component_manager::detail::NativeShutdownOwnerPhase;
   component_manager::detail::NativeShutdownProjection shutdown_projection(
       config.runtime_epoch);
+  // This must outlive all host owners: the drain guard arms it, and its own
+  // destructor disarms it only after those owners have finished destruction.
+  host_detail::HostShutdownWatchdog shutdown_watchdog;
+  struct ShutdownWatchdogPhase final {
+    std::atomic<const char *> &phase;
+    const char *name;
+    ~ShutdownWatchdogPhase() { phase.store(name, std::memory_order_release); }
+  };
   const auto host_ros_context_provider = MakeHostRosContextProvider();
   const auto host_motion_trace =
       std::make_shared<ros2_control_execution::VolatileMotionTrace>();
@@ -6983,7 +7212,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       });
   NativeShutdownOwnerPhase projection_destructor_phase{
       shutdown_projection, ShutdownPhase::kProjectionDestruction, projections};
-  // CONTRACTS §6: the installed adapter families (ament resource index
+  // The installed adapter families (ament resource index
   // `manyforge_component_adapters`). Declared before every composition and
   // the component runtime: their family adapters are code of these loaded
   // libraries, so the registry (which unloads them) is destroyed last.
@@ -7004,6 +7233,15 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   // would strand non-owning root and Stop-reader pointers while the Apply
   // remains command-closed.
   std::shared_ptr<ros2_control_execution::Ros2TransportResources> generic_io_transport;
+  ComponentStreamBridgeSlot component_stream_bridge_slot;
+  const auto generic_io_fault = std::make_shared<GenericIoFaultState>();
+  const auto adapter_transport_fault = std::make_shared<GenericIoFaultState>();
+  std::atomic<std::shared_ptr<const InstalledGenericIoMembership>>
+      installed_generic_io_membership;
+  std::atomic<std::shared_ptr<const InstalledAdapterTransportMembership>>
+      installed_adapter_transport_membership;
+  std::atomic<std::shared_ptr<const InstalledRetainedTransportMembership>>
+      installed_retained_transport_membership;
   std::unique_ptr<Composition> failed_prepared_composition;
   NativeShutdownOwnerPhase failed_destructor_phase{
       shutdown_projection, ShutdownPhase::kFailedCompositionDestruction,
@@ -7029,10 +7267,14 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   NativeShutdownOwnerPhase scheduler_destructor_phase{
       shutdown_projection, ShutdownPhase::kSchedulerOwnerRelease,
       detached_owner_scheduler};
+  ShutdownWatchdogPhase scheduler_watchdog_phase{shutdown_watchdog.phase,
+                                                "scheduler_destruction"};
   std::unique_ptr<RetainedCellRuntime> stable_cell_runtime_owner;
   NativeShutdownOwnerPhase cell_kernel_destructor_phase{
       shutdown_projection, ShutdownPhase::kKernelDestruction,
       stable_cell_runtime_owner};
+  ShutdownWatchdogPhase cell_kernel_watchdog_phase{shutdown_watchdog.phase,
+                                                  "cell_runtime_destruction"};
   std::shared_ptr<RetainedObservationWake> stable_observation_wake;
   std::unique_ptr<core::SqliteOperationJournal> detached_operation_journal;
   std::unique_ptr<core::ResourceAddressedExecutionKernel>
@@ -7040,6 +7282,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   NativeShutdownOwnerPhase detached_kernel_destructor_phase{
       shutdown_projection, ShutdownPhase::kKernelDestruction,
       detached_addressed_kernel};
+  ShutdownWatchdogPhase detached_kernel_watchdog_phase{shutdown_watchdog.phase,
+                                                      "kernel_destruction"};
+  std::vector<PendingDiscard> pending_discards;
   // The stable Kernel owns the Stop latch across product reconfiguration.
   // Command dispatch already pins the active composition with its shared
   // lifetime lock, so this atomic selects only that same current product's
@@ -7124,7 +7369,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   // The managed cell hosts the Headless Alarm Lifecycle Owner: Run/Resume
   // and motion-producing recovery evaluate its published attention. The
   // control plane is single-host: only projections from this host boot are
-  // accepted, so owner incarnations are comparable (spec 530 §11).
+  // accepted, so owner incarnations are comparable.
   bootstrap_kernel_config.operator_alarm_attention =
       core::OperatorAlarmAttentionPolicyDTO{
           core::kOperatorAlarmAttentionMaximumSnapshotAgeNs,
@@ -7164,7 +7409,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             "selected physical runtime could not close admission before "
             "composition initialization");
   }
-  // Active TCP (M7, design 4): each robot appends its confirmed changes to
+  // Active TCP: each robot appends its confirmed changes to
   // the stable cell journal (the `events` stream and History), stamped on
   // the Kernel's clock, under its own lock. A failed write is logged; results
   // and reads still carry the value and its sequence.
@@ -7209,12 +7454,77 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   std::optional<core::ManagerLivenessRequiredSetDTO>
       manager_liveness_required_set;
   std::set<std::pair<std::string, std::string>> retired_manager_epochs;
+  // Outlives `execution_composition_owner` and every adapter owner callback.
+  InstalledIoSignalRuntimeSlot installed_io_signal_runtime;
   auto execution_composition_owner =
       std::make_shared<ExecutionCompositionAccess>();
   execution_composition_owner->motion_trace = host_motion_trace;
   auto &execution_composition = *execution_composition_owner;
   const auto bind_cell_runtime_to_composition =
       [&](Composition &composition) {
+        const auto bind_late_cancel = [&](Composition &view) {
+          if (view.ros2_control_runtime_handle && view.gripper_runtime &&
+              view.gripper_runtime->participant_engine()) {
+            const std::weak_ptr<ExecutionCompositionAccess> access = execution_composition_owner;
+            const std::weak_ptr<RetainedGripperRuntime> gripper = view.gripper_runtime;
+            auto result = view.ros2_control_runtime_handle->InstallGripperLateCancelJournalHook(
+                view.gripper_runtime->participant_engine(),
+                [access, gripper](const std::uint64_t preparation_id,
+                                  const std::uint64_t command_id,
+                                  const std::uint64_t generation,
+                                  const core::CommandTargetId &target,
+                                  const std::string &gripper_id) -> core::Result<void> {
+                  const auto owner = access.lock();
+                  if (!owner)
+                    return core::Result<void>::Err({"late_cancel_owner_unavailable",
+                                                   "Late-cancel journal owner is unavailable", {}});
+                  std::shared_lock lock(owner->mutex);
+                  auto *kernel = owner->addressed_kernel.load(std::memory_order_acquire);
+                  if (!kernel)
+                    return core::Result<void>::Err({"late_cancel_kernel_unavailable",
+                                                   "Late-cancel journal kernel is unavailable", {}});
+                  const auto pinned_gripper = gripper.lock();
+                  if (!pinned_gripper || !pinned_gripper->participant_engine())
+                    return core::Result<void>::Err({"late_cancel_owner_unavailable",
+                                                   "Late-cancel journal owner is unavailable", {}});
+                  const auto recorded = kernel->record_late_cancel_uncertain(
+                      pinned_gripper->participant_engine(), preparation_id, command_id,
+                      generation, target);
+                  if (!recorded.ok()) return recorded;
+                  if (!pinned_gripper->participant_engine()->notify_exact_gripper_owner_loss_recorded(
+                          gripper_id, command_id, generation))
+                    return core::Result<void>::Err({"late_cancel_session_unavailable",
+                                                   "Exact gripper recovery session is unavailable", {}});
+                  return core::Result<void>::Ok();
+                });
+            if (!result.ok()) throw std::runtime_error(result.error().message);
+          }
+          if (!view.ros2_control_runtime_handle || !view.runtime ||
+              !view.runtime->participant_engine) return;
+          const std::weak_ptr<ExecutionCompositionAccess> access = execution_composition_owner;
+          const std::weak_ptr<core::ExecutionKernel> engine = view.runtime->participant_engine;
+          view.ros2_control_runtime_handle->InstallLateCancelJournalHook(
+              view.runtime->participant_engine.get(),
+              [access, engine](const std::uint64_t execution_id) -> core::Result<void> {
+                const auto owner = access.lock();
+                if (!owner)
+                  return core::Result<void>::Err({"late_cancel_owner_unavailable",
+                                                 "Late-cancel journal owner is unavailable", {}});
+                std::shared_lock lock(owner->mutex);
+                auto *kernel = owner->addressed_kernel.load(std::memory_order_acquire);
+                if (!kernel)
+                  return core::Result<void>::Err({"late_cancel_kernel_unavailable",
+                                                 "Late-cancel journal kernel is unavailable", {}});
+                const auto pinned_engine = engine.lock();
+                if (!pinned_engine)
+                  return core::Result<void>::Err({"late_cancel_owner_unavailable",
+                                                 "Late-cancel journal owner is unavailable", {}});
+                return kernel->record_late_cancel_uncertain(pinned_engine.get(), execution_id);
+              });
+        };
+        bind_late_cancel(composition);
+        for (const auto &participant : composition.participant_compositions)
+          if (participant != nullptr) bind_late_cancel(*participant);
         bind_active_tcp_events(composition);
         for (const auto &participant : composition.participant_compositions)
           if (participant != nullptr) bind_active_tcp_events(*participant);
@@ -7248,27 +7558,139 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               execution_composition);
         }
       };
-  // CONTRACTS §6: the host node the installed families' adapters use.
-  const auto adapter_transport = std::make_shared<ros2_control_execution::Ros2TransportResources>(
-      "manyforge_component_adapters", "/manyforge", 2U, host_ros_context_provider);
+  // The host node the installed families' adapters use.
+  std::atomic<std::shared_ptr<ros2_control_execution::Ros2TransportResources>> adapter_transport{
+      ros2_control_execution::Ros2TransportResources::create(
+          "manyforge_component_adapters", "/manyforge", 1U, host_ros_context_provider)};
+  // OD-66: vendor I/O state used for interrupt inputs (xArm io_states) runs on
+  // this owner's time-critical thread.
+  adapter_transport.load()->enable_time_critical_callbacks();
+  adapter_transport_fault->authoritative_owner.store(adapter_transport.load());
+  InstallGenericIoFaultObserver(adapter_transport.load(), adapter_transport_fault, stable_observation_wake);
+  execution_composition.publish_transport_membership =
+      [&](const Composition *selected) {
+        if (!selected) {
+          installed_generic_io_membership.store(nullptr);
+          installed_adapter_transport_membership.store(nullptr);
+          installed_retained_transport_membership.store(nullptr);
+          return;
+        }
+        if (generic_io_transport) {
+          const std::array<const Composition *, 1> roots{selected};
+          auto snapshot = CaptureCompositionIoOwnerRecovery(roots, generic_io_transport);
+          ResolveCompositionIoOwnerRecoveryServed(*snapshot);
+          auto membership = std::make_shared<InstalledGenericIoMembership>();
+          membership->owner = generic_io_transport;
+          membership->components = CompositionIoOwnerRecoveryServed(*snapshot);
+          Require(selected->bundle || membership->components.empty(),
+                  "generic I/O recovery membership requires its retained bundle");
+          for (const auto &component : membership->components)
+            membership->lifecycle_timeout_by_component.emplace(
+                component.value(), deployment::component_spec(*selected->bundle, site_facts, component)
+                                       .lifecycle_command_timeout_ns);
+          installed_generic_io_membership.store(std::move(membership));
+        } else {
+          installed_generic_io_membership.store(nullptr);
+        }
+        auto adapters = std::make_shared<InstalledAdapterTransportMembership>();
+        adapters->owner = adapter_transport.load();
+        const auto include = [&](const Composition &view) {
+          adapters->consumers.insert(adapters->consumers.end(),
+                                     view.adapter_transport_consumers.begin(),
+                                     view.adapter_transport_consumers.end());
+        };
+        include(*selected);
+        for (const auto &participant : selected->participant_compositions)
+          if (participant) include(*participant);
+        Require(selected->bundle || adapters->consumers.empty(),
+                "adapter recovery membership requires its retained bundle");
+        for (const auto &[id, consumer] : adapters->consumers) {
+          static_cast<void>(consumer);
+          adapters->lifecycle_timeout_by_component.emplace(
+              id, deployment::component_spec(*selected->bundle, site_facts,
+                                              core::ControllableComponentId(id))
+                      .lifecycle_command_timeout_ns);
+        }
+        installed_adapter_transport_membership.store(std::move(adapters));
+        auto retained = std::make_shared<InstalledRetainedTransportMembership>();
+        const auto include_retained = [&](const Composition &view) {
+          if (view.ros2_control_runtime_handle)
+            retained->entries.push_back({view.controllable_component_id.value(),
+                view.ros2_control_runtime_handle, view.gripper_runtime});
+        };
+        include_retained(*selected);
+        for (const auto &participant : selected->participant_compositions)
+          if (participant) include_retained(*participant);
+        installed_retained_transport_membership.store(std::move(retained));
+      };
+  execution_composition.enter_transport_effect =
+      [&](const std::string &component_id) -> core::Result<std::shared_ptr<void>> {
+        return EnterInstalledTransportEffect(
+            execution_composition, component_id, installed_generic_io_membership.load(),
+            installed_adapter_transport_membership.load(),
+            installed_retained_transport_membership.load());
+      };
+  execution_composition.transport_output_fault =
+      [generic_io_fault, &installed_generic_io_membership](const std::string &component_id,
+          const std::shared_ptr<ros2_control_execution::Ros2TransportResources> &owner)
+          -> std::optional<core::ErrorDTO> {
+        const auto membership = installed_generic_io_membership.load();
+        if (!membership || membership->owner != owner || !generic_io_fault->fault.load() ||
+            std::none_of(membership->components.begin(), membership->components.end(),
+                         [&](const auto &id) { return id.value() == component_id; }))
+          return std::nullopt;
+        return core::ErrorDTO{"component_not_ready", "The I/O transport recovery is not settled",
+                              {{"component_id", component_id}, {"effect", "none"}}};
+      };
+  execution_composition.adapter_output_fault =
+      [&adapter_transport, adapter_transport_fault](const std::string &component_id) -> std::optional<core::ErrorDTO> {
+        const auto owner = adapter_transport.load();
+        if (!owner || (!owner->executor_failure_started() && !adapter_transport_fault->fault.load()))
+          return std::nullopt;
+        return core::ErrorDTO{"ros_transport_executor_failed", "The ROS transport executor has failed",
+                              {{"component_id", component_id}, {"effect", "none"}}};
+      };
   // Spins for the host's lifetime: adapters add their subscriptions and
   // clients to this node as compositions install them.
-  adapter_transport->start();
-  // CONTRACTS §6: the host entries a family's adapters call.
+  adapter_transport.load()->start();
+  struct AdapterTransportQuiescence final {
+    std::atomic<std::shared_ptr<ros2_control_execution::Ros2TransportResources>> *resources;
+    ~AdapterTransportQuiescence() { if (auto current = resources->load()) current->quiesce(); }
+  } adapter_transport_quiescence{&adapter_transport};
+  // The host entries a family's adapters call.
   const auto restart_component_driver = [&execution_composition](
                                             const std::string &component_id, std::stop_token) {
     return RestartComponentDriver(execution_composition, component_id);
   };
+  const auto enter_component_transport_effect =
+      [weak = std::weak_ptr<ExecutionCompositionAccess>(execution_composition_owner)](
+          const std::string &component_id) -> core::Result<std::shared_ptr<void>> {
+        using Reply = core::Result<std::shared_ptr<void>>;
+        const auto access = weak.lock();
+        if (!access || !access->enter_transport_effect)
+          return Reply::Err({"component_not_ready", "The host transport authority is unavailable", {}});
+        return access->enter_transport_effect(component_id);
+      };
   const ComponentIoUpdateSink component_io_updates =
-      [&execution_composition](const std::string &component_id,
-                               const std::vector<core::IoSignalUpdateDTO> &updates,
-                               const std::int64_t received_at_ns) {
-        PublishComponentIoUpdates(execution_composition, component_id, updates, received_at_ns);
+      [&installed_io_signal_runtime](const std::string &component_id,
+                                     const std::vector<core::IoSignalUpdateDTO> &updates,
+                                     const std::int64_t received_at_ns) {
+        PublishComponentIoUpdates(installed_io_signal_runtime, component_id, updates,
+                                  received_at_ns);
       };
   execution_composition.addressed_kernel = stable_kernel_owner;
   execution_composition.operation_journal = stable_operation_journal;
-  // CONTRACTS §1-§6: the cell's one component runtime, kept across Apply.
-  // Every state change feeds the Kernel's cell latch (§5) and wakes the event
+  auto prepare_generic_recovery = std::make_shared<std::function<
+      core::IComponentAdapter::PreparedRecovery(const std::string &)>>();
+  auto prepare_adapter_recovery = std::make_shared<std::function<
+      core::IComponentAdapter::PreparedRecovery(
+          const std::string &, const std::shared_ptr<core::IComponentAdapter> &)>>();
+  auto prepare_retained_recovery = std::make_shared<std::function<
+      core::IComponentAdapter::PreparedRecovery(
+          const std::string &, const std::shared_ptr<core::IComponentAdapter> &)>>();
+  auto refresh_generic_recovery = std::make_shared<std::function<void()>>();
+  // The cell's one component runtime, kept across Apply.
+  // Every state change feeds the Kernel's cell latch and wakes the event
   // stream.
   // A successful `enable` opens the component's routes (`open_routes`)
   // before the action reports success.
@@ -7311,25 +7733,505 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                                        *product->gripper_route_owner,
                                        *stable_cell_runtime_owner, component);
           },
-          [] { core::execution_event_change_signal().Notify(); }});
-  // CONTRACTS §2: every Stop the Kernel accepts interrupts the component
+          [] { core::execution_event_change_signal().Notify(); },
+          [generic_io_fault, adapter_transport_fault, &installed_generic_io_membership,
+           &installed_adapter_transport_membership, &installed_retained_transport_membership](const std::string &id)
+              -> std::optional<core::Fault> {
+            // Stall snapshots are published independently of owner-held locks.
+            // Check every owner of this exact component before asking its adapter.
+            const auto stalled = [&](const auto &owner) -> std::optional<core::Fault> {
+              if (!owner) return std::nullopt;
+              const auto snapshot = owner->owner_stall();
+              if (!snapshot) return std::nullopt;
+              return core::Fault{core::FaultCode::kOwnerStalled,
+                  "ROS transport owner " + snapshot->owner + " stalled in " + snapshot->task,
+                  true, core::FaultOperatorAction::kRecover,
+                  std::nullopt, std::nullopt, {}, 0};
+            };
+            const auto generic = installed_generic_io_membership.load();
+            if (generic && std::any_of(generic->components.begin(), generic->components.end(),
+                    [&](const auto &component) { return component.value() == id; }))
+              if (auto fault = stalled(generic->owner)) return fault;
+            const auto shared_adapter = installed_adapter_transport_membership.load();
+            if (shared_adapter && std::any_of(shared_adapter->consumers.begin(), shared_adapter->consumers.end(),
+                    [&](const auto &entry) { return entry.first == id; }))
+              if (auto fault = stalled(shared_adapter->owner)) return fault;
+            const auto retained_owners = installed_retained_transport_membership.load();
+            if (retained_owners) {
+              for (const auto &entry : retained_owners->entries) {
+                if (entry.component != id) continue;
+                const auto owners = entry.handle->PublishedTransportOwners();
+                if (!owners) continue;
+                if (auto fault = stalled(owners->machine)) return fault;
+                if (auto fault = stalled(owners->epoch)) return fault;
+              }
+            }
+            const auto membership = installed_generic_io_membership.load();
+            auto owner = membership && std::any_of(membership->components.begin(), membership->components.end(),
+                [&](const auto &component) { return component.value() == id; }) ? membership->owner : nullptr;
+            auto fault = generic_io_fault->fault.load();
+            if (owner && (fault || owner->executor_failure_started())) {
+              if (fault) return *fault;
+            } else {
+              const auto adapters = installed_adapter_transport_membership.load();
+              owner = adapters && std::any_of(adapters->consumers.begin(), adapters->consumers.end(),
+                  [&](const auto &entry) { return entry.first == id; }) ? adapters->owner : nullptr;
+              fault = adapter_transport_fault->fault.load();
+              if (!owner || (!fault && !owner->executor_failure_started())) {
+                const auto retained = installed_retained_transport_membership.load();
+                if (!retained) return std::nullopt;
+                const auto row = std::find_if(retained->entries.begin(), retained->entries.end(),
+                    [&](const auto &entry) { return entry.component == id; });
+                if (row == retained->entries.end()) return std::nullopt;
+                const auto owners = row->handle->PublishedTransportOwners();
+                if (!owners) return std::nullopt;
+                owner = owners->machine && owners->machine->executor_failure_started()
+                            ? owners->machine : owners->epoch;
+                if (!owner || !owner->executor_failure_started()) return std::nullopt;
+                fault.reset();
+              }
+              if (fault) return *fault;
+            }
+            return core::Fault{core::FaultCode::kProcessExited,
+                               std::string("ROS transport executor thread failed (owner ") +
+                                   owner->owner_name() + ")",
+                               true, core::FaultOperatorAction::kRecover,
+                               std::nullopt, std::nullopt, {}, 0};
+          },
+          [prepare_generic_recovery](const std::string &id) {
+            return *prepare_generic_recovery ? (*prepare_generic_recovery)(id)
+                                             : core::IComponentAdapter::PreparedRecovery{};
+          },
+          [&execution_composition](const std::string &component_id, bool known_consumer)
+              -> core::Result<std::shared_ptr<void>> {
+            if (!known_consumer) return execution_composition.enter_transport_effect(component_id);
+            auto permit = execution_composition.TryTransportEffect();
+            if (!permit)
+              return core::Result<std::shared_ptr<void>>::Err(
+                  {"component_action_in_progress", "A shared transport recovery is in progress",
+                   {{"component_id", component_id}, {"effect", "none"}}});
+            return core::Result<std::shared_ptr<void>>::Ok(
+                std::make_shared<ExecutionCompositionAccess::TransportAdmission>(std::move(*permit)));
+          },
+          [adapter_transport_fault, &installed_adapter_transport_membership,
+           &installed_retained_transport_membership](const std::string &component_id, const core::IComponentAdapter *adapter)
+              -> std::optional<core::ErrorDTO> {
+            const auto *driver = dynamic_cast<const IoProviderDriverRecord *>(adapter);
+            const auto owner = driver ? driver->RosOwner() : nullptr;
+            const auto adapters = installed_adapter_transport_membership.load();
+            const bool failed_adapter = adapters &&
+                (adapters->owner->executor_failure_started() || adapter_transport_fault->fault.load()) &&
+                std::any_of(adapters->consumers.begin(), adapters->consumers.end(),
+                            [&](const auto &entry) { return entry.first == component_id; });
+            const auto retained = installed_retained_transport_membership.load();
+            const bool failed_retained = retained &&
+                std::any_of(retained->entries.begin(), retained->entries.end(), [&](const auto &entry) {
+                  if (entry.component != component_id) return false;
+                  const auto owners = entry.handle->PublishedTransportOwners();
+                  return owners &&
+                      ((owners->machine && owners->machine->executor_failure_started()) ||
+                       (owners->epoch && owners->epoch->executor_failure_started()));
+                });
+            if ((!owner || !owner->executor_failure_started()) && !failed_adapter && !failed_retained)
+              return std::nullopt;
+            return core::ErrorDTO{"ros_transport_executor_failed", "The ROS transport executor has failed",
+                                  {{"component_id", component_id}, {"effect", "none"}}};
+          },
+          [refresh_generic_recovery, &installed_retained_transport_membership] {
+            if (*refresh_generic_recovery) (*refresh_generic_recovery)();
+            const auto membership = installed_retained_transport_membership.load();
+            if (membership)
+              for (const auto &entry : membership->entries)
+                if (entry.gripper && entry.gripper->participant_engine()) {
+                  try { entry.gripper->participant_engine()->AdvanceGripperOwnerRecovery(); }
+                  catch (...) { /* The existing tick retries pending evidence. */ }
+                }
+          },
+          [&installed_generic_io_membership, &installed_adapter_transport_membership,
+           &installed_retained_transport_membership](const std::string &id) {
+            const auto generic = installed_generic_io_membership.load();
+            const auto adapter = installed_adapter_transport_membership.load();
+            const auto retained = installed_retained_transport_membership.load();
+            return (generic && std::any_of(generic->components.begin(), generic->components.end(),
+                                           [&](const auto &row) { return row.value() == id; })) ||
+                   (adapter && std::any_of(adapter->consumers.begin(), adapter->consumers.end(),
+                                           [&](const auto &row) { return row.first == id; })) ||
+                   (retained && std::any_of(retained->entries.begin(), retained->entries.end(),
+                                            [&](const auto &row) { return row.component == id; }));
+          },
+          [prepare_adapter_recovery, prepare_retained_recovery](const auto &id, const auto &adapter) {
+            if (*prepare_adapter_recovery) {
+              auto prepared = (*prepare_adapter_recovery)(id, adapter);
+              if (prepared) return prepared;
+            }
+            return *prepare_retained_recovery ? (*prepare_retained_recovery)(id, adapter)
+                                              : core::IComponentAdapter::PreparedRecovery{};
+          },
+          [&installed_adapter_transport_membership](const std::string &id) {
+            const auto membership = installed_adapter_transport_membership.load();
+            return membership && std::any_of(membership->consumers.begin(), membership->consumers.end(),
+                                             [&](const auto &entry) { return entry.first == id; });
+          }});
+  *prepare_adapter_recovery = [&, adapter_transport_fault](
+      const std::string &id, const std::shared_ptr<core::IComponentAdapter> &addressed)
+      -> core::IComponentAdapter::PreparedRecovery {
+    const auto membership = installed_adapter_transport_membership.load();
+    if (!membership || !addressed ||
+        std::none_of(membership->consumers.begin(), membership->consumers.end(),
+                     [&](const auto &entry) { return entry.first == id; }) ||
+        (!adapter_transport_fault->fault.load() && !membership->owner->executor_failure_started()))
+      return {};
+    const auto accepted_at = std::chrono::steady_clock::now();
+    const auto budget = membership->lifecycle_timeout_by_component.find(id);
+    if (budget == membership->lifecycle_timeout_by_component.end() || budget->second <= 0)
+      return [](std::stop_token) {
+        core::ActionResult result;
+        result.outcome = core::ActionOutcome::kFailed;
+        result.error = core::ActionError{"component_not_ready", "Authored recovery timeout is unavailable", {}, {}};
+        return result;
+      };
+    const auto recovery_deadline = accepted_at + std::chrono::nanoseconds(budget->second);
+    auto admission = execution_composition.TryTransportRecovery();
+    if (!admission) return [](std::stop_token) {
+      core::ActionResult result;
+      result.outcome = core::ActionOutcome::kFailed;
+      result.error = core::ActionError{"component_action_in_progress", "Another host effect is in progress",
+                                       std::nullopt, std::nullopt};
+      return result;
+    };
+    auto permit = std::make_shared<std::optional<ExecutionCompositionAccess::TransportAdmission>>(
+        std::move(*admission));
+    return [&, addressed, membership, permit = std::move(permit), adapter_transport_fault, recovery_deadline]
+        (std::stop_token stop) mutable {
+      const auto fail = [](std::string code, std::string message) {
+        core::ActionResult result;
+        result.outcome = core::ActionOutcome::kFailed;
+        result.error = core::ActionError{std::move(code), std::move(message), std::nullopt, std::nullopt};
+        return result;
+      };
+      if (stop.stop_requested())
+        return fail("component_action_interrupted_by_stop", "The recovery was interrupted");
+      const auto continue_recover = [&](const auto &current_membership) {
+        permit->reset();
+        auto ordinary = execution_composition.TryTransportEffect();
+        if (!ordinary) return fail("component_action_in_progress", "Another host effect is in progress");
+        if (installed_adapter_transport_membership.load() != current_membership)
+          return fail("component_action_in_progress", "The installed component changed after recovery");
+        if (current_membership->owner->executor_failure_started())
+          return fail("ros_transport_executor_failed", "The replacement transport has failed");
+        return addressed->Run(core::ComponentAction::kRecover, stop);
+      };
+      std::shared_ptr<StagedAdapterTransportRecovery> staged;
+      std::shared_ptr<ros2_control_execution::Ros2TransportResources> candidate;
+      try {
+        candidate = ros2_control_execution::Ros2TransportResources::rebuild_faulted(
+            *membership->owner, recovery_deadline, [] {}, [&] {
+              auto fresh = ros2_control_execution::Ros2TransportResources::create(
+                  "manyforge_component_adapters", "/manyforge", 1U, host_ros_context_provider);
+              fresh->enable_time_critical_callbacks();  // OD-66
+              InstallGenericIoFaultObserver(fresh, adapter_transport_fault, stable_observation_wake);
+              candidate = fresh;
+              return fresh;
+            }, [&](auto &fresh) {
+              auto prepared = StageAdapterTransportRecovery(membership->consumers, membership->owner, candidate);
+              if (!prepared.ok()) throw core::TypedError(prepared.error());
+              staged = std::move(prepared.value());
+              fresh.start();
+            });
+      } catch (const core::TypedError &error) {
+        return fail(error.code(), error.what());
+      } catch (const std::exception &error) {
+        return fail("component_not_ready", error.what());
+      }
+      if (stop.stop_requested())
+        return fail("component_action_interrupted_by_stop", "The recovery was interrupted");
+      auto replacement_membership = std::make_shared<InstalledAdapterTransportMembership>(*membership);
+      replacement_membership->owner = candidate;
+      const auto old_fault = adapter_transport_fault->fault.load();
+      bool activation_failed = false;
+      {
+        std::lock_guard lock(managed_composition_mutex);
+        std::unique_lock execution_lock(execution_composition.mutex);
+        if (installed_adapter_transport_membership.load() != membership ||
+            adapter_transport.load() != membership->owner || !active_managed_composition ||
+            execution_composition.current != active_managed_composition.get() ||
+            candidate->executor_failure_started())
+          return fail("component_action_in_progress", "The installed transport changed during recovery");
+        const auto committed = CommitAdapterTransportRecovery(*staged);
+        if (!committed.ok()) return fail(committed.error().code, committed.error().message);
+        adapter_transport.store(candidate);
+        adapter_transport_fault->authoritative_owner.store(candidate);
+        installed_adapter_transport_membership.store(replacement_membership);
+        const auto activated = ActivateAdapterTransportRecovery(*staged, candidate);
+        activation_failed = !activated.ok();
+      }
+      if (activation_failed || candidate->executor_failure_started()) {
+        PublishGenericIoFault(candidate, adapter_transport_fault, stable_observation_wake);
+        return fail("component_not_ready", "The replacement transport failed during recovery");
+      }
+      auto expected_fault = old_fault;
+      (void)adapter_transport_fault->fault.compare_exchange_strong(expected_fault, nullptr);
+      return continue_recover(replacement_membership);
+    };
+  };
+  *prepare_retained_recovery = [&](const std::string &id,
+      const std::shared_ptr<core::IComponentAdapter> &addressed)
+      -> core::IComponentAdapter::PreparedRecovery {
+    const auto membership = installed_retained_transport_membership.load();
+    if (!membership || !addressed) return {};
+    const auto found = std::find_if(membership->entries.begin(), membership->entries.end(),
+        [&](const auto &entry) { return entry.component == id; });
+    if (found == membership->entries.end() || !found->handle) return {};
+    const auto handle = found->handle;
+    const auto owners = handle->PublishedTransportOwners();
+    if (!owners || !((owners->machine && owners->machine->executor_failure_started()) ||
+                     (owners->epoch && owners->epoch->executor_failure_started()))) return {};
+    auto admission = execution_composition.TryTransportRecovery();
+    if (!admission) return [](std::stop_token) {
+      core::ActionResult result;
+      result.outcome = core::ActionOutcome::kFailed;
+      result.error = core::ActionError{"component_action_in_progress", "Another host effect is in progress",
+                                       std::nullopt, std::nullopt};
+      return result;
+    };
+    auto permit = std::make_shared<std::optional<ExecutionCompositionAccess::TransportAdmission>>(
+        std::move(*admission));
+    return [&, membership, handle, owners, addressed, permit = std::move(permit)]
+        (std::stop_token stop) mutable {
+      const auto fail = [](std::string message) {
+        core::ActionResult result;
+        result.outcome = core::ActionOutcome::kFailed;
+        result.error = core::ActionError{"component_action_in_progress", std::move(message),
+                                         std::nullopt, std::nullopt};
+        return result;
+      };
+      if (installed_retained_transport_membership.load() != membership)
+        return fail("The installed component changed before recovery");
+      RetainedRos2ControlRuntimeHandle::TransportOwners replacement;
+      auto result = handle->RecoverFaultedOwner(*owners, stop, replacement);
+      if (result.outcome != core::ActionOutcome::kSucceeded) return result;
+      if (!replacement.machine) return fail("The replacement ROS owner was not published");
+      permit->reset();
+      auto ordinary = execution_composition.TryTransportEffect();
+      if (!ordinary) return fail("Another host effect is in progress");
+      if (installed_retained_transport_membership.load() != membership)
+        return fail("The installed component changed after recovery");
+      return addressed->Run(core::ComponentAction::kRecover, stop);
+    };
+  };
+  *refresh_generic_recovery = [&, generic_io_fault] {
+    if (!generic_io_fault->fault.load() || !generic_io_fault->rebuilt_owner.load()) return;
+    const auto fault = generic_io_fault->fault.load();
+    const auto rebuilt = generic_io_fault->rebuilt_owner.load();
+    const auto snapshot = generic_io_fault->rebuilt_snapshot.load();
+    const auto membership = installed_generic_io_membership.load();
+    if (!fault || !rebuilt || !snapshot || !membership || membership->owner != rebuilt)
+      return;
+    if (rebuilt->executor_failure_started()) return;
+    if (installed_generic_io_membership.load() != membership ||
+        generic_io_fault->rebuilt_owner.load() != rebuilt || rebuilt->executor_failure_started())
+      return;
+    auto expected = fault;
+    if (generic_io_fault->fault.compare_exchange_strong(expected, nullptr)) {
+      auto old_snapshot = snapshot;
+      (void)generic_io_fault->rebuilt_snapshot.compare_exchange_strong(old_snapshot, nullptr);
+      auto old_owner = rebuilt;
+      (void)generic_io_fault->rebuilt_owner.compare_exchange_strong(old_owner, nullptr);
+    }
+  };
+
+  *prepare_generic_recovery = [&, generic_io_fault, refresh_generic_recovery](const std::string &id)
+      -> core::IComponentAdapter::PreparedRecovery {
+    const auto membership = installed_generic_io_membership.load();
+    if (!membership || (!generic_io_fault->fault.load() && !membership->owner->executor_failure_started()) ||
+        std::none_of(membership->components.begin(), membership->components.end(),
+                     [&](const auto &component) { return component.value() == id; }))
+      return {};
+    const auto accepted_at = std::chrono::steady_clock::now();
+    const auto budget = membership->lifecycle_timeout_by_component.find(id);
+    if (budget == membership->lifecycle_timeout_by_component.end() || budget->second <= 0)
+      return [](std::stop_token) {
+        core::ActionResult result;
+        result.outcome = core::ActionOutcome::kFailed;
+        result.error = core::ActionError{"component_not_ready", "Authored recovery timeout is unavailable", {}, {}};
+        return result;
+      };
+    const auto recovery_deadline = accepted_at + std::chrono::nanoseconds(budget->second);
+    auto accepted_permit = execution_composition.TryTransportRecovery();
+    if (!accepted_permit) {
+      return [](std::stop_token) {
+        core::ActionResult result;
+        result.outcome = core::ActionOutcome::kFailed;
+        result.error = core::ActionError{"component_action_in_progress",
+                                         "Another host effect is in progress",
+                                         std::nullopt, std::nullopt};
+        return result;
+      };
+    }
+    auto permit = std::make_shared<ExecutionCompositionAccess::TransportAdmission>(
+        std::move(*accepted_permit));
+    auto attempt = generic_io_fault->attempt.load();
+    if (!attempt) {
+      auto fresh = std::make_shared<GenericIoRecoveryAttempt>();
+      if (generic_io_fault->attempt.compare_exchange_strong(attempt, fresh)) attempt = std::move(fresh);
+    }
+    return [&, membership, attempt, permit = std::move(permit), generic_io_fault,
+            refresh_generic_recovery, recovery_deadline](std::stop_token stop) {
+      static_cast<void>(permit);
+      const auto fail = [](std::string code, std::string message) {
+        core::ActionResult result;
+        result.outcome = core::ActionOutcome::kFailed;
+        result.error = core::ActionError{std::move(code), std::move(message), std::nullopt, std::nullopt};
+        return result;
+      };
+      if (attempt->started.exchange(true))
+        return fail("component_action_in_progress", "The shared transport recovery is already in progress");
+      struct FinishAttempt final {
+        std::shared_ptr<GenericIoFaultState> state;
+        std::shared_ptr<GenericIoRecoveryAttempt> attempt;
+        ~FinishAttempt() { (void)state->attempt.compare_exchange_strong(attempt, nullptr); }
+      } finish{generic_io_fault, attempt};
+      if (stop.stop_requested())
+        return fail("component_action_interrupted_by_stop", "The recovery was interrupted");
+      if (generic_io_fault->rebuilt_owner.load() == membership->owner &&
+          !membership->owner->executor_failure_started()) {
+        (*refresh_generic_recovery)();
+        if (generic_io_fault->fault.load())
+          return fail("component_action_result_not_observed", "The rebuilt I/O owner is not yet healthy and idle");
+        core::ActionResult result;
+        result.outcome = core::ActionOutcome::kSucceeded;
+        return result;
+      }
+      Composition *selected = nullptr;
+      std::optional<core::ActiveBundlePublicationGeneration> generation;
+      std::shared_ptr<CompositionIoOwnerRecoverySnapshot> snapshot;
+      std::shared_ptr<void> old_bridge;
+      bool bridge_required = false;
+      const auto previous_snapshot = generic_io_fault->rebuilt_snapshot.load();
+      const auto previous_owner = generic_io_fault->rebuilt_owner.load();
+      static_cast<void>(previous_snapshot);
+      static_cast<void>(previous_owner);
+      bool failed_after_commit = false;
+      {
+        std::lock_guard lock(managed_composition_mutex);
+        std::shared_lock execution_lock(execution_composition.mutex);
+        if (installed_generic_io_membership.load() != membership ||
+            generic_io_transport != membership->owner || !active_managed_composition ||
+            execution_composition.current != active_managed_composition.get())
+          return fail("component_action_in_progress", "The installed transport changed before recovery");
+        selected = active_managed_composition.get();
+        generation = selected->publication_generation;
+        old_bridge = selected->component_stream_sample_bridge;
+        bridge_required = bool(old_bridge);
+        const std::array<const Composition *, 1> roots{selected};
+        snapshot = CaptureCompositionIoOwnerRecovery(roots, membership->owner);
+      }
+      const auto closed = CloseCompositionIoOwnerRecovery(*snapshot);
+      if (!closed.ok()) return fail(closed.error().code, closed.error().message);
+      if (stop.stop_requested())
+        return fail("component_action_interrupted_by_stop", "The recovery was interrupted");
+      std::shared_ptr<CompositionIoOwnerRecoveryStage> staged;
+      std::shared_ptr<ros2_control_execution::Ros2TransportResources> candidate;
+      std::shared_ptr<void> bridge;
+      auto bridge_active = std::make_shared<std::atomic<bool>>(false);
+      try {
+        candidate = ros2_control_execution::Ros2TransportResources::rebuild_faulted(
+            *membership->owner, recovery_deadline, [] {},
+            [&] {
+              auto fresh = ros2_control_execution::Ros2TransportResources::create(
+                  "manyforge_generic_io", "/", 1U, host_ros_context_provider);
+              fresh->enable_time_critical_callbacks();  // OD-66
+              InstallGenericIoFaultObserver(fresh, generic_io_fault, stable_observation_wake);
+              candidate = fresh;
+              return fresh;
+            },
+            [&](auto &fresh) {
+              auto prepared = StageCompositionIoOwnerRecovery(snapshot, candidate);
+              if (!prepared.ok()) throw core::TypedError(prepared.error());
+              staged = std::move(prepared.value());
+              if (bridge_required)
+                bridge = InstallComponentStreamSampleBridge(
+                    fresh.node(), host_component_stream_health(), candidate, bridge_active);
+              fresh.start();
+            });
+      } catch (const core::TypedError &error) {
+        return fail(error.code(), error.what());
+      } catch (const std::exception &error) {
+        return fail("component_not_ready", error.what());
+      }
+      if (stop.stop_requested())
+        return fail("component_action_interrupted_by_stop", "The recovery was interrupted");
+      auto replacement_membership = std::make_shared<InstalledGenericIoMembership>(*membership);
+      replacement_membership->owner = candidate;
+      {
+        std::lock_guard lock(managed_composition_mutex);
+        std::unique_lock execution_lock(execution_composition.mutex);
+        if (installed_generic_io_membership.load() != membership ||
+            active_managed_composition.get() != selected ||
+            execution_composition.current != selected ||
+            generic_io_transport != membership->owner ||
+            selected->publication_generation != *generation || candidate->executor_failure_started())
+          return fail("component_action_in_progress", "The installed transport changed during recovery");
+        const auto committed = CommitCompositionIoOwnerRecovery(*staged);
+        if (!committed.ok()) return fail(committed.error().code, committed.error().message);
+        selected->io_transport = candidate;
+        for (const auto &participant : selected->participant_compositions)
+          if (participant && participant->io_transport == membership->owner)
+            participant->io_transport = candidate;
+        selected->component_stream_sample_bridge = bridge;
+        component_stream_bridge_slot.owner = candidate;
+        component_stream_bridge_slot.bridge = bridge;
+        generic_io_transport = candidate;
+        generic_io_fault->authoritative_owner.store(candidate);
+        if (candidate->executor_failure_started()) {
+          generic_io_fault->rebuilt_snapshot.store(nullptr);
+          generic_io_fault->rebuilt_owner.store(nullptr);
+          installed_generic_io_membership.store(replacement_membership);
+          failed_after_commit = true;
+        } else {
+          generic_io_fault->rebuilt_snapshot.store(snapshot);
+          generic_io_fault->rebuilt_owner.store(candidate);
+          installed_generic_io_membership.store(replacement_membership);
+          ActivateCompositionIoOwnerRecovery(*staged);
+          bridge_active->store(true, std::memory_order_release);
+        }
+      }
+      if (failed_after_commit) {
+        PublishGenericIoFault(candidate, generic_io_fault, stable_observation_wake);
+        return fail("component_not_ready", "The replacement transport failed during recovery");
+      }
+      (*refresh_generic_recovery)();
+      if (generic_io_fault->fault.load())
+        return fail("component_action_result_not_observed", "The rebuilt I/O owner is not yet healthy and idle");
+      core::ActionResult result;
+      result.outcome = core::ActionOutcome::kSucceeded;
+      return result;
+    };
+  };
+  // Every Stop the Kernel accepts interrupts the component
   // actions in progress.
   stable_kernel_owner->set_stop_listener(
       [runtime = std::weak_ptr<HostComponentRuntime>(execution_composition.component_runtime)] {
         if (const auto owner = runtime.lock()) owner->InterruptActions();
       });
   CommittedToolPayloadFollower payload_follower([&] {
-    std::shared_lock lock(execution_composition.mutex);
-    if (!execution_composition.current) return;
-    const auto apply = [](const Composition &component) {
-      if (component.direct_control_motion_binding &&
-          component.ros2_control_runtime_handle && component.planner_scene_projection) {
-        static_cast<void>(component.ros2_control_runtime_handle->ApplyLatestCommittedToolPayload());
-      }
-    };
-    apply(*execution_composition.current);
-    for (const auto &peer : execution_composition.current->participant_compositions)
-      apply(*peer);
+    // The handles are copied under the composition lock; the payload sends
+    // (vendor calls) run after it is released (OD-69 F1).
+    std::vector<std::shared_ptr<RetainedRos2ControlRuntimeHandle>> handles;
+    {
+      std::shared_lock lock(execution_composition.mutex);
+      if (!execution_composition.current) return;
+      const auto collect = [&](const Composition &component) {
+        if (component.direct_control_motion_binding &&
+            component.ros2_control_runtime_handle && component.planner_scene_projection)
+          handles.push_back(component.ros2_control_runtime_handle);
+      };
+      collect(*execution_composition.current);
+      for (const auto &peer : execution_composition.current->participant_compositions)
+        collect(*peer);
+    }
+    for (const auto &handle : handles)
+      static_cast<void>(handle->FollowLatestCommittedToolPayload());
   });
   const auto wake_payload_follower = [&] { payload_follower.Notify(); };
   {
@@ -7351,7 +8253,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   bool current_composition_building = false;
   bool current_predecessor_composition_pending = false;
 
-  // Program Reset of Mock arm positions reads the component runtime (R4).
+  // Program Reset of Mock arm positions reads the component runtime.
   ConfigureProgramResetPositionAccess(execution_composition,
       core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch));
 
@@ -7376,7 +8278,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     Require(execution_surface_control.ready,
             "managed execution command surface did not become ready");
   }
-  // CONTRACTS §15: the last Apply this host installed (the Manager then
+  // The last Apply this host installed (the Manager then
   // publishes it); the liveness rebind to its successor checks it.
   std::optional<HostApplySelection> installed_apply;
   std::atomic<std::shared_ptr<const HostApplySelection>> installed_liveness_handoff;
@@ -7528,74 +8430,45 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     return engines;
   };
 
+  // Collect exact registration and process identities as well as the owner
+  // pins used by the transitive handle/backend closure.
+  const auto collect_pending_protection = [&](const PendingDiscard &pending,
+                                              std::vector<ProtectedCompositionPins> &pins,
+                                              std::set<core::IResolvedParticipantExecutionEngine *> &engines) {
+    CollectRetainedPendingProtection(pending, pins, engines, snapshot_registration_engines);
+  };
+
+  // Runs on the Manager lane while the Kernel and all final-slot owners live.
+  // Failed entries retain their full typed pins and are retried later.
+  const auto retry_pending_discards = [&](std::chrono::steady_clock::time_point host_deadline =
+                                               std::chrono::steady_clock::time_point::max()) noexcept {
+    std::vector<PendingDiscard> batch = std::move(pending_discards);
+    pending_discards.clear();
+    SettleApplyPendingSnapshots(
+        batch, pending_discards,
+        {active_managed_composition.get(), prepared_managed_composition.get(),
+         failed_prepared_composition.get(), retired_managed_composition.get()},
+        stable_addressed_kernel, snapshot_registration_engines, collect_pending_protection,
+        nullptr, host_deadline);
+    return pending_discards.empty();
+  };
+
+  const Composition *retired_failure_logged_for = nullptr;
   const auto try_release_retired_composition = [&] {
-    std::unique_lock lock(managed_composition_mutex);
-    auto *const owner = stable_addressed_kernel();
-    if (owner == nullptr) {
-      return;
-    }
-    if (retired_managed_composition == nullptr) {
-      Require(retired_registration_engines.empty(),
-              "retired engine snapshot has no retired composition");
-      projections.ReclaimRetiredProjections();
-      return;
-    }
-    std::set<core::IResolvedParticipantExecutionEngine *> active_engines;
-    if (active_managed_composition != nullptr) {
-      active_engines = snapshot_registration_engines(*active_managed_composition);
-    }
-    for (auto *engine : retired_registration_engines) {
-      if (active_engines.contains(engine)) {
-        continue;
-      }
-      if (owner->participant_engine_in_use(engine)) {
-        return;
-      }
-    }
-    const auto *const retiring = retired_managed_composition.get();
-    std::vector<std::shared_ptr<ControllerLaunchProcess>> removed_processes;
-    std::set<const ControllerLaunchProcess *> active_processes;
-    if (active_managed_composition) {
-      for (const auto &[id, view] :
-           IndexNativeComponentCompositions(*active_managed_composition)) {
-        static_cast<void>(id);
-        if (view->controller_process)
-          active_processes.insert(view->controller_process.get());
-      }
-    }
-    for (const auto &[id, view] :
-         IndexNativeComponentCompositions(*retired_managed_composition)) {
-      static_cast<void>(id);
-      if (view->controller_process &&
-          !active_processes.contains(view->controller_process.get()))
-        removed_processes.push_back(view->controller_process);
-    }
-    // The same Manager channel owns composition replacement. Keep its
-    // retired Composition, model and engine pins until exact group cleanup
-    // completes; operational Stop does not wait on this mutex.
-    lock.unlock();
-    for (const auto &process : removed_processes)
-      static_cast<void>(
-          host_controller_launch_supervisor().retire_exact(process));
-    lock.lock();
-    // Only Manager dispatch mutates the retired owner/fence; the cell owner is stable.
-    Require(retired_managed_composition.get() == retiring &&
-                stable_addressed_kernel() == owner,
-            "retired composition changed during exact process cleanup");
-    for (auto engine = retired_registration_engines.begin();
-         engine != retired_registration_engines.end();) {
-      if (active_engines.contains(*engine)) {
-        ++engine;
-        continue;
-      }
-      if (!owner->release_retired_engine(*engine).ok()) {
-        return;
-      }
-      engine = retired_registration_engines.erase(engine);
-    }
-    retired_registration_engines.clear();
-    retired_managed_composition.reset();
-    projections.ReclaimRetiredProjections();
+    std::vector<ProtectedCompositionPins> pending_pins;
+    std::set<core::IResolvedParticipantExecutionEngine *> pending_engines;
+    for (const auto &pending : pending_discards)
+      collect_pending_protection(pending, pending_pins, pending_engines);
+    TryReleaseRetiredComposition(
+        managed_composition_mutex, active_managed_composition,
+        prepared_managed_composition, failed_prepared_composition,
+        retired_managed_composition, retired_registration_engines,
+        retired_failure_logged_for, stable_addressed_kernel,
+        snapshot_registration_engines, IndexNativeComponentCompositions,
+        [](const auto &process) {
+          return host_controller_launch_supervisor().retire_exact(process);
+        }, [&] { projections.ReclaimRetiredProjections(); },
+        [](bool condition, const char *message) { Require(condition, message); }, pending_pins, pending_engines);
   };
 
   // A Scenario composition refusal fails only its own Apply (through the
@@ -7649,8 +8522,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       input->shared_scheduler = detached_owner_scheduler;
       input->observation_wake = stable_observation_wake;
       input->adapter_registry = &adapter_registry;
-      input->adapter_node = adapter_transport->node();
+      input->adapter_owner = adapter_transport.load();
+      input->adapter_node = input->adapter_owner->retain_entity(input->adapter_owner->node());
       input->restart_driver = restart_component_driver;
+      input->enter_transport_effect = enter_component_transport_effect;
       input->io_updates = component_io_updates;
       current_predecessor_composition_pending = false;
       current_composition_builder_started = true;
@@ -7672,6 +8547,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             {
               std::lock_guard lock(managed_composition_mutex);
               std::unique_lock execution_lock(execution_composition.mutex);
+              const InstalledIoSignalRuntimePublication io_runtime_publication{
+                  execution_composition, installed_io_signal_runtime};
               Require(stable_kernel_owner != nullptr &&
                           stable_operation_journal != nullptr &&
                           detached_owner_clock != nullptr &&
@@ -7682,7 +8559,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                            built->runtime->scheduler == detached_owner_scheduler)),
                       "current managed composition does not share the stable cell time owners");
               PrepareCompositionIoResources(*built, *stable_cell_runtime_owner,
-                                            generic_io_transport, host_ros_context_provider);
+                                            generic_io_transport, component_stream_bridge_slot,
+                                            generic_io_fault, stable_observation_wake,
+                                            host_ros_context_provider);
               auto current_registrations = NativeCellComponentRegistrations(*built);
               RetainedRuntimeParticipantResolverFactory staged_factory;
               auto current_resolver = NativeCellParticipantResolver(*built, current_registrations, &staged_factory);
@@ -7709,7 +8588,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               installed = active_managed_composition.get();
             }
             std::cerr << "native composition phase: stable Kernel bound\n";
-            // CONTRACTS §15 (host restart): every component starts
+            // Host restart: every component starts
             // not_prepared/offline; routes open at each component's Enable.
             // Ordinary initial Bootstrap is not successful NamedApply metadata.
             // Preserve its actual signal-service installation only when it has
@@ -7749,7 +8628,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         });
   };
 
-  // CONTRACTS §15: the one Apply call of the Manager, made while it holds
+  // The one Apply call of the Manager, made while it holds
   // this Apply's Kernel configuration fence. A known refusal is a failed
   // result; anything else throws and the RPC reports it (effects unknown).
   RpcTiming composition_timing;
@@ -7761,7 +8640,20 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     const auto failed = [](core::ErrorDTO error) {
       return component_manager::HostApplyResult{HostApplyOutcome::kFailed, std::move(error)};
     };
+    const std::function<void(std::vector<PendingDiscard> &)> settle_snapshots = [&](auto &snapshots) {
+      SettleApplyPendingSnapshots(
+          snapshots, pending_discards,
+          {active_managed_composition.get(), prepared_managed_composition.get(),
+           failed_prepared_composition.get(), retired_managed_composition.get()},
+          stable_addressed_kernel, snapshot_registration_engines, collect_pending_protection);
+    };
+    ApplyPendingSnapshotCleanup apply_cleanup{{}, settle_snapshots};
     Require(request.valid(), "host Apply request is invalid");
+    auto transport_admission = execution_composition.TryTransportEffect();
+    if (!transport_admission)
+      return failed({"component_action_in_progress",
+                     "A shared transport recovery is in progress",
+                     {{"effect", "none"}}});
     Require(manager_liveness_receiver_config.has_value(),
             "host Apply arrived before the Manager's liveness lease");
     const auto fence = fence_owner.HeldApplyFence(
@@ -7774,16 +8666,31 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     if (current_composition_builder.joinable()) current_composition_builder.join();
     rethrow_composition_failure();
 
+    // Reserve the exact existing affected components before Apply effects.
+    // The coordinator's existing action admission then refuses a later
+    // lifecycle action until this scope releases the reservation.
+    std::vector<std::string> changed;
+    for (const auto &component : request.removed_components) changed.push_back(component.value());
+    for (const auto &component : request.components)
+      if (!std::binary_search(request.retained_components.begin(),
+                              request.retained_components.end(), component))
+        changed.push_back(component.value());
+    std::vector<std::string> reserved_components;
+    auto release_reservation = [&reserved_components](HostComponentRuntime *runtime) noexcept {
+      runtime->ReleaseApplyReservation(reserved_components);
+    };
+    std::unique_ptr<HostComponentRuntime, decltype(release_reservation)> reservation(
+        nullptr, release_reservation);
+    if (const auto busy = execution_composition.component_runtime->ReserveForApply(
+            changed, reserved_components))
+      return failed({"component_action_in_progress", "A component action is running",
+                     {{"component_id", *busy}, {"effect", "none"}}});
+    reservation.reset(execution_composition.component_runtime.get());
+
     // Refuse before any effect: an enabled component is never replaced or
     // removed (dead or faulted ones are accepted, and so is one whose Disable
-    // failed: its process is stopped below like a dead one, CONTRACTS §11).
+    // failed: its process is stopped below like a dead one).
     {
-      std::vector<std::string> changed;
-      for (const auto &component : request.removed_components) changed.push_back(component.value());
-      for (const auto &component : request.components)
-        if (!std::binary_search(request.retained_components.begin(),
-                                request.retained_components.end(), component))
-          changed.push_back(component.value());
       const auto states = execution_composition.component_runtime->Read().states;
       for (const auto &component : changed) {
         const auto state = std::find_if(states.begin(), states.end(), [&](const auto &row) {
@@ -7877,8 +8784,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       }
       for (const auto &[id, owner] : keepers) {
         actual_retained_components.push_back(id);
-        // An armed machine's owner rides on its kept arm member (CONTRACTS
-        // §16): the arm's identity includes the owner's, so it is kept too.
+        // An armed machine's owner rides on its kept arm member: the
+        // arm's identity includes the owner's, so it is kept too.
         if (owner->owner_component && owner->owner_component->component_id != id.value() &&
             !keepers.contains(core::ControllableComponentId(owner->owner_component->component_id)))
           actual_retained_components.emplace_back(owner->owner_component->component_id);
@@ -7891,7 +8798,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     owner->controller_process, owner->io_provider_drivers,
                     owner->component_runtime_pins, owner->component_adapter,
                     owner->owner_component, owner->owner_handle, owner->owner_family,
-                    owner->owner_id, owner->member_role});
+                    owner->owner_id, owner->member_role, owner->adapter_transport_consumers});
       }
       std::sort(actual_retained_components.begin(), actual_retained_components.end());
       actual_retained_components.erase(
@@ -7920,11 +8827,19 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         }
     }
 
+    // Copy snapshot pins before any Apply effect. The exit guard owns them
+    // across input moves and resolves them against the final slots.
+    for (const auto &[id, snapshot] : retained_snapshots) {
+      PendingDiscard entry;
+      entry.component_id = id.value();
+      entry.snapshots.push_back(snapshot);
+      apply_cleanup.snapshots.push_back(std::move(entry));
+    }
+
     // Stop the processes of removed and replaced components (no clean
     // disable: the refusal above kept every enabled one whose Disable didn't
     // fail), before the candidate starts any: a machine's process moving
-    // between its arm and its owner never runs twice on one controller
-    // (CONTRACTS §11, §16).
+    // between its arm and its owner never runs twice on one controller.
     for (const auto &process : processes_to_retire) {
       if (process->cleanup_observation().state != ControllerLaunchCleanupState::kDrained)
         static_cast<void>(host_controller_launch_supervisor().retire_exact(process));
@@ -7943,8 +8858,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       input->retained_component_snapshots = std::move(retained_snapshots);
       input->observation_wake = stable_observation_wake;
       input->adapter_registry = &adapter_registry;
-      input->adapter_node = adapter_transport->node();
+      input->adapter_owner = adapter_transport.load();
+      input->adapter_node = input->adapter_owner->retain_entity(input->adapter_owner->node());
       input->restart_driver = restart_component_driver;
+      input->enter_transport_effect = enter_component_transport_effect;
       input->io_updates = component_io_updates;
     }
     const bool retain_view = input.has_value() && IsExactRetainedViewApply(selection) &&
@@ -7953,6 +8870,19 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                              active_managed_composition != nullptr;
     const auto staged_tcp = input ? StageRetainedTcpRebinds(*input)
                                   : std::vector<StagedRetainedTcpRebind>{};
+    // Remove the slot from reuse now, but keep its owner pinned until the
+    // exit guard resolves it against the final published roots.
+    const auto discard_root = [&](std::unique_ptr<Composition> &slot) {
+      if (!slot) return;
+      auto component_id = slot->controllable_component_id.value();
+      pending_discards.emplace_back();
+      auto &entry = pending_discards.back();
+      entry.component_id = std::move(component_id);
+      entry.root = std::move(slot);
+    };
+    if (input && !retain_view && prepared_managed_composition) {
+      discard_root(prepared_managed_composition);
+    }
     std::shared_ptr<host_detail::ExecutionProduct> logical_product;
     try {
       if (input && !retain_view)
@@ -7968,7 +8898,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     } catch (const std::exception &error) {
       // A data/setup inconsistency found while composing refuses this
       // Apply only: typed, with its cause, logged once here.
-      prepared_managed_composition.reset();
+      discard_root(prepared_managed_composition);
       std::cerr << "ERROR native composition refused: apply=" << selection.apply_id.value()
                 << " cause=" << error.what() << '\n';
       return failed(host_detail::ScenarioCompositionRefusal(error).error());
@@ -7987,6 +8917,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           selection.expected_predecessor_public_pointer_digest, [&] {
         std::lock_guard lock(managed_composition_mutex);
         std::unique_lock execution_lock(execution_composition.mutex);
+        const InstalledIoSignalRuntimePublication io_runtime_publication{
+            execution_composition, installed_io_signal_runtime};
         Require(retired_managed_composition == nullptr && retired_registration_engines.empty(),
                 "a predecessor runtime engine remains lifetime-pinned");
         const std::array<const Composition *, 3> io_predecessors{
@@ -8016,7 +8948,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             candidate.selected_program_outcome = selected.outcome;
           }
           PrepareCompositionIoResources(candidate, *stable_cell_runtime_owner, generic_io_transport,
-                                        host_ros_context_provider, io_resources);
+                                        component_stream_bridge_slot, generic_io_fault,
+                                        stable_observation_wake, host_ros_context_provider,
+                                        io_resources);
           InstallDirectSceneFrameResolver(projections, candidate);
           std::vector<core::ControllableComponentId> retained_components;
           for (const auto &[component, view] : IndexNativeComponentCompositions(candidate)) {
@@ -8103,7 +9037,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           }
           installed_effect = true;
           PrepareCompositionIoResources(*prepared, *stable_cell_runtime_owner, generic_io_transport,
-                                        host_ros_context_provider, io_resources);
+                                        component_stream_bridge_slot, generic_io_fault,
+                                        stable_observation_wake, host_ros_context_provider,
+                                        io_resources);
           auto registrations = NativeCellComponentRegistrations(*prepared);
           RetainedRuntimeParticipantResolverFactory staged_factory;
           auto resolver = NativeCellParticipantResolver(*prepared, registrations, &staged_factory);
@@ -8211,7 +9147,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               return projection ? projection->logical_snapshot() : nullptr;
             };
           const auto rebound = item.handle->RebindRetainedToolContext(
-              item.rows, item.direct_binding, std::move(source), std::move(committed),
+              item.rows, item.associations, item.direct_binding, std::move(source), std::move(committed),
               std::move(pose), std::move(scene_source),
               std::move(enable_source));
           if (!rebound.ok()) Fail("retained TCP rebind failed: " + rebound.error().message);
@@ -8220,6 +9156,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       });
     } catch (...) {
       if (prepared_managed_composition) {
+        discard_root(failed_prepared_composition);
         prepared_managed_composition->discard_unadopted_controller_launches();
         failed_prepared_composition = std::move(prepared_managed_composition);
       }
@@ -8229,7 +9166,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       return failed(std::move(error));
     }
     if (active_managed_composition) PrepareInstalledMeasuredSourcesAfterContext(*active_managed_composition);
-    // CONTRACTS §8: every rule returns to `active_at_start` at Load.
+    // Every rule returns to `active_at_start` at Load.
     const auto reset = stable_kernel_owner->reset_rule_activation();
     Require(reset.ok(), "host Apply could not reset rule activation");
     {
@@ -8634,6 +9571,80 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     }
   });
 
+  auto &shutdown_failure_phase = shutdown_watchdog.phase;
+  auto &shutdown_deadline = shutdown_watchdog.deadline;
+  std::string shutdown_failure_cause;
+  std::string shutdown_failure_component;
+  std::vector<std::shared_ptr<core::ExecutionKernel>> shutdown_motion_engines;
+  const std::function<bool()> quiesce_component_owners = [&]() {
+    const auto deadline = shutdown_deadline;
+    shutdown_failure_phase = "component_action_drain";
+    std::shared_ptr<HostComponentRuntime> component_runtime;
+    {
+      std::shared_lock lock(execution_composition.mutex);
+      component_runtime = execution_composition.component_runtime;
+    }
+    if (component_runtime && !component_runtime->CloseAndDrainActions(deadline)) return false;
+    shutdown_failure_phase = "pending_discard";
+    if (!retry_pending_discards(deadline)) return false;
+    shutdown_failure_phase = "component_quiesce";
+    std::set<RetainedRos2ControlRuntimeHandle *> seen;
+    std::set<core::ExecutionKernel *> seen_engines;
+    std::function<bool(Composition *)> quiesce = [&](Composition *composition) {
+      if (!composition) return true;
+      for (const auto &member : composition->participant_compositions)
+        if (!quiesce(member.get())) return false;
+      if (composition->io_signal_runtime) composition->io_signal_runtime->Shutdown();
+      const auto handle = composition->ros2_control_runtime_handle;
+      if (handle && seen.insert(handle.get()).second) {
+        const auto result = handle->QuiesceForHostShutdown(deadline);
+        if (result.outcome != RetainedRos2ControlRuntimeHandle::HostQuiesceOutcome::kSettled) {
+          shutdown_failure_phase.store(result.stage, std::memory_order_release);
+          shutdown_failure_cause = result.code.size() <= 128U ? result.code : "internal_error";
+          const auto &component_id = composition->controllable_component_id.value();
+          shutdown_failure_component = component_id.size() <= 256U ? component_id : "<too_long>";
+          return false;
+        }
+      }
+      if (composition->gripper_runtime && !handle) return false;
+      if (composition->runtime && composition->runtime->participant_engine &&
+          seen_engines.insert(composition->runtime->participant_engine.get()).second)
+        shutdown_motion_engines.push_back(composition->runtime->participant_engine);
+      return true;
+    };
+    if (!quiesce(active_managed_composition.get()) ||
+        !quiesce(prepared_managed_composition.get()) ||
+        !quiesce(retired_managed_composition.get()) ||
+        !quiesce(failed_prepared_composition.get())) return false;
+    shutdown_failure_phase = "io_owner_quiesce";
+    if (generic_io_transport && !generic_io_transport->quiesce_until(deadline)) return false;
+    shutdown_failure_phase = "adapter_owner_quiesce";
+    if (const auto owner = adapter_transport.load(std::memory_order_acquire))
+      if (!owner->quiesce_until(deadline)) return false;
+    return true;
+  };
+  const std::function<bool()> detach_engines_and_scheduler = [&]() {
+    const auto deadline = shutdown_deadline;
+    shutdown_failure_phase = "motion_engine_detach";
+    for (const auto &engine : shutdown_motion_engines)
+      if (!engine->detach(deadline).ok()) return false;
+    shutdown_failure_phase = "manager_liveness_detach";
+    if (auto *receiver = manager_liveness_receiver.get();
+        receiver && !receiver->DetachSchedulerUntil(deadline)) return false;
+    shutdown_failure_phase = "component_stream_health_detach";
+    if (!host_component_stream_health()->DetachSchedulerUntil(deadline)) return false;
+    if (detached_owner_scheduler) {
+      shutdown_failure_phase = "scheduler_drain";
+      detached_owner_scheduler->close_admission_and_discard();
+      const auto now = std::chrono::steady_clock::now();
+      const auto remaining = now < deadline
+          ? std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now)
+          : std::chrono::nanoseconds::zero();
+      if (!detached_owner_scheduler->drain_all_for(remaining)) return false;
+    }
+    return true;
+  };
+
   // Keep renewal servicing and captured state alive until every composition
   // builder and execution lane has drained, including exception unwinding.
   // Otherwise reverse declaration order stops renewal before that drain while
@@ -8646,16 +9657,33 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     bool &teardown_only;
     std::atomic<bool> &status_servicing;
     ExecutionCompositionAccess *execution_access;
+    const std::function<bool()> &quiesce_owners;
+    const std::function<bool()> &detach_scheduler;
+    std::atomic<const char *> &failure_phase;
+    const std::string &failure_cause;
+    const std::string &failure_component;
+    host_detail::HostShutdownWatchdog &watchdog;
     ~DrainBeforeLivenessShutdown() {
+      watchdog.Start(std::chrono::steady_clock::now() + std::chrono::seconds(10));
       // Keep existing renewals through group/worker/projection drain, as
       // before. Their original receiver can still be armed during those drains.
-      progress.Enter(ShutdownPhase::kGroupRetirement);
       // This destructor runs on the sole ordinary reader after that reader's
       // loop/receive has exited, including unwinding. Publish the handoff once.
       status_servicing.store(true, std::memory_order_release);
       HandleStopSignal(0); // same existing stop/wake fact, including barriers
       for (auto *worker : workers)
         worker->request_stop();
+      const std::array phases{ShutdownPhase::kExecutionDrain,
+                              ShutdownPhase::kCurrentBuilderDrain};
+      for (std::size_t i = 0; i < workers.size(); ++i) {
+        progress.Enter(phases[i]);
+        if (workers[i]->joinable()) {
+          workers[i]->join();
+          progress.WorkerJoined(); // only an actual completed join
+        }
+      }
+      progress.Enter(ShutdownPhase::kGroupRetirement);
+      failure_phase.store("group_retirement", std::memory_order_release);
       auto snapshot = host_controller_launch_supervisor().BeginHostShutdown();
       auto &supervisor = host_controller_launch_supervisor();
       while (true) {
@@ -8676,16 +9704,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
       }
-      const std::array phases{ShutdownPhase::kExecutionDrain,
-                              ShutdownPhase::kCurrentBuilderDrain};
-      for (std::size_t i = 0; i < workers.size(); ++i) {
-        progress.Enter(phases[i]);
-        if (workers[i]->joinable()) {
-          workers[i]->join();
-          progress.WorkerJoined(); // only an actual completed join
-        }
-      }
       progress.Enter(ShutdownPhase::kProjectionDrain);
+      failure_phase.store("projection_drain", std::memory_order_release);
       projections->Drain();
       {
         // Finish the last ordinary private handler before any borrowed owner
@@ -8693,9 +9713,27 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         std::lock_guard lock(servicing_mutex);
         teardown_only = true;
       }
+      if (!quiesce_owners()) {
+        const auto cause = content_identity::canonical_json(CanonicalValue(failure_cause));
+        const auto component = content_identity::canonical_json(CanonicalValue(failure_component));
+        std::fprintf(stderr,
+                     "{\"code\":\"execution_host_shutdown_incomplete\",\"phase\":\"%s\",\"cause_code\":%s,\"component\":%s}\n",
+                     failure_phase.load(std::memory_order_acquire), cause.c_str(), component.c_str());
+        std::fflush(stderr);
+        std::_Exit(component_manager::kExecutionHostShutdownIncompleteExitStatus);
+      }
       // Wait for scheduled evidence calls holding the same shared lease, then
       // make queued callbacks inert before any borrowed Kernel is destroyed.
+      failure_phase.store("internal_lease_drain", std::memory_order_release);
       execution_access->detach_addressed_owner();
+      if (!detach_scheduler()) {
+        std::fprintf(stderr,
+                     "{\"code\":\"execution_host_shutdown_incomplete\",\"phase\":\"%s\"}\n",
+                     failure_phase.load(std::memory_order_acquire));
+        std::fflush(stderr);
+        std::_Exit(component_manager::kExecutionHostShutdownIncompleteExitStatus);
+      }
+      failure_phase.store("kernel_destruction", std::memory_order_release);
     }
   } drain_before_liveness_shutdown{
       {&execution_surface, &current_composition_builder},
@@ -8704,7 +9742,13 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       manager_liveness_servicing_mutex,
       teardown_only,
       shutdown_status_servicing,
-      &execution_composition
+      &execution_composition,
+      quiesce_component_owners,
+      detach_engines_and_scheduler,
+      shutdown_failure_phase,
+      shutdown_failure_cause,
+      shutdown_failure_component,
+      shutdown_watchdog
   };
 
   // Empty published startup has no physical builder/before-Start callback.
@@ -8871,6 +9915,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     std::lock_guard lock(managed_composition_mutex);
     {
       std::unique_lock execution_lock(execution_composition.mutex);
+      const InstalledIoSignalRuntimePublication io_runtime_publication{
+          execution_composition, installed_io_signal_runtime};
       if (active_managed_composition || execution_composition.current ||
           installed_apply != installed_request ||
           execution_composition.logical_product != predecessor_logical ||
@@ -8935,6 +9981,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   while (g_stop_requested == 0) {
     rethrow_manager_liveness_failure();
     rethrow_composition_failure(true);
+    static_cast<void>(retry_pending_discards());
     try_start_current_composition();
     try_release_retired_composition();
     const auto global_startup = restore_empty_startup_globals();
@@ -9244,7 +10291,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   if (!previous || !previous->bundle)
                     return failure("installed_component_lifecycle_unavailable",
                                    "current component product is unavailable");
-                  // CONTRACTS §1: observation only, from the component runtime.
+                  // Observation only, from the component runtime.
                   const auto states = execution_composition.component_runtime->Read().states;
                   for (const auto &component :
                        previous->bundle->value()
@@ -9411,7 +10458,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   const auto prerequisites = close_join->ValidatePrerequisites();
                   if (!prerequisites.ok())
                     return component_manager::detail::SelectedRuntimeCompositionRpcFailure{prerequisites.error()};
-                  // DX583: receipt retention never refuses the mandatory exact
+                  // Receipt retention never refuses the mandatory exact
                   // Stop. Unresolved entries remain; when all slots are live,
                   // return the immediate actual outcome without retaining it.
                   if (cached == component_process_stop_results.end() &&

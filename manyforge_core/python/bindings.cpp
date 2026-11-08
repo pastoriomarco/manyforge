@@ -42,6 +42,7 @@ PYBIND11_MODULE(manyforge_core_py, m) {
   manyforge::core::python::register_interrupt_bindings(m);
   manyforge::core::python::register_command_schema_bindings(m);
   manyforge::core::python::register_deployment_candidate_bindings(m);
+  manyforge::core::python::register_prepared_activation_candidate_bindings(m);
   manyforge::core::python::register_model_compiler_bindings(m);
 
   // ========================================================================
@@ -302,8 +303,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       });
 
   py::enum_<manyforge::core::ReferenceDTO::Type>(m, "ReferenceType")
-      .value("kFrameRole", manyforge::core::ReferenceDTO::Type::kFrameRole)
-      .value("kComponentBodyRole", manyforge::core::ReferenceDTO::Type::kComponentBodyRole)
+      .value("kComponentFrame", manyforge::core::ReferenceDTO::Type::kComponentFrame)
+      .value("kComponentBody", manyforge::core::ReferenceDTO::Type::kComponentBody)
       .value("kSceneResource", manyforge::core::ReferenceDTO::Type::kSceneResource)
       .value("kRuntimeObject", manyforge::core::ReferenceDTO::Type::kRuntimeObject)
       .value("kPose", manyforge::core::ReferenceDTO::Type::kPose)
@@ -315,6 +316,21 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .def(py::init<manyforge::core::ReferenceDTO::Type, const std::string&>(), py::arg("type"),
            py::arg("id"))
       .def(py::init<manyforge::core::Pose3DTO>(), py::arg("pose"))
+      .def_static("component_frame", [](const std::string& component_id, const std::string& frame_id) {
+        return manyforge::core::ReferenceDTO(manyforge::core::ProgramFrameReferenceDTO{
+            manyforge::core::ControllableComponentId(component_id), manyforge::core::FrameRoleId(frame_id)});
+      }, py::arg("component_id"), py::arg("frame_id"))
+      .def_static("component_body", [](const std::string& component_id, const std::string& body_id) {
+        return manyforge::core::ReferenceDTO(manyforge::core::ProgramCollisionBodyReferenceDTO{
+            manyforge::core::ControllableComponentId(component_id), manyforge::core::CollisionBodyRoleId(body_id)});
+      }, py::arg("component_id"), py::arg("collision_body_id"))
+      .def_property_readonly("component_id", [](const manyforge::core::ReferenceDTO& reference) -> py::object {
+        if (const auto* frame = std::get_if<manyforge::core::ProgramFrameReferenceDTO>(&reference.id))
+          return py::cast(frame->component_id.value());
+        if (const auto* body = std::get_if<manyforge::core::ProgramCollisionBodyReferenceDTO>(&reference.id))
+          return py::cast(body->component_id.value());
+        return py::none();
+      })
       .def_readonly("type", &manyforge::core::ReferenceDTO::type)
       .def_property_readonly(
           "id",
@@ -707,12 +723,10 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       });
 
   // ========================================================================
-  // Normalized Collision DTOs (spec §3.8.1)
+  // Normalized Collision DTOs
   //
-  // During the historical collision-ownership rollout, these DTOs rode
-  // alongside the existing CollisionCheckRequestDTO /
-  // CollisionCheckResultDTO through Chunks 1-4 and became the kernel's
-  // source of truth in Chunk 5.
+  // These DTOs ride alongside the existing CollisionCheckRequestDTO /
+  // CollisionCheckResultDTO and are the kernel's collision source of truth.
   // ========================================================================
 
   py::enum_<manyforge::core::CollisionOwnerKind>(m, "CollisionOwnerKind")

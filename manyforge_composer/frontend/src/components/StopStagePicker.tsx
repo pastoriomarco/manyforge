@@ -7,7 +7,7 @@ import {
 /**
  * One rule's Stop stage choice: the robot's qualified stages (their sealed row
  * ids) when known; otherwise the three stage labels, not selectable, with the
- * "available after Apply" hint. A stored id is never invented, and an existing
+ * unavailable hint. A stored id is never invented, and an existing
  * one is kept and can be cleared.
  */
 export function StopStagePicker({ label, value, stages, omittedLabel, disabled, onChange }: {
@@ -39,9 +39,12 @@ export function StopStagePicker({ label, value, stages, omittedLabel, disabled, 
   const known = value === undefined || stages.some((stage) => stage.id === value);
   return (
     <select aria-label={label} value={value ?? ''} disabled={disabled}
-      onChange={(event) => onChange(event.target.value === '' ? undefined : event.target.value)}>
+      onChange={(event) => {
+        const next = event.target.value;
+        if (next === '' || stages.some((stage) => stage.id === next)) onChange(next === '' ? undefined : next);
+      }}>
       <option value="">{omittedLabel}</option>
-      {!known && <option value={value}>{`Not in this robot's chain: ${value}`}</option>}
+      {!known && <option value={value} disabled title="This stage is not qualified for the selected route.">{`Not in this robot's chain: ${value}`}</option>}
       {stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.label}</option>)}
     </select>
   );

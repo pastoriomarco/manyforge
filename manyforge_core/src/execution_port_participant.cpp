@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <future>
 #include <limits>
 #include <manyforge_core/execution_port_participant.hpp>
 #include <manyforge_core/execution_sample_association.hpp>
@@ -21,7 +22,7 @@ namespace {
 
 std::string format(double value) { return std::to_string(value); }
 
-/// Item 28 / Q11: the speed factor slews at most 4 per second.
+/// The speed factor slews at most 4 per second.
 constexpr double kMaxRuntimeScaleSlewPerS = 4.0;
 
 /// `main`'s backend fault shape: a Core error code with the stable reason
@@ -136,7 +137,7 @@ StopStageDispatchedGoalDTO stop_goal_for(const PreparedOperationParticipantDTO& 
                                     std::move(stop_plans)};
 }
 
-/// M6b (maintainer rule): a Stop stage that names a goal this participant
+/// A Stop stage that names a goal this participant
 /// never sent, with no goal of it live and no other Stop stage running, has
 /// nothing to stop: contained, no further checks (no fresh sample, no rest).
 /// The caller's dispatch fence keeps that goal from ever going out. The
@@ -200,15 +201,21 @@ std::optional<ParticipantStopStageResultDTO> no_goal_containment(
 struct ExecutionPortParticipant::Execution {
   std::uint64_t generation{};
   ExecutionGoalKey key;
+  /// The token of this goal's send (Dispatch, or a moving replacement's
+  /// DispatchReplacement); `dispatch_pending` while that send runs unlocked.
+  std::shared_ptr<ExecutionDispatchToken> dispatch_token;
+  bool dispatch_pending{false};
+  std::shared_ptr<GoalCancelAttempt> cancel_attempt{std::make_shared<GoalCancelAttempt>()};
   std::optional<double> scale_hold_until_cursor_s;
   TrajectoryDTO trajectory;
   std::shared_ptr<IExecutionPort> port;
+  std::shared_ptr<ParticipantStopStageHelper> stop_helper;
   ExecutionBindingEpoch epoch{0U};
-  /// Q50: the goal's sample association, shared with the Stop-stage helper.
+  /// The goal's sample association, shared with the Stop-stage helper.
   std::shared_ptr<ExecutionSampleAssociation> association;
   bool recognition_recorded{false};
-  /// Q52: a controller cycle later than the lane margin; reported to the
-  /// Kernel as a critical fault (item 17 path).
+  /// A controller cycle later than the lane margin; reported to the
+  /// Kernel as a critical fault.
   std::optional<ErrorDTO> critical_fault;
   std::optional<TimePoint> tracking_breach_since;
   /// When the successful result was first observed (measured completion gate).
@@ -219,7 +226,7 @@ struct ExecutionPortParticipant::Execution {
   std::optional<ErrorDTO> last_stage_error;
   bool terminal{false};
   ExecutionSnapshot snapshot;
-  /// Original-path cursor retained at the end (continuation, §3.3).
+  /// Original-path cursor retained at the end (continuation).
   std::optional<double> stopped_cursor_s;
   double cursor_s{0.0};
   // Same existing Stop join clock mapping, without a second progress authority.
@@ -240,6 +247,17 @@ struct ExecutionPortParticipant::Execution {
     if (publication.published)
       published_progress_sample = PublishedProgressSample{publication.sequence, std::move(sample)};
   }
+};
+
+struct ExecutionPortParticipant::PendingDispatch {
+  PendingDispatch(ExecutionGoalKey value, ContentDigest prepared_digest,
+                  std::shared_ptr<ExecutionDispatchToken> dispatch_token)
+      : key(std::move(value)), digest(std::move(prepared_digest)), token(std::move(dispatch_token)) {}
+  ExecutionGoalKey key;
+  ContentDigest digest;
+  std::shared_ptr<ExecutionDispatchToken> token;
+  std::promise<ExecutionHandle> result;
+  std::shared_future<ExecutionHandle> completion{result.get_future().share()};
 };
 
 struct ExecutionPortParticipant::Replacement {
@@ -268,7 +286,7 @@ ExecutionPortParticipant::ExecutionPortParticipant(
       waiter_(std::move(waiter)),
       state_authority_(std::move(state_authority)),
       config_(std::move(config)),
-      // The controller's own cursor on every lane (§3.3); a measured lane
+      // The controller's own cursor on every lane; a measured lane
       // publishes it under the measured-physical authority, whose cursor
       // expires after the freshness budget.
       progress_(config_.stop.trip_authority == StateAuthorityClass::kMeasured
@@ -312,6 +330,7 @@ ExecutionPortParticipant::ExecutionPortParticipant(
 ExecutionPortParticipant::~ExecutionPortParticipant() {
   {
     std::lock_guard lock(scale_mutex_);
+    if (scheduler_detach_complete_) return;
     ++ramp_generation_;
     if (ramp_handle_ != 0U) scheduler_.cancel(ramp_handle_);
     ramp_handle_ = 0U;
@@ -319,13 +338,218 @@ ExecutionPortParticipant::~ExecutionPortParticipant() {
   scheduler_.drain(SchedulerPriority::ControllerCommand);
 }
 
+Result<void> ExecutionPortParticipant::DetachSchedulerForHostShutdown(
+    const std::chrono::steady_clock::time_point deadline) {
+  ScheduleHandle ramp_to_cancel = 0U;
+  {
+    std::lock_guard lock(scale_mutex_);
+    if (scheduler_detach_complete_) return Result<void>::Ok();
+    if (scheduler_detach_started_)
+      return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
+          "Participant scheduler detachment is pending", "scheduler_detach_pending"));
+    scheduler_detach_started_ = true;
+    ++ramp_generation_;
+    ramp_to_cancel = ramp_handle_;
+    ramp_handle_ = 0U;
+    ramp_.reset();
+  }
+  if (ramp_to_cancel != 0U) scheduler_.cancel(ramp_to_cancel);
+  const auto now = std::chrono::steady_clock::now();
+  const auto remaining = now < deadline
+      ? std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now)
+      : std::chrono::nanoseconds::zero();
+  if (!scheduler_.drain_for(SchedulerPriority::ControllerCommand, remaining))
+    return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
+        "Participant scheduler did not drain before shutdown", "scheduler_detach_timeout"));
+  {
+    std::lock_guard lock(scale_mutex_);
+    scheduler_detach_complete_ = true;
+  }
+  return Result<void>::Ok();
+}
+
 std::shared_ptr<ParticipantStopStageHelper> ExecutionPortParticipant::MakeHelper(
     IExecutionPort& port) {
   return std::make_shared<ParticipantStopStageHelper>(
-      port, clock_, waiter_, [this] { return FreezeSpeedFactor(); }, config_.stop);
+      port, clock_, waiter_, [this, &port](auto deadline) { return FreezeSpeedFactor(port, deadline); }, config_.stop);
 }
 
 Result<void> ExecutionPortParticipant::RebindPort(std::shared_ptr<IExecutionPort> port) {
+  return RebindPortImpl(std::move(port), false);
+}
+
+Result<void> ExecutionPortParticipant::RebindPortAfterOwnerRebuild(
+    std::shared_ptr<IExecutionPort> port) {
+  return RebindPortImpl(std::move(port), true);
+}
+
+struct ExecutionPortParticipant::OwnerRebindStage final {
+  ExecutionPortParticipant* owner{};
+  std::shared_ptr<IExecutionPort> port;
+  std::shared_ptr<IExecutionPort> previous_port;
+  std::shared_ptr<ParticipantStopStageHelper> helper;
+  ExecutionLaneFactsDTO lane;
+  std::unique_lock<std::mutex> participant_lock;
+  std::unique_lock<std::mutex> scale_lock;
+  std::optional<std::uint64_t> execution_id;
+  std::optional<std::uint64_t> unknown_candidate;
+  bool unknown_execution{false};
+  bool committed{false};
+  bool timer_retired{false};
+};
+
+Result<std::shared_ptr<ExecutionPortParticipant::OwnerRebindStage>>
+ExecutionPortParticipant::StageOwnerRebind(std::shared_ptr<IExecutionPort> port) {
+  using StageResult = Result<std::shared_ptr<OwnerRebindStage>>;
+  if (!port) return StageResult::Err(
+      fault(ErrorCode::kExecutionRejected, "A rebinding requires its port instance", "execution_port_missing"));
+  auto stage = std::make_shared<OwnerRebindStage>();
+  stage->owner = this;
+  stage->port = std::move(port);
+  stage->lane = stage->port->ReadLaneFacts();
+  stage->helper = MakeHelper(*stage->port);
+  {
+    std::lock_guard lock(mutex_);
+    stage->previous_port = port_;
+  }
+  return StageResult::Ok(std::move(stage));
+}
+
+Result<void> ExecutionPortParticipant::RetireOwnerRebindTimer(
+    const std::shared_ptr<OwnerRebindStage>& stage) {
+  if (!stage || stage->owner != this || stage->committed || stage->participant_lock.owns_lock())
+    return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
+        "The staged port rebind is no longer current", "execution_port_rebind_busy"));
+  // The host has already verified the exact old owner and closed its SDK gate.
+  // Keep the handle until cancel returns; an exception leaves it owned here.
+  std::lock_guard lock(mutex_);
+  if (port_ != stage->previous_port)
+    return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
+        "The staged port rebind is no longer current", "execution_port_rebind_busy"));
+  std::lock_guard scale_lock(scale_mutex_);
+  if (scheduler_detach_started_)
+    return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
+        "Participant scheduler is detached", "scheduler_not_ready"));
+  if (ramp_handle_ != 0U) scheduler_.cancel(ramp_handle_);
+  ++ramp_generation_;
+  ramp_handle_ = 0U;
+  ramp_.reset();
+  stage->timer_retired = true;
+  return Result<void>::Ok();
+}
+
+Result<void> ExecutionPortParticipant::LockOwnerRebind(
+    const std::shared_ptr<OwnerRebindStage>& stage) {
+  const auto refuse = [](std::string reason, std::string message) {
+    return Result<void>::Err(fault(ErrorCode::kExecutionRejected, std::move(message), std::move(reason)));
+  };
+  if (!stage || stage->owner != this || stage->committed || stage->participant_lock.owns_lock())
+    return refuse("execution_port_rebind_busy", "The staged port rebind is no longer current");
+  stage->participant_lock = std::unique_lock<std::mutex>(mutex_);
+  try {
+    const auto& lane = stage->lane;
+    const auto& resources = binding_.value().resources;
+    if (lane.joint_names.size() != resources.size() ||
+        !std::all_of(lane.joint_names.begin(), lane.joint_names.end(),
+                     [&](const auto& name) {
+                       return std::count(lane.joint_names.begin(), lane.joint_names.end(), name) ==
+                           std::count_if(resources.begin(), resources.end(), [&](const auto& resource) {
+                             return name == resource.compiled_resource_name;
+                           });
+                     }) ||
+        (lane.supports_scale && !(lane.controller_update_rate_hz > 0.0))) {
+      UnlockOwnerRebind(stage);
+      return refuse("execution_port_lane_facts_mismatch",
+                    "The port's lane facts do not cover the participant binding");
+    }
+    if (port_ != stage->previous_port) {
+      UnlockOwnerRebind(stage);
+      return refuse("execution_port_rebind_busy", "The staged port rebind is no longer current");
+    }
+    bool retained_unknown_replacement = false;
+    if (execution_ && execution_->terminal &&
+        execution_->snapshot.state == ExecutionState::kInterventionRequired && replacement_ &&
+        replacement_->command && replacement_->command->dispatch != ExecutionPortDispatch::kNotDispatched &&
+        !replacement_->execution->terminal) {
+      const auto goal = port_->ReadGoal(replacement_->execution->key);
+      retained_unknown_replacement = goal && goal->key == replacement_->execution->key &&
+          goal->binding_epoch == replacement_->source.binding_epoch &&
+          goal->phase == ExecutionGoalPhase::kTerminal && goal->result == ExecutionGoalResult::kEndedUnknown;
+    }
+    if ((execution_ && !execution_->terminal) || stop_stages_in_flight_ != 0U ||
+        (replacement_ && replacement_->command &&
+         replacement_->command->dispatch != ExecutionPortDispatch::kNotDispatched &&
+         !replacement_->execution->terminal && !retained_unknown_replacement)) {
+      UnlockOwnerRebind(stage);
+      return refuse("execution_port_rebind_busy", "A port cannot be rebound while motion or a Stop is in flight");
+    }
+    stage->execution_id = prepared_membership_.active_execution_id();
+    stage->unknown_candidate.reset();
+    stage->unknown_execution = stage->execution_id && execution_ && execution_->terminal &&
+        execution_->snapshot.state == ExecutionState::kInterventionRequired;
+    if (retained_unknown_replacement) stage->unknown_candidate = replacement_->candidate_id;
+    stage->scale_lock = std::unique_lock<std::mutex>(scale_mutex_);
+    if (!stage->timer_retired || ramp_handle_ != 0U || ramp_) {
+      UnlockOwnerRebind(stage);
+      return refuse("execution_port_rebind_busy", "The old owner timer is not retired");
+    }
+    return Result<void>::Ok();
+  } catch (...) {
+    UnlockOwnerRebind(stage);
+    throw;
+  }
+}
+
+bool ExecutionPortParticipant::LockedOwnerRebindNeedsMotionProof(
+    const std::shared_ptr<OwnerRebindStage>& stage) const noexcept {
+  if (!stage || stage->owner != this || !stage->participant_lock.owns_lock() ||
+      !stage->scale_lock.owns_lock()) std::terminate();
+  return stage->unknown_execution;
+}
+
+void ExecutionPortParticipant::CommitLockedOwnerRebind(
+    const std::shared_ptr<OwnerRebindStage>& stage) noexcept {
+  // The owning host must hold this guard through every companion swap.
+  if (!stage || stage->owner != this || stage->committed ||
+      !stage->participant_lock.owns_lock() || !stage->scale_lock.owns_lock()) std::terminate();
+  static_assert(std::is_nothrow_swappable_v<ExecutionLaneFactsDTO>);
+  last_sent_scale_.reset();
+  scale_frozen_ = false;
+  if (stage->unknown_execution) {
+    if (!owner_rebuild_observation_ || owner_rebuild_observation_->first != *stage->execution_id) {
+      owner_rebuild_observation_ = std::make_pair(*stage->execution_id, state_authority_.publication->next_sequence());
+      retired_owner_rest_qualified_ = false;
+      retired_unknown_candidate_.reset();
+    }
+    if (!retired_owner_helper_) {
+      retired_owner_port_ = port_;
+      retired_owner_helper_ = helper_;
+    }
+    if (stage->unknown_candidate) retired_unknown_candidate_ = stage->unknown_candidate;
+  } else {
+    // No retained unknown motion needs a new standstill proof. Do not carry a
+    // marker from an unrelated earlier owner into a known or idle execution.
+    owner_rebuild_observation_.reset();
+    retired_owner_rest_qualified_ = false;
+    retired_unknown_candidate_.reset();
+  }
+  port_.swap(stage->port);
+  helper_.swap(stage->helper);
+  using std::swap;
+  swap(lane_, stage->lane);
+  timing_ = {};
+  stage->committed = true;
+}
+
+void ExecutionPortParticipant::UnlockOwnerRebind(
+    const std::shared_ptr<OwnerRebindStage>& stage) noexcept {
+  if (!stage || stage->owner != this) return;
+  if (stage->scale_lock.owns_lock()) stage->scale_lock.unlock();
+  if (stage->participant_lock.owns_lock()) stage->participant_lock.unlock();
+}
+
+Result<void> ExecutionPortParticipant::RebindPortImpl(std::shared_ptr<IExecutionPort> port,
+                                                       const bool owner_rebuilt) {
   const auto refuse = [](std::string reason, std::string message) {
     return Result<void>::Err(
         fault(ErrorCode::kExecutionRejected, std::move(message), std::move(reason)));
@@ -343,13 +567,28 @@ Result<void> ExecutionPortParticipant::RebindPort(std::shared_ptr<IExecutionPort
                   "The port's lane facts do not cover the participant binding");
   }
   std::lock_guard lock(mutex_);
+  bool retained_unknown_replacement = false;
+  if (owner_rebuilt && execution_ && execution_->terminal &&
+      execution_->snapshot.state == ExecutionState::kInterventionRequired && replacement_ &&
+      replacement_->command &&
+      replacement_->command->dispatch != ExecutionPortDispatch::kNotDispatched &&
+      !replacement_->execution->terminal) {
+    const auto goal = port_->ReadGoal(replacement_->execution->key);
+    retained_unknown_replacement = goal && goal->key == replacement_->execution->key &&
+        goal->binding_epoch == replacement_->source.binding_epoch &&
+        goal->phase == ExecutionGoalPhase::kTerminal &&
+        goal->result == ExecutionGoalResult::kEndedUnknown;
+  }
   if ((execution_ && !execution_->terminal) || stop_stages_in_flight_ != 0U ||
       (replacement_ && replacement_->command &&
        replacement_->command->dispatch != ExecutionPortDispatch::kNotDispatched &&
-       !replacement_->execution->terminal)) {
+       !replacement_->execution->terminal && !retained_unknown_replacement)) {
     return refuse("execution_port_rebind_busy",
                   "A port cannot be rebound while motion or a Stop is in flight");
   }
+  const auto id = prepared_membership_.active_execution_id();
+  const bool unknown_execution = owner_rebuilt && id && execution_ && execution_->terminal &&
+                                 execution_->snapshot.state == ExecutionState::kInterventionRequired;
   auto helper = MakeHelper(*port);
   {
     std::lock_guard scale_lock(scale_mutex_);
@@ -357,15 +596,57 @@ Result<void> ExecutionPortParticipant::RebindPort(std::shared_ptr<IExecutionPort
     if (ramp_handle_ != 0U) scheduler_.cancel(ramp_handle_);
     ramp_handle_ = 0U;
     ramp_.reset();
-    // A new binding epoch starts at the configured initial factor (§3.2).
+    // A new binding epoch starts at the configured initial factor.
     last_sent_scale_.reset();
     scale_frozen_ = false;
+  }
+  if (unknown_execution) {
+    if (!owner_rebuild_observation_ || owner_rebuild_observation_->first != *id) {
+      owner_rebuild_observation_ =
+          std::make_pair(*id, state_authority_.publication->next_sequence());
+      retired_owner_rest_qualified_ = false;
+      retired_unknown_candidate_.reset();
+    }
+    if (!retired_owner_helper_) {
+      retired_owner_port_ = port_;
+      retired_owner_helper_ = helper_;
+    }
+    if (retained_unknown_replacement)
+      retired_unknown_candidate_ = replacement_->candidate_id;
+  } else if (owner_rebuilt && !id) {
+    owner_rebuild_observation_ =
+        std::make_pair(0U, state_authority_.publication->next_sequence());
+    retired_owner_rest_qualified_ = false;
   }
   port_ = std::move(port);
   helper_ = std::move(helper);
   lane_ = lane;
+  scale_availability_view_.store(
+      std::make_shared<const ScaleAvailabilityView>(ScaleAvailabilityView{port_, lane_.supports_scale}),
+      std::memory_order_release);
   timing_ = {};
   return Result<void>::Ok();
+}
+
+std::optional<std::pair<std::uint64_t, std::uint64_t>>
+ExecutionPortParticipant::owner_rebuild_observation() const {
+  std::lock_guard lock(mutex_);
+  return owner_rebuild_observation_;
+}
+
+void ExecutionPortParticipant::record_owner_rebuild_rest(
+    const std::uint64_t execution_id) noexcept {
+  std::lock_guard lock(mutex_);
+  if (owner_rebuild_observation_ && owner_rebuild_observation_->first == execution_id)
+    retired_owner_rest_qualified_ = true;
+}
+
+bool ExecutionPortParticipant::owner_rebuild_unknown_candidate(
+    const std::uint64_t source_id, const std::uint64_t candidate_id) const {
+  std::lock_guard lock(mutex_);
+  return owner_rebuild_observation_ && owner_rebuild_observation_->first == source_id &&
+         retired_owner_rest_qualified_ && retired_unknown_candidate_ == candidate_id &&
+         stop_stages_in_flight_ == 0U;
 }
 
 Result<void> ExecutionPortParticipant::RebindRoute(
@@ -442,7 +723,7 @@ PrepareParticipantResultDTO ExecutionPortParticipant::Prepare(
     return reject("prepared_trajectory_resource_scope_mismatch");
   }
   if (motion.trajectory.waypoints.empty()) return reject("empty_trajectory");
-  // Q11: the speed ramp runs at the trajectory's own prepared bounds.
+  // The speed ramp runs at the trajectory's own prepared bounds.
   const auto& bounds = motion.trajectory.runtime_scale_bounds;
   if (!bounds || !std::isfinite(bounds->max_rate_per_s) || bounds->max_rate_per_s <= 0.0) {
     return reject("prepared_runtime_scale_bounds_missing");
@@ -552,7 +833,7 @@ Result<void> ExecutionPortParticipant::BeginReplacementPreparationScaleHold(
                                    "Moving preparation scaling hold was refused", reason));
   };
   {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (cancellation.stop_requested() || clock_.now() >= deadline)
       return refuse("motion_replacement_scale_hold_budget_expired");
     if (!SourceMatchesLocked(source) || execution_->terminal || execution_->stopping ||
@@ -562,7 +843,7 @@ Result<void> ExecutionPortParticipant::BeginReplacementPreparationScaleHold(
     const auto factor = source.controller_sample.applied_factor;
     if (!factor || !std::isfinite(*factor) || *factor <= 0.0 || *factor > 1.0)
       return refuse("motion_replacement_scale_hold_factor_invalid");
-    std::lock_guard scale_lock(scale_mutex_);
+    std::unique_lock scale_lock(scale_mutex_);
     if (scale_frozen_ ||
         (preparation_scale_hold_ && (preparation_scale_hold_->candidate_id != candidate_id ||
                                      preparation_scale_hold_->source_goal != source.goal)))
@@ -583,7 +864,19 @@ Result<void> ExecutionPortParticipant::BeginReplacementPreparationScaleHold(
         trace_scale_hold("confirmed", candidate_id, source.goal, *factor,
                          source.controller_sample.cursor_s, ramp_->rate_per_s);
       if (!settled) {
-        const auto pin = port_->SetScale(*factor);
+        const auto port = port_;
+        const auto sequence = port->ReserveScaleSequence();
+        scale_lock.unlock();
+        lock.unlock();
+        const auto pin = port->SetScale(*factor, sequence);
+        lock.lock();
+        scale_lock.lock();
+        if (port_ != port || !port->IsLatestScaleSequence(sequence) ||
+            !preparation_scale_hold_ || preparation_scale_hold_->candidate_id != candidate_id ||
+            preparation_scale_hold_->source_goal != source.goal || scale_frozen_ ||
+            !SourceMatchesLocked(source) || !execution_ || execution_->terminal ||
+            execution_->stopping || stop_stages_in_flight_ != 0U)
+          return refuse("motion_replacement_scale_hold_source_stale");
         if (pin.dispatch == ExecutionPortDispatch::kNotDispatched)
           return refuse("motion_replacement_scale_hold_pin_refused");
         last_sent_scale_ = *factor;
@@ -677,6 +970,7 @@ PrepareParticipantResultDTO ExecutionPortParticipant::PrepareReplacement(
   pending->source_cursor_s = motion.plan_request.moving_replacement->source_cursor_s;
   pending->divergence_cursor_s = motion.plan_request.moving_replacement->divergence_cursor_s;
   pending->execution = std::make_shared<Execution>();
+  pending->execution->cancel_attempt->execution_id = candidate_id;
   pending->execution->trajectory = motion.trajectory;
   const auto prefix_count =
       motion.plan_request.moving_replacement->source_prefix_trajectory.waypoints.size();
@@ -714,6 +1008,7 @@ PrepareParticipantResultDTO ExecutionPortParticipant::PrepareReplacement(
   pending->execution->generation = next_execution_generation_++;
   pending->execution->epoch = source.binding_epoch;
   pending->execution->port = port_;
+  pending->execution->stop_helper = helper_;
   replacement_ = std::move(pending);
   return accepted;
 }
@@ -721,7 +1016,7 @@ PrepareParticipantResultDTO ExecutionPortParticipant::PrepareReplacement(
 PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplacement(
     const PreparedMotionReplacementSourceDTO& source, const std::uint64_t candidate_id,
     const PreparedOperationParticipantDTO& participant, const ExecutionGoalKey& successor,
-    const std::int64_t preparation_deadline_ns) {
+    const std::int64_t preparation_deadline_ns, const ReplacementSendRecheck& recheck_before_send) {
   const auto reject = [](std::string reason, std::map<std::string, std::string> details = {}) {
     return PreparedMotionReplacementDispatchDTO{
         {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kStaleKey,
@@ -756,7 +1051,21 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
       return reject("motion_replacement_source_changed");
     return std::nullopt;
   };
-  if (auto decided = guards()) return std::move(*decided);
+  // Another attempt's send may be in flight without the lock (only a
+  // duplicate call; the Kernel's dispatch gate sends once). Decide after it
+  // has recorded its outcome, as when the lock was held across the send: a
+  // completed send then replays or conflicts.
+  const auto decide = [&]() -> std::optional<PreparedMotionReplacementDispatchDTO> {
+    while (replacement_ && replacement_->candidate_id == candidate_id &&
+           replacement_->execution->dispatch_pending) {
+      const auto in_flight = replacement_->execution->dispatch_token;
+      lock.unlock();
+      (void)in_flight->WaitUntil(std::chrono::steady_clock::time_point::max());
+      lock.lock();
+    }
+    return guards();
+  };
+  if (auto decided = decide()) return std::move(*decided);
   auto& pending = *replacement_;
   auto candidate = pending.execution;
   // Stage the goal/handle and failure receipt before choosing the actual join
@@ -803,7 +1112,7 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
            check(sample && sample->binding_epoch == source.binding_epoch &&
                      std::isfinite(sample->cursor_s),
                  "sample") &&
-           // D8: a cursor behind the captured source cursor is a controller that
+           // A cursor behind the captured source cursor is a controller that
            // already restarted (end hold); a join from it would move back.
            check(original_path_cursor(execution_->delivery_clock, sample->cursor_s) >=
                      pending.source_cursor_s,
@@ -920,7 +1229,7 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
     lock.unlock();
     while (clock_.now() < *until) waiter_(*until, std::stop_token{});
     lock.lock();
-    if (auto decided = guards()) return std::move(*decided);
+    if (auto decided = decide()) return std::move(*decided);
     if (replacement_.get() != staged || replacement_->execution != candidate)
       return reject("motion_replacement_membership_changed");
     // Another attempt (any successor) may have staged its keys and handle
@@ -977,31 +1286,75 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
   if (submitted_at >= preparation_deadline_ns)
     return reject("motion_replacement_preparation_deadline_expired");
   candidate->snapshot.timestamp_ns = submitted_at;
+  // Make the possible effect visible to Stop before the participant lock is
+  // released (as Dispatch): the successor joins the helper's sent set and its
+  // dispatch token is the one Stop fences (`TranslateStopStageImpl`,
+  // `CancelExecution`). The port admits the send only through this token, in
+  // its action leaf. A Stop that enters during the send therefore either
+  // fences the token first (the port never sends; the record is removed below
+  // before the token finishes, and the Stop stage waits for that) or finds it
+  // admitted, with the successor already in the sent set, and stops it
+  // together with the source.
+  auto candidate_token = std::make_shared<ExecutionDispatchToken>(candidate_id);
+  candidate->dispatch_token = candidate_token;
+  candidate->dispatch_pending = true;
+  const auto send_helper = candidate->stop_helper;
+  const auto send_port = candidate->port;
+  // The sent trajectory is the prepared Stop goal's identical copy; the record
+  // takes the other one. RetirePreparedExecution keeps this replacement while
+  // the send is in flight.
+  const TrajectoryDTO& send_trajectory = pending.stop_goal->trajectory;
+  send_helper->RecordReplacement(std::move(pending.record_key), std::move(pending.record_trajectory),
+                                 candidate->association,
+                                 pending.stop_goal->planned_controller_offset_s,
+                                 candidate->cancel_attempt);
+  // Diagnostics only, captured under the lock and written after it.
+  const auto trace_source_cursor_s =
+      original_path_cursor(execution_->delivery_clock, final_sample->cursor_s);
+  const auto trace_divergence_s = pending.divergence_cursor_s;
+  const auto trace_recognition_budget_ns = pending.recognition_budget_ns.value_or(0);
+  lock.unlock();
   ExecutionPortCommandResultDTO command;
-  try {
-    command = start.value().scheduled
-                  ? port_->ReplaceScheduled(source.goal, successor, pending.record_trajectory,
-                                             *start.value().scheduled)
-                  : port_->Replace(source.goal, successor, pending.record_trajectory);
-  } catch (...) {
-    command = std::move(uncertain);
+  std::optional<ErrorDTO> revoked;
+  if (recheck_before_send) revoked = recheck_before_send();
+  if (revoked) {
+    command = {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kStaleKey,
+               std::move(revoked)};
+  } else {
+    try {
+      command = start.value().scheduled
+                    ? send_port->ReplaceScheduled(source.goal, successor, send_trajectory,
+                                                  *start.value().scheduled, candidate_token)
+                    : send_port->Replace(source.goal, successor, send_trajectory, candidate_token);
+    } catch (...) {
+      command = std::move(uncertain);
+    }
+    if (command.dispatch == ExecutionPortDispatch::kNotDispatched &&
+        candidate_token->state() == ExecutionDispatchToken::State::kFenced)
+      command.error = fault(ErrorCode::kExecutionRejected,
+                            "A Stop fenced the motion replacement before its send",
+                            "motion_replacement_stop_fenced");
   }
-  if (command.dispatch != ExecutionPortDispatch::kNotDispatched) {
-    helper_->RecordReplacement(std::move(pending.record_key), std::move(pending.record_trajectory),
-                               candidate->association, pending.stop_goal->planned_controller_offset_s);
-    pending.submitted_at_ns = submitted_at;
+  const bool dispatched = command.dispatch != ExecutionPortDispatch::kNotDispatched;
+  const auto submitted_at_ns = dispatched ? std::optional<std::int64_t>(submitted_at) : std::nullopt;
+  lock.lock();
+  candidate->dispatch_pending = false;
+  // Known not sent: undo the visible record before the token finishes.
+  if (!dispatched) send_helper->RetireSettledReplacement(successor);
+  // Record the outcome only on the replacement this attempt sent for.
+  if (replacement_ && replacement_->execution == candidate) {
+    replacement_->submitted_at_ns = submitted_at_ns;
+    replacement_->command = command;
   }
-  // The possible effect is already in sent_ before any reply copy can fail.
-  pending.command = std::move(command);
+  candidate_token->Finish(command.dispatch);
+  lock.unlock();
   const auto written = std::fprintf(stderr,
       "manyforge_moving_dispatch owner=%llu submitted_ns=%lld origin_ns=%lld recognition_budget_ns=%lld source_cursor_s=%.17g divergence_s=%.17g factor=%.17g\n",
-      static_cast<unsigned long long>(candidate_id), static_cast<long long>(pending.submitted_at_ns.value_or(0)),
-      static_cast<long long>(join_started_at),
-      static_cast<long long>(pending.recognition_budget_ns.value_or(0)),
-      original_path_cursor(execution_->delivery_clock, final_sample->cursor_s),
-      pending.divergence_cursor_s, factor);
+      static_cast<unsigned long long>(candidate_id), static_cast<long long>(submitted_at_ns.value_or(0)),
+      static_cast<long long>(join_started_at), static_cast<long long>(trace_recognition_budget_ns),
+      trace_source_cursor_s, trace_divergence_s, factor);
   static_cast<void>(written);
-  return {*pending.command, std::move(handle), pending.submitted_at_ns};
+  return {std::move(command), std::move(handle), submitted_at_ns};
 }
 
 PreparedMotionReplacementObservationDTO ExecutionPortParticipant::ObserveReplacementLocked() const {
@@ -1153,15 +1506,40 @@ Result<void> ExecutionPortParticipant::AdoptReplacement(
   return Result<void>::Ok();
 }
 
-ExecutionPortCommandResultDTO ExecutionPortParticipant::CancelExecution(Execution& execution) {
-  if (replacement_ && replacement_->command &&
-      prepared_membership_.active_execution_id() != replacement_->candidate_id &&
-      replacement_->command->dispatch != ExecutionPortDispatch::kNotDispatched) {
-    const bool sent = helper_->CancelLiveGoals();
-    return {sent ? ExecutionPortDispatch::kEffectUncertain : ExecutionPortDispatch::kNotDispatched,
-            std::nullopt, std::nullopt};
+ExecutionPortCommandResultDTO ExecutionPortParticipant::CancelExecution(
+    Execution& execution, std::unique_lock<std::mutex>& lock,
+    std::chrono::steady_clock::time_point deadline) {
+  const auto attempt = execution.cancel_attempt;
+  const bool unadopted =
+      replacement_ && prepared_membership_.active_execution_id() != replacement_->candidate_id;
+  // A replacement send in flight (DispatchReplacement, unlocked): fenced
+  // here, the port never sends it and only the exact goal is cancelled;
+  // already admitted, it may be sent and is in the sent set, so every live
+  // goal is cancelled.
+  const bool send_admitted =
+      unadopted && replacement_->execution->dispatch_pending &&
+      replacement_->execution->dispatch_token->Fence() == ExecutionDispatchToken::State::kAdmitted;
+  const bool cancel_all =
+      unadopted && (send_admitted || (replacement_->command && replacement_->command->dispatch !=
+                                                                   ExecutionPortDispatch::kNotDispatched));
+  const auto helper = execution.stop_helper;
+  const auto key = execution.key;
+  lock.unlock();
+  ExecutionPortCommandResultDTO result;
+  try {
+    if (cancel_all) {
+      const bool sent = helper->CancelLiveGoals(deadline);
+      result.dispatch = sent ? ExecutionPortDispatch::kEffectUncertain
+                             : ExecutionPortDispatch::kNotDispatched;
+    } else {
+      result = helper->CancelExactGoal(key, attempt, deadline);
+    }
+  } catch (...) {
+    result.dispatch = ExecutionPortDispatch::kEffectUncertain;
   }
-  return execution.port->Cancel(execution.key);
+
+  lock.lock();
+  return result;
 }
 
 Result<void> ExecutionPortParticipant::RetirePreparedExecution(const std::uint64_t execution_id) {
@@ -1172,14 +1550,22 @@ Result<void> ExecutionPortParticipant::RetirePreparedExecution(const std::uint64
       return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
                                      "Replacement Stop work is in flight",
                                      "prepared_replacement_not_quiescent"));
+    // A send in flight may still have effects; its sender still uses it.
+    if (replacement_->execution->dispatch_pending)
+      return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
+                                     "The replacement may still have effects",
+                                     "prepared_replacement_not_quiescent"));
     if (replacement_->command &&
         replacement_->command->dispatch != ExecutionPortDispatch::kNotDispatched &&
         !replacement_->execution->terminal) {
-      if (ObserveReplacementLocked().phase != PreparedMotionReplacementPhaseDTO::kNoEffect)
+      const bool rebuilt_unknown = retired_owner_rest_qualified_ &&
+                                   retired_unknown_candidate_ == execution_id;
+      if (!rebuilt_unknown &&
+          ObserveReplacementLocked().phase != PreparedMotionReplacementPhaseDTO::kNoEffect)
         return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
                                        "The replacement may still have effects",
                                        "prepared_replacement_not_quiescent"));
-      helper_->RetireSettledReplacement(replacement_->execution->key);
+      if (!rebuilt_unknown) helper_->RetireSettledReplacement(replacement_->execution->key);
     }
     if (replacement_->execution->terminal)
       helper_->RetireSettledReplacement(replacement_->execution->key);
@@ -1187,6 +1573,11 @@ Result<void> ExecutionPortParticipant::RetirePreparedExecution(const std::uint64
       return Result<void>::Err(fault(ErrorCode::kInvalidRequest, "Replacement retirement is stale",
                                      "prepared_execution_stale"));
     replacement_.reset();
+    retired_unknown_candidate_.reset();
+    if (!prepared_membership_.active_execution_id()) {
+      retired_owner_helper_.reset();
+      retired_owner_port_.reset();
+    }
     return Result<void>::Ok();
   }
   if (active == execution_id &&
@@ -1201,10 +1592,16 @@ Result<void> ExecutionPortParticipant::RetirePreparedExecution(const std::uint64
                                    "prepared_execution_stale"));
   }
   if (active == execution_id) {
+    owner_rebuild_observation_.reset();
     prepared_goal_.reset();
     // A committed candidate is no longer pending after its exact owner
     // retirement. Do not carry its receipt into an unrelated ordinary goal.
     if (replacement_ && replacement_->candidate_id == execution_id) replacement_.reset();
+    if (!replacement_) {
+      retired_owner_rest_qualified_ = false;
+      retired_owner_helper_.reset();
+      retired_owner_port_.reset();
+    }
   }
   return Result<void>::Ok();
 }
@@ -1234,7 +1631,7 @@ Result<void> ExecutionPortParticipant::ApplyToolContext(
   if (!config_.apply_tool_context ||
       !std::holds_alternative<PreparedMotionExecutionDTO>(participant.payload))
     return Result<void>::Ok();
-  // TOOLCTX (M6b: its own action, before the motion is sent and counts as
+  // Tool context (its own action, before the motion is sent and counts as
   // running): no goal or Stop is in flight, so the robot is at rest. The lane
   // sends what changed and waits until the robot settled; a tool context the
   // robot did not confirm refuses this motion (fail closed). The vendor send
@@ -1280,7 +1677,7 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
   if (controller_goal_id.empty() || !controller_goal_generation.nonzero()) {
     return rejected("controller_goal_identity_invalid");
   }
-  // M6b: a Stop stage found this goal unsent and contained it; it never goes
+  // A Stop stage found this goal unsent and contained it; it never goes
   // out afterwards (also when that Stop ran during the fresh-sample wait
   // above, before this lock).
   if (stopped_before_dispatch_ ==
@@ -1290,6 +1687,17 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
   if (const auto invalid = BindingFieldError(participant)) return rejected(std::string(*invalid));
   if (!prepared_membership_.matches(participant)) {
     return rejected("prepared_participant_not_admitted");
+  }
+  if (pending_dispatch_) {
+    const auto pending = pending_dispatch_;
+    if (pending->key == ExecutionGoalKey{controller_goal_id, controller_goal_generation} &&
+        pending->digest == participant.prepared_contract_digest) {
+      lock.unlock();
+      return pending->completion.get();
+    }
+    if (pending->key.controller_goal_id == controller_goal_id)
+      return rejected("controller_goal_identity_conflict");
+    return rejected("execution_port_execution_in_flight");
   }
   // Replay protection: an exact repetition returns the same handle and never
   // sends a second goal; any other use of the goal identity is refused.
@@ -1302,14 +1710,14 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
   }
   if (execution_ && !execution_->terminal) return rejected("execution_port_execution_in_flight");
   if (stop_stages_in_flight_ != 0U) return rejected("execution_port_stop_in_flight");
-  // M6b: the tool-context action ran before this dispatch without the lock
+  // The tool-context action ran before this dispatch without the lock
   // (`ApplyToolContext`); a Stop that started since then wins: no goal.
   if (const auto stops_before = std::exchange(tool_context_stops_before_, std::nullopt);
       stops_before && stop_stages_started_ != *stops_before)
     return rejected("execution_port_stop_in_flight");
 
-  // §3.2: positions, velocities and accelerations in path time. A prepared
-  // trajectory carries its runtime-scale bounds (item 6, checked at Prepare),
+  // Positions, velocities and accelerations in path time. A prepared
+  // trajectory carries its runtime-scale bounds (checked at Prepare),
   // which the prepared codec admits only with complete derivatives.
   const auto& motion = std::get<PreparedMotionExecutionDTO>(participant.payload);
   auto* port = port_.get();
@@ -1327,55 +1735,32 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
     try { config_.observe_goal_context(key, participant, readiness.binding_epoch); } catch (...) {}
   }
   const auto dispatched_at = clock_.now();
-  const auto sent = port->Submit(key, motion.trajectory);
-  if (sent.dispatch == ExecutionPortDispatch::kNotDispatched) {
-    std::map<std::string, std::string> details;
-    if (sent.refusal) details["port_refusal"] = refusal_name(*sent.refusal);
-    if (sent.error) details["port_error"] = sent.error->message;
-    return rejected("execution_port_submit_refused", std::move(details));
-  }
   // Dispatched (or possibly sent): the goal is observed through the port.
   auto execution = std::make_shared<Execution>();
+  execution->cancel_attempt->execution_id = prepared_membership_.active_execution_id();
   execution->generation = next_execution_generation_++;
   execution->key = key;
   execution->trajectory = motion.trajectory;
   execution->port = port_;
+  execution->stop_helper = helper_;
   execution->epoch = readiness.binding_epoch;
   execution->association = std::make_shared<ExecutionSampleAssociation>(
       readiness.binding_epoch, baseline, dispatched_at);
-  // Item 10: Executing is published at dispatch.
+  // Executing is published at dispatch.
   execution->snapshot.timestamp_ns = dispatched_at;
   execution->snapshot.state = ExecutionState::kExecuting;
   execution->snapshot.state_source = "execution_port";
   if (!execution->trajectory.waypoints.empty()) {
     execution->snapshot.joint_positions_rad = execution->trajectory.waypoints.front().positions_rad;
   }
-  progress_.invalidate();
-  (void)progress_.publish(execution->generation, 0, dispatched_at, dispatched_at);
-
-  helper_->BindDispatchedGoal(stop_goal_for(participant, key, execution->trajectory),
-                              execution->association);
-
-  if (lane_.supports_scale) {
-    // Q11: the ramp of this motion starts from the factor last sent on this
-    // epoch (the lane's initial factor when none was) at the trajectory's
-    // prepared bounds; after a Stop the frozen factor is released here.
-    std::lock_guard scale_lock(scale_mutex_);
-    scale_frozen_ = false;
-    preparation_scale_hold_.reset();
-    // Item 28/Q11: linear slew at the trajectory's rate, at most 4/s; no
-    // separate rate-change limit.
-    ramp_ = ScaleRamp{last_sent_scale_.value_or(config_.initial_speed_factor), target_scale_,
-                      std::min(execution->trajectory.runtime_scale_bounds->max_rate_per_s,
-                               kMaxRuntimeScaleSlewPerS)};
-    if (ramp_->value != ramp_->target) {
-      last_ramp_tick_ = clock_.now();
-      ScheduleRampTickLocked();
-    }
-  }
+  execution->dispatch_token =
+      std::make_shared<ExecutionDispatchToken>(prepared_membership_.active_execution_id());
+  execution->dispatch_pending = true;
+  auto pending = std::make_shared<PendingDispatch>(key, participant.prepared_contract_digest,
+                                                   execution->dispatch_token);
+  const auto dispatch_helper = helper_;
 
   const auto generation = execution->generation;
-  execution_ = execution;
   ExecutionHandle handle{
       [this, execution](std::int64_t timeout_ns) { return WaitForCompletion(execution, timeout_ns); },
       [this, execution] {
@@ -1386,8 +1771,76 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
       controller_goal_id,
       controller_goal_generation,
       participant.prepared_contract_digest};
+  struct CompletionGuard {
+    std::shared_ptr<PendingDispatch> pending;
+    ExecutionPortDispatch dispatch{ExecutionPortDispatch::kEffectUncertain};
+    bool finished{false};
+    ~CompletionGuard() noexcept {
+      if (finished) return;
+      try { pending->token->Finish(dispatch); } catch (...) {}
+      try {
+        pending->result.set_exception(std::make_exception_ptr(
+            std::runtime_error("pending dispatch completion failed")));
+      } catch (...) {}
+    }
+  } completion{pending};
+  dispatch_helper->BindDispatchedGoal(stop_goal_for(participant, key, execution->trajectory),
+                                     execution->association, execution->cancel_attempt);
+  pending_dispatch_ = pending;
+  execution_ = execution;
+  const auto dispatch_port = execution->port;
+  lock.unlock();
+  ExecutionPortCommandResultDTO sent;
+  try {
+    sent = dispatch_port->Submit(key, execution->trajectory, execution->dispatch_token);
+  } catch (...) {
+    sent.dispatch = execution->dispatch_token->state() == ExecutionDispatchToken::State::kAdmitted
+                        ? ExecutionPortDispatch::kEffectUncertain
+                        : ExecutionPortDispatch::kNotDispatched;
+  }
+  completion.dispatch = sent.dispatch;
+  lock.lock();
+  execution->dispatch_pending = false;
+  if (sent.dispatch == ExecutionPortDispatch::kNotDispatched) {
+    dispatch_helper->ForgetKnownUnsent(key);
+    std::map<std::string, std::string> details;
+    if (sent.refusal) details["port_refusal"] = refusal_name(*sent.refusal);
+    if (sent.error) details["port_error"] = sent.error->message;
+    auto result = rejected("execution_port_submit_refused", std::move(details));
+    if (execution_ == execution) execution_.reset();
+    if (pending_dispatch_ == pending) pending_dispatch_.reset();
+    execution->dispatch_token->Finish(sent.dispatch);
+    pending->result.set_value(result);
+    completion.finished = true;
+    return result;
+  }
+  progress_.invalidate();
+  (void)progress_.publish(execution->generation, 0, dispatched_at, dispatched_at);
+
+  if (lane_.supports_scale && !execution->stopping) {
+    // The ramp of this motion starts from the factor last sent on this
+    // epoch (the lane's initial factor when none was) at the trajectory's
+    // prepared bounds; after a Stop the frozen factor is released here.
+    std::lock_guard scale_lock(scale_mutex_);
+    scale_frozen_ = false;
+    preparation_scale_hold_.reset();
+    // Linear slew at the trajectory's rate, at most 4/s; no
+    // separate rate-change limit.
+    ramp_ = ScaleRamp{last_sent_scale_.value_or(config_.initial_speed_factor), target_scale_,
+                      std::min(execution->trajectory.runtime_scale_bounds->max_rate_per_s,
+                               kMaxRuntimeScaleSlewPerS)};
+    if (ramp_->value != ramp_->target) {
+      last_ramp_tick_ = clock_.now();
+      ScheduleRampTickLocked();
+    }
+  }
+
   prepared_goal_ = PreparedGoalRecord{controller_goal_id, controller_goal_generation,
                                       participant.prepared_contract_digest, handle};
+  if (pending_dispatch_ == pending) pending_dispatch_.reset();
+  execution->dispatch_token->Finish(sent.dispatch);
+  pending->result.set_value(handle);
+  completion.finished = true;
   return handle;
 }
 
@@ -1452,7 +1905,7 @@ std::optional<ErrorDTO> ExecutionPortParticipant::StartStateError(
     }
   }
   if (max_error <= *config_.start_tolerance_rad) return std::nullopt;
-  // M6 ADAPTERM: e.g. a jog or Move-to target computed before the robot was
+  // E.g. a jog or Move-to target computed before the robot was
   // moved from its own interface. Refused before effect.
   return fault(ErrorCode::kStartStateMismatch,
                "Start state mismatch: the robot is not where this motion starts "
@@ -1483,16 +1936,37 @@ Result<void> ExecutionPortParticipant::sync_observed_state_before_planning() {
 }
 
 StopResultDTO ExecutionPortParticipant::stop() {
-  std::lock_guard lock(mutex_);
+  const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::nanoseconds(config_.stop.hard_stop_completion_timeout_ns);
+  std::unique_lock lock(mutex_);
   if (!execution_ || execution_->terminal) {
     return StopResultDTO{false, ErrorDTO{kErrorInvalidRequest, "No execution in flight", {}}};
   }
-  const auto sent = CancelExecution(*execution_);
-  if (execution_->critical_fault) {
-    // Q52 (item 17 path): the Kernel's hard stop after a critical fault ends
-    // this execution InterventionRequired with the fault.
-    Finish(*execution_, ExecutionState::kInterventionRequired, execution_->critical_fault);
+  const auto execution = execution_;
+  const auto pending = pending_dispatch_ && pending_dispatch_->key == execution->key
+      ? pending_dispatch_ : std::shared_ptr<PendingDispatch>{};
+  const auto fence = pending ? pending->token->Fence() : ExecutionDispatchToken::State::kAdmitted;
+  lock.unlock();
+  if (pending && fence == ExecutionDispatchToken::State::kFenced) {
+    const auto answer = pending->token->WaitUntil(deadline);
+    if (!answer || *answer == ExecutionPortDispatch::kNotDispatched)
+      return StopResultDTO{false, fault(ErrorCode::kStopFailed,
+          "The controller cancel was not dispatched", "hard_stop_cancel_not_dispatched")};
   }
+  lock.lock();
+  if (execution_ != execution || execution->terminal)
+    return StopResultDTO{false, ErrorDTO{kErrorInvalidRequest, "No execution in flight", {}}};
+  const auto sent = CancelExecution(*execution, lock, deadline);
+  if (execution_ != execution)
+    return StopResultDTO{false, ErrorDTO{kErrorInvalidRequest, "Execution changed during cancellation", {}}};
+  if (execution_ == execution && !execution->terminal && execution->critical_fault) {
+    // The Kernel's hard stop after a critical fault ends
+    // this execution InterventionRequired with the fault.
+    Finish(*execution, ExecutionState::kInterventionRequired, execution->critical_fault);
+  }
+  if (sent.error && sent.error->details.contains("reason") &&
+      sent.error->details.at("reason") == "stop_evidence_phase_expired")
+    return StopResultDTO{false, sent.error};
   if (sent.dispatch == ExecutionPortDispatch::kNotDispatched) {
     return StopResultDTO{
         false, fault(ErrorCode::kStopFailed, "The controller cancel was not dispatched",
@@ -1545,16 +2019,16 @@ ExecutionProgressHazardClaimResult ExecutionPortParticipant::claim_execution_pro
 bool ExecutionPortParticipant::WaitForCompletion(const std::shared_ptr<Execution>& execution,
                                                  const std::int64_t timeout_ns) {
   {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (replacement_ && replacement_->execution == execution && execution_ != execution &&
         prepared_membership_.active_execution_id() != replacement_->candidate_id)
       return false;
-    Evaluate(*execution);
+    Evaluate(*execution, lock);
     if (execution->terminal) return true;
   }
   waiter_(clock_.now() + std::max<std::int64_t>(0, timeout_ns), std::stop_token{});
-  std::lock_guard lock(mutex_);
-  Evaluate(*execution);
+  std::unique_lock lock(mutex_);
+  Evaluate(*execution, lock);
   return execution->terminal;
 }
 
@@ -1587,7 +2061,7 @@ void ExecutionPortParticipant::Finish(Execution& execution, const ExecutionState
 
 std::optional<double> ExecutionPortParticipant::ObserveTiming(IExecutionPort& port,
                                                               const ExecutionBindingEpoch epoch) {
-  // Q4: controller lateness (controller-manager periodicity) is kept apart
+  // Controller lateness (controller-manager periodicity) is kept apart
   // from telemetry loss (`controller_state` stamp gaps); best effort.
   const auto timing = port.ReadTiming();
   if (timing.binding_epoch != epoch) return std::nullopt;
@@ -1651,7 +2125,7 @@ void ExecutionPortParticipant::ObserveSample(Execution& execution,
   execution.snapshot.timestamp_ns = now;
   ++execution.snapshot.sequence_number;
   execution.snapshot.progress = total > 0.0 ? execution.cursor_s / total : 1.0;
-  // Item 20: commanded state on commanded lanes, measured on real ones.
+  // Commanded state on commanded lanes, measured on real ones.
   const bool measured = config_.stop.trip_authority == StateAuthorityClass::kMeasured;
   if (auto positions =
           reorder(measured ? sample.measured_positions_rad : sample.reference_positions_rad,
@@ -1669,8 +2143,16 @@ void ExecutionPortParticipant::ObserveSample(Execution& execution,
   execution.snapshot.source_age_ns = std::max<std::int64_t>(0, now - sample.local_receipt_stamp_ns);
 }
 
-void ExecutionPortParticipant::Evaluate(Execution& execution) {
+void ExecutionPortParticipant::Evaluate(Execution& execution, std::unique_lock<std::mutex>& lock) {
+  if (execution.dispatch_pending) return;
   if (execution.terminal) return;
+  const auto cancel = [&] {
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::nanoseconds(config_.stop.hard_stop_completion_timeout_ns);
+    (void)CancelExecution(execution, lock, deadline);
+    return !execution.terminal && !execution.stopping && stop_stages_in_flight_ == 0U &&
+        (execution_.get() == &execution || (replacement_ && replacement_->execution.get() == &execution));
+  };
   auto& port = *execution.port;
   // The sample before `now`: a receipt stamped (same monotonic clock) between
   // the two reads must not look newer than `now` and fail the freshness check.
@@ -1684,7 +2166,7 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
 
   if (execution.stopping) {
     // The Kernel's Stop owns the motion: no tracking or completion verdict.
-    // §3.3: progress continues on the original path, through the Stop
+    // Progress continues on the original path, through the Stop
     // planner's own mapping once a replacement runs (frozen after its hold).
     if (usable) {
       if (const auto mapped = helper_->OriginalPathCursor(sample)) {
@@ -1702,7 +2184,7 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
     if (*execution.last_stage_outcome == ParticipantStopStageOutcomeDTO::kSucceeded) {
       const auto original = port.ReadGoal(execution.key);
       Finish(execution, ExecutionState::kStopped, std::nullopt);
-      // Continuation (§3.3): the original path's end when the original goal
+      // Continuation: the original path's end when the original goal
       // itself completed (natural completion inside the Stop), else where the
       // on-path replacement left it; unknown after a hard stop.
       execution.stopped_cursor_s =
@@ -1717,8 +2199,8 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
 
   if (execution.critical_fault) throw ExecutionCriticalFault(*execution.critical_fault);
   if (const auto late = ObserveTiming(port, execution.epoch)) {
-    // Q52: a controller cycle later than the lane margin is a critical fault
-    // handled like item 17: the Kernel issues the lane's hard stop and the
+    // A controller cycle later than the lane margin is a critical fault
+    // handled like any critical fault: the Kernel issues the lane's hard stop and the
     // operation ends InterventionRequired.
     execution.critical_fault =
         fault(ErrorCode::kInternalError,
@@ -1735,7 +2217,7 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
   if (readiness.binding_epoch != execution.epoch || !ready(readiness)) {
     // As `main`: the controller binding was lost under an active goal.
     // Sending cancel does not prove this dispatched command has settled.
-    (void)CancelExecution(execution);
+    if (!cancel()) return;
     Finish(execution, ExecutionState::kInterventionRequired,
            fault(ErrorCode::kExecutionAborted,
                  "Controller binding or lifecycle readiness was lost during execution",
@@ -1749,7 +2231,7 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
   const bool pending_replacement = helper_->HasPendingReplacement();
   const bool goal_running = (goal && goal->phase != ExecutionGoalPhase::kTerminal) ||
                             (pending_replacement && helper_->HasLiveGoal());
-  // Q59 (`main`'s `joint_state_max_age_s`): during the motion the newest
+  // As `main`'s `joint_state_max_age_s`: during the motion the newest
   // controller state must be younger than the lane's maximum age; stale state
   // ends the motion like `main`'s other in-motion state faults (the goal is
   // cancelled and the execution fails).
@@ -1757,7 +2239,7 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
       !(sample && sample->binding_epoch == execution.epoch &&
         sample->local_receipt_stamp_ns <= now &&
         now - sample->local_receipt_stamp_ns <= config_.stop.controller_state_max_age_ns)) {
-    (void)CancelExecution(execution);
+    if (!cancel()) return;
     Finish(execution, ExecutionState::kInterventionRequired,
            fault(ErrorCode::kExecutionAborted,
                  "The controller state is older than the lane's maximum age during execution",
@@ -1779,12 +2261,12 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
   const bool own_sample = usable && goal && goal->phase != ExecutionGoalPhase::kTerminal &&
                           !replacement_sample && execution.association->Observe(*sample, goal);
   if (own_sample || replacement_sample) {
-    // Progress cursor: the controller's own cursor of this goal (§3.3).
+    // Progress cursor: the controller's own cursor of this goal.
     if (own_sample)
       ObserveSample(execution, *sample,
                     original_path_cursor(execution.delivery_clock, sample->cursor_s), now);
 
-    // Item 13 (as `main`'s host monitor): tolerance and timeout on the
+    // As `main`'s host monitor: tolerance and timeout on the
     // controller-reported error, at the sample rate.
     if (config_.tracking && config_.tracking->timeout_s > 0.0 &&
         finite(sample->error_positions_rad, joints)) {
@@ -1800,7 +2282,7 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
         if (!execution.tracking_breach_since) execution.tracking_breach_since = now;
         if (static_cast<double>(now - *execution.tracking_breach_since) / 1e9 >=
             config_.tracking->timeout_s) {
-          (void)CancelExecution(execution);
+          if (!cancel()) return;
           Finish(execution, ExecutionState::kInterventionRequired,
                  fault(ErrorCode::kExecutionAborted,
                        "Controller tracking error exceeded tolerance: " + format(error) + " rad",
@@ -1820,7 +2302,7 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
   }
 
   if (!goal) {
-    if (pending_replacement) (void)CancelExecution(execution);
+    if (pending_replacement && !cancel()) return;
     Finish(execution, ExecutionState::kInterventionRequired,
            fault(ErrorCode::kExecutionAborted, "The controller no longer reports the goal",
                  "controller_result_failed", {{"goal_result", "unavailable"}}));
@@ -1835,7 +2317,7 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
     if (result == ExecutionGoalResult::kSucceeded && !helper_->CanCompleteNaturally(execution.key))
       return;
     if (result != ExecutionGoalResult::kSucceeded) {
-      (void)CancelExecution(execution);
+      if (!cancel()) return;
       Finish(execution, ExecutionState::kInterventionRequired,
              fault(ErrorCode::kExecutionAborted,
                    std::string("FollowJointTrajectory goal failed: ") + to_string(result),
@@ -1846,13 +2328,13 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
     }
   }
   if (result == ExecutionGoalResult::kCanceled) {
-    // No addressed Stop owns it: the Kernel reports item 18.
+    // No addressed Stop owns it: the Kernel reports it.
     Finish(execution, ExecutionState::kStopped, std::nullopt);
     return;
   }
   if (result != ExecutionGoalResult::kSucceeded) {
     // As `main`: any unsuccessful controller result fails the motion; on real
-    // lanes this includes a goal-tolerance violation (Q3).
+    // lanes this includes a goal-tolerance violation.
     Finish(execution,
            result == ExecutionGoalResult::kEndedUnknown ? ExecutionState::kInterventionRequired
                                                         : ExecutionState::kFailed,
@@ -1863,7 +2345,7 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
                   {"mechanism_goal_id", goal->mechanism_goal_id.value()}}));
     return;
   }
-  // Completion (§4.1): kSucceeded plus `main`'s authority check. Every lane
+  // Completion: kSucceeded plus `main`'s authority check. Every lane
   // keeps its arrival tolerance as the JTC `goal` constraint, so kSucceeded
   // already means finished and within it; a commanded lane needs no second
   // check, the measured lane keeps `main`'s terminal gate on its own sample.
@@ -1875,7 +2357,7 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
   }
   if (!execution.success_observed_at) execution.success_observed_at = now;
   const auto result_at = goal->terminal_local_receipt_stamp.value_or(*execution.success_observed_at);
-  // Q50: a sample received after the result (as `main`) and newer by source
+  // A sample received after the result (as `main`) and newer by source
   // stamp than the goal's newest evidence (or, with none, than the newest
   // sample seen before the goal was sent).
   if (usable && sample->local_receipt_stamp_ns > result_at &&
@@ -1885,9 +2367,9 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
     // The one "robot at target" rule: the controller reported success (it
     // checked the same arrival tolerance as its `goal` constraint) and this
     // fresh measured sample lies within the lane's arrival tolerance.
-    // TODO(merge 6 ARRIVE): remove this measured re-check after the live
-    // validation of the kept JTC goal tolerance on Real (maintainer
-    // 2026-10-28); until then it stays, reading the same lane value.
+    // TODO: remove this measured re-check after the live validation of the
+    // kept JTC goal tolerance on Real; until then it stays, reading the same
+    // lane value.
     const auto at_target =
         positions ? robot_at_target(true, *positions, final_positions, *config_.final_tolerance_rad)
                   : RobotAtTargetDTO{};
@@ -1935,30 +2417,80 @@ ParticipantStopStageResultDTO ExecutionPortParticipant::TranslateStopStageForTak
 ParticipantStopStageResultDTO ExecutionPortParticipant::TranslateStopStageImpl(
     const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
     std::stop_token cancellation, IStopStageSpringReturnObserver* observer) {
+  const auto wall_received = std::chrono::steady_clock::now();
   const auto received_at = clock_.now();
+  const auto initial_leaf_budget = std::max<std::int64_t>(0,
+      budget.remaining_controlled_deadline_ns.value_or(config_.stop.hard_stop_completion_timeout_ns));
+  const auto leaf_deadline = wall_received + std::chrono::nanoseconds(initial_leaf_budget);
   // Copy before participant state changes: allocation failure has no effect.
   auto timed_budget = budget;
   std::shared_ptr<ParticipantStopStageHelper> helper;
   std::shared_ptr<Execution> execution;
   std::optional<std::uint64_t> fence_sequence;
+  std::shared_ptr<PendingDispatch> fenced_pending;
+  std::shared_ptr<ExecutionDispatchToken> fenced_replacement;
   {
     std::lock_guard lock(mutex_);
-    helper = helper_;
     execution = execution_;
+    const ExecutionGoalKey stage_goal{stage.controller_goal_id, stage.controller_goal_generation};
+    helper = execution && (!execution->terminal || execution->key == stage_goal)
+                 ? execution->stop_helper : helper_;
     ++stop_stages_in_flight_;
     ++stop_stages_started_;
     if (execution && !execution->terminal) execution->stopping = true;
-    // M6b: no live execution and none for this stage's goal: that goal was
+    // No live execution and none for this stage's goal: that goal was
     // never sent. Fence it under this lock (Dispatch rechecks it, and the
     // started count across its unlocked tool-context send), so it never goes
     // out after this Stop. No other Stop stage of this participant runs.
-    const ExecutionGoalKey stage_goal{stage.controller_goal_id, stage.controller_goal_generation};
+    if (pending_dispatch_ && pending_dispatch_->key == stage_goal &&
+        pending_dispatch_->token->Fence() == ExecutionDispatchToken::State::kFenced) {
+      fenced_pending = pending_dispatch_;
+      stopped_before_dispatch_ = stage_goal;
+      if (stop_stages_in_flight_ == 1U) fence_sequence = stop_stages_started_;
+    }
     if ((!execution || (execution->terminal && execution->key != stage_goal)) && !replacement_) {
       stopped_before_dispatch_ = stage_goal;
       if (stop_stages_in_flight_ == 1U) fence_sequence = stop_stages_started_;
     }
+    // A moving replacement send in flight (DispatchReplacement, unlocked).
+    // Fenced here: the port never sends it; wait below until its sender has
+    // removed it from the sent set. Already admitted: it may be sent and is in
+    // the sent set, so this stage stops it together with the source.
+    if (replacement_ && replacement_->execution->dispatch_pending &&
+        replacement_->execution->dispatch_token->Fence() ==
+            ExecutionDispatchToken::State::kFenced)
+      fenced_replacement = replacement_->execution->dispatch_token;
   }
-  if (fence_sequence && helper && !cancellation.stop_requested() && !helper->HasLiveGoal()) {
+  // Both waits are bounded by this stage's deadline; the fenced sender holds
+  // no lock and does not send.
+  const auto unsettled = [&] {
+    if (fenced_pending) {
+      const auto answer = fenced_pending->token->WaitUntil(leaf_deadline);
+      if (!answer || *answer != ExecutionPortDispatch::kNotDispatched) return true;
+    }
+    return fenced_replacement && !fenced_replacement->WaitUntil(leaf_deadline);
+  };
+  if (unsettled()) {
+    const auto error = fault(ErrorCode::kMotionInterruptBackendStopFailed,
+                             "Pending dispatch did not establish a no-send result before Stop deadline",
+                             "stop_evidence_phase_expired");
+    ParticipantStopStageResultDTO result{stage, StopStageAttemptDispositionDTO::kEffectUncertain,
+        ParticipantStopStageOutcomeDTO::kFailed, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::max<Duration>(0, clock_.now() - received_at), {}, error};
+    if (stage.stage_index < stage.participant_stop_plan.stage_commands.size()) {
+      const auto& command = stage.participant_stop_plan.stage_commands[stage.stage_index];
+      for (const auto& item : command.resolved_stage.evidence_requirements)
+        result.evidence_items.push_back(StopEvidenceItemDTO{
+            item.requirement.evidence_item_id, item.requirement.evidence_kind,
+            StopEvidenceItemStateDTO::kMissing, item.resolved_source, std::nullopt,
+            std::nullopt, std::nullopt, std::nullopt, error});
+    }
+    std::lock_guard lock(mutex_);
+    --stop_stages_in_flight_;
+    return result;
+  }
+  if (fence_sequence && helper && !cancellation.stop_requested() &&
+      (fenced_pending || !helper->HasLiveGoal())) {
     if (auto contained = no_goal_containment(stage, clock_, received_at, *fence_sequence)) {
       std::lock_guard lock(mutex_);
       --stop_stages_in_flight_;
@@ -2003,6 +2535,9 @@ ParticipantStopStageResultDTO ExecutionPortParticipant::TranslateStopStageImpl(
     std::shared_ptr<Execution> source_;
     IStopStageSpringReturnObserver* receiver_;
   } qualified_observer(*this, execution, observer);
+  timed_budget.remaining_controlled_deadline_ns = std::max<std::int64_t>(0,
+      std::chrono::duration_cast<std::chrono::nanoseconds>(leaf_deadline -
+          std::chrono::steady_clock::now()).count());
   if (timed_budget.stop_ingress_age_ns && *timed_budget.stop_ingress_age_ns >= 0 &&
       *timed_budget.stop_ingress_age_ns <= kMaximumStopDurationNs) {
     // Saturate to an invalid age rather than overflow on malformed timing.
@@ -2010,10 +2545,9 @@ ParticipantStopStageResultDTO ExecutionPortParticipant::TranslateStopStageImpl(
         std::max<Duration>(0, clock_.now() - received_at),
         kMaximumStopDurationNs + 1 - *timed_budget.stop_ingress_age_ns);
   }
-  auto result = observer ? helper->TranslateStopStageForTakeover(stage, timed_budget, cancellation,
-                                                                 qualified_observer)
-                         : helper->TranslateStopStage(stage, timed_budget, cancellation);
-  std::lock_guard lock(mutex_);
+  auto result = helper->TranslateStopStageWithDeadline(
+      stage, timed_budget, cancellation, observer ? &qualified_observer : nullptr, leaf_deadline);
+  std::unique_lock lock(mutex_);
   if (replacement_ && prepared_membership_.active_execution_id() != replacement_->candidate_id &&
       result.outcome == ParticipantStopStageOutcomeDTO::kSucceeded) {
     replacement_->execution->terminal = true;
@@ -2024,18 +2558,31 @@ ParticipantStopStageResultDTO ExecutionPortParticipant::TranslateStopStageImpl(
   if (execution && execution->stopping) {
     execution->last_stage_outcome = result.outcome;
     execution->last_stage_error = result.error;
-    Evaluate(*execution);
+    Evaluate(*execution, lock);
   }
   return result;
 }
 
-// --- Speed factor (Q11, Q17, Q35, Q38) ------------------------------------------
+// --- Speed factor ------------------------------------------
 
-void ExecutionPortParticipant::set_runtime_velocity_scale(double scale) {
+void ExecutionPortParticipant::set_runtime_velocity_scale(const double scale) {
+  apply_runtime_velocity_scale(scale, 0U);
+}
+
+void ExecutionPortParticipant::apply_runtime_velocity_scale(double scale,
+                                                            const std::uint64_t sequence) {
   scale = std::isfinite(scale) ? std::clamp(scale, 0.0, 1.0) : 0.0;
-  std::lock_guard lock(mutex_);
+  std::unique_lock lock(mutex_);
   if (!lane_.supports_scale) return;
-  std::lock_guard scale_lock(scale_mutex_);
+  std::unique_lock scale_lock(scale_mutex_);
+  if (scheduler_detach_started_) return;
+  // OD-72: latest value wins. The ramp target is the one store: a motion
+  // registering its ramp reads it under this same leaf lock, so no accepted
+  // value is lost; an older value arriving after a newer one changes nothing.
+  if (sequence != 0U) {
+    if (sequence < applied_scale_sequence_) return;
+    applied_scale_sequence_ = sequence;
+  }
   target_scale_ = scale;
   if (scale_frozen_ || preparation_scale_hold_ ||
       (execution_ && execution_->scale_hold_until_cursor_s)) return;  // target retained
@@ -2048,17 +2595,21 @@ void ExecutionPortParticipant::set_runtime_velocity_scale(double scale) {
     return;
   }
   // No motion: nothing moves, the value applies to the next goal's start.
-  PublishScaleLocked(scale);
-}
-
-void ExecutionPortParticipant::PublishScaleLocked(const double value) {
-  if (!port_) return;
-  if (port_->SetScale(value).dispatch != ExecutionPortDispatch::kNotDispatched) {
-    last_sent_scale_ = value;
-  }
+  const auto port = port_;
+  if (!port) return;
+  const auto port_sequence = port->ReserveScaleSequence();
+  scale_lock.unlock();
+  lock.unlock();
+  const auto result = port->SetScale(scale, port_sequence);
+  lock.lock();
+  scale_lock.lock();
+  if (port_ == port && port->IsLatestScaleSequence(port_sequence) &&
+      result.dispatch != ExecutionPortDispatch::kNotDispatched)
+    last_sent_scale_ = scale;
 }
 
 void ExecutionPortParticipant::ScheduleRampTickLocked() {
+  if (scheduler_detach_started_) return;
   const auto period_ns = static_cast<Duration>(1e9 / lane_.controller_update_rate_hz);
   const auto generation = ramp_generation_;
   ramp_handle_ = scheduler_.schedule(
@@ -2067,8 +2618,8 @@ void ExecutionPortParticipant::ScheduleRampTickLocked() {
 }
 
 void ExecutionPortParticipant::RampTick(const std::uint64_t ramp_generation) {
-  std::lock_guard lock(mutex_);
-  std::lock_guard scale_lock(scale_mutex_);
+  std::unique_lock lock(mutex_);
+  std::unique_lock scale_lock(scale_mutex_);
   if (ramp_generation != ramp_generation_) return;
   ramp_handle_ = 0U;
   if (scale_frozen_ || preparation_scale_hold_ ||
@@ -2080,23 +2631,59 @@ void ExecutionPortParticipant::RampTick(const std::uint64_t ramp_generation) {
   last_ramp_tick_ = now;
   ramp_->value = ramp_->value < ramp_->target ? std::min(ramp_->target, ramp_->value + step)
                                               : std::max(ramp_->target, ramp_->value - step);
-  PublishScaleLocked(ramp_->value);
-  if (ramp_->value != ramp_->target) ScheduleRampTickLocked();
+  const auto port = port_;
+  const auto value = ramp_->value;
+  if (!port) return;
+  const auto sequence = port->ReserveScaleSequence();
+  scale_lock.unlock();
+  lock.unlock();
+  const auto result = port->SetScale(value, sequence);
+  lock.lock();
+  scale_lock.lock();
+  if (port_ == port && port->IsLatestScaleSequence(sequence) &&
+      result.dispatch != ExecutionPortDispatch::kNotDispatched)
+    last_sent_scale_ = value;
+  if (ramp_generation == ramp_generation_ && ramp_ && !scale_frozen_ &&
+      !preparation_scale_hold_ && ramp_handle_ == 0U && ramp_->value != ramp_->target)
+    ScheduleRampTickLocked();
 }
 
-double ExecutionPortParticipant::FreezeSpeedFactor() {
-  std::lock_guard scale_lock(scale_mutex_);
-  scale_frozen_ = true;
-  ++ramp_generation_;
-  if (ramp_handle_ != 0U) scheduler_.cancel(ramp_handle_);
-  ramp_handle_ = 0U;
-  return last_sent_scale_.value_or(config_.initial_speed_factor);
+std::optional<double> ExecutionPortParticipant::FreezeSpeedFactor(
+    IExecutionPort& port, std::chrono::steady_clock::time_point deadline) {
+  double fallback;
+  {
+    std::lock_guard scale_lock(scale_mutex_);
+    scale_frozen_ = true;
+    (void)port.ReserveScaleSequence();
+    ++ramp_generation_;
+    if (ramp_handle_ != 0U) scheduler_.cancel(ramp_handle_);
+    ramp_handle_ = 0U;
+    fallback = last_sent_scale_.value_or(config_.initial_speed_factor);
+  }
+  const auto snapshot = port.SnapshotScaleAfterFence(deadline);
+  if (snapshot.status == ScaleSnapshot::Status::kDeadlineExpired) return std::nullopt;
+  return snapshot.status == ScaleSnapshot::Status::kFactor ? snapshot.factor : fallback;
+}
+
+RuntimeScaleMechanismAvailability ExecutionPortParticipant::runtime_velocity_scale_availability()
+    const noexcept {
+  const auto view = scale_availability_view_.load(std::memory_order_acquire);
+  if (!view || !view->supports_scale) return RuntimeScaleMechanismAvailability::kLaneUnsupported;
+  const auto listening = view->port ? view->port->ScaleInputListening() : std::nullopt;
+  return listening.value_or(true) ? RuntimeScaleMechanismAvailability::kAvailable
+                                  : RuntimeScaleMechanismAvailability::kControllerNotListening;
 }
 
 RuntimeScaleMechanismStatusDTO ExecutionPortParticipant::runtime_velocity_scale_status() const {
+  const auto availability = runtime_velocity_scale_availability();
   std::lock_guard lock(mutex_);
   RuntimeScaleMechanismStatusDTO status;
   status.supported = lane_.supports_scale;
+  if (availability == RuntimeScaleMechanismAvailability::kControllerNotListening) {
+    status.error = ErrorDTO{std::string(to_string(ErrorCode::kUnsupportedCapability)),
+                            "the controller is not listening for runtime scale input",
+                            {{"reason", kRuntimeScaleControllerNotListening}}};
+  }
   status.active = execution_ && !execution_->terminal;
   {
     std::lock_guard scale_lock(scale_mutex_);

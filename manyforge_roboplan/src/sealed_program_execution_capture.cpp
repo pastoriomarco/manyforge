@@ -35,14 +35,18 @@ PneumaticExecutionTable(const std::shared_ptr<const deployment::ProgramBindingCo
     if (!node_id || !node_id->is_string() || node_id->as_string() != "gripper.command_position")
       continue;
     const auto *parameters = node->find_object_member("parameters");
-    const auto *role = parameters ? parameters->find_object_member("target_role") : nullptr;
+    const auto *reference = parameters ? parameters->find_object_member("target") : nullptr;
+    const auto *component = reference ? reference->find_object_member("component_id") : nullptr;
+    const auto *command_target = reference ? reference->find_object_member("command_target_id") : nullptr;
     const auto *instance = node->find_object_member("instance_id");
-    if (!role || !role->is_string() || !instance || !instance->is_string())
+    if (!component || !component->is_string() || !command_target ||
+        !command_target->is_string() || !instance || !instance->is_string())
       throw std::invalid_argument("gripper node has no literal captured target or instance");
-    const auto target = std::find_if(binding.value().target_role_bindings.begin(),
-        binding.value().target_role_bindings.end(),
-        [&](const auto &row) { return row.target_role_id.value() == role->as_string(); });
-    if (target == binding.value().target_role_bindings.end())
+    const auto target = std::find_if(binding.value().target_bindings.begin(),
+        binding.value().target_bindings.end(),
+        [&](const auto &row) { return row.target.component_id.value() == component->as_string() &&
+                                      row.target.command_target_id.value() == command_target->as_string(); });
+    if (target == binding.value().target_bindings.end())
       throw std::invalid_argument("gripper node has no bound target");
     const auto *required = parameters->find_object_member("required_inputs");
     if (const auto *sources = node->find_object_member("value_sources");
@@ -59,8 +63,16 @@ PneumaticExecutionTable(const std::shared_ptr<const deployment::ProgramBindingCo
     if (table_node == table->nodes.end())
       throw std::invalid_argument("gripper node is absent from its execution table");
     auto &effects = table_node->target_effects;
+    const auto signal_target = [&](const core::ProgramSignalReferenceDTO &reference) {
+      const auto &signals = binding.value().signal_bindings;
+      const auto signal = std::find_if(signals.begin(), signals.end(),
+          [&](const auto &row) { return row.reference == reference; });
+      if (signal == signals.end())
+        throw std::invalid_argument("pneumatic signal has no bound target");
+      return signal->target;
+    };
     for (const auto &output : target->pneumatic_io->outputs)
-      effects.push_back({output.target_role_id, core::CapabilityId("io.gpio.set_output"), true});
+      effects.push_back({signal_target(output.signal), core::CapabilityId("io.gpio.set_output"), true});
     if (required) {
       for (const auto &item : required->as_array()) {
         const auto *name = item.find_object_member("input");
@@ -71,13 +83,13 @@ PneumaticExecutionTable(const std::shared_ptr<const deployment::ProgramBindingCo
             [&](const auto &row) { return row.input == name->as_string(); });
         if (input == target->pneumatic_io->inputs.end())
           throw std::invalid_argument("gripper required input is not declared by its deployment");
-        effects.push_back({input->target_role_id, core::CapabilityId("io.gpio.wait_for_input"), false});
-        effects.push_back({input->target_role_id, core::CapabilityId("io.gpio.get_input"), false});
+        effects.push_back({signal_target(input->signal), core::CapabilityId("io.gpio.wait_for_input"), false});
+        effects.push_back({signal_target(input->signal), core::CapabilityId("io.gpio.get_input"), false});
       }
     }
     std::sort(effects.begin(), effects.end(), [](const auto &left, const auto &right) {
-      return std::tie(left.target_role_id, left.capability_id) <
-             std::tie(right.target_role_id, right.capability_id);
+      return std::tie(left.target, left.capability_id) <
+             std::tie(right.target, right.capability_id);
     });
     effects.erase(std::unique(effects.begin(), effects.end()), effects.end());
   }

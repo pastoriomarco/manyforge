@@ -4,6 +4,7 @@
 #include <manyforge_component_manager/manager_apply_journal.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/prepared_activation_input.hpp>
+#include <manyforge_deployment/retained_bundle.hpp>
 #include <stdexcept>
 
 namespace manyforge::roboplan_backend::detail {
@@ -73,6 +74,8 @@ core::Result<SelectedProgramProducts> ReadSelectedProgramProducts(
       return rejected("program_selected_record_invalid");
     if (!outcome.value().program_binding_id)
       return Reply::Ok({nullptr, nullptr, outcome.value()});
+    const auto &catalog_root = program_artifact_root.empty() ? package_root : program_artifact_root;
+    const deployment::FilesystemVerifiedCatalogArtifactSource catalog(catalog_root);
     if (!model_map)
       return rejected("program_selected_products_unavailable");
     const core::ProgramId id(text("program_id"));
@@ -83,7 +86,7 @@ core::Result<SelectedProgramProducts> ReadSelectedProgramProducts(
       const deployment::FilesystemVerifiedProgramSource programs(root);
       if (!products.binding)
         products.binding = bindings.get_verified(
-            *outcome.value().program_binding_id, bundle, *model_map);
+            *outcome.value().program_binding_id, bundle, *model_map, catalog);
       if (!products.program)
         products.program = programs.get_verified(id, revision, bundle);
     };

@@ -71,7 +71,7 @@ inline constexpr std::string_view kInstalledTargetId =
 inline constexpr std::string_view kCandidateWorkerInstalledTargetId =
     execution_runtime_contract::kCandidateWorkerInstalledTargetId;
 
-/// CP9: the streams a ROS component declares (`component_streams` rows):
+/// The streams a ROS component declares (`component_streams` rows):
 /// every hosted component its measured joints, a gripper component also its
 /// gripper feedback.
 inline constexpr std::string_view kMeasuredJointsStreamId = "measured_joints";
@@ -81,7 +81,7 @@ inline constexpr std::string_view kAiModelStreamId = "endpoint";
 
 struct Configuration final {
   /// Deployment-authored fault Stop profile of one motion target, read
-  /// directly as `main` did (design Q37): no derivation from the operator
+  /// directly as `main` did: no derivation from the operator
   /// profile. `main`'s authored profile has no jerk field and `main` shaped
   /// every Stop ramp with its default jerk, so the decoded profile enables
   /// jerk limits with no per-joint override (default derived at Stop time).
@@ -94,24 +94,23 @@ struct Configuration final {
                            const FaultStopProfile &) = default;
   };
 
-  /// Q68: the controller profile of each hosted controllable component
-  /// inside the one ROS runtime unit (one controller manager per component,
-  /// Q66). The execution host reads the model's `component.yaml`
-  /// `lanes.<lane>` row (CONTRACTS §12) from `lane` and `model_family_id`;
+  /// The controller profile of each hosted controllable component
+  /// inside the one ROS runtime unit (one controller manager per component). The execution host reads the model's `component.yaml`
+  /// `lanes.<lane>` row from `lane` and `model_family_id`;
   /// Real's adapter comes from that row (`lanes.real.adapter`).
   struct ControllerProfile final {
     core::ControllableComponentId controllable_component_id;
     /// The authored lane: `mock`, `isaac` or `real`.
     std::string lane;
-    /// The model's `lanes.<lane>` row (CONTRACTS §12 ModelLaneRow: adapter,
+    /// The model's `lanes.<lane>` row (adapter,
     /// controller, arrival_tolerance_rad, goal_time_s?, adapter-specific
     /// keys, controllers_file?), verbatim as canonical JSON of one object.
     std::string lane_row;
     /// The model family whose lane row runs this component.
     std::string model_family_id;
-    /// Q82 authored literal TF prefix; empty preserves unprefixed frames.
+    /// Authored literal TF prefix; empty preserves unprefixed frames.
     std::string frame_prefix{};
-    /// CP8 step 1: the site-settings name of a Real robot's address, present
+    /// The site-settings name of a Real robot's address, present
     /// exactly on lane `real`. The address itself is a site fact, never
     /// compiled.
     std::optional<std::string> device_address_ref{};
@@ -119,15 +118,15 @@ struct Configuration final {
     /// measured (Real): the controller's command position (absent or
     /// `commanded`) or the measured position (`measured`).
     std::optional<core::StopLeadInAnchor> stop_lead_in_anchor{};
-    /// M6b: whether TCP updates are sent to the robot's controller (Real,
+    /// Whether TCP updates are sent to the robot's controller (Real,
     /// default on). Off: its vendor adapter keeps the controller's TCP offset
     /// at zero. Lanes without a vendor adapter ignore it.
     bool controller_tcp_offset_sync{core::kDefaultControllerTcpOffsetSync};
-    /// CONTRACTS §16: a machine's arm member names its owner and role; its
+    /// A machine's arm member names its owner and role; its
     /// `device_address_ref` is the owner's.
     std::optional<std::string> owner_component_id{};
     std::optional<std::string> member_role{};
-    /// N17: the launch values the compiler writes, so the host launches the
+    /// The launch values the compiler writes, so the host launches the
     /// component from its row alone. An arm's model source joints in
     /// controller order (its family's `arm_joints`); a tool's one gripper
     /// joint. Exactly one of the two is present.
@@ -137,7 +136,7 @@ struct Configuration final {
     /// static frames the cell adds (offset frames, custom TCPs, the mounts
     /// on it and a process-less mounted child's fixed links).
     std::string description{};
-    /// Q48: an arm's operator (controlled) Stop maximum deceleration per
+    /// An arm's operator (controlled) Stop maximum deceleration per
     /// source joint, every arm joint, from the Deployment's
     /// `controlled_stop.per_joint_limits`: its JTC's
     /// `max_deceleration_on_cancel` on every lane. Empty on a tool row.
@@ -149,7 +148,7 @@ struct Configuration final {
 
   /// One row per hosted controllable component, sorted by component.
   std::vector<ControllerProfile> controller_profiles;
-  /// CONTRACTS §16 / BOUNDARY §3: one row per machine owner, sorted by
+  /// One row per machine owner, sorted by
   /// component. The owner has no targets; `machine_lane_row` is its machine
   /// model's `lanes.<lane>` row as canonical JSON (absent on a lane without
   /// one: the host's passive owner).
@@ -199,7 +198,7 @@ struct Configuration final {
   /// At most one per hosted motion target; absent targets have no fault
   /// Stop profile (as `main` without `default_fault_stop_profile`).
   std::vector<FaultStopProfile> default_fault_stop_profiles;
-  /// DX791: active ROS rows require an explicit output choice; no absent
+  /// Active ROS rows require an explicit output choice; no absent
   /// authored ROS field is interpreted as commanded output.
   struct PneumaticOutput final {
     core::IoSignalId signal;
@@ -281,7 +280,7 @@ struct Configuration final {
   std::optional<double> collision_check_step_rad;
   std::optional<bool> collision_check_fresh_plans;
 
-  /// CP9: one row per model-free pose-source component (runtime kind
+  /// One row per model-free pose-source component (runtime kind
   /// `pose_source`, profile `pose_source_v0`), sorted by component. The
   /// component id is the observer's `source_id`.
   struct PoseSource final {
@@ -330,11 +329,10 @@ struct Configuration final {
   };
   std::vector<AiModel> ai_models;
 
-  /// CP9: each hosted component's declared streams and freshness budgets
+  /// Each hosted component's declared streams and freshness budgets
   /// (`component_streams`), sorted by (component, stream). Deployment
   /// `policies.component_streams` rows override the budget at runtime. What a
-  /// stale stream means belongs to the adapter, by component kind
-  /// (CONTRACTS §7).
+  /// stale stream means belongs to the adapter, by component kind.
   struct ComponentStream final {
     core::ControllableComponentId controllable_component_id;
     std::string stream_id;
@@ -349,7 +347,7 @@ struct Configuration final {
                          const Configuration &) = default;
 };
 
-/// Q89: the same ROS cell host with no hosted components. Values retain the
+/// The same ROS cell host with no hosted components. Values retain the
 /// established empty-host planner seed and cadence; no component is fabricated.
 [[nodiscard]] CanonicalValue empty_host_configuration();
 
@@ -372,8 +370,9 @@ require_configuration(const RetainedBundle &retained_bundle,
 /// Each component's lifecycle time budget (ns) authored in the Deployment as
 /// `lifecycle_command_timeout_s`: the `lifecycle_command_timeouts` rows
 /// (robots, tools, pose sources, AI models) and the I/O devices'
-/// `io_provider_devices` rows. CCLC bounds each of the component's lifecycle
-/// steps with it; without one, its plans' own bound (the same default) applies.
+/// `io_provider_devices` rows. The execution host passes this budget to the
+/// component adapter, which bounds each lifecycle action with it; without
+/// one, the default component lifecycle budget applies.
 [[nodiscard]] std::map<std::string, std::int64_t, std::less<>>
 component_lifecycle_budgets_ns(const core::CellGraphDTO &graph);
 
@@ -383,7 +382,7 @@ component_lifecycle_budgets_ns(const core::CellGraphDTO &graph);
 [[nodiscard]] std::map<std::string, std::int64_t, std::less<>>
 component_composition_budgets_ns(const core::CellGraphDTO &graph);
 
-/// CP9: the stream id of one pose-source binding,
+/// The stream id of one pose-source binding,
 /// `poses/<object_id>/<policy_id>` (the compiler keeps it a valid stream id).
 [[nodiscard]] std::string
 pose_source_stream_id(const Configuration::PoseSource::Binding &binding);
@@ -415,7 +414,7 @@ find_component_stream(const Configuration &configuration,
 find_controller_profile(const Configuration &configuration,
                         const core::ControllableComponentId &component_id);
 
-/// CP8 step 1: the simulator that feeds one hosted component, resolved once
+/// The simulator that feeds one hosted component, resolved once
 /// from its compiled controller profile (Isaac profiles depend on Isaac; Mock
 /// and Real profiles on none). Consumers read this instead of the lane keys.
 enum class ControllerSimulatorDependency : std::uint8_t { kNone, kIsaac };

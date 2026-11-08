@@ -324,10 +324,9 @@ template <typename T>
   const auto* lhs_motion = motion_payload(left);
   const auto* rhs_motion = motion_payload(right);
   return lhs_motion != nullptr && rhs_motion != nullptr &&
-         lhs.component_role_id == rhs.component_role_id &&
-         lhs.target_role_id == rhs.target_role_id &&
+         lhs.target == rhs.target &&
          lhs.required_capability_id == rhs.required_capability_id &&
-         lhs_motion->base_frame_role_id == rhs_motion->base_frame_role_id &&
+         lhs_motion->base_frame == rhs_motion->base_frame &&
          lhs_motion->tcp_endpoint == rhs_motion->tcp_endpoint;
 }
 

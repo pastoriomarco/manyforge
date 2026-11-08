@@ -1,3 +1,5 @@
+#include <manyforge_core/testing/heap_resource_addressed_kernel.hpp>
+
 #include "../src/program_reset_position_observation.hpp"
 #include <gtest/gtest.h>
 
@@ -88,8 +90,6 @@ make_binding(CoordinateKind kind, std::string target = "gripper.target",
       ProgramBindingId("program-binding"),
       RetainedBundleId("bundle"),
       GraphRevision("graph"),
-      ComponentRoleId("robot"),
-      TargetRoleId(angular ? "arm" : "gripper"),
       ControllableComponentId("robot.1"),
       ComponentTypeId("aggregate.robot"),
       ComponentTypeRevision("aggregate-revision"),
@@ -108,10 +108,10 @@ make_binding(CoordinateKind kind, std::string target = "gripper.target",
                 ModelGroupRoleId(angular ? "arm_group" : "gripper_group"),
                 ModelInstanceId("robot.model"), angular ? "arm" : "gripper",
                 joints}},
-      {ProgramFrameRoleBindingDTO{FrameRoleId("base"),
+      {ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("base")},
                                   ModelInstanceId("robot.model"),
                                   ModelRevision("model-revision"), "base"},
-       ProgramFrameRoleBindingDTO{FrameRoleId("tcp"),
+       ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("tcp")},
                                   ModelInstanceId("robot.model"),
                                   ModelRevision("model-revision"), "tool0"}},
       std::move(resources),
@@ -478,13 +478,13 @@ private:
 TEST(RetainedObservedStateChannelTest,
      BoundedReadAndPublishFailClosedUnderRouteContention) {
   auto binding = make_binding(CoordinateKind::kLinear, "gripper.target", true);
-  FakeClock clock;
-  clock.set(100);
+  auto clock = std::make_shared<FakeClock>();
+  clock->set(100);
   RetainedObservedStateChannel channel(
       binding, nullptr,
       RetainedObservedStateChannelConfig{
           ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U},
-      &clock);
+      clock);
   const std::array<double, 1U> initial_position{0.0};
   const std::array<double, 1U> initial_velocity{0.0};
   ASSERT_TRUE(
@@ -553,7 +553,7 @@ TEST(RetainedObservedStateChannelTest,
 
 TEST(RetainedObservedStateChannelTest,
      MeasuredRouteRebindNeverRestampsAndWaitsForAFreshMeasurement) {
-  // CP8 step 1: a Real arm's addressed state is measured. A route change keeps
+  // A Real arm's addressed state is measured. A route change keeps
   // the physical source but no earlier measurement becomes current under it.
   const auto measured = [](const RuntimeParticipantBinding &binding) {
     auto value = binding.value();
@@ -781,7 +781,7 @@ TEST(RetainedObservedStateChannelTest,
 
 TEST(RetainedObservedStateChannelTest,
      DisplayInputIsMarkedUntilTheNextAddressedSampleReplacesIt) {
-  // M6: display input moves only the display; on a channel that does not
+  // Display input moves only the display; on a channel that does not
   // follow display input, the next addressed publication takes the render
   // coordinates back.
   const auto binding =
@@ -817,7 +817,7 @@ TEST(RetainedObservedStateChannelTest,
 
 TEST(RetainedObservedStateChannelTest,
      AFollowingChannelKeepsTheDisplayInputOverAddressedSamples) {
-  // M6 (approval list 2, item 23): a Real arm's display always follows its
+  // A Real arm's display always follows its
   // vendor joint topic. Addressed samples render until the first display
   // input; afterwards they update only the authoritative state.
   const auto binding =
@@ -859,7 +859,7 @@ TEST(RetainedObservedStateChannelTest,
 
 TEST(RetainedObservedStateChannelTest,
      ALivePreviewStartsFromTheDisplayInputOnlyWhileTheStreamLeads) {
-  // M6 (approval list 2, item 34): poses follow the live controller stream.
+  // Poses follow the live controller stream.
   // A jog/Move-to preview starts from the display input (a Real arm's latest
   // valid vendor joint sample) while the arm counts as moved or re-arming,
   // or while the broadcaster's addressed state is stale. Otherwise, and on a
@@ -914,7 +914,7 @@ TEST(RetainedObservedStateChannelTest,
 
 TEST(RetainedObservedStateChannelTest,
      PresentationReadsFollowTheDisplayInputWhileTheStreamLeads) {
-  // M6 (approval list 2, items 23/34): the host's control-state and
+  // The host's control-state and
   // observation reads serve the live display pose under the preview rule,
   // instead of failing on a stale broadcaster. Otherwise they are exactly
   // current_bound_state; current_state (planning) never changes.
@@ -1319,7 +1319,7 @@ TEST(RetainedExecutionStateSinkTest,
   auto binding = make_binding(CoordinateKind::kAngular, "arm.target");
   auto channel = std::make_shared<FakeRetainedStateChannel>(
       binding, std::vector<double>{0.1, 0.2});
-  FakeClock clock;
+  auto clock = std::make_shared<FakeClock>();
   RetainedExecutionStateSink sink(
       clock, {{binding.value().model_groups.front().compiled_group_name,
                channel, false}});
@@ -1338,8 +1338,8 @@ TEST(RetainedExecutionStateSinkTest,
   auto binding = make_binding(CoordinateKind::kLinear, "gripper.target");
   auto channel = std::make_shared<FakeRetainedStateChannel>(
       binding, std::vector<double>{0.0});
-  FakeClock clock;
-  clock.set(123);
+  auto clock = std::make_shared<FakeClock>();
+  clock->set(123);
   RetainedExecutionStateSink sink(
       clock, {{binding.value().model_groups.front().compiled_group_name,
                channel, true}});
@@ -1358,8 +1358,8 @@ TEST(RetainedExecutionStateSinkTest,
   auto binding = make_binding(CoordinateKind::kAngular, "arm.target");
   auto channel = std::make_shared<FakeRetainedStateChannel>(
       binding, std::vector<double>{0.0, 0.0});
-  FakeClock clock;
-  clock.set(123);
+  auto clock = std::make_shared<FakeClock>();
+  clock->set(123);
   RetainedExecutionStateSink sink(
       clock, {{binding.value().model_groups.front().compiled_group_name,
                channel, true}});
@@ -1397,7 +1397,7 @@ TEST(RetainedExecutionStateSinkTest,
   auto binding = make_binding(CoordinateKind::kAngular, "arm.target");
   auto channel = std::make_shared<FakeRetainedStateChannel>(
       binding, std::vector<double>{0.1, 0.2});
-  FakeClock clock;
+  auto clock = std::make_shared<FakeClock>();
   RetainedExecutionStateSink sink(
       clock, {{binding.value().model_groups.front().compiled_group_name,
                channel, false}});
@@ -1550,7 +1550,7 @@ class GripperRuntimeOwnerTestBackend final : public IGripperCommandBackend,
 
 [[nodiscard]] std::shared_ptr<RetainedObservedStateChannel>
 make_gripper_restart_state_channel(const RuntimeParticipantBinding& binding,
-                                   IClock& clock) {
+                                   std::shared_ptr<IClock> clock) {
   auto channel = std::make_shared<RetainedObservedStateChannel>(
       binding, nullptr,
       RetainedObservedStateChannelConfig{
@@ -1558,14 +1558,31 @@ make_gripper_restart_state_channel(const RuntimeParticipantBinding& binding,
           "native.gripper.restart",
           1'000'000'000,
           1U},
-      &clock);
+      clock);
   const std::array<double, 1U> position{0.0};
   const std::array<double, 1U> velocity{0.0};
-  if (!channel->publish_state(position, velocity, clock.now(), clock.now())
+  if (!channel->publish_state(position, velocity, clock->now(), clock->now())
            .applied()) {
     throw std::logic_error("could not seed the restarted gripper state channel");
   }
   return channel;
+}
+
+TEST(RetainedGripperRuntimeTest, RecoveryEvidenceDistinguishesDeclaredLaneFromAbsentLane) {
+  auto binding = make_binding(CoordinateKind::kLinear);
+  auto backend = std::make_shared<GripperRuntimeOwnerTestBackend>(binding.value().command_target_id.value());
+  auto clock = std::make_shared<FakeClock>();
+  auto channel = std::make_shared<FakeRetainedStateChannel>(binding, std::vector<double>{0.0});
+  RetainedGripperRuntime runtime(RetainedGripperRuntimeInput{
+      binding, backend, clock, channel, nullptr, std::nullopt, false, {}, {}, std::nullopt});
+  const auto transport = std::make_shared<int>(1);
+  const auto absent = runtime.GripperOwnerRecoveryEvidence(false, binding.value().command_target_id.value(), transport);
+  ASSERT_TRUE(absent.has_value());
+  EXPECT_EQ(absent->mode, core::GripperOwnerRecoveryProofMode::kNoFeedback);
+  EXPECT_EQ(absent->owner, transport);
+  EXPECT_FALSE(runtime.GripperOwnerRecoveryEvidence(true, binding.value().command_target_id.value(), transport));
+  EXPECT_FALSE(runtime.GripperOwnerRecoveryEvidence(false, "other", transport));
+  EXPECT_FALSE(runtime.GripperOwnerRecoveryEvidence(false, binding.value().command_target_id.value(), nullptr));
 }
 
 TEST(RetainedGripperRuntimeTest,
@@ -1821,12 +1838,13 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
                              ".sqlite");
   {
     SqliteOperationJournal journal(journal_path, cell_id, 16U);
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {gripper->registration()}, *clock, *scheduler, journal,
         ResourceAddressedExecutionKernelConfig{
             RequestOwnerEpoch("owner.native.gripper.route"), cell_id, 16U,
             {}, nullptr, graph_revision});
-    RetainedGripperRoutePublicationOwner owner(gripper, *clock, kernel);
+    auto& kernel = *kernel_heap_test_owner;
+    RetainedGripperRoutePublicationOwner owner(gripper, clock, kernel);
 
     const auto& path = *binding.value().control_path;
     ActiveControlConfigurationDTO reconciled{
@@ -1902,7 +1920,7 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
   auto clock = std::make_shared<FakeClock>();
   clock->set(100);
   auto scheduler = std::make_shared<ManualScheduler>();
-  auto state_channel = make_gripper_restart_state_channel(current_binding, *clock);
+  auto state_channel = make_gripper_restart_state_channel(current_binding, clock);
   auto backend = std::make_shared<GripperRuntimeOwnerTestBackend>(
       current_binding.value().command_target_id.value());
   std::vector<ControlRouteId> rebound_routes;
@@ -1933,13 +1951,14 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
                              ".sqlite");
   {
     SqliteOperationJournal journal(journal_path, cell_id, 16U);
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {gripper->registration()}, *clock, *scheduler, journal,
         ResourceAddressedExecutionKernelConfig{
             RequestOwnerEpoch("owner.native.gripper.restart"), cell_id, 16U,
             {}, nullptr, current_binding.value().graph_revision});
+    auto& kernel = *kernel_heap_test_owner;
     RetainedGripperRoutePublicationOwner owner(
-        gripper, *clock, kernel,
+        gripper, clock, kernel,
         [](const ActiveControlConfigurationDTO&,
            const std::vector<RuntimeParticipantExecutionRegistration>& registrations) {
           RetainedGripperRoutePublicationOwner::KernelCandidate candidate;
@@ -1988,7 +2007,7 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
   auto clock = std::make_shared<FakeClock>();
   clock->set(100);
   auto scheduler = std::make_shared<ManualScheduler>();
-  auto state_channel = make_gripper_restart_state_channel(current_binding, *clock);
+  auto state_channel = make_gripper_restart_state_channel(current_binding, clock);
   auto backend = std::make_shared<GripperRuntimeOwnerTestBackend>(
       current_binding.value().command_target_id.value());
   std::vector<ControlRouteId> rebound_routes;
@@ -2020,13 +2039,14 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
                              ".sqlite");
   {
     SqliteOperationJournal journal(journal_path, cell_id, 16U);
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {gripper->registration()}, *clock, *scheduler, journal,
         ResourceAddressedExecutionKernelConfig{
             RequestOwnerEpoch("owner.native.gripper.restart.failure"), cell_id,
             16U, {}, nullptr, current_binding.value().graph_revision});
+    auto& kernel = *kernel_heap_test_owner;
     RetainedGripperRoutePublicationOwner owner(
-        gripper, *clock, kernel,
+        gripper, clock, kernel,
         [&builder_calls](const ActiveControlConfigurationDTO&,
            const std::vector<RuntimeParticipantExecutionRegistration>&) {
           ++builder_calls;
@@ -2131,7 +2151,7 @@ TEST(RetainedGripperRuntimeTest,
       RetainedObservedStateChannelConfig{
           ObservedStateSourceKind::kPredictedState, "native.gripper.local",
           1'000, 1U},
-      clock.get(), wake);
+      clock, wake);
   auto selected_backend = std::make_shared<GripperRuntimeOwnerTestBackend>(
       binding.value().command_target_id.value());
   auto owner = std::make_unique<RetainedGripperRuntime>(
@@ -2179,7 +2199,7 @@ TEST(RetainedGripperRuntimeTest,
           RetainedObservedStateChannelConfig{
               ObservedStateSourceKind::kPredictedState,
               "native.gripper.model", 1'000, 1U},
-          clock.get(), wake),
+          clock, wake),
       std::invalid_argument);
 }
 
@@ -2261,8 +2281,8 @@ void expect_same_gripper_alias_rows(
 [[nodiscard]] ResolvedStopBasePlanDTO gripper_alias_stop_plan_for(
     const RuntimeParticipantBinding& participant, const IGripperCommandBackend& backend) {
   const auto path =
-      std::filesystem::path(__FILE__).parent_path().parent_path().parent_path() /
-      "manyforge_core" / "test" / "golden" / "resolved_stop_base_plan.v1.json";
+      std::filesystem::path(MANYFORGE_CORE_TEST_GOLDEN_DIR) /
+      "resolved_stop_base_plan.v1.json";
   std::ifstream stream(path, std::ios::binary);
   std::string bytes{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
   if (bytes.ends_with('\n')) {
@@ -2625,8 +2645,9 @@ TEST(RetainedGripperRuntimeTest,
           ComputeRequiredRuntimeSetDigest({}), RuntimeUnitId("manager.gripper.alias"),
           RuntimeEpoch("manager.gripper.alias.1"),
           RequestOwnerEpoch("manager.gripper.alias.1"), {}};
-      ResourceAddressedExecutionKernel kernel(registrations.value(), *clock, *scheduler,
+      auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(registrations.value(), *clock, *scheduler,
           journal, config);
+      auto& kernel = *kernel_heap_test_owner;
       ASSERT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
       const CellAdmissionReadinessSnapshotDTO ready{
           true,
@@ -2644,7 +2665,7 @@ TEST(RetainedGripperRuntimeTest,
           value.program_id, value.program_revision, value.program_binding_id,
           ProgramRunId("run.gripper.alias"), value.graph_revision, value.retained_bundle_id,
           std::nullopt,
-          {{value.component_role_id, value.target_role_id, feedback.value().capability_id,
+          {{{value.controllable_component_id, value.command_target_id}, feedback.value().capability_id,
             std::nullopt, CapabilityCommandIntentDTO{
                 schema.command_schema_id, schema.command_schema_revision,
                 GripperPositionCommandValueDTO{LinearPositionDTO{0.02}, std::nullopt},
@@ -2688,9 +2709,8 @@ TEST(RetainedGripperRuntimeTest,
 [[nodiscard]] RuntimeParticipantBinding make_gripper_alias_peer_binding(
     const RuntimeParticipantBinding& command) {
   auto value = command.value();
-  value.component_role_id = ComponentRoleId("peer");
-  value.target_role_id = TargetRoleId("peer.gripper");
   value.controllable_component_id = ControllableComponentId("peer.component");
+  for (auto &frame : value.frame_bindings) frame.reference.component_id = value.controllable_component_id;
   value.command_target_id = CommandTargetId("peer.target");
   value.resources.front().resource_id = ResourceId("peer.finger");
   value.resources.front().compiled_resource_name = "peer.finger";
@@ -2715,7 +2735,7 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
     auto clock = std::make_shared<FakeClock>();
     clock->set(100);
     auto scheduler = std::make_shared<ManualScheduler>();
-    auto channel = make_gripper_restart_state_channel(current, *clock);
+    auto channel = make_gripper_restart_state_channel(current, clock);
     auto backend = std::make_shared<GripperRuntimeOwnerTestBackend>(
         current.value().command_target_id.value(), GripperActuationKind::kPneumatic, output);
     std::vector<ControlRouteId> rebound_routes;
@@ -2730,7 +2750,7 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
           return Result<void>::Ok();
         }, scheduler, std::nullopt, {}, {current, current_feedback}});
     auto peer_backend = std::make_shared<GripperRuntimeOwnerTestBackend>("peer.target");
-    auto peer_channel = make_gripper_restart_state_channel(peer_binding, *clock);
+    auto peer_channel = make_gripper_restart_state_channel(peer_binding, clock);
     RetainedGripperRuntime peer(RetainedGripperRuntimeInput{
         peer_binding, peer_backend, clock, peer_channel, nullptr, std::nullopt,
         true, {}, scheduler, std::nullopt});
@@ -2744,16 +2764,17 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
             std::chrono::steady_clock::now().time_since_epoch().count()) + ".sqlite");
     {
       SqliteOperationJournal journal(path, cell, 16U);
-      ResourceAddressedExecutionKernel kernel(installed, *clock, *scheduler, journal,
+      auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(installed, *clock, *scheduler, journal,
           {RequestOwnerEpoch("owner.gripper.alias.recovery"), cell, 16U, {}, nullptr,
            current.value().graph_revision});
+      auto& kernel = *kernel_heap_test_owner;
       auto peer_configuration = gripper_route_configuration(peer_binding);
       peer_configuration.state = ActiveControlConfigurationStateDTO::kExternalOrUnknownUnreconciled;
       const auto peer_before = kernel.publish_runtime_route_configuration(peer_configuration);
       ASSERT_TRUE(peer_before.ok()) << peer_before.error().message;
       int builder_calls = 0;
       int adopted_caches = 0;
-      RetainedGripperRoutePublicationOwner owner(runtime, *clock, kernel,
+      RetainedGripperRoutePublicationOwner owner(runtime, clock, kernel,
           [&](const ActiveControlConfigurationDTO& configuration,
               const std::vector<RuntimeParticipantExecutionRegistration>& aliases) {
             ++builder_calls;
@@ -2844,7 +2865,7 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
   auto clock = std::make_shared<FakeClock>();
   clock->set(100);
   auto scheduler = std::make_shared<ManualScheduler>();
-  auto channel = make_gripper_restart_state_channel(current, *clock);
+  auto channel = make_gripper_restart_state_channel(current, clock);
   auto backend = std::make_shared<GripperRuntimeOwnerTestBackend>(current.value().command_target_id.value());
   std::vector<ControlRouteId> rebound_routes;
   auto runtime = std::make_shared<RetainedGripperRuntime>(RetainedGripperRuntimeInput{
@@ -2864,11 +2885,12 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
           std::chrono::steady_clock::now().time_since_epoch().count()) + ".sqlite");
   {
     SqliteOperationJournal journal(path, cell, 16U);
-    ResourceAddressedExecutionKernel kernel(before, *clock, *scheduler, journal,
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(before, *clock, *scheduler, journal,
         {RequestOwnerEpoch("owner.gripper.alias.failed.recovery"), cell, 16U, {}, nullptr,
          current.value().graph_revision});
+    auto& kernel = *kernel_heap_test_owner;
     int builder_calls = 0;
-    RetainedGripperRoutePublicationOwner owner(runtime, *clock, kernel,
+    RetainedGripperRoutePublicationOwner owner(runtime, clock, kernel,
         [&](const ActiveControlConfigurationDTO&,
             const std::vector<RuntimeParticipantExecutionRegistration>& aliases) {
           ++builder_calls;

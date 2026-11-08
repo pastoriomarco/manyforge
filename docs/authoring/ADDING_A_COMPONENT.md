@@ -283,15 +283,38 @@ arrive again. Without a row there's no budget. Mock and `geometric_contact`
 inputs have no sender. A machine's I/O members are covered by their own I/O
 stream.
 
-The `geometric_contact` input names a motion robot and follows its current
-Active TCP at each evaluation, using the contact bodies of that TCP's owner.
-It is always active. Preparation wires the robot and all tools it carries,
-the robot's collision model and the Scene. No Active TCP, an owner without
-contact bodies, or an uncarried tool makes the input unavailable with a typed
-reason, rather than false. Missing, stale, busy or inconclusive geometry also
-makes it unavailable. Contact bodies static relative to the motion group give
-`contact_bodies_static`. The input is read-only and sampled; manual and timed
-Mock writes do not apply.
+### Geometric-contact inputs
+
+This input is true while the selected robot's contact bodies touch the selected Scene resource, checked against live geometry. If ManyForge can't make the check, the input is unavailable, never false. Contact bodies are the collision shapes on the robot, or on the mounted tool, that owns its Active TCP (the tool center point currently selected for that robot); a Scene resource is a named object in the cell's Scene.
+
+During setup, ManyForge prepares the selected robot, its mounted tools, the robot collision model and the cell
+Scene for this check. While the I/O source is enabled, it samples independently of whether a Program reads the
+signal. At every sample, ManyForge reads the current Active TCP and collision geometry. A Program may read this
+signal, but it does not store those live values or the contact result.
+
+A live unavailable sample uses `io_source_unavailable`; its `reason` says why:
+
+- `active_tcp_unavailable`: the robot has no current Active TCP.
+- `active_tcp_unknown`: the current Active TCP is not in this robot's TCP list.
+- `tcp_tool_not_mounted`: the TCP's tool is not mounted on this robot.
+- `active_tcp_contact_bodies_unavailable`: no contact bodies are declared for the Active TCP's component.
+- `runtime_motion_endpoint_body_unresolved`, `runtime_motion_endpoint_invalid`,
+  `runtime_motion_endpoint_body_invalid`, `runtime_collision_body_alias_table_invalid`, or
+  `runtime_collision_body_alias_unresolved`: the runtime cannot identify or validate a contact body
+  in the robot's model.
+- `observed_state_missing_or_stale`: current robot or tool positions needed for the check are
+  missing or older than their freshness limit.
+- `collision_geometry_missing_or_stale`: current collision geometry for the robot or Scene resource
+  is missing or stale.
+- `collision_geometry_unresolved`: ManyForge cannot match or prepare the contact bodies and Scene
+  resource geometry for a complete check.
+- `collision_query_busy`: the previous contact check is still running.
+- `collision_query_inconclusive`: the geometry query cannot confirm contact or no contact.
+- `contact_bodies_static`: at least one contact body is static relative to the robot's motion
+  group, so it does not move with the robot.
+
+Before the first sample, the signal has no value. A valid sample becomes stale when it is older than the configured **Maximum sample age**. Setting that age below normal sample-production time can make the sample stale. This input is read-only; manual
+and timed Mock writes do not apply.
 
 ## Add a tool
 
@@ -327,7 +350,7 @@ mesh `package://` URIs that share one folder before `meshes/`.
      finger joint (`roles.joints.fingers`) and the `gripper` section.
    - `gripper.actuation: position_commanded` is a gripper with its own
      controller. `lanes.mock` gives its Mock row: `adapter: mock`, its
-     `GripperActionController` as `controller`, `controllers_file`
+     parallel gripper action controller as `controller`, `controllers_file`
      (`mock_controllers.yaml`), `gripper_result_timeout_s` and
      `gripper_stop_finish_tolerance` ([Grippers](GRIPPERS.md#stop-near-the-target)).
      A tool row has no `arrival_tolerance_rad`. An Isaac row
@@ -395,8 +418,8 @@ mesh `package://` URIs that share one folder before `meshes/`.
      component's TCPs. A tool made from a descriptor has one target and never
      needs it.
 
-   In `assignment.yaml`, a `tool` component role selects the tool component.
-   Then:
+   Program nodes select the mounted tool directly by its component and command
+   target IDs. Then:
 
    ```bash
    scripts/manyforge component check manyforge_example_models/models/vac_gripper \
@@ -516,7 +539,8 @@ process belongs to its owner, built with its arm member's model.
 **Capabilities.** Besides the four lifecycle actions, an adapter declares
 what it supports: `reset_position`, `power_off`, `reboot`, `io_manual_write`,
 `io_output_readback`, and a simulator's `sim_reset`. Only declared actions
-are offered.
+are offered. Declaring `sim_reset` identifies the component as a simulator;
+its state never latches the cell or blocks Execute.
 
 **Components without a lane** (a pneumatic tool driven by I/O) run on the
 host's generic adapter: Prepare, Enable, Disable and Recover succeed at once;
@@ -651,7 +675,7 @@ Tool:
 | `gripper.attach_frame`, `gripper.touch_links` | with a gripper | The link a grasped object attaches to; the links that may touch it |
 | `gripper.command_duration_s` | pneumatic | The valve dwell in seconds |
 | `lanes.<lane>` | no | One row per lane: `adapter`, `controller` (the gripper controller), `controllers_file` on Mock, timeouts and the adapter's keys; no `arrival_tolerance_rad`. A pneumatic tool may have none |
-| `lanes.<lane>.gripper_stop_finish_tolerance` | Mock and GripperCommand Isaac rows | Finger distance to the target (the gripper's position unit, about 5% of the stroke) within which a Stop lets the command finish instead of cancelling it; see [Grippers](GRIPPERS.md#stop-near-the-target) |
+| `lanes.<lane>.gripper_stop_finish_tolerance` | Mock and `ros_gripper_command` Isaac rows | Finger distance to the target (the gripper's position unit, about 5% of the stroke) within which a Stop lets the command finish instead of cancelling it; see [Grippers](GRIPPERS.md#stop-near-the-target) |
 
 I/O device: `signals` (required), each with `signal_name` (unique),
 `direction` (`input` or `output`) and `value_type` (`bool`). Provider form:

@@ -18,9 +18,7 @@ inline constexpr std::string_view kCollisionWorldContentApiVersion =
     "manyforge.collision_world_snapshot.v1";
 inline constexpr std::string_view kCollisionWorldContentIdentityDomain = "collision-world-content";
 
-/// Build a deterministic, validated `CollisionWorldSnapshot` (spec
-/// §3.8.1, defined by the kernel-architecture sprint
-/// P-2-impl-snapshot chunk).
+/// Build a deterministic, validated `CollisionWorldSnapshot`.
 ///
 /// The builder is the single canonical way to assemble a snapshot.
 /// Publishers MUST go through it; hand-constructed snapshots are only

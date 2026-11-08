@@ -23,7 +23,7 @@ inline constexpr char kDigestC[] =
 
 [[nodiscard]] std::string GoldenBytes() {
   const auto path =
-      std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
+      std::filesystem::path(MANYFORGE_CORE_TEST_GOLDEN_DIR) / "resolved_stop_base_plan.v1.json";
   std::ifstream stream(path, std::ios::binary);
   std::ostringstream bytes;
   bytes << stream.rdbuf();
@@ -80,8 +80,6 @@ inline constexpr char kDigestC[] =
       ProgramBindingId(kDigestB),
       base.retained_bundle_id,
       base.graph_revision,
-      ComponentRoleId("robot"),
-      TargetRoleId("arm"),
       ControllableComponentId("robot.1"),
       ComponentTypeId("robot.type"),
       ComponentTypeRevision("robot.type.revision"),
@@ -92,7 +90,7 @@ inline constexpr char kDigestC[] =
       {ProgramModelRoleBindingDTO{ModelRoleId("body"), ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision")}},
       {},
-      {ProgramFrameRoleBindingDTO{FrameRoleId("base"), ModelInstanceId("robot.model"),
+      {ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("base")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision"), "robot_base"}},
       {RuntimeResourceBindingDTO{ResourceRoleId("joint.1"), ResourceId("joint.1"),
                                  std::string("joint_1"), "joint_1", CoordinateKind::kAngular},
@@ -517,29 +515,29 @@ TEST(StopTerminalReducerTest, ProofProjectionKeepsExactOriginRowsFromPartialProm
   ASSERT_TRUE(b.ok()) << b.error().message;
   ASSERT_EQ(b.value().result, StopCertificateResultDTO::kPartial);
 
-  auto p2_input = Input();
-  p2_input.stop_id = StopId("stop.promoted.p2");
-  p2_input.stop_generation = StopGeneration(3U);
-  p2_input.stop_certificate_id = StopCertificateId("certificate.promoted.p2");
-  p2_input.requested_selector = StopRequestedSelectorSnapshotDTO{
+  auto promoted_input = Input();
+  promoted_input.stop_id = StopId("stop.promoted");
+  promoted_input.stop_generation = StopGeneration(3U);
+  promoted_input.stop_certificate_id = StopCertificateId("certificate.promoted");
+  promoted_input.requested_selector = StopRequestedSelectorSnapshotDTO{
       StopRequestedSelectorKindDTO::kExplicitFull, ContentDigest(kDigestC), std::nullopt,
       std::nullopt};
-  p2_input.resolution_reason = StopScopeResolutionReasonDTO::kExplicitFullStop;
-  p2_input.newly_captured_scope_entries.clear();
-  p2_input.newly_completed_stage_results.clear();
-  p2_input.capture_history = {Capture(
+  promoted_input.resolution_reason = StopScopeResolutionReasonDTO::kExplicitFullStop;
+  promoted_input.newly_captured_scope_entries.clear();
+  promoted_input.newly_completed_stage_results.clear();
+  promoted_input.capture_history = {Capture(
       {{a.value().stop_id, a.value().stop_generation, ContentDigest(kDigestA)},
        {b.value().stop_id, b.value().stop_generation, ContentDigest(kDigestB)}},
       {}, {}, StopResolutionDispositionDTO::kExact,
       StopScopeResolutionReasonDTO::kExplicitFullStop)};
-  p2_input.predecessor_certificates = {a.value(), b.value()};
-  const auto p2 = ReduceStopTerminal(p2_input);
-  ASSERT_TRUE(p2.ok()) << p2.error().message;
-  ASSERT_EQ(p2.value().result, StopCertificateResultDTO::kPartial);
-  ASSERT_EQ(p2.value().scope_entries.size(), 2U);
-  ASSERT_EQ(p2.value().predecessor_certificates.size(), 2U);
-  EXPECT_TRUE(std::any_of(p2.value().predecessor_certificates.begin(),
-                          p2.value().predecessor_certificates.end(), [&](const auto& ref) {
+  promoted_input.predecessor_certificates = {a.value(), b.value()};
+  const auto promoted = ReduceStopTerminal(promoted_input);
+  ASSERT_TRUE(promoted.ok()) << promoted.error().message;
+  ASSERT_EQ(promoted.value().result, StopCertificateResultDTO::kPartial);
+  ASSERT_EQ(promoted.value().scope_entries.size(), 2U);
+  ASSERT_EQ(promoted.value().predecessor_certificates.size(), 2U);
+  EXPECT_TRUE(std::any_of(promoted.value().predecessor_certificates.begin(),
+                          promoted.value().predecessor_certificates.end(), [&](const auto& ref) {
                             return ref.stop_id == a.value().stop_id;
                           }));
 
@@ -554,15 +552,15 @@ TEST(StopTerminalReducerTest, ProofProjectionKeepsExactOriginRowsFromPartialProm
                                            ContentDigest(kDigestC)};
   };
   next.capture_history = {Capture(
-      {ref_for(a.value()), ref_for(p2.value())}, {}, {},
+      {ref_for(a.value()), ref_for(promoted.value())}, {}, {},
       StopResolutionDispositionDTO::kExact,
       StopScopeResolutionReasonDTO::kExactCurrentScope)};
-  next.predecessor_certificates = {p2.value()};
+  next.predecessor_certificates = {promoted.value()};
   const auto a_row = a.value().scope_entries.front().key;
   const internal::StopProofPredecessorScope proof{
-      StopCertificateRefDTO{p2.value().stop_certificate_id,
-                            p2.value().stop_certificate_revision,
-                            p2.value().stop_id, p2.value().stop_generation},
+      StopCertificateRefDTO{promoted.value().stop_certificate_id,
+                            promoted.value().stop_certificate_revision,
+                            promoted.value().stop_id, promoted.value().stop_generation},
       {a_row}};
   const auto reused = internal::ReduceStopTerminalWithProofScopes(next, {&proof, 1U});
   ASSERT_TRUE(reused.ok()) << reused.error().message;
@@ -578,7 +576,7 @@ TEST(StopTerminalReducerTest, ProofProjectionKeepsExactOriginRowsFromPartialProm
                           }));
   EXPECT_TRUE(std::any_of(reused.value().predecessor_certificates.begin(),
                           reused.value().predecessor_certificates.end(), [&](const auto& ref) {
-                            return ref.stop_id == p2.value().stop_id;
+                            return ref.stop_id == promoted.value().stop_id;
                           }));
   EXPECT_TRUE(std::none_of(reused.value().predecessor_certificates.begin(),
                            reused.value().predecessor_certificates.end(), [&](const auto& ref) {
@@ -590,15 +588,15 @@ TEST(StopTerminalReducerTest, ProofProjectionKeepsExactOriginRowsFromPartialProm
                           [&](const auto& ref) { return ref.predecessor_stop_id == a.value().stop_id; }));
   EXPECT_TRUE(std::any_of(reused.value().capture_history.back().predecessor_stops.begin(),
                           reused.value().capture_history.back().predecessor_stops.end(),
-                          [&](const auto& ref) { return ref.predecessor_stop_id == p2.value().stop_id; }));
+                          [&](const auto& ref) { return ref.predecessor_stop_id == promoted.value().stop_id; }));
 
   auto over_cap = next;
-  const auto p2_acceptance = ref_for(p2.value());
+  const auto promoted_acceptance = ref_for(promoted.value());
   over_cap.capture_history = {Capture(
-      std::vector<StopPredecessorAcceptanceRefDTO>(65U, p2_acceptance), {}, {},
+      std::vector<StopPredecessorAcceptanceRefDTO>(65U, promoted_acceptance), {}, {},
       StopResolutionDispositionDTO::kExact,
       StopScopeResolutionReasonDTO::kExactCurrentScope)};
-  over_cap.predecessor_certificates.assign(65U, p2.value());
+  over_cap.predecessor_certificates.assign(65U, promoted.value());
   const auto rejected_over_cap =
       internal::ReduceStopTerminalWithProofScopes(over_cap, {&proof, 1U});
   ASSERT_FALSE(rejected_over_cap.ok());
@@ -610,9 +608,9 @@ TEST(StopTerminalReducerTest, ProofProjectionKeepsExactOriginRowsFromPartialProm
   ASSERT_TRUE(c.ok()) << c.error().message;
 
   auto aggregate = Input();
-  aggregate.stop_id = StopId("stop.aggregate.p3");
+  aggregate.stop_id = StopId("stop.aggregate");
   aggregate.stop_generation = StopGeneration(6U);
-  aggregate.stop_certificate_id = StopCertificateId("certificate.aggregate.p3");
+  aggregate.stop_certificate_id = StopCertificateId("certificate.aggregate");
   aggregate.requested_selector = StopRequestedSelectorSnapshotDTO{
       StopRequestedSelectorKindDTO::kExplicitFull, ContentDigest(kDigestC), std::nullopt,
       std::nullopt};
@@ -620,10 +618,10 @@ TEST(StopTerminalReducerTest, ProofProjectionKeepsExactOriginRowsFromPartialProm
   aggregate.newly_captured_scope_entries.clear();
   aggregate.newly_completed_stage_results.clear();
   aggregate.capture_history = {Capture(
-      {ref_for(a.value()), ref_for(c.value()), ref_for(p2.value())}, {}, {},
+      {ref_for(a.value()), ref_for(c.value()), ref_for(promoted.value())}, {}, {},
       StopResolutionDispositionDTO::kExact,
       StopScopeResolutionReasonDTO::kExplicitFullStop)};
-  aggregate.predecessor_certificates = {c.value(), p2.value()};
+  aggregate.predecessor_certificates = {c.value(), promoted.value()};
   const internal::StopProofPredecessorScope aggregate_proof{
       proof.certificate, {a_row}};
   const auto mixed =
@@ -644,8 +642,8 @@ TEST(StopTerminalReducerTest, ProofProjectionKeepsExactOriginRowsFromPartialProm
 
   auto full_aggregate = aggregate;
   full_aggregate.capture_history = {Capture(
-      {ref_for(a.value()), ref_for(b.value()), ref_for(c.value()), ref_for(p2.value())}, {}, {},
-      StopResolutionDispositionDTO::kExact,
+      {ref_for(a.value()), ref_for(b.value()), ref_for(c.value()), ref_for(promoted.value())},
+      {}, {}, StopResolutionDispositionDTO::kExact,
       StopScopeResolutionReasonDTO::kExplicitFullStop)};
   const auto full_union = ReduceStopTerminal(full_aggregate);
   ASSERT_TRUE(full_union.ok()) << full_union.error().message;

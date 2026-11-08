@@ -14,11 +14,11 @@ import math
 import re
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from itertools import islice
 from numbers import Real
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 
 HISTORICAL_SOURCE_BLOB: Final = "07de241694d2e7738a55d8c6c74bab1ef5d11b20"
@@ -45,6 +45,19 @@ _PREFERRED_SERVICE_LEAVES: Final = {
     "get_entity_state": "get_entity_state",
     "get_entity_bounds": "get_entity_bounds",
 }
+
+
+class _EntityOperationOwnerUnavailable(RuntimeError):
+    """The caller cannot hand an entity mutation to its executor owner."""
+
+
+class _EntityOperationDispatcher(Protocol):
+    def __call__(
+        self,
+        operation: Callable[[], Any],
+        *,
+        allow_stopped: bool = False,
+    ) -> Any: ...
 
 
 @dataclass(frozen=True)
@@ -138,6 +151,7 @@ class SimulationSceneMirrorClient:
         *,
         service_names: SimulationServiceNames | None = None,
         service_timeout_s: float = 2.0,
+        entity_operation_dispatcher: _EntityOperationDispatcher | None = None,
     ) -> None:
         if not callable(getattr(node, "get_service_names_and_types", None)):
             raise TypeError("node must expose the rclpy graph API")
@@ -145,6 +159,10 @@ class SimulationSceneMirrorClient:
         self.service_names = service_names or SimulationServiceNames()
         self.service_timeout_s = _bounded_timeout(service_timeout_s)
         self._retained_clients: dict[tuple[str, type], object] = {}
+        # Includes clients between create_client() and readiness, so shutdown
+        # can still release one if cancellation races an owner-executor stop.
+        self._owned_clients: dict[int, object] = {}
+        self._entity_operation_dispatcher = entity_operation_dispatcher
         self._closed = False
         self._cancelled = threading.Event()
         self._rclpy = importlib.import_module("rclpy")
@@ -160,14 +178,19 @@ class SimulationSceneMirrorClient:
         self.close()
 
     def close(self) -> None:
-        """Release any long-lived typed clients after their caller stops."""
+        """Release typed clients after their caller stops.
+
+        The pose observer joins its poll worker before closing. Its executor
+        owner calls this after spin returns, so stopped-executor cleanup runs
+        inline on that same owner thread.
+        """
 
         self.cancel()
         self._closed = True
-        clients = tuple(self._retained_clients.values())
+        clients = tuple(self._owned_clients.values())
         self._retained_clients.clear()
         for client in clients:
-            self.node.destroy_client(client)
+            self._destroy_client(client, allow_stopped=True)
 
     def cancel(self) -> None:
         """Request that one in-flight bounded capture return between calls."""
@@ -563,7 +586,7 @@ class SimulationSceneMirrorClient:
             key for key in self._retained_clients if key not in selected
         ]
         for key in retired:
-            self.node.destroy_client(self._retained_clients.pop(key))
+            self._destroy_client(self._retained_clients.pop(key))
 
     def _call_service(
         self,
@@ -576,7 +599,12 @@ class SimulationSceneMirrorClient:
         client = self._retained_clients.get(key)
         created = client is None
         if client is None:
-            client = self.node.create_client(service_type, service_name)
+            def create_client() -> object:
+                selected = self.node.create_client(service_type, service_name)
+                self._owned_clients[id(selected)] = selected
+                return selected
+
+            client = self._entity_operation(create_client)
         try:
             if created and not client.wait_for_service(
                 timeout_sec=self.service_timeout_s
@@ -589,8 +617,46 @@ class SimulationSceneMirrorClient:
             return self._wait_for_future(future)
         except Exception:
             retained = self._retained_clients.pop(key, None)
-            self.node.destroy_client(retained if retained is not None else client)
+            selected_client = retained if retained is not None else client
+            if selected_client is not None:
+                self._destroy_client(selected_client)
             raise
+
+    def _entity_operation(
+        self,
+        operation: Callable[[], Any],
+        *,
+        allow_stopped: bool = False,
+    ) -> Any:
+        dispatcher = self._entity_operation_dispatcher
+        if dispatcher is None:
+            return operation()
+        return dispatcher(operation, allow_stopped=allow_stopped)
+
+    def _destroy_client(
+        self,
+        client: object,
+        *,
+        allow_stopped: bool = False,
+    ) -> bool:
+        def destroy_client() -> Any:
+            result = self.node.destroy_client(client)
+            self._owned_clients.pop(id(client), None)
+            return result
+
+        try:
+            self._entity_operation(
+                destroy_client,
+                allow_stopped=allow_stopped,
+            )
+        except _EntityOperationOwnerUnavailable:
+            # Shutdown sets cancellation before joining the poll worker. If
+            # spin has already returned, close() will release this tracked
+            # client on the lifecycle owner after that join.
+            if self._cancelled.is_set() and not allow_stopped:
+                return False
+            raise
+        return True
 
     def _wait_for_future(self, future: object) -> object:
         deadline = time.monotonic() + self.service_timeout_s

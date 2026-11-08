@@ -1,0 +1,18 @@
+==================
+WARNING: ThreadSanitizer: data race (pid=39)
+  Write of size 2 at 0x1234 by thread T1052:
+    #0 memcpy ../../../../src/libsanitizer/sanitizer_common/sanitizer_common_interceptors_memintrinsics.inc:115 (libtsan.so.2+0x930fc)
+    #1 eprosima::fastcdr::Cdr::serialize_array(char const*, unsigned long) <null> (libfastcdr.so.2+0x10394)
+
+  Previous read of size 4 at 0x1234 by thread T1053:
+    #0 memcpy ../../../../src/libsanitizer/sanitizer_common/sanitizer_common_interceptors_memintrinsics.inc:115 (libtsan.so.2+0x930fc)
+    #1 rmw_fastrtps_shared_cpp::TypeSupport::deserialize(void*) <null> (librmw_fastrtps_shared_cpp.so+0x4fc3c)
+
+  Location is heap block of size 31 at 0x1234 allocated by main thread:
+    #0 calloc ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:685 (libtsan.so.2+0x5720c)
+    #1 eprosima::fastdds::rtps::TopicPayloadPool::do_allocate(unsigned int) <null> (libfastdds.so.3.6+0x4ca824)
+    #2 rclcpp_action::create_client() /opt/ros/lyrical/include/rclcpp_action/create_client.hpp:89
+    #3 manyforge::ros2_control_execution::Ros2ControlExecutionBackend::Ros2ControlExecutionBackend() /source/manyforge_ros2_control_execution/src/ros2_control_execution_backend.cpp:292
+
+SUMMARY: ThreadSanitizer: data race in memcpy
+==================

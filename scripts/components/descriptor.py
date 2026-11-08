@@ -3,7 +3,7 @@
 A descriptor (`api_version: manyforge.component_package.v1`) describes one
 robot, tool, I/O device, machine or sensor as data. A machine (`kind: machine`) is an
 owner with member slots `{role, model}` and lane rows naming their adapter
-(`lanes.real: {adapter}`; plan, "Machines: owners and members"); a machine's own I/O bank is an `io_device` in model form (signals
+(`lanes.real: {adapter}`); a machine's own I/O bank is an `io_device` in model form (signals
 once plus `lanes.real {adapter, bank}`); a sensor (`kind: sensor`, e.g. a
 point-cloud source) names its sensor type and its one adapter row
 (`adapter_row: {adapter}`); it has no lane. Its field names are the planned component
@@ -15,8 +15,8 @@ What reads a descriptor today:
 - `manyforge component check <folder>`: the descriptor against its own URDF
   and SRDF and, for a robot or a tool, against the rows Apply reads (the
   model family row and component profile rows of the maintained description,
-  the generated catalog files) and its lane rows (`lanes.<lane>`, CONTRACTS
-  §12) against their files. With `--scenario`, a
+  the generated catalog files) and its lane rows (`lanes.<lane>`) against
+  their files. With `--scenario`, a
   Scenario's components of that robot or tool; a tool's must be mounted on a
   free robot `flange`.
 - `manyforge component register <folder>`: writes those rows from a robot or
@@ -78,7 +78,7 @@ _KIND_FIELDS = {
     "io_device": (("signals",), ("lanes",)),
     # A machine (owner) with its member slots and its own lane rows.
     "machine": (("default_owner_id", "members", "lanes"), ()),
-    # A simulator (CONTRACTS §14) is a component with its lane rows only.
+    # A simulator is a component with its lane rows only.
     "simulator": (("lanes",), ()),
     # A sensor: its sensor type and its one adapter row (it has no lane).
     "sensor": (("sensor", "adapter_row"), ()),
@@ -106,7 +106,7 @@ IO_BANKS = ("controller", "tool")
 COMPONENT_MODELS = "component_models"
 _INPUT_ONLY_FIELDS = ("freshness", "transition_capability", "update_mode")
 # The lanes a model may declare (`lanes.<lane>`, a Deployment component's
-# `lane`). Each row names its adapter, which reads its own keys (CONTRACTS §12).
+# `lane`). Each row names its adapter, which reads its own keys.
 LANES = ("mock", "isaac", "real")
 _LANE_ROW_REQUIRED = ("adapter", "controller")
 # The Mock lane adapter (manyforge_ros2_control_execution/lane/): its row
@@ -425,7 +425,7 @@ def _validate_gripper(f: _Fields, value: Any) -> None:
 
 def _validate_lanes(f: _Fields, data: dict[str, Any], robot: bool,
                     simulator: bool = False) -> None:
-    """`lanes.<lane>` rows (CONTRACTS §12): every row names its adapter and,
+    """`lanes.<lane>` rows: every row names its adapter and,
     but a simulator's, its controller (the arm's, or a tool's gripper
     controller); a robot's row its `arrival_tolerance_rad`, a tool's none. The
     other keys are the adapter's."""
@@ -475,7 +475,7 @@ def _validate_sensor(f: _Fields, data: dict[str, Any]) -> None:
 def _validate_machine(f: _Fields, data: dict[str, Any]) -> None:
     """Member slots `{role, model}` and lane rows naming their adapter; no
     row on a lane: the owner gets the host's passive adapter. Every member may
-    be deactivated on every lane (AUD-5b revised)."""
+    be deactivated on every lane."""
     _validate_machine_members(f, data)
     if "lanes" in data:
         lanes = f.mapping(data["lanes"], "lanes", (), LANES)
@@ -1272,7 +1272,7 @@ def check_scenario(
 
         configuration = component.get("configuration", {})
         runtime = configuration.get("runtime_configuration", {})
-        # A member runs on its owner's lane (CONTRACTS §16).
+        # A member runs on its owner's lane.
         owner = next((row for row in deployment.get("components", [])
                       if "owner" in component
                       and row.get("component_id") == component["owner"]), component)
@@ -1385,8 +1385,7 @@ def check_tool_scenario(
 
     A mounted tool has one `attachments` row
     `{parent: {component_id: <robot>, interface: flange}, child: {component_id:
-    <tool>, interface: mount}}`, no `root_pose_in_cell`, and the assignment's
-    `tool` role, when present, selects a mounted tool.
+    <tool>, interface: mount}}` and no `root_pose_in_cell`.
     """
     deployment = _scenario_file(scenario, "deployment.yaml", report)
     if deployment is None:
@@ -1527,17 +1526,6 @@ def check_tool_scenario(
                 fail(f"gripper mount_frame {row.get('mount_frame')!r} must be mount.frame "
                      f"{mount_frame!r}")
         _check_gripper_rows(grippers, model, gripper_group, fail)
-    assignment = (
-        _scenario_file(scenario, "assignment.yaml", report)
-        if (scenario / "assignment.yaml").is_file()
-        else None
-    ) or {}
-    for role in assignment.get("component_roles", []):
-        selected = role.get("controllable_component_id")
-        if role.get("component_role_id") == "tool" and selected not in children:
-            report.error("component_attachment_invalid", f"{scenario.name} assignment.yaml",
-                         f"role 'tool' selects {selected!r}, which is not a mounted tool; "
-                         "select the tool component")
     if len(report.errors) == before:
         report.note(f"{scenario.name}: {len(components)} component(s) of {descriptor.id} are "
                     "mounted and agree with the descriptor")
@@ -1815,7 +1803,7 @@ def list_components(root: Path) -> dict[str, Any]:
     with a Mock lane, a tool with a Mock lane or lane-free, a machine when its
     arm has a Mock lane, a sensor always (it has no lane); a
     machine's member model (its arm robot, a
-    model-form I/O device) only as a machine member (AUD-5).
+    model-form I/O device) only as a machine member.
     """
     entries: list[dict[str, Any]] = []
     seen: dict[tuple[str, str], tuple[str, dict[str, Any], str]] = {}

@@ -293,7 +293,7 @@ def step_node_environment(ctx: Context) -> None:
 def step_program_revisions(ctx: Context) -> None:
     tool = ctx.tool("manyforge_program_revision")
     for path in sorted((ROOT / "examples").glob("*.program.yaml")):
-        if load_data(path.read_bytes()).get("api_version") != "manyforge.program.v2":
+        if load_data(path.read_bytes()).get("api_version") != "manyforge.program.v3":
             continue
         try:
             run(tool, "--check", "--input", path)
@@ -333,6 +333,9 @@ def step_scenario_pins(ctx: Context) -> None:
         manifest_path = project / sa.SCENARIO_MANIFEST
         manifest = load_strict_json_yaml_bytes(manifest_path.read_bytes(),
                                                source=rel(manifest_path))
+        if (manifest.get("api_version") != sa.SCENARIO_PROJECT_API_VERSION
+                or (project / "assignment.yaml").exists()):
+            raise Stale(f"Scenario {project.name} uses an unsupported project format; re-author it with direct references")
         values, digests = {}, {}
         for member, filename in sa.SCENARIO_PROJECT_MEMBERS.items():
             raw = (project / filename).read_bytes()
@@ -344,12 +347,14 @@ def step_scenario_pins(ctx: Context) -> None:
         pinned["content"] = {
             "deployment_present": values["deployment_draft"] is not None,
             "program_present": values["program_draft"] is not None,
-            "assignment_present": values["program_role_assignment"] is not None,
         }
+        content_digest = sa.scenario_content_digest(
+            values["program_draft"], values["deployment_draft"])
         pinned["saved_status"] = {**manifest["saved_status"],
-                                  "checked_content_digest": sa.scenario_content_digest(
-                                      values["program_draft"], values["deployment_draft"],
-                                      values["program_role_assignment"])}
+                                  "checked_content_digest": content_digest}
+        if (content_digest != manifest["saved_status"]["checked_content_digest"]
+                and pinned["saved_status"]["last_known_status"] == "ready"):
+            pinned["saved_status"]["last_known_status"] = "unknown"
         pinned["source_snapshot"], _ = sa._source_snapshot(values["deployment_draft"],
                                                            project_root=project)
         if pinned != manifest:

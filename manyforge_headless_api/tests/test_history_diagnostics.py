@@ -139,6 +139,7 @@ def test_same_revision_source_order_survives_late_feedback_and_later_terminal_ac
         "manyforge.program_diagnostic.v1",
         "manyforge.program_diagnostic.v2",
         "manyforge.program_diagnostic.v3",
+        "manyforge.program_diagnostic.v4",
     ],
 )
 def test_program_values_export_keeps_partial_capture_and_delivery_gaps_explicit(
@@ -152,7 +153,7 @@ def test_program_values_export_keeps_partial_capture_and_delivery_gaps_explicit(
         "omitted_blackboard_count": 8,
         "delivery_loss_count": 3,
     }
-    if schema_version != "manyforge.program_diagnostic.v3":
+    if schema_version in {"manyforge.program_diagnostic.v1", "manyforge.program_diagnostic.v2"}:
         # Retained v1/v2 originals still carry withdrawn runtime-override values;
         # they are read as recorded but never become identities or samples.
         event["event"]["payload"].update(
@@ -476,7 +477,7 @@ def _trace_client(response):
 
 def test_execution_client_reads_volatile_trace_with_attributed_allowance():
     ok = {
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "ok": True,
         "command": "read_volatile_motion_trace",
         "trace": _TRACE,
@@ -485,7 +486,7 @@ def test_execution_client_reads_volatile_trace_with_attributed_allowance():
     assert client.read_volatile_motion_trace(4096) is _TRACE
     assert sent == [
         {
-            "api_version": "manyforge.execution_command.v1",
+            "api_version": "manyforge.execution_command.v3",
             "attribution": {"transport": "internal", "assurance": "unverified", "principal_id": None},
             "command": "read_volatile_motion_trace",
             "allowance_bytes": 4096,
@@ -520,7 +521,7 @@ def _file_trace_client(tmp_path):
         "status": "complete",
     }
     client, sent = _trace_client({
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "ok": True,
         "command": "read_volatile_motion_trace",
         "trace_file": metadata,

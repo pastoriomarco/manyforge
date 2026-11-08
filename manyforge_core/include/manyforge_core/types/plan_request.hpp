@@ -21,6 +21,8 @@
 
 namespace manyforge::core {
 
+enum class PlannerCollisionMode { kEnforced, kDiagnosticDisabled };
+
 struct PlannerModelBindingDTO final {
   ModelInstanceId model_instance_id;
   ModelRevision model_revision;
@@ -84,7 +86,7 @@ struct MovingReplacementInputDTO final {
   std::optional<double> remaining_planning_budget_s{};
 };
 
-/// Kernel-produced, fully resolved planning request (spec 210 section 3.6).
+/// Kernel-produced, fully resolved planning request.
 /// Public callers never construct this type and no field permits selection by
 /// a singleton robot/group spelling. Generated frame/joint names appear only
 /// inside their exact compiler-owned model/resource binding.
@@ -164,15 +166,19 @@ struct PlanRequestDTO final {
   /// scene-aware planner keeps the same clearance as Kernel validation. Null
   /// means margin 0.
   std::shared_ptr<const CollisionClearanceMargins> retained_clearance_margins{};
+  PlannerCollisionMode collision_mode{PlannerCollisionMode::kEnforced};
+  std::optional<ControlledStateDTO> diagnostic_qualified_target{};
 };
 
-/// Planning result (spec §3.6)
+/// Planning result
 struct PlanResultDTO {
   std::optional<TrajectoryDTO> trajectory;  // present on success
   std::optional<ErrorDTO> error;            // present on failure; absent on success
   /// Exact composite projection consumed by the planner. Required whenever
   /// `trajectory` is present and must equal the request projection revision.
   ProjectionRevisionDTO projection_revision;
+  bool target_qualified{false};
+  std::optional<ControlledStateDTO> qualified_target{};
 };
 
 }  // namespace manyforge::core

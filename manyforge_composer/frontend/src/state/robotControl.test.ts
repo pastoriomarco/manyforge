@@ -8,7 +8,9 @@ import {
   initialRobotControlState,
   poseDragNotice,
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
+  robotControlAcceptedOperationMode,
   robotControlCandidatePresentationAllowed,
+  robotControlHasTransientPreviewRefusal,
   robotControlPreviewApprovable,
   robotControlReducer,
   selectedStatusForState,
@@ -24,6 +26,75 @@ import { computeCartesianMoveDraft } from '../utils/moveTo';
 import { tcpEntryIdentityKey } from '../types/robotControl';
 
 describe('addressed Robot Control state', () => {
+  it('classifies only preview-stage planning, collision, and clearance refusals as brief', () => {
+    const base = readyState();
+    const refused = (code: string, details: Record<string, string | number | boolean | null> = {}) => robotControlReducer(
+      { ...base, phase: 'planning' },
+      { type: 'preview_rejected', generation: base.generation, error: 'preview failed',
+        errorRefusal: { code, message: 'preview failed', details, origin: null } },
+    );
+    expect(robotControlHasTransientPreviewRefusal(refused('planning_failed', { reason: 'native_rrt_failed' }))).toBe(true);
+    expect(robotControlHasTransientPreviewRefusal(refused('planning_failed', { classification: 'clearance' }))).toBe(true);
+    expect(robotControlHasTransientPreviewRefusal(refused('planning_failed', {
+      collision_body_a: 'arm_link', collision_body_b: 'table',
+    }))).toBe(true);
+    expect(robotControlHasTransientPreviewRefusal(refused('validation_collision'))).toBe(true);
+    expect(robotControlHasTransientPreviewRefusal(refused('planning_failed', { reason: 'worker_failure' }))).toBe(false);
+    expect(robotControlHasTransientPreviewRefusal(refused('motion_preview_projection_unavailable'))).toBe(false);
+    expect(robotControlHasTransientPreviewRefusal(refused('rule_holds'))).toBe(false);
+
+    const approving = robotControlReducer(base, { type: 'approve_started' });
+    const approvalRefusal = robotControlReducer(approving, {
+      type: 'approve_rejected', generation: base.generation, error: 'not approved',
+      errorRefusal: { code: 'planning_failed', message: 'not approved',
+        details: { reason: 'native_rrt_failed' }, origin: null },
+    });
+    expect(robotControlHasTransientPreviewRefusal(approvalRefusal)).toBe(false);
+  });
+
+  it('uses an accepted mode only for the exact owner operation identity', () => {
+    const base = readyState();
+    const intent = base.intent;
+    const status = base.status;
+    if (intent === null || status === null) throw new Error('ready fixture needs owner evidence');
+    const accepted = robotControlReducer(base, {
+      type: 'operation_mode_accepted', generation: base.generation, ownerEpoch: status.ownerEpoch,
+      requestId: intent.request_context.request_id, operationId: 'accepted-operation', mode: 'move_to',
+    });
+    const participant = intent.participants[0];
+    const operation = {
+      operationId: 'accepted-operation', operationRevision: 1, resident: true, state: 'executing' as const,
+      progress: 0, activeStopId: null, activeStopGeneration: null, terminalError: null,
+      controllableComponentId: participant.target.component_id, commandTargetId: participant.target.command_target_id,
+    };
+    const running = { ...accepted, phase: 'executing' as const, operation };
+    expect(robotControlAcceptedOperationMode(running)).toBe('move_to');
+    expect(robotControlAcceptedOperationMode({ ...running, operation: { ...operation, operationId: 'external-operation' } })).toBeNull();
+    expect(robotControlAcceptedOperationMode({ ...running, acceptedOperationMode: null })).toBeNull();
+  });
+
+  it('deletes hidden preview evidence and rejects a late receipt', () => {
+    const ready = readyState();
+    const hidden = robotControlReducer(ready, { type: 'preview_hidden' });
+    expect(hidden.preview).toBeNull();
+    expect(hidden.ghost).toBeNull();
+    expect(hidden.diagnosticPreview).toBeNull();
+    expect(hidden.intent).toBeNull();
+    expect(hidden.previewSampleIndex).toBe(0);
+    expect(robotControlPreviewApprovable(hidden)).toBe(false);
+    expect(robotControlReducer(hidden, {
+      type: 'preview_resolved', generation: ready.generation, receipt: ready.preview!,
+    })).toEqual(hidden);
+  });
+
+  it('hiding preview leaves an accepted operation and its phase intact', () => {
+    const executing = executingState();
+    const hidden = robotControlReducer(executing, { type: 'preview_hidden' });
+    expect(hidden.operation).toEqual(executing.operation);
+    expect(hidden.phase).toBe(executing.phase);
+    expect(hidden.preview).toBeNull();
+    expect(hidden.ghost).toBeNull();
+  });
   it('keeps an owner refusal with its message and clears both together', () => {
     const approving = robotControlReducer(readyState(), { type: 'approve_started' });
     expect(approving.phase).toBe('approving');
@@ -63,10 +134,10 @@ describe('addressed Robot Control state', () => {
     status.directControlGripperTargets = [status.directControlGripper!, secondGripper];
     status.observedMotions = [primaryObservation, secondObservedMotion];
     status.observedGrippers = [{
-      ...status.observedGripper!, targetRoleId: status.directControlGripper!.targetRoleId,
+      ...status.observedGripper!,
       controllableComponentId: 'robot-a', commandTargetId: 'gripper',
     }, {
-      ...status.observedGripper!, targetRoleId: secondGripper.targetRoleId,
+      ...status.observedGripper!,
       controllableComponentId: 'robot-b', commandTargetId: 'gripper', sequence: 5,
     }];
 
@@ -240,6 +311,41 @@ describe('addressed Robot Control state', () => {
     // The next drag clears the notice.
     expect(robotControlReducer({ ...ready, ownerNotice: 'x' }, { type: 'begin_pose_drag' }).ownerNotice).toBeNull();
   });
+  it('uses the Cartesian request for Linear Move To and invalidates on path changes', () => {
+    let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status: statusFixture() });
+    state = robotControlReducer(state, { type: 'select_mode', mode: 'move_to' });
+    state = robotControlReducer(state, { type: 'edit_pose', pose: state.draftPose });
+    const linear = robotControlReducer(state, { type: 'set_move_to_path', path: 'linear' });
+    expect(linear.generation).toBe(state.generation + 1);
+    expect(linear.preview).toBeNull();
+    expect(buildPreviewIntent(linear, 'linear').participants[0].payload).toEqual(
+      buildPreviewIntent({ ...linear, mode: 'cartesian_path' }, 'linear').participants[0].payload,
+    );
+    const free = robotControlReducer(linear, { type: 'set_move_to_path', path: 'free' });
+    expect(buildPreviewIntent(free, 'free').participants[0].payload).toMatchObject({ motion: { kind: 'pose_goal' } });
+    expect(free.generation).toBe(linear.generation + 1);
+    const unavailable = structuredClone(state);
+    unavailable.status!.directControl!.targetDescriptor.contracts.supportingProviders =
+      unavailable.status!.directControl!.targetDescriptor.contracts.supportingProviders.filter(
+        (provider) => provider.capabilityId !== 'planning.motion.cartesian_path');
+    expect(robotControlReducer(unavailable, { type: 'set_move_to_path', path: 'linear' })).toBe(unavailable);
+  });
+
+  it('uses Linear for a target that only plans straight lines and refuses Free there', () => {
+    const status = statusFixture();
+    status.directControl!.targetDescriptor.contracts.supportingProviders =
+      status.directControl!.targetDescriptor.contracts.supportingProviders.filter(
+        (provider) => provider.capabilityId === 'planning.motion.cartesian_path');
+    let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
+    expect(state.moveToPath).toBe('linear');
+    state = robotControlReducer(state, { type: 'select_mode', mode: 'move_to' });
+    state = robotControlReducer(state, { type: 'edit_pose', pose: state.draftPose });
+    expect(robotControlReducer(state, { type: 'set_move_to_path', path: 'free' })).toBe(state);
+    expect(buildPreviewIntent(state, 'linear').participants[0].payload).toEqual(
+      buildPreviewIntent({ ...state, mode: 'cartesian_path' }, 'linear').participants[0].payload,
+    );
+  });
+
   it('invalidates a Move To preview when its semantic source kind changes at the same pose', () => {
     let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status: statusFixture() });
     state = robotControlReducer(state, { type: 'select_mode', mode: 'move_to' });
@@ -269,6 +375,8 @@ describe('addressed Robot Control state', () => {
     let status = statusFixture();
     if (retained) status.manualOperations = [{
       programRunId: status.directControl!.programRunId, operationId: 'completed-1',
+      controllableComponentId: status.directControl!.controllableComponentId,
+      commandTargetId: status.directControl!.commandTargetId,
       operationRevision: 2, resident: false, state: 'completed', progress: 1,
       activeStopGeneration: null, activeStopId: null, terminalError: null,
     }];
@@ -367,9 +475,8 @@ describe('addressed Robot Control state', () => {
     expect(intent.program_id).toBe('manyforge.direct_control.motion');
     expect(intent.program_binding_id).toBe('sha256:direct-binding');
     expect(intent.request_context.request_owner_epoch).toBe('execution-owner-1');
-    expect(participant.component_role_id).toBe('controlled_component');
-    expect(participant.target_role_id).toBe('command_target');
-    expect(participant.payload.base_frame_role_id).toBe('base');
+    expect(participant.target).toEqual({ component_id: 'robot-a', command_target_id: 'arm' });
+    expect(participant.payload.base_frame).toEqual({ component_id: 'robot-a', frame_id: 'base' });
     expect(participant.payload.tcp_endpoint).toEqual({ kind: 'current' });
     expect(participant.payload).not.toHaveProperty('tcp_frame_role_id');
     expect(participant.payload.motion).toEqual({
@@ -768,6 +875,8 @@ describe('addressed Robot Control state', () => {
     const status = statusFixture();
     status.manualOperations = [{
       programRunId: status.directControl!.programRunId,
+      controllableComponentId: status.directControl!.controllableComponentId,
+      commandTargetId: status.directControl!.commandTargetId,
       operationId: 'operation-recovered',
       operationRevision: 4,
       resident: true,
@@ -879,6 +988,8 @@ describe('addressed Robot Control state', () => {
     const ready = readyState();
     if (retained) ready.status!.manualOperations = [{
       programRunId: ready.status!.directControl!.programRunId, operationId: 'completed-1',
+      controllableComponentId: ready.status!.directControl!.controllableComponentId,
+      commandTargetId: ready.status!.directControl!.commandTargetId,
       operationRevision: 2, resident: false, state: 'completed', progress: 1,
       activeStopGeneration: null, activeStopId: null, terminalError: null,
     }];
@@ -915,6 +1026,8 @@ describe('addressed Robot Control state', () => {
     const status = statusFixture();
     status.manualOperations = ['one', 'two'].map((operationId) => ({
       programRunId: status.directControl!.programRunId,
+      controllableComponentId: status.directControl!.controllableComponentId,
+      commandTargetId: status.directControl!.commandTargetId,
       operationId,
       operationRevision: 1,
       resident: true,
@@ -984,6 +1097,8 @@ describe('addressed Robot Control state', () => {
     status.manualOperations = ['program-motion-1', 'program-motion-2'].map(
       (operationId) => ({
         programRunId: 'program-run.1',
+        controllableComponentId: status.directControl!.controllableComponentId,
+        commandTargetId: status.directControl!.commandTargetId,
         operationId,
         operationRevision: 1,
         resident: true,
@@ -1290,9 +1405,9 @@ describe('Robot Control Active TCP', () => {
   it('hides other robots’ tools by default and shows them on request', () => {
     const motion = statusFixture().directControl!;
     const row = motion.targetDescriptor.tcps[0];
-    const other = { ...row, entry: { componentId: 'other-tool', targetId: 'tool', frameRoleId: 'tcp' },
+    const other = { ...row, entry: { componentId: 'other-tool', targetId: 'tool', frameComponentId: 'other-tool', frameRoleId: 'tcp' },
       mountedHere: false, mountedElsewhere: true };
-    const unmounted = { ...row, entry: { componentId: 'bench-tool', targetId: 'tool', frameRoleId: 'tcp' },
+    const unmounted = { ...row, entry: { componentId: 'bench-tool', targetId: 'tool', frameComponentId: 'bench-tool', frameRoleId: 'tcp' },
       mountedHere: false, mountedElsewhere: false };
     motion.targetDescriptor.tcps.push(other, unmounted);
     expect(visibleRobotControlTcps(motion, false)).toEqual([row, unmounted]);
@@ -1315,7 +1430,7 @@ describe('Robot Control Active TCP', () => {
   it('uses the owner entry and its pose, rebasing an old draft when it changes', () => {
     const status = statusFixture();
     const motion = status.directControl!;
-    const flange = { componentId: 'robot-a', targetId: 'arm', frameRoleId: 'flange' };
+    const flange = { componentId: 'robot-a', targetId: 'arm', frameComponentId: 'robot-a', frameRoleId: 'flange' };
     const pose = { position_m: { x_m: 0.1, y_m: 0.2, z_m: 0.37 },
       orientation: { x: 0, y: 0, z: 0, w: 1 } };
     motion.targetDescriptor.tcps.push({ ...motion.targetDescriptor.tcps[0], entry: flange,
@@ -1350,5 +1465,70 @@ describe('Robot Control Active TCP', () => {
     if (payload.kind !== 'motion') throw new Error('expected motion');
     expect(payload.tcp_endpoint).toEqual({ kind: 'current' });
     expect(() => buildPoseMotionIntent(selected, state.draftPose, 'pose')).toThrow(/TCP frame contract/);
+  });
+});
+
+describe('diagnostic path isolation', () => {
+  it('never approves a diagnostic, fences stale responses and clears it on draft changes', () => {
+    const path = { sourceJointNames: ['joint'], pairs: [], samples: [
+      { timeFromStartS: 0, positionsRad: [0], contacts: [], status: 'unknown' as const },
+    ] };
+    const initial = readyState();
+    const rejected = robotControlReducer(initial, { type: 'preview_rejected', generation: initial.generation, error: 'refused' });
+    const stale = robotControlReducer(rejected, { type: 'preview_diagnostic', generation: initial.generation - 1, diagnostic: path });
+    expect(stale.diagnosticPreview).toBeNull();
+    const shown = robotControlReducer(rejected, { type: 'preview_diagnostic', generation: initial.generation, diagnostic: path });
+    expect(shown.diagnosticPreview).toEqual(path);
+    expect(robotControlPreviewApprovable(shown)).toBe(false);
+    const edited = robotControlReducer(shown, { type: 'edit_joint', jointIndex: 0, positionRad: 0.4 });
+    expect(edited.diagnosticPreview).toBeNull();
+    expect(robotControlPreviewApprovable(edited)).toBe(false);
+  });
+});
+
+
+describe('preview sample initialization', () => {
+  const path = { sourceJointNames: ['joint_1', 'joint_2'], pairs: [], samples: [
+    { timeFromStartS: 0, positionsRad: [0, 0], contacts: [], status: 'checked' as const },
+    { timeFromStartS: 0.4, positionsRad: [0.1, 0.2], contacts: [], status: 'checked' as const },
+    { timeFromStartS: 1, positionsRad: [0.25, 0.5], contacts: [], status: 'checked' as const },
+  ] };
+
+  it('selects the last sample of a newly accepted preview and still allows scrubbing', () => {
+    const ready = readyState();
+    const planning = { ...ready, phase: 'planning' as const, preview: null, previewSampleIndex: 0 };
+    const receipt = { ...receiptFixture(ready.status!, 'request-1', [0.25, 0.5]), pathPreview: path };
+    const resolved = robotControlReducer(planning, { type: 'preview_resolved',
+      generation: planning.generation, receipt });
+    expect(resolved.phase).toBe('ready');
+    expect(resolved.previewSampleIndex).toBe(2);
+    expect(robotControlReducer(resolved, { type: 'select_preview_sample', index: 1 }).previewSampleIndex).toBe(1);
+    const stale = robotControlReducer(planning, { type: 'preview_resolved',
+      generation: planning.generation - 1, receipt });
+    expect(stale).toBe(planning);
+  });
+
+  it('keeps sample zero for a receipt whose path has no samples', () => {
+    const ready = readyState();
+    const planning = { ...ready, phase: 'planning' as const, preview: null, previewSampleIndex: 2 };
+    const receipt = receiptFixture(ready.status!, 'request-1', [0.25, 0.5]);
+    const resolved = robotControlReducer(planning, { type: 'preview_resolved',
+      generation: planning.generation, receipt });
+    expect(resolved.phase).toBe('ready');
+    expect(resolved.previewSampleIndex).toBe(0);
+  });
+
+  it('selects the last diagnostic sample, fences stale replies and keeps it non-approvable', () => {
+    const ready = readyState();
+    const blocked = robotControlReducer(ready, { type: 'preview_rejected',
+      generation: ready.generation, error: 'refused' });
+    const stale = robotControlReducer(blocked, { type: 'preview_diagnostic',
+      generation: blocked.generation - 1, diagnostic: path });
+    expect(stale).toBe(blocked);
+    const diagnostic = robotControlReducer(blocked, { type: 'preview_diagnostic',
+      generation: blocked.generation, diagnostic: path });
+    expect(diagnostic.previewSampleIndex).toBe(2);
+    expect(robotControlPreviewApprovable(diagnostic)).toBe(false);
+    expect(robotControlReducer(diagnostic, { type: 'select_preview_sample', index: 0 }).previewSampleIndex).toBe(0);
   });
 });

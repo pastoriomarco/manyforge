@@ -48,10 +48,10 @@ namespace manyforge::deployment::detail {
         std::nullopt,
     std::span<const QualifiedComponentType> component_types = {});
 
-/// B5 [C-P1]: the default TCP compiled into a component's graph row. Its
+/// The default TCP compiled into a component's graph row. Its
 /// TCPs are `{target, role}` pairs: on each target that declares a default
 /// TCP, the roles the type tags as TCPs and the row's custom TCPs (a merely
-/// named `tcp` is no TCP, C-P3). An authored `default_tcp` must be one of
+/// named `tcp` is no TCP). An authored `default_tcp` must be one of
 /// them (`component_default_tcp_unknown`). Without one, the single target
 /// that declares a default gives it; TCPs on several such targets refuse
 /// with `component_default_tcp_required`. None when the component has no TCP.

@@ -1,4 +1,4 @@
-"""The old direct live-VLM node path remains unavailable until I6/N."""
+"""The old direct live-VLM node path remains unavailable."""
 
 import pytest
 

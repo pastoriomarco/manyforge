@@ -9,7 +9,7 @@ import { OverlayPanel } from './OverlayPanel';
 const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$/;
 
 /**
- * Application-wide Composer settings (UA7W.11): profiles, Restore defaults
+ * Application-wide Composer settings: profiles, Restore defaults
  * and the way to each surface's own settings. Everything here is saved by
  * this installation and applies to every browser using it.
  */

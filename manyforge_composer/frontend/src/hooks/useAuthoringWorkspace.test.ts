@@ -74,7 +74,7 @@ function snapshotFixture(
     ? null
     : `sha256:${String(programDraftRevision).padStart(64, '0')}`;
   return {
-    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2',
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v3',
     workspaceEpoch: 'workspace.epoch.1',
     workspaceRevision,
     program: {
@@ -88,7 +88,7 @@ function snapshotFixture(
         program: (
           programRevision === null
             ? null
-            : { api_version: 'manyforge.program.v2' }
+            : { api_version: 'manyforge.program.v3' }
         ) as unknown as ProgramDocument | null,
         diagnostics: [],
         formulaReferences: { computedKeys: {}, nodes: {} },
@@ -116,7 +116,6 @@ function snapshotFixture(
       documentDescription: '',
       sourceDiagnostics: [],
       sourceDocumentDigest: null,
-      programRoleAssignment: null,
       sourceProgramDigest: null,
       sourceDeploymentDigest: null,
     },

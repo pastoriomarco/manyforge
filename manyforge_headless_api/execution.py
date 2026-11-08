@@ -33,6 +33,8 @@ from .models import (
     ManualProgramHandover,
     ManualControlAvailability,
     Pose3Request,
+    ResolvedPreviewTcp,
+    RecoveryPreflightProjection,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     ProgramRunStopIntentRequest,
@@ -61,7 +63,7 @@ EXECUTION_CONTROL_SOCKET_FILE = "execution-control.sock"
 EXECUTION_OBSERVATION_SOCKET_FILE = "execution-observation.sock"
 ACTIVE_TCP_EVENT_KIND = "active_tcp_changed"
 # The host's component model facts in every ``events`` reply and stream
-# ``state`` (CONTRACTS §1, §5, §7, §10): a change of any wakes the control
+# ``state``: a change of any wakes the control
 # state. Signal samples count by value, source and freshness, not by age.
 COMPONENT_MODEL_STATE_FIELDS = (
     "cell_latch",
@@ -70,8 +72,8 @@ COMPONENT_MODEL_STATE_FIELDS = (
     "rule_holds",
     "signal_samples",
 )
-EXECUTION_COMMAND_VERSION = "manyforge.execution_command.v1"
-EXECUTION_RESPONSE_VERSION = "manyforge.execution_command_response.v1"
+EXECUTION_COMMAND_VERSION = "manyforge.execution_command.v3"
+EXECUTION_RESPONSE_VERSION = "manyforge.execution_command_response.v4"
 VOLATILE_MOTION_TRACE_VERSION = "manyforge.volatile_motion_trace.v1"
 MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 OPERATION_EVENT_KINDS = frozenset(
@@ -84,10 +86,10 @@ OPERATION_EVENT_KINDS = frozenset(
         "operation_prepared",
         "state_observed",
         "host_replaced",
-        # Kernel global rule state rows (contract 64): folded by the global
+        # Kernel global rule state rows: folded by the global
         # rule status projection and ingested by the historian unchanged.
         STATE_EVENT_KIND,
-        # Active TCP (M7): one row per confirmed change; the Runner's mirror
+        # Active TCP: one row per confirmed change; the Runner's mirror
         # reads it, the historian ingests it unchanged (History event).
         ACTIVE_TCP_EVENT_KIND,
     }
@@ -193,7 +195,6 @@ MOTION_PREVIEW_RECEIPT_KEYS = frozenset(
     {
         "collision_world_revision",
         "commit_eligible",
-        "component_role_id",
         "final_positions_rad",
         "final_tcp_pose",
         "graph_revision",
@@ -211,9 +212,104 @@ MOTION_PREVIEW_RECEIPT_KEYS = frozenset(
         "schema_version",
         "source_joint_names",
         "start_positions_rad",
-        "target_role_id",
+        "target",
     }
 )
+MOTION_PREVIEW_V2_RECEIPT_KEYS = MOTION_PREVIEW_RECEIPT_KEYS | {"path_preview", "resolved_tcp"}
+MOTION_PATH_PREVIEW_MAX_BYTES = 48 * 1024
+
+
+def _motion_path_preview_valid(value: Any, expected_names: list[str] | None = None, *, diagnostic: bool = False) -> bool:
+    """Validate bounded, display-only path evidence; unknown is never clear."""
+    def finite_number(value: Any) -> bool:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return False
+        try:
+            return math.isfinite(value)
+        except OverflowError:
+            return False
+
+    keys = {"source_joint_names", "pairs", "samples"}
+    if diagnostic:
+        keys |= {"schema_version", "kind", "reason"}
+    if not isinstance(value, dict) or set(value) != keys:
+        return False
+    if diagnostic and (value["schema_version"] != "manyforge.motion_preview_diagnostic.v2"
+                       or value["kind"] not in ("validated_path", "collision_disabled_path", "collision_disabled_ik_pose", "collision_disabled_ik_path")
+                       or not isinstance(value["reason"], str) or not value["reason"]):
+        return False
+    names, pairs, samples = value["source_joint_names"], value["pairs"], value["samples"]
+    if (not isinstance(names, list) or not 1 <= len(names) <= 256
+            or not all(isinstance(n, str) and n for n in names)
+            or len(set(names)) != len(names)
+            or (expected_names is not None and names != expected_names)
+            or not isinstance(pairs, list) or len(pairs) > 64
+            or not isinstance(samples, list) or not 1 <= len(samples) <= 32):
+        return False
+    def valid_body(value: Any) -> bool:
+        if not isinstance(value, str) or not value:
+            return False
+        try:
+            value.encode("utf-8", errors="strict")
+        except UnicodeError:
+            return False
+        return True
+
+    pair_keys = []
+    for pair in pairs:
+        if not isinstance(pair, dict) or set(pair) != {"body_a", "body_b"}:
+            return False
+        a, b = pair["body_a"], pair["body_b"]
+        if not valid_body(a) or not valid_body(b) or a >= b:
+            return False
+        pair_keys.append((a, b))
+    if pair_keys != sorted(set(pair_keys)):
+        return False
+    previous = -1.0
+    for sample in samples:
+        sample_keys = {"time_from_start_s", "positions_rad", "contacts", "status"}
+        if diagnostic:
+            sample_keys.add("clearance_violations")
+        if not isinstance(sample, dict) or set(sample) != sample_keys:
+            return False
+        timestamp, positions, contacts = sample["time_from_start_s"], sample["positions_rad"], sample["contacts"]
+        if (not finite_number(timestamp) or timestamp < 0 or timestamp <= previous
+                or sample["status"] not in ("checked", "unknown")
+                or not isinstance(positions, list) or len(positions) != len(names)
+                or not all(finite_number(n) for n in positions)
+                or not isinstance(contacts, list) or len(contacts) > len(pairs)):
+            return False
+        previous = timestamp
+        seen = set()
+        for contact in contacts:
+            if not isinstance(contact, dict) or set(contact) != {"pair_index", "disposition"}:
+                return False
+            index = contact["pair_index"]
+            if (type(index) is not int or not 0 <= index < len(pairs) or index in seen
+                    or contact["disposition"] not in ("allowed", "refused", "unknown")):
+                return False
+            seen.add(index)
+        if diagnostic:
+            violations = sample["clearance_violations"]
+            if not isinstance(violations, list) or len(violations) > len(pairs):
+                return False
+            seen_violations = set()
+            for violation in violations:
+                if not isinstance(violation, dict) or set(violation) != {"pair_index", "distance_m", "required_clearance_m"}:
+                    return False
+                index = violation["pair_index"]
+                distance, required = violation["distance_m"], violation["required_clearance_m"]
+                if (type(index) is not int or not 0 <= index < len(pairs) or index in seen_violations
+                        or not finite_number(distance) or not finite_number(required)
+                        or not 0 < distance < required):
+                    return False
+                seen_violations.add(index)
+    if diagnostic and ((value["kind"] == "collision_disabled_ik_pose" and len(samples) != 1)
+                       or (value["kind"] == "collision_disabled_ik_path" and len(samples) < 2)):
+        return False
+    return True
+
+
 MOTION_PREVIEW_COLLISION_REVISION_KEYS = frozenset({"content_hash", "revision_id"})
 CAPABILITY_COMMAND_PREVIEW_RESPONSE_KEYS = frozenset(
     {"api_version", "command", "ok", "preview_receipt"}
@@ -223,7 +319,6 @@ CAPABILITY_COMMAND_PREVIEW_RECEIPT_KEYS = frozenset(
         "command_schema_id",
         "command_schema_revision",
         "commit_eligible",
-        "component_role_id",
         "coordinate_kind",
         "graph_revision",
         "intent_digest",
@@ -242,7 +337,7 @@ CAPABILITY_COMMAND_PREVIEW_RECEIPT_KEYS = frozenset(
         "source_coordinate_name",
         "source_kind",
         "target_position",
-        "target_role_id",
+        "target",
     }
 )
 
@@ -351,6 +446,10 @@ class ExecutionPort(Protocol):
     def component_model(self) -> dict[str, Any]: ...
 
     def component_action(self, component_id: str, action: str) -> dict[str, Any]: ...
+
+    def component_recovery_preflight(self, component_id: str) -> dict[str, Any]: ...
+
+    def component_recover_enable(self, component_id: str, confirmation: dict[str, Any]) -> dict[str, Any]: ...
 
     def set_io_output(
         self, signal_id: str, value: bool | float, *, origin: str
@@ -804,7 +903,7 @@ class ExecutionCommandClient:
                 "stop_generation",
                 "stop_id",
             }
-            # The additive forensic projection state (SX-2226): one string.
+            # The additive forensic projection state: one string.
             or status.get("terminal_projection", "pending")
             not in ("pending", "recorded", "failed")
             or status.get("schema_version") != "manyforge.execution_stop_status.v1"
@@ -830,8 +929,8 @@ class ExecutionCommandClient:
         return response
 
     def subscribe_events(self, after_cursor: int, owner_epoch: str | None):
-        """Open the event subscription stream strictly after ``after_cursor``
-        (contract §8.1); a context manager yielding the subscription."""
+        """Open the event subscription stream strictly after ``after_cursor``;
+        a context manager yielding the subscription."""
 
         return open_event_subscription(self._run_root, after_cursor, owner_epoch)
 
@@ -987,7 +1086,7 @@ class ExecutionCommandClient:
         )
         observation = response.get("target_observation")
         expected = request.model_dump(mode="json", exclude_none=True)
-        expected["schema_version"] = "manyforge.target_observation.v1"
+        expected["schema_version"] = "manyforge.target_observation.v2"
         if request.kind == "frame_transform":
             self._require_frame_transform(response, observation, expected)
             return response
@@ -1065,12 +1164,11 @@ class ExecutionCommandClient:
             )
         )
         expected = {
-            "schema_version": "manyforge.target_observation.v1",
+            "schema_version": "manyforge.target_observation.v2",
             "owner_epoch": request.owner_epoch,
             "program_binding_id": request.program_binding_id,
-            "target_role_id": request.target_role_id,
             "kind": "io_signal",
-            "resource_role_id": request.resource_role_id,
+            "signal": request.signal.model_dump(mode="json"),
         }
         self._require_io_signal(
             response,
@@ -1319,7 +1417,7 @@ class ExecutionCommandClient:
                 or type(admission_generation) is not int
                 or not 1 <= admission_generation <= MAXIMUM_SAFE_INTEGER
                 or not isinstance(page, dict)
-                or page.get("schema_version") != "manyforge.execution_event_page.v1"
+                or page.get("schema_version") != "manyforge.execution_event_page.v2"
                 or page.get("owner_epoch") != owner_epoch
                 or type(page.get("next_after_sequence")) is not int
                 or not after_sequence <= page["next_after_sequence"] <= MAXIMUM_SAFE_INTEGER
@@ -1522,14 +1620,33 @@ class ExecutionCommandClient:
                 "operation": operation,
             }
         )
+        participant = operation["participants"][0]
         if response.get("ok") is not True:
+            diagnostic = response.get("diagnostic_preview")
+            if "diagnostic_preview" in response:
+                motion = participant["payload"].get("motion")
+                expected = motion.get("joint_names") if isinstance(motion, dict) and motion.get("kind") == "joint_goal" else None
+                try:
+                    valid = (not ({"preview_receipt", "receipt_digest", "token", "approval_token", "commit_eligible"} & response.keys())
+                             and _motion_path_preview_valid(diagnostic, expected, diagnostic=True)
+                             and len(_canonical_json(response)) <= MOTION_PATH_PREVIEW_MAX_BYTES)
+                except (ValueError, TypeError, HeadlessApiError):
+                    valid = False
+                if not valid:
+                    response = {key: value for key, value in response.items() if key != "diagnostic_preview"}
+            # A failed preview is never an approval receipt, even if the native
+            # response contains undeclared receipt or token fields.
+            forbidden = {"preview_receipt", "receipt_digest", "token", "approval_token", "commit_eligible"}
+            if forbidden.intersection(response):
+                response = {key: value for key, value in response.items() if key not in forbidden}
             return response
         receipt = response.get("preview_receipt")
-        participant = operation["participants"][0]
+        version = receipt.get("schema_version") if isinstance(receipt, dict) else None
+        receipt_keys = MOTION_PREVIEW_V2_RECEIPT_KEYS
         if (
             set(response) != MOTION_PREVIEW_RESPONSE_KEYS
             or not isinstance(receipt, dict)
-            or set(receipt) != MOTION_PREVIEW_RECEIPT_KEYS
+            or set(receipt) != receipt_keys
         ):
             raise HeadlessApiError(
                 "execution_command_response_invalid",
@@ -1537,8 +1654,8 @@ class ExecutionCommandClient:
             )
         if (
             response.get("command") != "preview_motion"
-            or receipt.get("schema_version")
-            != "manyforge.direct_control_motion_preview.v1"
+            or receipt.get("target") != participant["target"]
+            or version != "manyforge.direct_control_motion_preview.v4"
             or receipt.get("commit_eligible") is not True
         ):
             raise HeadlessApiError(
@@ -1547,6 +1664,25 @@ class ExecutionCommandClient:
             )
         source_names = receipt.get("source_joint_names")
         submitted_motion = participant["payload"].get("motion")
+        try:
+            resolved_tcp = ResolvedPreviewTcp.model_validate(receipt["resolved_tcp"])
+        except ValueError as exc:
+            raise HeadlessApiError(
+                "execution_command_response_invalid", "native motion preview TCP is malformed"
+            ) from exc
+        tcp_selector = participant["payload"].get("tcp_endpoint")
+        if (
+            resolved_tcp.owner_epoch != receipt.get("request_owner_epoch")
+            or (resolved_tcp.source == "active_tcp" and tcp_selector != {"kind": "current"})
+            or (resolved_tcp.source == "joint_flange_fallback" and
+                (not isinstance(submitted_motion, dict) or submitted_motion.get("kind") != "joint_goal"
+                 or tcp_selector != {"kind": "current"}))
+            or (resolved_tcp.source == "explicit_entry" and
+                tcp_selector != {"kind": "entry", **resolved_tcp.entry.model_dump(mode="json")})
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid", "native motion preview TCP provenance is invalid"
+            )
         submitted_source_names = (
             submitted_motion.get("joint_names")
             if isinstance(submitted_motion, dict)
@@ -1586,6 +1722,14 @@ class ExecutionCommandClient:
             raise HeadlessApiError(
                 "execution_command_response_invalid",
                 "native motion preview receipt is malformed",
+            )
+        if (
+            not _motion_path_preview_valid(receipt["path_preview"], source_names)
+            or len(_canonical_json(response)) > MOTION_PATH_PREVIEW_MAX_BYTES
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "native motion preview path is malformed or oversized",
             )
         digest_input = dict(receipt)
         receipt_digest = digest_input.pop("receipt_digest", None)
@@ -1641,8 +1785,9 @@ class ExecutionCommandClient:
             )
         if (
             response.get("command") != "preview_capability_command"
+            or receipt.get("target") != participant["target"]
             or receipt.get("schema_version")
-            != "manyforge.direct_control_capability_command_preview.v1"
+            != "manyforge.direct_control_capability_command_preview.v2"
             or receipt.get("commit_eligible") is not True
         ):
             raise HeadlessApiError(
@@ -2084,7 +2229,7 @@ class ExecutionCommandClient:
         return response
 
     def component_model(self) -> dict[str, Any]:
-        """CONTRACTS §1/§5/§7/§8: every ComponentState, the CellLatch, every
+        """Every ComponentState, the CellLatch, every
         SignalSample, the rule holds and the required signal ids, as the
         execution host publishes them (an in-memory read)."""
         return self._read_projection_on(
@@ -2092,7 +2237,7 @@ class ExecutionCommandClient:
         )
 
     def component_action(self, component_id: str, action: str) -> dict[str, Any]:
-        """CONTRACTS §2: hand one action to the core component coordinator.
+        """Hand one action to the core component coordinator.
 
         The reply only accepts or refuses (`component_action_in_progress`,
         `component_action_unsupported`, `component_not_found`); the result
@@ -2107,10 +2252,34 @@ class ExecutionCommandClient:
         )
         return self._validate_projection_response("component_action", response)
 
+    def component_recovery_preflight(self, component_id: str) -> dict[str, Any]:
+        response = self._exchange_control({
+            "api_version": EXECUTION_COMMAND_VERSION,
+            "command": "component_recovery_preflight",
+            "request": {"component_id": component_id},
+        })
+        self._validate_projection_response("component_recovery_preflight", response)
+        if response.get("ok") is True:
+            try:
+                projection = RecoveryPreflightProjection.model_validate(response.get("preflight"))
+            except ValueError as error:
+                raise HeadlessApiError("execution_command_response_invalid", "recovery preflight is malformed") from error
+            if projection.components[-1].component_id != component_id:
+                raise HeadlessApiError("execution_command_response_invalid", "recovery preflight names another component")
+        return response
+
+    def component_recover_enable(self, component_id: str, confirmation: dict[str, Any]) -> dict[str, Any]:
+        response = self._exchange_control({
+            "api_version": EXECUTION_COMMAND_VERSION,
+            "command": "component_action",
+            "request": {"component_id": component_id, "action": "enable", "recovery_preflight": confirmation},
+        })
+        return self._validate_projection_response("component_action", response)
+
     def set_io_output(
         self, signal_id: str, value: bool | float, *, origin: str
     ) -> dict[str, Any]:
-        """CONTRACTS §7: one output write; the reply carries SetOutputResult.
+        """One output write; the reply carries SetOutputResult.
         `origin` is `manual` (refused while motion executes) or `program`."""
         response = self._exchange(
             {
@@ -2177,7 +2346,7 @@ class ExecutionCommandClient:
 
 
 class StreamedExecutionEvents:
-    """The event pump's source on the subscription stream (contract §8.1).
+    """The event pump's source on the subscription stream.
 
     One follower thread keeps the subscription (reconnect from the last
     cursor, dead link after three missed heartbeats) and buffers its rows;
@@ -2301,7 +2470,7 @@ class StreamedExecutionEvents:
                     "has_more": has_more,
                     "next_after_sequence": rows[-1]["sequence"] if rows else after_sequence,
                     "owner_epoch": owner_epoch,
-                    "schema_version": "manyforge.execution_event_page.v1",
+                    "schema_version": "manyforge.execution_event_page.v2",
                 },
                 "ok": True,
                 "operation_progress": list(self._progress),
@@ -2339,7 +2508,7 @@ class ExecutionEventPump:
         self._execution = execution
         self._poll_seconds = poll_seconds
         self._stop = threading.Event()
-        # Contract §8.1: identity, pages and wake-ups come from the event
+        # Identity, pages and wake-ups come from the event
         # subscription; the request/reply `events` command is never polled.
         self._stream = StreamedExecutionEvents(execution.subscribe_events, self._stop)
         self._page_limit = page_limit
@@ -2450,7 +2619,7 @@ class ExecutionEventPump:
             pass
 
     def _refresh_alarm_sources(self) -> None:
-        """Keep the alarm sources within their currency bound (spec 530 §11).
+        """Keep the alarm sources within their currency bound.
 
         Every pump iteration offers the refresh; the core performs it at most
         once per period R and otherwise returns without its lock. A failed
@@ -2775,8 +2944,8 @@ class ExecutionEventPump:
                 if admission_generation != next_admission_generation:
                     admission_generation = next_admission_generation
                     control_projection_changed = True
-                # The host publishes component states on change (CONTRACTS
-                # §1); they reach the stream as a ``state`` message, no row.
+                # The host publishes component states on change;
+                # they reach the stream as a ``state`` message, no row.
                 if component_model != page["component_model"]:
                     component_model = page["component_model"]
                     control_projection_changed = True

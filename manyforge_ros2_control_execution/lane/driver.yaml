@@ -1,4 +1,4 @@
-# Mock lane driver (CONTRACTS §12): no vendor driver. The hardware is stock
+# Mock lane driver: no vendor driver. The hardware is stock
 # ros2_control mock hardware, installed with ros2_control in every image
 # (the pinned controller overlay of Dockerfile.ros-lyrical-full).
 source:

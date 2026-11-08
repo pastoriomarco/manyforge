@@ -7,7 +7,7 @@
 
 namespace manyforge::core::detail {
 
-// Spring-back at-rest join (item 6). Forward braking ended at rest at
+// Spring-back at-rest join. Forward braking ended at rest at
 // `forward_end_s`; the return lasts `return_time_s` and normally starts at the
 // half boundary `phase_time_s`. A late forward end moves the return start
 // after it. Returns the return start time, or nullopt when the whole Stop
@@ -21,7 +21,7 @@ struct StopPhaseJerkLimits {
   std::string source;
 };
 
-// Jerk limits for one Stop phase (decision Q36, as main). An authored jerk is
+// Jerk limits for one Stop phase (as main). An authored jerk is
 // used verbatim; a joint without one gets motion_jerk_preset_limit(accel,
 // reference_s), where reference_s is the phase's own duration: deceleration
 // time - stop_traj_delta_s for a soft ramp or a spring-back forward half,

@@ -1,4 +1,4 @@
-"""Entity poses are a generic pose source keyed by entity name (CONTRACTS §14).
+"""Entity poses are a generic pose source keyed by entity name.
 
 The per-scene mappings are Scenario data: each Isaac Scenario's
 ``policies.scene_pose_sources[].source_key.simulation_entity`` names a simulator entity

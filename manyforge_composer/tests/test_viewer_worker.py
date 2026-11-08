@@ -39,9 +39,9 @@ HISTORICAL_CASE_FAMILIES: Final = (
         "attachment_following_restart_and_worker_policy",
         "historical line 201",
         1,
-        ("UI6-I",),
+        ("scene_join",),
         "epoch/current-only delivery uses test_execution_observation_stream.py; "
-        "attachment and interrupted Scene joins remain UI6-I, not a future worker",
+        "attachment and interrupted Scene joins remain with the Scene join, not a future worker",
     ),
 )
 

@@ -373,6 +373,28 @@ ParallelCollisionValidationWorkerPool::~ParallelCollisionValidationWorkerPool() 
   release_abandoned_worker_threads();
 }
 
+void ParallelCollisionValidationWorkerPool::detach() {
+  closing_.store(true, std::memory_order_release);
+  // The owning Kernel has already drained admission. Hold the existing call
+  // serializer until all retained and previously abandoned workers have left.
+  std::lock_guard<std::mutex> call_lock(validation_call_mutex_);
+  stop_worker_threads();
+  std::vector<std::shared_ptr<WorkerSlot>> abandoned;
+  {
+    std::lock_guard<std::mutex> lock(abandoned_worker_slots_mutex_);
+    abandoned.swap(abandoned_worker_slots_);
+  }
+  for (const auto& slot : abandoned) {
+    {
+      std::lock_guard<std::mutex> lock(slot->mutex);
+      slot->stop = true;
+    }
+    slot->cv.notify_all();
+  }
+  for (const auto& slot : abandoned)
+    if (slot->thread.joinable()) slot->thread.join();
+}
+
 void ParallelCollisionValidationWorkerPool::ensure_worker_threads(int count) {
   if (count <= 0) {
     return;
@@ -666,6 +688,13 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
     CollisionValidationPassConfig pass_config, CollisionWorldSnapshotPtr snapshot_owner,
     std::optional<TimePoint> absolute_wall_deadline) {
   std::lock_guard<std::mutex> call_lock(validation_call_mutex_);
+  if (closing_.load(std::memory_order_acquire)) {
+    auto result = inconclusive_bundle();
+    result.borrowed_world_revision = snapshot.revision;
+    result.final_world_revision = snapshot.revision;
+    result.decision.collision_world_revision = snapshot.revision;
+    return result;
+  }
   last_telemetry_ = {};
   last_telemetry_.workers_requested = config_.worker_count;
   last_telemetry_.workers_effective = 0;

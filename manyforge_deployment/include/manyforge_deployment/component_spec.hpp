@@ -86,7 +86,7 @@ component_description_facts(const core::CellGraphDTO &typed, const CanonicalValu
 
 /// What one component is launched and constructed with (build spec plan,
 /// tier 1). A change to any of it restarts the component; nothing else does.
-/// The execution host builds a component from this value only (FP-2): the
+/// The execution host builds a component from this value only: the
 /// typed members below are decoded once from the sections, so every fact the
 /// host reads is in the fingerprint.
 ///
@@ -95,7 +95,7 @@ component_description_facts(const core::CellGraphDTO &typed, const CanonicalValu
 ///   (asset, revision, custom TCPs; no placement), the mounts on it (pose,
 ///   interfaces, primary; no collision exclusions) with each mounted child's
 ///   model, whether the child runs no process of its own (and then its custom
-///   TCPs); a machine owner also its arm member's description (CONTRACTS §16).
+///   TCPs); a machine owner also its arm member's description.
 /// - controllers: its control domains, desired control configurations and
 ///   compiled domain products.
 /// - launch: its runtime-unit rows and products, runtime-contract
@@ -107,7 +107,7 @@ component_description_facts(const core::CellGraphDTO &typed, const CanonicalValu
 ///   at kernel construction; a component with I/O signals on one ROS host
 ///   also whether that host is simulated (its simulated PLC); a machine
 ///   owner also its arm member's sections other than description and owner
-///   (CONTRACTS §16: the owner's process is launched with its arm, so the
+///   (the owner's process is launched with its arm, so the
 ///   host rebuilds the owner whenever it rebuilds that arm).
 /// - adapter: its adapter configuration rows (lifecycle timeout, streams,
 ///   I/O devices, pose-source, AI-model and sensor settings) and, on a

@@ -1,4 +1,4 @@
-"""I6 unit-tagged controlled/observed-state Python projection tests."""
+"""Unit-tagged controlled/observed-state Python projection tests."""
 
 from __future__ import annotations
 

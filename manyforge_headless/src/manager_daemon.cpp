@@ -17,8 +17,10 @@
 #include <manyforge_deployment/initial_scene_projection.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
+#include <manyforge_deployment/activation_content_collection.hpp>
 #include <manyforge_deployment/prepared_activation_repository.hpp>
 #include <manyforge_deployment/program_contract.hpp>
+#include "manager_reference_diagnostics_internal.hpp"
 #include <manyforge_deployment/program_binding_outcome.hpp>
 #include <manyforge_component_manager/manager_runtime_convergence_coordinator.hpp>
 #include <manyforge_component_manager/retained_execution_host_unit_adapter.hpp>
@@ -106,7 +108,7 @@ core::ErrorDTO SceneRuntimeFailureFromException(
   return {std::move(code), error.what(), std::move(details)};
 }
 constexpr std::string_view kManagerCommandResponseApiVersion =
-    "manyforge.manager_command_response.v1";
+    "manyforge.manager_command_response.v2";
 // The owner named by a Manager response error unless a typed cause names
 // another producer (for example a forwarded Kernel refusal).
 constexpr std::string_view kManagerProducer = "component_manager";
@@ -530,7 +532,7 @@ struct DeploymentCandidateReceipt final {
   core::GraphRevision expected_current_graph_revision;
   core::AdmissionGeneration expected_admission_generation;
   std::string manager_owner_epoch;
-  /// Digest of the authoritative impact shown with this preview (H1a). Apply
+  /// Digest of the authoritative impact shown with this preview. Apply
   /// is refused if the recomputed impact differs, and a destructive impact
   /// must be explicitly accepted by echoing this digest.
   core::ContentDigest impact_digest;
@@ -718,7 +720,7 @@ RequiredDeploymentCandidateReceipt(const CanonicalValue &value) {
   return receipt;
 }
 
-/// Decode the exact UA2A prepared activation accepted by one named Apply.
+/// Decode the exact prepared activation accepted by one named Apply.
 ///
 /// The Manager records these facts in the durable intent and never reopens a
 /// mutable Scenario/catalog selection, draft or current-selection fact to
@@ -745,7 +747,7 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
           "SHA-256");
   Require(core::IsExactLowercaseSha256Digest(prepared_activation_id),
           "Apply prepared_activation_id must be canonical SHA-256");
-  // Exactly one typed Program outcome (H1a): the candidate binding, or the
+  // Exactly one typed Program outcome: the candidate binding, or the
   // named non-executable result for the preserved authored Program.
   const auto &program_outcome = RequiredMember(value, "program_outcome");
   std::optional<core::ProgramBindingId> program_binding_id;
@@ -817,7 +819,7 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
 /// A new Apply is accepted only for a prepared value the preparer published
 /// in the trusted activation store: its identity and content reverify, its
 /// Program outcome recompiles to exactly the recorded binding or named
-/// non-executable result (H1a), and the request summary equals it exactly.
+/// non-executable result, and the request summary equals it exactly.
 /// A caller therefore cannot submit an outcome the preparer did not produce.
 bool PreparedActivationIsStoredExactly(
     const std::filesystem::path &activation_root,
@@ -1668,7 +1670,7 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
   result.deployment_artifact_id =
       core::DeploymentArtifactId(deployment_artifact_id);
   result.deployment_revision = core::DeploymentRevision(deployment_revision);
-  // Explicit acceptance of a destructive preview impact (H1a); null when
+  // Explicit acceptance of a destructive preview impact; null when
   // the caller accepts none.
   if (const auto accepted = OptionalString(root, "accepted_impact_digest")) {
     Require(core::IsExactLowercaseSha256Digest(*accepted),
@@ -1868,7 +1870,7 @@ SceneRuntimeOwnerReadResponse(const std::string_view cell_id,
 using ConfiguredPoseSource = deployment::ros2_control_execution_runtime_contract::
     Configuration::PoseSource;
 
-/// CP9: the active bundle's pose-source component rows (source_id =
+/// The active bundle's pose-source component rows (source_id =
 /// component id) across its ROS execution runtime units.
 [[nodiscard]] std::vector<ConfiguredPoseSource>
 ConfiguredPoseSources(const deployment::RetainedBundle &bundle) {
@@ -2175,6 +2177,10 @@ CanonicalValue ErrorResponse(const std::string_view code,
 /// and producer; any other exception is `fallback_code` with its text.
 core::TypedCause ManagerCauseOf(const std::exception &error,
                                 const std::string_view fallback_code) {
+  if (dynamic_cast<const deployment::ProgramReferenceValidationRefusal *>(&error)) {
+    const core::TypedError typed("program_reference_validation_failed", error.what());
+    return core::CauseOf(typed, fallback_code, kManagerProducer);
+  }
   if (const auto *program =
           dynamic_cast<const deployment::ProgramContractError *>(&error);
       program != nullptr && !program->code().empty()) {
@@ -2184,11 +2190,19 @@ core::TypedCause ManagerCauseOf(const std::exception &error,
   return core::CauseOf(error, fallback_code, kManagerProducer);
 }
 
+CanonicalValue WithReferenceDiagnostics(CanonicalValue response,
+                                        const std::exception &error) {
+  const auto *refusal = dynamic_cast<const deployment::ProgramReferenceValidationRefusal *>(&error);
+  if (!refusal) return response;
+  return detail::AttachReferenceDiagnostics(std::move(response), refusal->diagnostics());
+}
+
 CanonicalValue CaughtErrorResponse(const std::exception &error,
                                    const std::string_view fallback_code) {
   const auto cause = ManagerCauseOf(error, fallback_code);
-  return DetailedErrorResponse(cause.error.code, cause.error.message,
-                               cause.error.details, cause.producer);
+  return WithReferenceDiagnostics(
+      DetailedErrorResponse(cause.error.code, cause.error.message,
+                            cause.error.details, cause.producer), error);
 }
 
 CanonicalValue ApplyDetailedErrorResponse(
@@ -2304,7 +2318,7 @@ CanonicalValue DeploymentGraphDiff(const core::CellGraphDTO &current,
   });
 }
 
-/// The one authoritative impact of applying `candidate` over `current` (H1a):
+/// The one authoritative impact of applying `candidate` over `current`:
 /// the per-component runtime decision, shared Scene/attachment consequences
 /// and the prepared Program outcome, all derived from verified facts. Clients
 /// present it and bind their confirmation to it; they never re-derive it.
@@ -2447,7 +2461,7 @@ ApplyResponse(const ManagerCommand &command,
   });
 }
 
-/// Compact immutable identity of the UA2A preparation accepted by one Apply.
+/// Compact immutable identity of the preparation accepted by one Apply.
 /// The complete receipt remains in the Manager journal; observation does not
 /// expand that private input into a second public status shape.
 CanonicalValue ApplyPreparedActivationValue(
@@ -2459,7 +2473,7 @@ CanonicalValue ApplyPreparedActivationValue(
        CanonicalValue(activation.deployment_artifact_id.value())},
       {"deployment_revision",
        CanonicalValue(activation.deployment_revision.value())},
-      // Null exactly for a prepared non-executable Program (H1a).
+      // Null exactly for a prepared non-executable Program.
       {"program_binding_id",
        activation.program_binding_id.has_value()
            ? CanonicalValue(activation.program_binding_id->value())
@@ -2781,14 +2795,6 @@ public:
           core::ProgramId(required("program_id")),
           core::ProgramRevision(required("program_revision")), bundle);
     };
-    const auto read_binding = [&](const std::filesystem::path &root) {
-      if (!model_map.has_value()) {
-        throw std::invalid_argument(
-            "Apply initial Scene binding has no retained model map");
-      }
-      return deployment::FilesystemVerifiedProgramBindingSource(root)
-          .get_verified(*activation.program_binding_id, bundle, *model_map);
-    };
     auto program = activation_root_.has_value()
                        ? read_program(*activation_root_)
                        : nullptr;
@@ -2814,13 +2820,22 @@ public:
       }
       const auto outcome =
           deployment::recompile_prepared_program_outcome(*prepared);
-      if (!outcome.resolved_roles.has_value()) {
+      if (!outcome.resolved_references.has_value()) {
         throw std::invalid_argument(
             "Apply initial Scene outcome is not non-executable");
       }
       return deployment::project_resolved_initial_scene(
-          *program, *outcome.resolved_roles, bundle.value().cell_graph.cell_id);
+          *program, *outcome.resolved_references, bundle.value().cell_graph.cell_id);
     }
+    const auto &catalog_root = activation_root_.has_value() ? *activation_root_ : package_root_;
+    const deployment::FilesystemVerifiedCatalogArtifactSource catalog(catalog_root);
+    const auto read_binding = [&](const std::filesystem::path &root) {
+      if (!model_map.has_value()) {
+        throw std::invalid_argument("Apply initial Scene binding has no retained model map");
+      }
+      return deployment::FilesystemVerifiedProgramBindingSource(root)
+          .get_verified(*activation.program_binding_id, bundle, *model_map, catalog);
+    };
     auto binding = activation_root_.has_value()
                        ? read_binding(*activation_root_)
                        : nullptr;
@@ -3065,7 +3080,7 @@ private:
   AdmissionCloser admission_closer_;
 };
 
-// Only the daemon's named coordinator owns this adapter. Its Q101 entries
+// Only the daemon's named coordinator owns this adapter. Its entries
 // are called inside the original captured named operation; a replacement
 // coordinator has no such capture and can only read retained Scene evidence.
 // The actual remote port supplies checked owner readback, never HeldStatusView.
@@ -3266,7 +3281,7 @@ public:
     RequireCurrentPackageGeneration();
     EnsureBootstrap();
     RequireCurrentPackageGeneration();
-    // DX-753: preserve native-named per-unit launch, inventory, epochs, liveness, Stop and fencing plumbing.
+    // Preserve native-named per-unit launch, inventory, epochs, liveness, Stop and fencing plumbing.
     // Native children are directly owned by this Manager process and therefore
     // never survive its restart. Recreate the runtime selected by the durable
     // public pointer before the progression lane resumes an incomplete Apply.
@@ -3583,13 +3598,15 @@ private:
           core::RequestOwnerEpoch(*command.request_owner_epoch),
           core::RequestId(*command.request_id));
       if (!accepted.has_value()) {
-        return ApplyKnownNoEffectDetailedErrorResponse(command, cause.error,
-                                                       cause.producer);
+        return WithReferenceDiagnostics(
+            ApplyKnownNoEffectDetailedErrorResponse(command, cause.error,
+                                                    cause.producer), error);
       }
     } catch (...) {
       // A failed journal observation cannot prove whether acceptance happened.
     }
-    return ApplyDetailedErrorResponse(command, cause.error, cause.producer);
+    return WithReferenceDiagnostics(
+        ApplyDetailedErrorResponse(command, cause.error, cause.producer), error);
   }
 
   // An owned replay copy may outlive a transport call. Never write its result
@@ -3867,7 +3884,7 @@ private:
       const component_manager::ManagerActiveRuntimeConvergenceResult &runtime,
       const core::ProgramCycleStatusDTO &program_cycle_status,
       const std::uint32_t unsettled_effect_count, const bool forced_closed) {
-    // These counts describe runtime-service convergence, not CCLC component
+    // These counts describe runtime-service convergence, not component
     // activation or provider command readiness. Keep the public DTO unchanged.
     const auto runtime_unit_total = runtime.plan.runtime_units.size();
     Require(runtime_unit_total <= std::numeric_limits<std::uint32_t>::max(),
@@ -4105,7 +4122,7 @@ private:
   /// receiver, publish their observations to the Kernel and reduce one
   /// cell-admission readiness snapshot.
   ///
-  /// Traced path (UA3.1): ProbeProgramRunnerLiveness (read-only socket probe) ->
+  /// Traced path: ProbeProgramRunnerLiveness (read-only socket probe) ->
   /// required-set construction from the currently observed epochs ->
   /// RenewProgramRunnerLiveness -> RetainedExecutionHostAdapter
   /// RenewManagerLivenessBatch -> Kernel liveness publication ->
@@ -4418,7 +4435,7 @@ private:
             "Kernel rejected Program Runner liveness observation: " +
             published_runner.error().message);
       }
-      // C1: the native rows and this actual Runner row now make the exact
+      // The native rows and this actual Runner row now make the exact
       // successor renewal available to the existing Kernel owner guard.
       // Subsequent readiness reduction/publication is not a settlement gate.
       required_owners_published = true;
@@ -4561,7 +4578,7 @@ private:
     if (reuse_only) return false;
     if (!manager_liveness_attempted_publication_ ||
         *manager_liveness_attempted_publication_ != publication) {
-      // C2: the SAME publication-boundary reset covers heartbeat and initial
+      // The SAME publication-boundary reset covers heartbeat and initial
       // settlement, before the existing retry gate can skip a native attempt.
       manager_liveness_retry_gate_.RecordSuccess();
       manager_liveness_attempted_publication_ = publication;
@@ -4948,6 +4965,7 @@ private:
   }
 
   void RunApplyProgressLane() noexcept {
+    CollectUnreferencedActivationContent();
     std::unique_lock lock(apply_progress_lane_mutex_);
     while (!apply_progress_lane_stop_) {
       apply_progress_lane_condition_.wait(lock, [&] {
@@ -4964,16 +4982,27 @@ private:
       lock.unlock();
 
       bool pending = false;
+      bool succeeded = false;
+      const auto note_success =
+          [&](const std::optional<component_manager::ManagerNamedApplyResult> &result) {
+            succeeded = succeeded ||
+                        (result.has_value() &&
+                         result->state ==
+                             component_manager::ManagerNamedApplyResultState::kSucceeded);
+          };
       try {
         if (settlement_requested)
-          static_cast<void>(named_apply_.RetryPendingSettlementOnHeartbeat(*settlement_requested));
+          note_success(named_apply_.RetryPendingSettlementOnHeartbeat(*settlement_requested));
         if (progress_requested) {
           const auto result = named_apply_.RecoverIncompleteApply();
           pending = result.has_value() &&
                     result->state ==
                         component_manager::ManagerNamedApplyResultState::kPending &&
                     !result->settlement_pending;
+          note_success(result);
         }
+        if (succeeded)
+          CollectUnreferencedActivationContent();
       } catch (const std::exception &error) {
         std::cerr << "Manager daemon Apply progression stopped fail-closed: "
                   << error.what() << '\n';
@@ -4999,6 +5028,61 @@ private:
           apply_progress_requested_ = true;
         }
       }
+    }
+  }
+
+  /// Delete activation-root content no live configuration references (its
+  /// stores are bounded and refuse when full). Live are the current
+  /// publication's bundle, Program and binding and the bundle it replaced.
+  /// Runs once when the Apply lane starts and after each successful Apply, on
+  /// that lane: Applies progress one at a time there, so no publication
+  /// changes underneath. A failure is logged; the content stays until the
+  /// next collection.
+  void CollectUnreferencedActivationContent() noexcept {
+    if (config_.activation_root.empty())
+      return;
+    const auto started = std::chrono::steady_clock::now();
+    const auto elapsed_ms = [&] {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - started)
+          .count();
+    };
+    try {
+      const auto publication = plan_source_.ReadCurrentPlan().active_publication;
+      deployment::ActiveActivationContent active{
+          {publication.request.candidate_retained_bundle_id}, std::nullopt,
+          std::nullopt};
+      if (const auto *named = std::get_if<core::NamedApplyPublicationTransactionDTO>(
+              &publication.request.transaction_ref)) {
+        const auto intent = stores_.apply_journal().ReadIntent(
+            named->apply_id, named->apply_generation);
+        Require(intent.has_value(), "active publication has no durable Apply intent");
+        active.retained_bundle_ids.push_back(
+            intent->intent.expected_active_projection_revision.retained_bundle_id);
+        const auto &prepared = intent->intent.prepared_activation;
+        active.program_binding_id = prepared.program_binding_id;
+        const auto receipt = content_identity::parse_canonical_json(
+            prepared.canonical_receipt_json,
+            {component_manager::kMaximumManagerApplyPreparedReceiptBytes, 16U,
+             4096U});
+        if (const auto *revision = receipt.find_object_member("program_revision");
+            revision != nullptr && revision->is_string())
+          active.program_revision = core::ProgramRevision(revision->as_string());
+      }
+      const auto collected = deployment::collect_unreferenced_activation_content(
+          config_.activation_root, active);
+      // One line per run, also when nothing is removed or a preparation
+      // deferred it: its duration is time this lane holds the writer lock.
+      std::cerr << "Manager activation content collection: "
+                << (collected.collected ? "collected" : "deferred")
+                << " examined=" << collected.examined_entries
+                << " removed=" << collected.removed_entries
+                << " removed_bytes=" << collected.removed_bytes
+                << " read_bytes=" << collected.read_bytes
+                << " elapsed_ms=" << elapsed_ms() << '\n';
+    } catch (const std::exception &error) {
+      std::cerr << "Manager activation content collection skipped after "
+                << elapsed_ms() << " ms: " << error.what() << '\n';
     }
   }
 
@@ -5072,8 +5156,8 @@ private:
   }
 
   // Requests the normal operational Stop of the carrier's motion through the
-  // Kernel's Stop control socket, as the public Stop route does. C-P4 (G1):
-  // it names the holder and every component it is mounted on, from the
+  // Kernel's Stop control socket, as the public Stop route does.
+  // It names the holder and every component it is mounted on, from the
   // active bundle's cell graph, so a loss during an arm move stops the arm.
   // A component with no running motion is a no-effect Stop.
   std::optional<core::ErrorDTO>
@@ -5098,7 +5182,7 @@ private:
       const auto response = ExchangeLocalPacket(
           config_.execution_run_root / "execution-control.sock",
           CanonicalValue(CanonicalValue::Object{
-              {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+              {"api_version", CanonicalValue("manyforge.execution_command.v3")},
               {"attribution",
                CanonicalValue(CanonicalValue::Object{
                    {"assurance", CanonicalValue("unverified")},
@@ -5141,8 +5225,8 @@ private:
 
   // Publishes one gripper's `carried_object_lost.<target>` system signal level
   // into the execution host's signal ingress, on the same control socket and
-  // envelope as the loss Stop (contract §8.4). `loss` (attachment, object,
-  // loss event id, stored key; §10) is present iff the level is `true`. The
+  // envelope as the loss Stop. `loss` (attachment, object,
+  // loss event id, stored key) is present iff the level is `true`. The
   // host records the level even while no composition holds the signal.
   std::optional<core::ErrorDTO> PublishCarriedObjectLostLevel(
       const core::ControllableComponentId &component,
@@ -5152,7 +5236,7 @@ private:
       const auto response = ExchangeLocalPacket(
           config_.execution_run_root / "execution-control.sock",
           CanonicalValue(CanonicalValue::Object{
-              {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+              {"api_version", CanonicalValue("manyforge.execution_command.v3")},
               {"attribution",
                CanonicalValue(CanonicalValue::Object{
                    {"assurance", CanonicalValue("unverified")},
@@ -6040,7 +6124,7 @@ private:
             // The previewed impact is revalidated at acceptance for every
             // caller, not only the GUI: a changed impact is a stale
             // confirmation, and a destructive one must be explicitly
-            // accepted by its exact digest (H1a). Both refuse before effects.
+            // accepted by its exact digest. Both refuse before effects.
             const auto current_bundle =
                 verified_package_.get_verified(current_pointer.candidate_retained_bundle_id);
             const auto candidate_bundle = verified_package_.get_verified(
@@ -6134,7 +6218,7 @@ private:
         return false;
       }
       case CommandKind::kApplyReleaseForNew: {
-        // New (R3, N7): release whatever failed Apply still holds the cell.
+        // New: release whatever failed Apply still holds the cell.
         Require(command.request_id.has_value() && command.source_label.has_value(),
                 "decoded Apply release for New lacks its request context");
         const auto released = named_apply_.ReleaseFailedApplyForNew(

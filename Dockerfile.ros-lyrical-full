@@ -6,11 +6,23 @@
 #
 # Purpose:
 #   - Run ManyForge Composer/behavior/RoboPlan and ROS adapters in one image.
-#   - Keep ROS Python packages apt-managed while ManyForge application deps live
-#     in a pinned venv with --system-site-packages.
+#   - Keep ROS (and its Python packages) in /opt/ros/lyrical while ManyForge
+#     application deps live in a pinned venv with --system-site-packages.
 #   - Provide the production-shaped integration image for Isaac Sim, ROS drivers,
-#     and simulator/robot adapter validation, including the pinned controller
-#     overlay (stock JTC 6.10.0) and the UFactory xArm driver.
+#     and simulator/robot adapter validation, including stock JTC >= 6.10.1
+#     and the UFactory xArm driver.
+#
+# ROS base (build ARG ROS_BASE):
+#   apt (default) - NVIDIA Isaac ROS apt mirror plus the pinned controller and
+#       rmw_fastrtps overlays.
+#   source - ROS Lyrical built from source: the release set of the rosdistro
+#       sync recorded in third_party/ros_lyrical/ros-lyrical.repos
+#       (scripts/ros/generate-lyrical-source-repos.sh), plus version floors.
+#       NOT YET BUILDABLE END TO END: upstream Lyrical removed CMake
+#       ament_target_dependencies() (NVIDIA's mirror restores it), which the
+#       xArm driver and two ManyForge packages use.
+# Both are built in clean stages without the ManyForge venv, so no ROS or
+# ROS-workspace library can link against venv/cmeel libraries.
 #
 # Build and start (see docs/operations/DEVELOPMENT_WORKBENCH.md):
 #   ./scripts/compose-dev.sh build
@@ -18,6 +30,8 @@
 #
 # Runtime/product availability is defined by the selected entrypoint, not by
 # this toolchain image or a successful build.
+
+ARG ROS_BASE=source
 
 # --- Stage 1: Build React frontend ---
 FROM node:22-slim AS frontend-builder
@@ -33,51 +47,130 @@ COPY manyforge_headless_api/tests/fixtures/control-v2-local-delta.json \
      /workspace/manyforge_headless_api/tests/fixtures/control-v2-local-delta.json
 RUN npm run build
 
-# --- Stage 2: ROS + ManyForge runtime ---
-# LYRICAL: no official ros:lyrical-*-noble image exists. Start from the exact
-# Ubuntu 24.04 (Noble) image and install ROS from NVIDIA's buildfarm below.
-FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
-
-ARG ROBOPLAN_SOURCE_MODE=qualified
-# Bound source-build memory on Jetsons; callers may select another job budget.
-ARG CMAKE_BUILD_PARALLEL_LEVEL=4
+# --- Stage 2: OS base shared by every ROS stage ---
+# LYRICAL: no official ros:lyrical-*-noble image exists (Ubuntu 24.04 is a
+# Tier 3 platform for Lyrical). Start from the exact Ubuntu 24.04 image.
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 AS os-base
 ENV DEBIAN_FRONTEND=noninteractive
 # LYRICAL: distro selector; the shared entrypoint and test-all.sh read it.
 ENV ROS_DISTRO=lyrical
 # LYRICAL: the ros:*-ros-base image sets this locale; the plain Ubuntu image does not.
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
-ENV MANYFORGE_VENV=/opt/manyforge/venv
-ENV VIRTUAL_ENV=/opt/manyforge/venv
-ENV PATH=/opt/manyforge/venv/bin:$PATH
-ENV LD_LIBRARY_PATH=/usr/local/lib
-
 SHELL ["/bin/bash", "-c"]
+# The standard ROS 2 apt source (ros2-apt-source 1.2.0, sha256-pinned) for
+# distribution-independent tooling (colcon, rosdep, vcstool) only.
+ARG ROS_APT_SOURCE_SHA256=0804d9b13db770eb87019be414cd78378835228ad5fa801fc88758596dd8f7e5
+ARG ROS_ARCHIVE_FPR=C1CF6E31E6BADE8868B172B4F42ED6FBAB17C654
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
+    curl -fsSL --retry 5 --retry-all-errors -o /tmp/ros2-apt-source.deb \
+      https://github.com/ros-infrastructure/ros-apt-source/releases/download/1.2.0/ros2-apt-source_1.2.0.noble_all.deb; \
+    echo "${ROS_APT_SOURCE_SHA256}  /tmp/ros2-apt-source.deb" | sha256sum -c -; \
+    dpkg -i /tmp/ros2-apt-source.deb; \
+    gpg --show-keys --with-colons /usr/share/keyrings/ros2-archive-keyring.gpg | awk -F: '$1=="fpr"{print $10}' | grep -qx "${ROS_ARCHIVE_FPR}"; \
+    rm -rf /var/lib/apt/lists/* /tmp/ros2-apt-source.deb
 
+# --- Stage 3a: ROS Lyrical from source (ROS_BASE=source) ---
+# Upstream repositories at release tags; no source is modified. Only the
+# packages in third_party/ros_lyrical/packages.txt and their dependencies are
+# built. Only Fast DDS is built as RMW, as in the apt base (exclude.txt); the
+# other RMWs that rmw_implementation names are rosdep-skipped here.
+FROM os-base AS ros-source-build
+# rosdep rules from the same rosdistro sync as the source set.
+ARG ROSDISTRO_SYNC_TAG=lyrical/2026-10-05
+ARG ROSDISTRO_SYNC_COMMIT=df04dc94976c3fe616c39dec8851bc375c1d4fc1
+ARG ROS_SOURCE_SKIP_KEYS="rmw_connextdds rmw_connextdds_common rmw_connextddsmicro rti_connext_dds_cmake_module rmw_cyclonedds_cpp cyclonedds iceoryx_binding_c iceoryx_hoofs iceoryx_posh rmw_zenoh_cpp zenoh_cpp_vendor"
+ARG ROS_SOURCE_PARALLEL_WORKERS=8
+ARG ROS_SOURCE_JOBS_PER_PACKAGE=2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ccache cmake git python3-dev python3-pip \
+        python3-colcon-common-extensions python3-rosdep python3-vcstool \
+    && rm -rf /var/lib/apt/lists/*
+COPY third_party/ros_lyrical/ /opt/ros_src/manifest/
+RUN set -euo pipefail; \
+    cd /opt/ros_src; mkdir -p src extra; \
+    vcs import --shallow --retry 5 --input manifest/ros-lyrical.repos src; \
+    vcs export --exact src > manifest-exact.repos; \
+    grep -v '^#' manifest/packages.txt > targets.txt; \
+    colcon list --base-paths src extra --packages-up-to $(cat targets.txt) \
+      > build-set.txt; \
+    wc -l build-set.txt
+RUN set -euo pipefail; \
+    cd /opt/ros_src; \
+    rosdistro=https://raw.githubusercontent.com/ros/rosdistro/${ROSDISTRO_SYNC_COMMIT}; \
+    mkdir -p /etc/ros/rosdep/sources.list.d; \
+    printf 'yaml %s/rosdep/%s.yaml\n' "${rosdistro}" base "${rosdistro}" python "${rosdistro}" ruby \
+      > /etc/ros/rosdep/sources.list.d/20-default.list; \
+    export ROSDISTRO_INDEX_URL="${rosdistro}/index-v4.yaml"; \
+    rosdep update --rosdistro lyrical; \
+    # Build and runtime dependencies only (BUILD_TESTING=OFF): test-only keys
+    # (linters' stubs such as python3-typeshed) would leak into the venv's
+    # system site packages and break its `pip check`.
+    rosdep install --simulate --reinstall --rosdistro lyrical --ignore-src -y \
+      --dependency-types build --dependency-types buildtool \
+      --dependency-types build_export --dependency-types buildtool_export \
+      --dependency-types exec \
+      --skip-keys "${ROS_SOURCE_SKIP_KEYS}" \
+      --from-paths $(awk '{print $2}' build-set.txt) > rosdep-simulate.txt; \
+    if grep -v -e '^#' -e 'apt-get install -y' rosdep-simulate.txt | grep -q .; then \
+      echo "rosdep needs a non-apt installer:" >&2; cat rosdep-simulate.txt >&2; exit 1; \
+    fi; \
+    sed -n 's/.*apt-get install -y //p' rosdep-simulate.txt | tr ' ' '\n' | grep . | sort -u > rosdep-apt.txt; \
+    apt-get update; \
+    xargs -a rosdep-apt.txt apt-get install -y --no-install-recommends; \
+    rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,id=manyforge-ros-lyrical-src-ccache,target=/root/.cache/ccache \
+    set -euo pipefail; \
+    cd /opt/ros_src; \
+    export CCACHE_DIR=/root/.cache/ccache CMAKE_BUILD_PARALLEL_LEVEL="${ROS_SOURCE_JOBS_PER_PACKAGE}" \
+      MAKEFLAGS="-j${ROS_SOURCE_JOBS_PER_PACKAGE}"; \
+    nice -n 10 colcon build --base-paths src extra --merge-install --install-base "/opt/ros/${ROS_DISTRO}" \
+      --parallel-workers "${ROS_SOURCE_PARALLEL_WORKERS}" \
+      --packages-up-to $(cat targets.txt) \
+      --event-handlers console_cohesion- console_direct- console_stderr+ status- summary+ \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache; \
+    ccache -s | head -5; \
+    record="/opt/ros/${ROS_DISTRO}/manyforge-source"; mkdir -p "${record}"; \
+    cp manifest/ros-lyrical.repos manifest/floors.repos manifest/packages.txt manifest-exact.repos \
+      build-set.txt rosdep-apt.txt "${record}/"; \
+    printf 'rosdistro %s %s\n' "${ROSDISTRO_SYNC_TAG}" "${ROSDISTRO_SYNC_COMMIT}" > "${record}/ROSDISTRO_SYNC"; \
+    rm -rf build log
+
+FROM os-base AS ros-base-source
+COPY --from=ros-source-build /opt/ros/lyrical /opt/ros/lyrical
+# Runtime/build system dependencies of the source set (rosdep, same sync).
+RUN apt-get update \
+    && xargs -a /opt/ros/lyrical/manyforge-source/rosdep-apt.txt \
+         apt-get install -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Stage 3b: ROS Lyrical from NVIDIA's Isaac ROS apt mirror (ROS_BASE=apt) ---
+FROM os-base AS ros-base-apt
 # LYRICAL: replaces what the ros:jazzy-ros-base-noble image provides.
 #   - NVIDIA Isaac ROS buildfarm "ubuntu/main" (ros-lyrical-* for Noble) and
 #     "release-5.0" (only needed for ros-lyrical-gripper-controllers, which the
 #     Lyrical ros2-controllers metapackage no longer pulls in; Jazzy's does).
+#     OPEN DECISION (OD-74 D2): ManyForge no longer installs
+#     gripper-controllers (the parallel gripper controller comes from the
+#     controller overlay below), so release-5.0 looks unused; delete it once
+#     confirmed.
 #     repos.key carries two signing keys; each repository is signed by one.
 #     Both fingerprints and the key file digest are pinned.
 #   - release-5.0 also ships OLDER copies of some base packages (e.g.
 #     joint-state-broadcaster 6.8.0 vs 6.9.0); it is pinned to priority 100 so
 #     it only supplies packages absent from ubuntu/main.
-#   - The standard ROS 2 apt source (ros2-apt-source 1.2.0, sha256-pinned) for
-#     distribution-independent tooling (colcon, rosdep), as NVIDIA documents.
 ARG NVIDIA_ISAAC_ROS_KEY_SHA256=d45fbd909e89914960a66dba17d4c659adf908ab4d6fe2cf55381e9ffe5ce59d
 ARG NVIDIA_ISAAC_ROS_BUILDFARM_FPR=428F5D2ACFBC9AA1F8EAC84658F4DA023E691207
 ARG NVIDIA_ISAAC_ROS_RELEASE_FPR=9EEB7195A4BD947C572666F9BBE5EA6DE681BCAB
-ARG ROS_APT_SOURCE_SHA256=0804d9b13db770eb87019be414cd78378835228ad5fa801fc88758596dd8f7e5
-ARG ROS_ARCHIVE_FPR=C1CF6E31E6BADE8868B172B4F42ED6FBAB17C654
 # LYRICAL: release-5.0 suite per platform, as NVIDIA documents: "noble" for
 # x86_64 (its arm64 "noble" index lacks gripper-controllers), "noble-jetpack"
 # for Jetson (JetPack 7), "noble-fastos" for DGX Spark. ubuntu/main is "noble"
 # on every architecture.
 ARG NVIDIA_ISAAC_ROS_RELEASE_SUITE=noble
 RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
     curl -fsSL https://isaac.download.nvidia.com/isaac-ros/repos.key -o /tmp/nvidia-isaac-ros.key; \
     echo "${NVIDIA_ISAAC_ROS_KEY_SHA256}  /tmp/nvidia-isaac-ros.key" | sha256sum -c -; \
     gpg --show-keys --with-colons /tmp/nvidia-isaac-ros.key | awk -F: '$1=="fpr"{print $10}' > /tmp/nvidia-fprs.txt; \
@@ -90,15 +183,163 @@ RUN set -eux; \
       > /etc/apt/sources.list.d/nvidia-isaac-ros.list; \
     printf '%s\n' 'Package: *' 'Pin: release o=NVIDIA,l=NVIDIA Isaac ROS' 'Pin-Priority: 100' \
       > /etc/apt/preferences.d/nvidia-isaac-ros-release; \
-    curl -fsSL -o /tmp/ros2-apt-source.deb \
-      https://github.com/ros-infrastructure/ros-apt-source/releases/download/1.2.0/ros2-apt-source_1.2.0.noble_all.deb; \
-    echo "${ROS_APT_SOURCE_SHA256}  /tmp/ros2-apt-source.deb" | sha256sum -c -; \
-    dpkg -i /tmp/ros2-apt-source.deb; \
-    gpg --show-keys --with-colons /usr/share/keyrings/ros2-archive-keyring.gpg | awk -F: '$1=="fpr"{print $10}' | grep -qx "${ROS_ARCHIVE_FPR}"; \
     apt-get update; \
-    apt-cache policy ros-lyrical-ros-base ros-lyrical-gripper-controllers ros-lyrical-joint-state-broadcaster; \
-    apt-get install -y --no-install-recommends ros-lyrical-ros-base; \
-    rm -rf /var/lib/apt/lists/* /tmp/nvidia-isaac-ros.key /tmp/nvidia-fprs.txt /tmp/ros2-apt-source.deb
+    apt-cache policy ros-lyrical-ros-base ros-lyrical-joint-state-broadcaster; \
+    apt-get install -y --no-install-recommends \
+        build-essential cmake git python3-colcon-common-extensions \
+        ros-${ROS_DISTRO}-ros-base \
+        ros-${ROS_DISTRO}-control-msgs \
+        ros-${ROS_DISTRO}-sensor-msgs \
+        ros-${ROS_DISTRO}-simulation-interfaces \
+        ros-${ROS_DISTRO}-trajectory-msgs \
+        ros-${ROS_DISTRO}-vision-msgs \
+        ros-${ROS_DISTRO}-xacro \
+        ros-${ROS_DISTRO}-rclpy \
+        ros-${ROS_DISTRO}-controller-manager \
+        ros-${ROS_DISTRO}-joint-state-broadcaster \
+        ros-${ROS_DISTRO}-joint-trajectory-controller \
+        ros-${ROS_DISTRO}-ros2-control \
+        ros-${ROS_DISTRO}-ros2-controllers \
+        ros-${ROS_DISTRO}-launch-param-builder \
+        ros-${ROS_DISTRO}-robot-state-publisher \
+        ros-${ROS_DISTRO}-urdf; \
+    rm -rf /var/lib/apt/lists/* /tmp/nvidia-isaac-ros.key /tmp/nvidia-fprs.txt
+
+# Stock JTC 6.10.1 controller overlay: apt ros2_control plus source JTC and
+# parallel_gripper_controller 6.10.1 (ros2_controllers tag 6.10.1),
+# realtime_tools 5.4.0 and ros2_control_cmake 1.0.0.
+ARG ROS2_CONTROL_CMAKE_COMMIT=10b9df0d804c2880e7dc50927f8fd82c7198bda4
+ARG REALTIME_TOOLS_COMMIT=f2f8ee08580659e0ee673a8cdbd1a83b274e9d4a
+ARG ROS2_CONTROLLERS_COMMIT=04b74a6f6a98920e97de4b5bc163ccb900839b95
+RUN set -euo pipefail; \
+    ws=/tmp/control_overlay_ws; mkdir -p "${ws}/src"; \
+    fetch() { \
+      git init -q "${ws}/src/$1"; \
+      git -C "${ws}/src/$1" fetch -q --depth 1 "https://github.com/ros-controls/$1" "$2"; \
+      git -C "${ws}/src/$1" checkout -q FETCH_HEAD; \
+      test "$(git -C "${ws}/src/$1" rev-parse HEAD)" = "$2"; \
+    }; \
+    fetch ros2_control_cmake "${ROS2_CONTROL_CMAKE_COMMIT}"; \
+    fetch realtime_tools "${REALTIME_TOOLS_COMMIT}"; \
+    fetch ros2_controllers "${ROS2_CONTROLLERS_COMMIT}"; \
+    set +u; source "/opt/ros/${ROS_DISTRO}/setup.bash"; set -u; \
+    cd "${ws}"; \
+    colcon build --install-base /opt/manyforge/control_overlay \
+        --packages-select ros2_control_cmake realtime_tools joint_trajectory_controller \
+          parallel_gripper_controller \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF; \
+    printf 'ros2_control_cmake %s\nrealtime_tools %s\nros2_controllers %s\n' \
+        "${ROS2_CONTROL_CMAKE_COMMIT}" "${REALTIME_TOOLS_COMMIT}" "${ROS2_CONTROLLERS_COMMIT}" \
+        > /opt/manyforge/control_overlay/UPSTREAM_COMMITS; \
+    rm -rf "${ws}"
+
+# Stock rmw_fastrtps 9.4.11 overlay (OD-63): the Isaac ROS mirror still ships
+# 9.4.9, which can lose a guard-condition trigger in rmw_wait (fixed upstream in
+# ros2/rmw_fastrtps#895, Lyrical backport #915, released in 9.4.10). Unmodified
+# upstream tag 9.4.11, built against the image's Fast DDS; loaded at run time,
+# so nothing else is rebuilt against it.
+ARG RMW_FASTRTPS_COMMIT=46111733c6f03c162262581f0e1556f7c52fbd50
+RUN set -euo pipefail; \
+    ws=/tmp/rmw_fastrtps_overlay_ws; mkdir -p "${ws}/src"; \
+    git init -q "${ws}/src/rmw_fastrtps"; \
+    git -C "${ws}/src/rmw_fastrtps" fetch -q --depth 1 https://github.com/ros2/rmw_fastrtps "${RMW_FASTRTPS_COMMIT}"; \
+    git -C "${ws}/src/rmw_fastrtps" checkout -q FETCH_HEAD; \
+    test "$(git -C "${ws}/src/rmw_fastrtps" rev-parse HEAD)" = "${RMW_FASTRTPS_COMMIT}"; \
+    set +u; source "/opt/ros/${ROS_DISTRO}/setup.bash"; set -u; \
+    cd "${ws}"; \
+    colcon build --install-base /opt/manyforge/rmw_fastrtps_overlay \
+        --packages-select rmw_fastrtps_shared_cpp rmw_fastrtps_cpp rmw_fastrtps_dynamic_cpp \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF; \
+    printf 'rmw_fastrtps %s\n' "${RMW_FASTRTPS_COMMIT}" > /opt/manyforge/rmw_fastrtps_overlay/UPSTREAM_COMMITS; \
+    rm -rf "${ws}"
+
+# --- Stage 4: selected ROS base ---
+FROM ros-base-${ROS_BASE} AS ros-base
+
+# --- Stage 5: ROS workspaces on the selected base (clean, no venv) ---
+FROM ros-base AS ros-workspaces
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git python3-colcon-common-extensions \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TOPIC_BASED_ROS2_CONTROL_REPO=https://github.com/PickNikRobotics/topic_based_ros2_control.git
+ARG TOPIC_BASED_ROS2_CONTROL_REF=aa9f9ef9525a60f8becea322537dd1d6d1bf9123
+
+RUN set -eux; \
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+    mkdir -p /tmp/topic_based_ros2_control_ws/src /opt/manyforge/topic_based_ros2_control; \
+    git clone "${TOPIC_BASED_ROS2_CONTROL_REPO}" /tmp/topic_based_ros2_control_ws/src/topic_based_ros2_control; \
+    cd /tmp/topic_based_ros2_control_ws/src/topic_based_ros2_control; \
+    git checkout "${TOPIC_BASED_ROS2_CONTROL_REF}"; \
+    test "$(git rev-parse HEAD)" = "aa9f9ef9525a60f8becea322537dd1d6d1bf9123"; \
+    cd /tmp/topic_based_ros2_control_ws; \
+    set +u; \
+    source "/opt/ros/${ROS_DISTRO}/setup.bash"; \
+    set -u; \
+    colcon build --merge-install --install-base /opt/manyforge/topic_based_ros2_control/install --packages-select topic_based_ros2_control --cmake-args -DBUILD_TESTING=OFF; \
+    printf '%s\n' "aa9f9ef9525a60f8becea322537dd1d6d1bf9123" > /opt/manyforge/topic_based_ros2_control/install/UPSTREAM_COMMIT; \
+    rm -rf /tmp/topic_based_ros2_control_ws
+
+# Description data only, for the test lanes' data overlay (scripts/test-all.sh).
+# The xArm driver is built separately below. Keep this exact previously
+# qualified description revision independently pinned.
+ARG XARM_DESCRIPTION_REPO=https://github.com/pastoriomarco/xarm_ros2
+ARG XARM_DESCRIPTION_REF=c3172e57c1c1bb2982fc008304ad6bc886357c87
+RUN set -eux; \
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+    git clone --no-checkout "${XARM_DESCRIPTION_REPO}" /tmp/xarm_description_ws/src/xarm_ros2; \
+    cd /tmp/xarm_description_ws/src/xarm_ros2; \
+    git sparse-checkout init --cone; \
+    git sparse-checkout set xarm_description; \
+    git checkout "${XARM_DESCRIPTION_REF}"; \
+    test "$(git rev-parse HEAD)" = "c3172e57c1c1bb2982fc008304ad6bc886357c87"; \
+    set +u; \
+    source "/opt/ros/${ROS_DISTRO}/setup.bash"; \
+    set -u; \
+    cd /tmp/xarm_description_ws; \
+    colcon build --base-paths src/xarm_ros2/xarm_description \
+      --install-base /opt/manyforge/xarm_description/install \
+      --packages-select xarm_description --cmake-args -DBUILD_TESTING=OFF; \
+    printf '%s\n' "c3172e57c1c1bb2982fc008304ad6bc886357c87" \
+      > /opt/manyforge/xarm_description/install/VENDOR_COMMIT; \
+    rm -rf /tmp/xarm_description_ws
+
+# UFactory xArm driver (xArm 5/6/7, Lite 6, UF850) from the fork
+# branch `lyrical-no-gazebo` (upstream lyrical + the xarm_io_states topic and
+# system_control service; gazebo packages removed), built against the selected
+# ROS base (and the apt base's controller overlay).
+ARG XARM_SOURCE_REPOSITORY=https://github.com/pastoriomarco/xarm_ros2
+ARG XARM_SOURCE_COMMIT=3654c9afef9c51c3bd6723d65ccecca166bc38b0
+ARG XARM_SDK_COMMIT=f36794320a285c0b4bf1cd8ef181cbff6e3b794a
+RUN set -euo pipefail; \
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+    ws=/opt/manyforge/xarm_ws; mkdir -p "${ws}/src"; \
+    git clone -q "${XARM_SOURCE_REPOSITORY}" "${ws}/src/xarm_ros2"; \
+    cd "${ws}/src/xarm_ros2"; \
+    git checkout -q "${XARM_SOURCE_COMMIT}"; \
+    git submodule update --init --recursive -q; \
+    test "$(git -C xarm_sdk/cxx rev-parse HEAD)" = "${XARM_SDK_COMMIT}"; \
+    printf 'xarm_ros2 %s\nxarm_sdk %s\n' "$(git rev-parse HEAD)" "${XARM_SDK_COMMIT}" > "${ws}/UPSTREAM_COMMITS"; \
+    rm -rf .git xarm_sdk/cxx/.git; \
+    set +u; source "/opt/ros/${ROS_DISTRO}/setup.bash"; \
+    if [ -f /opt/manyforge/control_overlay/local_setup.bash ]; then \
+      source /opt/manyforge/control_overlay/local_setup.bash; \
+    fi; set -u; \
+    cd "${ws}"; \
+    colcon build --packages-up-to xarm_controller xarm_api uf_ros_lib \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF; \
+    rm -rf build log
+
+# --- Stage 6: ROS + ManyForge runtime ---
+FROM ros-base
+
+ARG ROBOPLAN_SOURCE_MODE=qualified
+# Bound source-build memory on Jetsons; callers may select another job budget.
+ARG CMAKE_BUILD_PARALLEL_LEVEL=4
+ENV MANYFORGE_VENV=/opt/manyforge/venv
+ENV VIRTUAL_ENV=/opt/manyforge/venv
+ENV PATH=/opt/manyforge/venv/bin:$PATH
+ENV LD_LIBRARY_PATH=/usr/local/lib
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -129,19 +370,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libyaml-cpp-dev \
         liburdfdom-dev \
         liboctomap-dev \
-        ros-${ROS_DISTRO}-control-msgs \
-        ros-${ROS_DISTRO}-sensor-msgs \
-        ros-${ROS_DISTRO}-simulation-interfaces \
-        ros-${ROS_DISTRO}-trajectory-msgs \
-        ros-${ROS_DISTRO}-vision-msgs \
-        ros-${ROS_DISTRO}-xacro \
-        ros-${ROS_DISTRO}-rclpy \
-        ros-${ROS_DISTRO}-controller-manager \
-        ros-${ROS_DISTRO}-joint-state-broadcaster \
-        ros-${ROS_DISTRO}-joint-trajectory-controller \
-        ros-${ROS_DISTRO}-ros2-control \
-        ros-${ROS_DISTRO}-ros2-controllers \
-        ros-${ROS_DISTRO}-gripper-controllers \
     && cd /usr/src/googletest && cmake . && make \
     && cp lib/*.a /usr/lib/ \
     && rm -rf /var/lib/apt/lists/*
@@ -254,7 +482,7 @@ COPY third_party/roboplan/ /tmp/roboplan-manifest/
 COPY scripts/ci/build-roboplan-source-stack.sh /tmp/build-roboplan-source-stack.sh
 COPY scripts/ci/build-roboplan-source-closure.sh /tmp/build-roboplan-source-closure.sh
 COPY scripts/ci/verify-external-source-closure.py /tmp/verify-external-source-closure.py
-COPY verification/composable_cell_e1/external_delta_ledger.v1.json /tmp/external-delta-ledger.v1.json
+COPY third_party/external_delta_ledger.v1.json /tmp/external-delta-ledger.v1.json
 COPY scripts/ci/check-roboplan-dependency-stack.py /tmp/check-roboplan-dependency-stack.py
 RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.cmake" -printf '%h\n' 2>/dev/null | head -1) \
     && PINOCCHIO_PREFIX=$(dirname "$(dirname "$(dirname "$PINOCCHIO_CMAKE_DIR")")") \
@@ -332,108 +560,10 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
          /tmp/verify-external-source-closure.py /tmp/external-delta-ledger.v1.json \
          /tmp/check-roboplan-dependency-stack.py /tmp/native-xml-needed.txt /tmp/native-xml-symbols.txt
 
-ARG TOPIC_BASED_ROS2_CONTROL_REPO=https://github.com/PickNikRobotics/topic_based_ros2_control.git
-ARG TOPIC_BASED_ROS2_CONTROL_REF=aa9f9ef9525a60f8becea322537dd1d6d1bf9123
-
-RUN set -eux; \
-    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
-    mkdir -p /tmp/topic_based_ros2_control_ws/src /opt/manyforge/topic_based_ros2_control; \
-    git clone "${TOPIC_BASED_ROS2_CONTROL_REPO}" /tmp/topic_based_ros2_control_ws/src/topic_based_ros2_control; \
-    cd /tmp/topic_based_ros2_control_ws/src/topic_based_ros2_control; \
-    git checkout "${TOPIC_BASED_ROS2_CONTROL_REF}"; \
-    test "$(git rev-parse HEAD)" = "aa9f9ef9525a60f8becea322537dd1d6d1bf9123"; \
-    cd /tmp/topic_based_ros2_control_ws; \
-    set +u; \
-    source "/opt/ros/${ROS_DISTRO}/setup.bash"; \
-    set -u; \
-    colcon build --merge-install --install-base /opt/manyforge/topic_based_ros2_control/install --packages-select topic_based_ros2_control --cmake-args -DBUILD_TESTING=OFF; \
-    printf '%s\n' "aa9f9ef9525a60f8becea322537dd1d6d1bf9123" > /opt/manyforge/topic_based_ros2_control/install/UPSTREAM_COMMIT; \
-    rm -rf /tmp/topic_based_ros2_control_ws
-
-# Description data only, for the test lanes' data overlay (scripts/test-all.sh).
-# The xArm driver is built separately below. Keep this exact previously
-# qualified description revision independently pinned.
-ARG XARM_DESCRIPTION_REPO=https://github.com/pastoriomarco/xarm_ros2
-ARG XARM_DESCRIPTION_REF=c3172e57c1c1bb2982fc008304ad6bc886357c87
-RUN set -eux; \
-    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
-    git clone --no-checkout "${XARM_DESCRIPTION_REPO}" /tmp/xarm_description_ws/src/xarm_ros2; \
-    cd /tmp/xarm_description_ws/src/xarm_ros2; \
-    git sparse-checkout init --cone; \
-    git sparse-checkout set xarm_description; \
-    git checkout "${XARM_DESCRIPTION_REF}"; \
-    test "$(git rev-parse HEAD)" = "c3172e57c1c1bb2982fc008304ad6bc886357c87"; \
-    set +u; \
-    source "/opt/ros/${ROS_DISTRO}/setup.bash"; \
-    set -u; \
-    cd /tmp/xarm_description_ws; \
-    colcon build --base-paths src/xarm_ros2/xarm_description \
-      --install-base /opt/manyforge/xarm_description/install \
-      --packages-select xarm_description --cmake-args -DBUILD_TESTING=OFF; \
-    printf '%s\n' "c3172e57c1c1bb2982fc008304ad6bc886357c87" \
-      > /opt/manyforge/xarm_description/install/VENDOR_COMMIT; \
-    rm -rf /tmp/xarm_description_ws
-
-# --- ROS dependency overlays used by every lane (Mock, Isaac, Real) ---
-# The entrypoint sources them in this order: xArm driver, controller overlay
-# last. Every source is pinned by commit.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ros-${ROS_DISTRO}-launch-param-builder \
-        ros-${ROS_DISTRO}-robot-state-publisher \
-        ros-${ROS_DISTRO}-urdf \
-    && rm -rf /var/lib/apt/lists/*
-
-# Stock JTC 6.10.0 controller overlay: apt ros2_control plus source JTC 6.10.0
-# (ros2_controllers tag 6.10.0), realtime_tools 5.4.0 and ros2_control_cmake 1.0.0.
-ARG ROS2_CONTROL_CMAKE_COMMIT=10b9df0d804c2880e7dc50927f8fd82c7198bda4
-ARG REALTIME_TOOLS_COMMIT=f2f8ee08580659e0ee673a8cdbd1a83b274e9d4a
-ARG ROS2_CONTROLLERS_COMMIT=0c702e0e938f94a9cc04c45e014ffdc4667f940e
-RUN set -euo pipefail; \
-    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
-    ws=/tmp/control_overlay_ws; mkdir -p "${ws}/src"; \
-    fetch() { \
-      git init -q "${ws}/src/$1"; \
-      git -C "${ws}/src/$1" fetch -q --depth 1 "https://github.com/ros-controls/$1" "$2"; \
-      git -C "${ws}/src/$1" checkout -q FETCH_HEAD; \
-      test "$(git -C "${ws}/src/$1" rev-parse HEAD)" = "$2"; \
-    }; \
-    fetch ros2_control_cmake "${ROS2_CONTROL_CMAKE_COMMIT}"; \
-    fetch realtime_tools "${REALTIME_TOOLS_COMMIT}"; \
-    fetch ros2_controllers "${ROS2_CONTROLLERS_COMMIT}"; \
-    set +u; source "/opt/ros/${ROS_DISTRO}/setup.bash"; set -u; \
-    cd "${ws}"; \
-    colcon build --install-base /opt/manyforge/control_overlay \
-        --packages-select ros2_control_cmake realtime_tools joint_trajectory_controller \
-        --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF; \
-    printf 'ros2_control_cmake %s\nrealtime_tools %s\nros2_controllers %s\n' \
-        "${ROS2_CONTROL_CMAKE_COMMIT}" "${REALTIME_TOOLS_COMMIT}" "${ROS2_CONTROLLERS_COMMIT}" \
-        > /opt/manyforge/control_overlay/UPSTREAM_COMMITS; \
-    rm -rf "${ws}"
-
-# UFactory xArm driver (xArm 5/6/7, Lite 6, UF850) from the fork
-# branch `lyrical-no-gazebo` (upstream lyrical + the xarm_io_states topic and
-# system_control service; gazebo packages removed), built against the controller
-# overlay above.
-ARG XARM_SOURCE_REPOSITORY=https://github.com/pastoriomarco/xarm_ros2
-ARG XARM_SOURCE_COMMIT=46aa1147d99963a8357b89744633db428746667b
-ARG XARM_SDK_COMMIT=f36794320a285c0b4bf1cd8ef181cbff6e3b794a
-RUN set -euo pipefail; \
-    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
-    ws=/opt/manyforge/xarm_ws; mkdir -p "${ws}/src"; \
-    git clone -q "${XARM_SOURCE_REPOSITORY}" "${ws}/src/xarm_ros2"; \
-    cd "${ws}/src/xarm_ros2"; \
-    git checkout -q "${XARM_SOURCE_COMMIT}"; \
-    git submodule update --init --recursive -q; \
-    test "$(git -C xarm_sdk/cxx rev-parse HEAD)" = "${XARM_SDK_COMMIT}"; \
-    printf 'xarm_ros2 %s\nxarm_sdk %s\n' "$(git rev-parse HEAD)" "${XARM_SDK_COMMIT}" > "${ws}/UPSTREAM_COMMITS"; \
-    rm -rf .git xarm_sdk/cxx/.git; \
-    set +u; source "/opt/ros/${ROS_DISTRO}/setup.bash"; \
-    source /opt/manyforge/control_overlay/setup.bash; set -u; \
-    cd "${ws}"; \
-    colcon build --packages-up-to xarm_controller xarm_api uf_ros_lib \
-        --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF; \
-    rm -rf build log
-
+# ROS workspaces built in the clean stage above (no venv/cmeel on any path).
+COPY --from=ros-workspaces /opt/manyforge/topic_based_ros2_control /opt/manyforge/topic_based_ros2_control
+COPY --from=ros-workspaces /opt/manyforge/xarm_description /opt/manyforge/xarm_description
+COPY --from=ros-workspaces /opt/manyforge/xarm_ws /opt/manyforge/xarm_ws
 
 # The venv distributions are the sole RoboPlan runtime/CMake prefix. The
 # disconnected C++ closure is removed in the same layer and cannot compete at

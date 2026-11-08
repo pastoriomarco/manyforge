@@ -23,7 +23,7 @@ export function coordinateUnitForKind(
 
 /**
  * Retain an addressed, unit-tagged UI draft. It cannot be submitted directly;
- * I6 owns the exact gripper.command_position transport shape and validation.
+ * the exact gripper.command_position transport shape and validation live elsewhere.
  */
 export function gripperPositionDraft(
   componentId: string,

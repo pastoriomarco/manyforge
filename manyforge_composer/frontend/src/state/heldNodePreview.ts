@@ -235,8 +235,7 @@ export interface HeldNodeGhostSource {
  *
  * A Program move is planned through the run's captured Program binding, not
  * the manual-control binding, so the receipt is resolved through the Applied
- * Program binding: the preview's exact component and target roles must name
- * the same physical component and command target there, and that physical
+ * Program binding: the preview's exact component and command target must match there, and that physical
  * target's model descriptor must list the receipt's joints. Null when there
  * is no successful preview; otherwise a ghost or the reason there is none.
  */
@@ -263,26 +262,24 @@ export function heldNodeGhostSource(
     };
   }
   if (
-    receipt.componentRoleId !== target.componentRoleId
-    || receipt.targetRoleId !== target.targetRoleId
-    || !binding.target_role_bindings.some((row) => (
-      row.target_role_id === target.targetRoleId
-      && row.component_role_id === target.componentRoleId
-      && row.controllable_component_id === target.controllableComponentId
-      && row.command_target_id === target.commandTargetId
+    receipt.target.componentId !== target.componentId
+    || receipt.target.commandTargetId !== target.commandTargetId
+    || !binding.target_bindings.some((row) => (
+      row.target.component_id === target.componentId
+      && row.target.command_target_id === target.commandTargetId
     ))
   ) {
     return {
-      reason: `The Applied binding does not bind ${target.componentRoleId}/${target.targetRoleId} to the previewed robot target.`,
+      reason: `The Applied binding does not bind ${target.componentId}/${target.commandTargetId} to the previewed robot target.`,
     };
   }
   const descriptor = motionTargets.find((candidate) => (
-    candidate.targetDescriptor.controllableComponentId === target.controllableComponentId
+    candidate.targetDescriptor.controllableComponentId === target.componentId
     && candidate.targetDescriptor.commandTargetId === target.commandTargetId
   ))?.targetDescriptor ?? null;
   if (descriptor === null) {
     return {
-      reason: `No robot model is available for ${target.controllableComponentId}/${target.commandTargetId}.`,
+      reason: `No robot model is available for ${target.componentId}/${target.commandTargetId}.`,
     };
   }
   if (

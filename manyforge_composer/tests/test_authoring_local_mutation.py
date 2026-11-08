@@ -15,10 +15,11 @@ import logging
 from typing import Any
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from manyforge_headless_api.client import HeadlessClientError
+from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 
 from manyforge_composer.backend.authoring_admission import (
     AuthoringAdmissionCoordinator,
@@ -711,6 +712,49 @@ def test_uncertain_acquire_retains_exact_request_and_recovers_no_effect(
     assert coordinator.mutation_ready is True
     assert headless.settlements[-1]["settlement_kind"] == "proven_no_effect"
     assert "install" not in headless.events
+
+
+@pytest.mark.parametrize("error_type", [httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout])
+def test_real_http_client_retains_claim_after_lost_acquire_reply(error_type) -> None:
+    accepted = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/program/authoring-transactions"
+        accepted.append(json.loads(request.content))
+        raise error_type("reply lost after acceptance", request=request)
+
+    with httpx.Client(base_url="http://headless.test", transport=httpx.MockTransport(handler)) as raw:
+        coordinator = AuthoringAdmissionCoordinator(HeadlessHttpClient("http://headless.test", client=raw))
+        with pytest.raises(HTTPException) as raised:
+            coordinator._acquire_local_claim(
+                transaction_id="transaction.1", payload_digest="sha256:" + "a" * 64,
+                expected_admission_generation=7, operation_kind="load_scenario_document",
+            )
+        assert raised.value.detail["code"] == (
+            "headless_http_timeout" if error_type is httpx.ReadTimeout else "headless_http_unavailable"
+        )
+        assert len(accepted) == 1
+        assert coordinator.mutation_ready is False
+        assert coordinator.local_claim_pending is True
+        assert coordinator._pending_local_claim.acquire_request == accepted[0]
+
+
+def test_real_http_client_authoritative_acquire_refusal_does_not_contain() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"detail": {"code": "authoring_not_ready",
+                                                    "message": "admission closed"}}, request=request)
+
+    with httpx.Client(base_url="http://headless.test", transport=httpx.MockTransport(handler)) as raw:
+        coordinator = AuthoringAdmissionCoordinator(HeadlessHttpClient("http://headless.test", client=raw))
+        with pytest.raises(HTTPException) as raised:
+            coordinator._acquire_local_claim(
+                transaction_id="transaction.1", payload_digest="sha256:" + "a" * 64,
+                expected_admission_generation=7, operation_kind="load_scenario_document",
+            )
+        assert raised.value.detail["code"] == "authoring_not_ready"
+        assert coordinator.mutation_ready is True
+        assert coordinator.local_claim_pending is False
 
 
 def test_uncertain_no_effect_settlement_retains_its_disposition(tmp_path) -> None:

@@ -3,7 +3,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { readStyleSource, styleFiles, styleTokens } from './readStyleSource';
 
-// UI6-I-VC guard: colors live only in the two token files, every class the
+// Style system guard: colors live only in the two token files, every class the
 // components use has a rule, and no rule prelude is written twice in one file.
 
 const stylesRoot = new URL('./', import.meta.url);
@@ -94,7 +94,7 @@ function preludes(css: string): string[] {
   return found;
 }
 
-describe('UI6-I-VC style system', () => {
+describe('style system', () => {
   const files = styleFiles();
 
   it('keeps raw colors in tokens.css and tokens.ts only', () => {

@@ -110,12 +110,18 @@ public:
 
 class FeedbackRig {
 public:
-  runtime::WallClock clock;
-  ros::Ros2TransportResources resources;
+  std::shared_ptr<runtime::WallClock> clock_owner = std::make_shared<runtime::WallClock>();
+  runtime::WallClock &clock = *clock_owner;
+  runtime::SimpleScheduler scheduler;
+  std::shared_ptr<ros::Ros2TransportResources> resources_owner;
+  ros::Ros2TransportResources &resources;
+  std::shared_ptr<ros::Ros2TransportResources> epoch_resources;
   std::unique_ptr<ros::Ros2ControlExecutionBackend> adapter;
   core::ExecutionGoalKey key{core::ControllerGoalId("perf.feedback"), core::ControllerGoalGeneration(1)};
-  FeedbackRig() : resources("manyforge_perf_feedback_" + fake::unique_suffix(), "", 2,
-                            std::make_shared<NullSink>(), "arm", clock) {
+  FeedbackRig() : resources_owner(ros::Ros2TransportResources::create(
+                      "manyforge_perf_feedback_" + fake::unique_suffix(), "", 2,
+                      std::make_shared<NullSink>(), "arm", clock)),
+                  resources(*resources_owner) {
     const auto route = "/manyforge_perf_" + fake::unique_suffix();
     server_ = rclcpp_action::create_server<Action>(resources.node(), route + "/fjt",
       [](const auto&, auto) { return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE; },
@@ -126,11 +132,15 @@ public:
     config.state_topic = route + "/state";
     config.scale_topic = route + "/scale";
     config.binding_epoch = core::ExecutionBindingEpoch(1);
+    config.lifecycle_command_timeout_ns = 1'000'000'000;
     config.lane_facts.joint_names = {"joint_1"};
     config.lane_facts.controller_update_rate_hz = 100.0;
-    adapter = std::make_unique<ros::Ros2ControlExecutionBackend>(resources, clock, config);
+    epoch_resources = ros::Ros2TransportResources::create(
+        "manyforge_perf_epoch_" + fake::unique_suffix(), "", 1);
+    adapter = std::make_unique<ros::Ros2ControlExecutionBackend>(epoch_resources, clock_owner, scheduler, config);
     adapter->ObserveReadiness({true, true, true, core::ExecutionBindingEpoch(1)});
     resources.start();
+    epoch_resources->start();
     await([&] { return adapter->ActionServerIsReady(); }, "Fake FJT discovery timed out");
     core::TrajectoryDTO trajectory;
     trajectory.joint_names = {"joint_1"};
@@ -222,7 +232,8 @@ core::RuntimeParticipantBinding ArmBinding() {
 // enabling FakeJtc's periodic publisher. One manually published sample remains
 // unchanged while the real public handle's 100 Hz observer timer runs.
 struct IdleRig {
-  runtime::WallClock clock;
+  std::shared_ptr<runtime::WallClock> clock_owner = std::make_shared<runtime::WallClock>();
+  runtime::WallClock &clock = *clock_owner;
   runtime::SimpleScheduler scheduler;
   core::RuntimeParticipantBinding binding = ArmBinding();
   core::ObservedRobotStatePublication publication{
@@ -250,9 +261,9 @@ struct IdleRig {
     arm.controller = {prefix + "/controller_manager", "arm_controller", "TestSystem"};
     arm.compiled_joint_names = {"joint_1"};
     const auto bound = handle->Bind(
-      std::make_unique<ros::Ros2TransportResources>(
+      ros::Ros2TransportResources::create(
         "manyforge_perf_handle_" + fake::unique_suffix(), "/", 3,
-        std::make_shared<NullSink>(), "arm", clock), clock, std::move(arm),
+        std::make_shared<NullSink>(), "arm", clock), clock, scheduler, std::move(arm),
       [this](std::shared_ptr<core::IExecutionPort> port) {
         // Existing runtime-handle test fixture values; no motion is submitted.
         core::ExecutionPortParticipantConfig config;
@@ -267,7 +278,7 @@ struct IdleRig {
           [](core::TimePoint, const std::stop_token&) { std::this_thread::sleep_for(1ms); },
           core::ExecutionPortParticipantStateAuthority{
             &publication, [] { return core::Result<void>::Ok(); }}, std::move(config));
-      }, nullptr, binding, std::nullopt);
+      }, nullptr, binding, std::nullopt, clock_owner);
     require(bound.ok(), "Idle runtime handle binding failed");
     handle->InstallSampleObserver([this](const core::ExecutionControllerSampleDTO& sample) {
       observed_epoch.store(sample.binding_epoch.value());

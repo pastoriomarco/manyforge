@@ -7,7 +7,6 @@ from manyforge_behavior.motion_runtime import (
     MotionTransactionOwnerUnavailableError,
 )
 from manyforge_behavior.nodes.motion_scoped import (
-    MOTION_SCOPED_NODE_RESTORATION_GATES,
     MotionScopedNodeUnavailableError,
     MoveUntilSignal,
     ProbeSearchMove,
@@ -26,8 +25,6 @@ def test_motion_scoped_nodes_fail_before_kernel_or_signal_access(node_type: type
         match="composable_cell_motion_scoped_node_unavailable",
     ):
         node_type(poison, kernel=poison, signal=poison)
-
-    assert MOTION_SCOPED_NODE_RESTORATION_GATES == ("I6", "N", "I8", "P5")
 
 
 def test_motion_transaction_fails_before_kernel_access() -> None:

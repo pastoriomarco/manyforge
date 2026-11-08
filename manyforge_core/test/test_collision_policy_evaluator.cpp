@@ -1,4 +1,4 @@
-// Unit tests for the Chunk 3 CollisionPolicyEvaluator: free-space default,
+// Unit tests for the CollisionPolicyEvaluator: free-space default,
 // static-static filtering, support-contact state machine (start / continued
 // / separated / recontact violation), touch-link allowances, and the
 // diagnostic-incomplete fail-closed rule.
@@ -640,7 +640,7 @@ TEST(CollisionPolicyEvaluator,
   EXPECT_FALSE(out.pairs[1].is_first_failure);
 }
 
-// --- M6 collision clearance: per-pair margins from the policy -------------
+// --- Collision clearance: per-pair margins from the policy ----------------
 
 CollisionWorldBody clearance_body(const std::string& id, CollisionOwnerKind owner,
                                   std::optional<CollisionBodyId> parent = std::nullopt) {
@@ -653,7 +653,7 @@ CollisionWorldBody clearance_body(const std::string& id, CollisionOwnerKind owne
 }
 
 TEST(CollisionClearanceMargins, MarginFollowsTheContactPolicies) {
-  // M6 decision 17: a pair the contact policy allows to touch keeps margin 0;
+  // A pair the contact policy allows to touch keeps margin 0;
   // every other robot <-> environment pair gets the move's clearance. The
   // move's target object is not exempt by itself.
   const std::string base = "component/arm/model/arm_model/body/base/collision/0";

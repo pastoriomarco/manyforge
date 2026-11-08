@@ -1054,7 +1054,7 @@ export function parseSceneRuntimeProjection(value: unknown): SceneRuntimeProject
     'sceneRuntime.state',
   );
   const stateApiVersion = stringAt(state.api_version, 'sceneRuntime.state.api_version');
-  // Contract 130 (SX-2377): v2 carries the pose-source `payload_quality`; v1 is refused.
+  // v2 carries the pose-source `payload_quality`; v1 is refused.
   if (stateApiVersion !== 'manyforge.scene_runtime_state.v2') {
     return fail('sceneRuntime.state.api_version', 'manyforge.scene_runtime_state.v2');
   }
@@ -1781,8 +1781,8 @@ export function parseSceneTransactionResponse(value: unknown): SceneTransactionR
     'sceneTransaction',
   );
   const apiVersion = stringAt(record.api_version, 'sceneTransaction.api_version');
-  if (apiVersion !== 'manyforge.manager_command_response.v1') {
-    return fail('sceneTransaction.api_version', 'manyforge.manager_command_response.v1');
+  if (apiVersion !== 'manyforge.manager_command_response.v2') {
+    return fail('sceneTransaction.api_version', 'manyforge.manager_command_response.v2');
   }
   if (record.ok !== true || record.error !== null) {
     return fail('sceneTransaction', 'a successful committed response');

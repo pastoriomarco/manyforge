@@ -50,7 +50,7 @@ struct TargetSpec final {
       {"planning.motion.pose_goal", std::nullopt},
       {"state.observed.current", std::nullopt},
   };
-  // TCP-A: frame roles tagged `tcp` (`flange` adds a flange row) and the
+  // Frame roles tagged `tcp` (`flange` adds a flange row) and the
   // target's default TCP.
   std::vector<std::string> tcp_frames{};
   std::optional<std::string> default_tcp{};
@@ -565,7 +565,7 @@ TEST(ComponentTypeCodecTest,
   EXPECT_ANY_THROW(qualify(duplicate_body, rich_dependencies()));
 }
 
-// TCP-A: TCP tags and the default TCP; a motion target tags its flange.
+// TCP tags and the default TCP; a motion target tags its flange.
 TEST(ComponentTypeCodecTest, TcpTagsNeedOneTaggedDefaultAndAMotionFlange) {
   TypeSpec spec;
   spec.targets.front().tcp_frames = {"tcp"};

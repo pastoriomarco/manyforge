@@ -1,4 +1,4 @@
-"""C2 run-scoped recovery ledger contracts."""
+"""Run-scoped recovery ledger contracts."""
 
 from __future__ import annotations
 

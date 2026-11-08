@@ -83,6 +83,17 @@ constexpr std::array<std::string_view, 14U> kCellCapabilities{{
     "scene.shape.mesh",
     "scene.shape.sphere",
 }};
+constexpr std::array<std::string_view, 2U> kExecutionCoreCapabilities{{
+    "execution.interrupt.contact_policy",
+    "execution.interrupt.resource_scoped",
+}};
+constexpr std::array<std::string_view, 5U> kSimulatorCapabilities{{
+    "simulator.control.pause",
+    "simulator.control.play",
+    "simulator.control.reset",
+    "simulator.control.step",
+    "simulator.entity_state.set",
+}};
 // The generic native provider's lifecycle surface: exactly the intents its
 // catalog plans. Recover is offered only for named supported conditions, and
 // the native catalog currently has none.
@@ -238,6 +249,39 @@ class CatalogSelection final {
   });
 }
 
+// The execution core is always present in the cell host. Its interrupt
+// capabilities are cell services and require no external runtime endpoint.
+// An empty cell is infrastructure-only and carries no capabilities.
+[[nodiscard]] Array execution_core_provider_rows(CatalogSelection &catalog,
+                                                 const core::CellId &runtime_cell_id) {
+  const auto &execution_core = catalog.require(
+      core::CatalogRecordKind::kProviderManifest,
+      "manyforge.provider.execution_core");
+  Array rows;
+  for (const auto capability : kExecutionCoreCapabilities) {
+    std::string normalized(capability);
+    std::replace(normalized.begin(), normalized.end(), '.', '-');
+    Object row{
+        {"capability_provider_binding_id", CanonicalValue(
+            runtime_cell_id.value() + "." + normalized + ".provider")},
+        {"capability_provider_binding_revision", CanonicalValue(std::string(kZeroDigest))},
+    };
+    const auto selected_capability = selector(catalog, capability);
+    for (const auto &selected : object(selected_capability, "selector"))
+      row.push_back(selected);
+    row.insert(row.end(), {
+        {"scope", CanonicalValue("cell_global")},
+        {"target", CanonicalValue(Object{{"cell_id", CanonicalValue(runtime_cell_id.value())}})},
+        {"provider_instance_id", CanonicalValue(runtime_cell_id.value() + ".execution_core")},
+        {"provider_manifest_id", CanonicalValue("manyforge.provider.execution_core")},
+        {"provider_manifest_revision", CanonicalValue(revision(execution_core))},
+        {"endpoint_bindings", CanonicalValue(Array{})},
+    });
+    rows.emplace_back(std::move(row));
+  }
+  return rows;
+}
+
 [[nodiscard]] std::vector<std::string>
 source_joints(const ActivationComponentProfile &profile,
               std::string_view role) {
@@ -284,7 +328,7 @@ component_type_id(const ActivationComponentProfile &profile,
   return profile.model_asset_id + ".fixed_scale.component";
 }
 
-// D4: a pneumatic tool profile runs on no lane (its row declares no
+// A pneumatic tool profile runs on no lane (its row declares no
 // `lanes`). Its lane lives in the I/O components its `pneumatic_io`
 // references, so one tool row serves every lane.
 [[nodiscard]] bool lane_free_tool(const ActivationComponentProfile &profile) {
@@ -292,8 +336,8 @@ component_type_id(const ActivationComponentProfile &profile,
          is_tool(profile) && !profile.lane.has_value();
 }
 
-// CP8 step 1: a real robot reports measured state; Mock and Isaac stay
-// commanded (CP4 authority rule).
+// A real robot reports measured state; Mock and Isaac stay
+// commanded.
 [[nodiscard]] bool real_controller_profile(
     const ActivationComponentProfile &profile) {
   return profile.runtime_kind == ActivationRuntimeKind::kRos2Control &&
@@ -302,7 +346,7 @@ component_type_id(const ActivationComponentProfile &profile,
 
 // Every lane uses the one shared ros2_control provider: the vendor adapter
 // the execution host reads from the model's `lanes.real.adapter` row
-// (CONTRACTS §12) does the vendor sequence, so no provider names a vendor.
+// does the vendor sequence, so no provider names a vendor.
 constexpr std::string_view kRos2ControlProviderId =
     "manyforge.provider.ros2_control";
 
@@ -420,7 +464,7 @@ motion_limits(const ActivationDeploymentComponent &component) {
   return CanonicalValue(std::move(result));
 }
 
-// Q37: carry the component's authored `default_fault_stop_profile` (main's
+// Carry the component's authored `default_fault_stop_profile` (main's
 // field set) unchanged into the ROS runtime configuration for its arm target.
 // The source-joint map becomes canonical-sorted rows because the closed
 // runtime schema has no map form; nothing is derived or defaulted here.
@@ -463,7 +507,7 @@ motion_limits(const ActivationDeploymentComponent &component) {
   return CanonicalValue(std::move(row));
 }
 
-/// Q48: an arm's authored `controlled_stop.per_joint_limits`, one row per
+/// An arm's authored `controlled_stop.per_joint_limits`, one row per
 /// arm source joint, keyed by that joint (never by row position), each Stop
 /// deceleration no lower than the acceleration ordinary planning may use for
 /// the joint. Its two outputs are the arm's Stop stage rows and its
@@ -585,7 +629,7 @@ struct ComponentProjection final {
                                  : "manyforge.gripper_position_cancellation";
 }
 
-// CP9: measured joints remain required. A pneumatic gripper without its own
+// Measured joints remain required. A pneumatic gripper without its own
 // controller (Real robot, lane-free tool) has no gripper-feedback stream; the
 // other lanes retain their existing requirement.
 void require_component_stream_rows(const ActivationDeploymentComponent &component,
@@ -833,7 +877,7 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
       fail(component.component_id + " (model " +
            profile.component_profile_id + ") names no lane");
     }
-    // The model's `lanes.<lane>` row (CONTRACTS §12 ModelLaneRow) travels
+    // The model's `lanes.<lane>` row travels
     // verbatim as canonical JSON, so the execution host builds the
     // component's adapter without reading the model folder.
     Object row{
@@ -843,9 +887,9 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
         {"lane_row", CanonicalValue(canonical_json(*profile.lane_row))},
         {"model_family_id", CanonicalValue(profile.model_family_id)},
     };
-    // CP8 step 1: a Real row names its address through a site-settings
+    // A Real row names its address through a site-settings
     // reference (never an address); the other lanes carry none. A machine's
-    // arm member takes its owner's (CONTRACTS §16) and has none of its own.
+    // arm member takes its owner's and has none of its own.
     if (profile.owner_component_id.has_value()) {
       if (configuration.find_object_member("device_address_ref") != nullptr)
         fail(component.component_id + " is a member of " +
@@ -875,11 +919,11 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
     if (const auto *anchor = configuration.find_object_member("stop_lead_in_anchor")) {
       row.emplace_back("stop_lead_in_anchor", *anchor);
     }
-    // M6b: the component's controller TCP offset sync (absent: on).
+    // The component's controller TCP offset sync (absent: on).
     if (const auto *sync = configuration.find_object_member("controller_tcp_offset_sync")) {
       row.emplace_back("controller_tcp_offset_sync", *sync);
     }
-    // N17: what the host launches the component with, so it reads no model
+    // What the host launches the component with, so it reads no model
     // or planning product for it: an arm's source joints in controller order
     // (its `arm_joints`), a tool's gripper joint, and its description (the
     // model URDF; compile_activation_deployment adds the cell's static
@@ -894,7 +938,7 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
       row.emplace_back("joint_names", CanonicalValue(std::move(joints)));
     }
     row.emplace_back("description", CanonicalValue(source_urdf(model)));
-    // Q48: an arm launches its JTC with its operator Stop decelerations.
+    // An arm launches its JTC with its operator Stop decelerations.
     if (!tool)
       row.emplace_back("max_deceleration_on_cancel_rad_s2",
                        max_deceleration_on_cancel_rows(
@@ -946,7 +990,7 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
   CanonicalValue runtime_configuration =
       object_with(configuration, "motion_target_limits", limits);
   if (controller_profile_row.has_value()) {
-    // Q68: the unit carries each component's own controller profile.
+    // The unit carries each component's own controller profile.
     for (const std::string_view field :
          {"device_address_ref", "stop_lead_in_anchor",
           "controller_tcp_offset_sync"})
@@ -1004,7 +1048,7 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
   Array bindings;
   for (const std::string_view target : {std::string_view("arm"),
                                         std::string_view("gripper")}) {
-    // DX783: arm-only models expose no synthetic gripper target or resource.
+    // Arm-only models expose no synthetic gripper target or resource.
     // A tool has no arm target.
     if ((target == "gripper" && !has_gripper) || (target == "arm" && tool))
       continue;
@@ -1292,8 +1336,8 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
   });
 }
 
-// N17: every controller profile's description (its model URDF so far) with
-// the static frames of the composed cell appended (CONTRACTS §12): its own
+// Every controller profile's description (its model URDF so far) with
+// the static frames of the composed cell appended: its own
 // offset frames, the mounts on it and a process-less mounted child's fixed
 // links. `graph` is the compiled cell graph; composition reads none of its
 // runtime configuration, so the descriptions do not change it.
@@ -1440,7 +1484,7 @@ CanonicalValue compile_activation_deployment(
                                    CanonicalValue(0.0), CanonicalValue(1.0)})},
                            })},
     });
-    // B5: the primary tool of an interface; written only when true.
+    // The primary tool of an interface; written only when true.
     if (const auto *primary = row.find_object_member("primary");
         primary != nullptr && primary->as_bool()) {
       auto edge = attachments.back().as_object();
@@ -1474,8 +1518,8 @@ CanonicalValue compile_activation_deployment(
         }));
     return prepared_models.at(index);
   };
-  // Q89: empty membership keeps the same ROS cell host and optional world.
-  // Q68: a ROS composition admits any number of robots and components, each
+  // Empty membership keeps the same ROS cell host and optional world.
+  // A ROS composition admits any number of robots and components, each
   // of which must select a ROS controller profile from the catalog. Mixing
   // with native components stays refused until the native executor goes.
   const auto has_ros_controller_profile = [](const auto &profile) {
@@ -1700,7 +1744,7 @@ CanonicalValue compile_activation_deployment(
       }
     }
     using MergedFields = std::array<std::string_view, 13U>;
-    // Q68: one ROS runtime unit hosts every component and each component
+    // One ROS runtime unit hosts every component and each component
     // keeps its own controller profile, fault Stop profile, authored
     // gripper target rows and stream defaults; the ROS runtime schema has no
     // native direct-control field.
@@ -1794,7 +1838,7 @@ CanonicalValue compile_activation_deployment(
     const auto ready = prepare_cell_graph_identity(intrinsic, selected_profiles);
     return compute_graph_revision(ready);
   };
-  // N17: the launched descriptions need the composed cell, which needs the
+  // The launched descriptions need the composed cell, which needs the
   // graph: compose the graph with the model URDFs, then compile it again with
   // the full descriptions.
   if (!controller_profiles.empty())
@@ -2049,7 +2093,7 @@ CanonicalValue compile_activation_deployment(
               controlled_parameters.emplace_back("fallback_stop_modes",
                                                  *fallback_modes);
           }
-          // Q28/Q51 (`main`): the per-profile maximum Stop time, when authored.
+          // The per-profile maximum Stop time, when authored.
           if (const auto *max_stop = controlled.find_object_member("max_stop_time_s");
               max_stop != nullptr) {
             const auto *seconds = std::get_if<double>(&max_stop->storage());
@@ -2077,7 +2121,7 @@ CanonicalValue compile_activation_deployment(
         }
       }
     }
-    // Every native component uses the generic CCLC lifecycle provider.
+    // Every native component uses the generic component lifecycle provider.
     for (const auto capability : kLifecycleCapabilities) {
       static_cast<void>(selector(catalog, capability));
     }
@@ -2085,7 +2129,7 @@ CanonicalValue compile_activation_deployment(
       static_cast<void>(selector(catalog, "component.lifecycle.recover"));
     }
   }
-  // Model-free provider families: the I/O signal provider, the CP9 pose
+  // Model-free provider families: the I/O signal provider, the pose
   // source and the AI model. Each selects its exact maintained manifest once.
   struct ModelFreeProvider final {
     std::string_view manifest_id;
@@ -2141,7 +2185,7 @@ CanonicalValue compile_activation_deployment(
              "definition");
     }
   };
-  // A machine owner (CONTRACTS §16) and a sensor have no targets and no
+  // A machine owner and a sensor have no targets and no
   // provider binding.
   const auto target_less = [&](std::string_view component_id) {
     return std::any_of(component_profiles.begin(), component_profiles.end(),
@@ -2265,6 +2309,39 @@ CanonicalValue compile_activation_deployment(
         })})},
     });
     providers.emplace_back(std::move(row));
+  }
+  for (auto &row : execution_core_provider_rows(catalog, runtime_cell_id))
+    providers.emplace_back(std::move(row));
+  // These cell capabilities describe the configured Isaac dependency. They
+  // do not create a simulator or change the Runner's control port.
+  const bool has_isaac = std::any_of(
+      controller_profiles.begin(), controller_profiles.end(), [](const auto &profile) {
+        return text(member(profile, "lane", "controller profile"), "lane") == "isaac";
+      });
+  if (has_isaac) {
+    const auto &simulator = catalog.require(
+        core::CatalogRecordKind::kProviderManifest, "manyforge.provider.simulator");
+    for (const auto capability : kSimulatorCapabilities) {
+      std::string normalized(capability);
+      std::replace(normalized.begin(), normalized.end(), '.', '-');
+      Object row{
+          {"capability_provider_binding_id", CanonicalValue(
+              runtime_cell_id.value() + "." + normalized + ".provider")},
+          {"capability_provider_binding_revision", CanonicalValue(std::string(kZeroDigest))},
+      };
+      const auto selected_capability = selector(catalog, capability);
+      for (const auto &selected : object(selected_capability, "selector"))
+        row.push_back(selected);
+      row.insert(row.end(), {
+          {"scope", CanonicalValue("cell_global")},
+          {"target", CanonicalValue(Object{{"cell_id", CanonicalValue(runtime_cell_id.value())}})},
+          {"provider_instance_id", CanonicalValue(runtime_id + ".simulator")},
+          {"provider_manifest_id", CanonicalValue("manyforge.provider.simulator")},
+          {"provider_manifest_revision", CanonicalValue(revision(simulator))},
+          {"endpoint_bindings", CanonicalValue(Array{})},
+      });
+      providers.emplace_back(std::move(row));
+    }
   }
   for (std::size_t index = 0; index < component_profiles.size(); ++index)
     if (!is_model_free_runtime_kind(component_profiles[index].runtime_kind) &&

@@ -5,7 +5,7 @@
 
 namespace manyforge::core {
 
-/// Timeouts DTO (spec §3.4)
+/// Timeouts DTO
 struct TimeoutsDTO {
     double planning_timeout_s = 5.0;    // > 0
     double execution_timeout_s = 10.0;  // > 0
@@ -21,7 +21,7 @@ struct TimeoutsDTO {
 /// Kernel's execution watchdog fires only after max(10 s, `minimum_s`,
 /// 1.5 x duration + 2 s), so the controller's own verdict (end of trajectory
 /// plus its `goal_time`) always comes first. Also the bound of a dispatched
-/// Stop trajectory (maintainer M6: a Stop finishes like a normal motion).
+/// Stop trajectory (a Stop finishes like a normal motion).
 [[nodiscard]] inline double trajectory_execution_budget_s(const double duration_s,
                                                           const double minimum_s = 10.0) {
     return std::max({10.0, minimum_s, 1.5 * duration_s + 2.0});

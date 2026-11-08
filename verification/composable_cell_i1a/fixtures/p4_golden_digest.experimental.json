@@ -1,6 +1,0 @@
-{
-  "bundle_sha256": "8c53a19316a645586eb431cfb4670ced9345c469ba88852bc2c3fe303660473f",
-  "case": "single_composable_arm",
-  "manifest_sha256": "9e9809df4f588db8b0128a43c4310acdbed30506f281dc5910a12447f9a53dfc",
-  "schema": "manyforge.experimental.composable_cell.i1a.v0"
-}

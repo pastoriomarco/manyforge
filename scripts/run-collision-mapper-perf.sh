@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# N7 successor for the deleted FNV/path-derived collision mapper probe.
+# Successor for the deleted FNV/path-derived collision mapper probe.
 #
 # The current product performs no runtime mapper rebuild. This entrypoint runs
 # the exact compiler-emitted symbol/body point-lookup workload through the

@@ -134,8 +134,11 @@ TEST(XArmLaunchContribution, EverySupportedModelGeneratesItsTemplate) {
     EXPECT_EQ(manager["hardware_components_initial_state"]["inactive"][0].as<std::string>(),
               "${hardware_component}");
     const auto arm = controllers["/**/__controller__"]["ros__parameters"];
-    // The generator writes the hardware's command interfaces.
-    EXPECT_EQ(arm["command_interfaces"][0].as<std::string>(), "__command_interfaces__");
+    // The arm claims position only, although the hardware exports position
+    // and velocity: stock JTC accepts speed scaling only with that claim.
+    ASSERT_EQ(arm["command_interfaces"].size(), 1U) << yaml;
+    EXPECT_EQ(arm["command_interfaces"][0].as<std::string>(), "position");
+    EXPECT_EQ(count("__command_interfaces__"), 0U) << yaml;
     EXPECT_DOUBLE_EQ(arm["action_monitor_rate"].as<double>(), 20.0);
     EXPECT_TRUE(arm["constraints"]["decelerate_on_cancel"].as<bool>());
 
@@ -148,7 +151,7 @@ TEST(XArmLaunchContribution, EverySupportedModelGeneratesItsTemplate) {
     for (const auto &name : settings["driver"]["services"])
       EXPECT_TRUE(driver["services"][name.as<std::string>()].as<bool>()) << name.as<std::string>();
     EXPECT_FALSE(driver["services"]["move_joint"].as<bool>());
-    // M7's list: clean_warn, get_state, get_servo_angle, set_mode on; the
+    // The list: clean_warn, get_state, get_servo_angle, set_mode on; the
     // digital-input reads off (the I/O stream replaced them).
     for (const auto *name : {"clean_warn", "get_state", "get_servo_angle", "set_mode"})
       EXPECT_TRUE(driver["services"][name].as<bool>()) << name;
@@ -191,7 +194,7 @@ TEST(XArmLaunchContribution, MockAndIsaacRowsTakeTheVendorControllersWithoutTheR
   }
 }
 
-// CONTRACTS §16, AUD-5b revised: the machine's process with its arm
+// The machine's process with its arm
 // deactivated: the same hardware (starting inactive) and driver parameters
 // (the I/O stream), and no arm controller at all.
 TEST(XArmLaunchContribution, ArmDeactivatedProcessHasNoArmController) {
@@ -266,6 +269,40 @@ TEST(XArmLaunchContribution, InvalidRowsAreRefusedTyped) {
     ASSERT_FALSE(row.ok()) << text;
     EXPECT_EQ(row.error().code, "adapter_configuration_invalid");
   }
+}
+
+// The pre-0.2.0 adapter rule (EXPECTED_CONTROLLER_COMMAND_INTERFACES): a
+// generated arm controller claiming anything but `position` is refused typed.
+TEST(XArmLaunchContribution, ArmControllerClaimingMoreThanPositionIsRefusedTyped) {
+  const auto real = YAML::LoadFile(
+      (kRoot / "manyforge_example_models" / "models" / "lite6" / "component.yaml").string())
+      ["lanes"]["real"];
+  const auto row = lane_row(real);
+  const auto share = vendor_share("lite6", row.controller);
+  for (const auto *claim : {"[position, velocity]", "[velocity]", "[]"}) {
+    const auto vendor = std::filesystem::temp_directory_path() /
+                        ("manyforge_xarm_vendor_refusal_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(vendor);
+    std::filesystem::copy(kVendor, vendor, std::filesystem::copy_options::recursive);
+    auto settings = YAML::LoadFile((vendor / "manyforge_settings.yaml").string());
+    settings["controllers"]["arm_controller"]["ros__parameters"]["command_interfaces"] =
+        YAML::Load(claim);
+    std::ofstream(vendor / "manyforge_settings.yaml") << YAML::Dump(settings);
+
+    const auto made = make_xarm_launch_contribution(row, vendor, in(share), true);
+    ASSERT_FALSE(made.ok()) << claim;
+    EXPECT_EQ(made.error().code, "adapter_configuration_invalid") << claim;
+    ASSERT_TRUE(made.error().details.contains("reason")) << claim;
+    EXPECT_EQ(made.error().details.at("reason"), "xarm_arm_controller_command_interfaces_refused")
+        << claim;
+    const auto controllers = make_xarm_controllers(row, vendor, in(share));
+    ASSERT_FALSE(controllers.ok()) << claim;
+    EXPECT_EQ(controllers.error().details.at("reason"),
+              "xarm_arm_controller_command_interfaces_refused")
+        << claim;
+    std::filesystem::remove_all(vendor);
+  }
+  std::filesystem::remove_all(share);
 }
 
 } // namespace

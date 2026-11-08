@@ -1,6 +1,6 @@
 # Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
 # `scripts/manyforge component check manyforge_example_models/models/lite_gripper`.
-# Mounts on a robot's `flange` interface as its own component (merge 6).
+# Mounts on a robot's `flange` interface as its own component.
 api_version: manyforge.component_package.v1
 kind: tool
 id: ufactory.lite_gripper
@@ -37,7 +37,7 @@ lanes:
   isaac:                          # Isaac lane adapter: the finger joint is in the robot's articulation
     adapter: isaac
     gripper_transport: isaac_joint_state_effort   # effort written straight to the joint command topic, no bridge
-    controller: lite_gripper_controller   # its GripperCommand action is <controller>/gripper_cmd
+    controller: lite_gripper_controller   # its ParallelGripperCommand action is <controller>/gripper_cmd
     command_topic: /isaac_joint_commands_gripper
     state_topic: /isaac_joint_states
     completion_policy: dwell_elapsed

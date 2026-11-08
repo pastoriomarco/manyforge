@@ -122,7 +122,7 @@ ExecuteRequestDTO base_request() {
 }
 
 ReferenceDTO frame_reference(std::string id) {
-  return ReferenceDTO(ReferenceDTO::Type::kFrameRole, std::move(id));
+  return ReferenceDTO(ProgramFrameReferenceDTO{ControllableComponentId("robot"), FrameRoleId(std::move(id))});
 }
 
 TEST(MotionTargetResolution, RelativeJointDeltasResolveByJointName) {
@@ -249,10 +249,7 @@ Pose3DTO yaw_quarter_turn_at(double x_m, double y_m, double z_m) {
 TEST(MotionTargetResolution, AbsolutePoseInGoalFrameComposesFrameInBase) {
   auto request = base_request();
   request.goal_frame_reference =
-      ReferenceDTO(FrameRoleId("tcp"),
-                   ReferenceTargetDTO{TargetRoleId("peer_arm"),
-                                      ControllableComponentId("peer"),
-                                      CommandTargetId("arm")});
+      ReferenceDTO(ProgramFrameReferenceDTO{ControllableComponentId("peer"), FrameRoleId("tcp")});
   request.motion = PoseGoalDTO{pose_at(0.1, 0.0, 0.0)};
   ReferenceResolver resolver;
   resolver.poses.emplace("tcp", yaw_quarter_turn_at(1.0, 2.0, 3.0));
@@ -331,18 +328,15 @@ TEST(MotionTargetResolution, GoalFrameFailsClosedWithoutStartContextOrOutsideAbs
 
 TEST(MotionTargetResolution, RobotQualifiedFrameStaysDistinctFromOwnFrame) {
   const ReferenceDTO own = frame_reference("tcp");
-  const ReferenceDTO peer(FrameRoleId("tcp"),
-                         ReferenceTargetDTO{TargetRoleId("peer_arm"),
-                                            ControllableComponentId("peer"),
-                                            CommandTargetId("arm")});
+  const ReferenceDTO peer(ProgramFrameReferenceDTO{ControllableComponentId("peer"), FrameRoleId("tcp")});
   EXPECT_TRUE(reference_identity_matches_type(own));
   EXPECT_TRUE(reference_identity_matches_type(peer));
   EXPECT_FALSE(own == peer);
   auto incomplete = peer;
-  incomplete.target->command_target_id = CommandTargetId("");
+  std::get<ProgramFrameReferenceDTO>(incomplete.id).component_id = ControllableComponentId("");
   EXPECT_FALSE(reference_identity_matches_type(incomplete));
   auto qualified_scene = ReferenceDTO(ReferenceDTO::Type::kSceneResource, "box");
-  qualified_scene.target = peer.target;
+  qualified_scene.id = std::get<ProgramFrameReferenceDTO>(peer.id);
   EXPECT_FALSE(reference_identity_matches_type(qualified_scene));
 }
 

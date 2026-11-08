@@ -63,19 +63,18 @@ export interface ManualControlContracts {
 export interface TcpEntryIdentity {
   componentId: string;
   targetId: string;
+  frameComponentId: string;
   frameRoleId: string;
 }
 
 /** A stable in-memory key. The display name is never parsed or sent. */
 export function tcpEntryIdentityKey(entry: TcpEntryIdentity): string {
-  return JSON.stringify([entry.componentId, entry.targetId, entry.frameRoleId]);
+  return JSON.stringify([entry.componentId, entry.targetId, entry.frameComponentId, entry.frameRoleId]);
 }
 
 /** One TCP Robot Control can move a robot at, identified by its exact owner. */
 export interface DirectControlTcp {
   entry: TcpEntryIdentity;
-  /** Interim: present only for rows covered by the legacy endpoint binding. */
-  targetRoleId: string | null;
   controllableComponentId: string;
   commandTargetId: string;
   frameRoleId: string;
@@ -91,14 +90,13 @@ export interface DirectControlTcp {
 }
 
 export interface ManualControlMotionDescriptor {
-  schemaVersion: 'manyforge.manual_control_motion_descriptor.v6';
+  schemaVersion: 'manyforge.manual_control_motion_descriptor.v8';
   controllableComponentId: string;
   /** Exact component selected by Applied at this robot's flange; null if empty. */
   endEffectorComponentId: string | null;
   commandTargetId: string;
-  componentRoleId: string;
-  targetRoleId: string;
   frames: Array<{
+    frameComponentId: string;
     frameRoleId: string;
     compiledFrameName: string;
     modelInstanceId: string;
@@ -126,11 +124,9 @@ export interface ManualControlMotionDescriptor {
 }
 
 export interface ManualControlGripperDescriptor {
-  schemaVersion: 'manyforge.manual_control_gripper_descriptor.v3';
+  schemaVersion: 'manyforge.manual_control_gripper_descriptor.v5';
   controllableComponentId: string;
   commandTargetId: string;
-  componentRoleId: string;
-  targetRoleId: string;
   description: string | null;
   commandKind: 'gripper_position';
   actuationKind: 'position_commanded' | 'pneumatic' | null;
@@ -179,7 +175,7 @@ export interface ManualControlGripperDescriptor {
   contracts: ManualControlContracts;
 }
 
-/** One stage of a target's qualified Stop chain (SX-2167), in chain order. */
+/** One stage of a target's qualified Stop chain, in chain order. */
 export interface TargetStopResponseStage {
   stageId: string;
   stageKind: string;
@@ -202,15 +198,11 @@ export interface DirectControlMotionStatus {
     registrationGeneration: number; sequence: number } | null;
   controllableComponentId: string;
   commandTargetId: string;
-  componentRoleId: string;
-  targetRoleId: string;
+  baseFrame: { componentId: string; frameId: string };
   baseFrameRoleId: string;
-  /** The end-effector TCP's frame role, null when the robot has none (B1);
+  /** The end-effector TCP's frame role, null when the robot has none;
    * in a selected-status projection, the selected TCP's frame role. */
   tcpFrameRoleId: string | null;
-  /** Selected-status projection only: the selected TCP's direct-control
-   * target role (the robot's, or the mounted tool's). */
-  tcpTargetRoleId?: string | null;
   /** Selected-status projection: exact identity of the selected TCP row. */
   selectedTcpEntryKey?: string;
   operationCapabilityId: string;
@@ -232,8 +224,6 @@ export type ResourceSourceKind = 'model_role' | 'component_local';
 export interface DirectControlGripperStatus {
   controllableComponentId: string;
   commandTargetId: string;
-  componentRoleId: string;
-  targetRoleId: string;
   operationCapabilityId: string;
   programId: string;
   programRevision: string;
@@ -250,7 +240,6 @@ export interface DirectControlGripperStatus {
 }
 
 export interface ObservedMotionTarget {
-  targetRoleId: string;
   controllableComponentId: string;
   commandTargetId: string;
   sequence: number;
@@ -258,7 +247,7 @@ export interface ObservedMotionTarget {
   sourceJointNames: string[];
   positionsRad: number[];
   complete: boolean;
-  /** The end-effector TCP's pose, null when the robot has none (B1); in a
+  /** The end-effector TCP's pose, null when the robot has none; in a
    * selected-status projection, the selected TCP's. */
   currentTcpPose: Pose3Value | null;
   /** TCP-C: carried TCP poses in the base frame, by exact entry identity key. */
@@ -266,7 +255,6 @@ export interface ObservedMotionTarget {
 }
 
 export interface ObservedGripperTarget {
-  targetRoleId: string;
   controllableComponentId: string;
   commandTargetId: string;
   sequence: number;
@@ -308,7 +296,7 @@ export interface CellStopActionStatus {
   } | null;
 }
 
-/** One component listed by the execution owner (H1a-IF.2). A present but
+/** One component listed by the execution owner. A present but
  * ineligible component stays listed; the backend refuses its commands. */
 export interface ExecutionComponentStatus {
   controllableComponentId: string;
@@ -382,7 +370,7 @@ export type DirectControlMotionSpec =
 export interface MotionParticipantPayload {
   kind: 'motion';
   move_id: string;
-  base_frame_role_id: string;
+  base_frame: { component_id: string; frame_id: string };
   tcp_endpoint: { kind: 'current' };
   tolerances: {
     joint_position_tol_rad: number;
@@ -464,8 +452,7 @@ export interface DirectControlOperationIntent {
   /** The latest Scene is used; callers name no Scene revision. */
   expected_scene_revision: null;
   participants: [{
-    component_role_id: string;
-    target_role_id: string;
+    target: { component_id: string; command_target_id: string };
     required_capability_id: string;
     action_span: null;
     payload: MotionParticipantPayload | CapabilityCommandParticipantPayload;
@@ -478,18 +465,33 @@ export type JointMotionOperationIntent = DirectControlOperationIntent;
 
 export type DirectControlSetTcpIntent = Omit<DirectControlOperationIntent, 'participants'> & {
   participants: [{
-    component_role_id: string;
-    target_role_id: string;
+    target: { component_id: string; command_target_id: string };
     required_capability_id: string;
     action_span: null;
-    payload: { kind: 'set_tcp'; tcp: { kind: 'entry'; entry: {
-      component_id: string; target_id: string; frame_role_id: string;
-    } } };
+    payload: { kind: 'set_tcp'; tcp: { kind: 'entry'; target: {
+      component_id: string; command_target_id: string;
+    }; frame: { component_id: string; frame_id: string } } };
   }];
 };
 
+export interface MotionPreviewPath {
+  schemaVersion?: 'manyforge.motion_preview_diagnostic.v2';
+  kind?: 'validated_path' | 'collision_disabled_path' | 'collision_disabled_ik_pose' | 'collision_disabled_ik_path';
+  reason?: string;
+  sourceJointNames: string[];
+  pairs: { bodyA: string; bodyB: string }[];
+  samples: {
+    timeFromStartS: number;
+    positionsRad: number[];
+    contacts: { pairIndex: number; disposition: 'allowed' | 'refused' | 'unknown' }[];
+    status: 'checked' | 'unknown';
+    clearanceViolations?: { pairIndex: number; distanceM: number; requiredClearanceM: number }[];
+  }[];
+}
+
 export interface MotionPreviewReceipt {
-  schemaVersion: 'manyforge.direct_control_motion_preview.v1';
+  schemaVersion: 'manyforge.direct_control_motion_preview.v4';
+  pathPreview: MotionPreviewPath;
   receiptDigest: string;
   intentDigest: string;
   requestId: string;
@@ -501,8 +503,17 @@ export interface MotionPreviewReceipt {
   graphRevision: string;
   retainedBundleId: string;
   sceneRevision: SceneRevisionValue;
-  componentRoleId: string;
-  targetRoleId: string;
+  target: { componentId: string; commandTargetId: string };
+  resolvedTcp: {
+    entry: {
+      target: { componentId: string; commandTargetId: string };
+      frame: { componentId: string; frameId: string };
+    };
+    source: 'active_tcp' | 'joint_flange_fallback' | 'explicit_entry';
+    ownerEpoch: string;
+    registrationGeneration: number;
+    sequence: number;
+  };
   requiredCapabilityId: string;
   sourceJointNames: string[];
   startPositionsRad: number[];
@@ -516,7 +527,7 @@ export interface MotionPreviewReceipt {
 }
 
 export interface CapabilityCommandPreviewReceipt {
-  schemaVersion: 'manyforge.direct_control_capability_command_preview.v1';
+  schemaVersion: 'manyforge.direct_control_capability_command_preview.v2';
   receiptDigest: string;
   intentDigest: string;
   requestId: string;
@@ -527,8 +538,7 @@ export interface CapabilityCommandPreviewReceipt {
   programRunId: string;
   graphRevision: string;
   retainedBundleId: string;
-  componentRoleId: string;
-  targetRoleId: string;
+  target: { componentId: string; commandTargetId: string };
   requiredCapabilityId: string;
   commandSchemaId: string;
   commandSchemaRevision: string;
@@ -571,8 +581,6 @@ export interface OperationObservation {
   activeStopGeneration: number | null;
   terminalError: string | null;
   /** Exact target identity when the owner exposes operation participants. */
-  componentRoleId?: string;
-  targetRoleId?: string;
   controllableComponentId?: string;
   commandTargetId?: string;
 }
@@ -586,8 +594,8 @@ export type RuntimeScaleApplicationState =
 export interface RuntimeScaleControlSingularSelector {
   kind: 'singular';
   programBindingId: string;
-  componentRoleId: string;
-  targetRoleId: string;
+  componentId: string;
+  commandTargetId: string;
 }
 
 export interface RuntimeScaleControlGroupSelector {
@@ -597,8 +605,8 @@ export interface RuntimeScaleControlGroupSelector {
 }
 
 export interface RuntimeScaleControlTarget {
-  componentRoleId: string;
-  targetRoleId: string;
+  componentId: string;
+  commandTargetId: string;
 }
 
 export type RuntimeScaleControlSelector =

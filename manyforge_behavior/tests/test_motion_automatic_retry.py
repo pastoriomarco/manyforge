@@ -1,5 +1,5 @@
-"""Automatic motion retry and the motion operation lifecycle (spec 400 §7,
-spec 410 §4.1, DX-1169 close_operation, contract items 25-41)."""
+"""Automatic motion retry and the motion operation lifecycle
+(including close_operation)."""
 
 from __future__ import annotations
 
@@ -1058,7 +1058,7 @@ def test_program_refuses_a_value_source_on_the_literal_only_motion_settings() ->
             document,
             own_field="program_revision",
             identity_domain="program-revision",
-            api_version="manyforge.program.v2",
+            api_version="manyforge.program.v3",
         )
         with pytest.raises(ProgramValidationError, match=name):
             Program.from_dict(document, catalog)
@@ -1082,7 +1082,7 @@ def test_a_tree_reentry_is_a_new_node_attempt_with_its_own_automatic_budget() ->
     assert len(adapter.audit_events) == 2
 
 
-# --- Close reader (SX-1972..1974) ---------------------------------------------
+# --- Close reader -------------------------------------------------------------
 
 
 def test_close_permission_decides_first_over_legacy_labels_and_allowed_actions() -> None:
@@ -1216,7 +1216,7 @@ class _UnreadablePort(_MotionPort):
 def test_a_stopped_move_whose_state_reads_keep_failing_fails_after_the_transport_timeout(
     monkeypatch,
 ) -> None:
-    # CONTRACTS §9: the node waits for its component, but never forever when
+    # The node waits for its component, but never forever when
     # its state can't be read: after the Runner's transport timeout it fails
     # with a typed error and the tree handles it.
     now = [100.0]
@@ -1237,7 +1237,7 @@ def test_a_stopped_move_whose_state_reads_keep_failing_fails_after_the_transport
 
 def test_a_stopped_move_whose_reads_recover_keeps_waiting_without_the_bound(monkeypatch) -> None:
     # A readable but still undecided stopped task (activity `unknown`) waits
-    # as long as it takes (R2); only consecutive failed reads count.
+    # as long as it takes; only consecutive failed reads count.
     now = [0.0]
     monkeypatch.setattr(v2_owner, "_monotonic", lambda: now[0])
     interrupted = _failed(None, state=OwnerTaskState.INTERRUPTED)
@@ -1306,7 +1306,7 @@ def test_a_preempted_node_under_an_intervention_policy_is_neither_held_nor_retri
 
 
 def test_raw_co_participant_facts_never_replace_the_selected_cause_and_permission() -> None:
-    # SX-1985: every participant's raw terminal fact is kept. Close, retry and
+    # Every participant's raw terminal fact is kept. Close, retry and
     # hold read the selected cause and the Kernel's eligible_close/assessment,
     # never a fact list that would have to mirror the selected error.
     task = _failed(_assessment())
@@ -1330,7 +1330,7 @@ def test_raw_co_participant_facts_never_replace_the_selected_cause_and_permissio
     assert _tick(adapter) is _SUCCESS
 
 
-# Interrupt motion nodes (P5, I5): the adapter maps the typed rule result -----
+# Interrupt motion nodes: the adapter maps the typed rule result -------------
 
 
 def _rule_row(cause: str, stop_result: str | None, *, trip: bool = True) -> dict[str, Any]:
@@ -1487,7 +1487,7 @@ def test_interrupt_adapter_does_not_decide_on_an_unknown_execution_state_spellin
 ) -> None:
     # Only Core's exact TitleCase spellings qualify: an unknown one is neither
     # stopped nor intervention, so the stopped operation stays undecided and
-    # the node keeps rereading (CONTRACTS §9: it waits, never decides).
+    # the node keeps rereading (it waits, never decides).
     monkeypatch.setattr(v2_owner, "_ASSESSMENT_REREAD_LIMIT", 3)
     task = _interrupt_task(
         OwnerTaskState.INTERRUPTED, _rule_row("signal_trip", "succeeded_nominal"),
@@ -1598,7 +1598,7 @@ def _stuck_stop() -> OwnerTaskSnapshot:
 def test_an_unconfirmed_stop_waits_for_the_component_then_gets_its_normal_result(
     monkeypatch,
 ) -> None:
-    """CONTRACTS §9 (R2, R5): a stopped operation whose result can't be
+    """A stopped operation whose result can't be
     confirmed (the component's activity is `unknown`) neither holds for an
     operator acknowledgement nor advances the tree: the node waits past the
     old reread bound, then gets the Stop's normal result once it settles."""
@@ -1720,7 +1720,7 @@ def _escalated_terminal() -> dict[str, Any]:
 
 
 def test_interrupt_adapter_waits_while_the_stop_terminal_is_pending() -> None:
-    # SX-2226: the record may follow the terminal operation; the node stays
+    # The record may follow the terminal operation; the node stays
     # RUNNING and re-observes once per tick until it is there.
     row = _rule_row("signal_trip", "succeeded_escalated")
     chain = ["controlled_stop", "controller_goal_cancel", "software_hard_stop"]
@@ -1788,7 +1788,8 @@ def test_interrupt_nodes_are_qualified_and_build_the_interrupt_adapter() -> None
         ports=SimpleNamespace(kernel_operations=_MotionPort([]), program_interventions=None),
         program_clock=_clocked()[1], operator_stop_hold_scope=None, motion_attention=None,
         audit_sink=None, name="probe", node_instance_id="probe", attempt_source=_Attempts(),
-        parameters={"target_role": "arm"}, value_sources={}, input_resolver=_Resolver(), operator_stop_state=None,  # TCP migration: build context needs target role
+        parameters={"target": {"component_id": "robot", "command_target_id": "arm"}},
+        value_sources={}, input_resolver=_Resolver(), operator_stop_state=None,
         transport_timeout_s=5.0,
     )
     assert type(build(context)) is v2_owner.InterruptMotionTaskAdapter
@@ -1855,7 +1856,7 @@ def test_interrupt_adapter_fails_a_source_loss_without_automatic_retry() -> None
 
 
 def test_interrupt_adapter_never_retries_an_ordinary_failure_automatically() -> None:
-    # An eligible planning failure would retry a plain move (spec 410 §4.1).
+    # An eligible planning failure would retry a plain move.
     port = _MotionPort([_failed(_assessment()), _succeeded()])
     adapter, _, audit = _interrupt_motion(port)
     assert _tick(adapter) is _FAILURE
@@ -1865,7 +1866,7 @@ def test_interrupt_adapter_never_retries_an_ordinary_failure_automatically() -> 
 
 def test_probe_search_refused_by_its_unavailable_contact_capability_fails() -> None:
     # The Core refuses an unprovided precision-contact capability before any
-    # effect (Apply refuses it first; spec 260 §12.9): a Failure, no trip.
+    # effect (Apply refuses it first): a Failure, no trip.
     from manyforge_behavior.kernel_client import KernelOperationAdmissionRejectedError
 
     refusal = KernelOperationAdmissionRejectedError(
@@ -1964,7 +1965,7 @@ def test_a_smooth_or_absent_takeover_records_nothing(metadata) -> None:
     assert adapter.audit_events == []
 
 
-# CONTRACTS §8: a rule that holds its scope refuses new motion; no "Motion waits"
+# A rule that holds its scope refuses new motion; no "Motion waits"
 
 
 def test_a_motion_refused_by_a_holding_rule_fails_at_once() -> None:
@@ -1986,7 +1987,7 @@ def test_a_motion_refused_by_a_holding_rule_fails_at_once() -> None:
 
 
 def test_a_motion_refused_while_the_simulation_is_not_playing_holds_for_run() -> None:
-    """SIM-1 (N4b): the refusal is never a node failure. The node holds before
+    """The refusal is never a node failure. The node holds before
     admission as under the operator's Stop ("waiting for Run"), asks the run
     owner for that Stop once, and sends nothing until the operator's Run; a
     Run while the simulation still isn't playing holds it again."""

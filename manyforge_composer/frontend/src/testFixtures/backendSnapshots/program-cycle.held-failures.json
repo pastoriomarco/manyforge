@@ -387,7 +387,7 @@
     "reason_code": "no_feasible_candidate",
     "run_end": null,
     "run_revision": 5,
-    "schema_version": "manyforge.program_run_status.v3",
+    "schema_version": "manyforge.program_run_status.v4",
     "state": "intervention_required",
     "tree_status": "running"
   },
@@ -406,9 +406,9 @@
           "resume_allowed": false,
           "resume_unavailable_reason": "selected_owner_recovery_unavailable",
           "runtime_scale_selector": {
-            "component_role_id": "robot",
-            "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
-            "target_role_id": "arm"
+            "command_target_id": "arm",
+            "component_id": "ur5_robot",
+            "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003"
           },
           "runtime_scale_unavailable_reason": null,
           "start_allowed": false,
@@ -425,9 +425,9 @@
           "resume_allowed": false,
           "resume_unavailable_reason": "selected_owner_recovery_unavailable",
           "runtime_scale_selector": {
-            "component_role_id": "robot",
-            "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
-            "target_role_id": "arm"
+            "command_target_id": "arm",
+            "component_id": "ur5_robot",
+            "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003"
           },
           "runtime_scale_unavailable_reason": null,
           "start_allowed": false,
@@ -444,9 +444,9 @@
           "resume_allowed": false,
           "resume_unavailable_reason": "selected_owner_recovery_unavailable",
           "runtime_scale_selector": {
-            "component_role_id": "robot",
-            "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
-            "target_role_id": "arm"
+            "command_target_id": "arm",
+            "component_id": "ur5_robot",
+            "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003"
           },
           "runtime_scale_unavailable_reason": null,
           "start_allowed": false,

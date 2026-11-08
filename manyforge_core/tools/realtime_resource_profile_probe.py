@@ -334,6 +334,10 @@ def evaluate_composer(
             "accepted": accepted,
         }
 
+    # OD-59: the strict profile locks the execution host's memory.
+    memory_locked = observation.locked_memory_bytes > 0
+    if not memory_locked:
+        failures.append("Composer strict profile requires locked memory but VmLck is zero")
     if observation.main_policy != "SCHED_OTHER" or observation.main_priority != 0:
         failures.append("Composer main/Python thread must remain SCHED_OTHER/0")
     if observation.main_affinity != expected_nrt:
@@ -371,7 +375,8 @@ def evaluate_composer(
         "nrt_threads_outside_reservation": [
             asdict(item) for item in nrt_outside_reservation
         ],
-        "process_wide_memory_lock_requested": False,
+        "process_wide_memory_lock_requested": True,
+        "memory_lock_accepted": memory_locked,
     }
 
 
@@ -441,11 +446,12 @@ def evaluate_controller_manager(
     ]
     if higher_rt_threads:
         failures.append("controller_manager contains an unowned higher-priority RT thread")
-    lock_requested = environment.get(
-        "MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY", "false"
-    ).strip().lower() in {"1", "true", "yes", "on"}
+    # OD-59: the strict profile (its one source of truth) sets the stock
+    # `lock_memory: true` on every lane's controller manager, which upstream
+    # only warns about when it fails.
+    lock_requested = True
     lock_accepted = observation.locked_memory_bytes > 0
-    if lock_requested and not lock_accepted:
+    if not lock_accepted:
         failures.append("controller_manager requested memory locking but VmLck is zero")
     return failures, {
         "expected": {

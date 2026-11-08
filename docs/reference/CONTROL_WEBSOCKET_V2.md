@@ -35,7 +35,7 @@ measured product profile, not per-session tuning knobs.
 
 The shell fact `held_run_draft_edit_allowed` (boolean) sits beside
 `authoring_admission`: true only while a Program run exists, nothing of it is
-moving and nothing can start (spec 450 §5.1.1). Headless derives it from the
+moving and nothing can start. Headless derives it from the
 same capture as `program_cycle` and `execution_control_state`; Composer
 applies the same rule to each Draft edit, and the browser only reads it.
 

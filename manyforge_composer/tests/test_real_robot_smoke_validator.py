@@ -1,9 +1,8 @@
 """Tests for the fail-closed real-Lite6 product-lane smoke reducer.
 
 Historical test blob ``4f5eaf4f570d01bbac798ded94bcb0fc735ab94d``
-maps advancing/closed admission to I5/H0 plus I10/R, unexpected admission to
-I8 plus I10/R, component convergence/identity to I4/I5 plus I10/R, and
-endpoint failure handling to the future I10/R thin client.
+defers advancing/closed admission, unexpected admission, component
+convergence/identity, and endpoint failure handling to a future thin client.
 """
 
 from __future__ import annotations

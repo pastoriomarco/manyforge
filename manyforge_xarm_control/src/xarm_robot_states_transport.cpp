@@ -57,24 +57,52 @@ std::string xarm_robot_states_topic(const std::string_view driver_namespace) {
 
 XArmRobotStatesTransport::XArmRobotStatesTransport(
     rclcpp::Node &node, const std::string_view driver_namespace,
-    core::IClock &clock)
+    core::IClock &clock, const XArmRosOwner *ros_owner)
     : topic_(xarm_robot_states_topic(driver_namespace)),
       cache_(std::make_shared<Cache>(clock)) {
-  // The driver publishes reliably at 5 Hz; only the latest report matters.
-  subscription_ = node.create_subscription<xarm_msgs::msg::RobotMsg>(
-      topic_, rclcpp::SensorDataQoS().keep_last(1),
-      [cache = cache_](const xarm_msgs::msg::RobotMsg::ConstSharedPtr message) {
-        cache->Store(*message);
-      });
+  const auto create = [&] {
+    struct Entities final {
+      rclcpp::Node::SharedPtr node;
+      std::shared_ptr<core::IClock> clock;
+      rclcpp::Subscription<xarm_msgs::msg::RobotMsg>::SharedPtr subscription;
+    };
+    auto entities = std::make_shared<Entities>();
+    if (ros_owner) {
+      entities->node = ros_owner->node;
+      entities->clock = ros_owner->clock;
+    }
+    // The driver publishes reliably at 5 Hz; only the latest report matters.
+    entities->subscription = node.create_subscription<xarm_msgs::msg::RobotMsg>(
+        topic_, rclcpp::SensorDataQoS().keep_last(1),
+        [cache = cache_, active = ros_owner ? ros_owner->active : nullptr](const xarm_msgs::msg::RobotMsg::ConstSharedPtr message) {
+          if (active && !active->load(std::memory_order_acquire)) return;
+          cache->Store(*message);
+        });
+    std::shared_ptr<void> held = ros_owner ? ros_owner->retain(std::move(entities)) : entities;
+    auto *raw = static_cast<Entities *>(held.get());
+    subscription_ = decltype(subscription_)(held, raw->subscription.get());
+  };
+  if (ros_owner) ros_owner->invoke(create);
+  else create();
 }
 
 XArmObservedState XArmRobotStatesTransport::observe() const {
-  std::lock_guard lock(cache_->mutex);
-  return cache_->latest;
+  std::shared_ptr<Cache> cache;
+  { std::lock_guard lock(state_mutex_); cache = cache_; }
+  std::lock_guard lock(cache->mutex);
+  return cache->latest;
 }
 
 void XArmRobotStatesTransport::Receive(const xarm_msgs::msg::RobotMsg &message) {
-  cache_->Store(message);
+  std::shared_ptr<Cache> cache;
+  { std::lock_guard lock(state_mutex_); cache = cache_; }
+  cache->Store(message);
+}
+
+void XArmRobotStatesTransport::SwapRosState(XArmRobotStatesTransport &replacement) noexcept {
+  std::scoped_lock lock(state_mutex_, replacement.state_mutex_);
+  cache_.swap(replacement.cache_);
+  subscription_.swap(replacement.subscription_);
 }
 
 } // namespace manyforge::xarm_control

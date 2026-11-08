@@ -98,7 +98,7 @@ def test_stop_validation_and_distinct_full_stop_are_public() -> None:
 
 
 def test_stop_acceptance_carries_no_shared_stop_budget() -> None:
-    # Q51: each robot's Stop deadlines come from its own profile at Stop time;
+    # Each robot's Stop deadlines come from its own profile at Stop time;
     # the acceptance carries only its time.
     affected = mf.StopAffectedOperationRevisionDTO(
         operation_id=mf.OperationId("operation.1"),

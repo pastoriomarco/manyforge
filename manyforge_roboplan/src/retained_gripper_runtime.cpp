@@ -2,12 +2,15 @@
 #include <cmath>
 #include <manyforge_roboplan/retained_gripper_runtime.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
+#include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
+#include <limits>
 #include <map>
 #include <iterator>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 namespace manyforge::roboplan_backend {
@@ -146,8 +149,6 @@ namespace {
   const auto& left_path = *lhs.control_path;
   const auto& right_path = *rhs.control_path;
   return lhs.controllable_component_id == rhs.controllable_component_id &&
-         lhs.component_role_id == rhs.component_role_id &&
-         lhs.target_role_id == rhs.target_role_id &&
          lhs.component_type_id == rhs.component_type_id &&
          lhs.component_type_revision == rhs.component_type_revision &&
          lhs.command_target_id == rhs.command_target_id && lhs.capability_id == rhs.capability_id &&
@@ -291,6 +292,27 @@ void RetainedGripperRuntime::BindCellKernel(core::ResourceAddressedExecutionKern
   cell_kernel_ = &kernel;
 }
 
+std::shared_ptr<const RetainedPreparedRobotMeasuredSources>
+RetainedGripperRuntime::SnapshotPreparedMeasuredSources() const {
+  std::lock_guard lock(mutex_);
+  return prepared_measured_sources_;
+}
+
+bool RetainedGripperRuntime::MatchesPreparedMeasuredSources(
+    const std::shared_ptr<const RetainedPreparedRobotMeasuredSources> &expected) const {
+  std::lock_guard lock(mutex_);
+  return prepared_measured_sources_ == expected;
+}
+
+bool RetainedGripperRuntime::WithExactPreparedMeasuredSources(
+    const std::shared_ptr<const RetainedPreparedRobotMeasuredSources> &expected,
+    void (*commit)(void *) noexcept, void *context) const {
+  std::lock_guard lock(mutex_);
+  if (!commit || prepared_measured_sources_ != expected) return false;
+  commit(context);
+  return true;
+}
+
 core::Result<core::RobotMeasuredStateSourceView> RetainedGripperRuntime::PrepareCurrentMeasuredSources() {
   using Result = core::Result<core::RobotMeasuredStateSourceView>;
   std::unique_lock lock(mutex_);
@@ -322,6 +344,8 @@ core::Result<core::RobotMeasuredStateSourceView> RetainedGripperRuntime::Prepare
   if (cell_kernel_ != kernel || binding_.value() != binding.value() || prepared_measured_sources_ != previous ||
       current.value() != route.value())
     return Result::Err({"measured_source_unavailable", "Gripper source association changed while preparing", {}});
+  if (staged.value()->matches_transport_owner && !staged.value()->matches_transport_owner())
+    return Result::Err({"measured_source_unavailable", "Gripper transport changed while preparing sources", {}});
   auto prepared = std::move(staged.value());
   prepared_measured_sources_.swap(prepared);
   prepared_measured_sources_->enable_publication();
@@ -468,8 +492,75 @@ core::GripperParticipantEngine* RetainedGripperRuntime::participant_engine() con
   return participant_engine_.get();
 }
 
+std::optional<core::GripperOwnerRecoveryEvidence>
+RetainedGripperRuntime::GripperOwnerRecoveryEvidence(
+    const bool measured_lane, const std::string &target,
+    const std::shared_ptr<const void> &owner) const {
+  std::shared_ptr<const RetainedPreparedRobotMeasuredSources> sources;
+  std::vector<core::HardStopResourceLimitDTO> limits;
+  {
+    std::lock_guard lock(mutex_);
+    if (!owner || binding_.value().command_target_id.value() != target) return std::nullopt;
+    sources = prepared_measured_sources_;
+    limits = retained_default_stop_limits_;
+  }
+  core::GripperOwnerRecoveryEvidence evidence;
+  evidence.owner = owner;
+  if (!measured_lane) {
+    evidence.mode = core::GripperOwnerRecoveryProofMode::kNoFeedback;
+    return evidence;
+  }
+  if (!sources || !sources->owner_rebuild_boundary || sources->source_view.sources.size() != 1U)
+    return std::nullopt;
+  const auto boundary = sources->owner_rebuild_boundary(0U);
+  if (!boundary || boundary->owner != owner) return std::nullopt;
+  const auto &source = sources->source_view.sources.front();
+  const auto *publication = dynamic_cast<const core::AddressedObservedStatePublication *>(source.reader.get());
+  const auto &resources = source.descriptor.publication.query_context.resources;
+  if (!publication || resources.empty() || limits.size() != resources.size()) return std::nullopt;
+  auto view = publication->numeric_publication().acquire(clock_->now());
+  if (!view || view.sequence() < boundary->next_sequence) return std::nullopt;
+  core::ObservedStateEvidenceDTO sample;
+  sample.sequence = view.sequence();
+  sample.sampled_at_ns = view.received_timestamp_ns();
+  sample.freshness_budget_ns = view.freshness_budget_ns();
+  if (sample.freshness_budget_ns == 0)
+    sample.freshness_budget_ns = std::numeric_limits<std::int64_t>::max() -
+                                 std::max<std::int64_t>(0, sample.sampled_at_ns);
+  sample.complete = view.complete();
+  sample.joint_order_token = std::string(view.joint_order_token());
+  sample.source_identity = std::string(view.source_id());
+  sample.authority_profile = std::string(view.authority_profile_id());
+  sample.measured_authority = view.authority_profile() == core::ObservedRobotStateAuthorityProfile::kMeasured;
+  sample.at_rest = view.velocities_complete() && view.velocities_rad_s().size() == resources.size();
+  if (sample.at_rest) {
+    for (std::size_t i = 0; i < resources.size(); ++i) {
+      const auto limit = std::find_if(limits.begin(), limits.end(),
+          [&](const auto &row) { return row.resource_id == resources[i]; });
+      if (limit == limits.end()) return std::nullopt;
+      const auto threshold = std::visit([](const auto &value) {
+        if constexpr (std::is_same_v<std::decay_t<decltype(value)>, core::AngularVelocityDTO>)
+          return value.value_rad_s;
+        else return value.value_m_s;
+      }, limit->settle_velocity_threshold);
+      const double velocity = view.velocities_rad_s()[i];
+      if (!std::isfinite(velocity) || std::abs(velocity) > threshold) sample.at_rest = false;
+    }
+  }
+  evidence.mode = core::GripperOwnerRecoveryProofMode::kMeasured;
+  evidence.first_sequence = boundary->next_sequence;
+  evidence.joint_order_token = sample.joint_order_token;
+  evidence.sample = std::move(sample);
+  return evidence;
+}
+
 core::IGripperCommandBackend* RetainedGripperRuntime::backend() const noexcept {
   return backend_.get();
+}
+
+std::shared_ptr<core::IGripperCommandBackend>
+RetainedGripperRuntime::backend_owner() const noexcept {
+  return backend_;
 }
 
 core::IControlDomainExecutionPort* RetainedGripperRuntime::stop_execution_port()

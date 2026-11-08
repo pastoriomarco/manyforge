@@ -6,21 +6,19 @@
 
 namespace manyforge::core {
 
-/// Active TCP (M7): the one wire and journal shape of a TCP entry and a TCP
-/// selector, shared by the host's intent decoder, the operation journal, the
-/// Set TCP payload and the `tcp_entry` blackboard value.
-///
-///   entry:    {"component_id": C, "target_id": T, "frame_role_id": F}
+/// Resolved internal entries retain the component-local physical shape.
+/// Authored v3 entries carry separate direct target and frame references:
+///   entry: {"target": {"component_id", "command_target_id"},
+///           "frame": {"component_id", "frame_id"}}
 ///   selector: {"kind": "current"}
-///           | {"kind": "default_of_role", "role": R}
-///           | {"kind": "entry", "entry": <entry>}
-///
-/// Decoding is closed (no unknown or missing member). The pre-M7 endpoint
-/// `{"target_role_id", "frame_role_id"}` is refused with reason
-/// `tcp_endpoint_legacy_form`; any other malformed value with
-/// `tcp_selector_invalid`. Both use code `invalid_request`.
+///           | {"kind": "default_of_target", "target": <target>}
+///           | {"kind": "entry", "target": <target>, "frame": <frame>}
+/// Decoders are closed; old endpoint and role forms do not select a target.
 [[nodiscard]] content_identity::CanonicalValue EncodeTcpEntry(const TcpEntryDTO& entry);
 [[nodiscard]] Result<TcpEntryDTO> DecodeTcpEntry(const content_identity::CanonicalValue& value);
+[[nodiscard]] content_identity::CanonicalValue EncodeTcpEntryReference(const TcpEntryReferenceDTO& entry);
+[[nodiscard]] Result<TcpEntryReferenceDTO> DecodeTcpEntryReference(
+    const content_identity::CanonicalValue& value);
 [[nodiscard]] content_identity::CanonicalValue EncodeTcpSelector(const TcpSelectorDTO& selector);
 [[nodiscard]] Result<TcpSelectorDTO> DecodeTcpSelector(
     const content_identity::CanonicalValue& value);

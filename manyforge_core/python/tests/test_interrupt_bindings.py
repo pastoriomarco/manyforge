@@ -19,7 +19,7 @@ def test_explicit_jerk_settings_resolve_without_changing_the_authored_profile():
     frozen = core.resolve_motion_interrupt_stop_jerk_limits(profile)
     assert len(profile.per_joint_max_jerk) == 1
     assert frozen.per_joint_max_jerk["joint"].value_rad_s3 == 20.0
-    # Q36: missing jerk is derived per Stop phase at Stop time, not frozen.
+    # Missing jerk is derived per Stop phase at Stop time, not frozen.
     assert "slide" not in frozen.per_joint_max_jerk
     profile.jerk_limits_enabled = False
     assert (
@@ -98,7 +98,7 @@ def test_profile_surface_has_no_retired_fallback_or_timeout_fields() -> None:
 
     assert core.motion_interrupt_stop_profile_field_error(profile) == ""
     assert core.motion_interrupt_deceleration_time_or_default(profile) == 1.0
-    # Q51 (as `main`): the per-profile controlled Stop deadline is restored.
+    # As `main`: the per-profile controlled Stop deadline is restored.
     assert profile.max_stop_time_s is None
     profile.max_stop_time_s = 3.0
     assert core.motion_interrupt_stop_profile_field_error(profile) == ""

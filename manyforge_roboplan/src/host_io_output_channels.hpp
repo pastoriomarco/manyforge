@@ -24,7 +24,7 @@ struct HostIoOutputAliasInstallation final {
   std::weak_ptr<const void> actual_driver_owner;
   core::ActiveBundlePublicationGeneration active_publication_generation;
   /// The owning device's authored `output_source_ack_timeout_s` (SetBool
-  /// outputs; CONTRACTS §7).
+  /// outputs).
   core::Duration ack_timeout_ns{};
 };
 
@@ -64,6 +64,7 @@ struct HostIoOutputChannelEntry final {
 CreateHostIoOutputChannels(
     std::vector<HostIoOutputAliasInstallation> aliases,
     rclcpp::Node::SharedPtr node, core::IClock &clock,
-    std::span<const HostIoGpioTopicPin> captured_topics = {});
+    std::span<const HostIoGpioTopicPin> captured_topics = {},
+    std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner = {});
 
 } // namespace manyforge::roboplan_backend::host_detail

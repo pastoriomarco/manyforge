@@ -4,10 +4,10 @@ The complete implementation is pinned at source blob
 ``ed0b7fa46046f9e257baae9f6f07c97049b11718``.  It owned the private
 ``manyforge.isaac.mesh_transfer_{request,status,chunk}.v0.1`` wire, chunk
 framing and integrity checks, DDS transport, filesystem materialization, and a
-live ROS CLI.  Those responsibilities cannot remain callable while I9 is
-unavailable, and the v0.1 wire is not a future compatibility contract.
+live ROS CLI.  Those responsibilities cannot remain callable while the Isaac
+lane is unavailable, and the v0.1 wire is not a future compatibility contract.
 
-I9/I must recover the useful bounded-transfer properties through the frozen
+The useful bounded-transfer properties return through the frozen
 retained-product client.  Historical test blob
 ``3653dea92b75948e9bd8a47d1b9ce6af4c3bcc66`` preserves the packet integrity
 case at lines 11-37 and the live two-chunk transfer/cleanup case at lines
@@ -26,8 +26,7 @@ RESTORATION_GATE: Final = "I9/I"
 HISTORICAL_SOURCE_BLOB: Final = "ed0b7fa46046f9e257baae9f6f07c97049b11718"
 HISTORICAL_TEST_BLOB: Final = "3653dea92b75948e9bd8a47d1b9ce6af4c3bcc66"
 UNAVAILABLE_MESSAGE: Final = (
-    f"{UNAVAILABLE_REASON_CODE}: live Isaac mesh transfer requires the "
-    f"{RESTORATION_GATE} restoration gate"
+    f"{UNAVAILABLE_REASON_CODE}: live Isaac mesh transfer is not available"
 )
 
 

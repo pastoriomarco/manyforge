@@ -226,7 +226,7 @@ std::vector<ActivationPreparedIoType> prepare_activation_machine_types(
     if (profile.runtime_kind != ActivationRuntimeKind::kMachine)
       continue;
     const auto &component = intent.components[index];
-    // CONTRACTS §16 / BOUNDARY §3: the owner's compiled row.
+    // The owner's compiled row.
     Object row{{"controllable_component_id", Value(component.component_id)},
                {"lane", Value(*profile.lane)}};
     if (profile.lane_row)

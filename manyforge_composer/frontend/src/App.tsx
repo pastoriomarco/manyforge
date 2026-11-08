@@ -1,8 +1,10 @@
+import { useReferenceValidation } from './hooks/useReferenceValidation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DirectControlMotionStatus } from './types/robotControl';
 import type { CSSProperties } from 'react';
 
 import { ApiError, api, apiErrorCode } from './api/client';
+import { parseLogicalSceneProjection } from './api/parsers';
 import {
   AssistantOverlay,
   NO_AI_MODEL_COMPONENT,
@@ -25,6 +27,7 @@ import { DocumentControls } from './components/DocumentControls';
 import { programDocumentHeader } from './components/ProgramDocumentControls';
 import { ScenarioDocumentCommands } from './components/ScenarioDocumentCommands';
 import { OverlayPanel } from './components/OverlayPanel';
+import { DraftInputResetProvider } from './components/common/DraftInputs';
 import { PaneDivider } from './components/PaneDivider';
 import { ProgramWorkspace } from './components/ProgramWorkspace';
 import { componentsTabStatus, runtimeStatusPresentation } from './components/runtimeStatus';
@@ -47,7 +50,18 @@ import { isaacJointStreamNotices } from './state/isaacJointStreamNotices';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
-import { robotControlHasActiveOperation } from './state/robotControl';
+import {
+  robotControlHasActiveOperation,
+  robotControlHasTransientPreviewRefusal,
+  type RobotControlState,
+} from './state/robotControl';
+import {
+  AuthoringAdmissionTooltipProvider,
+  authoringAdmissionTooltip,
+  replacementAdmissionAllowed,
+  manualOperationAdmissionCopy,
+  type ManualOperationAdmissionCopy,
+} from './components/authoringAdmission';
 import { useHeldNodePreview } from './hooks/useHeldNodePreview';
 import { useResetApply } from './hooks/useResetApply';
 import { useAppliedSettlementRefresh } from './hooks/useAppliedSettlementRefresh';
@@ -65,13 +79,9 @@ import {
 } from './state/nodeEnvironmentRefresh';
 import { useStructuralResource } from './state/structuralResource';
 import { deriveProgramMotionConfiguration, programBlackboardKeys } from './utils/programAuthoring';
-import { changedOutsideOutputs, globalRuleIds } from './utils/interruptAuthoring';
+import { globalRuleIds } from './utils/interruptAuthoring';
 import { isRuleHoldsRefusal } from './state/commandRefusal';
-import {
-  CARRIED_OBJECT_LOST_RESOURCE_ROLE,
-  draftCarriedObjectLostSignals,
-  resolveCarriedObjectLostSignalChoices,
-} from './utils/systemSignalAuthoring';
+import { CARRIED_OBJECT_LOST_SIGNAL_PREFIX } from './utils/systemSignalAuthoring';
 import {
   useOperationalErrorMirror,
   useOperationalErrors,
@@ -87,7 +97,6 @@ import {
   type ManagerApplyIdentity,
 } from './state/managerApply';
 import {
-  deploymentMatchesApplied,
   deploymentDocumentStates,
   deploymentUnapplied,
   programDocumentStates,
@@ -201,8 +210,46 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
+export function authoringAdmissionNotices(
+  authoringAllowed: boolean | null | undefined,
+  manualOperation: ManualOperationAdmissionCopy | null = null,
+  backgroundStep = false,
+): WorkbenchNotice[] {
+  if (manualOperation !== null) return [{
+    id: `authoring-admission.manual.${manualOperation.ownerEpoch}.${manualOperation.operationId}`,
+    severity: 'info',
+    domain: 'program_authoring',
+    title: manualOperation.title,
+    message: manualOperation.message,
+    busy: true,
+  }];
+  return authoringAllowed === false && backgroundStep ? [{
+    id: 'authoring-admission',
+    severity: 'info',
+    domain: 'program_authoring',
+    title: 'The cell is finishing a background step.',
+    message: '',
+    busy: true,
+  }] : [];
+}
+
+export function manualPreviewRefusalNotice(
+  state: RobotControlState,
+): WorkbenchNotice | null {
+  if (!robotControlHasTransientPreviewRefusal(state)) return null;
+  const ownerEpoch = state.status?.ownerEpoch ?? 'unknown-owner';
+  return {
+    id: `robot-control.preview.${ownerEpoch}.${state.generation}`,
+    severity: 'info',
+    domain: 'runtime',
+    title: 'Manual preview refused',
+    message: state.previewIssue ?? state.error ?? 'The manual motion preview was refused.',
+  };
+}
+
 export default function App() {
   const [activeWorkspace, setActiveWorkspace] = useState<'program' | 'scene' | 'components' | 'deployment'>('program');
+  const [selectedProgramNode, setSelectedProgramNode] = useState<{draftId: string; id: string | null} | null>(null);
   const [deploymentTabRequest, setDeploymentTabRequest] = useState<{
     tab: ComponentManagerTab;
     sequence: number;
@@ -236,11 +283,6 @@ export default function App() {
   const [runtimePanelAutomatic, setRuntimePanelAutomatic] = useState(false);
   const [programInvalidEdit, setProgramInvalidEdit] = useState(false);
   const [componentOverviewRequest, setComponentOverviewRequest] = useState(0);
-  const [programRequirementCreated, setProgramRequirementCreated] = useState<{
-    sequence: number;
-    id: string;
-    kind: 'component_role' | 'target_role';
-  } | null>(null);
   const workbench = useRef<HTMLDivElement>(null);
   const centralInspector = useRef<HTMLElement>(null);
   const bothInspectorSectionsExpanded = programInspectorState.active
@@ -444,29 +486,42 @@ export default function App() {
     authoringWorkspace,
     onScenarioActivated,
   );
+  // The node selection belongs to one Program Draft. The handler stays stable
+  // (memoized canvas callbacks keep it) and reads the current Draft from a ref.
+  const programDraftId = programController.state.workspace?.draft.draftId;
+  const programDraftIdRef = useRef(programDraftId);
+  useEffect(() => { programDraftIdRef.current = programDraftId; }, [programDraftId]);
+  const selectProgramNode = useCallback((id: string | null) => {
+    const draftId = programDraftIdRef.current;
+    if (draftId) setSelectedProgramNode({ draftId, id });
+  }, []);
+  const referenceValidation = useReferenceValidation(programController.state.workspace);
   // Draft / Saved / Applied of both documents, shown in every workspace.
   const programStates = programDocumentStates(programController.state.workspace);
   // Keys a global interrupt rule may read: the Program Draft's declared and
-  // system keys (schema04 §3; T2 resolves them against the Applied Program).
+  // system keys (resolved against the Applied Program).
   const programDraftAuthoring = programController.state.workspace?.draft.authoring ?? null;
   const deploymentDraftDocument = deploymentController.workspace?.draft.document ?? null;
-  const draftSystemSignals = useMemo(
-    () => draftCarriedObjectLostSignals(deploymentDraftDocument),
-    [deploymentDraftDocument],
-  );
-  const deploymentDraftApiVersion = typeof deploymentDraftDocument?.api_version === 'string'
-    ? deploymentDraftDocument.api_version : null;
-  const appliedDeploymentIdentity = deploymentController.workspace?.managerApplied.activationOrder ?? null;
-  // Null without a Program Draft: a rule's user keys then wait for one (contract 106).
+  // Null without a Program Draft: a rule's user keys then wait for one.
   const globalRuleProgramKeys = useMemo(() => (programDraftAuthoring === null ? null
     : programBlackboardKeys(programDraftAuthoring, globalRuleIds(deploymentDraftDocument))),
   [deploymentDraftDocument, programDraftAuthoring]);
   const programSceneIds = useMemo(() => (programDraftAuthoring === null ? null
     : (programDraftAuthoring.scene ?? []).map((resource) => resource.scene_resource_id)),
   [programDraftAuthoring]);
+  const sceneResourceIds = useMemo(() => {
+    const section = headlessSnapshot?.runtime.sections.logicalScene;
+    if (!section?.available || section.freshness !== 'fresh' || section.payload === null) return [];
+    try { return parseLogicalSceneProjection(section.payload).snapshot?.objects.map((item) => item.scene_resource_id) ?? []; }
+    catch { return []; }
+  }, [headlessSnapshot]);
   const deploymentStates = deploymentDocumentStates(deploymentController.workspace);
   const cellState = useCellState(headlessStateSource);
-  const changedOutside = useMemo(() => changedOutsideOutputs(cellState.io), [cellState.io]);
+  const changedOutside = useMemo(() => new Set((referenceValidation.selectorFacts?.signals ?? [])
+    .filter((row) => !row.ambiguous && row.target !== null && row.value_type === 'bool'
+      && row.direction === 'input' && row.reference.signal_name.endsWith('.changed_outside'))
+    .map((row) => `${row.reference.component_id}/${row.reference.signal_name.slice(0, -'.changed_outside'.length)}`)),
+  [referenceValidation.selectorFacts]);
   const programRuntime = useProgramRuntime(
     headlessEnabled,
     headlessSnapshot,
@@ -476,7 +531,7 @@ export default function App() {
   );
   // Manual motion uses Applied defaults; Draft changes wait for Apply.
   const appliedProgram = programRuntime.state.applied;
-  // A global rule's execution_groups scope names the Applied Program's groups (contract 73).
+  // A global rule's execution_groups scope names the Applied Program's groups.
   const appliedExecutionGroupIds = useMemo(() => (appliedProgram === null || appliedProgram === undefined ? null
     : Object.keys(appliedProgram.program.execution_groups ?? {}).sort()), [appliedProgram]);
   const programCartesianDefaults = useMemo(() => {
@@ -507,29 +562,13 @@ export default function App() {
     programController.state.workspace?.hasUnappliedChanges === true
       || deploymentUnapplied(deploymentController.workspace),
   );
-  const systemSignalChoiceResolution = useMemo(() => resolveCarriedObjectLostSignalChoices(
-    draftSystemSignals,
-    (robotControl.currentStatus?.systemSignals ?? []).map((row) => ({
-      controllableComponentId: row.controllableComponentId,
-      commandTargetId: row.commandTargetId,
-      signalName: row.signalName,
-      resourceRoleId: CARRIED_OBJECT_LOST_RESOURCE_ROLE,
-      direction: 'input' as const,
-      valueType: 'bool' as const,
-    })),
-    deploymentDraftApiVersion,
-    deploymentMatchesApplied(deploymentController.workspace),
-    robotControl.currentStatus === null ? null : {
-      graphRevision: robotControl.currentStatus.graphRevision,
-      retainedBundleId: robotControl.currentStatus.retainedBundleId,
-    },
-    appliedDeploymentIdentity === null ? null : {
-      graphRevision: appliedDeploymentIdentity.graphRevision,
-      retainedBundleId: appliedDeploymentIdentity.retainedBundleId,
-    },
-  ), [appliedDeploymentIdentity, deploymentController.workspace, deploymentDraftApiVersion,
-    draftSystemSignals, robotControl.currentStatus]);
-  const { choices: systemSignalChoices, needApply: systemSignalsNeedApply } = systemSignalChoiceResolution;
+  const systemSignalChoices = useMemo(() => (referenceValidation.selectorFacts?.signals ?? [])
+    .filter((row) => !row.ambiguous && row.target !== null && row.value_type === 'bool'
+      && row.direction === 'input' && row.reference.signal_name.startsWith(CARRIED_OBJECT_LOST_SIGNAL_PREFIX))
+    .map((row) => ({ controllableComponentId: row.target!.component_id,
+      commandTargetId: row.target!.command_target_id, signalName: row.reference.signal_name,
+      direction: 'input' as const, valueType: 'bool' as const })), [referenceValidation.selectorFacts]);
+  const systemSignalsNeedApply = referenceValidation.selectorFacts === null;
   // Robots are moving: a Program run that is not positively held, a starting or
   // stopping cycle, or an active manual operation. Document actions wait.
   const documentCycle = headlessSnapshot?.programCycle;
@@ -550,7 +589,7 @@ export default function App() {
     message: programController.state.error,
     onDismiss: programController.clearFeedback,
   });
-  // A global rule holding its scope (`rule_holds`, CONTRACTS §8) refused a
+  // A global rule holding its scope (`rule_holds`) refused a
   // past command: like any refusal it is a warning until acknowledged.
   useOperationalErrorMirror({
     source: 'composer.program_runtime',
@@ -565,8 +604,11 @@ export default function App() {
     message: robotControl.runtimeScaleError,
     onDismiss: robotControl.dismissRuntimeScaleError,
   });
-  // The panel's own target validation stays in the panel (typed, not by text).
-  const robotOperationalError = robotControl.state.errorLocal ? null : robotControl.state.error;
+  // Local validation stays in the panel; only typed preview planner/collision
+  // refusals move to a brief Activity notice instead of the warning rail.
+  const robotPreviewRefusal = manualPreviewRefusalNotice(robotControl.state);
+  const robotOperationalError = robotControl.state.errorLocal || robotPreviewRefusal !== null
+    ? null : robotControl.state.error;
   useOperationalErrorMirror({
     source: 'composer.robot_control',
     title: isRuleHoldsRefusal(robotControl.state.errorRefusal)
@@ -677,12 +719,13 @@ export default function App() {
   // re-reads the status; only positive evidence that no failed Apply remains
   // hides the notice here.
   const applyAcknowledgementOutcomeUnknown = activation.acknowledgementOutcomeUnknown;
+  const acknowledgeFailure = activation.acknowledgeFailure;
   const acknowledgeFailedApply = useCallback(async () => {
     if (applyAcknowledgement?.busy === true || acknowledgementKey === null
       || activationStatus?.state !== 'failed') return;
     setApplyAcknowledgement({ key: acknowledgementKey, busy: true, message: null });
     try {
-      const result = await activation.acknowledgeFailure();
+      const result = await acknowledgeFailure();
       if (result.noFailedApply) {
         setDismissedActivationNotice(`activation.${acknowledgementKey}`);
       } else if (!result.confirmed && result.message !== null) {
@@ -703,7 +746,7 @@ export default function App() {
   }, [
     acknowledgementKey,
     applyAcknowledgement?.busy,
-    activation.acknowledgeFailure,
+    acknowledgeFailure,
     activationStatus,
   ]);
   const acknowledgingApply = applyAcknowledgement?.busy === true;
@@ -722,7 +765,9 @@ export default function App() {
     () => catalog.status === 'ready' ? catalog.data.entries : [],
     [catalog],
   );
+  const [heldPreviewVisible, setHeldPreviewVisible] = useState(false);
   const heldNodePreview = useHeldNodePreview({
+    visible: activeWorkspace === 'program' && !programInspectorMinimized && heldPreviewVisible,
     runtime: programRuntime,
     workspace: programController,
     snapshot: headlessSnapshot,
@@ -745,6 +790,9 @@ export default function App() {
     ? authoringWorkspace.project?.documentPath ?? null
     : null;
   const authoringAdmissionOpen = headlessSnapshot?.authoringAdmission.authoringAllowed ?? null;
+  const authoringCause = headlessEnabled
+    ? authoringUnavailableCause(authoringWorkspace.published, headlessSnapshot)
+    : null;
   // Only owner evidence scopes a transition: the observed activation's status
   // read as pending. An advertised, submitted or unobservable (lost) operation
   // is not evidence, so it never downgrades an error.
@@ -811,6 +859,7 @@ export default function App() {
         }
       : null,
   );
+  const robotPreviewNotice = useBriefNotice(robotPreviewRefusal);
 
   const pendingProgramAction = programController.state.pendingAction;
   const programMessage = useBriefNotice(
@@ -835,9 +884,18 @@ export default function App() {
           message: deploymentController.feedback,
         },
   );
-  const authoringCause = headlessEnabled
-    ? authoringUnavailableCause(authoringWorkspace.published, headlessSnapshot)
-    : null;
+  const manualOperationAdmission = useMemo(
+    () => manualOperationAdmissionCopy(robotControl.state),
+    [robotControl.state],
+  );
+  const authoringAdmissionBackgroundStep = authoringAdmissionOpen === false
+    && (maintenance !== null || activationStatus?.state === 'pending'
+      || deploymentController.applying || pendingProgramAction !== null);
+  const authoringAdmissionTooltipText = authoringAdmissionTooltip(
+    manualOperationAdmission,
+    authoringAdmissionBackgroundStep,
+    authoringCause,
+  );
   const [resetReloadRequest, setResetReloadRequest] = useState(0);
   const initialSceneFailure = headlessSnapshot?.runtime.initialSceneFailure ?? null;
   const operationNotices = useMemo<WorkbenchNotice[]>(() => {
@@ -888,7 +946,8 @@ export default function App() {
         message: reason,
         busy: true,
       });
-    } else if (authoringCause === 'not_admitted' && maintenance === null && !deploymentController.applying && pendingProgramAction === null) {
+    } else if (authoringCause === 'not_admitted' && manualOperationAdmission === null
+      && maintenance === null && !deploymentController.applying && pendingProgramAction === null) {
       notices.push({
         id: 'authoring.unavailable',
         severity: 'info',
@@ -916,6 +975,7 @@ export default function App() {
     pendingProgramAction,
     headlessSnapshot,
     maintenance,
+    manualOperationAdmission,
   ]);
   const publishedNotices = usePublishedWorkbenchNotices();
   const sessionNotice = health.status === 'ready'
@@ -990,20 +1050,30 @@ export default function App() {
     ...sessionNotices,
     ...startupNotices,
     ...submissionNotices,
+    ...(robotPreviewNotice === null ? [] : [robotPreviewNotice]),
+    ...authoringAdmissionNotices(
+      authoringAdmissionOpen,
+      manualOperationAdmission,
+      authoringAdmissionBackgroundStep,
+    ),
     ...(activationCompleted === null ? [] : [activationCompleted]),
     ...(programMessage === null ? [] : [programMessage]),
     ...(deploymentMessage === null ? [] : [deploymentMessage]),
   ], [
     activationCompleted,
     activationNotices,
+    authoringAdmissionBackgroundStep,
     controlNotices,
     deploymentMessage,
+    manualOperationAdmission,
     operationNotices,
     programMessage,
     publishedNotices,
     sessionNotices,
     startupNotices,
     submissionNotices,
+    authoringAdmissionOpen,
+    robotPreviewNotice,
   ]);
   const transitionScope = useTransitionScope(transitionKey, workbenchNotices);
   const transitionClassified = useMemo(
@@ -1309,6 +1379,8 @@ export default function App() {
   const scenarioCommands = (
     <ScenarioDocumentCommands
       controller={programController}
+      authoringAdmissionAllowed={authoringAdmissionOpen}
+      replacementAdmissionAllowed={replacementAdmissionAllowed(authoringAdmissionOpen, authoringCause)}
       deploymentDirty={deploymentController.workspace?.draft.differsFromSaved === true}
       localInvalidEdit={programInvalidEdit}
       motionActive={documentMotionActive}
@@ -1321,12 +1393,15 @@ export default function App() {
       program={programController}
       deployment={deploymentController}
       runtime={programRuntime}
+      authoringAdmissionAllowed={authoringAdmissionOpen}
       resetApply={resetApply}
       localInvalidEdit={programInvalidEdit}
     />
   );
 
   return (
+    <AuthoringAdmissionTooltipProvider tooltip={authoringAdmissionTooltipText}>
+    <DraftInputResetProvider scope="scenario" resetKey={`${programController.scenarioDraftInputResetEpoch}:${deploymentController.scenarioDraftInputResetEpoch}`}>
     <main className="app-shell">
       <header className="app-header">
         <div className="app-identity" aria-label="ManyForge Composer">
@@ -1466,22 +1541,25 @@ export default function App() {
       >
         <section className="workbench-workspace">
           {activeWorkspace === 'program' ? (
+            <DraftInputResetProvider scope="program" resetKey={programController.programDraftInputResetEpoch}>
             <ProgramWorkspace
+              selectedNodeId={selectedProgramNode !== null && selectedProgramNode.draftId === programDraftId ? selectedProgramNode.id : null}
+              onSelectedNodeIdChange={selectProgramNode}
+              onHeldPreviewVisibilityChange={setHeldPreviewVisible}
+              referenceValidation={referenceValidation}
               controller={programController}
               runtime={programRuntime}
+              manualPreviewController={robotControl}
               heldNodePreview={heldNodePreview}
               catalog={catalog}
               environment={nodeEnvironment}
               sourceModel={sourceModel}
               deploymentWorkspace={deploymentController.workspace}
-              systemSignalChoices={systemSignalChoices}
               changedOutsideOutputs={changedOutside}
               systemSignalsNeedApply={systemSignalsNeedApply}
-              programRoleAssignment={authoringWorkspace.project?.programRoleAssignment ?? null}
               motionDescriptors={robotControl.motionTargets.map(
                 (target) => target.targetDescriptor,
               )}
-              stopChains={robotControl.motionTargets}
               onRetryCatalog={retryCatalogTracked}
               onRetryEnvironment={retryNodeEnvironmentTracked}
               onInvalidEditChange={setProgramInvalidEdit}
@@ -1491,13 +1569,8 @@ export default function App() {
               onInspectorMinimizedChange={setProgramInspectorMinimized}
               onInspectorMaximize={maximizeProgramInspector}
               onInspectorStateChange={handleProgramInspectorState}
-              programRequirementCreated={programRequirementCreated}
-              onProgramRequirementCreated={(kind, id) => setProgramRequirementCreated((current) => ({
-                sequence: (current?.sequence ?? 0) + 1,
-                kind,
-                id,
-              }))}
             />
+            </DraftInputResetProvider>
           ) : activeWorkspace === 'scene' ? (
             <div
               ref={setSceneEditorTarget}
@@ -1506,6 +1579,7 @@ export default function App() {
             />
           ) : activeWorkspace === 'components' ? (
             <div className="deployment-workspace">
+              <DraftInputResetProvider scope="deployment" resetKey={deploymentController.deploymentDraftInputResetEpoch}>
               <ComponentsWorkspace
                 enabled={headlessEnabled}
                 controller={deploymentController}
@@ -1519,15 +1593,16 @@ export default function App() {
                   (target) => target.targetDescriptor,
                 )}
                 programSceneIds={programSceneIds}
-                programComponentRoles={programDraftAuthoring?.component_roles ?? null}
-                programRoleAssignment={authoringWorkspace.project?.programRoleAssignment ?? null}
+                sceneResourceIds={sceneResourceIds}
                 robotControlIds={robotControlIds}
                 onOpenRobotControl={openRobotControl}
                 onOpenDeployment={openDeploymentTab}
               />
+              </DraftInputResetProvider>
             </div>
           ) : (
             <div className="deployment-workspace">
+              <DraftInputResetProvider scope="deployment" resetKey={deploymentController.deploymentDraftInputResetEpoch}>
               <DeploymentCompositionPanel
                 controller={deploymentController}
                 componentCatalog={componentCatalog}
@@ -1551,8 +1626,6 @@ export default function App() {
                 systemSignalsNeedApply={systemSignalsNeedApply}
                 changedOutsideOutputs={changedOutside}
                 maintenanceStatus={activation}
-                programComponentRoles={programDraftAuthoring?.component_roles ?? null}
-                programRoleAssignment={authoringWorkspace.project?.programRoleAssignment ?? null}
                 componentOverview={{
                   request: componentOverviewRequest,
                   status: runtimeView,
@@ -1581,6 +1654,7 @@ export default function App() {
                   onOpenRuntimeHistory: openRuntimeDetails,
                 }}
               />
+              </DraftInputResetProvider>
             </div>
           )}
         </section>
@@ -1645,6 +1719,7 @@ export default function App() {
           <div className="workbench-pane">
             <div className="viewer-slot">
               <SceneAuthoringWorkspace
+                selectorFacts={referenceValidation.selectorFacts}
                 editorTarget={sceneEditorTarget}
                 environment={nodeEnvironment}
                 headlessStateSource={headlessStateSource}
@@ -1654,6 +1729,7 @@ export default function App() {
                 programController={programController}
                 deploymentController={deploymentController}
                 programRuntime={programRuntime}
+                authoringAdmissionAllowed={authoringAdmissionOpen}
                 robotControl={robotControl}
                 correctionGhost={heldNodePreview.ghost}
                 runtimeEnabled={connectedProjection}
@@ -1712,5 +1788,7 @@ export default function App() {
         />
       </OverlayPanel>
     </main>
+    </DraftInputResetProvider>
+    </AuthoringAdmissionTooltipProvider>
   );
 }

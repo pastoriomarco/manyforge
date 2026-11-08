@@ -49,13 +49,12 @@ if TYPE_CHECKING:
     from .authoring_admission import OperationEffects
 
 
-SCENARIO_API_VERSION = "manyforge.scenario.authoring.v3"
-SCENARIO_PROJECT_API_VERSION = "manyforge.scenario.project.v2"
+SCENARIO_API_VERSION = "manyforge.scenario.authoring.v4"
+SCENARIO_PROJECT_API_VERSION = "manyforge.scenario.project.v3"
 SCENARIO_MANIFEST = "scenario.yaml"
 SCENARIO_PROJECT_MEMBERS = {
     "deployment_draft": "deployment.yaml",
     "program_draft": "program.yaml",
-    "program_role_assignment": "assignment.yaml",
 }
 # Scenario parameter overrides were removed (single source of truth: Program
 # parameter defaults). The former member and versions are refused, never read.
@@ -79,6 +78,18 @@ def _refuse_removed_overrides_member(directory_fd: int, *, source: str) -> None:
         f"{source}: {_REMOVED_OVERRIDES_MESSAGE}",
         status_code=409,
     )
+
+
+def _refuse_removed_assignment_member(directory_fd: int, *, source: str) -> None:
+    try:
+        os.stat("assignment.yaml", dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    _fail(
+        "scenario_artifact_version_unsupported",
+        f"{source}: assignment.yaml is unsupported; re-author the Scenario with direct references",
+        status_code=409,
+    )
 SCENARIO_SAVE_MARKER = ".manyforge-save-pending.json"
 # Save failed after it created the project or published a file in it.
 SCENARIO_SAVE_INCOMPLETE = "scenario_artifact_save_incomplete"
@@ -100,10 +111,14 @@ _STATUS_VALUES = frozenset({"ready", "incomplete", "unknown"})
 
 
 class ScenarioArtifactError(RuntimeError):
-    def __init__(self, code: str, message: str, *, status_code: int = 400) -> None:
+    def __init__(
+        self, code: str, message: str, *, status_code: int = 400,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+        self.details = details
 
 
 def _fail(code: str, message: str, *, status_code: int = 400) -> NoReturn:
@@ -187,7 +202,6 @@ def scenario_project_path(directory: str, name: str) -> str:
 def scenario_content_digest(
     program_draft: dict[str, Any] | None,
     deployment_draft: dict[str, Any] | None,
-    program_role_assignment: dict[str, Any] | None,
 ) -> str:
     try:
         return raw_sha256_digest(
@@ -195,7 +209,6 @@ def scenario_content_digest(
                 {
                     "program_draft": program_draft,
                     "deployment_draft": deployment_draft,
-                    "program_role_assignment": program_role_assignment,
                 }
             )
         )
@@ -210,14 +223,12 @@ def build_scenario_document(
     description: str,
     program_draft: dict[str, Any] | None,
     deployment_draft: dict[str, Any] | None,
-    program_role_assignment: dict[str, Any] | None,
     manyforge_version: str,
     last_known_status: str,
 ) -> dict[str, Any]:
     digest = scenario_content_digest(
         program_draft,
         deployment_draft,
-        program_role_assignment,
     )
     document: dict[str, Any] = {
         "api_version": SCENARIO_API_VERSION,
@@ -226,7 +237,6 @@ def build_scenario_document(
         "description": description,
         "program_draft": deepcopy(program_draft),
         "deployment_draft": deepcopy(deployment_draft),
-        "program_role_assignment": deepcopy(program_role_assignment),
         "saved_status": {
             "manyforge_version": manyforge_version,
             "last_known_status": last_known_status,
@@ -234,59 +244,6 @@ def build_scenario_document(
         },
     }
     return validate_scenario_document(document, source="<scenario-save>")
-
-
-def _validate_role_assignment(
-    value: Any,
-    *,
-    source: str,
-) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    if type(value) is not dict or set(value) != {"component_roles", "target_roles"}:
-        _fail(
-            "scenario_artifact_invalid",
-            f"{source}: program_role_assignment must contain component_roles and target_roles",
-        )
-    normalized: dict[str, list[dict[str, str]]] = {}
-    for field, role_field, target_field in (
-        ("component_roles", "component_role_id", "controllable_component_id"),
-        ("target_roles", "target_role_id", "command_target_id"),
-    ):
-        rows = value[field]
-        if type(rows) is not list:
-            _fail("scenario_artifact_invalid", f"{source}: {field} must be a list")
-        seen: set[str] = set()
-        normalized_rows: list[dict[str, str]] = []
-        for index, row in enumerate(rows):
-            if type(row) is not dict or set(row) != {role_field, target_field}:
-                _fail(
-                    "scenario_artifact_invalid",
-                    f"{source}: {field}[{index}] has invalid fields",
-                )
-            role = row[role_field]
-            target = row[target_field]
-            if (
-                type(role) is not str
-                or not role
-                or len(role.encode("utf-8")) > 256
-                or type(target) is not str
-                or not target
-                or len(target.encode("utf-8")) > 256
-            ):
-                _fail(
-                    "scenario_artifact_invalid",
-                    f"{source}: {field}[{index}] identifiers are invalid",
-                )
-            if role in seen:
-                _fail(
-                    "scenario_artifact_invalid",
-                    f"{source}: duplicate {role_field} {role!r}",
-                )
-            seen.add(role)
-            normalized_rows.append({role_field: role, target_field: target})
-        normalized[field] = sorted(normalized_rows, key=lambda row: row[role_field])
-    return normalized
 
 
 def _validate_saved_status(value: Any, *, source: str) -> dict[str, str]:
@@ -320,11 +277,16 @@ def validate_scenario_document(
         "description",
         "program_draft",
         "deployment_draft",
-        "program_role_assignment",
         "saved_status",
     }
     if type(value) is not dict:
         _fail("scenario_artifact_invalid", f"{source}: Scenario must be an object")
+    if value.get("api_version") != SCENARIO_API_VERSION:
+        _fail(
+            "scenario_artifact_version_unsupported",
+            f"{source}: unsupported Scenario version {value.get('api_version')!r}; "
+            "re-author the Scenario with direct references",
+        )
     if "typed_parameter_overrides" in value:
         _fail(
             "scenario_artifact_version_unsupported",
@@ -340,15 +302,7 @@ def validate_scenario_document(
     description = value["description"]
     program = value["program_draft"]
     deployment = value["deployment_draft"]
-    assignment = _validate_role_assignment(
-        value["program_role_assignment"], source=source
-    )
     saved = _validate_saved_status(value["saved_status"], source=source)
-    if value["api_version"] != SCENARIO_API_VERSION:
-        _fail(
-            "scenario_artifact_version_unsupported",
-            f"{source}: unsupported Scenario version {value['api_version']!r}",
-        )
     if not scenario_name_valid(scenario_id):
         _fail(
             "scenario_artifact_invalid",
@@ -376,7 +330,6 @@ def validate_scenario_document(
         _fail("scenario_artifact_invalid", f"{source}: {error}")
     normalized = deepcopy(value)
     normalized["deployment_draft"] = deepcopy(deployment)
-    normalized["program_role_assignment"] = assignment
     return normalized
 
 
@@ -423,7 +376,6 @@ def _project_payload(
         "content": {
             "deployment_present": normalized["deployment_draft"] is not None,
             "program_present": normalized["program_draft"] is not None,
-            "assignment_present": normalized["program_role_assignment"] is not None,
         },
         "members": {
             filename: raw_sha256_digest(raw)
@@ -457,7 +409,8 @@ def _validate_project_manifest(value: Any, *, source: str) -> dict[str, Any]:
     if value["api_version"] != SCENARIO_PROJECT_API_VERSION:
         _fail(
             "scenario_artifact_version_unsupported",
-            f"{source}: unsupported Scenario project version {value['api_version']!r}",
+            f"{source}: unsupported Scenario project version {value['api_version']!r}; "
+            "re-author the Scenario with direct references",
         )
     scenario_id = value["scenario_id"]
     if not scenario_name_valid(scenario_id):
@@ -470,7 +423,6 @@ def _validate_project_manifest(value: Any, *, source: str) -> dict[str, Any]:
     if type(content) is not dict or set(content) != {
         "deployment_present",
         "program_present",
-        "assignment_present",
     } or any(type(item) is not bool for item in content.values()):
         _fail("scenario_artifact_invalid", f"{source}: content flags are invalid")
     members = value["members"]
@@ -731,6 +683,7 @@ def _capture_project(
             project, manifest["scenario_id"], manifest["name"], source=str(project)
         )
         _refuse_removed_overrides_member(directory_fd, source=str(project))
+        _refuse_removed_assignment_member(directory_fd, source=str(project))
         member_values: dict[str, Any] = {}
         member_digests: dict[str, str] = {}
         total_bytes = len(manifest_raw)
@@ -766,12 +719,10 @@ def _capture_project(
         current_digest = scenario_content_digest(
             document["program_draft"],
             document["deployment_draft"],
-            document["program_role_assignment"],
         )
         actual_presence = {
             "deployment_present": document["deployment_draft"] is not None,
             "program_present": document["program_draft"] is not None,
-            "assignment_present": document["program_role_assignment"] is not None,
         }
         changed = (
             member_digests != manifest["members"]
@@ -1038,6 +989,8 @@ def save_scenario_artifact(
         existing_names = set(os.listdir(project_fd))
         if _REMOVED_OVERRIDES_MEMBER in existing_names:
             _refuse_removed_overrides_member(project_fd, source=str(target))
+        if "assignment.yaml" in existing_names:
+            _refuse_removed_assignment_member(project_fd, source=str(target))
         if existing_names and SCENARIO_MANIFEST not in existing_names and not existing_names <= {
             "sources",
             "assets",
@@ -1125,7 +1078,6 @@ def save_scenario_member(
         "last_known_status": "unknown",
         "checked_content_digest": scenario_content_digest(
             document["program_draft"], document["deployment_draft"],
-            document["program_role_assignment"],
         ),
     }
     save_scenario_artifact(

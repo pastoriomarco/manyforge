@@ -30,14 +30,14 @@ using Offset = std::array<double, 6>;
   return core::Result<bool>::Err(std::move(error));
 }
 
-// A sent call's effect (T-N1): `observed` once this step re-armed the robot.
+// A sent call's effect: `observed` once this step re-armed the robot.
 void mark_effect(core::ErrorDTO &error, const bool rearmed) {
   if (rearmed) error.details.insert_or_assign("effect", "observed");
 }
 
 [[nodiscard]] core::ErrorDTO load_not_applied(const XArmServiceCallResult &call,
                                               const bool rearmed) {
-  // M6 XADAPT: a sent call with no answer in time is the robot controller
+  // A sent call with no answer in time is the robot controller
   // unresponsive (the component fault); any other failure is the typed
   // refusal, with the vendor reason recorded.
   const bool unanswered = call.outcome == XArmServiceCallOutcome::kUnknown &&
@@ -91,7 +91,7 @@ core::Result<bool>
 XArmToolContextSender::Apply(const std::optional<core::Pose3DTO> &offset,
                              const std::optional<core::ToolContextPointMassDTO> &payload,
                              const bool at_enable, const XArmToolContextBound &bound) {
-  std::lock_guard lock(mutex_);
+  // Serialized upstream (see the header); no lock across the driver calls.
   bool rearmed = false;
   if (offset) {
     const core::Pose3DTO &sent = *offset;
@@ -104,7 +104,7 @@ XArmToolContextSender::Apply(const std::optional<core::Pose3DTO> &offset,
             std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
             "the robot controller's status report is missing or out of date",
             {{"reason", "xarm_status_unavailable"}, {"effect", "not_started"}}});
-      // LR-3 (DX-3100): if the host crashes after an asynchronous offset
+      // If the host crashes after an asynchronous offset
       // send, a matching report at the new host's Enable can skip this send
       // before the old request lands. The maintainer accepted that residual.
       send = !offset_matches(*reported, wanted);
@@ -121,7 +121,7 @@ XArmToolContextSender::Apply(const std::optional<core::Pose3DTO> &offset,
              {"tool_context_field", "tcp_offset"},
              {"effect", "possible"}}}));
       rearmed = true;
-      // T-C2d: the report after the re-arm shows the sent offset.
+      // The report after the re-arm shows the sent offset.
       if (!sent_result.ready_offset || !offset_matches(*sent_result.ready_offset, wanted, true)) {
         core::ErrorDTO error{
             "tcp_offset_not_applied",

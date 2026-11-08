@@ -46,17 +46,35 @@ GitHub Actions runs in two tiers. Superseded runs on the same ref are cancelled.
   package, `pytest -n auto` where tests are independent) and `cpp-unit`
   (ROS-free C++ packages, Release; `manyforge_core` is built once and its
   tests run in four shards). `python-tests` and `cpp-unit` also run nightly on
-  `dev`, which keeps their compiler cache warm for pushes and pull requests.
+  `dev`, which refreshes their compiler cache for pushes and pull requests.
 - **Heavy tier**, nightly on `dev`, on release tags `v*` and on demand:
-  `cpp-asan`, `cpp-tsan`, `cpp-stability-gate` and `python-nightly` (I2
+  `cpp-asan`, `cpp-tsan`, `cpp-stability-gate` and `python-nightly` (core
   compiler bindings and the Python tests marked `@pytest.mark.slow`). Mark a
   test `slow` to move it from pull requests to the nightly run; every test
   still runs somewhere. Start a heavy workflow by hand with
   `gh workflow run <name>.yml --ref dev` or from the Actions tab.
+- **Nightly runs only after a change:** every scheduled workflow first calls
+  `nightly-dev-changed`, and skips its jobs unless `dev` was pushed after that
+  workflow's previous scheduled run started. A failure is therefore reported
+  once, not every night. Manual, tag, push and pull-request runs always run.
 - **`local-ci`** runs every lane, including the ROS integration and e2e
   suites, in the development containers on a self-hosted runner labelled
   `manyforge-local`. It starts on release tags and on demand only, never on
   pull requests.
+
+The ROS-backed TSan job in `local-ci` is staged with an explicit hold until
+the v0.2.1 workflows are re-enabled. It runs the ROS execution backend,
+gripper backend, kernel-stop integration and retained-runtime-handle binaries
+once each in separate processes, without suppressions. For each TSan report,
+the first relevant frame in each conflicting access and allocation stack is
+checked after sanitizer/interceptor, allocation, and standard-library
+allocator/container frames are skipped. A ManyForge frame there, or a
+ManyForge global location, fails the job. Other reports, including truncated
+stacks, appear as **“SDK race, to
+classify”** warnings; retain their complete logs and assess them for the
+upstream findings. A deeper ManyForge caller alone does not establish that an
+SDK access or allocation is ManyForge-owned. Test failures and TSan runtime
+failures also fail the job. The staged job has not yet qualified the release.
 
 ## Agent authorization
 

@@ -98,24 +98,6 @@ def _load_script(name: str, relative_path: str) -> ModuleType:
     return module
 
 
-def test_lite6_runtime_resolver_shell_is_a_pre_effect_i10_gate() -> None:
-    source = (
-        _ROOT / "scripts/ros/resolve-lite6-supervised-runtime.sh"
-    ).read_text(encoding="utf-8")
-
-    assert 'REASON_CODE="composable_cell_runtime_unavailable"' in source
-    assert 'RESTORATION_GATE="I10/R"' in source
-    assert "exit 78" in source
-    for forbidden in (
-        "generate-lite6-fixed-pneumatic-model.sh",
-        "source ",
-        "ros2 run",
-        "ROBOT_IP",
-        "OUTPUT_ROOT",
-    ):
-        assert forbidden not in source
-
-
 def test_controlled_stop_seam_reducer_is_transport_neutral() -> None:
     module = _load_script(
         "manyforge_controlled_stop_evidence_test",

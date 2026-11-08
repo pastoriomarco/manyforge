@@ -11,7 +11,7 @@
 namespace manyforge::roboplan_backend::worker_protocol {
 
 inline constexpr std::uint32_t kFrameMagic = 0x4d465750U;  // MFWP
-inline constexpr std::uint16_t kProtocolVersion = 12U;
+inline constexpr std::uint16_t kProtocolVersion = 13U;
 inline constexpr int kProtocolDescriptor = 3;
 /// Worker-reserved duplicate of the approved scene-asset root directory.
 inline constexpr int kSceneAssetRootDescriptor = 9;
@@ -51,6 +51,9 @@ struct WorkerIkRequestDTO final {
   /// Native body-name pairs (`first < second`) the selected contact policy
   /// allows; the worker deactivates them for this solve.
   std::vector<std::pair<std::string, std::string>> contact_allowed_pairs{};
+  core::PlannerCollisionMode collision_mode{core::PlannerCollisionMode::kEnforced};
+  std::optional<std::int64_t> diagnostic_deadline_ns{};
+  std::optional<core::TolerancesDTO> diagnostic_tolerances{};
 };
 
 [[nodiscard]] std::string encode_initialization(
@@ -68,9 +71,11 @@ struct WorkerIkRequestDTO final {
     std::optional<std::int64_t>* planning_deadline_ns = nullptr);
 
 [[nodiscard]] std::string encode_trajectory_result(
-    const core::Result<core::TrajectoryDTO>& value);
+    const core::Result<core::TrajectoryDTO>& value,
+    const std::optional<core::ControlledStateDTO>& qualified_target = std::nullopt);
 [[nodiscard]] core::Result<core::TrajectoryDTO> decode_trajectory_result(
-    std::string_view bytes);
+    std::string_view bytes,
+    std::optional<core::ControlledStateDTO>* qualified_target = nullptr);
 
 [[nodiscard]] std::string encode_ik_request(
     const WorkerIkRequestDTO& value);

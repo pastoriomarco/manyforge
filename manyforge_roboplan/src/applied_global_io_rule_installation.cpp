@@ -99,7 +99,7 @@ CompileGlobalIoRuleCatalog(
 }
 
 namespace {
-/// The committed composition takes the grasp-lost levels (SX-206): the host
+/// The committed composition takes the grasp-lost levels: the host
 /// store's sink moves to its runtime and the rows of grippers it does not hold
 /// drop. Only here, after the terminal publication proof; an Apply candidate
 /// never prunes.
@@ -161,7 +161,7 @@ core::Result<void> CommitAppliedGlobalIoRuleCatalog(
                 selected->context, selected->catalog, selected->service,
                 selected->waiting)
           : kernel.ActivateGlobalIoRuleCatalog(selected->context, selected->service);
-      // CONTRACTS §8, §11: after an Apply (Load included) every rule returns
+      // After an Apply (Load included) every rule returns
       // to its `active_at_start`.
       if (result.ok() && !restore)
         result = kernel.reset_rule_activation();

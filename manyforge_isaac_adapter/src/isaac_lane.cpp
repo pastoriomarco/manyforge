@@ -151,7 +151,7 @@ roboplan_backend::LaunchContribution isaac_launch_contribution(
     parameters += "    " + name + ": " + value + "\n";
   yaml.insert(at + kManager.size(), parameters);
   contribution.world_parent_frame = settings.world_parent_frame;
-  // RP-1b: an arm's `reset_position` is Mock's stock writer; the topic-based
+  // An arm's `reset_position` is Mock's stock writer; the topic-based
   // hardware publishes its position commands every cycle (threshold -1), so
   // the write is acknowledged on Isaac's joint commands topic.
   if (arm) {

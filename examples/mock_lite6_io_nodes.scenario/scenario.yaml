@@ -1,19 +1,17 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Mock Lite6 I/O nodes. Mock: read_part_initial scripts part_present false and reads it; wait_part scripts part_present false then true after 250 ms (timeout 2 s); check_part reads the value left true; set clamp and lamp. ROS: set plc_start (SetBool ack, 500 ms), wait for plc_ready (Bool topic, timeout 5 s). wait_operator_ack scripts operator_ack false with no change, so it times out after 5 s into a Fallback unless operator_ack is set true in the Tool & I/O panel during the wait.",
   "members": {
-    "assignment.yaml": "sha256:96366a3e2c8984bfc53586b8897ca0e29addab3483aa30d8dec203d11b41923e",
     "deployment.yaml": "sha256:6ad44b7d46ed4b530854afe0c772bba5f840c948ef2e260ce41eaefae01ae8b0",
-    "program.yaml": "sha256:8ea3bb47ee5d302d3ef0c6b42382f0aa7344dd3515de9af084a1115089c87182"
+    "program.yaml": "sha256:02364999e4c9b498b3f9134a78a2f0b39109801064b9643cdbf19d7090030f65"
   },
   "name": "mock_lite6_io_nodes",
   "saved_status": {
-    "checked_content_digest": "sha256:57435f6412364ba5388cdd8f0be263820b5069c87681a630a5377d4049077211",
+    "checked_content_digest": "sha256:fd2914ba9e615e41b88d6a9e90fc9885cf5ae10b2f3f16c21d4b2a4c90b1e47a",
     "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },

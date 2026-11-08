@@ -214,8 +214,8 @@ struct StopCertificateDTO final {
   std::int64_t completed_at_ns{};
   std::optional<ErrorDTO> terminal_error;
   /// Scope entries whose hard stop was the intended Stop: requested directly
-  /// (a zero-speed hold timeout, or Reset without an operator Stop profile;
-  /// Q27, Q31) or chosen by the Stop planner (Q33). Their strongest stage is
+  /// (a zero-speed hold timeout, or Reset without an operator Stop profile)
+  /// or chosen by the Stop planner. Their strongest stage is
   /// then not an escalation. Canonically ordered; normally empty.
   std::vector<StopScopeEntryKeyDTO> lane_hard_stop_requested{};
 

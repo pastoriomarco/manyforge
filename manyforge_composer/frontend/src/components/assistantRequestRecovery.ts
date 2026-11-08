@@ -61,7 +61,7 @@ export function shouldReconcileAssistantRequest(error: unknown): boolean {
 
 /**
  * Reconcile an uncertain request against its authoritative status reader.
- * Terminal semantics are supplied by the eventual I5 client contract rather
+ * Terminal semantics are supplied by an eventual client contract rather
  * than re-created here from the deleted assistant DTO.
  */
 export async function reconcileAssistantRequest<

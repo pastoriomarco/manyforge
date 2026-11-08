@@ -1,7 +1,7 @@
-"""Strict v2 Program authoring and bounded legacy-neutral tree helpers.
+"""Strict v3 Program authoring and bounded tree helpers.
 
 The loader validates portable authored meaning against one independently
-verified v2 catalog. It does not restore the former v0 singleton schema,
+verified v3 catalog. It does not restore the former v0 singleton schema,
 runtime factories, deployment-wide capability union, or binding authority.
 """
 
@@ -29,6 +29,7 @@ from manyforge_behavior.catalog import (
     SEMVER_RE,
     NodeCatalog,
 )
+from manyforge_behavior.program_frame_facts import ProgramFrameFacts
 from manyforge_behavior.interrupt_condition import (
     InterruptConditionError,
     check_condition,
@@ -57,7 +58,6 @@ from manyforge_behavior.value_path import (
     value_at_path,
 )
 from manyforge_behavior.skill_loader import SkillCatalog
-from manyforge_behavior.tcp_migration import migrate_tcp_selectors
 
 _MAX_TREE_DEPTH: Final = 256
 _MAX_TREE_NODES: Final = 100_000
@@ -74,13 +74,12 @@ _MAX_DOCUMENT_TEXT_CHARS: Final = 8 * 1024 * 1024
 # outside ±(2^53−1) is refused at parse, never rounded later.
 MAX_SAFE_INTEGER_LITERAL: Final = 9_007_199_254_740_991
 _MAX_CANONICAL_BYTES: Final = 96 * 1024 * 1024
-_PROGRAM_API_VERSION: Final = "manyforge.program.v2"
-_PREVIOUS_PROGRAM_API_VERSION: Final = "manyforge.program.v1"
+_PROGRAM_API_VERSION: Final = "manyforge.program.v3"
 _MAX_EXECUTION_GROUPS: Final = 4096
 _MAX_RESOLVED_GROUP_MEMBERSHIPS: Final = _MAX_TREE_NODES
 _MAX_RESOLVED_TARGET_EFFECTS: Final = _MAX_TREE_NODES
 _PROGRAM_PROFILE: Final = "composable-cell-v1"
-_CATALOG_API_VERSION: Final = "manyforge.node_catalog.v2"
+_CATALOG_API_VERSION: Final = "manyforge.node_catalog.v3"
 _GRASP_LOST_RESPONSE_DEFAULTS: Final = MappingProxyType(
     {
         "raise_alarm": True,
@@ -90,6 +89,7 @@ _GRASP_LOST_RESPONSE_DEFAULTS: Final = MappingProxyType(
     }
 )
 _IDENTIFIER_RE: Final = re.compile(r"^[a-z][a-z0-9_.-]*$")
+_CATALOG_IDENTIFIER_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _MAX_PROGRAM_ROLES: Final = 4096
 _MAX_PROGRAM_DECLARATIONS: Final = 100_000
 _PROGRAM_MOTION_DEFAULTS: Final = frozenset(
@@ -109,17 +109,43 @@ class ProgramValidationError(ValueError):
     """A Program artifact or retained tree-document value is malformed."""
 
 
-class TcpEndpointAliasAmbiguous(ProgramValidationError):
-    """Legacy aliases whose exact TCP needs an explicit authoring choice."""
+class ProgramFrameReferenceError(ProgramValidationError):
+    """A runtime frame has no unique match in the captured Program facts."""
 
-    code: Final = "tcp_endpoint_alias_ambiguous"
+    def __init__(self, code: str, path: str, component_id: str, frame_id: str) -> None:
+        super().__init__(f"{path}: {code}: {component_id}/{frame_id}")
+        self.code = code
+        self.details = {"reason": code, "reference_type": "component_frame",
+                        "reference_id": frame_id, "component_id": component_id}
 
-    def __init__(self, affected: Iterable[tuple[str, str]]) -> None:
-        self.affected = tuple(affected)
-        super().__init__("; ".join(
-            f"move {instance} on role {role}: choose its TCP"
-            for instance, role in self.affected
-        ))
+
+class ProgramFormatUnsupported(ProgramValidationError):
+    """A Program selects an unsupported format before any normalization."""
+
+    code: Final = "program_format_unsupported"
+
+    def __init__(self, actual_api_version: str, supported_api_version: str) -> None:
+        self.details = {
+            "actual_api_version": actual_api_version,
+            "supported_api_version": supported_api_version,
+        }
+        super().__init__(
+            f"Program format {actual_api_version!r} is unsupported; "
+            f"expected {supported_api_version!r}"
+        )
+
+
+def require_program_format(document: Any, *, supported_api_version: str) -> None:
+    """Refuse a different declared format before migration or normalization.
+
+    Both strict Program documents and Composer forests carry ``api_version``.
+    Missing or non-string versions remain the caller's structural error.
+    """
+    if not isinstance(document, Mapping):
+        return
+    actual = document.get("api_version")
+    if isinstance(actual, str) and actual != supported_api_version:
+        raise ProgramFormatUnsupported(actual, supported_api_version)
 
 
 class ProgramNodeValidationError(ProgramValidationError):
@@ -634,7 +660,7 @@ def _remove_explicit_default_policy_spelling(
     *,
     execution_groups_supported: bool = False,
 ) -> dict[str, Any]:
-    """Remove only the exact source spellings permitted by C1 migration."""
+    """Remove only the exact source spellings permitted by policy-default migration."""
 
     def is_default_recovery(value: Any) -> bool:
         return (
@@ -1270,19 +1296,19 @@ MOTION_NODE_IDS: Final = frozenset(
 
 
 # The two interrupt motion nodes: each carries one per-node interrupt
-# condition (schema02 §2, schema03).
+# condition.
 INTERRUPT_MOTION_NODE_IDS: Final = frozenset(
     {"motion.move_until_signal", "motion.probe_search"}
 )
 # The core-held `changed_outside` signal of an output with read-back
-# (CONTRACTS §7) is named by the output's resource role plus this suffix.
+# is named by the output's resource role plus this suffix.
 CHANGED_OUTSIDE_SUFFIX: Final = ".changed_outside"
 # Signal-reading io nodes: their one signal is (target_role, resource_role).
 IO_SIGNAL_INPUT_NODE_IDS: Final = frozenset(
     {"io.get_input", "io.check_input", "io.wait_for_input"}
 )
 MOCK_SIMULATION_NODE_IDS: Final = INTERRUPT_MOTION_NODE_IDS | IO_SIGNAL_INPUT_NODE_IDS
-# Node Mock simulation refusals (contract item 133, spec 410 §4.5).
+# Node Mock simulation refusals.
 MOCK_SIMULATION_INVALID: Final = "mock_simulation_invalid"
 MOCK_SIMULATION_SIGNAL_UNUSED: Final = "mock_simulation_signal_unused"
 MOCK_SIMULATION_SIGNAL_DUPLICATE: Final = "mock_simulation_signal_duplicate"
@@ -1323,14 +1349,35 @@ def is_node_outcome_key(key: str) -> bool:
 ACTIVE_TCP_NAMESPACE: Final = "active_tcp"
 
 
-def active_tcp_key(target_role: str) -> str:
-    """The system-owned Active TCP key for a motion target role."""
+def active_tcp_key(component_id: str, command_target_id: str) -> str:
+    """The reserved Active TCP key for one exact component and target."""
 
-    return f"{ACTIVE_TCP_NAMESPACE}.{target_role}"
+    if (type(component_id) is not str or len(component_id) > 128
+            or _IDENTIFIER_RE.fullmatch(component_id) is None
+            or type(command_target_id) is not str or len(command_target_id) > 128
+            or _CATALOG_IDENTIFIER_RE.fullmatch(command_target_id) is None):
+        raise ValueError("Active TCP target identity is invalid")
+    return f"{ACTIVE_TCP_NAMESPACE}/{component_id}/{command_target_id}"
+
+
+def parse_active_tcp_key(key: str) -> tuple[str, str] | None:
+    """Return the exact identity only for a valid reserved Active TCP key."""
+
+    if type(key) is not str:
+        return None
+    parts = key.split("/")
+    if len(parts) != 3 or parts[0] != ACTIVE_TCP_NAMESPACE:
+        return None
+    try:
+        if active_tcp_key(parts[1], parts[2]) != key:
+            return None
+    except ValueError:
+        return None
+    return parts[1], parts[2]
 
 
 def is_active_tcp_key(key: str) -> bool:
-    return key.startswith(f"{ACTIVE_TCP_NAMESPACE}.")
+    return parse_active_tcp_key(key) is not None
 
 
 # System-owned global-rule state keys (contract items 63, 64): each Deployment
@@ -1343,7 +1390,7 @@ def is_active_tcp_key(key: str) -> bool:
 # with_interrupt_state_keys (Applied rule ids) and the Composer GUI (Draft
 # rules); `require_interrupt_state_rules` is the Python form of that check.
 INTERRUPT_STATE_NAMESPACE: Final = "interrupt_state"
-# CONTRACTS §8: the key is withdrawn (absent) while the rule can't watch.
+# The key is withdrawn (absent) while the rule can't watch.
 INTERRUPT_STATE_VALUES: Final = ("inactive", "clear", "tripped")
 
 
@@ -1352,7 +1399,7 @@ def is_interrupt_state_key(key: str) -> bool:
 
 
 def interrupt_state_key(rule_id: str) -> str:
-    """The reserved key mirroring one global rule's Kernel state (item 64)."""
+    """The reserved key mirroring one global rule's Kernel state."""
 
     return f"{INTERRUPT_STATE_NAMESPACE}.{rule_id}"
 
@@ -1447,7 +1494,7 @@ def _declare_interrupt_state_keys(
 
 
 def require_interrupt_state_rules(program: "Program", rule_ids: Iterable[str]) -> None:
-    """The Program x Deployment join (contract 64, CONTRACTS §9): every
+    """The Program x Deployment join: every
     ``interrupt_state.<rule_id>`` the Program reads and every rule its
     ``rules.set_active`` nodes name is a declared global rule of the
     Deployment."""
@@ -1461,18 +1508,18 @@ def require_interrupt_state_rules(program: "Program", rule_ids: Iterable[str]) -
         )
 
 
-# Contract 87: every blackboard key an interrupt condition reads (a node rule
+# Every blackboard key an interrupt condition reads (a node rule
 # on move_until_signal / probe_search, or a Deployment global rule) declares
 # `initial:` (presence only; false / 0 are valid). Same reason as the Core.
 # System keys (node_outcome.*, interrupt_state.*) are exempt: the system
-# defines their start value (contract 105).
+# defines their start value.
 INTERRUPT_KEY_INITIAL_REQUIRED: Final = "interrupt_key_initial_required"
 
 
 def require_interrupt_key_initials(
     program: "Program", global_rules: Iterable[Mapping[str, Any]] = ()
 ) -> None:
-    """The Program x Deployment check of contract 87, where both are known.
+    """The Program x Deployment check of interrupt key initials, where both are known.
 
     Undeclared keys and malformed conditions are refused by their own checks
     and are not reported here.
@@ -1516,8 +1563,8 @@ def _global_rule_keys(rule: Mapping[str, Any]) -> frozenset[str]:
 
 
 def require_global_rule_operands(global_rules: Iterable[Mapping[str, Any]]) -> None:
-    """A global rule's condition never reads an ``interrupt_state.*`` key
-    (contract 111); Program nodes and node rules keep reading them."""
+    """A global rule's condition never reads an ``interrupt_state.*`` key;
+    Program nodes and node rules keep reading them."""
 
     found = sorted(
         (str(rule.get("rule_id")), key)
@@ -1537,7 +1584,7 @@ def require_global_rule_keys(
     program: "Program", global_rules: Iterable[Mapping[str, Any]]
 ) -> None:
     """Applying a Program that does not declare a blackboard key some global
-    rule reads is refused, naming the rule and the key (contract 106).
+    rule reads is refused, naming the rule and the key.
 
     ``interrupt_state.*`` operands are refused by
     ``require_global_rule_operands`` and are not reported here.
@@ -1568,7 +1615,7 @@ _RESERVED_NAMESPACES: Final = MappingProxyType(
 
 def _reserved_namespace(name: str) -> str | None:
     """The system namespace a key or parameter name uses (the bare namespace
-    name or any name under it), or None (contract 105(c))."""
+    name or any name under it), or None."""
 
     namespace = name.split(".", 1)[0]
     return namespace if namespace in _RESERVED_NAMESPACES else None
@@ -1576,11 +1623,10 @@ def _reserved_namespace(name: str) -> str | None:
 
 def _declare_active_tcp_selector_keys(
     keys: dict[str, BlackboardKeyDeclaration], roots: Iterable[Any],
-    target_roles: Mapping[str, dict[str, Any]],
 ) -> dict[str, BlackboardKeyDeclaration]:
-    """Declare portable Current reads for roles selected by motion or planning nodes."""
+    """Declare Current reads for targets selected by motion or planning nodes."""
     selector_nodes = MOTION_NODE_IDS | INTERRUPT_MOTION_NODE_IDS | frozenset({
-        "planning.plan_pick_sequence", "planning.plan_place_sequence",
+        "planning.plan_pick_sequence", "planning.plan_place_sequence", "motion.set_tcp",
     })
     pending = list(roots)
     seen = 0
@@ -1590,14 +1636,20 @@ def _declare_active_tcp_selector_keys(
         if type(node) is not dict:
             continue
         parameters = node.get("parameters")
-        role = parameters.get("target_role") if type(parameters) is dict else None
+        target = parameters.get("target") if type(parameters) is dict else None
         node_id = node.get("node_id")
-        if type(node_id) is str and node_id in selector_nodes and type(role) is str and role in target_roles:
-            key = active_tcp_key(role)
+        if type(node_id) is str and node_id in selector_nodes and isinstance(target, Mapping):
+            try:
+                key = active_tcp_key(target.get("component_id"), target.get("command_target_id"))
+            except ValueError:
+                key = None  # The ordinary field validator reports incomplete Drafts.
+        else:
+            key = None
+        if key is not None:
             keys[key] = BlackboardKeyDeclaration(
                 key=key, type="tcp_entry", access="read", persistence="run",
                 fields=MappingProxyType({}),
-                description=f"Active TCP of target role {role}",
+                description=f"Active TCP of target {target['component_id']}/{target['command_target_id']}",
             )
         children = node.get("children")
         if type(children) is list:
@@ -1960,6 +2012,20 @@ def _program_identifier(value: Any, *, path: str) -> str:
     return text
 
 
+def _program_direct_reference(value: Any, *, path: str, member: str) -> dict[str, Any]:
+    row = _program_mapping(value, path=path)
+    _program_closed(row, required=frozenset({"component_id", member}), path=path)
+    component = row["component_id"]
+    if (type(component) is not str or len(component) > 128
+            or _IDENTIFIER_RE.fullmatch(component) is None):
+        _program_error(f"{path}.component_id", "must be a Deployment component ID")
+    identity = row[member]
+    if (type(identity) is not str or len(identity) > 128
+            or _CATALOG_IDENTIFIER_RE.fullmatch(identity) is None):
+        _program_error(f"{path}.{member}", "must be a catalog feature ID")
+    return row
+
+
 def _program_number(value: Any, *, path: str) -> float:
     if type(value) not in {int, float}:
         _program_error(path, "must be a finite number")
@@ -2052,6 +2118,7 @@ class _ProgramValidationContext:
     blackboard_keys: dict[str, BlackboardKeyDeclaration]
     contact_policy_modes: dict[str, str]
     expressions: ExpressionEnvironment
+    direct_references: bool = False
     execution_groups_supported: bool = True
     target_effect_count: int = 0
     tree_instance_ids: set[str] = field(default_factory=set)
@@ -2111,6 +2178,10 @@ _DYNAMIC_SOURCE_FORBIDDEN_SEMANTICS: Final = frozenset(
         "resource_role",
         "source_joint",
         "target_role",
+        "target_reference",
+        "signal_reference",
+        "frame_reference",
+        "collision_body_reference",
     }
 )
 _DYNAMIC_SOURCE_FORBIDDEN_PARAMETERS: Final = frozenset(
@@ -2119,20 +2190,20 @@ _DYNAMIC_SOURCE_FORBIDDEN_PARAMETERS: Final = frozenset(
         "tcp_endpoint",
         "model_endpoint_alias",
         "prompt_template_id",
-        # Automatic retry settings are literal values (spec 400 §7).
+        # Automatic retry settings are literal values.
         "automatic_retries",
         "automatic_retry_delay_s",
-        # Preemption priority and result are literal values (contract item 33).
+        # Preemption priority and result are literal values.
         "preemption_priority",
         "preempted_result",
-        # Per-node interrupt rules are sealed literals (schema02 §2).
+        # Per-node interrupt rules are sealed literals.
         "interrupt_condition",
         "on_signal",
         "on_no_signal",
         "priority",
         "stop_entry_stage_id",
         "success_through_stage_id",
-        # Node Mock simulation rows are literal-only (contract item 133).
+        # Node Mock simulation rows are literal-only.
         "mock_simulation",
         # The attach node's grasp-lost response is literal-only.
         "on_grasp_lost",
@@ -2172,8 +2243,11 @@ def _validate_viewer(value: Any, *, path: str) -> None:
         optional=frozenset(
             {
                 "frame_role_visibility",
+                "frame_visibility",
+                "cell_frame_visible",
                 "frame_gizmo_size_m",
                 "resource_role_visibility",
+                "scene_resource_visibility",
                 "scene_resource_axes_visibility",
                 "object_axes_gizmo_size_m",
                 "hidden_execution_groups",
@@ -2190,6 +2264,7 @@ def _validate_viewer(value: Any, *, path: str) -> None:
     for field_name in (
         "frame_role_visibility",
         "resource_role_visibility",
+        "scene_resource_visibility",
         "scene_resource_axes_visibility",
     ):
         if field_name not in row:
@@ -2198,6 +2273,21 @@ def _validate_viewer(value: Any, *, path: str) -> None:
         _canonical_mapping_keys(visibility, path=f"{path}.{field_name}")
         if any(type(item) is not bool for item in visibility.values()):
             _program_error(f"{path}.{field_name}", "values must be booleans")
+    if "cell_frame_visible" in row and type(row["cell_frame_visible"]) is not bool:
+        _program_error(f"{path}.cell_frame_visible", "must be a boolean")
+    if "frame_visibility" in row:
+        entries = _program_list(row["frame_visibility"], path=f"{path}.frame_visibility")
+        keys: list[tuple[str, str]] = []
+        for index, value in enumerate(entries):
+            entry_path = f"{path}.frame_visibility[{index}]"
+            entry = _program_mapping(value, path=entry_path)
+            _program_closed(entry, required=frozenset({"frame", "visible"}), path=entry_path)
+            frame = _program_direct_reference(entry["frame"], path=f"{entry_path}.frame", member="frame_id")
+            if type(entry["visible"]) is not bool:
+                _program_error(f"{entry_path}.visible", "must be a boolean")
+            keys.append((frame["component_id"], frame["frame_id"]))
+        if keys != sorted(set(keys)):
+            _program_error(f"{path}.frame_visibility", "must be sorted and unique by frame")
     for field_name in ("frame_gizmo_size_m", "object_axes_gizmo_size_m"):
         if (
             field_name in row
@@ -2213,8 +2303,21 @@ def _validate_viewer_references(
     target_roles: Mapping[str, dict[str, Any]],
     scene_resource_roles: set[str],
     scene_resource_ids: set[str],
+    direct_references: bool = False,
 ) -> None:
     row = _program_mapping(value, path=path)
+    if direct_references:
+        for field_name in ("frame_role_visibility", "resource_role_visibility"):
+            if field_name in row:
+                _program_error(f"{path}.{field_name}", "is unavailable in Program v3")
+        for field_name in ("scene_resource_axes_visibility", "scene_resource_visibility"):
+            for resource in _program_mapping(row.get(field_name, {}), path=f"{path}.{field_name}"):
+                if resource not in scene_resource_ids:
+                    _program_error(
+                        f"{path}.{field_name}.{resource}",
+                        "does not name a declared scene resource",
+                    )
+        return
     declared_frame_roles = {
         role
         for target in target_roles.values()
@@ -2385,6 +2488,7 @@ def _validate_initial_scene_pose(
     *,
     path: str,
     component_roles: Mapping[str, dict[str, Any]],
+    direct_references: bool = False,
 ) -> None:
     pose = _program_mapping(value, path=path)
     _program_closed(
@@ -2411,6 +2515,10 @@ def _validate_initial_scene_pose(
         _program_error(
             f"{path}.frame_ref.kind", "must be cell_frame or component_frame"
         )
+    if direct_references:
+        _program_closed(frame, required=frozenset({"kind", "frame"}), path=f"{path}.frame_ref")
+        _program_direct_reference(frame["frame"], path=f"{path}.frame_ref.frame", member="frame_id")
+        return
     _program_closed(
         frame,
         required=frozenset({"kind", "component_role", "model_role", "frame_role"}),
@@ -2442,6 +2550,7 @@ def _validate_scene(
     path: str,
     catalog: NodeCatalog,
     component_roles: Mapping[str, dict[str, Any]],
+    direct_references: bool = False,
 ) -> tuple[set[str], set[str], set[str]]:
     rows = _program_list(value, path=path)
     scene_ids: list[str] = []
@@ -2470,7 +2579,8 @@ def _validate_scene(
         if shape_issues:
             _program_error(shape_issues[0].path, shape_issues[0].message)
         _validate_initial_scene_pose(
-            row["pose"], path=f"{row_path}.pose", component_roles=component_roles
+            row["pose"], path=f"{row_path}.pose", component_roles=component_roles,
+            direct_references=direct_references,
         )
         if "resource_roles" in row:
             scene_resource_roles.update(
@@ -2639,6 +2749,7 @@ def _validate_pose_frame_ref(
     path: str,
     target_roles: Mapping[str, dict[str, Any]],
     scene_resource_ids: set[str],
+    direct_references: bool = False,
 ) -> None:
     frame = _program_mapping(value, path=path)
     kind = frame.get("kind")
@@ -2664,6 +2775,10 @@ def _validate_pose_frame_ref(
         _program_error(
             f"{path}.kind", "must be cell_frame, target_frame, or scene_resource"
         )
+    if direct_references:
+        _program_closed(frame, required=frozenset({"kind", "frame"}), path=path)
+        _program_direct_reference(frame["frame"], path=f"{path}.frame", member="frame_id")
+        return
     _program_closed(
         frame,
         required=frozenset({"kind", "target_role", "frame_role"}),
@@ -2685,6 +2800,9 @@ def _frame_ref_order(frame: Mapping[str, Any]) -> tuple[str, str, str]:
     """Canonical order of pose frames: by kind, then target role or scene
     resource, then frame role."""
 
+    reference = frame.get("frame")
+    if isinstance(reference, Mapping):
+        return (str(frame["kind"]), str(reference["component_id"]), str(reference["frame_id"]))
     return (
         str(frame["kind"]),
         str(frame.get("target_role", frame.get("scene_resource_id", ""))),
@@ -2699,6 +2817,7 @@ def _validate_allowed_frames(
     declared_type: str,
     target_roles: Mapping[str, dict[str, Any]],
     scene_resource_ids: set[str],
+    direct_references: bool = False,
 ) -> tuple[Mapping[str, Any], ...]:
     """A closed, non-empty, duplicate-free, canonically ordered list of
     declared pose frames; valid only for pose keys."""
@@ -2714,6 +2833,7 @@ def _validate_allowed_frames(
             path=f"{path}[{index}]",
             target_roles=target_roles,
             scene_resource_ids=scene_resource_ids,
+            direct_references=direct_references,
         )
     order = [_frame_ref_order(row) for row in rows]
     if order != sorted(order) or len(order) != len(set(order)):
@@ -2747,6 +2867,7 @@ def _validate_declared_type_value(
     path: str,
     scene_resource_ids: set[str] | None = None,
     target_roles: Mapping[str, dict[str, Any]] | None = None,
+    direct_references: bool = False,
 ) -> None:
     if declared_type == "bool":
         if type(value) is not bool:
@@ -2772,6 +2893,11 @@ def _validate_declared_type_value(
         return
     if declared_type == "tcp_entry":
         row = _program_mapping(value, path=path)
+        if direct_references:
+            _program_closed(row, required=frozenset({"target", "frame"}), path=path)
+            _program_direct_reference(row["target"], path=f"{path}.target", member="command_target_id")
+            _program_direct_reference(row["frame"], path=f"{path}.frame", member="frame_id")
+            return
         fields = frozenset({"component_id", "target_id", "frame_role_id"})
         _program_closed(row, required=fields, path=path)
         for name in fields:
@@ -2795,6 +2921,7 @@ def _validate_declared_type_value(
             path=f"{path}.frame_ref",
             target_roles=target_roles or {},
             scene_resource_ids=scene_resource_ids or set(),
+            direct_references=direct_references,
         )
         return
     # Structured runtime values are declared by type but are not valid Program
@@ -2907,6 +3034,7 @@ def _validate_parameters(
     path: str,
     scene_resource_ids: set[str],
     target_roles: Mapping[str, dict[str, Any]],
+    direct_references: bool = False,
 ) -> dict[str, ProgramParameterDeclaration]:
     rows = _program_list(value, path=path)
     ids: list[str] = []
@@ -2947,6 +3075,7 @@ def _validate_parameters(
             path=f"{row_path}.default",
             scene_resource_ids=scene_resource_ids,
             target_roles=target_roles,
+            direct_references=direct_references,
         )
         constraints = _validate_constraints(
             row.get("constraints", {}),
@@ -2979,6 +3108,7 @@ def _validate_blackboard(
     path: str,
     scene_resource_ids: set[str],
     target_roles: Mapping[str, dict[str, Any]],
+    direct_references: bool = False,
 ) -> tuple[set[str], dict[str, BlackboardKeyDeclaration]]:
     root = _program_mapping(value, path=path)
     _program_closed(
@@ -3118,6 +3248,7 @@ def _validate_blackboard(
                 declared_type=declared_type,
                 target_roles=target_roles,
                 scene_resource_ids=scene_resource_ids,
+                direct_references=direct_references,
             )
         )
         has_initial = "initial" in row
@@ -3134,6 +3265,7 @@ def _validate_blackboard(
                 path=f"{row_path}.initial",
                 scene_resource_ids=scene_resource_ids,
                 target_roles=target_roles,
+                direct_references=direct_references,
             )
             _require_allowed_frame(initial, allowed_frames, path=f"{row_path}.initial")
         expression: str | None = None
@@ -3186,7 +3318,7 @@ def _validate_blackboard(
 
 
 def motion_tcp_selection(
-    parameters: Mapping[str, Any], *, path: str = "parameters"
+    parameters: Mapping[str, Any], *, path: str = "parameters", direct_references: bool = False
 ) -> dict[str, Any]:
     """Return the portable selector, defaulting a motion to Current."""
     if "tcp_frame_role" in parameters:
@@ -3197,16 +3329,29 @@ def motion_tcp_selection(
         path=f"{path}.tcp_endpoint",
     )
     kind = value.get("kind")
-    fields = {
-        "current": frozenset({"kind"}),
-        "default_of_role": frozenset({"kind", "role"}),
-        "entry": frozenset({"kind", "target_role", "frame_role"}),
-    }
+    fields = (
+        {
+            "current": frozenset({"kind"}),
+            "default_of_target": frozenset({"kind", "target"}),
+            "entry": frozenset({"kind", "target", "frame"}),
+        }
+        if direct_references
+        else {
+            "current": frozenset({"kind"}),
+            "default_of_role": frozenset({"kind", "role"}),
+            "entry": frozenset({"kind", "target_role", "frame_role"}),
+        }
+    )
     if type(kind) is not str or kind not in fields:
         _program_error(f"{path}.tcp_endpoint.kind", "has an unsupported TCP selector kind")
     _program_closed(value, required=fields[kind], path=f"{path}.tcp_endpoint")
     for name in fields[kind] - {"kind"}:
-        _program_identifier(value[name], path=f"{path}.tcp_endpoint.{name}")
+        field_path = f"{path}.tcp_endpoint.{name}"
+        if direct_references:
+            member = "command_target_id" if name == "target" else "frame_id"
+            _program_direct_reference(value[name], path=field_path, member=member)
+        else:
+            _program_identifier(value[name], path=field_path)
     return {"tcp_endpoint": dict(value)}
 
 
@@ -3217,6 +3362,7 @@ def _validate_contact_selector(
     component_roles: Mapping[str, dict[str, Any]],
     target_roles: Mapping[str, dict[str, Any]],
     blackboard_keys: Mapping[str, BlackboardKeyDeclaration],
+    direct_references: bool = False,
 ) -> tuple[str, str]:
     row = _program_mapping(value, path=path)
     kind = row.get("kind")
@@ -3224,6 +3370,12 @@ def _validate_contact_selector(
         _program_closed(row, required=frozenset({"kind"}), path=path)
         return kind, ""
     if kind == "component_model_body":
+        if direct_references:
+            _program_closed(row, required=frozenset({"kind", "body"}), path=path)
+            _program_direct_reference(
+                row["body"], path=f"{path}.body", member="collision_body_id"
+            )
+            return kind, canonical_json_bytes(row).decode("utf-8")
         _program_closed(
             row,
             required=frozenset({"kind", "component_role_id", "collision_body_role_id"}),
@@ -3297,6 +3449,7 @@ def _validate_contact_policies(
     component_roles: Mapping[str, dict[str, Any]],
     target_roles: Mapping[str, dict[str, Any]],
     blackboard_keys: Mapping[str, BlackboardKeyDeclaration],
+    direct_references: bool = False,
 ) -> dict[str, str]:
     rows = _program_list(value, path=path)
     policy_ids: list[str] = []
@@ -3434,6 +3587,7 @@ def _validate_contact_policies(
                     component_roles=component_roles,
                     target_roles=target_roles,
                     blackboard_keys=blackboard_keys,
+                    direct_references=direct_references,
                 )
                 right = _validate_contact_selector(
                     pair["body_b"],
@@ -3441,6 +3595,7 @@ def _validate_contact_policies(
                     component_roles=component_roles,
                     target_roles=target_roles,
                     blackboard_keys=blackboard_keys,
+                    direct_references=direct_references,
                 )
                 kinds = {left[0], right[0]}
                 if kinds not in (
@@ -3507,11 +3662,18 @@ def _validate_semantic_value(
     if concrete.nullable and value is None:
         return
     semantic_type = concrete.semantic_type
-    if semantic_type is not None:
+    # Reference objects are checked structurally by the catalog schema and
+    # against Deployment by the shared reference validator. They are not
+    # role identifiers in the Program's declaration tables.
+    if semantic_type is not None and concrete.schema_type != "object":
         if semantic_type == "source_joint":
             _program_text(value, path=path, max_chars=_MAX_IDENTIFIER_CHARS)
         else:
-            identity = _program_identifier(value, path=path)
+            identity = (
+                value
+                if semantic_type == "blackboard_key" and is_active_tcp_key(value)
+                else _program_identifier(value, path=path)
+            )
             if semantic_type == "target_role" and identity not in context.target_roles:
                 _program_error(path, "does not name a declared target role")
             if (
@@ -3533,7 +3695,7 @@ def _validate_semantic_value(
                 CHANGED_OUTSIDE_SUFFIX
             ):
                 # `<output role>.changed_outside`: the core-held signal of
-                # that output (CONTRACTS §7), read like any input signal.
+                # that output, read like any input signal.
                 identity = identity[: -len(CHANGED_OUTSIDE_SUFFIX)]
             if semantic_type in {
                 "frame_role",
@@ -3661,7 +3823,12 @@ def _source_declared_type(
     kind = source.get("kind")
     if kind not in {"program_parameter", "blackboard_key", "blackboard_field"}:
         _program_error(f"{path}.kind", "has an unsupported value-source kind")
-    reference = _program_identifier(source.get("reference"), path=f"{path}.reference")
+    raw_reference = source.get("reference")
+    reference = (
+        raw_reference
+        if kind in {"blackboard_key", "blackboard_field"} and is_active_tcp_key(raw_reference)
+        else _program_identifier(raw_reference, path=f"{path}.reference")
+    )
     if kind == "program_parameter":
         if "field" in source:
             _program_error(path, "program_parameter forbids field")
@@ -3797,7 +3964,7 @@ def _validate_node_capabilities(
     context: _ProgramValidationContext,
 ) -> None:
     parameter_by_id = {parameter.id: parameter for parameter in entry.parameters}
-    effects: set[tuple[str, str]] = set()
+    effects: set[tuple[Any, str]] = set()
     for requirement in entry.required_capabilities:
         if requirement.when_parameter is not None:
             selected = _effective_parameter_value(
@@ -3815,6 +3982,19 @@ def _validate_node_capabilities(
             target_parameter = parameter_by_id[selector]
             if target_parameter.has_default:
                 target_role = target_parameter.default
+        if context.direct_references:
+            if type(target_role) is not dict or not all(
+                type(key) is str and type(value) is str
+                for key, value in target_role.items()
+            ):
+                _program_error(
+                    f"{path}.parameters.{selector}",
+                    "must select a component reference for capability validation",
+                )
+            # The shared Deployment validator checks capability availability;
+            # the Program validator only maintains the existing effect bound.
+            effects.add((tuple(sorted(target_role.items())), requirement.capability_id))
+            continue
         if type(target_role) is not str or target_role not in context.target_roles:
             _program_error(
                 f"{path}.parameters.{selector}",
@@ -3924,6 +4104,7 @@ def _validate_key_typed_parameters(
                 path=f"{path}.parameters.{parameter_id}",
                 scene_resource_ids=context.scene_resource_ids,
                 target_roles=context.target_roles,
+                direct_references=context.direct_references,
             )
 
 
@@ -4155,12 +4336,16 @@ def _validate_node_value_sources(
 
 
 def _goal_frame(
-    pose: Any, parameters: Mapping[str, Any]
+    pose: Any, parameters: Mapping[str, Any], *, direct_references: bool = False
 ) -> Mapping[str, Any] | None:
     """The authored frame of a goal pose; None for the moving robot's base."""
 
     frame = pose.get("frame_ref") if type(pose) is dict else None
-    if frame is None or frame == {
+    if frame is None:
+        return None
+    if direct_references and frame == {"kind": "target_frame", "frame": parameters.get("base_frame")}:
+        return None
+    if not direct_references and frame == {
         "kind": "target_frame",
         "target_role": parameters.get("target_role"),
         "frame_role": parameters.get("base_frame_role"),
@@ -4226,7 +4411,10 @@ def _validate_node_cross_fields(
     when its value is resolved at node start."""
 
     if node_id == "scene.attach_carried_object":
-        selected = {name for name in ("carrier_frame_role", "carrier_frame")
+        carrier_parameter = (
+            "carrier_frame_ref" if context.direct_references else "carrier_frame_role"
+        )
+        selected = {name for name in (carrier_parameter, "carrier_frame")
                     if name in parameters or name in sourced}
         if len(selected) != 1:
             _program_error(f"{path}.parameters", "requires exactly one carrier frame selector")
@@ -4252,7 +4440,10 @@ def _validate_node_cross_fields(
             if node_id == "motion.move_to_pose"
             else parameters.get("path") if type(parameters.get("path")) is list else []
         )
-        frames = [_goal_frame(pose, parameters) for pose in poses if type(pose) is dict]
+        frames = [
+            _goal_frame(pose, parameters, direct_references=context.direct_references)
+            for pose in poses if type(pose) is dict
+        ]
         field = "goal" if node_id == "motion.move_to_pose" else "path"
         if any(frame != frames[0] for frame in frames):
             _program_error(f"{path}.parameters.{field}", "waypoints must all use one frame")
@@ -4298,16 +4489,23 @@ def _validate_node_cross_fields(
                     for role, target in context.target_roles.items()
                 },
                 path=f"{path}.parameters.interrupt_condition",
+                direct_references=context.direct_references,
             )
         except InterruptConditionError as error:
             _program_error(error.path, f"{error.reason}: {error.message}")
     if node_id in MOCK_SIMULATION_NODE_IDS and "mock_simulation" in parameters:
         if node_id in INTERRUPT_MOTION_NODE_IDS:
             used = (
-                condition_signals(parameters["interrupt_condition"])
+                condition_signals(
+                    parameters["interrupt_condition"],
+                    direct_references=context.direct_references,
+                )
                 if "interrupt_condition" in parameters
                 else frozenset()
             )
+        elif context.direct_references and "signal" in parameters:
+            signal = parameters["signal"]
+            used = frozenset({(signal["component_id"], signal["signal_name"])})
         elif {"target_role", "resource_role"} <= set(parameters):
             used = frozenset({(parameters["target_role"], parameters["resource_role"])})
         else:
@@ -4316,6 +4514,7 @@ def _validate_node_cross_fields(
             parameters["mock_simulation"],
             used,
             path=f"{path}.parameters.mock_simulation",
+            direct_references=context.direct_references,
         )
     if node_id == "io.wait_for_input" and (
         "edge" in sourced or parameters.get("edge", "level") != "level"
@@ -4331,6 +4530,7 @@ def _validate_node_cross_fields(
             path=f"{path}.parameters.frame_ref",
             target_roles=context.target_roles,
             scene_resource_ids=context.scene_resource_ids,
+            direct_references=context.direct_references,
         )
         if any(
             low > high
@@ -4358,13 +4558,17 @@ def _validate_mock_simulation(
     used: frozenset[tuple[str, str]],
     *,
     path: str,
+    direct_references: bool = False,
 ) -> None:
     """Each row names one distinct signal the node itself reads (catalog
     schema already checked the row shape and bool values)."""
 
     seen: set[tuple[str, str]] = set()
     for index, row in enumerate(rows):
-        signal = (row["signal"]["target_role"], row["signal"]["resource_role"])
+        signal = (
+            row["signal"]["component_id" if direct_references else "target_role"],
+            row["signal"]["signal_name" if direct_references else "resource_role"],
+        )
         row_path = f"{path}[{index}].signal"
         if signal not in used:
             _program_error(
@@ -4467,7 +4671,7 @@ def _validate_program_tree_node(
                 "is an unsupported lifecycle Program node; use the explicit "
                 "idle-time component-management API",
             )
-        _program_error(f"{path}.node_id", "is absent from the active v2 catalog")
+        _program_error(f"{path}.node_id", "is absent from the active v3 catalog")
     if entry.min_program_profile != _PROGRAM_PROFILE:
         _program_error(path, "requires an unsupported Program profile")
 
@@ -4541,7 +4745,9 @@ def _validate_program_tree_node(
     effective_parameters.update(parameters)
 
     if "tcp_endpoint" in catalog_parameters:
-        motion_tcp_selection(parameters, path=f"{path}.parameters")
+        motion_tcp_selection(
+            parameters, path=f"{path}.parameters", direct_references=context.direct_references
+        )
 
     for parameter_id, catalog_parameter in catalog_parameters.items():
         supplied_literal = parameter_id in parameters
@@ -4704,37 +4910,41 @@ def program_value_declarations(
     """
 
     root = _program_mapping(dict(document), path=source)
-    if "component_roles" not in root:
+    direct_references = root.get("api_version") == "manyforge.program.v3"
+    if not direct_references and "component_roles" not in root:
         _program_error(f"{source}.component_roles", "is required")
-    component_roles = _validate_component_roles(
+    component_roles = {} if direct_references else _validate_component_roles(
         root["component_roles"], path=f"{source}.component_roles"
     )
-    target_roles = _validate_target_roles(
-        root.get("target_roles", {}),
-        path=f"{source}.target_roles",
-        component_roles=component_roles,
+    target_roles = {} if direct_references else _validate_target_roles(
+        root.get("target_roles", {}), path=f"{source}.target_roles", component_roles=component_roles
     )
     scene_resource_ids, _roles = _validate_scene(
         root.get("scene", []),
         path=f"{source}.scene",
         catalog=catalog,
         component_roles=component_roles,
+        direct_references=direct_references,
     )
     parameters = _validate_parameters(
         root.get("parameters", []),
         path=f"{source}.parameters",
         scene_resource_ids=scene_resource_ids,
         target_roles=target_roles,
+        direct_references=direct_references,
     )
     _namespaces, keys = _validate_blackboard(
         root.get("blackboard", {"namespaces": [], "keys": []}),
         path=f"{source}.blackboard",
         scene_resource_ids=scene_resource_ids,
         target_roles=target_roles,
+        direct_references=direct_references,
     )
     # A Program's tree, or a Draft's authoring forest.
     forest = root.get("forest")
     roots = [root.get("tree"), *(forest if type(forest) is list else [])]
+    if direct_references:
+        keys = _declare_active_tcp_selector_keys(keys, roots)
     keys = _declare_node_outcome_keys(keys, roots)
     return parameters, _declare_interrupt_state_keys(keys, roots, root.get("blackboard"))
 
@@ -4867,6 +5077,9 @@ def _validate_program_document(
     tuple[dict[str, str], ...],
 ]:
     root = _program_mapping(data, path=source)
+    direct_references = api_version == "manyforge.program.v3"
+    if direct_references:
+        require_program_format(root, supported_api_version=api_version)
     root = _select_identity_verified_program_root(
         root,
         source=source,
@@ -4883,12 +5096,13 @@ def _validate_program_document(
                 "program_profile",
                 "name",
                 "catalog",
-                "component_roles",
-                "target_roles",
                 "tree",
             }
+        ) | (frozenset() if direct_references else frozenset({"component_roles", "target_roles"})),
+        optional=(
+            _TOP_LEVEL_FIELDS - {"component_roles", "target_roles"}
+            if direct_references else _TOP_LEVEL_FIELDS
         ),
-        optional=_TOP_LEVEL_FIELDS,
         path=source,
     )
     if root["api_version"] != api_version:
@@ -4923,71 +5137,34 @@ def _validate_program_document(
     ):
         _program_error(
             f"{source}.catalog",
-            "does not select the exact active v2 catalog version",
+            "does not select the exact active v3 catalog version",
         )
     if authoring_load and not catalog_version_compatible(
         catalog_ref["content_version"], catalog.content_version
     ):
         _program_error(
             f"{source}.catalog",
-            "does not select a compatible active v2 catalog version (same "
+            "does not select a compatible active v3 catalog version (same "
             f"major, minor not above {catalog.content_version})",
         )
-    if (
-        authoring_load
-        and catalog_ref["content_version"] == "2.8.0"
-        and catalog.content_version == "2.9.0"
-    ):
-        # Copy the bounded tree before converting; never modify the caller's
-        # source or reinterpret an identity mismatch as a migration edit.
-        clean_identity = False
-        try:
-            verify_content_identity(
-                root, own_field="program_revision", identity_domain="program-revision",
-                api_version=api_version, label=source,
-            )
-            clean_identity = True
-        except StrictArtifactError:
-            pass
-        root = _remove_explicit_default_policy_spelling(
-            root, execution_groups_supported=api_version == _PROGRAM_API_VERSION
-        )
-        pending = [root.get("tree")]
-        nodes = []
-        while pending:
-            node = pending.pop()
-            if type(node) is not dict:
-                continue
-            if type(node.get("parameters")) is dict:
-                node["parameters"] = dict(node["parameters"])
-            nodes.append(node)
-            children = node.get("children")
-            if type(children) is list:
-                pending.extend(children)
-        root["target_roles"] = deepcopy(root.get("target_roles"))
-        ambiguous = migrate_tcp_selectors(nodes, root)
-        if ambiguous:
-            raise TcpEndpointAliasAmbiguous(ambiguous)
-        if clean_identity:
-            root["program_revision"] = compute_content_identity(
-                root, own_field="program_revision", identity_domain="program-revision",
-                api_version=api_version,
-            )
     if "compatibility" in root:
         _validate_compatibility(root["compatibility"], path=f"{source}.compatibility")
-    component_roles = _validate_component_roles(
-        root["component_roles"], path=f"{source}.component_roles"
+    component_roles = (
+        {} if direct_references else _validate_component_roles(
+            root["component_roles"], path=f"{source}.component_roles"
+        )
     )
-    target_roles = _validate_target_roles(
-        root["target_roles"],
-        path=f"{source}.target_roles",
-        component_roles=component_roles,
+    target_roles = (
+        {} if direct_references else _validate_target_roles(
+            root["target_roles"], path=f"{source}.target_roles", component_roles=component_roles
+        )
     )
     scene_resource_ids, scene_resource_roles = _validate_scene(
         root.get("scene", []),
         path=f"{source}.scene",
         catalog=catalog,
         component_roles=component_roles,
+        direct_references=direct_references,
     )
     if "viewer" in root:
         _validate_viewer(root["viewer"], path=f"{source}.viewer")
@@ -4997,32 +5174,24 @@ def _validate_program_document(
             target_roles=target_roles,
             scene_resource_roles=scene_resource_roles,
             scene_resource_ids=scene_resource_ids,
+            direct_references=direct_references,
         )
     parameters = _validate_parameters(
         root.get("parameters", []),
         path=f"{source}.parameters",
         scene_resource_ids=scene_resource_ids,
         target_roles=target_roles,
+        direct_references=direct_references,
     )
     namespaces, blackboard_keys = _validate_blackboard(
         root.get("blackboard", {"namespaces": [], "keys": []}),
         path=f"{source}.blackboard",
         scene_resource_ids=scene_resource_ids,
         target_roles=target_roles,
+        direct_references=direct_references,
     )
-    for role, target in target_roles.items():
-        if any(
-            item["capability_id"] == "execution.trajectory.execute"
-            for item in target["required_capabilities"]
-        ):
-            key = active_tcp_key(role)
-            blackboard_keys[key] = BlackboardKeyDeclaration(
-                key=key, type="tcp_entry", access="read", persistence="run",
-                fields=MappingProxyType({}),
-                description=f"Active TCP of target role {role}",
-            )
     blackboard_keys = _declare_active_tcp_selector_keys(
-        blackboard_keys, [root.get("tree")], target_roles
+        blackboard_keys, [root.get("tree")]
     )
     blackboard_keys = _declare_node_outcome_keys(blackboard_keys, [root.get("tree")])
     blackboard_keys = _declare_interrupt_state_keys(
@@ -5038,6 +5207,7 @@ def _validate_program_document(
         component_roles=component_roles,
         target_roles=target_roles,
         blackboard_keys=blackboard_keys,
+        direct_references=direct_references,
     )
     context = _ProgramValidationContext(
         catalog=catalog,
@@ -5049,7 +5219,8 @@ def _validate_program_document(
         blackboard_keys=blackboard_keys,
         contact_policy_modes=contact_policy_modes,
         expressions=expressions,
-        execution_groups_supported=api_version == _PROGRAM_API_VERSION,
+        direct_references=direct_references,
+        execution_groups_supported=api_version in {_PROGRAM_API_VERSION, "manyforge.program.v3"},
     )
     tree = _validate_program_tree(
         root["tree"],
@@ -5062,7 +5233,7 @@ def _validate_program_document(
         root.get("execution_groups"),
         path=f"{source}.execution_groups",
     )
-    if execution_group_policies and api_version != _PROGRAM_API_VERSION:
+    if execution_group_policies and api_version not in {_PROGRAM_API_VERSION, "manyforge.program.v3"}:
         _program_error(
             f"{source}.execution_groups",
             "is unavailable in the previous Program contract",
@@ -5138,11 +5309,11 @@ def _validate_program_document(
 
 
 class Program:
-    """Validated portable ``manyforge.program.v2`` authoring artifact.
+    """Validated ``manyforge.program.v3`` authoring artifact.
 
     This loader owns no binding, runtime, filesystem discovery, node factory,
     or deployment-capability union. It validates authored meaning against one
-    already verified v2 catalog; exact retained coordinates remain the binding
+    already verified v3 catalog; exact retained coordinates remain the binding
     phase's responsibility.
     """
 
@@ -5157,12 +5328,12 @@ class Program:
     ) -> None:
         if skill_catalog is not None:
             raise ProgramValidationError(
-                "v0 skill expansion is unavailable; v2 Programs contain only "
+                "v0 skill expansion is unavailable; v3 Programs contain only "
                 "ordinary active-catalog nodes"
             )
         if deployment_capability_keys is not None:
             raise ProgramValidationError(
-                "deployment-wide capability unions cannot validate a v2 Program"
+                "deployment-wide capability unions cannot validate a v3 Program"
             )
         source_path = Path(path)
         try:
@@ -5190,12 +5361,12 @@ class Program:
     ) -> "Program":
         if skill_catalog is not None:
             raise ProgramValidationError(
-                "v0 skill expansion is unavailable; v2 Programs contain only "
+                "v0 skill expansion is unavailable; v3 Programs contain only "
                 "ordinary active-catalog nodes"
             )
         if deployment_capability_keys is not None:
             raise ProgramValidationError(
-                "deployment-wide capability unions cannot validate a v2 Program"
+                "deployment-wide capability unions cannot validate a v3 Program"
             )
         if type(data) is not dict:
             raise ProgramValidationError("Program root must be a built-in mapping")
@@ -5287,20 +5458,23 @@ class Program:
             key: declaration for key, declaration in self.blackboard_keys.items()
             if not is_active_tcp_key(key)
         }
-        for row in binding.get("target_role_bindings", ()):
+        for row in binding.get("target_bindings", ()):
             if not isinstance(row, Mapping) or "robot_tcps" not in row:
                 continue
-            role = row.get("target_role_id")
-            if type(role) is not str or role not in self._data["target_roles"]:
+            target = row.get("target")
+            if not isinstance(target, Mapping):
                 continue
-            key = active_tcp_key(role)
+            try:
+                key = active_tcp_key(target.get("component_id"), target.get("command_target_id"))
+            except ValueError:
+                continue
             keys[key] = BlackboardKeyDeclaration(
                 key=key,
                 type="tcp_entry",
                 access="read",
                 persistence="run",
                 fields=MappingProxyType({}),
-                description=f"Active TCP of target role {role}",
+                description=f"Active TCP of target {target['component_id']}/{target['command_target_id']}",
             )
         clone = copy(self)
         clone.blackboard_keys = MappingProxyType(dict(sorted(keys.items())))
@@ -5308,7 +5482,7 @@ class Program:
 
     def with_interrupt_state_keys(self, rule_ids: Iterable[str]) -> "Program":
         """This Program plus the reserved ``interrupt_state.<rule_id>`` key of
-        each Applied global rule (contract 64).
+        each Applied global rule.
 
         The Runner calls this with the Applied Deployment's global rule ids.
         Keys the Program itself reads are already declared by validation.
@@ -5322,12 +5496,39 @@ class Program:
         clone.blackboard_keys = MappingProxyType(dict(sorted(keys.items())))
         return clone
 
+    def with_program_frame_facts(self, facts: ProgramFrameFacts) -> "Program":
+        """Use the immutable facts of this exact Applied capture at runtime."""
+        if not isinstance(facts, ProgramFrameFacts):
+            raise TypeError("runtime frame facts must be a validated capture")
+        clone = copy(self)
+        clone._program_frame_facts = facts
+        return clone
+
+    def without_program_frame_facts(self) -> "Program":
+        """Keep authored-value validation for the existing Reset path."""
+        clone = copy(self)
+        clone._program_frame_facts = None
+        return clone
+
+    def _validate_captured_frame(self, frame: Mapping[str, Any], *, path: str) -> None:
+        facts = getattr(self, "_program_frame_facts", None)
+        if facts is None or frame.get("kind") != "target_frame":
+            return
+        reference = frame["frame"]
+        component_id, frame_id = reference["component_id"], reference["frame_id"]
+        count = facts.match_count(component_id, frame_id)
+        if count != 1:
+            raise ProgramFrameReferenceError(
+                "frame_missing" if count == 0 else "reference_ambiguous",
+                path, component_id, frame_id,
+            )
+
     def validate_key_value(self, key: str, value: Any, *, path: str) -> None:
         """Validate one value against the declared type of ``key``.
 
         The one check for initial, node, operator and restored values alike:
-        pose frames are checked against this Program's declared target roles
-        and scene resources, and against the key's ``allowed_frames``.
+        Pose frames are checked against authored scene resources, the captured
+        component frame facts when present, and the key's ``allowed_frames``.
         """
 
         declaration = self.blackboard_keys.get(key)
@@ -5338,33 +5539,36 @@ class Program:
             value,
             path=path,
             scene_resource_ids=self._scene_resource_ids(),
-            target_roles=self._data["target_roles"],
+            target_roles=self._data.get("target_roles", {}),
+            direct_references=self._data.get("api_version") == "manyforge.program.v3",
         )
         if declaration.type == "stored_pose":
             _require_allowed_frame(value, declaration.allowed_frames, path=path)
+            self._validate_captured_frame(value["frame_ref"], path=f"{path}.frame_ref")
 
     def validate_pose_frame(self, value: Any, *, path: str) -> None:
-        """Validate one pose ``frame_ref`` against this Program's declared
-        target roles and scene resources (a pose inside a structured value)."""
+        """Validate a structured pose frame against its captured facts and scene."""
 
         _validate_pose_frame_ref(
             value,
             path=path,
-            target_roles=self._data["target_roles"],
+            target_roles=self._data.get("target_roles", {}),
             scene_resource_ids=self._scene_resource_ids(),
+            direct_references=self._data.get("api_version") == "manyforge.program.v3",
         )
+        self._validate_captured_frame(value, path=path)
 
     def _scene_resource_ids(self) -> set[str]:
         return {row["scene_resource_id"] for row in self._data.get("scene", [])}
 
     def to_dict(self) -> dict[str, Any]:
-        """Return one detached exact v2 authoring document."""
+        """Return one detached exact v3 authoring document."""
 
         return deepcopy(self._data)
 
 
 def _interrupt_condition_keys(tree: ProgramTreeNode) -> tuple[str, ...]:
-    """The Run's fixed referenced-key union (contract 52, SX-2091): exactly the
+    """The Run's fixed referenced-key union: exactly the
     keys the Program's interrupt conditions name as operands, sorted. A
     computed key's own dependencies are not included."""
 
@@ -5382,7 +5586,7 @@ def _interrupt_condition_keys(tree: ProgramTreeNode) -> tuple[str, ...]:
 
 def _rule_activation_rule_ids(tree: ProgramTreeNode) -> tuple[str, ...]:
     """The global rule ids the Program's ``rules.set_active`` nodes name
-    literally, sorted (each must be a rule of the Deployment, CONTRACTS §9)."""
+    literally, sorted (each must be a rule of the Deployment)."""
 
     rule_ids: set[str] = set()
     pending = [tree]
@@ -5396,116 +5600,6 @@ def _rule_activation_rule_ids(tree: ProgramTreeNode) -> tuple[str, ...]:
     return tuple(sorted(rule_ids))
 
 
-def migrate_program_v1(data: dict[str, Any], catalog: NodeCatalog) -> Program:
-    """Explicit offline conversion; the runtime loader never calls this path.
-
-    Validate the old closed schema and its original identity before creating
-    the successor. The input and any existing binding remain untouched.
-    """
-
-    if type(data) is not dict:
-        raise ProgramValidationError("Program root must be a built-in mapping")
-    try:
-        canonical_json_bytes(data)
-        normalized, *_validated = _validate_program_document(
-            deepcopy(data),
-            catalog=catalog,
-            source="v1 migration",
-            api_version=_PREVIOUS_PROGRAM_API_VERSION,
-        )
-        normalized["api_version"] = _PROGRAM_API_VERSION
-        normalized["program_revision"] = compute_content_identity(
-            normalized,
-            own_field="program_revision",
-            identity_domain="program-revision",
-            api_version=_PROGRAM_API_VERSION,
-        )
-    except StrictArtifactError as exc:
-        raise ProgramValidationError(str(exc)) from exc
-    return Program.from_dict(normalized, catalog)
-
-
-def migrate_program_execution_groups(
-    data: dict[str, Any], catalog: NodeCatalog
-) -> Program:
-    """Explicitly replace the former synchronization list in one v2 Program."""
-
-    if type(data) is not dict or data.get("api_version") != _PROGRAM_API_VERSION:
-        raise ProgramValidationError("execution-group migration requires a v2 Program")
-    if "execution_groups" in data:
-        raise ProgramValidationError("Program already uses execution group definitions")
-    try:
-        verify_content_identity(
-            data,
-            own_field="program_revision",
-            identity_domain="program-revision",
-            api_version=_PROGRAM_API_VERSION,
-            label="execution-group migration input",
-        )
-    except StrictArtifactError as exc:
-        raise ProgramValidationError(str(exc)) from exc
-    selected = data.get("synchronized_execution_groups", [])
-    synchronized = _parse_synchronized_execution_groups_legacy(
-        selected, path="synchronized_execution_groups"
-    )
-    migrated = deepcopy(data)
-    migrated.pop("synchronized_execution_groups", None)
-    names: set[str] = set()
-    pending = [migrated.get("tree")]
-    while pending:
-        node = pending.pop()
-        if type(node) is not dict:
-            raise ProgramValidationError("Program tree is invalid")
-        memberships = node.get("execution_groups")
-        if type(memberships) is list:
-            names.update(memberships)
-        children = node.get("children", [])
-        if type(children) is not list:
-            raise ProgramValidationError("Program tree children are invalid")
-        pending.extend(children)
-    unknown = set(synchronized) - names
-    if unknown:
-        raise ProgramValidationError(
-            f"synchronized execution groups are unused: {sorted(unknown)}"
-        )
-    if names:
-        migrated["execution_groups"] = {
-            name: {
-                "execution_policy": (
-                    "common_start" if name in synchronized else "independent"
-                )
-            }
-            for name in sorted(names)
-        }
-    migrated["program_revision"] = compute_content_identity(
-        migrated,
-        own_field="program_revision",
-        identity_domain="program-revision",
-        api_version=_PROGRAM_API_VERSION,
-    )
-    return Program.from_dict(migrated, catalog)
-
-
-def _parse_synchronized_execution_groups_legacy(
-    raw: Any, *, path: str
-) -> tuple[str, ...]:
-    if (
-        type(raw) is not list
-        or len(raw) > _MAX_EXECUTION_GROUPS
-        or raw != sorted(raw)
-        or len(set(raw)) != len(raw)
-        or any(
-            type(name) is not str
-            or len(name) > 128
-            or _IDENTIFIER_RE.fullmatch(name) is None
-            or name in {"all", "inherit"}
-            for name in raw
-        )
-    ):
-        raise ProgramValidationError(f"{path} is invalid")
-    return tuple(raw)
-
-
 __all__ = [
     "BlackboardKey",
     "BlackboardFieldDeclaration",
@@ -5516,20 +5610,18 @@ __all__ = [
     "ProgramParameterDeclaration",
     "ProgramTreeNode",
     "ProgramValidationError",
-    "TcpEndpointAliasAmbiguous",
     "TreeNode",
     "apply_tree_param_overrides",
     "check_draft_formulas",
     "compute_program_tree_hash",
     "find_tree_node_by_name",
     "merge_param_patch",
-    "migrate_program_v1",
-    "migrate_program_execution_groups",
     "program_node_policies",
     "program_value_declarations",
     "INTERRUPT_MOTION_NODE_IDS",
     "ACTIVE_TCP_NAMESPACE",
     "active_tcp_key",
+    "parse_active_tcp_key",
     "is_active_tcp_key",
     "INTERRUPT_STATE_NAMESPACE",
     "INTERRUPT_STATE_VALUES",

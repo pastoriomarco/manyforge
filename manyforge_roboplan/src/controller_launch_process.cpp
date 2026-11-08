@@ -49,7 +49,7 @@ constexpr std::string_view kAiModelLaunchFile = "ai_model.launch.py";
 
 [[nodiscard]] int parent_death_signal(const ControllerLaunchCommand &command) {
   const auto &argv = command.argv;
-  // Q116 applies only to these qualified ROS launch roles. Arbitrary
+  // The parent-death signal applies only to these qualified ROS launch roles. Arbitrary
   // controller commands retain their existing SIGTERM policy.
   if (argv.size() >= 4U && argv[0] == kRos2 && argv[1] == "launch" &&
       argv[2] == kBringupPackage &&
@@ -521,14 +521,14 @@ isaac_gripper_launch_command(const ControllerLaunchArtifacts &artifacts,
 
 namespace {
 
-// Q80 INTERIM, TO BE DELETED: until the Components panel drives the
+// INTERIM, TO BE DELETED: until the Components panel drives the
 // per-component bring-up request, a Deployment Apply that activates a
 // component whose launch has exited brings it up again (a new launch through
 // the normal activation path). Delete this function and its single call as
 // soon as the Components panel works; the exited case then stays failed until
 // the explicit bring-up request.
 [[nodiscard]] ControllerLaunchDecision
-q80_interim_apply_brings_up_an_exited_launch() {
+interim_apply_brings_up_an_exited_launch() {
   return ControllerLaunchDecision::kRestart;
 }
 
@@ -548,7 +548,7 @@ ControllerLaunchDecision decide_controller_launch(
     const std::optional<ControllerLaunchObservation> &current,
     const ControllerLaunchCommand &next) {
   if (!current.has_value()) return ControllerLaunchDecision::kStart;
-  if (!current->running) return q80_interim_apply_brings_up_an_exited_launch();
+  if (!current->running) return interim_apply_brings_up_an_exited_launch();
   if (next.keep_across_apply &&
       current->keep_across_apply && current->identity == next.identity) {
     return ControllerLaunchDecision::kKeep;
@@ -1402,7 +1402,7 @@ ControllerLaunchSupervisor::ensure(const ControllerLaunchCommand &command,
     }
     if (decision == ControllerLaunchDecision::kKeep)
       return {decision, predecessor};
-    // Q66: the checked predecessor has ended before serialized spawn/publish.
+    // The checked predecessor has ended before serialized spawn/publish.
     // Re-read the stable slot's counters: a null current can span a concurrent
     // start/remove, whose since-host-start loss must still be preserved.
     auto counters =
@@ -1459,7 +1459,7 @@ bool ControllerLaunchSupervisor::retire_exact(
       return false;
   }
   // Keep the predecessor registered until containment completes. A concurrent
-  // ensure must also stop it before starting the successor (Q66).
+  // ensure must also stop it before starting the successor.
   expected->stop(stop_grace_);
   std::lock_guard lock(mutex_);
   const auto found = processes_.find(component);

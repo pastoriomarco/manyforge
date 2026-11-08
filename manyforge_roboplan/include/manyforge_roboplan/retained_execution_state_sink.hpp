@@ -30,7 +30,7 @@ struct RetainedExecutionStateSinkBinding final {
 class RetainedExecutionStateSink final : public core::IExecutionStateSink {
  public:
   RetainedExecutionStateSink(
-      core::IClock& clock,
+      std::shared_ptr<core::IClock> clock,
       std::vector<RetainedExecutionStateSinkBinding> bindings);
 
   core::ExecutionStateSinkResult apply_group_joint_positions(
@@ -56,7 +56,7 @@ class RetainedExecutionStateSink final : public core::IExecutionStateSink {
   [[nodiscard]] static double position_value(
       const core::CoordinatePositionDTO& position) noexcept;
 
-  core::IClock* clock_{};
+  std::shared_ptr<core::IClock> clock_;
   std::vector<RetainedExecutionStateSinkBinding> bindings_;
   /// Serializes every publish-on-apply read/update/publication as one writer
   /// transaction. Projection-only motion bindings never acquire this lock.

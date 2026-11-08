@@ -1,4 +1,4 @@
-import { act, createElement, useCallback, useEffect, useRef } from 'react';
+import { act, createElement, useCallback, useEffect, useLayoutEffect, useRef } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { api, apiErrorCode } from '../api/client';
@@ -203,12 +203,13 @@ function Host({
     );
   }, [catalog, nodeEnvironment, retryCatalogTracked, retryNodeEnvironmentTracked, semanticStatus, snapshot, transportStatus]);
 
-  latestStatuses = { catalog: catalog.status, nodeEnvironment: nodeEnvironment.status };
+  useLayoutEffect(() => {
+    latestStatuses = { catalog: catalog.status, nodeEnvironment: nodeEnvironment.status };
+  }, [catalog.status, nodeEnvironment.status]);
   return null;
 }
 
 function installDom(): Element {
-  let document: Record<string, unknown>;
   const node = () => ({
     nodeType: 1,
     nodeName: 'DIV',
@@ -224,7 +225,7 @@ function installDom(): Element {
     setAttribute: () => undefined,
     removeAttribute: () => undefined,
   });
-  document = {
+  const document: Record<string, unknown> = {
     nodeType: 9,
     activeElement: null,
     defaultView: {},
@@ -279,7 +280,7 @@ function resolveCatalog(request: PendingFetch): void {
     status: 200,
     statusText: 'OK',
     json: async () => ({
-      apiVersion: 'manyforge.node_catalog.v2',
+      apiVersion: 'manyforge.node_catalog.v3',
       contentVersion: 'test',
       catalogId: 'test',
       entries: [],

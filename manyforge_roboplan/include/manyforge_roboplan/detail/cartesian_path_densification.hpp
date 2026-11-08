@@ -14,7 +14,7 @@ namespace manyforge::roboplan_backend::detail {
 /// Largest direction change between consecutive samples of a rounded corner
 /// (well under RoboPlan's 0.175 rad Bounded `corner_tolerance`, so the tool
 /// runs through the arc without a stop). RoboPlan's Bounded resolution walks
-/// the arc at the same turn per step (N18: r/20, within the decided r/10).
+/// the arc at the same turn per step (r/20, within r/10).
 inline constexpr double kCornerArcMaxTurnRad = 0.05;
 
 struct DensifiedCartesianPath final {
@@ -31,7 +31,7 @@ struct CartesianResolutionTolerances final {
   double rotation_rad{};
 };
 
-/// N18: the position and orientation tolerances handed to RoboPlan's Bounded
+/// The position and orientation tolerances handed to RoboPlan's Bounded
 /// resolution. RoboPlan walks each run between stops in one even step of half
 /// its tolerances, so the node's tolerances are scaled down by one common
 /// factor until that translation step is at most r * kCornerArcMaxTurnRad
@@ -42,7 +42,7 @@ struct CartesianResolutionTolerances final {
     const DensifiedCartesianPath& dense, double translation_tol_m,
     double rotation_tol_rad);
 
-/// Samples the requested Cartesian path for RoboPlan (RP-2). Straight
+/// Samples the requested Cartesian path for RoboPlan. Straight
 /// segments are split by `max_translation_step_m` / `max_rotation_step_rad`
 /// (positions linear, orientation slerp). An interior waypoint with a blend
 /// radius r > 0 between two segments of non-zero length is rounded by the

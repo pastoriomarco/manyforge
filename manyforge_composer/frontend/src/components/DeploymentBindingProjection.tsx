@@ -14,7 +14,7 @@ export function DeploymentBindingProjection({
     <details className="dcard">
       <summary>
         <span>Program Binding</span>
-        <span className="dcard-meta">{binding === null ? 'no exact match' : `${binding.component_role_bindings.length} component roles`}</span>
+        <span className="dcard-meta">{binding === null ? 'no exact match' : `${binding.component_bindings.length} components`}</span>
       </summary>
       <div className="deployment-binding-body">
         {binding === null ? (
@@ -33,23 +33,22 @@ export function DeploymentBindingProjection({
             </dl>
             <div className="deployment-binding-groups">
               <section>
-                <h4>Component roles</h4>
-                {binding.component_role_bindings.map((row) => (
-                  <div className="deployment-binding-row" key={row.component_role_id}>
-                    <strong>{row.component_role_id}</strong>
-                    <span>{row.controllable_component_id}</span>
+                <h4>Components</h4>
+                {binding.component_bindings.map((row) => (
+                  <div className="deployment-binding-row" key={row.component_id}>
+                    <strong>{row.component_id}</strong>
                     <small>{row.component_type_id}</small>
                   </div>
                 ))}
               </section>
               <section>
-                <h4>Target roles</h4>
-                {binding.target_role_bindings.map((row) => (
-                  <div className="deployment-binding-row" key={row.target_role_id}>
-                    <strong>{row.target_role_id}</strong>
-                    <span>{row.controllable_component_id} · {row.command_target_id}</span>
+                <h4>Targets</h4>
+                {binding.target_bindings.map((row) => (
+                  <div className="deployment-binding-row"
+                    key={`${row.target.component_id}/${row.target.command_target_id}`}>
+                    <strong>{row.target.component_id} · {row.target.command_target_id}</strong>
                     <small>
-                      {row.frame_role_bindings.length} frames · {row.resource_role_bindings.length} resources · {row.capability_bindings.length} capabilities
+                      {row.frame_references.length} frames · {row.signal_references.length} signals · {row.capability_bindings.length} capabilities
                     </small>
                   </div>
                 ))}

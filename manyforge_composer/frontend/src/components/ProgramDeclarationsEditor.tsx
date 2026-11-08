@@ -13,7 +13,6 @@ import type {
   JsonValue,
   ProgramAuthoringDiagnostic,
   ProgramFormulaReferences,
-  ProgramDocument,
   ProgramParameterDeclaration,
   ProgramPoseFrame,
   ProgramTreeNode,
@@ -30,7 +29,7 @@ import {
   type ProgramMotionDefaultRole,
 } from '../utils/programAuthoring';
 import { requestOpenSettings } from '../state/settingsNavigation';
-import { canonicalFrames, frameKey, frameLabel, programFrameChoices } from '../utils/programFrames';
+import { canonicalFrames, frameKey, frameLabel, programFrameChoices, type FrameScope } from '../utils/programFrames';
 import { valuePathParameter } from '../utils/valuePaths';
 import { INTERRUPT_KEY_INITIAL_REQUIRED } from '../utils/interruptAuthoring';
 import { reservedNameProblem } from '../utils/blackboardNamespaces';
@@ -79,9 +78,9 @@ interface ProgramDeclarationsEditorProps {
   diagnostics?: ProgramAuthoringDiagnostic[];
   /** Parameters acting as Program motion defaults, by parameter ID. */
   motionDefaults?: ReadonlyMap<string, ProgramMotionDefaultRole>;
-  /** The declared robots and Scene objects a pose key's `allowed_frames` name. */
-  frameProgram?: Pick<ProgramDocument, 'target_roles' | 'scene'>;
-  /** Keys read by a node or global interrupt rule: each must declare `initial:` (contract 87). */
+  /** The frames a pose key's `allowed_frames` may name: referenced components' frames and Scene objects. */
+  frameScope?: FrameScope;
+  /** Keys read by a node or global interrupt rule: each must declare `initial:`. */
   interruptKeyUses?: ReadonlySet<string>;
 }
 
@@ -299,7 +298,7 @@ export function ProgramDeclarationsEditor({
   onInvalidEditChange,
   diagnostics = [],
   motionDefaults = new Map(),
-  frameProgram,
+  frameScope,
   interruptKeyUses = NO_INTERRUPT_KEY_USES,
 }: ProgramDeclarationsEditorProps) {
   const cardLayout = useCardPanelLayout();
@@ -1177,11 +1176,11 @@ export function ProgramDeclarationsEditor({
                 </span>
               </label>
             )}
-            {keyType === 'stored_pose' && frameProgram !== undefined && (
+            {keyType === 'stored_pose' && frameScope !== undefined && (
               <fieldset id="program-key-allowed-frames" className="program-blackboard-fields">
                 <legend>Allowed frames</legend>
                 {keyAllowedFrames === null
-                  ? <p className="program-policy-help">Any frame the Program declares.</p>
+                  ? <p className="program-policy-help">Any frame of a component the Program uses, or a Scene object.</p>
                   : keyAllowedFrames.map((frame) => (
                     <div key={frameKey(frame)}>
                       <span>{frameLabel(frame)}</span>
@@ -1200,8 +1199,8 @@ export function ProgramDeclarationsEditor({
                   ))}
                 <FrameSelector
                   scope={{
-                    program: frameProgram,
-                    allowedFrames: programFrameChoices({ program: frameProgram })
+                    ...frameScope,
+                    allowedFrames: programFrameChoices(frameScope)
                       .map((choice) => choice.frame)
                       .filter((frame) => !(keyAllowedFrames ?? [])
                         .some((row) => frameKey(row) === frameKey(frame))),

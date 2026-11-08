@@ -39,7 +39,7 @@ const ERROR_PRESENTATION_IDENTITY_KEYS = [
  * Keep one incident stable across incremental diagnostic enrichment. Retained
  * from source blob aaa1d7fd40e2692773cf46b2c9549bb639104d61 and test blob
  * fc9a9d1ad41db46dc8d9aafe6e2593977652a4ce; interpreting the diagnostic code
- * and choosing remediation copy remain an I8 projection job.
+ * and choosing remediation copy remain a Kernel projection job.
  */
 export function errorPresentationKey(error: KernelErrorView): string {
   const identities = ERROR_PRESENTATION_IDENTITY_KEYS.flatMap((key) => {
@@ -110,7 +110,7 @@ interface KernelErrorPanelProps {
 }
 
 /**
- * Retained diagnostic presentation shell. I8 owns the exact Kernel projection,
+ * Retained diagnostic presentation shell. The Kernel projection owns the exact
  * code taxonomy, Stop-chain interpretation, and remediation text; this client
  * does not preserve the deleted browser-side error-policy table.
  */

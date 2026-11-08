@@ -34,7 +34,7 @@ constexpr std::size_t kMaximumPackageRows = 256U;
 constexpr std::size_t kMaximumSourceRows = 65536U;
 constexpr std::string_view kManifestApiVersion =
     "manyforge.node_environment_manifest.v1";
-constexpr std::string_view kCatalogApiVersion = "manyforge.node_catalog.v2";
+constexpr std::string_view kCatalogApiVersion = "manyforge.node_catalog.v3";
 
 [[noreturn]] void Fail(const std::string &detail) {
   throw NodeEnvironmentProjectionError("node environment projection: " +

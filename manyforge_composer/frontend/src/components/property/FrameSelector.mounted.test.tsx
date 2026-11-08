@@ -123,14 +123,17 @@ function optionValues(select: FakeNode): Array<[string, string]> {
 }
 
 const program = {
-  target_roles: {
-    arm: { required_frame_roles: ['base', 'tcp'] },
-    peer: { required_frame_roles: ['base', 'flange'] },
-  },
   scene: [{ scene_resource_id: 'table' }],
   blackboard: { namespaces: [], keys: [] },
   parameters: [],
 } as unknown as ProgramAuthoringDocument;
+
+const movingFrames = ['base', 'tcp'].map((frame_id) => ({ component_id: 'arm', frame_id }));
+const frameScope = {
+  program,
+  movingFrames,
+  frames: [...movingFrames, ...['base', 'flange'].map((frame_id) => ({ component_id: 'peer', frame_id }))],
+};
 
 function entry(id: string, parameters: CatalogEntry['parameters']): CatalogEntry {
   return {
@@ -162,11 +165,10 @@ const MOTION_REFERENCE: CatalogJsonSchema = {
   properties: {
     type: {
       type: 'string',
-      enum: ['frame_role', 'component_body_role', 'scene_resource', 'runtime_object', 'pose', 'cell_frame'],
+      enum: ['component_frame', 'component_body', 'scene_resource', 'runtime_object', 'pose', 'cell_frame'],
     },
-    frame_role_id: { type: 'string', minLength: 1 },
-    target_role: { type: 'string', minLength: 1 },
-    collision_body_role_id: { type: 'string', minLength: 1 },
+    frame: { type: 'object' },
+    body: { type: 'object' },
     scene_resource_id: { type: 'string', minLength: 1 },
     runtime_object_id: { type: 'string', minLength: 1 },
     pose: { type: 'object' },
@@ -176,7 +178,7 @@ const MOTION_REFERENCE: CatalogJsonSchema = {
 async function mountReference(initial: JsonValue) {
   const committed: JsonValue[] = [];
   const move = entry('motion.move_to_pose', [
-    { id: 'target_role', required: true, schema: { type: 'string', 'x-manyforge-semantic-type': 'target_role' }, schemaHash: 'sha256:t', hasDefault: false },
+    { id: 'target', required: true, schema: { type: 'object' }, schemaHash: 'sha256:t', hasDefault: false },
     { id: 'target_reference', required: false, schema: MOTION_REFERENCE, schemaHash: 'sha256:r', hasDefault: false },
   ]);
   function Host() {
@@ -184,7 +186,7 @@ async function mountReference(initial: JsonValue) {
     const node: ProgramTreeNode = {
       node_id: move.id,
       instance_id: 'move',
-      parameters: { target_role: 'arm', target_reference: value },
+      parameters: { target: { component_id: 'arm', command_target_id: 'motion' }, target_reference: value },
       children: [],
     };
     return (
@@ -192,7 +194,7 @@ async function mountReference(initial: JsonValue) {
         schema={MOTION_REFERENCE}
         value={value}
         disabled={false}
-        context={{ entry: move, node, parameterId: 'target_reference', program }}
+        context={{ entry: move, node, parameterId: 'target_reference', program, frameScope }}
         path="target_reference"
         onCommit={(next) => {
           committed.push(next);
@@ -206,30 +208,30 @@ async function mountReference(initial: JsonValue) {
 
 describe('one frame selector', () => {
   it('lists the moving robot first, other robots by name, then the cell and Scene objects', async () => {
-    const editor = await mountReference({ type: 'frame_role', frame_role_id: 'tcp' });
+    const editor = await mountReference({ type: 'component_frame', frame: { component_id: 'arm', frame_id: 'tcp' } });
     expect(optionValues(editor.control('Motion reference frame'))).toEqual([
-      ['Moving robot · arm', 'robot:arm:base'],
-      ['Moving robot · arm', 'robot:arm:tcp'],
-      ['Other robots', 'robot:peer:base'],
-      ['Other robots', 'robot:peer:flange'],
+      ['Moving robot · arm', 'component:arm:base'],
+      ['Moving robot · arm', 'component:arm:tcp'],
+      ['Other robots', 'component:peer:base'],
+      ['Other robots', 'component:peer:flange'],
       ['Cell', 'cell'],
       ['Scene objects', 'scene:table'],
     ]);
-    expect(reactProps(editor.control('Motion reference frame'))!.value).toBe('robot:arm:tcp');
+    expect(reactProps(editor.control('Motion reference frame'))!.value).toBe('component:arm:tcp');
     // No free-text reference field remains for frames.
     expect(editor.exists('Motion reference frame_role_id')).toBe(false);
     await editor.unmount();
   });
 
   it('writes the own-robot, other-robot, cell and Scene object reference forms', async () => {
-    const editor = await mountReference({ type: 'frame_role', frame_role_id: 'tcp' });
-    await editor.choose('Motion reference frame', 'robot:peer:flange');
-    await editor.choose('Motion reference frame', 'robot:arm:base');
+    const editor = await mountReference({ type: 'component_frame', frame: { component_id: 'arm', frame_id: 'tcp' } });
+    await editor.choose('Motion reference frame', 'component:peer:flange');
+    await editor.choose('Motion reference frame', 'component:arm:base');
     await editor.choose('Motion reference frame', 'cell');
     await editor.choose('Motion reference frame', 'scene:table');
     expect(editor.committed).toEqual([
-      { type: 'frame_role', frame_role_id: 'flange', target_role: 'peer' },
-      { type: 'frame_role', frame_role_id: 'base' },
+      { type: 'component_frame', frame: { component_id: 'peer', frame_id: 'flange' } },
+      { type: 'component_frame', frame: { component_id: 'arm', frame_id: 'base' } },
       { type: 'cell_frame' },
       { type: 'scene_resource', scene_resource_id: 'table' },
     ]);
@@ -258,7 +260,7 @@ describe('a key-typed pose with allowed_frames', () => {
       persistence: 'run',
       allowed_frames: [
         { kind: 'scene_resource', scene_resource_id: 'table' },
-        { kind: 'target_frame', target_role: 'peer', frame_role: 'flange' },
+        { kind: 'target_frame', frame: { component_id: 'peer', frame_id: 'flange' } },
       ],
     }];
     const setValue = entry('logic.set_value', [
@@ -284,6 +286,7 @@ describe('a key-typed pose with allowed_frames', () => {
             node: { node_id: setValue.id, instance_id: 'set', parameters: { key: 'place', value }, children: [] },
             parameterId: 'value',
             program: { ...program, blackboard: { namespaces: [], keys } },
+            frameScope: { ...frameScope, movingFrames: [] },
           }}
           path="value"
           onCommit={(next) => {
@@ -298,7 +301,7 @@ describe('a key-typed pose with allowed_frames', () => {
     const select = editor.control('Frame reference');
     expect(optionValues(select)).toEqual([
       ['', 'cell'],
-      ['Robots', 'robot:peer:flange'],
+      ['Robots', 'component:peer:flange'],
       ['Scene objects', 'scene:table'],
     ]);
     // The current cell frame is shown as not available and blocks the edit.
@@ -374,11 +377,11 @@ describe('the allowed_frames editor of a pose key', () => {
           type: 'stored_pose',
           access: 'read_write',
           persistence: 'run',
-          allowed_frames: [{ kind: 'target_frame', target_role: 'arm', frame_role: 'tcp' }],
+          allowed_frames: [{ kind: 'target_frame', frame: { component_id: 'arm', frame_id: 'tcp' } }],
         }]}
         formulaReferences={{ computedKeys: {}, nodes: {} }}
         busy={false}
-        frameProgram={program}
+        frameScope={frameScope}
         onMutate={(mutation, args) => { mutations.push([mutation, args]); }}
       />,
     );
@@ -389,7 +392,7 @@ describe('the allowed_frames editor of a pose key', () => {
     };
     // Already allowed frames are not offered again.
     expect(optionValues(editor.control('Add allowed frame')).map(([, value]) => value))
-      .toEqual(['', 'robot:arm:base', 'robot:peer:base', 'robot:peer:flange', 'cell', 'scene:table']);
+      .toEqual(['', 'component:arm:base', 'component:peer:base', 'component:peer:flange', 'cell', 'scene:table']);
 
     await editor.choose('Add allowed frame', 'scene:table');
     await editor.choose('Add allowed frame', 'cell');
@@ -403,7 +406,7 @@ describe('the allowed_frames editor of a pose key', () => {
         allowed_frames: [
           { kind: 'cell_frame' },
           { kind: 'scene_resource', scene_resource_id: 'table' },
-          { kind: 'target_frame', target_role: 'arm', frame_role: 'tcp' },
+          { kind: 'target_frame', frame: { component_id: 'arm', frame_id: 'tcp' } },
         ],
       }],
     }]);

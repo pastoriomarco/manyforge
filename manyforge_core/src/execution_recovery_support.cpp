@@ -537,6 +537,11 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
       assessment.recovery_class = RecoveryClass::kUnknownFault;
       assessment.status = RecoveryAssessmentStatus::kResetRequired;
       assessment.reason_code = reason_codes::kRecoveryLatchNotRetryable;
+      if (capture.owner_rebuild_pending) {
+        assessment.reason_code = capture.owner_rebuild_rest_qualified
+                                     ? kOwnerRebuildObservedAtRest
+                                     : kOwnerRebuildObservationPending;
+      }
       add_reset_action();
       break;
     }
@@ -624,6 +629,12 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
       assessment.recovery_class = RecoveryClass::kNone;
       assessment.status = RecoveryAssessmentStatus::kUnavailable;
       assessment.reason_code = reason_codes::kRecoveryNoneActive;
+      if (capture.owner_rebuild_pending && capture.execution_id == 0U &&
+          capture.execution_state == ExecutionState::kIdle) {
+        assessment.reason_code = capture.owner_rebuild_rest_qualified
+                                     ? kOwnerRebuildObservedAtRest
+                                     : kOwnerRebuildObservationPending;
+      }
       break;
     }
   }
@@ -633,9 +644,12 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
                         (capture.execution_state == ExecutionState::kStopped &&
                          assessment.backend_stop_confirmed &&
                          !assessment.stop_certificate_id.empty());
-  assessment.eligible_close = terminal && capture.execution_id != 0U &&
+  const bool rebuilt_unknown = capture.owner_rebuild_pending && capture.owner_rebuild_rest_qualified &&
+                               capture.execution_state == ExecutionState::kInterventionRequired &&
+                               capture.terminal_effect == ParticipantEffectKnowledge::kEffectUncertain;
+  assessment.eligible_close = (terminal || rebuilt_unknown) && capture.execution_id != 0U &&
       capture.terminal_cleanup_complete &&
-      capture.terminal_effect != ParticipantEffectKnowledge::kEffectUncertain &&
+      (capture.terminal_effect != ParticipantEffectKnowledge::kEffectUncertain || rebuilt_unknown) &&
       !any_stop_owner_active && !capture.stronger_authority_active;
   if (capture.execution_state == ExecutionState::kFailed && addressed_contained &&
       !assessment.retry_admissible && assessment.eligible_close) {
@@ -811,7 +825,7 @@ ErrorDTO recovery_action_rejection_error(const KernelRecoveryActionRequestDTO& r
     error.details["required_preemption_result"] = "succeeded";
     error.details["stop_owner_active"] = assessment.stop_owner_active ? "true" : "false";
   }
-  // `retryable` mirrors spec/210 §3.12: true when the same action can become
+  // `retryable`: true when the same action can become
   // admissible without a reset (waiting states); false for identity/stale
   // mismatches, which need a freshly bound request instead.
   const std::string_view reason = rejection_reason;

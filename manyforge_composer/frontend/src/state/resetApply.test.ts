@@ -181,7 +181,7 @@ describe('Apply after Reset sequence', () => {
   });
 });
 
-describe('Deployment Reset and Apply (AUD-4)', () => {
+describe('Deployment Reset and Apply', () => {
   const snapshot = (state: string) => ({ programCycle: { state } }) as never;
   it('resets only a stopped or held run; the server Apply resets a finished one itself', () => {
     expect(deploymentApplyResetsRun(null)).toBe(false);

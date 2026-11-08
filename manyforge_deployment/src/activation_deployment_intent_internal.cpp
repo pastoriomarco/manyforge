@@ -207,7 +207,7 @@ custom_tcps(const CanonicalValue *value, std::string_view label) {
         member(rows[index], "tcp_id", row_label), row_label + ".tcp_id");
     const auto &parent = text(member(rows[index], "parent_frame", row_label),
                               row_label + ".parent_frame");
-    // The spec 210 authoring pose: `position_m` plus `orientation` as either
+    // The authoring pose: `position_m` plus `orientation` as either
     // `rpy_deg` (fixed-axis roll, pitch, yaw in degrees) or a unit `xyzw`.
     const auto &pose = member(rows[index], "pose", row_label);
     const std::string pose_label = row_label + ".pose";
@@ -250,7 +250,7 @@ custom_tcps(const CanonicalValue *value, std::string_view label) {
   return result;
 }
 
-// B5: `default_tcp: {command_target_id, frame_role_id}`. The compiler checks
+// `default_tcp: {command_target_id, frame_role_id}`. The compiler checks
 // the pair against the component's TCPs.
 [[nodiscard]] std::optional<core::ComponentDefaultTcpDTO>
 default_tcp(const CanonicalValue *value, std::string_view label) {
@@ -358,7 +358,7 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
                       : nullptr;
     return kind != nullptr && kind->is_string() && kind->as_string() == "sensor";
   };
-  // CONTRACTS §16: a member names its owner; an owner is a row with neither
+  // A member names its owner; an owner is a row with neither
   // an owner, a model source nor a runtime kind; an I/O member has no model
   // source.
   const auto is_member = [](const CanonicalValue &component) {

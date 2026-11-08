@@ -1,5 +1,6 @@
 #include "program_contact_envelope_codec.hpp"
 #include "manyforge_deployment/program_contract.hpp"
+#include "manyforge_deployment/program_reference_validator.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -12,15 +13,18 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#include <manyforge_core/active_tcp_blackboard_key.hpp>
 #include "content_identity_internal.hpp"
 #include "embedded_build_evidence.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/expression.hpp"
+#include "manyforge_deployment/io_signal_catalog.hpp"
 #include "manyforge_deployment/program_value_path.hpp"
 
 namespace manyforge::deployment {
@@ -164,6 +168,27 @@ template <typename StrongType>
 }
 
 template <typename StrongType>
+[[nodiscard]] StrongType parse_direct_reference_identity(
+    const CanonicalValue &value, std::string_view path) {
+  const auto &spelling = require_string(value, path);
+  if constexpr (std::is_same_v<StrongType, core::ControllableComponentId>) {
+    require_program_local_identity(spelling, path);
+  } else {
+    const auto alphanumeric = [](unsigned char ch) {
+      return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+             (ch >= '0' && ch <= '9');
+    };
+    if (spelling.empty() || spelling.size() > 128U ||
+        !alphanumeric(static_cast<unsigned char>(spelling.front())) ||
+        !std::all_of(spelling.begin(), spelling.end(), [&](unsigned char ch) {
+          return alphanumeric(ch) || ch == '_' || ch == '.' || ch == '-';
+        }))
+      fail(std::string(path) + ": invalid component feature identity");
+  }
+  return StrongType(spelling);
+}
+
+template <typename StrongType>
 [[nodiscard]] std::vector<StrongType>
 parse_identity_set(const CanonicalValue *value, std::string_view path) {
   if (value == nullptr) {
@@ -236,25 +261,13 @@ require_capability_definition(const core::RetainedBundleDTO &bundle,
   }
   // The requirement's revision is the builtin definition. Whether the
   // candidate cell retains that definition is a binding fact: an absent
-  // record makes the Program non-executable against this cell (H1a), while
+  // record makes the Program non-executable against this cell, while
   // a duplicate or different revision remains a corrupt/incompatible catalog.
   if (exact_matches > 1U || conflicting_matches != 0U) {
     fail("retained catalog does not contain exactly one selected capability "
          "definition revision");
   }
   return descriptor;
-}
-
-[[nodiscard]] core::ProgramCapabilityDisposition
-parse_disposition(const CanonicalValue &value, std::string_view path) {
-  const std::string &spelling = require_string(value, path);
-  if (spelling == "required") {
-    return core::ProgramCapabilityDisposition::kRequired;
-  }
-  if (spelling == "optional") {
-    return core::ProgramCapabilityDisposition::kOptional;
-  }
-  fail(std::string(path) + ": expected required or optional");
 }
 
 void verify_value_source(const CanonicalValue &value, std::string_view path) {
@@ -265,9 +278,11 @@ void verify_value_source(const CanonicalValue &value, std::string_view path) {
     require_exact_fields(source, {"kind", "reference"}, path);
     const auto &reference = require_string(require_member(source, "reference", path),
                                            child_path(path, "reference"));
-    require_program_local_identity(reference, child_path(path, "reference"),
-        kind == "blackboard_key" && reference.starts_with("node_outcome.")
-            ? 256U : kMaximumIdentityBytes);
+    if (!(kind == "blackboard_key" && core::ParseActiveTcpBlackboardKey(reference))) {
+      require_program_local_identity(reference, child_path(path, "reference"),
+          kind == "blackboard_key" && reference.starts_with("node_outcome.")
+              ? 256U : kMaximumIdentityBytes);
+    }
     return;
   }
   if (kind == "expression") {
@@ -719,27 +734,19 @@ parse_contact_grasp_pair(const CanonicalValue &value, std::string_view path) {
     const std::string &kind = require_string(
         require_member(side, "kind", side_path), child_path(side_path, "kind"));
     if (kind == "component_model_body") {
-      require_fields(side,
-                     {"kind", "component_role_id", "collision_body_role_id"},
-                     {"model_role_id"}, side_path);
+      require_fields(side, {"kind", "body"}, {}, side_path);
       if (body_selector.has_value() || motion_endpoint) {
         fail(std::string(path) +
              ": contact_grasp pair has two component-model sides");
       }
-      std::optional<core::ModelRoleId> model_role;
-      if (const auto *model = find_member(side, "model_role_id");
-          model != nullptr) {
-        model_role = parse_program_identity<core::ModelRoleId>(
-            *model, child_path(side_path, "model_role_id"));
-      }
-      body_selector = core::ProgramContactGraspBodySelectorDTO{
-          parse_program_identity<core::ComponentRoleId>(
-              require_member(side, "component_role_id", side_path),
-              child_path(side_path, "component_role_id")),
-          std::move(model_role),
-          parse_program_identity<core::CollisionBodyRoleId>(
-              require_member(side, "collision_body_role_id", side_path),
-              child_path(side_path, "collision_body_role_id"))};
+      const auto &body = require_object(require_member(side, "body", side_path),
+                                        child_path(side_path, "body"));
+      require_exact_fields(body, {"component_id", "collision_body_id"}, side_path);
+      body_selector = core::ProgramContactGraspBodySelectorDTO{{
+          parse_direct_reference_identity<core::ControllableComponentId>(
+              require_member(body, "component_id", side_path), side_path),
+          parse_direct_reference_identity<core::CollisionBodyRoleId>(
+              require_member(body, "collision_body_id", side_path), side_path)}};
       return;
     }
     if (kind == "motion_endpoint") {
@@ -779,9 +786,7 @@ parse_contact_grasp_pair(const CanonicalValue &value, std::string_view path) {
 }
 
 [[nodiscard]] std::vector<core::ProgramContactGraspTemplateDTO>
-parse_contact_grasp_templates(
-    const CanonicalValue::Object &root,
-    const std::vector<core::ProgramTargetRoleRequirementDTO> &targets) {
+parse_contact_grasp_templates(const CanonicalValue::Object &root) {
   const auto *policies_value = find_member(root, "contact_policies");
   if (policies_value == nullptr) {
     return {};
@@ -800,7 +805,7 @@ parse_contact_grasp_templates(
     if (mode_value == nullptr ||
         (require_string(*mode_value, child_path(path, "mode")) != "contact_grasp" &&
          require_string(*mode_value, child_path(path, "mode")) != "contact_release")) {
-      // N5d adds one binding projection for contact-grasp. Other policy modes
+      // This adds one binding projection for contact-grasp. Other policy modes
       // retain their existing Program validation and runtime ownership.
       continue;
     }
@@ -816,7 +821,7 @@ parse_contact_grasp_templates(
     }
     if (require_string(require_member(policy, "sensing_mode", path),
                        child_path(path, "sensing_mode")) != "geometry_only") {
-      fail(path + ": I6/N5d accepts only geometry-only contact_grasp policies");
+      fail(path + ": only geometry-only contact_grasp policies are accepted");
     }
     if (require_string(
             require_member(policy, "default_unmatched_response", path),
@@ -912,11 +917,8 @@ parse_contact_grasp_templates(
       }
     }
     const auto selector_key = [](const auto &selector) {
-      return std::tuple(selector.component_role_id.value(),
-                        selector.model_role_id.has_value()
-                            ? selector.model_role_id->value()
-                            : std::string{},
-                        selector.collision_body_role_id.value());
+      return std::tuple(selector.body.component_id.value(),
+                        selector.body.collision_body_id.value());
     };
     if (!std::is_sorted(selectors.begin(), selectors.end(),
                         [&](const auto &left, const auto &right) {
@@ -928,26 +930,6 @@ parse_contact_grasp_templates(
                            }) != selectors.end()) {
       fail(zone_path +
            ": contact_grasp body pairs must be unique and canonical-sorted");
-    }
-    for (const auto &selector : selectors) {
-      const auto matches = std::count_if(
-          targets.begin(), targets.end(), [&](const auto &target) {
-            return target.component_role_id == selector.component_role_id &&
-                   std::find(target.required_collision_body_roles.begin(),
-                             target.required_collision_body_roles.end(),
-                             selector.collision_body_role_id) !=
-                       target.required_collision_body_roles.end() &&
-                   (!selector.model_role_id.has_value() ||
-                    std::find(target.required_model_roles.begin(),
-                              target.required_model_roles.end(),
-                              *selector.model_role_id) !=
-                        target.required_model_roles.end());
-          });
-      if (matches != 1) {
-        fail(path +
-             ": contact_grasp body selector does not identify exactly one "
-             "Program target role");
-      }
     }
     if (!runtime_object_id.has_value() ||
         !declared_scene_resource_runtime_object(root,
@@ -1077,7 +1059,7 @@ struct QualifiedExecutionCatalog final {
 
 [[nodiscard]] std::vector<core::ProgramNodeTargetEffectDTO> node_target_effects(
     const CanonicalValue::Object &node, const CanonicalValue::Object &entry,
-    const std::vector<core::ProgramTargetRoleRequirementDTO> &targets,
+    const std::vector<RetainedIoSignalConfiguration> &signals,
     std::string_view path) {
   const auto effective = [&](const std::string &id,
                              bool condition = false) -> const CanonicalValue * {
@@ -1099,11 +1081,25 @@ struct QualifiedExecutionCatalog final {
       if (value == nullptr || *value != require_member(when, "equals", path))
         continue;
     }
-    const auto *role = effective(
+    const auto *selection = effective(
         require_string(require_member(fields, "target_parameter", path), path));
-    if (role == nullptr)
-      fail(std::string(path) + ": missing literal target role for node effect");
-    const core::TargetRoleId role_id(require_string(*role, path));
+    if (selection == nullptr)
+      fail(std::string(path) + ": missing literal target reference for node effect");
+    const auto &selected = require_object(*selection, path);
+    const auto component = parse_direct_reference_identity<core::ControllableComponentId>(
+        require_member(selected, "component_id", path), path);
+    std::optional<core::CommandTargetId> target_id;
+    if (const auto *target = find_member(selected, "command_target_id")) {
+      require_exact_fields(selected, {"component_id", "command_target_id"}, path);
+      target_id = parse_direct_reference_identity<core::CommandTargetId>(*target, path);
+    } else {
+      require_exact_fields(selected, {"component_id", "signal_name"}, path);
+      const auto &name = require_string(require_member(selected, "signal_name", path), path);
+      const auto matches = FindProgramSignalMatches(signals, {component, name});
+      if (matches.size() != 1U)
+        fail(std::string(path) + ": signal reference is missing or ambiguous");
+      target_id = matches.front().retained->command_target_id;
+    }
     const core::CapabilityId capability(
         require_string(require_member(fields, "capability_id", path), path));
     const auto *effectful_value = find_member(fields, "effectful");
@@ -1111,30 +1107,11 @@ struct QualifiedExecutionCatalog final {
       fail(child_path(path, "effectful") + ": expected boolean");
     const bool effectful =
         effectful_value != nullptr && effectful_value->as_bool();
-    const auto target =
-        std::lower_bound(targets.begin(), targets.end(), role_id,
-                         [](const auto &item, const auto &id) {
-                           return item.target_role_id < id;
-                         });
-    if (target == targets.end() || target->target_role_id != role_id) {
-      fail(std::string(path) + ": effect references an undeclared target role");
-    }
-    const auto associated =
-        std::lower_bound(target->required_capabilities.begin(),
-                         target->required_capabilities.end(), capability,
-                         [](const auto &item, const auto &id) {
-                           return item.capability_id < id;
-                         });
-    if (associated == target->required_capabilities.end() ||
-        associated->capability_id != capability) {
-      fail(std::string(path) +
-           ": target role does not declare the node's required capability");
-    }
-    effects.push_back({role_id, capability, effectful});
+    effects.push_back({{component, *target_id}, capability, effectful});
   }
   const auto less = [](const auto &a, const auto &b) {
-    return std::tie(a.target_role_id, a.capability_id) <
-           std::tie(b.target_role_id, b.capability_id);
+    return std::tie(a.target, a.capability_id) <
+           std::tie(b.target, b.capability_id);
   };
   std::sort(effects.begin(), effects.end(), less);
   effects.erase(std::unique(effects.begin(), effects.end()), effects.end());
@@ -1165,7 +1142,6 @@ find_declaration(const CanonicalValue *rows, std::string_view id_field,
 // (program_pose_value_conformance.v1.yaml runs both).
 
 struct PoseFrames final {
-  const std::vector<core::ProgramTargetRoleRequirementDTO> &targets;
   std::set<std::string> scene_resource_ids;
 };
 
@@ -1238,8 +1214,8 @@ require_pose_mapping(const CanonicalValue &value, const std::string &path) {
   return numbers;
 }
 
-// Returns the canonical order of the frame: kind, then target role or scene
-// resource, then frame role.
+// Returns the canonical order of the frame: kind, then component or scene
+// resource, then component-local frame identity.
 std::tuple<std::string, std::string, std::string>
 verify_pose_frame_ref(const CanonicalValue &value, const PoseFrames &frames,
                       const std::string &path) {
@@ -1267,28 +1243,16 @@ verify_pose_frame_ref(const CanonicalValue &value, const PoseFrames &frames,
     fail(child_path(path, "kind") +
          ": must be cell_frame, target_frame, or scene_resource");
   }
-  require_closed_pose_value(frame, {"kind", "target_role", "frame_role"}, path);
-  const auto &target_role =
-      require_string(require_member(frame, "target_role", path),
-                     child_path(path, "target_role"));
-  const auto &frame_role =
-      require_string(require_member(frame, "frame_role", path),
-                     child_path(path, "frame_role"));
-  const auto target = std::find_if(
-      frames.targets.begin(), frames.targets.end(), [&](const auto &item) {
-        return item.target_role_id.value() == target_role;
-      });
-  if (target == frames.targets.end()) {
-    fail(child_path(path, "target_role") +
-         ": does not name a declared target role");
-  }
-  if (std::none_of(target->required_frame_roles.begin(),
-                   target->required_frame_roles.end(),
-                   [&](const auto &role) { return role.value() == frame_role; })) {
-    fail(child_path(path, "frame_role") +
-         ": is not required by the selected target role");
-  }
-  return {kind, target_role, frame_role};
+  require_closed_pose_value(frame, {"kind", "frame"}, path);
+  const auto frame_path = child_path(path, "frame");
+  const auto &ref = require_pose_mapping(require_member(frame, "frame", path),
+                                          frame_path);
+  require_closed_pose_value(ref, {"component_id", "frame_id"}, child_path(path, "frame"));
+  const auto component = parse_direct_reference_identity<core::ControllableComponentId>(
+      require_member(ref, "component_id", path), child_path(path, "frame.component_id"));
+  const auto id = parse_direct_reference_identity<core::FrameRoleId>(
+      require_member(ref, "frame_id", path), child_path(path, "frame.frame_id"));
+  return {kind, component.value(), id.value()};
 }
 
 void verify_stored_pose(const CanonicalValue &value, const PoseFrames &frames,
@@ -1413,7 +1377,9 @@ void verify_blackboard_pose_keys(const CanonicalValue::Object &root,
 
 [[nodiscard]] bool reserved_system_namespace(std::string_view name) {
   return name == "node_outcome" || name.starts_with("node_outcome.") ||
-         name == "interrupt_state" || name.starts_with("interrupt_state.");
+         name == "interrupt_state" || name.starts_with("interrupt_state.") ||
+         name == "active_tcp" || name.starts_with("active_tcp.") ||
+         name.starts_with("active_tcp/");
 }
 
 // System declarations are a validation view only: the authored root and its
@@ -1448,6 +1414,7 @@ with_node_outcome_declarations(const CanonicalValue::Object &root,
       fail("reserved_system_namespace: program.blackboard.keys: " + name +
            " is system-owned and cannot be authored");
   }
+  std::set<std::string> active_tcp_keys;
   // verify_tree has already bounded and validated this tree and its IDs.
   const auto visit = [&](auto &&self, const CanonicalValue &value) -> void {
     const auto &node = require_object(value, "program.tree");
@@ -1463,6 +1430,27 @@ with_node_outcome_declarations(const CanonicalValue::Object &root,
           {"type", CanonicalValue("string")},
           {"access", CanonicalValue("read")},
           {"persistence", CanonicalValue("run")}});
+    }
+    if (id == "motion.move_to_joint_target" || id == "motion.move_to_pose" ||
+        id == "motion.follow_cartesian_path" || id == "motion.move_until_signal" ||
+        id == "motion.probe_search" || id == "planning.plan_pick_sequence" ||
+        id == "planning.plan_place_sequence" || id == "motion.set_tcp") {
+      const auto &parameters = require_object(require_member(node, "parameters", "tree"), "parameters");
+      if (const auto *target = find_member(parameters, "target")) {
+        const auto &reference = require_object(*target, "target");
+        require_exact_fields(reference, {"component_id", "command_target_id"}, "target");
+        const core::ProgramTargetReferenceDTO selected{
+            parse_direct_reference_identity<core::ControllableComponentId>(
+                require_member(reference, "component_id", "target"), "target.component_id"),
+            parse_direct_reference_identity<core::CommandTargetId>(
+                require_member(reference, "command_target_id", "target"), "target.command_target_id")};
+        const auto key = core::ActiveTcpBlackboardKey(selected);
+        if (!key) fail("invalid Active TCP target reference");
+        if (active_tcp_keys.insert(*key).second)
+          keys.emplace_back(CanonicalValue::Object{
+              {"key", CanonicalValue(*key)}, {"type", CanonicalValue("tcp_entry")},
+              {"access", CanonicalValue("read")}, {"persistence", CanonicalValue("run")}});
+      }
     }
     for (const auto &child :
          require_array(require_member(node, "children", "tree"), "children")) {
@@ -1848,6 +1836,294 @@ resolve_catalog_schema(const CanonicalValue::Object &holder,
   fail(std::string(path) + ": catalog schema reference chain is too long");
 }
 
+struct CapturedInputSignalUse final {
+  std::set<core::ProgramSignalReferenceDTO> signals;
+  bool all_uses_are_signal_reads{true};
+};
+
+struct CapturedDirectReferences final {
+  std::set<core::ProgramTargetReferenceDTO> targets;
+  std::set<core::ProgramSignalReferenceDTO> signals;
+  std::set<core::ProgramFrameReferenceDTO> frames;
+  std::set<core::ProgramCollisionBodyReferenceDTO> bodies;
+  std::map<core::CapabilityId, CapturedInputSignalUse> input_signal_uses;
+  bool default_tcp_required{};
+};
+
+using TargetAssociations =
+    std::map<core::ProgramTargetReferenceDTO, CapturedDirectReferences>;
+
+void capture_direct_reference(const CanonicalValue &value, std::string_view kind,
+                              CapturedDirectReferences &result,
+                              std::string_view path) {
+  const auto &object = require_object(value, path);
+  const auto component = parse_direct_reference_identity<core::ControllableComponentId>(
+      require_member(object, "component_id", path), path);
+  if (kind == "target_reference") {
+    require_exact_fields(object, {"component_id", "command_target_id"}, path);
+    result.targets.insert({component, parse_direct_reference_identity<core::CommandTargetId>(
+                                          require_member(object, "command_target_id", path), path)});
+  } else if (kind == "signal_reference") {
+    require_exact_fields(object, {"component_id", "signal_name"}, path);
+    const auto &signal = require_string(require_member(object, "signal_name", path), path);
+    if (signal.empty() || signal.size() > 512U || signal.find('\0') != std::string::npos)
+      fail(std::string(path) + ": invalid signal name");
+    result.signals.insert({component, signal});
+  } else if (kind == "frame_reference") {
+    require_exact_fields(object, {"component_id", "frame_id"}, path);
+    result.frames.insert({component, parse_direct_reference_identity<core::FrameRoleId>(
+                                         require_member(object, "frame_id", path), path)});
+  } else if (kind == "collision_body_reference") {
+    require_exact_fields(object, {"component_id", "collision_body_id"}, path);
+    result.bodies.insert({component, parse_direct_reference_identity<core::CollisionBodyRoleId>(
+                                         require_member(object, "collision_body_id", path), path)});
+  } else {
+    fail(std::string(path) + ": unknown direct reference type");
+  }
+}
+
+void capture_condition_references(const CanonicalValue &condition,
+                                  CapturedDirectReferences &result,
+                                  std::string_view path, std::size_t depth) {
+  if (depth > 8U) fail(std::string(path) + ": condition depth exceeded");
+  const auto &object = require_object(condition, path);
+  if (object.size() != 1U) fail(std::string(path) + ": invalid condition");
+  const auto &[op, value] = object.front();
+  if (op == "all" || op == "any") {
+    for (const auto &item : require_array(value, path))
+      capture_condition_references(item, result, path, depth + 1U);
+  } else if (op == "not") {
+    capture_condition_references(value, result, path, depth + 1U);
+  } else if (op == "compare") {
+    const auto &compare = require_object(value, path);
+    const auto &operand = require_object(require_member(compare, "operand", path), path);
+    if (const auto *signal = find_member(operand, "signal"))
+      capture_direct_reference(*signal, "signal_reference", result, path);
+  } else {
+    fail(std::string(path) + ": invalid condition operator");
+  }
+}
+
+void capture_schema_references(const CanonicalValue &value,
+                               const CanonicalValue::Object &holder,
+                               CapturedDirectReferences &result,
+                               std::string_view path, std::size_t depth) {
+  if (depth > 256U) fail(std::string(path) + ": schema depth exceeded");
+  const auto &shape = resolve_catalog_schema(holder, path);
+  if (const auto *semantic = find_member(shape, "semantic_type")) {
+    const auto &kind = require_string(*semantic, path);
+    if (kind == "target_reference" || kind == "signal_reference" ||
+        kind == "frame_reference" || kind == "collision_body_reference") {
+      capture_direct_reference(value, kind, result, path);
+      return;
+    }
+  }
+  if (const auto *type = find_member(shape, "type");
+      type && type->is_string() && type->as_string() == "component_interrupt_condition") {
+    capture_condition_references(value, result, path, 1U);
+    return;
+  }
+  if (value.is_object()) {
+    const auto *properties = find_member(shape, "properties");
+    if (!properties) return;
+    const auto &fields = require_object(*properties, path);
+    for (const auto &[name, child] : value.as_object()) {
+      if (const auto *child_schema = find_member(fields, name))
+        capture_schema_references(child, require_object(*child_schema, path),
+                                  result, path, depth + 1U);
+    }
+  } else if (value.is_array()) {
+    const auto *items = find_member(shape, "items");
+    if (!items) return;
+    for (const auto &child : value.as_array())
+      capture_schema_references(child, require_object(*items, path),
+                                result, path, depth + 1U);
+  }
+}
+
+[[nodiscard]] CapturedDirectReferences capture_node_references(
+    const CanonicalValue::Object &node, const CanonicalValue::Object &entry,
+    const CanonicalValue::Object &root, std::string_view path) {
+  CapturedDirectReferences result;
+  const auto &parameters = require_object(require_member(node, "parameters", path), path);
+  for (const auto &value : require_array(require_member(entry, "parameters", path), path)) {
+    const auto &definition = require_object(value, path);
+    const auto &id = require_string(require_member(definition, "id", path), path);
+    const auto *selected = find_member(parameters, id);
+    if (!selected) selected = find_member(definition, "default");
+    if (selected) {
+      capture_schema_references(*selected, definition, result, path, 0U);
+      // A key-typed value has no fixed semantic_type in the catalog. Its
+      // literal key determines whether the value is a stored pose.
+      const auto &shape = resolve_catalog_schema(definition, path);
+      const auto *from_key = find_member(shape, "value_type_from_key");
+      const auto *key_name = from_key && from_key->is_string()
+                                 ? find_member(parameters, from_key->as_string())
+                                 : nullptr;
+      const auto *blackboard = find_member(root, "blackboard");
+      const auto *keys = blackboard && blackboard->is_object()
+                             ? find_member(blackboard->as_object(), "keys")
+                             : nullptr;
+      const auto *key = key_name && key_name->is_string()
+                            ? find_declaration(keys, "key", key_name->as_string(), path)
+                            : nullptr;
+      const auto *key_type = key ? find_member(*key, "type") : nullptr;
+      if (key_type && key_type->is_string() && key_type->as_string() == "stored_pose") {
+        const auto &pose = require_object(*selected, path);
+        const auto &frame = require_object(require_member(pose, "frame_ref", path), path);
+        const auto &kind = require_string(require_member(frame, "kind", path), path);
+        if (kind == "target_frame" || kind == "component_frame")
+          capture_direct_reference(require_member(frame, "frame", path),
+                                   "frame_reference", result, path);
+      }
+    }
+  }
+  return result;
+}
+
+void capture_node_associations(
+    const CanonicalValue::Object &node, const CapturedDirectReferences &references,
+    const std::vector<RetainedIoSignalConfiguration> &signals,
+    CapturedDirectReferences &all_references,
+    TargetAssociations &associations, std::string_view path) {
+  const auto &parameters = require_object(require_member(node, "parameters", path), path);
+  const auto target_for = [&](std::string_view parameter)
+      -> std::optional<core::ProgramTargetReferenceDTO> {
+    const auto *value = find_member(parameters, parameter);
+    if (!value) return std::nullopt;
+    CapturedDirectReferences selected;
+    capture_direct_reference(*value, "target_reference", selected, path);
+    return *selected.targets.begin();
+  };
+  const auto main_target = target_for("target");
+  const auto tool_target = target_for("tool_target");
+  const auto append_one = [&](const std::optional<core::ProgramTargetReferenceDTO> &target,
+                              std::string_view parameter, std::string_view kind) {
+    const auto *value = find_member(parameters, parameter);
+    if (!target || !value) return;
+    capture_direct_reference(*value, kind, associations[*target], path);
+  };
+  append_one(main_target, "base_frame", "frame_reference");
+  append_one(tool_target ? tool_target : main_target, "carrier_frame_ref", "frame_reference");
+  if (const auto *bodies = find_member(parameters, "touch_bodies")) {
+    const auto target = tool_target ? tool_target : main_target;
+    if (!target) fail(std::string(path) + ": touch bodies have no selected target");
+    for (const auto &body : require_array(*bodies, path))
+      capture_direct_reference(body, "collision_body_reference", associations[*target], path);
+  }
+  for (const auto parameter : {"tcp_endpoint", "tcp"}) {
+    const auto *tcp = find_member(parameters, parameter);
+    if (!tcp) continue;
+    const auto &selector = require_object(*tcp, path);
+    const auto *kind = find_member(selector, "kind");
+    if (kind && kind->is_string() && kind->as_string() == "default_of_target") {
+      CapturedDirectReferences target;
+      capture_direct_reference(require_member(selector, "target", path),
+                               "target_reference", target, path);
+      associations[*target.targets.begin()].default_tcp_required = true;
+      continue;
+    }
+    if (kind && (!kind->is_string() || kind->as_string() != "entry")) continue;
+    if (const auto *target_value = find_member(selector, "target")) {
+      CapturedDirectReferences target;
+      capture_direct_reference(*target_value, "target_reference", target, path);
+      capture_direct_reference(require_member(selector, "frame", path), "frame_reference",
+                               associations[*target.targets.begin()], path);
+    }
+  }
+  for (const auto &reference : references.signals) {
+    const auto matches = FindProgramSignalMatches(signals, reference);
+    if (matches.size() != 1U)
+      fail(std::string(path) + ": signal reference is missing or ambiguous");
+    auto &associated = associations[{reference.component_id,
+                                      matches.front().retained->command_target_id}];
+    associated.signals.insert(reference);
+    if (matches.front().changed_outside) {
+      const core::ProgramSignalReferenceDTO base{
+          reference.component_id, matches.front().retained->descriptor.signal_id.name};
+      associated.signals.insert(base);
+      all_references.signals.insert(base);
+    }
+  }
+}
+
+void capture_non_node_references(const CanonicalValue::Object &root,
+                                 CapturedDirectReferences &result,
+                                 TargetAssociations &associations) {
+  const auto capture_frame_ref = [&](const CanonicalValue &value,
+                                     std::string_view path) {
+    const auto &frame = require_object(value, path);
+    const auto &kind = require_string(require_member(frame, "kind", path), path);
+    if (kind == "target_frame" || kind == "component_frame")
+      capture_direct_reference(require_member(frame, "frame", path),
+                               "frame_reference", result, path);
+  };
+  const auto capture_typed = [&](const CanonicalValue::Object &row,
+                                 std::string_view field, std::string_view path) {
+    const auto *type = find_member(row, "type");
+    const auto *value = find_member(row, field);
+    if (!type || !type->is_string() || !value) return;
+    if (type->as_string() == "stored_pose") {
+      const auto &pose = require_object(*value, path);
+      capture_frame_ref(require_member(pose, "frame_ref", path), path);
+    } else if (type->as_string() == "tcp_entry") {
+      const auto &entry = require_object(*value, path);
+      require_exact_fields(entry, {"target", "frame"}, path);
+      CapturedDirectReferences target;
+      capture_direct_reference(require_member(entry, "target", path),
+                               "target_reference", target, path);
+      result.targets.insert(target.targets.begin(), target.targets.end());
+      capture_direct_reference(require_member(entry, "frame", path),
+                               "frame_reference", result, path);
+      capture_direct_reference(require_member(entry, "frame", path),
+                               "frame_reference", associations[*target.targets.begin()], path);
+    }
+  };
+  if (const auto *scene = find_member(root, "scene")) {
+    for (const auto &value : require_array(*scene, "program.scene")) {
+      const auto &row = require_object(value, "program.scene[]");
+      const auto &pose = require_object(require_member(row, "pose", "scene"), "scene.pose");
+      capture_frame_ref(require_member(pose, "frame_ref", "scene.pose"), "scene.pose.frame_ref");
+    }
+  }
+  if (const auto *policies = find_member(root, "contact_policies")) {
+    for (const auto &value : require_array(*policies, "program.contact_policies")) {
+      const auto &policy = require_object(value, "program.contact_policies[]");
+      const auto &zones = require_array(require_member(policy, "zones", "contact policy"),
+                                        "contact policy.zones");
+      for (const auto &zone_value : zones) {
+        const auto &zone = require_object(zone_value, "contact policy zone");
+        const auto &pairs = require_array(require_member(zone, "body_pairs", "zone"), "zone.body_pairs");
+        for (const auto &pair_value : pairs) {
+          const auto &pair = require_object(pair_value, "zone.body_pairs[]");
+          for (const auto side : {"body_a", "body_b"}) {
+            const auto &selector = require_object(require_member(pair, side, "body pair"), side);
+            if (require_string(require_member(selector, "kind", side), side) == "component_model_body")
+              capture_direct_reference(require_member(selector, "body", side),
+                                       "collision_body_reference", result, side);
+          }
+        }
+      }
+    }
+  }
+  if (const auto *parameters = find_member(root, "parameters")) {
+    for (const auto &value : require_array(*parameters, "program.parameters"))
+      capture_typed(require_object(value, "program.parameters[]"), "default", "program.parameters[].default");
+  }
+  if (const auto *blackboard = find_member(root, "blackboard")) {
+    const auto &object = require_object(*blackboard, "program.blackboard");
+    if (const auto *keys = find_member(object, "keys")) {
+      for (const auto &value : require_array(*keys, "program.blackboard.keys")) {
+        const auto &row = require_object(value, "program.blackboard.keys[]");
+        capture_typed(row, "initial", "program.blackboard.keys[].initial");
+        if (const auto *frames = find_member(row, "allowed_frames"))
+          for (const auto &frame : require_array(*frames, "blackboard.allowed_frames"))
+            capture_frame_ref(frame, "blackboard.allowed_frames[]");
+      }
+    }
+  }
+}
+
 /// Where a path-keyed value source writes: the catalog schema at the path,
 /// or the key type of a whole key-typed value (`schema` is then null).
 struct SourceDestination final {
@@ -2188,9 +2464,8 @@ void verify_node_value_sources(const CanonicalValue::Object &node,
       "mock_simulation",
       "prompt_template_id"};
   static const std::set<std::string, std::less<>> kForbiddenSemantics{
-      "blackboard_key", "collision_body_role", "component_role",
-      "frame_role",     "resource_role",       "source_joint",
-      "target_role"};
+      "blackboard_key", "collision_body_reference", "frame_reference",
+      "signal_reference", "source_joint", "target_reference"};
   const auto *sources_value = find_member(node, "value_sources");
   if (sources_value == nullptr) {
     return;
@@ -2231,6 +2506,17 @@ void verify_node_value_sources(const CanonicalValue::Object &node,
     const auto entry_path = child_path(child_path(path, "value_sources"), key);
     const auto &source = require_object(source_value, entry_path);
     const auto value_path = parse_value_path(key);
+    // Set TCP accepts a whole tcp_entry from a blackboard key, matching the
+    // Program loader. Other sources cannot dynamically choose a TCP selector.
+    if (require_string(require_member(node, "node_id", path), path) == "motion.set_tcp" &&
+        value_path.size() == 1U && std::get<std::string>(value_path.front()) == "tcp") {
+      const auto source_type = source_declared_type(source, root, entry_path);
+      if (require_string(require_member(source, "kind", entry_path), entry_path) != "blackboard_key" ||
+          source_type != "tcp_entry") {
+        fail(entry_path + ": Set TCP requires a tcp_entry blackboard key");
+      }
+      continue;
+    }
     const auto destination = value_source_destination(
         value_path,
         *definition_of(std::get<std::string>(value_path.front())), parameters,
@@ -2370,20 +2656,56 @@ void verify_node_outcome_writes(const CanonicalValue::Object &node,
   }
 }
 
+void verify_catalog_node_semantics(
+    const CanonicalValue &tree, const CanonicalValue::Object &root,
+    const core::RetainedNodeEnvironmentDTO &environment,
+    const ProgramExpressionContext &expressions, const PoseFrames &frames) {
+  const auto catalog = qualified_program_catalog(environment);
+  const auto visit = [&](auto &&self, const CanonicalValue &value) -> void {
+    const auto &node = require_object(value, "program.tree");
+    const auto &instance = require_string(require_member(node, "instance_id", "tree"), "instance_id");
+    const auto path = "program.tree." + instance;
+    const auto &node_id = require_string(require_member(node, "node_id", path), path);
+    const auto definition = catalog.entries.find(node_id);
+    if (definition == catalog.entries.end())
+      fail(path + ": node is absent from the qualified catalog");
+    const auto &entry = require_object(definition->second, "catalog.entry");
+    (void)capture_node_references(node, entry, root, path);
+    verify_node_outcome_writes(node, entry, path);
+    verify_key_typed_parameters(node, entry, root, frames, path);
+    verify_node_value_sources(node, entry, root, expressions, path);
+    if (node_id == "scene.attach_carried_object") {
+      const auto &parameters = require_object(require_member(node, "parameters", path), path);
+      bool literal_frame = find_member(parameters, "carrier_frame_ref") != nullptr;
+      bool active_frame = find_member(parameters, "carrier_frame") != nullptr;
+      if (const auto *sources = find_member(node, "value_sources")) {
+        for (const auto &[key, unused] : require_object(*sources, path)) {
+          (void)unused;
+          const auto parts = parse_value_path(key);
+          const auto &name = std::get<std::string>(parts.front());
+          literal_frame = literal_frame || name == "carrier_frame_ref";
+          active_frame = active_frame || name == "carrier_frame";
+        }
+      }
+      if (literal_frame == active_frame)
+        fail(path + ": requires exactly one carrier frame selector");
+    }
+    validate_automatic_motion_retry_policy(node, entry, node_id, path);
+    for (const auto &child : require_array(require_member(node, "children", path), path))
+      self(self, child);
+  };
+  visit(visit, tree);
+}
+
 [[nodiscard]] core::ProgramExecutionTableDTO capture_execution_table(
     const CanonicalValue &tree, const CanonicalValue::Object &root,
     const std::set<std::string> &instances,
     const core::RetainedNodeEnvironmentDTO &environment,
-    const std::vector<core::ProgramTargetRoleRequirementDTO> &targets,
-    const std::map<std::string, core::ProgramExecutionPolicy> &group_policies,
-    const ProgramExpressionContext &expressions, const PoseFrames &frames) {
-  const auto &catalog = execution_catalog();
-  if (catalog.catalog_id != environment.catalog_id ||
-      catalog.content_version != environment.content_version ||
-      core::ContentDigest(catalog.digest) != environment.catalog_digest) {
-    fail("Program execution capture requires the exact qualified retained node "
-         "catalog");
-  }
+    const std::vector<RetainedIoSignalConfiguration> &signals,
+    CapturedDirectReferences &references,
+    TargetAssociations &associations,
+    const std::map<std::string, core::ProgramExecutionPolicy> &group_policies) {
+  const auto catalog = qualified_program_catalog(environment);
   core::ProgramExecutionTableDTO table;
   table.nodes.reserve(instances.size());
   for (const auto &instance : instances) {
@@ -2448,6 +2770,14 @@ void verify_node_outcome_writes(const CanonicalValue::Object &node,
     if (definition == catalog.entries.end())
       fail(path + ": node is absent from the qualified catalog");
     const auto &entry = require_object(definition->second, "catalog.entry");
+    const auto node_references = capture_node_references(node, entry, root, path);
+    selected->signal_references.assign(node_references.signals.begin(),
+                                       node_references.signals.end());
+    references.targets.insert(node_references.targets.begin(), node_references.targets.end());
+    references.signals.insert(node_references.signals.begin(), node_references.signals.end());
+    references.frames.insert(node_references.frames.begin(), node_references.frames.end());
+    references.bodies.insert(node_references.bodies.begin(), node_references.bodies.end());
+    capture_node_associations(node, node_references, signals, references, associations, path);
     const auto &kind =
         require_string(require_member(entry, "kind", path), path);
     const auto *authored_stop_policy =
@@ -2470,29 +2800,34 @@ void verify_node_outcome_writes(const CanonicalValue::Object &node,
         require_object(require_member(entry, "execution", path), path);
     selected->owner_api =
         require_string(require_member(execution, "owner_api", path), path);
-    verify_node_outcome_writes(node, entry, path);
-    verify_key_typed_parameters(node, entry, root, frames, path);
-    verify_node_value_sources(node, entry, root, expressions, path);
-    if (node_id == "scene.attach_carried_object") {
-      const auto &parameters = require_object(require_member(node, "parameters", path), path);
-      bool literal_frame = find_member(parameters, "carrier_frame_role") != nullptr;
-      bool active_frame = find_member(parameters, "carrier_frame") != nullptr;
-      if (const auto *sources = find_member(node, "value_sources")) {
-        for (const auto &[key, unused] : require_object(*sources, path)) {
-          (void)unused;
-          const auto parts = parse_value_path(key);
-          const auto &name = std::get<std::string>(parts.front());
-          literal_frame = literal_frame || name == "carrier_frame_role";
-          active_frame = active_frame || name == "carrier_frame";
-        }
-      }
-      if (literal_frame == active_frame)
-        fail(path + ": requires exactly one carrier frame selector");
-    }
-
-    validate_automatic_motion_retry_policy(node, entry, node_id, path);
     selected->preemption_priority = capture_preemption_priority(node, entry, node_id, path);
-    selected->target_effects = node_target_effects(node, entry, targets, path);
+    selected->target_effects = node_target_effects(node, entry, signals, path);
+    for (const auto &effect : selected->target_effects) {
+      const auto &capability = effect.capability_id.value();
+      if (capability != "io.gpio.get_input" && capability != "io.gpio.wait_for_input")
+        continue;
+      auto &use = associations[effect.target].input_signal_uses[effect.capability_id];
+      const bool input_node =
+          ((node_id == "io.get_input" || node_id == "io.check_input") &&
+           capability == "io.gpio.get_input") ||
+          (node_id == "io.wait_for_input" && capability == "io.gpio.wait_for_input");
+      const auto &parameters = require_object(require_member(node, "parameters", path), path);
+      const auto *value = find_member(parameters, "signal");
+      if (!input_node || !value) {
+        use.all_uses_are_signal_reads = false;
+        continue;
+      }
+      CapturedDirectReferences selected_signal;
+      capture_direct_reference(*value, "signal_reference", selected_signal, path);
+      const auto &reference = *selected_signal.signals.begin();
+      const auto matches = FindProgramSignalMatches(signals, reference);
+      if (matches.size() != 1U || reference.component_id != effect.target.component_id ||
+          matches.front().retained->command_target_id != effect.target.command_target_id) {
+        use.all_uses_are_signal_reads = false;
+        continue;
+      }
+      use.signals.insert(reference);
+    }
     if (selected->target_effects.size() >
         core::kMaxProgramTargetEffects - effect_count) {
       fail(path + ": resolved target effects exceed fixed bound");
@@ -2561,6 +2896,8 @@ void verify_node_outcome_writes(const CanonicalValue::Object &node,
 [[nodiscard]] core::ProgramBindingContractDTO
 extract_contract(const CanonicalValue &root_value,
                  const RetainedBundle &retained_bundle,
+                 const std::optional<VerifiedRetainedModelMap> *model_map,
+                 const ICatalogArtifactSource *catalog_source,
                  core::ProgramExecutionTableDTO &execution_table,
                  std::vector<core::ProgramBlackboardKeyDeclarationDTO>
                      &blackboard_declarations) {
@@ -2568,13 +2905,13 @@ extract_contract(const CanonicalValue &root_value,
   require_fields(
       root,
       {"api_version", "program_id", "program_revision", "program_profile",
-       "name", "catalog", "component_roles", "target_roles", "tree"},
+       "name", "catalog", "tree"},
       {"description", "compatibility", "viewer", "scene", "parameters",
        "blackboard", "contact_policies", "execution_groups"},
       "program");
   if (require_string(require_member(root, "api_version", "program"),
                      "program.api_version") != core::kProgramApiVersion) {
-    fail("program.api_version: expected manyforge.program.v2");
+    fail("program.api_version: expected manyforge.program.v3");
   }
   if (require_string(require_member(root, "program_profile", "program"),
                      "program.program_profile") !=
@@ -2598,7 +2935,7 @@ extract_contract(const CanonicalValue &root_value,
                        "program.catalog");
   if (require_string(require_member(catalog, "api_version", "program.catalog"),
                      "program.catalog.api_version") !=
-          "manyforge.node_catalog.v2" ||
+          "manyforge.node_catalog.v3" ||
       require_string(
           require_member(catalog, "content_version", "program.catalog"),
           "program.catalog.content_version") !=
@@ -2606,129 +2943,8 @@ extract_contract(const CanonicalValue &root_value,
     fail("Program catalog selector differs from the retained node environment");
   }
 
-  const auto &component_roles =
-      require_object(require_member(root, "component_roles", "program"),
-                     "program.component_roles");
-  if (component_roles.size() > core::kMaxProgramContractRoles) {
-    fail("program.component_roles: violates fixed role bound");
-  }
-  std::vector<core::ProgramComponentRoleRequirementDTO> components;
-  components.reserve(component_roles.size());
-  for (const auto &[role_name, role_value] : component_roles) {
-    require_program_local_identity(role_name, "program.component_roles key");
-    const std::string path = "program.component_roles." + role_name;
-    const auto &role = require_object(role_value, path);
-    require_fields(role, {},
-                   {"required_component_type_tags", "required_model_roles",
-                    "required_attachment_interfaces"},
-                   path);
-    components.push_back(core::ProgramComponentRoleRequirementDTO{
-        core::ComponentRoleId(role_name),
-        parse_text_set(find_member(role, "required_component_type_tags"),
-                       child_path(path, "required_component_type_tags")),
-        parse_identity_set<core::ModelRoleId>(
-            find_member(role, "required_model_roles"),
-            child_path(path, "required_model_roles")),
-        parse_identity_set<core::AttachmentInterfaceId>(
-            find_member(role, "required_attachment_interfaces"),
-            child_path(path, "required_attachment_interfaces")),
-    });
-  }
-
-  const auto &target_roles = require_object(
-      require_member(root, "target_roles", "program"), "program.target_roles");
-  if (target_roles.size() > core::kMaxProgramContractRoles) {
-    fail("program.target_roles: exceeds fixed role bound");
-  }
-  std::vector<core::ProgramTargetRoleRequirementDTO> targets;
-  targets.reserve(target_roles.size());
-  for (const auto &[role_name, role_value] : target_roles) {
-    require_program_local_identity(role_name, "program.target_roles key");
-    const std::string path = "program.target_roles." + role_name;
-    const auto &role = require_object(role_value, path);
-    require_fields(role, {"component_role", "required_capabilities"},
-                   {"required_frame_roles", "required_resource_roles",
-                    "required_collision_body_roles", "required_model_roles"},
-                   path);
-    const core::ComponentRoleId component_role =
-        parse_program_identity<core::ComponentRoleId>(
-            require_member(role, "component_role", path),
-            child_path(path, "component_role"));
-    if (std::none_of(components.begin(), components.end(),
-                     [&](const auto &component) {
-                       return component.component_role_id == component_role;
-                     })) {
-      fail(path + ": references an undeclared component role");
-    }
-
-    const auto &capability_values =
-        require_array(require_member(role, "required_capabilities", path),
-                      child_path(path, "required_capabilities"));
-    if (capability_values.empty() ||
-        capability_values.size() > core::kMaxProgramRoleRequirements) {
-      fail(path + ": required_capabilities violates fixed non-empty bound");
-    }
-    std::vector<core::ProgramCapabilityRequirementDTO> capabilities;
-    capabilities.reserve(capability_values.size());
-    for (std::size_t index = 0U; index < capability_values.size(); ++index) {
-      const std::string capability_path =
-          index_path(child_path(path, "required_capabilities"), index);
-      const auto &capability =
-          require_object(capability_values[index], capability_path);
-      require_exact_fields(capability,
-                           {"capability_id", "parameters", "disposition"},
-                           capability_path);
-      const core::CapabilityId capability_id =
-          parse_program_identity<core::CapabilityId>(
-              require_member(capability, "capability_id", capability_path),
-              child_path(capability_path, "capability_id"));
-      (void)require_object(
-          require_member(capability, "parameters", capability_path),
-          child_path(capability_path, "parameters"));
-      const auto *definition =
-          require_capability_definition(bundle, capability_id);
-      capabilities.push_back(core::ProgramCapabilityRequirementDTO{
-          capability_id,
-          core::CapabilityDefinitionRevision(
-              std::string(definition->capability_definition_revision)),
-          parse_disposition(
-              require_member(capability, "disposition", capability_path),
-              child_path(capability_path, "disposition")),
-      });
-    }
-    if (!std::is_sorted(capabilities.begin(), capabilities.end(),
-                        [](const auto &left, const auto &right) {
-                          return left.capability_id < right.capability_id;
-                        }) ||
-        std::adjacent_find(capabilities.begin(), capabilities.end(),
-                           [](const auto &left, const auto &right) {
-                             return left.capability_id == right.capability_id;
-                           }) != capabilities.end()) {
-      fail(path +
-           ": required_capabilities must be unique and canonical-sorted");
-    }
-
-    targets.push_back(core::ProgramTargetRoleRequirementDTO{
-        core::TargetRoleId(role_name),
-        component_role,
-        std::move(capabilities),
-        parse_identity_set<core::FrameRoleId>(
-            find_member(role, "required_frame_roles"),
-            child_path(path, "required_frame_roles")),
-        parse_identity_set<core::ResourceRoleId>(
-            find_member(role, "required_resource_roles"),
-            child_path(path, "required_resource_roles")),
-        parse_identity_set<core::CollisionBodyRoleId>(
-            find_member(role, "required_collision_body_roles"),
-            child_path(path, "required_collision_body_roles")),
-        parse_identity_set<core::ModelRoleId>(
-            find_member(role, "required_model_roles"),
-            child_path(path, "required_model_roles")),
-    });
-  }
-
   verify_optional_top_level_shapes(root);
-  const PoseFrames frames{targets, declared_scene_resource_ids(root)};
+  const PoseFrames frames{declared_scene_resource_ids(root)};
   verify_blackboard_pose_keys(root, frames);
   std::size_t tree_count = 0U;
   std::set<std::string> instance_ids;
@@ -2739,6 +2955,9 @@ extract_contract(const CanonicalValue &root_value,
       with_node_outcome_declarations(root, retained_bundle);
   const auto &validation_root = validation_view.as_object();
   const auto expressions = verify_program_expressions(validation_root);
+  verify_catalog_node_semantics(require_member(root, "tree", "program"),
+                                validation_root, bundle.catalogs.node_environment,
+                                expressions, frames);
   blackboard_declarations.clear();
   if (const auto *blackboard = find_member(validation_root, "blackboard")) {
     if (const auto *keys = find_member(blackboard->as_object(), "keys")) {
@@ -2754,10 +2973,22 @@ extract_contract(const CanonicalValue &root_value,
       }
     }
   }
+  if (!model_map || !catalog_source)
+    throw ProgramReferenceValidationIncomplete("Program verification requires exact reference-validation inputs");
+  auto diagnostics = validate_program_references(root_value, false, retained_bundle,
+                                                  *model_map, *catalog_source);
+  if (!diagnostics.empty())
+    throw ProgramReferenceValidationRefusal(std::move(diagnostics));
+  const auto signal_catalog = ResolveCompiledIoSignalCatalog(bundle.cell_graph);
+  if (!signal_catalog.ok())
+    fail("Program execution capture cannot resolve retained I/O catalog: " +
+         signal_catalog.error().message);
+  CapturedDirectReferences references;
+  TargetAssociations associations;
   execution_table = capture_execution_table(
       require_member(root, "tree", "program"), validation_root, instance_ids,
-      bundle.catalogs.node_environment, targets,
-      execution_group_policies(root, "program"), expressions, frames);
+      bundle.catalogs.node_environment, signal_catalog.value(), references, associations,
+      execution_group_policies(root, "program"));
   std::sort(node_policies.begin(), node_policies.end(),
             [](const auto &left, const auto &right) {
               return left.instance_id < right.instance_id;
@@ -2769,20 +3000,79 @@ extract_contract(const CanonicalValue &root_value,
   if (!is_sha256_digest(revision)) {
     fail("program.program_revision: expected lowercase sha256 digest");
   }
-  auto contact_grasp_templates = parse_contact_grasp_templates(root, targets);
+  auto contact_grasp_templates = parse_contact_grasp_templates(root);
+  capture_non_node_references(root, references, associations);
+  for (const auto &contact : contact_grasp_templates)
+    for (const auto &selector : contact.allowed_body_selectors)
+      references.bodies.insert(selector.body);
+  std::map<core::ProgramTargetReferenceDTO,
+           std::map<core::CapabilityId, core::ProgramCapabilityRequirementDTO>>
+      target_capabilities;
+  for (const auto &target : references.targets)
+    target_capabilities.try_emplace(target);
+  for (const auto &[target, unused] : associations) {
+    (void)unused;
+    target_capabilities.try_emplace(target);
+  }
+  for (const auto &node : execution_table.nodes) {
+    for (const auto &effect : node.target_effects) {
+      const auto *definition = require_capability_definition(bundle, effect.capability_id);
+      target_capabilities[effect.target].try_emplace(
+          effect.capability_id,
+          core::ProgramCapabilityRequirementDTO{
+              effect.capability_id,
+              core::CapabilityDefinitionRevision(std::string(definition->capability_definition_revision)),
+              core::ProgramCapabilityDisposition::kRequired});
+    }
+  }
+  std::vector<core::ProgramTargetRequirementDTO> targets;
+  for (auto &[target, capabilities] : target_capabilities) {
+    std::vector<core::ProgramCapabilityRequirementDTO> rows;
+    rows.reserve(capabilities.size());
+    for (auto &[id, capability] : capabilities) {
+      (void)id;
+      rows.push_back(std::move(capability));
+    }
+    const auto found = associations.find(target);
+    const CapturedDirectReferences empty;
+    const auto &associated = found == associations.end() ? empty : found->second;
+    std::vector<core::ProgramInputSignalUseDTO> input_signal_uses;
+    for (const auto &[capability, use] : associated.input_signal_uses)
+      input_signal_uses.push_back({capability, {use.signals.begin(), use.signals.end()},
+                                   use.all_uses_are_signal_reads});
+    targets.push_back({target, std::move(rows),
+                       {associated.frames.begin(), associated.frames.end()},
+                       {associated.bodies.begin(), associated.bodies.end()},
+                       {associated.signals.begin(), associated.signals.end()},
+                       std::move(input_signal_uses), associated.default_tcp_required});
+  }
   return core::ProgramBindingContractDTO{
       parse_program_identity<core::ProgramId>(
           require_member(root, "program_id", "program"), "program.program_id"),
       core::ProgramRevision(revision),
       bundle.catalogs.node_environment,
-      std::move(components),
       std::move(targets),
+      std::vector<core::ProgramFrameReferenceDTO>(references.frames.begin(), references.frames.end()),
+      std::vector<core::ProgramSignalReferenceDTO>(references.signals.begin(), references.signals.end()),
+      std::vector<core::ProgramCollisionBodyReferenceDTO>(references.bodies.begin(), references.bodies.end()),
       std::move(contact_grasp_templates),
       std::move(node_policies),
   };
 }
 
 } // namespace
+
+QualifiedProgramCatalogView qualified_program_catalog(
+    const core::RetainedNodeEnvironmentDTO &environment) {
+  const auto &catalog = execution_catalog();
+  if (catalog.catalog_id != environment.catalog_id ||
+      catalog.content_version != environment.content_version ||
+      core::ContentDigest(catalog.digest) != environment.catalog_digest) {
+    fail("Program execution capture requires the exact qualified retained node "
+         "catalog");
+  }
+  return {catalog.schema_types, catalog.entries};
+}
 
 namespace detail {
 
@@ -2802,12 +3092,20 @@ public:
 
 } // namespace detail
 
-CanonicalValue normalize_program_authoring(const CanonicalValue &source_root) {
+void require_supported_program_format(const CanonicalValue &source_root) {
   const auto &source = require_object(source_root, "program");
-  if (require_string(require_member(source, "api_version", "program"),
-                     "program.api_version") != core::kProgramApiVersion) {
-    fail("program.api_version: expected manyforge.program.v2");
+  const auto &version = require_string(require_member(source, "api_version", "program"),
+                                       "program.api_version");
+  if (version != core::kProgramApiVersion) {
+    throw ProgramContractError(
+        "program.api_version: unsupported Program format",
+        ProgramContractError::UnsupportedFormat{version, std::string(core::kProgramApiVersion)});
   }
+}
+
+CanonicalValue normalize_program_authoring(const CanonicalValue &source_root) {
+  require_supported_program_format(source_root);
+  const auto &source = source_root.as_object();
   (void)require_member(source, "tree", "program");
   auto members = source;
   std::size_t count = 0U;
@@ -2818,28 +3116,25 @@ CanonicalValue normalize_program_authoring(const CanonicalValue &source_root) {
   return CanonicalValue(std::move(members));
 }
 
-std::shared_ptr<const ProgramBindingContract>
-verify_program_binding_contract(std::string_view canonical_program_bytes,
-                                const RetainedBundle &retained_bundle) {
+static std::shared_ptr<const ProgramBindingContract>
+verify_program_binding_contract_impl(std::string_view canonical_program_bytes,
+                                     const RetainedBundle &retained_bundle,
+                                     const std::optional<VerifiedRetainedModelMap> *model_map,
+                                     const ICatalogArtifactSource *catalog_source) {
   try {
     if (canonical_program_bytes.size() > kMaxArtifactEncodedBytes) {
       fail("canonical Program exceeds fixed artifact byte bound");
     }
+    const auto parsed = parse_strict_json_model_yaml(canonical_program_bytes);
+    const CanonicalValue source_root = parsed.root();
+    require_supported_program_format(source_root);
     if (!verify_retained_bundle_identity(retained_bundle)) {
       fail("Program binding contract selected an invalid retained bundle");
     }
-    const auto parsed = parse_strict_json_model_yaml(canonical_program_bytes);
-    const CanonicalValue source_root = parsed.root();
     if (canonical_json(source_root) != canonical_program_bytes) {
       fail("Program binding input is not schema-normalized RFC 8785 JSON");
     }
     CanonicalValue root = normalize_program_authoring(source_root);
-    core::ProgramExecutionTableDTO execution_table;
-    std::vector<core::ProgramBlackboardKeyDeclarationDTO>
-        blackboard_declarations;
-    core::ProgramBindingContractDTO value = extract_contract(
-        root, retained_bundle, execution_table, blackboard_declarations);
-    const std::string normalized_bytes = canonical_json(root);
     if (!detail::verify_content_identity(
             root, detail::ContentIdentitySpec{
                       .identity_domain = "program-revision",
@@ -2848,15 +3143,39 @@ verify_program_binding_contract(std::string_view canonical_program_bytes,
                   })) {
       fail("ProgramRevision does not match the complete canonical Program");
     }
+    core::ProgramExecutionTableDTO execution_table;
+    std::vector<core::ProgramBlackboardKeyDeclarationDTO>
+        blackboard_declarations;
+    core::ProgramBindingContractDTO value = extract_contract(
+        root, retained_bundle, model_map, catalog_source, execution_table, blackboard_declarations);
+    const std::string normalized_bytes = canonical_json(root);
     return detail::ProgramBindingContractConstructionAuthority::construct(
         std::move(value), std::move(root), normalized_bytes,
         std::move(execution_table), std::move(blackboard_declarations));
+  } catch (const ProgramReferenceValidationRefusal &) {
+    throw;
+  } catch (const ProgramReferenceValidationIncomplete &) {
+    throw;
   } catch (const ProgramContractError &) {
     throw;
   } catch (const std::exception &error) {
     fail(std::string("Program binding-contract verification failed: ") +
          error.what());
   }
+}
+
+std::shared_ptr<const ProgramBindingContract>
+verify_program_binding_contract(std::string_view canonical_program_bytes,
+                                const RetainedBundle &retained_bundle) {
+  return verify_program_binding_contract_impl(canonical_program_bytes, retained_bundle, nullptr, nullptr);
+}
+
+std::shared_ptr<const ProgramBindingContract>
+verify_program_binding_contract(std::string_view canonical_program_bytes,
+                                const RetainedBundle &retained_bundle,
+                                const std::optional<VerifiedRetainedModelMap> &model_map,
+                                const ICatalogArtifactSource &catalog_source) {
+  return verify_program_binding_contract_impl(canonical_program_bytes, retained_bundle, &model_map, &catalog_source);
 }
 
 } // namespace manyforge::deployment

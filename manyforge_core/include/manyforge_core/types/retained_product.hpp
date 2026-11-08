@@ -17,7 +17,7 @@
 
 namespace manyforge::core {
 
-// These I3 identities deliberately live in a separate header until the
+// These retained-product identities deliberately live in a separate header until the
 // retained-product DTO family is linked into the complete core surface.  They
 // remain StrongString domains and therefore cannot be interchanged with an
 // equal-spelled graph, catalog, or raw-content identity.

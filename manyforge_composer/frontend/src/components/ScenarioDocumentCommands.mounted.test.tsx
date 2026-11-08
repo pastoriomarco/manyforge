@@ -75,7 +75,7 @@ beforeEach(() => {
 async function mount(documentUnavailableReason: string | null = null, motionActive = false,
   documentPath = '/projects/current.scenario', readOnly = false, hasChanges = true,
   cellComponents: readonly string[] | null = [], scenarioReplacementUnavailableReason: string | null = null,
-  busyOperation: BusyOperation | null = null) {
+  busyOperation: BusyOperation | null = null, authoringAdmissionAllowed: boolean | null = null) {
   const dom = mountedHost();
   const controller = {
     busyOperation,
@@ -89,9 +89,13 @@ async function mount(documentUnavailableReason: string | null = null, motionActi
   } as unknown as ProgramWorkspaceController;
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(dom.host as unknown as Element);
-  await act(() => root.render(<ScenarioDocumentCommands controller={controller} motionActive={motionActive}
-    cellComponents={cellComponents} />));
+  let admissionAllowed = authoringAdmissionAllowed;
+  const render = async () => act(() => root.render(<ScenarioDocumentCommands controller={controller}
+    motionActive={motionActive} cellComponents={cellComponents}
+    authoringAdmissionAllowed={admissionAllowed} />));
+  await render();
   unmount = async () => { await act(() => root.unmount()); };
+  const rerenderAdmission = async (allowed: boolean | null) => { admissionAllowed = allowed; await render(); };
   const click = async (props: Props) => { await act(async () => props.onClick?.({ currentTarget: { focus: () => undefined } })); };
   const open = async (label: string) => click(dom.find((p) => p['aria-label'] === label));
   const confirm = async () => { await act(() => dom.find((p) => p.type === 'checkbox').onChange?.({ target: { checked: true } })); };
@@ -101,7 +105,7 @@ async function mount(documentUnavailableReason: string | null = null, motionActi
     .onChange?.({ target: { value: `saved:/projects/${id}` } })); };
   // Confirmations use the danger look, the primary look elsewhere.
   const primary = (label: string) => dom.find((p) => (p.className === 'primary-action' || p.className === 'danger-button') && p.children === label);
-  return { ...dom, controller, click, open, confirm, choose, primary, ack };
+  return { ...dom, controller, click, open, confirm, choose, primary, ack, rerenderAdmission };
 }
 
 it('disables New, Save, Save As and Load while robots are moving', async () => {
@@ -316,7 +320,7 @@ it('Export Browse… can write to another allowed root', async () => {
 });
 
 
-it('New of a non-empty cell confirms once, then calls the server New once (R3)', async () => {
+it('New of a non-empty cell confirms once, then calls the server New once', async () => {
   const test = await mount(null, false, '/projects/current.scenario', false, false, ['lite6']);
   await test.open('New');
   expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
@@ -334,7 +338,7 @@ it('shows a refused New and does not resend it', async () => {
   expect(test.find((p) => p.children === 'New was refused; nothing was retried.')).toBeDefined();
 });
 
-// AUD-1: New and Load ask once when the cell isn't empty (one dialog).
+// New and Load ask once when the cell isn't empty (one dialog).
 const listsComponents = (text: string) => (p: Props) => Array.isArray(p.children)
   && (p.children as unknown[]).includes(text);
 const discardLine = (p: Props) => p.children === 'Current unsaved and unapplied Draft changes will be discarded.';
@@ -369,7 +373,7 @@ it('asks when the cell\'s components cannot be read', async () => {
 });
 
 it('New and Load follow their own gate, not the Idle-only document gate', async () => {
-  // A finished run blocks Save, not New or Load (R3; the server Resets it).
+  // A finished run blocks Save, not New or Load (the server Resets it).
   const finished = await mount('Program execution is terminal awaiting reset; authoring requires Idle.');
   for (const label of ['New', 'Load Scenario']) {
     expect(finished.find((p) => p['aria-label'] === label).disabled).toBe(false);
@@ -383,6 +387,66 @@ it('New and Load follow their own gate, not the Idle-only document gate', async 
     expect(button.disabled).toBe(true);
     expect(button['data-tooltip']).toBe(`${label}: Authoring is currently locked by the backend.`);
   }
+});
+
+it('gates Scenario writes while admission is false and leaves portable export available', async () => {
+  browseTree({ '/projects': [['out', false], ['current.scenario', true]] });
+  const blocked = await mount(null, false, '/projects/current.scenario', false, true, [], null, null, false);
+  const tooltip = 'The cell is finishing a background step; this is available again in a moment.';
+  for (const label of ['New', 'Save Scenario', 'Load Scenario']) {
+    const button = blocked.find((p) => p['aria-label'] === label);
+    expect(button.disabled).toBe(true);
+    expect(button['data-tooltip']).toBe(tooltip);
+  }
+  const saveAsEntry = blocked.find((p) => p['aria-label'] === 'Save Scenario as');
+  expect(saveAsEntry.disabled).toBe(false);
+  expect(saveAsEntry['data-tooltip']).toBe('Save Scenario as');
+  await blocked.open('Save Scenario as');
+  expect(blocked.primary('Save Scenario').disabled).toBe(true);
+  expect(blocked.primary('Save Scenario').title).toBe(tooltip);
+  expect(blocked.find((p) => p.role === 'status' && p.className === 'inline-message severity-info').children)
+    .toEqual([
+      'Project Save is unavailable. ', tooltip,
+      ' Choose Portable copy to export without saving to the project.',
+    ]);
+  await blocked.click(blocked.find((p) => p.children === 'Portable copy'));
+  await blocked.click(blocked.find((p) => p.children === 'Browse…'));
+  await blocked.click(blocked.find((p) => p.title === '/projects' && typeof p.onClick === 'function'));
+  await blocked.click(blocked.find((p) => p.role === 'listitem' && label(p) === 'out'));
+  await blocked.click(blocked.find((p) => p.children === 'Use this folder'));
+  expect(blocked.primary('Export copy').disabled).toBe(false);
+  await blocked.click(blocked.primary('Export copy'));
+  expect(blocked.controller.exportScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/out/current.scenario');
+  await unmount?.(); unmount = null;
+
+  const unknown = await mount(null, false, '/projects/current.scenario', false, true, [], null, null, null);
+  expect(unknown.find((p) => p['aria-label'] === 'New').disabled).toBe(false);
+  expect(unknown.find((p) => p['aria-label'] === 'Save Scenario').disabled).toBe(false);
+  expect(unknown.find((p) => p['aria-label'] === 'Load Scenario').disabled).toBe(false);
+});
+
+it('disables a New confirmation if authoring admission closes while it is open', async () => {
+  const test = await mount(null, false, '/projects/current.scenario', false, true, [], null, null, true);
+  await test.open('New');
+  expect(test.find((p) => p.children === 'New Scenario?')).toBeDefined();
+  await test.rerenderAdmission(false);
+  const acknowledge = test.find((p) => p.className === 'danger-button');
+  expect(acknowledge.disabled).toBe(true);
+  expect(acknowledge.title).toBe('The cell is finishing a background step; this is available again in a moment.');
+  expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
+});
+
+it('disables a Load confirmation if authoring admission closes while it is open', async () => {
+  const test = await mount(null, false, '/projects/current.scenario', false, true, [], null, null, true);
+  await test.open('Load Scenario');
+  await test.choose('other');
+  await test.click(test.primary('Load Scenario'));
+  expect(test.find((p) => p.children === 'Load Scenario?')).toBeDefined();
+  await test.rerenderAdmission(false);
+  const acknowledge = test.find((p) => p.className === 'danger-button');
+  expect(acknowledge.disabled).toBe(true);
+  expect(acknowledge.title).toBe('The cell is finishing a background step; this is available again in a moment.');
+  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
 });
 
 it('a refused Load shows its reason, not the generic line', async () => {

@@ -122,7 +122,7 @@ struct AlarmCallerAttribution final {
 };
 
 /// Validate the common public-mutation attribution envelope shared by alarm
-/// acknowledgement and the other H0 owner mutations.
+/// acknowledgement and the other headless owner mutations.
 void ValidateAlarmCallerAttribution(const AlarmCallerAttribution &caller);
 
 struct OperatorAlarmRecord final {
@@ -170,7 +170,7 @@ struct OperatorAlarmRecord final {
 
 /// Whether `record` is a motion-attention member: a motion-attention
 /// definition (a condition interlock, which never requires acknowledgement)
-/// gates exactly while active. Acknowledgement never gates work (V2-5).
+/// gates exactly while active. Acknowledgement never gates work.
 [[nodiscard]] bool GatesMotion(const OperatorAlarmRecord &record) noexcept;
 
 struct AlarmLifecycleFact final {
@@ -289,7 +289,7 @@ struct AlarmMotionAttentionGate final {
 
 /// The generation-fenced motion-attention projection published to the
 /// Kernel. The Kernel alone evaluates it against an operation's exact
-/// reserved resources at admission (spec 450 §5.2, spec 530 §11).
+/// reserved resources at admission.
 struct AlarmMotionAttentionProjection final {
   std::string cell_id;
   std::string owner_epoch;
@@ -303,7 +303,7 @@ struct AlarmMotionAttentionProjection final {
   /// The active configuration (retained bundle and graph revision) whose
   /// resource registry judged these subjects; absent before one is observed.
   /// The Kernel treats attention as available only when this equals its own
-  /// active configuration (spec 530 §11).
+  /// active configuration.
   std::optional<AlarmConfigurationIdentity> active_configuration;
   /// Complete membership sorted by condition id.
   std::vector<AlarmMotionAttentionGate> members;

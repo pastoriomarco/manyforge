@@ -1,4 +1,4 @@
-"""Pure boolean/signal reduction and I6/N logic-node gates."""
+"""Pure boolean/signal reduction and logic-node gates."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from typing import Final, Literal
 LOGIC_NODE_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_logic_node_binding_unavailable"
 )
-LOGIC_NODE_RESTORATION_GATES: Final = ("I6", "N")
 BooleanEdge = Literal["rising", "falling", "either"]
 
 
@@ -110,7 +109,7 @@ class _UnavailableLogicNode:
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         raise LogicNodeBindingUnavailableError(
             f"{LOGIC_NODE_UNAVAILABLE_REASON_CODE}: bound logic and gripper "
-            "nodes return at I6/N"
+            "nodes are not available"
         )
 
 

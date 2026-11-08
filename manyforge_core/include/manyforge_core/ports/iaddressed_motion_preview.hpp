@@ -53,7 +53,8 @@ class IAddressedMotionPreviewSession {
       CollisionWorldLeaseInventory projection_inventory,
       RobotStateDTO start_state,
       std::uint32_t planning_attempt_index = 0U,
-      std::stop_token stop_token = {}) = 0;
+      std::stop_token stop_token = {},
+      std::optional<MotionPathPreview>* path_preview = nullptr) = 0;
 };
 
 /// Addressed owner of serialized preview sessions. The public operation
