@@ -44,7 +44,7 @@ for _path in (ROOT / "manyforge_deployment/tools", ROOT, ROOT / "manyforge_behav
 BEHAVIOR = "manyforge_behavior"
 MAINTAINED = "manyforge_deployment/resources/maintained"
 DESCRIPTION = f"{MAINTAINED}/maintained_deployment_sources.v1.json"
-ASSISTANT_PROFILES = f"{MAINTAINED}/maintained_assistant_profiles.v1.json"
+ASSISTANT_PROFILES = f"{MAINTAINED}/maintained_assistant_profiles.v2.json"
 CATALOG_PY = f"{BEHAVIOR}/manyforge_behavior/catalog.py"
 NODE_CATALOG = f"{BEHAVIOR}/resources/node_catalog.yaml"
 SCHEMA_ROOT = "manyforge_deployment/resources/closed_schema"
@@ -276,15 +276,6 @@ def step_program_binding_transport(ctx: Context) -> None:
            *(["--check"] if not ctx.update else []), ctx=ctx)
 
 
-def step_assistant_registry(ctx: Context) -> None:
-    python("manyforge_deployment/tools/generate_assistant_instrument_registry.py",
-           *(["--check"] if not ctx.update else []),
-           "--catalog", ROOT / NODE_CATALOG,
-           "--assistant-profiles", ROOT / ASSISTANT_PROFILES,
-           "--output", ROOT / "manyforge_deployment/resources/assistant/"
-                              "assistant_instrument_registry_source.v1.json", ctx=ctx)
-
-
 def step_node_environment(ctx: Context) -> None:
     python(f"{BEHAVIOR}/scripts/generate_node_environment_manifest.py",
            *(["--check"] if not ctx.update else []), ctx=ctx)
@@ -397,8 +388,6 @@ STEPS = (
          ("manyforge_headless_api/program_binding_transport.py",
           "manyforge_composer/frontend/src/types/programBindingTransport.generated.ts",
           "manyforge_composer/frontend/src/api/programBindingTransport.generated.ts")),
-    Step("assistant-registry", step_assistant_registry,
-         ("manyforge_deployment/resources/assistant/*.json",)),
     Step("node-environment", step_node_environment,
          (f"{BEHAVIOR}/resources/node_environment_manifest.yaml",)),
     Step("program-revisions", step_program_revisions, ("examples/*.program.yaml",),

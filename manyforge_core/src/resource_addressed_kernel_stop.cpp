@@ -321,10 +321,6 @@ bool ResourceAddressedExecutionKernel::ordinary_request_id_retained_locked(
                      [&](const auto& row) {
                        return row.request.request_context.request_id == request_id;
                      }) ||
-         std::any_of(runtime_scale_replay_ledger_.begin(), runtime_scale_replay_ledger_.end(),
-                     [&](const auto& row) {
-                       return row.request.request_context.request_id == request_id;
-                     }) ||
          std::any_of(runtime_scale_control_replay_ledger_.begin(),
                      runtime_scale_control_replay_ledger_.end(), [&](const auto& row) {
                        return row.request.request_context.request_id == request_id;

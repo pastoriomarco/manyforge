@@ -484,6 +484,21 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
   manyforge_register_component_adapter_family(
     manyforge_pointcloud_adapter_family pointcloud)
 
+  # The assistant (a `kind: assistant` model); its host runs as the
+  # component's own process and owns the chat bridge.
+  add_library(manyforge_assistant_adapter_family SHARED
+    src/assistant_adapter_family.cpp
+    src/assistant_component_adapter.cpp
+    src/ros_assistant_host_link.cpp)
+  target_include_directories(manyforge_assistant_adapter_family PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(manyforge_assistant_adapter_family PRIVATE
+    manyforge_roboplan_ros2_control_runtime
+    rclcpp::rclcpp
+    ${std_msgs_TARGETS})
+  manyforge_register_component_adapter_family(
+    manyforge_assistant_adapter_family assistant)
+
   # The vendor and simulator adapter packages build their families against
   # the runtime above.
   foreach(_adapter_package manyforge_xarm_control manyforge_isaac_adapter)
@@ -497,6 +512,7 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     manyforge_mock_adapter_family
     manyforge_simulation_adapter_family
     manyforge_pointcloud_adapter_family
+    manyforge_assistant_adapter_family
     manyforge_xarm_adapter_family
     manyforge_isaac_adapter_family)
 endif()
@@ -1113,7 +1129,8 @@ if(BUILD_TESTING)
       add_executable(test_ros_adapter_entity_owner
         test/test_ros_adapter_entity_owner.cpp
         src/ros_simulation_control.cpp
-        src/ros_pointcloud_bridge_link.cpp)
+        src/ros_pointcloud_bridge_link.cpp
+        src/ros_assistant_host_link.cpp)
       target_include_directories(test_ros_adapter_entity_owner PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
       target_link_libraries(test_ros_adapter_entity_owner PRIVATE
@@ -1130,6 +1147,16 @@ if(BUILD_TESTING)
       target_link_libraries(test_pointcloud_source_adapter PRIVATE
         manyforge_core manyforge::content_identity GTest::gtest_main)
       gtest_discover_tests(test_pointcloud_source_adapter
+        PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+      add_executable(test_assistant_component_adapter
+        test/test_assistant_component_adapter.cpp
+        src/assistant_component_adapter.cpp)
+      target_include_directories(test_assistant_component_adapter PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include")
+      target_link_libraries(test_assistant_component_adapter PRIVATE
+        manyforge_core manyforge::content_identity GTest::gtest_main)
+      gtest_discover_tests(test_assistant_component_adapter
         PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
       # The registry loads the real Mock and simulation_interfaces family

@@ -568,7 +568,6 @@ _TASK_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
         "assistant.scene_selection": "assistant_requests",
         "kernel.operation": "kernel_operations",
         "kernel.reset": "kernel_controls",
-        "kernel.runtime_scaling": "kernel_controls",
         "kernel.stop": "kernel_controls",
         "kernel.full_stop": "kernel_controls",
         "kernel.recovery": "kernel_controls",

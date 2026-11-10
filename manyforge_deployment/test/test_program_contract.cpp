@@ -2183,7 +2183,18 @@ TEST(ProgramContractTest, RefusesTheSharedValueSourceConformanceCases) {
   };
   for (const auto &test_case : conformance_member(file, "accepted").as_array()) {
     SCOPED_TRACE(conformance_member(test_case.as_object(), "name").as_string());
-    EXPECT_NO_THROW(static_cast<void>(verify(test_case)));
+    try {
+      static_cast<void>(verify(test_case));
+    } catch (const manyforge::deployment::ProgramReferenceValidationRefusal &refusal) {
+      // The Lite 6 fixture cell has no usable model query, so a model node
+      // reports only that capability; its value sources are accepted.
+      for (const auto &diagnostic : refusal.diagnostics()) {
+        EXPECT_EQ(diagnostic.code, "cell_capability_missing");
+        const auto *capability = diagnostic.payload.find_object_member("capability_id");
+        ASSERT_NE(capability, nullptr);
+        EXPECT_EQ(capability->as_string(), "assistant.model.query");
+      }
+    }
   }
   std::size_t refused = 0U;
   for (const auto &test_case : conformance_member(file, "refused").as_array()) {

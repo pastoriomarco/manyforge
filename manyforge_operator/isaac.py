@@ -199,6 +199,23 @@ class RemoteNativeConfig:
             raise ValueError("canonical_empty_admission_filename must be package-relative")
 
 
+def _make_private_directories(path: Path) -> None:
+    """Create `path` and its missing parents as owner-only directories.
+
+    The mode is set after creation because ``mkdir``'s mode is masked by the
+    umask; directories that already exist are left as they are.
+    """
+
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir()
+        os.chmod(directory, 0o700)
+
+
 @dataclass(frozen=True, slots=True)
 class IsaacLauncherConfig:
     """Control-host outer-lifecycle configuration for the split Isaac profile."""
@@ -425,7 +442,7 @@ class IsaacLauncher:
 
     @staticmethod
     def _make_store(config: IsaacLauncherConfig) -> _StateStore:
-        config.instance_root.mkdir(parents=True, exist_ok=True)
+        _make_private_directories(config.instance_root)
         return _StateStore(
             root=config.instance_root,
             lock_root=config.instance_root,
@@ -436,7 +453,7 @@ class IsaacLauncher:
         if not instance_id or "/" in instance_id or "\\" in instance_id:
             raise LauncherError("invalid_instance_id", "instance id is invalid", exit_code=64)
         root = Path(state_root).absolute() / instance_id
-        root.mkdir(parents=True, exist_ok=True)
+        _make_private_directories(root)
         store = _StateStore(root=root, lock_root=root)
         launcher = cls.__new__(cls)
         launcher.store = store
@@ -834,8 +851,15 @@ class IsaacLauncher:
         if actual != expected:
             raise LauncherError("source_identity_mismatch", "remote source differs from the exact G source", exit_code=71)
 
+    def _remote_native_build(self) -> None:
+        # Its own call before start: a cold native build takes about 30-40
+        # minutes, and start's own timeout then bounds readiness only.
+        self._ssh(self._container_shell("build-native"), timeout=2700)
+
     def _remote_native_start(self) -> dict[str, Any]:
         if getattr(self._require_config().remote, "container_image_id", ""):
+            # Nothing has started yet: a failed build leaves no container.
+            self._remote_native_build()
             try:
                 status = self._remote_container_operation("start")
             except LauncherError:

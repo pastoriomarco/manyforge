@@ -103,7 +103,7 @@ struct Configuration final {
     /// The authored lane: `mock`, `isaac` or `real`.
     std::string lane;
     /// The model's `lanes.<lane>` row (adapter,
-    /// controller, arrival_tolerance_rad, goal_time_s?, adapter-specific
+    /// controller, arrival_tolerance_rad, runtime_scale (robots), goal_time_s?, adapter-specific
     /// keys, controllers_file?), verbatim as canonical JSON of one object.
     std::string lane_row;
     /// The model family whose lane row runs this component.
@@ -232,11 +232,6 @@ struct Configuration final {
   struct GripperTargetConfiguration final
       : execution_runtime_contract::Configuration::GripperTargetConfiguration {
     core::GripperOutputMode output_mode;
-    /// ROS-only pneumatic delivery bound. Absence preserves the source row and
-    /// resolves to 1.0 s for pneumatic at backend configuration. Position rows
-    /// reject this field. None retains positive metadata but has no delivery
-    /// deadline or transport.
-    std::optional<double> delivery_result_timeout_s;
     /// Signal identities and output levels; the Program selects which inputs
     /// are required for a particular open or close command.
     std::optional<PneumaticIo> pneumatic_io;
@@ -249,13 +244,11 @@ struct Configuration final {
     GripperTargetConfiguration(
         execution_runtime_contract::Configuration::GripperTargetConfiguration value,
         core::GripperOutputMode mode,
-        std::optional<double> delivery_timeout = std::nullopt,
         std::optional<PneumaticIo> io = std::nullopt,
         std::optional<GraspConfirmation> grasp = std::nullopt,
         std::optional<double> finish_tolerance = std::nullopt)
         : execution_runtime_contract::Configuration::GripperTargetConfiguration(
-              std::move(value)), output_mode(mode),
-          delivery_result_timeout_s(delivery_timeout), pneumatic_io(std::move(io)),
+              std::move(value)), output_mode(mode), pneumatic_io(std::move(io)),
           grasp_confirmation(std::move(grasp)),
           stop_finish_tolerance(finish_tolerance) {}
 

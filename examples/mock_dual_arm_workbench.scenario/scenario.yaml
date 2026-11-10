@@ -6,12 +6,12 @@
   },
   "description": "Mock UR5e and Lite6 on a wall-separated bench, as an editable workbench. Started as a copy of mock_dual_arm_shared_group; edit it freely.",
   "members": {
-    "deployment.yaml": "sha256:27dcf08c5c324a0fbd5fd85567c92d273e21e6039440d4912d58581a24652a36",
-    "program.yaml": "sha256:a4ee8ed3e1737a7b4ac552a09478edaa1efbc981f66fffd3db9573aa2076a1e6"
+    "deployment.yaml": "sha256:a93772bdbf95379df530fabbab9d1fd89cb46be63fb37bd2eacb152e1e9934da",
+    "program.yaml": "sha256:12fe1905bc755c43cdb6172d2a17ed4c3dc64dd8f7f24302a76f202c65f97de7"
   },
   "name": "mock_dual_arm_workbench",
   "saved_status": {
-    "checked_content_digest": "sha256:8d2495d86fcfd8b1b3d6972014716d85d00c71e005f770219b2acc8b6bfb1494",
+    "checked_content_digest": "sha256:913e63dbc0309ce4d54663429764bfa8630b1b4237c160e248902134ff50e912",
     "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },

@@ -424,8 +424,9 @@ def _wait_program(edge: str | None, *, timeout_s: float | None = None) -> dict[s
 
 @pytest.mark.parametrize("edge", ["rising", "falling"])
 def test_program_validation_refuses_edge_waits(edge: str) -> None:
+    # The catalog offers only level; an edge wait is refused by its schema.
     catalog = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
-    with pytest.raises(ProgramValidationError, match="io_watch_condition_unsupported"):
+    with pytest.raises(ProgramValidationError, match="edge"):
         Program.from_dict(_wait_program(edge), catalog)
 
 

@@ -387,6 +387,8 @@ struct ComponentLane final {
       lane.row.arrival_tolerance_rad = member.as_number();
     } else if (key == "goal_time_s") {
       lane.row.goal_time_s = member.as_number();
+    } else if (key == "runtime_scale") {
+      lane.row.runtime_scale_supported = member.as_string() == "supported";
     } else if (key == "controllers_file") {
       std::filesystem::path file(member.as_string());
       lane.row.controllers_file =
@@ -10526,8 +10528,16 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       } catch (const std::exception &error) {
         auto failure = host_detail::SelectedRuntimeCompositionRpcError(error);
         // A composition refusal was logged once where it was found.
-        if (failure.code != component_manager::kScenarioCompositionRefusedCode)
-          std::cerr << "native selected composition failed: " << error.what() << '\n';
+        if (failure.code != component_manager::kScenarioCompositionRefusedCode) {
+          const auto *typed = dynamic_cast<const core::TypedError *>(&error);
+          std::string cause;
+          if (typed) {
+            cause = typed->code() + ": ";
+            if (const auto reason = typed->details().find("reason"); reason != typed->details().end())
+              cause = typed->code() + " reason=" + reason->second + ": ";
+          }
+          std::cerr << "native selected composition failed: " << cause << error.what() << '\n';
+        }
         response =
             component_manager::detail::SelectedRuntimeCompositionRpcFailure{
                 std::move(failure)};

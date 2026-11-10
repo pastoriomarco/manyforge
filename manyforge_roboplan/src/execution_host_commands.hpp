@@ -208,7 +208,6 @@ enum class CommandKind {
   /// One manual output write (`set_io_output`).
   kSetIoOutput,
   kSetRuntimeScaleControl,
-  kSetOperationRuntimeScale,
   kGetRuntimeScaleControl,
   kPlanPick,
   kPlanPlace,
@@ -375,7 +374,6 @@ struct Command final {
   std::variant<bool, double> io_output_value{false};
   bool io_output_manual{};
   std::optional<core::RuntimeScaleControlRequestDTO> runtime_scale_control;
-  std::optional<core::RuntimeScaleRequestDTO> operation_runtime_scale;
   std::optional<core::RuntimeScaleControlSelectorDTO>
       runtime_scale_control_selector;
   std::optional<core::RequestOwnerEpoch> event_owner_epoch{};

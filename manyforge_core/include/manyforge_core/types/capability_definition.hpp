@@ -15,7 +15,7 @@ namespace manyforge::core {
 inline constexpr std::string_view kCapabilityDefinitionApiVersion =
     "manyforge.capability_definition.v1";
 inline constexpr std::string_view kBuiltinCapabilityDefinitionRegistryDigest =
-    "sha256:5f7eedf93f5bafe37e49149ceb32d09a7794b5792a823e7e786f0d288d4d5883";
+    "sha256:a8cd4531c38c0e4dafcc44193968bdbc25a4fe9036c711c190b4dcd896701794";
 
 enum class CapabilityScope : std::uint8_t {
   kCellGlobal = 0,
@@ -237,10 +237,6 @@ inline constexpr auto kBuiltinCapabilityDefinitionRegistry =
          "sha256:53267e14deed19c4888e454fdcf56fc9057b21119a3b04f26dfaeb074d8bb5aa",
          CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kControlBinding,
          std::nullopt},
-        {"execution.runtime_scale.operation_scoped",
-         "sha256:4ee00df7b3510c1490c83e247d12b73553ab53e4e6673da53ebea475fb756fad",
-         CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kControlBinding,
-         std::nullopt},
         {"execution.interrupt.resource_scoped",
          "sha256:ea0a625d949b1287de5b1eb0ed1e9d400d927f86c62c00b63c69898bdc58da36",
          CapabilityScope::kCellGlobal, CapabilityProviderBindingKind::kCapabilityProviderBinding,
@@ -335,6 +331,12 @@ inline constexpr auto kBuiltinCapabilityDefinitionRegistry =
          std::nullopt},
         {"assistant.model.invoke",
          "sha256:f900f43ad7bbc61f49c09295a2a63e5fabe93eb57bc9c5f44c26e3c4eeeac158",
+         CapabilityScope::kCellGlobal, CapabilityProviderBindingKind::kCapabilityProviderBinding,
+         std::nullopt},
+        // A usable model query: a model endpoint and at least one prompt
+        // template in the Deployment's assistant settings.
+        {"assistant.model.query",
+         "sha256:b136ad03b4ca732ee49c4ec34cfb00bb79f1bd1dcd3961784affa51417e23806",
          CapabilityScope::kCellGlobal, CapabilityProviderBindingKind::kCapabilityProviderBinding,
          std::nullopt},
         {"assistant.bridge.request",

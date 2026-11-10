@@ -38,6 +38,8 @@ export interface ReferenceSelectorFacts {
     update_mode: string | null; liveness: 'in_process' | 'periodic' | 'change_only' | null; provider_profile: string | null }[];
   frames: { reference: { component_id: string; frame_id: string }; ambiguous: boolean; moving_targets: CandidateTarget[] }[];
   bodies: { reference: { component_id: string; collision_body_id: string }; ambiguous: boolean; moving_targets: CandidateTarget[] }[];
+  /** The Deployment's interrupt rules; `scope` and `condition` stay in their normalized Deployment form. */
+  rules: { rule_id: string; scope: string | { execution_groups: string[] }; on_trip: 'stop' | 'notify'; active_at_start: boolean; condition: Record<string, unknown> }[];
 }
 
 export function referenceResult(value: unknown, digest: string, generation: Record<string, unknown>): { issues: ReferenceIssue[]; total: number; truncated: boolean; selectorFacts: ReferenceSelectorFacts } {
@@ -94,7 +96,7 @@ function selectorFacts(value: unknown): ReferenceSelectorFacts {
     const frame = object(row.frame, ['component_id', 'frame_id']);
     return { target: target(row.target), frame: { component_id: text(frame.component_id), frame_id: text(frame.frame_id) } };
   };
-  const root = object(value, ['components', 'targets', 'signals', 'frames', 'bodies']);
+  const root = object(value, ['components', 'targets', 'signals', 'frames', 'bodies', 'rules']);
   const components = list(root.components, (item) => { const row = object(item, ['component_id']); return { component_id: text(row.component_id) }; });
   const targets = list(root.targets, (item) => {
     const row = object(item, ['target', 'capabilities', 'source_joint_names', 'tcp_entries', 'default_tcp', 'stop_routes']);
@@ -151,6 +153,15 @@ function selectorFacts(value: unknown): ReferenceSelectorFacts {
     if (row.ambiguous && moving.length !== 0) throw new Error('Ambiguous feature has selected targets');
     return { reference: { component_id: text(ref.component_id), [key]: text(ref[key]) } as { component_id: string } & Record<K, string>, ambiguous: row.ambiguous, moving_targets: moving };
   };
+  const rules = list(root.rules, (item) => {
+    const row = object(item, ['rule_id', 'scope', 'on_trip', 'active_at_start', 'condition']);
+    const scope = typeof row.scope === 'string' ? row.scope
+      : { execution_groups: list(object(row.scope, ['execution_groups']).execution_groups, text) };
+    if ((row.on_trip !== 'stop' && row.on_trip !== 'notify') || typeof row.active_at_start !== 'boolean'
+      || !row.condition || typeof row.condition !== 'object' || Array.isArray(row.condition)) throw new Error('Invalid rule selector');
+    return { rule_id: text(row.rule_id), scope, on_trip: row.on_trip as 'stop' | 'notify', active_at_start: row.active_at_start,
+      condition: row.condition as Record<string, unknown> };
+  });
   return { components, targets, signals, frames: list(root.frames, (row) => features(row, 'frame_id')),
-    bodies: list(root.bodies, (row) => features(row, 'collision_body_id')) };
+    bodies: list(root.bodies, (row) => features(row, 'collision_body_id')), rules };
 }

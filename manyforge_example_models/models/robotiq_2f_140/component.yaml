@@ -31,7 +31,6 @@ lanes:
     controller: robotiq_gripper_controller
     controllers_file: mock_controllers.yaml
     hard_stop_completion_timeout_s: 0.5
-    gripper_result_timeout_s: 15.0
     gripper_stop_finish_tolerance: 0.035  # rad of knuckle travel (5% of the 0.7 stroke): a Stop this close lets the command finish
   isaac:                          # Isaac lane adapter: ParallelGripperCommand through the lane's bridge
     adapter: isaac
@@ -45,6 +44,5 @@ lanes:
     open_effort: 0.0
     close_effort: 40.0
     publish_nominal_position: false
-    gripper_result_timeout_s: 15.0
     gripper_stop_finish_tolerance: 0.035  # rad of knuckle travel (5% of the 0.7 stroke): a Stop this close lets the command finish
     gripper_bridge: robotiq_2f_140.yaml   # in the lane folder's gripper_bridges/

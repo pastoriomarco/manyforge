@@ -517,11 +517,6 @@ def create_app(
                             if headless.get("headless_projection_ready")
                             else "degraded"
                         ),
-                        "assistant_bridge": (
-                            "configured"
-                            if state.assistant_client is not None
-                            else "unconfigured"
-                        ),
                     },
                     "headless": headless,
                     "runtimeAvailability": None,
@@ -541,11 +536,6 @@ def create_app(
                             "loaded" if state.draft_session.program_loaded else "none"
                         ),
                         "headless_projection": "unavailable",
-                        "assistant_bridge": (
-                            "configured"
-                            if state.assistant_client is not None
-                            else "unconfigured"
-                        ),
                     },
                     "headless": {
                         "status_scope": "headless_projection",
@@ -573,7 +563,6 @@ def create_app(
                     "loaded" if state.draft_session.program_loaded else "none"
                 ),
                 "runtime": "unavailable",
-                "assistant_bridge": "unconfigured",
             },
             "runtimeAvailability": _UNAVAILABLE_PAYLOAD,
             "timestamp": time.time(),
@@ -629,7 +618,6 @@ def create_app(
             create_assistant_draft_router(state),
             tags=["assistant-draft-callback"],
         )
-    if state.headless_client is not None and state.assistant_client is not None:
         app.include_router(
             create_assistant_router(state),
             tags=["assistant-provider-client"],

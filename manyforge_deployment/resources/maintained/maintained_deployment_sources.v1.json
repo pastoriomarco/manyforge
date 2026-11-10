@@ -1,6 +1,7 @@
 {
   "api_version": "manyforge.maintained_deployment_sources.v1",
   "component_models": [
+    "components/assistant/manyforge.assistant/component.yaml",
     "components/io_device/ufactory.lite6_controller_io/component.yaml",
     "components/io_device/ufactory.lite6_tool_io/component.yaml",
     "components/io_device/ufactory.uf850_controller_io/component.yaml",

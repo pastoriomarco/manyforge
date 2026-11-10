@@ -19,7 +19,6 @@
 
 #include "compiler_semantic_limits_internal.hpp"
 #include "content_identity_internal.hpp"
-#include "embedded_assistant_instrument_registry_source_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 
 namespace manyforge::deployment {
@@ -73,8 +72,8 @@ constexpr std::size_t kMaximumAssistantTextBytes = 1024U;
 constexpr std::size_t kMaximumPromptTemplateBytes = 16384U;
 constexpr double kMaximumModelRequestTimeoutSeconds = 3600.0;
 constexpr std::uint32_t kMaximumModelOutputTokens = 1U << 20U;
-constexpr std::string_view kAssistantInstrumentRegistrySourceApiVersion =
-    "manyforge.assistant_instrument_registry_source.v1";
+constexpr double kMaximumSamplingTemperature = 2.0;
+constexpr std::uint32_t kMaximumSamplingTopK = 1U << 20U;
 
 const detail::ContentIdentitySpec kInstrumentRegistryIdentitySpec{
     "assistant-instrument-registry-digest",
@@ -193,6 +192,23 @@ void require_exact_fields(
   }
 }
 
+// Like require_exact_fields, with fields that may be left out.
+void require_fields(const CanonicalValue::Object& object,
+                    std::initializer_list<std::string_view> required,
+                    std::initializer_list<std::string_view> optional,
+                    std::string_view path) {
+  for (const auto& [name, unused] : object) {
+    (void)unused;
+    if (std::find(required.begin(), required.end(), name) == required.end() &&
+        std::find(optional.begin(), optional.end(), name) == optional.end()) {
+      fail(path, "unknown field '" + name + "'");
+    }
+  }
+  for (const std::string_view name : required) {
+    (void)require_member(object, name, path);
+  }
+}
+
 [[nodiscard]] constexpr bool is_ascii_alphanumeric(
     unsigned char byte) noexcept {
   return (byte >= 'a' && byte <= 'z') ||
@@ -279,16 +295,13 @@ template <typename Enum, typename Parser>
   return parser(value, path);
 }
 
-[[nodiscard]] core::AssistantProviderKind parse_provider_kind(
+[[nodiscard]] core::AssistantModeRunState parse_run_state(
     const CanonicalValue& value, std::string_view path) {
   const std::string& text = require_string(value, path);
-  if (text == "direct") {
-    return core::AssistantProviderKind::kDirect;
+  if (text == "no_program_active") {
+    return core::AssistantModeRunState::kNoProgramActive;
   }
-  if (text == "nemoclaw") {
-    return core::AssistantProviderKind::kNemoclaw;
-  }
-  fail(path, "provider_kind is outside the closed v1 registry");
+  fail(path, "run state is outside the closed registry");
 }
 
 [[nodiscard]] core::AssistantSessionKind parse_session_kind(
@@ -454,9 +467,25 @@ parse_template_variables(const CanonicalValue& value, std::string_view path) {
   return CanonicalValue(std::move(result));
 }
 
+[[nodiscard]] CanonicalValue encode_model_sampling(
+    const core::AssistantModelSamplingDTO& sampling) {
+  CanonicalValue::Object result;
+  if (sampling.temperature.has_value()) {
+    result.emplace_back("temperature", CanonicalValue(*sampling.temperature));
+  }
+  if (sampling.top_k.has_value()) {
+    result.emplace_back("top_k",
+                        CanonicalValue(static_cast<double>(*sampling.top_k)));
+  }
+  if (sampling.top_p.has_value()) {
+    result.emplace_back("top_p", CanonicalValue(*sampling.top_p));
+  }
+  return CanonicalValue(std::move(result));
+}
+
 [[nodiscard]] CanonicalValue encode_model_request_contract(
     const core::AssistantModelEndpointRequestContractDTO& contract) {
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object result{
       {"default_timeout_s", CanonicalValue(contract.default_timeout_s)},
       {"max_output_tokens",
        CanonicalValue(static_cast<double>(contract.max_output_tokens))},
@@ -470,7 +499,17 @@ parse_template_variables(const CanonicalValue& value, std::string_view path) {
        CanonicalValue(contract.supports_response_tools)},
       {"tool_call_family",
        CanonicalValue(std::string(core::to_string(contract.tool_call_family)))},
-  });
+  };
+  if (contract.reasoning.has_value()) {
+    // EXPERIMENTAL; members stay in canonical (sorted) order.
+    result.emplace(result.begin() + 2, "reasoning",
+                   CanonicalValue(std::string(*contract.reasoning ? "on" : "off")));
+  }
+  if (contract.sampling.has_value()) {
+    // The object constructor puts members in canonical order.
+    result.emplace_back("sampling", encode_model_sampling(*contract.sampling));
+  }
+  return CanonicalValue(std::move(result));
 }
 
 [[nodiscard]] std::string parse_prompt_template_text(const CanonicalValue& value,
@@ -539,199 +578,53 @@ parse_template_variables(const CanonicalValue& value, std::string_view path) {
   return CanonicalValue(std::move(object));
 }
 
-[[nodiscard]] core::AssistantToolEffect parse_tool_effect(
-    const CanonicalValue& value, std::string_view path) {
-  const std::string& text = require_string(value, path);
-  if (text == "read_only") {
-    return core::AssistantToolEffect::kReadOnly;
-  }
-  if (text == "proposal") {
-    return core::AssistantToolEffect::kProposal;
-  }
-  if (text == "composer_draft_mutating") {
-    return core::AssistantToolEffect::kComposerDraftMutating;
-  }
-  if (text == "runtime_mutating") {
-    return core::AssistantToolEffect::kRuntimeMutating;
-  }
-  fail(path, "effect is outside the closed assistant-tool enum");
-}
-
-void require_closed_input_schema(const CanonicalValue& value,
-                                 std::string_view path) {
-  const auto& object = require_object(value, path);
-  const CanonicalValue* variants = find_member(object, "oneOf");
-  if (variants != nullptr && find_member(object, "type") == nullptr) {
-    const CanonicalValue* definitions = find_member(object, "$defs");
-    if (object.size() != (definitions == nullptr ? 1U : 2U)) {
-      fail(path, "root oneOf schema may carry only local $defs");
-    }
-    if (definitions != nullptr) {
-      const auto& definition_object =
-          require_object(*definitions, child_path(path, "$defs"));
-      if (definition_object.empty() ||
-          definition_object.size() > kMaximumAssistantRows) {
-        fail(child_path(path, "$defs"),
-             "local definitions are empty or exceed the fixed bound");
-      }
-    }
-    const auto& array = require_array(*variants, child_path(path, "oneOf"));
-    if (array.empty() || array.size() > kMaximumAssistantRows) {
-      fail(child_path(path, "oneOf"),
-           "root schema variants are empty or exceed the fixed bound");
-    }
-    for (std::size_t index = 0U; index < array.size(); ++index) {
-      require_closed_input_schema(array[index],
-                                  index_path(child_path(path, "oneOf"), index));
-    }
-    return;
-  }
-  if (require_string(require_member(object, "type", path),
-                     child_path(path, "type")) != "object") {
-    fail(child_path(path, "type"), "tool input root must be an object");
-  }
-  if (require_bool(require_member(object, "additionalProperties", path),
-                   child_path(path, "additionalProperties"))) {
-    fail(child_path(path, "additionalProperties"),
-         "tool input root must reject unknown fields");
-  }
-  (void)require_object(require_member(object, "properties", path),
-                       child_path(path, "properties"));
-}
-
-struct ParsedInstrumentRegistrySource final {
-  std::vector<core::AssistantSkillDescriptorDTO> skills;
-  std::vector<core::AssistantToolDescriptorDTO> tools;
-  std::vector<core::AssistantNodeDescriptorDTO> nodes;
+// The assistant tool and skill table. Tool descriptions and input schemas
+// are built from the loaded node catalog where the mode projection is built
+// (Headless); this table carries what Apply qualifies: identity and effect.
+struct AssistantToolRow final {
+  std::string_view tool_id;
+  core::AssistantToolEffect effect;
 };
 
-[[nodiscard]] ParsedInstrumentRegistrySource
-parse_instrument_registry_source() {
-  const CanonicalValue source =
-      parse_strict_json_model_yaml(
-          detail::kEmbeddedAssistantInstrumentRegistrySource)
-          .root();
-  const auto& root = require_object(source, "$.assistant_instrument_source");
-  require_exact_fields(root, {"api_version", "skills", "tools", "nodes"},
-                       "$.assistant_instrument_source");
-  if (require_string(
-          require_member(root, "api_version", "$.assistant_instrument_source"),
-          "$.assistant_instrument_source.api_version") !=
-      kAssistantInstrumentRegistrySourceApiVersion) {
-    fail("$.assistant_instrument_source.api_version",
-         "unsupported build-owned registry source version");
-  }
+constexpr auto kReadOnly = core::AssistantToolEffect::kReadOnly;
+constexpr auto kDraftMutating = core::AssistantToolEffect::kComposerDraftMutating;
 
-  ParsedInstrumentRegistrySource result;
-  std::set<std::string> all_ids;
-  std::string previous_id;
+constexpr std::array<AssistantToolRow, 30U> kAssistantTools{{
+    {"alarms_read", kReadOnly},
+    {"blackboard_draft_remove_keys", kDraftMutating},
+    {"blackboard_draft_remove_namespaces", kDraftMutating},
+    {"blackboard_draft_upsert_keys", kDraftMutating},
+    {"blackboard_draft_upsert_namespaces", kDraftMutating},
+    {"catalog_read", kReadOnly},
+    {"deployment_capabilities_read", kReadOnly},
+    {"history_read", kReadOnly},
+    {"inspect_isaac_scene", kReadOnly},
+    {"program_draft_remove_contact_policies", kDraftMutating},
+    {"program_draft_remove_parameters", kDraftMutating},
+    {"program_draft_upsert_contact_policies", kDraftMutating},
+    {"program_draft_upsert_parameters", kDraftMutating},
+    {"program_read", kReadOnly},
+    {"program_validate", kReadOnly},
+    {"scene_draft_add_object", kDraftMutating},
+    {"scene_draft_remove_objects", kDraftMutating},
+    {"scene_draft_update_object", kDraftMutating},
+    {"scene_draft_upsert_objects", kDraftMutating},
+    {"scene_inspect", kReadOnly},
+    {"skills_read", kReadOnly},
+    {"status_read", kReadOnly},
+    {"tree_draft_change_node_kind", kDraftMutating},
+    {"tree_draft_delete_node", kDraftMutating},
+    {"tree_draft_insert_node", kDraftMutating},
+    {"tree_draft_move_node", kDraftMutating},
+    {"tree_draft_rename_node", kDraftMutating},
+    {"tree_draft_replace_subtree", kDraftMutating},
+    {"tree_draft_update_node_params", kDraftMutating},
+    {"tree_draft_wrap_node", kDraftMutating},
+}};
 
-  const auto& source_skills = require_array(
-      require_member(root, "skills", "$.assistant_instrument_source"),
-      "$.assistant_instrument_source.skills");
-  if (source_skills.size() > kMaximumAssistantRows) {
-    fail("$.assistant_instrument_source.skills",
-         "skill table exceeds the fixed bound");
-  }
-  for (std::size_t index = 0U; index < source_skills.size(); ++index) {
-    const std::string path =
-        index_path("$.assistant_instrument_source.skills", index);
-    const auto& row = require_object(source_skills[index], path);
-    require_exact_fields(row, {"skill_id", "requires_tools"}, path);
-    std::string skill_id = parse_portable_token(
-        require_member(row, "skill_id", path), child_path(path, "skill_id"));
-    if (!previous_id.empty() && skill_id <= previous_id) {
-      fail(path, "skill table must be unique and canonical-sorted");
-    }
-    previous_id = skill_id;
-    if (!all_ids.insert(skill_id).second) {
-      fail(path, "instrument namespaces overlap");
-    }
-    result.skills.push_back({
-        std::move(skill_id),
-        parse_id_list(require_member(row, "requires_tools", path),
-                      child_path(path, "requires_tools"),
-                      InstrumentIdKind::kTool),
-    });
-  }
-
-  previous_id.clear();
-  const auto& source_tools = require_array(
-      require_member(root, "tools", "$.assistant_instrument_source"),
-      "$.assistant_instrument_source.tools");
-  if (source_tools.empty() || source_tools.size() > kMaximumAssistantRows) {
-    fail("$.assistant_instrument_source.tools",
-         "tool table is empty or exceeds the fixed bound");
-  }
-  for (std::size_t index = 0U; index < source_tools.size(); ++index) {
-    const std::string path =
-        index_path("$.assistant_instrument_source.tools", index);
-    const auto& row = require_object(source_tools[index], path);
-    require_exact_fields(
-        row, {"tool_id", "effect", "description", "input_schema"}, path);
-    std::string tool_id = parse_tool_id(require_member(row, "tool_id", path),
-                                        child_path(path, "tool_id"));
-    if (!previous_id.empty() && tool_id <= previous_id) {
-      fail(path, "tool table must be unique and canonical-sorted");
-    }
-    previous_id = tool_id;
-    if (!all_ids.insert(tool_id).second) {
-      fail(path, "instrument namespaces overlap");
-    }
-    const CanonicalValue& schema = require_member(row, "input_schema", path);
-    require_closed_input_schema(schema, child_path(path, "input_schema"));
-    const std::string canonical_schema = canonical_json(schema);
-    result.tools.push_back({
-        std::move(tool_id),
-        parse_tool_effect(require_member(row, "effect", path),
-                          child_path(path, "effect")),
-        parse_bounded_text(require_member(row, "description", path),
-                           child_path(path, "description"), false),
-        canonical_schema,
-        core::ContentDigest(sha256_digest(canonical_schema)),
-    });
-  }
-
-  previous_id.clear();
-  const auto& source_nodes = require_array(
-      require_member(root, "nodes", "$.assistant_instrument_source"),
-      "$.assistant_instrument_source.nodes");
-  if (source_nodes.size() > kMaximumAssistantRows) {
-    fail("$.assistant_instrument_source.nodes",
-         "node table exceeds the fixed bound");
-  }
-  for (std::size_t index = 0U; index < source_nodes.size(); ++index) {
-    const std::string path =
-        index_path("$.assistant_instrument_source.nodes", index);
-    const auto& row = require_object(source_nodes[index], path);
-    require_exact_fields(row, {"node_id"}, path);
-    std::string node_id = parse_portable_token(
-        require_member(row, "node_id", path), child_path(path, "node_id"));
-    if (!previous_id.empty() && node_id <= previous_id) {
-      fail(path, "node table must be unique and canonical-sorted");
-    }
-    previous_id = node_id;
-    if (!all_ids.insert(node_id).second) {
-      fail(path, "instrument namespaces overlap");
-    }
-    result.nodes.push_back({std::move(node_id)});
-  }
-
-  for (const auto& skill : result.skills) {
-    for (const auto& required_tool : skill.requires_tools) {
-      const auto iterator = std::lower_bound(
-          result.tools.begin(), result.tools.end(), required_tool,
-          [](const core::AssistantToolDescriptorDTO& tool,
-             std::string_view id) { return tool.tool_id < id; });
-      if (iterator == result.tools.end() ||
-          iterator->tool_id != required_tool) {
-        fail("$.assistant_instrument_source.skills",
-             "skill requires a tool absent from the same build source");
-      }
-    }
-  }
-  return result;
-}
+// The installed skill catalog (manyforge_behavior/resources/skills).
+constexpr std::array<std::string_view, 3U> kAssistantSkills{
+    "move_to_named_config", "pick_object", "place_object"};
 
 [[nodiscard]] CanonicalValue encode_registry(
     const core::AssistantInstrumentRegistryDTO& registry) {
@@ -747,29 +640,14 @@ parse_instrument_registry_source() {
   CanonicalValue::Array tools;
   tools.reserve(registry.tools.size());
   for (const auto& tool : registry.tools) {
-    const CanonicalValue schema =
-        parse_strict_json_model_yaml(tool.canonical_input_schema).root();
     tools.emplace_back(CanonicalValue::Object{
-        {"description", CanonicalValue(tool.description)},
         {"effect", CanonicalValue(std::string(core::to_string(tool.effect)))},
-        {"input_schema", schema},
-        {"input_schema_digest",
-         CanonicalValue(tool.input_schema_digest.value())},
         {"tool_id", CanonicalValue(tool.tool_id)},
-    });
-  }
-
-  CanonicalValue::Array nodes;
-  nodes.reserve(registry.nodes.size());
-  for (const auto& node : registry.nodes) {
-    nodes.emplace_back(CanonicalValue::Object{
-        {"node_id", CanonicalValue(node.node_id)},
     });
   }
 
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue(registry.api_version)},
-      {"nodes", CanonicalValue(std::move(nodes))},
       {"registry_digest", CanonicalValue(registry.registry_digest.value())},
       {"skills", CanonicalValue(std::move(skills))},
       {"tools", CanonicalValue(std::move(tools))},
@@ -778,15 +656,18 @@ parse_instrument_registry_source() {
 
 [[nodiscard]] std::pair<core::AssistantInstrumentRegistryDTO, CanonicalValue>
 make_registry_value() {
-  ParsedInstrumentRegistrySource source = parse_instrument_registry_source();
-
   core::AssistantInstrumentRegistryDTO value{
       std::string(kAssistantInstrumentRegistryApiVersion),
       core::ContentDigest(std::string(kZeroDigest)),
-      std::move(source.skills),
-      std::move(source.tools),
-      std::move(source.nodes),
+      {},
+      {},
   };
+  for (const auto skill_id : kAssistantSkills) {
+    value.skills.push_back({std::string(skill_id), {}});
+  }
+  for (const auto& row : kAssistantTools) {
+    value.tools.push_back({std::string(row.tool_id), row.effect});
+  }
   CanonicalValue normalized = encode_registry(value);
   const std::string digest = detail::compute_content_identity(
       normalized, kInstrumentRegistryIdentitySpec);
@@ -796,17 +677,61 @@ make_registry_value() {
   return {std::move(value), std::move(normalized)};
 }
 
+// Optional `sampling: {temperature?, top_p?, top_k?}`; at least one field.
+[[nodiscard]] core::AssistantModelSamplingDTO parse_model_sampling(
+    const CanonicalValue& value, std::string_view path) {
+  const auto& object = require_object(value, path);
+  require_fields(object, {}, {"temperature", "top_p", "top_k"}, path);
+  if (object.empty()) {
+    fail(path, "sampling must set at least one field");
+  }
+  core::AssistantModelSamplingDTO sampling;
+  if (const CanonicalValue* temperature = find_member(object, "temperature")) {
+    const auto* number = std::get_if<double>(&temperature->storage());
+    if (number == nullptr || !std::isfinite(*number) || *number < 0.0 ||
+        *number > kMaximumSamplingTemperature) {
+      fail(child_path(path, "temperature"),
+           "expected a finite number from 0 to 2");
+    }
+    sampling.temperature = *number;
+  }
+  if (const CanonicalValue* top_p = find_member(object, "top_p")) {
+    sampling.top_p = require_bounded_positive_number(
+        *top_p, child_path(path, "top_p"), 1.0);
+  }
+  if (const CanonicalValue* top_k = find_member(object, "top_k")) {
+    sampling.top_k = require_bounded_positive_integer(
+        *top_k, child_path(path, "top_k"), kMaximumSamplingTopK);
+  }
+  return sampling;
+}
+
 [[nodiscard]] core::AssistantModelEndpointRequestContractDTO
 parse_model_request_contract(const CanonicalValue& value,
                              std::string_view path) {
   const auto& object = require_object(value, path);
-  require_exact_fields(
-      object,
-      {"default_timeout_s", "max_output_tokens",
-       "supports_response_tools", "supports_json_object",
-       "supports_image_input", "supported_image_transports",
-       "tool_call_family"},
-      path);
+  // `reasoning` (on|off, EXPERIMENTAL) and `sampling` are optional.
+  require_fields(object,
+                 {"default_timeout_s", "max_output_tokens",
+                  "supports_response_tools", "supports_json_object",
+                  "supports_image_input", "supported_image_transports",
+                  "tool_call_family"},
+                 {"reasoning", "sampling"}, path);
+  const CanonicalValue* reasoning_value = find_member(object, "reasoning");
+  std::optional<core::AssistantModelSamplingDTO> sampling;
+  if (const CanonicalValue* sampling_value = find_member(object, "sampling")) {
+    sampling = parse_model_sampling(*sampling_value,
+                                    child_path(path, "sampling"));
+  }
+  std::optional<bool> reasoning;
+  if (reasoning_value != nullptr) {
+    const std::string& text =
+        require_string(*reasoning_value, child_path(path, "reasoning"));
+    if (text != "on" && text != "off") {
+      fail(child_path(path, "reasoning"), "reasoning must be on or off");
+    }
+    reasoning = text == "on";
+  }
   const auto& source_transports = require_array(
       require_member(object, "supported_image_transports", path),
       child_path(path, "supported_image_transports"));
@@ -854,6 +779,8 @@ parse_model_request_contract(const CanonicalValue& value,
       std::move(transports),
       parse_tool_call_family(require_member(object, "tool_call_family", path),
                              child_path(path, "tool_call_family")),
+      reasoning,
+      std::move(sampling),
   };
 }
 
@@ -939,19 +866,31 @@ parse_prompt_response_contract(const CanonicalValue& value,
   };
 }
 
-[[nodiscard]] core::AssistantProviderAliasDTO parse_provider_alias(
-    std::string alias, const CanonicalValue& value, std::string_view path) {
-  const auto& object = require_object(value, path);
-  require_exact_fields(
-      object, {"provider_kind", "bridge_external_resource_alias"}, path);
-  return {
-      std::move(alias),
-      parse_provider_kind(require_member(object, "provider_kind", path),
-                          child_path(path, "provider_kind")),
-      core::ExternalResourceAlias(parse_portable_token(
-          require_member(object, "bridge_external_resource_alias", path),
-          child_path(path, "bridge_external_resource_alias"))),
-  };
+/// A mode's `runs_in`: a non-empty, sorted set of run states.
+[[nodiscard]] std::vector<core::AssistantModeRunState> parse_runs_in(
+    const CanonicalValue& value, std::string_view path) {
+  const auto& array = require_array(value, path);
+  if (array.empty()) {
+    fail(path, "a mode runs in at least one cell state");
+  }
+  std::vector<core::AssistantModeRunState> result;
+  for (std::size_t index = 0; index < array.size(); ++index) {
+    const auto state = parse_run_state(array[index], index_path(path, index));
+    if (!result.empty() && state <= result.back()) {
+      fail(path, "run states must be sorted and unique");
+    }
+    result.push_back(state);
+  }
+  return result;
+}
+
+[[nodiscard]] CanonicalValue encode_runs_in(
+    const std::vector<core::AssistantModeRunState>& runs_in) {
+  CanonicalValue::Array result;
+  for (const auto state : runs_in) {
+    result.emplace_back(std::string(core::to_string(state)));
+  }
+  return CanonicalValue(std::move(result));
 }
 
 [[nodiscard]] core::AssistantGrantPolicyDTO parse_grant_policy(
@@ -974,39 +913,60 @@ parse_prompt_response_contract(const CanonicalValue& value,
 [[nodiscard]] core::AssistantModeCatalogDTO parse_mode_catalog(
     const CanonicalValue& value, std::string_view path) {
   const auto& object = require_object(value, path);
-  require_exact_fields(object, {"skills", "tools", "nodes"}, path);
+  require_exact_fields(object, {"skills", "tools"}, path);
   return {
       parse_id_list(require_member(object, "skills", path),
                     child_path(path, "skills"), InstrumentIdKind::kPortable),
       parse_id_list(require_member(object, "tools", path),
                     child_path(path, "tools"), InstrumentIdKind::kTool),
-      parse_id_list(require_member(object, "nodes", path),
-                    child_path(path, "nodes"), InstrumentIdKind::kPortable),
   };
 }
 
 [[nodiscard]] core::AssistantModeDTO parse_mode(
     std::string mode_id, const CanonicalValue& value, std::string_view path) {
   const auto& object = require_object(value, path);
-  require_exact_fields(object,
-                       {"enabled", "description", "provider_alias",
-                        "model_endpoint_alias", "grant_policy", "catalog"},
-                       path);
+  // stuck_loop_recovery is optional in a source and defaults to on;
+  // compact_history and constrained_regeneration (EXPERIMENTAL) are
+  // optional and default to off.
+  require_fields(object,
+                 {"enabled", "description", "assistant_component_id",
+                  "model_endpoint_alias", "runs_in", "grant_policy", "catalog"},
+                 {"stuck_loop_recovery", "compact_history",
+                  "constrained_regeneration"},
+                 path);
+  const CanonicalValue* stuck_loop_recovery =
+      find_member(object, "stuck_loop_recovery");
+  const CanonicalValue* compact_history =
+      find_member(object, "compact_history");
+  const CanonicalValue* constrained_regeneration =
+      find_member(object, "constrained_regeneration");
   return {
       std::move(mode_id),
       require_bool(require_member(object, "enabled", path),
                    child_path(path, "enabled")),
       parse_bounded_text(require_member(object, "description", path),
                          child_path(path, "description"), false),
-      parse_portable_token(require_member(object, "provider_alias", path),
-                           child_path(path, "provider_alias")),
+      parse_portable_token(
+          require_member(object, "assistant_component_id", path),
+          child_path(path, "assistant_component_id")),
       parse_portable_token(
           require_member(object, "model_endpoint_alias", path),
           child_path(path, "model_endpoint_alias")),
+      parse_runs_in(require_member(object, "runs_in", path),
+                    child_path(path, "runs_in")),
       parse_grant_policy(require_member(object, "grant_policy", path),
                          child_path(path, "grant_policy")),
       parse_mode_catalog(require_member(object, "catalog", path),
                          child_path(path, "catalog")),
+      stuck_loop_recovery == nullptr
+          ? true
+          : require_bool(*stuck_loop_recovery,
+                         child_path(path, "stuck_loop_recovery")),
+      compact_history != nullptr &&
+          require_bool(*compact_history, child_path(path, "compact_history")),
+      constrained_regeneration != nullptr &&
+          require_bool(*constrained_regeneration,
+                       child_path(path, "constrained_regeneration")),
   };
 }
 
@@ -1031,9 +991,6 @@ template <typename DTO, typename Parser>
       return left.prompt_template_id < right.prompt_template_id;
     } else if constexpr (std::is_same_v<DTO, core::AssistantModelEndpointAliasDTO>) {
       return left.model_endpoint_alias < right.model_endpoint_alias;
-    } else if constexpr (std::is_same_v<DTO,
-                                        core::AssistantProviderAliasDTO>) {
-      return left.provider_alias < right.provider_alias;
     } else {
       return left.mode_id < right.mode_id;
     }
@@ -1075,18 +1032,6 @@ template <typename DTO, typename Parser>
         }));
   }
 
-  CanonicalValue::Object provider_aliases;
-  for (const auto& alias : settings.provider_aliases) {
-    provider_aliases.emplace_back(
-        alias.provider_alias,
-        CanonicalValue(CanonicalValue::Object{
-            {"bridge_external_resource_alias",
-             CanonicalValue(alias.bridge_external_resource_alias.value())},
-            {"provider_kind",
-             CanonicalValue(std::string(core::to_string(alias.provider_kind)))},
-        }));
-  }
-
   CanonicalValue::Object modes;
   for (const auto& mode : settings.modes) {
     const CanonicalValue session_kind =
@@ -1099,29 +1044,40 @@ template <typename DTO, typename Parser>
             ? CanonicalValue(std::string(
                   core::to_string(*mode.grant_policy.approval_mode)))
             : CanonicalValue(nullptr);
-    modes.emplace_back(
-        mode.mode_id,
-        CanonicalValue(CanonicalValue::Object{
-            {"catalog",
-             CanonicalValue(CanonicalValue::Object{
-                 {"nodes", encode_string_array(mode.catalog.node_ids)},
-                 {"skills", encode_string_array(mode.catalog.skill_ids)},
-                 {"tools", encode_string_array(mode.catalog.tool_ids)},
-             })},
-            {"description", CanonicalValue(mode.description)},
-            {"enabled", CanonicalValue(mode.enabled)},
-            {"grant_policy",
-             CanonicalValue(CanonicalValue::Object{
-                 {"approval_mode", approval_mode},
-                 {"review_policy",
-                  CanonicalValue(std::string(
-                      core::to_string(mode.grant_policy.review_policy)))},
-                 {"session_kind", session_kind},
-             })},
-            {"model_endpoint_alias",
-             CanonicalValue(mode.model_endpoint_alias)},
-            {"provider_alias", CanonicalValue(mode.provider_alias)},
-        }));
+    CanonicalValue::Object mode_source{
+        {"assistant_component_id", CanonicalValue(mode.assistant_component_id)},
+        {"catalog",
+         CanonicalValue(CanonicalValue::Object{
+             {"skills", encode_string_array(mode.catalog.skill_ids)},
+             {"tools", encode_string_array(mode.catalog.tool_ids)},
+         })},
+        {"description", CanonicalValue(mode.description)},
+        {"enabled", CanonicalValue(mode.enabled)},
+        {"grant_policy",
+         CanonicalValue(CanonicalValue::Object{
+             {"approval_mode", approval_mode},
+             {"review_policy",
+              CanonicalValue(std::string(
+                  core::to_string(mode.grant_policy.review_policy)))},
+             {"session_kind", session_kind},
+         })},
+        {"model_endpoint_alias",
+         CanonicalValue(mode.model_endpoint_alias)},
+        {"runs_in", encode_runs_in(mode.runs_in)},
+        {"stuck_loop_recovery", CanonicalValue(mode.stuck_loop_recovery)},
+    };
+    if (mode.compact_history) {
+      // Present only when on, so existing settings keep their encoding.
+      mode_source.emplace(mode_source.begin() + 2, "compact_history",
+                          CanonicalValue(true));
+    }
+    if (mode.constrained_regeneration) {
+      // Sorted after compact_history; present only when on.
+      mode_source.emplace(
+          mode_source.begin() + (mode.compact_history ? 3 : 2),
+          "constrained_regeneration", CanonicalValue(true));
+    }
+    modes.emplace_back(mode.mode_id, CanonicalValue(std::move(mode_source)));
   }
 
   return CanonicalValue(CanonicalValue::Object{
@@ -1129,7 +1085,6 @@ template <typename DTO, typename Parser>
       {"model_endpoint_aliases", CanonicalValue(std::move(model_aliases))},
       {"modes", CanonicalValue(std::move(modes))},
       {"prompt_templates", CanonicalValue(std::move(prompt_templates))},
-      {"provider_aliases", CanonicalValue(std::move(provider_aliases))},
   });
 }
 
@@ -1166,16 +1121,6 @@ template <typename DTO, typename Parser>
          encode_model_request_contract(alias.request_contract)},
     });
   }
-  CanonicalValue::Array provider_aliases;
-  for (const auto& alias : settings.provider_aliases) {
-    provider_aliases.emplace_back(CanonicalValue::Object{
-        {"bridge_external_resource_alias",
-         CanonicalValue(alias.bridge_external_resource_alias.value())},
-        {"provider_alias", CanonicalValue(alias.provider_alias)},
-        {"provider_kind",
-         CanonicalValue(std::string(core::to_string(alias.provider_kind)))},
-    });
-  }
   CanonicalValue::Array modes;
   for (const auto& mode : settings.modes) {
     const CanonicalValue session_kind =
@@ -1188,10 +1133,10 @@ template <typename DTO, typename Parser>
             ? CanonicalValue(std::string(
                   core::to_string(*mode.grant_policy.approval_mode)))
             : CanonicalValue(nullptr);
-    modes.emplace_back(CanonicalValue::Object{
+    CanonicalValue::Object retained_mode{
+        {"assistant_component_id", CanonicalValue(mode.assistant_component_id)},
         {"catalog",
          CanonicalValue(CanonicalValue::Object{
-             {"nodes", encode_string_array(mode.catalog.node_ids)},
              {"skills", encode_string_array(mode.catalog.skill_ids)},
              {"tools", encode_string_array(mode.catalog.tool_ids)},
          })},
@@ -1207,8 +1152,19 @@ template <typename DTO, typename Parser>
          })},
         {"mode_id", CanonicalValue(mode.mode_id)},
         {"model_endpoint_alias", CanonicalValue(mode.model_endpoint_alias)},
-        {"provider_alias", CanonicalValue(mode.provider_alias)},
-    });
+        {"runs_in", encode_runs_in(mode.runs_in)},
+        {"stuck_loop_recovery", CanonicalValue(mode.stuck_loop_recovery)},
+    };
+    if (mode.compact_history) {
+      retained_mode.emplace(retained_mode.begin() + 2, "compact_history",
+                            CanonicalValue(true));
+    }
+    if (mode.constrained_regeneration) {
+      retained_mode.emplace(
+          retained_mode.begin() + (mode.compact_history ? 3 : 2),
+          "constrained_regeneration", CanonicalValue(true));
+    }
+    modes.emplace_back(std::move(retained_mode));
   }
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
@@ -1219,7 +1175,6 @@ template <typename DTO, typename Parser>
       {"modes", CanonicalValue(std::move(modes))},
       {"prompt_templates", CanonicalValue(std::move(prompt_templates))},
       {"projection_digest", CanonicalValue(std::string(projection_digest))},
-      {"provider_aliases", CanonicalValue(std::move(provider_aliases))},
   });
 }
 
@@ -1248,11 +1203,6 @@ void require_disjoint_registry(
       fail("$.assistant.instruments", "instrument namespaces overlap");
     }
   }
-  for (const auto& node : registry.nodes) {
-    if (!ids.insert(node.node_id).second) {
-      fail("$.assistant.instruments", "instrument namespaces overlap");
-    }
-  }
 }
 
 void require_mode_semantics(
@@ -1268,11 +1218,6 @@ void require_mode_semantics(
     return find_by_key(
         registry.skills, skill_id,
         [](const auto& skill) -> const std::string& { return skill.skill_id; });
-  };
-  const auto find_node = [&registry](std::string_view node_id) {
-    return find_by_key(
-        registry.nodes, node_id,
-        [](const auto& node) -> const std::string& { return node.node_id; });
   };
 
   std::vector<core::AssistantToolEffect> effects;
@@ -1297,12 +1242,6 @@ void require_mode_semantics(
              "skill '" + skill_id + "' requires absent tool '" +
                  required_tool + "'");
       }
-    }
-  }
-  for (const auto& node_id : mode.catalog.node_ids) {
-    if (find_node(node_id) == nullptr) {
-      fail(child_path(path, "catalog.nodes"),
-           "unresolved node ID '" + node_id + "'");
     }
   }
 
@@ -1395,7 +1334,7 @@ void require_mode_semantics(
   require_exact_fields(
       root,
       {"api_version", "projection_digest", "audit_policy", "model_endpoint_aliases",
-       "provider_aliases", "modes", "prompt_templates", "instruments"},
+       "modes", "prompt_templates", "instruments"},
       "$.assistant");
   const std::string& api_version =
       require_string(require_member(root, "api_version", "$.assistant"), "$.assistant.api_version");
@@ -1479,40 +1418,17 @@ void require_mode_semantics(
         }));
   }
 
-  CanonicalValue::Object provider_alias_map;
-  const auto& provider_aliases = require_array(
-      require_member(root, "provider_aliases", "$.assistant"),
-      "$.assistant.provider_aliases");
-  for (std::size_t index = 0; index < provider_aliases.size(); ++index) {
-    const std::string path = index_path("$.assistant.provider_aliases", index);
-    const auto& object = require_object(provider_aliases[index], path);
-    require_exact_fields(object,
-                         {"provider_alias", "provider_kind",
-                          "bridge_external_resource_alias"},
-                         path);
-    const std::string alias = parse_portable_token(
-        require_member(object, "provider_alias", path),
-        child_path(path, "provider_alias"));
-    provider_alias_map.emplace_back(
-        alias,
-        CanonicalValue(CanonicalValue::Object{
-            {"bridge_external_resource_alias",
-             require_member(object, "bridge_external_resource_alias", path)},
-            {"provider_kind", require_member(object, "provider_kind", path)},
-        }));
-  }
-
   CanonicalValue::Object mode_map;
   const auto& modes = require_array(require_member(root, "modes", "$.assistant"),
                                     "$.assistant.modes");
   for (std::size_t index = 0; index < modes.size(); ++index) {
     const std::string path = index_path("$.assistant.modes", index);
     const auto& object = require_object(modes[index], path);
-    require_exact_fields(object,
-                         {"mode_id", "enabled", "description",
-                          "provider_alias", "model_endpoint_alias",
-                          "grant_policy", "catalog"},
-                         path);
+    require_fields(object,
+                   {"mode_id", "enabled", "description", "assistant_component_id",
+                    "model_endpoint_alias", "runs_in", "grant_policy", "catalog",
+                    "stuck_loop_recovery"},
+                   {"compact_history", "constrained_regeneration"}, path);
     const std::string mode_id = parse_portable_token(
         require_member(object, "mode_id", path), child_path(path, "mode_id"));
     CanonicalValue::Object source_mode;
@@ -1529,7 +1445,6 @@ void require_mode_semantics(
       {"model_endpoint_aliases", CanonicalValue(std::move(model_alias_map))},
       {"modes", CanonicalValue(std::move(mode_map))},
       {"prompt_templates", CanonicalValue(std::move(prompt_template_map))},
-      {"provider_aliases", CanonicalValue(std::move(provider_alias_map))},
   });
 }
 
@@ -1627,7 +1542,7 @@ TypedAssistantSettingsCandidate decode_assistant_settings_candidate(
   }
   require_exact_fields(
       object,
-      {"audit_policy", "prompt_templates", "model_endpoint_aliases", "provider_aliases", "modes"},
+      {"audit_policy", "prompt_templates", "model_endpoint_aliases", "modes"},
       "$.assistant");
 
   core::AssistantSettingsDTO value{
@@ -1639,17 +1554,13 @@ TypedAssistantSettingsCandidate decode_assistant_settings_candidate(
       parse_alias_map<core::AssistantModelEndpointAliasDTO>(
           require_member(object, "model_endpoint_aliases", "$.assistant"),
           "$.assistant.model_endpoint_aliases", parse_model_alias),
-      parse_alias_map<core::AssistantProviderAliasDTO>(
-          require_member(object, "provider_aliases", "$.assistant"),
-          "$.assistant.provider_aliases", parse_provider_alias),
       parse_alias_map<core::AssistantModeDTO>(
           require_member(object, "modes", "$.assistant"),
           "$.assistant.modes", parse_mode),
   };
   if (value.modes.empty()) {
     if (value.prompt_templates.empty() &&
-        value.model_endpoint_aliases.empty() &&
-        value.provider_aliases.empty()) {
+        value.model_endpoint_aliases.empty()) {
       fail("$.assistant",
            "a non-empty assistant block must configure an interactive mode "
            "or a bounded model-query endpoint and prompt; use the exact "
@@ -1660,11 +1571,6 @@ TypedAssistantSettingsCandidate decode_assistant_settings_candidate(
       fail("$.assistant",
            "model-query-only assistant settings require at least one prompt "
            "template and model endpoint alias");
-    }
-    if (!value.provider_aliases.empty()) {
-      fail("$.assistant.provider_aliases",
-           "provider aliases require at least one interactive assistant "
-           "mode");
     }
   }
   return TypedAssistantSettingsCandidate(
@@ -1688,14 +1594,6 @@ QualifiedAssistantSettings qualify_assistant_settings(
   // Model aliases are served by the Deployment's AI model component; they
   // resolve to no external resource.
   for (const auto& mode : candidate.value().modes) {
-    if (find_by_key(
-            candidate.value().provider_aliases, mode.provider_alias,
-            [](const auto& alias) -> const std::string& {
-              return alias.provider_alias;
-            }) == nullptr) {
-      fail("$.assistant.modes." + mode.mode_id + ".provider_alias",
-           "provider alias does not resolve");
-    }
     if (find_by_key(
             candidate.value().model_endpoint_aliases,
             mode.model_endpoint_alias,

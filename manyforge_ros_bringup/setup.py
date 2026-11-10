@@ -31,6 +31,7 @@ setup(
             "isaac_demo_supervisor = manyforge_ros_bringup.isaac_demo_supervisor:main",
             "pose_source_snapshot_publisher = manyforge_ros_bringup.pose_source_snapshot_publisher:main",
             "ai_model_probe = manyforge_ros_bringup.ai_model_probe:main",
+            "assistant_host = manyforge_ros_bringup.assistant_host:main",
             "sim_plc = manyforge_ros_bringup.sim_plc:main",
         ],
     },

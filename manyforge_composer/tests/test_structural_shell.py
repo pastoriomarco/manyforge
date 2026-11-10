@@ -39,6 +39,7 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     assert health.json()["status"] == "degraded"
     assert health.json()["mode"] == "structural_only"
     assert health.json()["components"]["runtime"] == "unavailable"
+    assert "assistant_bridge" not in health.json()["components"]
     assert health.json()["runtimeAvailability"]["code"] == (
         "composable_cell_runtime_unavailable"
     )
@@ -54,7 +55,7 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     catalog = client.get("/api/catalog")
     assert catalog.status_code == 200
     payload = catalog.json()
-    assert len(payload["entries"]) == 52  # rules.set_active, io.clear_outside_change
+    assert len(payload["entries"]) == 51  # rules.set_active, io.clear_outside_change
     assert payload["apiVersion"] == "manyforge.node_catalog.v3"
     assert payload["contentVersion"] == NodeCatalog(BUILTIN_CATALOG_PATH).content_version
     assert payload["catalogId"] == "manyforge_builtin"
@@ -93,7 +94,7 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     assert environment.status_code == 200
     environment_payload = environment.json()
     assert environment_payload["catalog"]["catalogDigest"] == payload["catalogDigest"]
-    assert len(environment_payload["executableRegistry"]) == 52
+    assert len(environment_payload["executableRegistry"]) == 51
 
 
 def test_removed_runtime_routes_fail_with_one_typed_unavailable_reason() -> None:

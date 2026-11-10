@@ -2817,27 +2817,6 @@ describe('Program workspace parsers', () => {
         message: 'No component offers assistant.model.invoke',
         details: { capability: 'assistant.model.invoke' },
       }]);
-    const modelPayload = {
-      ...capabilityPayload,
-      availability: {
-        ...capabilityPayload.availability,
-        implementations: capabilityPayload.availability.implementations.map((row) => ({
-          ...row,
-          reason_codes: ['model_not_configured'],
-          reasons: [{
-            code: 'model_not_configured',
-            message: 'No model is configured',
-            details: {},
-          }],
-        })),
-      },
-    };
-    expect(parseNodeEnvironmentResponse(modelPayload).implementations[0]?.reasons)
-      .toEqual([{
-        code: 'model_not_configured',
-        message: 'No model is configured',
-        details: {},
-      }]);
     const malformedCapability = {
       ...capabilityPayload,
       availability: {

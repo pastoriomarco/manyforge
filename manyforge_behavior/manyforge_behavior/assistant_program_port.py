@@ -50,7 +50,7 @@ from manyforge_behavior.orchestration_ports import (
 from manyforge_behavior.json_scalars import nonnegative_int64_value
 
 
-_RETAINED_ASSISTANT_API: Final = "manyforge.retained_assistant.v1"
+_RETAINED_ASSISTANT_API: Final = "manyforge.retained_assistant.v3"
 _SCENE_SOURCE_API: Final = "manyforge.logical_scene_source.v1"
 _SCENE_POSE_QUERY_API: Final = "manyforge.scene_resource_pose_query.v1"
 _SCENE_POSE_RESPONSE_API: Final = "manyforge.scene_resource_pose_response.v1"
@@ -577,7 +577,6 @@ def _parse_assistant(value: Mapping[str, Any]) -> _AssistantContract:
             "projection_digest",
             "audit_policy",
             "model_endpoint_aliases",
-            "provider_aliases",
             "modes",
             "prompt_templates",
             "instruments",
@@ -634,6 +633,10 @@ def _parse_assistant(value: Mapping[str, Any]) -> _AssistantContract:
         _text(row["external_resource_alias"], field="external_resource_alias")
         _text(row["model_id"], field="model_id", maximum_bytes=4_096)
         contract = dict(_mapping(row["request_contract"], field="request_contract"))
+        # EXPERIMENTAL `reasoning: on|off` and `sampling` apply to the
+        # bridge's chat only.
+        contract.pop("reasoning", None)
+        contract.pop("sampling", None)
         _exact(
             contract,
             {

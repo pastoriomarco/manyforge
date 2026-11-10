@@ -82,8 +82,8 @@ joint commands on ROS topics.
 
 | Model | Row |
 | --- | --- |
-| Lite 6 | `vendor: xarm`, `vendor_model: lite6`, `controller: lite6_traj_controller`, `arrival_tolerance_rad: 0.05`, `goal_time_s: 1.0`, `hard_stop_completion_timeout_s: 1.5` |
-| UR10e | `controller: isaac_arm_controller`, `arrival_tolerance_rad: 0.1`, `goal_time_s: 1.0`, `hard_stop_completion_timeout_s: 0.5` |
+| Lite 6 | `vendor: xarm`, `vendor_model: lite6`, `controller: lite6_traj_controller`, `arrival_tolerance_rad: 0.05`, `runtime_scale: supported`, `goal_time_s: 1.0`, `hard_stop_completion_timeout_s: 1.5` |
+| UR10e | `controller: isaac_arm_controller`, `arrival_tolerance_rad: 0.1`, `runtime_scale: supported`, `goal_time_s: 1.0`, `hard_stop_completion_timeout_s: 0.5` |
 | Lite gripper | `gripper_transport: isaac_joint_state_effort`: effort on `/isaac_joint_commands_gripper`, dwell completion, no bridge |
 | Robotiq 2F-140 | `gripper_transport: ros_gripper_command`, bridge `gripper_bridges/robotiq_2f_140.yaml` |
 | Isaac Sim | `adapter: simulation_interfaces` with the standard service names at the root, a 10 s response timeout and a 1 s state poll |
@@ -97,13 +97,15 @@ before v2.
    topics (`manyforge_settings.yaml`).
 2. Add a `lanes.isaac` row to the model's `component.yaml`:
    - a robot needs `adapter: isaac`, `controller`, `arrival_tolerance_rad`,
+     `runtime_scale: supported` (the lane's arm controller claims position only),
      `goal_time_s` and `hard_stop_completion_timeout_s`; a vendor's model also
      `vendor` and the vendor's keys (xArm: `vendor_model`), and its
      `controller` is the vendor's;
    - a tool needs `adapter: isaac`, `controller` (its ParallelGripperCommand action is
      `<controller>/gripper_cmd`), `gripper_transport`, `command_topic`,
-     `state_topic`, `completion_policy`, the open/closed positions and efforts,
-     `publish_nominal_position` and `gripper_result_timeout_s`;
+     `state_topic`, `completion_policy`, the open/closed positions and efforts
+     and `publish_nominal_position` (the command's completion deadline is the
+     node's `completion_timeout_s`);
    - a tool with the `ros_gripper_command` transport also needs
      `gripper_bridge`, a file in `gripper_bridges/`, and
      `gripper_stop_finish_tolerance` (a Stop that finds the fingers this close

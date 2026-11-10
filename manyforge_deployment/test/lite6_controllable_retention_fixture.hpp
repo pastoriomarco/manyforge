@@ -492,9 +492,9 @@ assistant_source(const bool composer_draft_enabled = false) {
   CanonicalValue::Object modes{
       {"query",
        CanonicalValue(CanonicalValue::Object{
+           {"assistant_component_id", CanonicalValue("assistant")},
            {"catalog",
             CanonicalValue(CanonicalValue::Object{
-                {"nodes", CanonicalValue(CanonicalValue::Array{})},
                 {"skills", CanonicalValue(CanonicalValue::Array{})},
                 {"tools", text_array({"inspect_isaac_scene", "scene_inspect",
                                       "status_read"})},
@@ -508,15 +508,15 @@ assistant_source(const bool composer_draft_enabled = false) {
                 {"session_kind", CanonicalValue(nullptr)},
             })},
            {"model_endpoint_alias", CanonicalValue("primary_model")},
-           {"provider_alias", CanonicalValue("direct_local")},
+           {"runs_in", text_array({"no_program_active"})},
        })},
   };
   if (composer_draft_enabled) {
     modes.emplace_back(
         "composer-assistant",
         CanonicalValue(CanonicalValue::Object{
+            {"assistant_component_id", CanonicalValue("assistant")},
             {"catalog", CanonicalValue(CanonicalValue::Object{
-                            {"nodes", CanonicalValue(CanonicalValue::Array{})},
                             {"skills", CanonicalValue(CanonicalValue::Array{})},
                             {"tools", text_array({"program_read",
                                                   "scene_draft_add_object"})},
@@ -529,7 +529,7 @@ assistant_source(const bool composer_draft_enabled = false) {
                                  {"session_kind", CanonicalValue(nullptr)},
                              })},
             {"model_endpoint_alias", CanonicalValue("primary_model")},
-            {"provider_alias", CanonicalValue("direct_local")},
+            {"runs_in", text_array({"no_program_active"})},
         }));
   }
   return CanonicalValue(CanonicalValue::Object{
@@ -558,14 +558,6 @@ assistant_source(const bool composer_draft_enabled = false) {
             })},
        })},
       {"modes", CanonicalValue(std::move(modes))},
-      {"provider_aliases",
-       CanonicalValue(CanonicalValue::Object{
-           {"direct_local", CanonicalValue(CanonicalValue::Object{
-                                {"bridge_external_resource_alias",
-                                 CanonicalValue("assistant_bridge")},
-                                {"provider_kind", CanonicalValue("direct")},
-                            })},
-       })},
       {"prompt_templates", CanonicalValue(CanonicalValue::Object{})},
   });
 }
@@ -2365,7 +2357,7 @@ assistant_source(const bool composer_draft_enabled = false) {
               if (key == "lane_row")
                 setting = CanonicalValue(
                     R"({"adapter":"mock","arrival_tolerance_rad":0.01,"controller":"lite6_traj_controller",)"
-                    R"("gripper_result_timeout_s":5,"hard_stop_completion_timeout_s":1.5,)"
+                    R"("hard_stop_completion_timeout_s":1.5,"runtime_scale":"supported",)"
                     R"("vendor":"xarm","vendor_model":"lite6"})");
               if (key == "model_family_id") setting = CanonicalValue("lite6");
             }

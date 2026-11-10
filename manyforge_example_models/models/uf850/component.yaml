@@ -37,14 +37,14 @@ lanes:
     vendor_model: uf850             # xarm_controller/config/uf850_controllers.yaml
     controller: uf850_traj_controller
     arrival_tolerance_rad: 0.01     # every arm joint's JTC goal
+    runtime_scale: supported        # the arm's controller accepts runtime speed scaling
     hard_stop_completion_timeout_s: 1.5
-    gripper_result_timeout_s: 5.0
   real:                           # xArm adapter (manyforge_xarm_control/vendor/README.md)
     adapter: xarm
     controller: uf850_traj_controller
     arrival_tolerance_rad: 0.01     # every arm joint's JTC goal
+    runtime_scale: supported        # the arm's controller accepts runtime speed scaling
     hard_stop_completion_timeout_s: 1.5
-    gripper_result_timeout_s: 5.0
     vendor_model: uf850             # xarm_controller/config/uf850_controllers.yaml
     robot_type: uf850
     dof: 6

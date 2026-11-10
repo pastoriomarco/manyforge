@@ -103,8 +103,8 @@ retained_ros2_control_armless_machines(
     const std::vector<std::string> &transport_joints,
     const ControllerLaneRates &rates, double stop_completion_timeout_s,
     core::Duration controller_state_max_age_ns,
-    // Whether the lane's controller accepts runtime speed scaling
-    // (`jtc_accepts_speed_scaling` of its claimed command interfaces).
+    // Whether the lane's controller accepts runtime speed scaling: the lane
+    // row's declared `runtime_scale`, which its written launch matches.
     bool supports_scale);
 
 /// Read only the strict authored row for this exact selected component/target.
@@ -121,8 +121,7 @@ void configure_retained_gripper_output_mode(
     const core::RuntimeParticipantBinding& binding);
 
 /// Populate the existing stock Mock ParallelGripperCommand transport from the exact
-/// binding, the tool's lane row (`gripper_result_timeout_s`,
-/// `gripper_stop_finish_tolerance`) and its written
+/// binding, the tool's lane row (`gripper_stop_finish_tolerance`) and its written
 /// controllers. No motion participant is constructed.
 /// The arm builder and the no-motion owner share these unchanged lane values.
 void configure_retained_mock_gripper_action(
@@ -134,7 +133,7 @@ void configure_retained_mock_gripper_action(
     const std::string& controller_manager);
 
 /// The ROS execution configuration of a Mock component from its model lane
-/// row (`hard_stop_completion_timeout_s`, `gripper_result_timeout_s`) and its
+/// row (`hard_stop_completion_timeout_s`) and its
 /// written launch artifacts (controller names, cadence, reset writer). Lane facts: Isaac's (lead-in `stop_traj_delta_s` 0.1 s,
 /// Stop sample period 0.01 s, tracking
 /// tolerance 0.05 rad with timeout 0), hard-stop completion and gripper

@@ -353,8 +353,17 @@ CanonicalValue prepared_selector_facts(const PreparedActivationMaterialization& 
     bodies.emplace_back(V::Object{{"reference", body_value(ref)}, {"ambiguous", V(ambiguous)},
                                   {"moving_targets", targets_value(moving)}});
   }
+  // Deployment interrupt rules as retained (normalized, sorted by rule_id).
+  V::Array rules;
+  if (const auto* configuration = bundle.normalized_root().find_object_member("interrupt_policy_configuration"))
+    for (const auto& rule : configuration->find_object_member("interrupt_rules")->as_array()) {
+      V::Object row;
+      for (const char* key : {"rule_id", "scope", "on_trip", "active_at_start", "condition"})
+        row.emplace_back(key, *rule.find_object_member(key));
+      rules.emplace_back(std::move(row));
+    }
   return V(V::Object{{"components", V(std::move(components))}, {"targets", V(std::move(targets))},
                      {"signals", V(std::move(signals))}, {"frames", V(std::move(frames))},
-                     {"bodies", V(std::move(bodies))}});
+                     {"bodies", V(std::move(bodies))}, {"rules", V(std::move(rules))}});
 }
 }  // namespace manyforge::deployment::detail

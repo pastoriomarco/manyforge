@@ -74,8 +74,9 @@ _MODEL_FREE_PROFILES = {
     "pose_source_v0": "pose_source",
     "ai_model_v0": "ai_model",
 }
-# A machine (owner) or a model-form I/O member model (the description's
-# `component_models`): its rows carry no model source and no runtime_kind.
+# A machine (owner), a model-form I/O member model or a lane-free adapter
+# component model (a sensor, the assistant) (the description's
+# `component_models`): its rows carry no model source.
 _COMPONENT_MODEL = object()
 
 
@@ -451,7 +452,8 @@ def _prepare_model_closure(
                 )
             seen_components.add(component_id)
             if profile is _COMPONENT_MODEL:
-                # A machine owner or a model-form I/O member: no model.
+                # A machine owner, a model-form I/O member, a sensor or the
+                # assistant: no model.
                 if "model_source" in component or source is not None:
                     raise HeadlessApiError(
                         "activation_model_profile_invalid",
@@ -532,12 +534,23 @@ class ActivationPreparer:
         self._publish_canonical_empty = publish_canonical_empty
         self._lock = threading.Lock()
         self._prepared: dict[str, dict[str, Any]] = {}
+        # Reference validation's prepared candidate, capacity one, keyed on the
+        # Deployment and model-source digests: a Draft edit changes only the
+        # Program, so the candidate is reused. Leaf lock: guards the slot only.
+        self._candidate_lock = threading.Lock()
+        self._candidate: tuple[tuple[str, str], Any] | None = None
 
     def validate_program_references(
-        self, *, deployment: Mapping[str, Any], model_source_closure: Mapping[str, Any],
+        self, *, deployment: Mapping[str, Any], model_source_closure: Mapping[str, Any] | None = None,
+        model_source_closure_digest: str | None = None,
         program: Mapping[str, Any], program_content_digest: str, draft: bool,
     ) -> dict[str, Any]:
-        """Build and validate one detached candidate without publication or admission."""
+        """Build and validate one detached candidate without publication or admission.
+
+        Exactly one of ``model_source_closure`` and ``model_source_closure_digest``
+        is given. A digest names the closure of the held candidate; a digest the
+        candidate slot does not hold is refused with ``model_sources_unknown``.
+        """
         try:
             require_program_format(program, supported_api_version="manyforge.program.v3")
         except ProgramFormatUnsupported as error:
@@ -545,7 +558,7 @@ class ActivationPreparer:
         try:
             program_bytes = rfc8785.dumps(dict(program))
             deployment_bytes = rfc8785.dumps(dict(deployment))
-            source_bytes = rfc8785.dumps(dict(model_source_closure))
+            source_bytes = b"" if model_source_closure is None else rfc8785.dumps(dict(model_source_closure))
         except (TypeError, ValueError) as error:
             raise HeadlessApiError("activation_preparation_failed", "Candidate input is invalid") from error
         if (len(program_bytes) + len(deployment_bytes) + len(source_bytes)
@@ -556,23 +569,33 @@ class ActivationPreparer:
         # Apply admits a strict Program after canonical transport. Draft forest
         # preflight instead uses its existing incomplete-authoring input form.
         _validate_raw_reference_program(program if draft else json.loads(program_bytes), draft)
-        prepared = _prepare_model_closure(
-            deployment=deployment, model_source_closure=model_source_closure,
-            profiles=self._profiles,
-        )
-        prepared_bytes = rfc8785.dumps(prepared)
-        if (len(program_bytes) + len(deployment_bytes) + len(source_bytes) + len(prepared_bytes)
-                > MAX_ACTIVATION_PREPARATION_REQUEST_BYTES):
-            raise HeadlessApiError("activation_preparation_request_oversized", "Candidate input exceeds its bound")
         try:
             import manyforge_core_py  # type: ignore[import-not-found]
         except ImportError as error:
             raise HeadlessApiError("activation_preparer_unavailable", "Reference validation is unavailable") from error
+        source_digest = (model_source_closure_digest if model_source_closure is None
+                         else "sha256:" + hashlib.sha256(source_bytes).hexdigest())
+        key = ("sha256:" + hashlib.sha256(deployment_bytes).hexdigest(), source_digest)
+        with self._candidate_lock:
+            candidate = self._candidate[1] if self._candidate and self._candidate[0] == key else None
+        if candidate is None and model_source_closure is None:
+            raise HeadlessApiError("model_sources_unknown", "The model-source closure digest names no prepared candidate")
         try:
-            candidate = manyforge_core_py.prepare_activation_candidate(
-                str(self._capability_root), deployment_bytes.decode(), source_bytes.decode(),
-                prepared_bytes.decode(), self._runtime_cell_id,
-            )
+            if candidate is None:
+                prepared = _prepare_model_closure(
+                    deployment=deployment, model_source_closure=model_source_closure,
+                    profiles=self._profiles,
+                )
+                prepared_bytes = rfc8785.dumps(prepared)
+                if (len(program_bytes) + len(deployment_bytes) + len(source_bytes) + len(prepared_bytes)
+                        > MAX_ACTIVATION_PREPARATION_REQUEST_BYTES):
+                    raise HeadlessApiError("activation_preparation_request_oversized", "Candidate input exceeds its bound")
+                candidate = manyforge_core_py.prepare_activation_candidate(
+                    str(self._capability_root), deployment_bytes.decode(), source_bytes.decode(),
+                    prepared_bytes.decode(), self._runtime_cell_id,
+                )
+                with self._candidate_lock:
+                    self._candidate = (key, candidate)
             encoded = candidate.validate_program_references(program_bytes.decode(), draft)
             selector_encoded = candidate.selector_facts_json()
         except manyforge_core_py.PreparedActivationCandidateError as error:
@@ -596,7 +619,7 @@ class ActivationPreparer:
             selector = json.loads(selector_encoded)
         except (TypeError, ValueError) as error:
             raise HeadlessApiError("activation_preparer_response_invalid", "Candidate selectors are invalid") from error
-        if not isinstance(selector, dict) or set(selector) != {"components", "targets", "signals", "frames", "bodies"} or any(not isinstance(value, list) for value in selector.values()):
+        if not isinstance(selector, dict) or set(selector) != {"components", "targets", "signals", "frames", "bodies", "rules"} or any(not isinstance(value, list) for value in selector.values()):
             raise HeadlessApiError("activation_preparer_response_invalid", "Candidate selectors are invalid")
         result["selector_facts"] = selector
         return result

@@ -57,6 +57,14 @@ describe('component model v2 wire parsing', () => {
     expect(() => parseComponentState({ ...robot, details: [{ name: 'Mode', value: 1 }] }, 'state')).toThrow();
   });
 
+  it('parses the optional endpoints', () => {
+    expect(parseComponentState(robot, 'state')).not.toHaveProperty('endpoints');
+    const endpoints = [{ role_id: 'assistant_request', url: 'http://127.0.0.1:41234' }];
+    expect(parseComponentState({ ...robot, endpoints }, 'state').endpoints).toEqual(endpoints);
+    expect(() => parseComponentState({ ...robot, endpoints: [{ role_id: 'assistant_request' }] }, 'state'))
+      .toThrow();
+  });
+
   it('parses latch, readiness, samples and Apply results', () => {
     expect(parseCellLatch({ latched: true, causes: [{ component_id: 'a', kind: 'offline' }] }).causes[0])
       .toEqual({ component_id: 'a', kind: 'offline' });

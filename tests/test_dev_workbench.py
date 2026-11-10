@@ -23,6 +23,22 @@ dev_workbench = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(dev_workbench)
 
 
+def _built_native_fixture(
+    monkeypatch: Any, *, extension: Path, preparer: Path, runtime_targets: tuple[Path, ...] = ()
+) -> None:
+    """serve only checks the native artifacts; it never runs a build step."""
+
+    for build in ("_ensure_current_backend", "_ensure_current_ros_backend",
+                  "_ensure_activation_preparer", "_ensure_core_bindings"):
+        monkeypatch.setattr(dev_workbench, build,
+                            lambda *_a, _build=build, **_k: pytest.fail(f"serve ran {_build}"))
+    monkeypatch.setattr(dev_workbench, "_current_backend", lambda: extension)
+    monkeypatch.setattr(dev_workbench, "_ros_backend_environment", dict)
+    monkeypatch.setattr(dev_workbench, "_current_ros_backend", lambda _environment: runtime_targets)
+    monkeypatch.setattr(dev_workbench, "_current_activation_preparer", lambda: preparer)
+    monkeypatch.setattr(dev_workbench, "_current_core_bindings", lambda: extension)
+
+
 def test_ros_home_is_owned_shared_and_inherited_before_service_spawn(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -397,10 +413,9 @@ def test_no_project_ros_start_selects_repository_empty_with_original_identity(
         sources[name] = source
     monkeypatch.setattr(dev_workbench, "MANAGER_BINARY", sources["manyforge_manager_daemon"])
     monkeypatch.setattr(dev_workbench, "CANONICAL_EMPTY_GENERATOR", sources["generator"])
-    monkeypatch.setattr(dev_workbench, "_ensure_current_backend", lambda: sources["extension"])
-    monkeypatch.setattr(dev_workbench, "_ensure_current_ros_backend", lambda: (
-        sources["manyforge_roboplan_candidate_worker"], sources["manyforge_ros2_control_execution_host"]))
-    monkeypatch.setattr(dev_workbench, "_ensure_activation_preparer", lambda: sources["preparer"])
+    _built_native_fixture(monkeypatch, extension=sources["extension"], preparer=sources["preparer"],
+        runtime_targets=(sources["manyforge_roboplan_candidate_worker"],
+                         sources["manyforge_ros2_control_execution_host"]))
     monkeypatch.setattr(dev_workbench, "_ensure_frontend_dependencies", lambda: None)
     monkeypatch.setattr(dev_workbench, "_port_available", lambda _port: True)
     monkeypatch.setattr(dev_workbench, "_capture_ros_bootstrap_project",
@@ -511,10 +526,10 @@ def test_process_stack_stages_only_selected_host_without_starting_services(
 def test_invalid_ros_selection_is_refused_before_builds_or_runtime_start(
     monkeypatch: Any, project: str | None, bootstrap: str | None, ros: bool, error: str
 ) -> None:
-    def unexpected_build() -> None:
-        pytest.fail("invalid selection must fail before build")
+    def unexpected_check() -> None:
+        pytest.fail("invalid selection must fail before native artifact checks")
 
-    monkeypatch.setattr(dev_workbench, "_ensure_current_backend", unexpected_build)
+    monkeypatch.setattr(dev_workbench, "_current_backend", unexpected_check)
     if project == "non_ros_fixture":
         # Maintained examples now use ROS. Supply an explicitly non-ROS
         # Scenario through the actual capture seam to retain this guard case.
@@ -568,10 +583,12 @@ def test_ros_bootstrap_captures_io_provider_scenario() -> None:
         allowed_root=REPOSITORY_ROOT / "examples",
     )
     assert source.endswith("/examples/real_lite6_pneumatic_pick_and_place.scenario")
+    # Machine and member components carry no runtime kind.
     assert sorted(
         component["configuration"]["runtime_kind"]
         for component in captured["deployment"]["components"]
-    ) == ["io_provider", "io_provider", "ros2_control"]
+        if "runtime_kind" in component.get("configuration", {})
+    ) == ["io_provider", "ros2_control", "ros2_control"]
 
 
 def test_ros_bootstrap_captures_authored_program_and_uses_production_preparer(
@@ -585,12 +602,12 @@ def test_ros_bootstrap_captures_authored_program_and_uses_production_preparer(
         allowed_root=REPOSITORY_ROOT / "examples",
     )
     assert source.endswith("/examples/sim_ur10e_pick_and_place.scenario")
-    assert captured["program"]["api_version"] == "manyforge.program.v2"
+    assert captured["program"]["api_version"] == "manyforge.program.v3"
     assert captured["model_source_closure"]["components"]
     assert sorted(
         component["configuration"]["runtime_kind"]
         for component in captured["deployment"]["components"]
-    ) == ["pose_source", "ros2_control"]
+    ) == ["pose_source", "ros2_control", "ros2_control"]
     tool = tmp_path / "preparer"
     tool.write_bytes(b"current preparer")
     calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -641,9 +658,7 @@ def test_ros_source_change_during_frontend_preparation_never_starts_runtime(
     monkeypatch.setattr(dev_workbench, "MANAGER_BINARY", manager)
     monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path / "state")
     monkeypatch.setattr(dev_workbench, "_ensure_frontend_dependencies", frontend_preparation)
-    monkeypatch.setattr(dev_workbench, "_ensure_current_backend", lambda: tmp_path / "extension")
-    monkeypatch.setattr(dev_workbench, "_ensure_current_ros_backend", lambda: ())
-    monkeypatch.setattr(dev_workbench, "_ensure_activation_preparer", lambda: tmp_path / "preparer")
+    _built_native_fixture(monkeypatch, extension=tmp_path / "extension", preparer=tmp_path / "preparer")
     monkeypatch.setattr(dev_workbench, "_ensure_ros_bootstrap_package", lambda *_a, **_k: tmp_path)
     workbench = dev_workbench.Workbench(
         project_path=None, bootstrap_project_path="/project", ros2_control=True,
@@ -660,9 +675,11 @@ def test_runtime_capability_selection_keeps_one_build_closure(
     ros = (tmp_path / "worker", tmp_path / "ros")
     calls: list[str] = []
     monkeypatch.setattr(
-        dev_workbench, "_ensure_current_ros_backend",
-        lambda: calls.append("ros") or ros,
+        dev_workbench, "_current_ros_backend",
+        lambda _environment: calls.append("ros") or ros,
     )
+    monkeypatch.setattr(dev_workbench, "_ensure_current_ros_backend",
+                        lambda: pytest.fail("serve checks the ROS product; it never builds it"))
     workbench = dev_workbench.Workbench(
         project_path=None, headless_port=1, runner_port=2,
         composer_port=3, frontend_port=4,
@@ -881,10 +898,10 @@ def test_cleanup_uses_bounded_reverse_owner_order(monkeypatch: Any) -> None:
     assert observed == [
         "Vite HMR",
         "Composer backend",
+        "Headless API",
         "Manager",
         "Program runner fenced",
         "Program runner",
-        "Headless API",
     ]
 
 
@@ -946,7 +963,7 @@ def test_g_status_uses_fresh_manager_health_without_cccl_apply_permission(tmp_pa
     assert status["timing"]["build_elapsed_seconds"] == 999
 
 
-def test_g_package_mismatch_refuses_before_build_or_process_start(tmp_path, monkeypatch):
+def test_g_package_mismatch_refuses_before_artifact_checks_or_process_start(tmp_path, monkeypatch):
     from manyforge_operator.package_aggregate import package_aggregate_sha256
     install = tmp_path / "package"
     install.mkdir()
@@ -957,7 +974,7 @@ def test_g_package_mismatch_refuses_before_build_or_process_start(tmp_path, monk
         headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
         operator_install_root=install, operator_cell_id="fixture_cell",
         canonical_empty_admission_filename="empty.json", package_aggregate_digest=digest)
-    monkeypatch.setattr(dev_workbench, "_ensure_current_backend", lambda: pytest.fail("must not build changed package"))
+    monkeypatch.setattr(dev_workbench, "_current_backend", lambda: pytest.fail("must refuse changed package first"))
     with pytest.raises(dev_workbench.WorkbenchError, match="aggregate mismatch"):
         workbench.start()
     assert workbench.processes == []
@@ -979,15 +996,14 @@ def test_g_owner_start(tmp_path, monkeypatch):
     monkeypatch.setattr(dev_workbench.time, "time_ns", lambda: session_started_ns)
     monkeypatch.setenv("ROS_HOME", str(tmp_path / "foreign-home"))
     monkeypatch.setenv("ROS_LOG_DIR", str(tmp_path / "foreign-logs"))
-    def backend():
-        clock[0] += 120.0  # Arbitrary fixture duration, not a runtime claim.
-        return extension
+    # Recorded by the separate build step; arbitrary fixture duration.
+    native_timing = tmp_path / "native-build-timing.json"
+    native_timing.write_text('{"build_elapsed_seconds":120.0}')
+    monkeypatch.setattr(dev_workbench, "NATIVE_BUILD_TIMING", native_timing)
     monkeypatch.setattr(dev_workbench.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(dev_workbench, "MANAGER_BINARY", manager_binary)
     monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path / "state")
-    monkeypatch.setattr(dev_workbench, "_ensure_current_backend", backend)
-    monkeypatch.setattr(dev_workbench, "_ensure_current_ros_backend", lambda: ())
-    monkeypatch.setattr(dev_workbench, "_ensure_activation_preparer", lambda: tmp_path / "preparer")
+    _built_native_fixture(monkeypatch, extension=extension, preparer=tmp_path / "preparer")
     monkeypatch.setattr(dev_workbench, "_port_available", lambda port: port != 3000)
     monkeypatch.setattr(dev_workbench, "_ensure_frontend_dependencies", lambda: pytest.fail("G must not npm ci"))
     monkeypatch.setattr(dev_workbench, "_ensure_repository_bootstrap_package", lambda: pytest.fail("G must use its qualified package"))
@@ -999,7 +1015,6 @@ def test_g_owner_start(tmp_path, monkeypatch):
         composer_bind_host="0.0.0.0")
     monkeypatch.setattr(workbench, "_simulation_control_arguments", lambda: ())
     commands = []
-    bridge_environments: list[dict[str, str]] = []
     socket_owner = socket.socket(socket.AF_UNIX)
     manager_environments: list[dict[str, str] | None] = []
     def spawn(name, command, environment=None):
@@ -1016,14 +1031,7 @@ def test_g_owner_start(tmp_path, monkeypatch):
             socket_owner.bind(str(Path(command[index + 1]) / "manager-command.sock"))
     monkeypatch.setattr(workbench, "_spawn", spawn)
     def popen(command, **kwargs):
-        name = (
-            "Assistant bridge"
-            if "manyforge_assistant_bridge.bridge" in command
-            else "Composer backend"
-        )
-        commands.append((name, tuple(command)))
-        if name == "Assistant bridge":
-            bridge_environments.append(kwargs["env"])
+        commands.append(("Composer backend", tuple(command)))
         return SimpleNamespace(poll=lambda: None)
     monkeypatch.setattr(dev_workbench.subprocess, "Popen", popen)
     class Client:
@@ -1054,23 +1062,18 @@ def test_g_owner_start(tmp_path, monkeypatch):
     finally:
         socket_owner.close()
     assert [name for name, _ in commands] == [
-        "Program runner", "Headless API", "Manager", "Assistant bridge", "Composer backend",
+        "Program runner", "Headless API", "Manager", "Composer backend",
     ]
     composer_command = dict(commands)["Composer backend"]
-    assert composer_command[composer_command.index("--assistant-bridge-url") + 1] == (
-        "http://127.0.0.1:8100"
-    )
-    (bridge_environment,) = bridge_environments
-    assert bridge_environment["MANYFORGE_HEADLESS_API_URL"] == "http://127.0.0.1:9010"
-    assert bridge_environment["MANYFORGE_COMPOSER_URL"] == "http://127.0.0.1:9000"
-    # The execution host (and a point-cloud source's process) inherit it.
-    assert manager_environments == [{"MANYFORGE_COMPOSER_URL": "http://127.0.0.1:9000"}]
-    assert bridge_environment["MANYFORGE_ASSISTANT_BRIDGE_PORT"] == "8100"
-    assert bridge_environment["MANYFORGE_ASSISTANT_AUDIT_LOG"] == str(
-        tmp_path / "state/current/assistant-bridge/audit.jsonl"
-    )
-    assert not any(key.startswith("MANYFORGE_ASSISTANT_UPSTREAM") for key in bridge_environment)
-    assert workbench._readiness_deadline == 125.0  # Build duration is outside readiness budget.
+    assert "--assistant-bridge-url" not in composer_command
+    assert not any("manyforge_assistant_bridge" in part for _, command in commands for part in command)
+    # The execution host and its component processes (a point-cloud source,
+    # the assistant's host and bridge) inherit both.
+    assert manager_environments == [{
+        "MANYFORGE_COMPOSER_URL": "http://127.0.0.1:9000",
+        "MANYFORGE_HEADLESS_API_URL": "http://127.0.0.1:9010",
+    }]
+    assert workbench._readiness_deadline == 5.0  # Only readiness is bounded; serve never builds.
     timing = json.loads((tmp_path / "state/current/workbench-startup-timing.json").read_text())
     assert timing == {"build_elapsed_seconds": 120.0, "readiness_elapsed_seconds": 0.0}
     assert os.environ["ROS_LOG_DIR"] == str(tmp_path / "state/current/execution-run/ros" / f"1-{session_started_ns}")
@@ -1095,9 +1098,7 @@ def test_restored_terminal_cycle_starts_vite_without_reset_or_authoring_admissio
     extension.write_bytes(b"fixture extension")
     monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path / "state")
     monkeypatch.setattr(dev_workbench, "MANAGER_BINARY", manager_binary)
-    monkeypatch.setattr(dev_workbench, "_ensure_current_backend", lambda: extension)
-    monkeypatch.setattr(dev_workbench, "_ensure_current_ros_backend", lambda: ())
-    monkeypatch.setattr(dev_workbench, "_ensure_activation_preparer", lambda: tmp_path / "preparer")
+    _built_native_fixture(monkeypatch, extension=extension, preparer=tmp_path / "preparer")
     monkeypatch.setattr(dev_workbench, "_ensure_repository_bootstrap_package", lambda: tmp_path / "package")
     monkeypatch.setattr(dev_workbench, "_ensure_frontend_dependencies", lambda: None)
     monkeypatch.setattr(dev_workbench, "_port_available", lambda _port: True)
@@ -1112,11 +1113,7 @@ def test_restored_terminal_cycle_starts_vite_without_reset_or_authoring_admissio
         workbench.processes.append((name, SimpleNamespace(poll=lambda: None)))
     monkeypatch.setattr(workbench, "_spawn", spawn)
     def popen(command, **_kwargs):
-        spawned.append(
-            "Vite HMR" if command[0] == "node"
-            else "Assistant bridge" if "manyforge_assistant_bridge.bridge" in command
-            else "Composer backend"
-        )
+        spawned.append("Vite HMR" if command[0] == "node" else "Composer backend")
         return SimpleNamespace(poll=lambda: None)
     monkeypatch.setattr(dev_workbench.subprocess, "Popen", popen)
     cycle = {"state": "terminal_awaiting_reset"}
@@ -1162,7 +1159,7 @@ def test_restored_terminal_cycle_starts_vite_without_reset_or_authoring_admissio
     workbench.start()
 
     assert spawned == [
-        "Program runner", "Headless API", "Manager", "Assistant bridge", "Composer backend", "Vite HMR",
+        "Program runner", "Headless API", "Manager", "Composer backend", "Vite HMR",
     ]
     assert waits == ["Program Runner and Headless reconciliation services", "Manager command socket",
                      "contained Program-cycle startup reconciliation", "Composer backend", "Vite HMR"]
@@ -1268,3 +1265,85 @@ def test_ros_dependency_setup_failure_prevents_build_with_exact_path(
     with pytest.raises(dev_workbench.WorkbenchError) as raised:
         dev_workbench._ensure_current_ros_backend()
     assert selected in str(raised.value)
+
+
+def test_build_command_runs_the_native_steps_in_order_and_records_build_time(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    calls: list[str] = []
+    for build in ("_ensure_current_backend", "_ensure_current_ros_backend",
+                  "_ensure_activation_preparer", "_ensure_core_bindings"):
+        monkeypatch.setattr(dev_workbench, build, lambda _build=build: calls.append(_build))
+    monkeypatch.setattr(dev_workbench, "_run", lambda command: calls.append(tuple(command)))
+    clock = iter((10.0, 52.5))
+    monkeypatch.setattr(dev_workbench.time, "monotonic", lambda: next(clock))
+    timing = tmp_path / "native-build-timing.json"
+    monkeypatch.setattr(dev_workbench, "NATIVE_BUILD_TIMING", timing)
+
+    assert dev_workbench.main(["build"]) == 0
+
+    assert calls[:4] == ["_ensure_current_backend", "_ensure_current_ros_backend",
+                         "_ensure_activation_preparer", "_ensure_core_bindings"]
+    # Then the served Python packages are compiled by the services' interpreter.
+    compile_command = calls[4]
+    assert compile_command[:3] == (dev_workbench.sys.executable, "-m", "compileall")
+    assert str(dev_workbench.WORKSPACE / "manyforge_headless_api") in compile_command
+    assert json.loads(timing.read_text()) == {"build_elapsed_seconds": 42.5}
+    monkeypatch.setattr(dev_workbench, "NATIVE_BUILD_TIMING", tmp_path / "absent.json")
+    assert dev_workbench._native_build_elapsed() is None
+
+
+def test_build_command_failure_exits_unavailable(monkeypatch: Any, capsys: Any) -> None:
+    def failed_build() -> None:
+        raise dev_workbench.WorkbenchError("command failed with exit 1: cmake --build")
+
+    monkeypatch.setattr(dev_workbench, "_ensure_current_backend", failed_build)
+    assert dev_workbench.main(["build"]) == 69
+    assert "cmake --build" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("missing", [
+    "manager", "headless", "ros_worker", "ros_host", "ros_overlay",
+    "preparer", "generator", "core",
+])
+def test_serve_refuses_missing_native_artifacts_with_the_build_step(
+    tmp_path: Path, monkeypatch: Any, missing: str
+) -> None:
+    build = tmp_path / "build"
+    artifacts = {
+        "manager": (build / "headless/manyforge_manager_daemon", True),
+        "headless": (build / "headless/manyforge_headless_py.fixture.so", False),
+        "ros_worker": (build / "ros-integration/manyforge_roboplan_candidate_worker", True),
+        "ros_host": (build / "ros-integration/manyforge_ros2_control_execution_host", True),
+        "ros_overlay": (build / "isaac/ros-overlay/install/setup.bash", False),
+        "preparer": (build / "deployment-authoring/manyforge_prepare_activation", True),
+        "generator": (build / "deployment-authoring/manyforge_generate_canonical_empty_package", True),
+        "core": (build / "core-python/manyforge_core_py.fixture.so", False),
+    }
+    for name, (path, executable) in artifacts.items():
+        if name == missing:
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("true\n")
+        if executable:
+            path.chmod(0o755)
+    monkeypatch.setattr(dev_workbench.os, "environ", dict(os.environ))
+    monkeypatch.delenv("MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS", raising=False)
+    monkeypatch.setenv("MANYFORGE_DEV_BUILD_JOBS", "1")
+    monkeypatch.setattr(dev_workbench, "BUILD_ROOT", build)
+    monkeypatch.setattr(dev_workbench, "HEADLESS_BUILD", build / "headless")
+    monkeypatch.setattr(dev_workbench, "MANAGER_BINARY", artifacts["manager"][0])
+    monkeypatch.setattr(dev_workbench, "ACTIVATION_PREPARER", artifacts["preparer"][0])
+    monkeypatch.setattr(dev_workbench, "CANONICAL_EMPTY_GENERATOR", artifacts["generator"][0])
+    monkeypatch.setattr(dev_workbench, "CORE_PYTHON_BUILD", build / "core-python")
+    monkeypatch.setattr(dev_workbench, "NATIVE_BUILD_TIMING", build / "native-build-timing.json")
+    monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(dev_workbench, "_port_available", lambda _port: True)
+    monkeypatch.setattr(dev_workbench, "_run", lambda *_a, **_k: pytest.fail("serve must not build"))
+    workbench = dev_workbench.Workbench(
+        project_path=None, headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+    )
+    with pytest.raises(dev_workbench.NativeBuildMissingError,
+                       match="run the native build step first: python3 scripts/dev-workbench.py build"):
+        workbench.start()
+    assert workbench.processes == []

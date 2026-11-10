@@ -184,7 +184,6 @@ IsaacGripperFacts isaac_gripper_facts(const roboplan_backend::ModelLaneRow &row,
   facts.open_effort = number(row, "open_effort");
   facts.close_effort = number(row, "close_effort");
   facts.publish_nominal_position = boolean(row, "publish_nominal_position");
-  facts.result_timeout_s = positive(row, "gripper_result_timeout_s");
   const bool has_bridge = row.adapter_keys.contains("gripper_bridge");
   if (facts.transport_kind == kGripperCommandTransport) {
     if (!has_bridge) fail("a ros_gripper_command tool needs its gripper_bridge");

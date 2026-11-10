@@ -32,7 +32,6 @@ roboplan_backend::ModelLaneRow robotiq_row() {
                       {"open_effort", "0.0"},
                       {"close_effort", "40.0"},
                       {"publish_nominal_position", "false"},
-                      {"gripper_result_timeout_s", "15.0"},
                       {"gripper_stop_finish_tolerance", "0.035"},
                       {"gripper_bridge", "robotiq_2f_140.yaml"}};
   return row;
@@ -99,6 +98,17 @@ TEST(IsaacLaunchContribution, AnArmCarriesTheResetPositionWriter) {
                             "  interface_name: position\n"
                             "  acknowledged_on: joint_commands_topic\n"),
             std::string::npos);
+}
+
+// The Isaac arm controller claims position only, so its rows declare
+// `runtime_scale: supported` and the lane fact `supports_scale` (the declared
+// value, held to the written claim at launch) stays true.
+TEST(IsaacLaunchContribution, TheArmControllerAcceptsRuntimeScaling) {
+  roboplan_backend::ModelLaneRow row;
+  row.adapter = "isaac";
+  const auto contribution = isaac_launch_contribution(settings(), row, true);
+  EXPECT_TRUE(roboplan_backend::jtc_accepts_speed_scaling(
+      roboplan_backend::controller_command_interfaces(contribution.controllers_yaml)));
 }
 
 TEST(IsaacLaunchContribution, AVendorsModelRunsTheVendorsControllersOnTheTopicBasedHardware) {

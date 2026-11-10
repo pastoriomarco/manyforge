@@ -3,13 +3,31 @@ import type {
   JsonValue,
   ProgramTreeNode,
 } from '../types/api';
-import { catalogDefaultParameters, nextProgramInstanceId } from './programAuthoring';
+import {
+  catalogDefaultParameters,
+  nextProgramInstanceId,
+  PROGRAM_MOTION_FIELDS,
+} from './programAuthoring';
+import { NODE_OUTCOME_NAMESPACE } from './blackboardNamespaces';
 
 export interface ProgramPaletteActivation {
   catalogId: string;
 }
 
 export const PROGRAM_NODE_DRAG_MIME = 'application/manyforge-node';
+
+/**
+ * The catalog defaults a new node starts with, without the motion-default
+ * fields: those are left unset so the node inherits the Program parameters of
+ * the same name (or the catalog value when the Program declares none).
+ */
+export function programNewNodeParameters(entry: CatalogEntry): Record<string, JsonValue> {
+  const motionFields: readonly string[] = PROGRAM_MOTION_FIELDS;
+  return Object.fromEntries(
+    Object.entries(catalogDefaultParameters(entry))
+      .filter(([name]) => !motionFields.includes(name)),
+  );
+}
 
 export function programPaletteClickIntent(entry: CatalogEntry): ProgramPaletteActivation {
   return { catalogId: entry.id };
@@ -106,7 +124,7 @@ export function programInsertionMutation(
       node: {
         node_id: entry.id,
         instance_id: instanceId,
-        parameters: catalogDefaultParameters(entry),
+        parameters: programNewNodeParameters(entry),
         children: [],
       },
     },
@@ -127,19 +145,75 @@ export function programCopyInstanceId(
   return `${stem}_${suffix}`;
 }
 
-/** A deep copy of one subtree in which every node has a fresh instance id. */
+const NODE_OUTCOME_PREFIX = `${NODE_OUTCOME_NAMESPACE}.`;
+
+/**
+ * Remap the node outcome keys (`node_outcome.<instance_id>`, the only way a
+ * node refers to another node) of copied nodes: a literal key anywhere in the
+ * parameters, a value source reference, and `key.node_outcome.<id>` in an
+ * expression. Keys of nodes outside the copy are unchanged.
+ */
+function remapNodeOutcomeReferences<T>(value: T, renamed: ReadonlyMap<string, string>): T {
+  // Longest first, so `pick.approach` is matched before `pick`.
+  const ids = [...renamed.keys()].sort((left, right) => right.length - left.length);
+  const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const expressionKey = ids.length === 0 ? null : new RegExp(
+    `\\bkey\\.${escape(NODE_OUTCOME_PREFIX)}(${ids.map(escape).join('|')})(?![A-Za-z0-9_.-])`,
+    'g',
+  );
+  const remap = (current: unknown, inExpression: boolean): unknown => {
+    if (typeof current === 'string') {
+      if (current.startsWith(NODE_OUTCOME_PREFIX)) {
+        const target = renamed.get(current.slice(NODE_OUTCOME_PREFIX.length));
+        if (target !== undefined) return `${NODE_OUTCOME_PREFIX}${target}`;
+      }
+      return inExpression && expressionKey !== null
+        ? current.replace(expressionKey, (_match, id: string) => `key.${NODE_OUTCOME_PREFIX}${renamed.get(id)}`)
+        : current;
+    }
+    if (Array.isArray(current)) return current.map((item) => remap(item, inExpression));
+    if (current !== null && typeof current === 'object') {
+      const record = current as Record<string, unknown>;
+      const expression = record.kind === 'expression';
+      return Object.fromEntries(Object.entries(record).map(([name, item]) => [
+        name,
+        remap(item, inExpression || (expression && name === 'expression')),
+      ]));
+    }
+    return current;
+  };
+  return remap(value, false) as T;
+}
+
+/**
+ * An exact copy of one subtree except names: every node gets a fresh instance
+ * id, and references between nodes inside the copy (their node outcome keys)
+ * point at the copies. References to nodes outside the copy and blackboard
+ * keys are kept.
+ */
 export function programSubtreeCopy(
   node: ProgramTreeNode,
   existingInstanceIds: Iterable<string>,
 ): ProgramTreeNode {
   const taken = new Set(existingInstanceIds);
-  const copy = (source: ProgramTreeNode): ProgramTreeNode => {
+  const renamed = new Map<string, string>();
+  const rename = (source: ProgramTreeNode): ProgramTreeNode => {
     const { children, ...fields } = source;
     const instanceId = programCopyInstanceId(source.instance_id, taken);
     taken.add(instanceId);
-    return { ...structuredClone(fields), instance_id: instanceId, children: children.map(copy) };
+    renamed.set(source.instance_id, instanceId);
+    return { ...structuredClone(fields), instance_id: instanceId, children: children.map(rename) };
   };
-  return copy(node);
+  const copy = rename(node);
+  const remapNode = (current: ProgramTreeNode): ProgramTreeNode => {
+    const { instance_id: instanceId, children, ...fields } = current;
+    return {
+      ...remapNodeOutcomeReferences(fields, renamed),
+      instance_id: instanceId,
+      children: children.map(remapNode),
+    };
+  };
+  return remapNode(copy);
 }
 
 /** Insert one whole subtree (a duplicate or a pasted copy) in one edit. */
@@ -195,7 +269,7 @@ export function programChangeKindMutation(
   retainedParameterNames: Iterable<string>,
 ): ProgramDraftMutation {
   const retained = new Set(retainedParameterNames);
-  const defaults = catalogDefaultParameters(entry);
+  const defaults = programNewNodeParameters(entry);
   const parameters = Object.fromEntries(
     Object.entries(defaults).filter(([name]) => !retained.has(name)),
   );

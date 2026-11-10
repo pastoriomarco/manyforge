@@ -73,7 +73,7 @@ const targetFact = (componentId: string, commandTargetId: string): TargetFact =>
 const trialEFacts = (extra: SignalFact[] = [], extraTargets: TargetFact[] = []): ReferenceSelectorFacts => ({
   components: [{ component_id: 'lite6_robot' }, { component_id: 'station_io' }],
   targets: [targetFact('lite6_robot', 'arm'), targetFact('station_io', 'io'), ...extraTargets],
-  frames: [], bodies: [],
+  frames: [], bodies: [], rules: [],
   signals: [
     inputFact('station_io', 'curtain_blocked', 'io'),
     inputFact('station_io', 'edge_sensor', 'io'),

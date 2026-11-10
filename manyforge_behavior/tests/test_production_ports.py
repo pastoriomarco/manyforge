@@ -249,7 +249,6 @@ class _ControlTransport(_Transport):
             "runtime_scale_generation": 0,
             "participants": [{"command_target_id": "robot.arm"}],
         }
-        self.scale = {"generation": 0, "state": "pending"}
 
     def _control(self, kind, operation_id, body):
         response = super()._control(kind, operation_id, body)
@@ -278,7 +277,6 @@ class _ControlTransport(_Transport):
             "owner_epoch": "kernel.epoch.7",
             "target": target("robot.1", "arm.command"),
             "operation": deepcopy(self.operations["controlled"]),
-            "runtime_scale": deepcopy(self.scale),
         }
 
     def control_state(self):
@@ -301,16 +299,6 @@ class _ControlTransport(_Transport):
         self.controls[-1] = ("full_stop", "cell", deepcopy(body))
         return result
 
-    def set_operation_runtime_scale(self, body):
-        self.controls.append(("scale", "controlled", deepcopy(body)))
-        self.scale["generation"] = body["expected_runtime_scale_generation"] + 1
-        self.operations["controlled"]["runtime_scale_generation"] = self.scale["generation"]
-        return {
-            "ok": True,
-            "accepted": {"runtime_scale_generation": self.scale["generation"]},
-        }
-
-
 def _control_port():
     transport = _ControlTransport()
     owner = NativeKernelProgramPort(KernelClient(transport))
@@ -324,11 +312,7 @@ def _control_port():
                     *row["capability_bindings"],
                     *(
                         {"capability_id": cap, "command_schema": None}
-                        for cap in (
-                            "execution.reset",
-                            "execution.stop.soft",
-                            "execution.runtime_scale.operation_scoped",
-                        )
+                        for cap in ("execution.reset", "execution.stop.soft")
                     ),
                 ],
             }
@@ -607,24 +591,6 @@ def test_full_stop_never_needs_ordinary_read_or_fresh_owner(monkeypatch):
     assert len(transport.controls) == 1
     assert transport.controls[0][0] == "full_stop"
     assert transport.controls[0][2]["request_context"]["request_owner_epoch"] == "kernel.epoch.7"
-
-
-def test_operation_scale_node_waits_for_application_without_changing_scope_setting():
-    owner, transport = _control_port()
-    identity = NodeAttemptIdentity("program-run.1", "control", "attempt.scale")
-    task = owner.controls.start(
-        "kernel.set_runtime_scale",
-        identity,
-        OwnerNodeInputs({"target": target("robot.1", "arm.command"), "scale": 0.5}),
-    )
-    assert owner.controls.observe(task.task_id).state is OwnerTaskState.ACTIVE
-    transport.scale["state"] = "applied"
-    assert owner.controls.observe(task.task_id).state is OwnerTaskState.SUCCEEDED
-    assert [kind for kind, _, _ in transport.controls] == ["scale"]
-    request = transport.controls[0][2]
-    assert request["operation_id"] == "controlled"
-    assert request["expected_runtime_scale_generation"] == 0
-    assert "selector" not in request  # no persistent operator-setting mutation
 
 
 @pytest.mark.parametrize(
@@ -2454,6 +2420,21 @@ def test_named_gripper_alias_resolves_configured_reference_once_per_attempt(kind
     assert transport.submissions[1]["participants"][0]["payload"]["command_value"]["position"] == {
         "kind": kind, field: 0.5,
     }
+
+
+def test_named_gripper_alias_hands_effort_to_kernel_with_the_grippers_own_kind():
+    # OD-90: a linear gripper's preset resolves to linear_m; an angular effort
+    # then reaches the kernel's typed gripper_command_effort_unit_mismatch check.
+    transport = _preset_transport(kind="linear_m")
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_gripper_inputs().parameters)
+    parameters["position"] = {"kind": "named_preset", "name": "closed"}
+    parameters["max_effort"] = {"kind": "angular_newton_meter", "value_nm": 1.0}
+    port.operations.start("gripper.command_position", _identity(), OwnerNodeInputs(parameters=parameters))
+    value = transport.submissions[0]["participants"][0]["payload"]["command_value"]
+    assert value["position"] == {"kind": "linear_m", "value_m": 0.1}
+    assert value["max_effort"] == {"kind": "angular_newton_meter", "value_nm": 1.0}
 
 
 @pytest.mark.parametrize("case", [

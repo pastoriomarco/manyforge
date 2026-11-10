@@ -138,6 +138,45 @@ def test_program_refuses_nonsemantic_gripper_preset_name_before_runtime() -> Non
         Program.from_dict(_identified(source), _catalog())
 
 
+def _gripper_effort_program(position: dict[str, Any], effort: dict[str, Any]) -> Program:
+    source = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
+    source["tree"] = {
+        "node_id": "gripper.command_position", "instance_id": "effort-command",
+        "parameters": {
+            "target": target("lite_gripper", "gripper"), "position": position, "max_effort": effort,
+        }, "children": [],
+    }
+    return Program.from_dict(_identified(source), _catalog())
+
+
+@pytest.mark.parametrize("alias", ["open", "closed"])
+@pytest.mark.parametrize("effort", [
+    {"kind": "linear_newton", "value_n": 40.0},
+    {"kind": "angular_newton_meter", "value_nm": 1.0},
+])
+def test_named_gripper_preset_accepts_max_effort_of_either_kind(alias, effort) -> None:
+    # OD-90: the gripper's own coordinate kind decides at run time.
+    program = _gripper_effort_program({"kind": "named_preset", "name": alias}, effort)
+    assert program.to_dict()["tree"]["parameters"]["max_effort"] == effort
+
+
+@pytest.mark.parametrize("position,effort", [
+    ({"kind": "linear_m", "value_m": 0.01}, {"kind": "linear_newton", "value_n": 40.0}),
+    ({"kind": "angular_rad", "value_rad": 0.5}, {"kind": "angular_newton_meter", "value_nm": 1.0}),
+])
+def test_numeric_gripper_position_accepts_matching_effort_kind(position, effort) -> None:
+    _gripper_effort_program(position, effort)
+
+
+@pytest.mark.parametrize("position,effort", [
+    ({"kind": "linear_m", "value_m": 0.01}, {"kind": "angular_newton_meter", "value_nm": 1.0}),
+    ({"kind": "angular_rad", "value_rad": 0.5}, {"kind": "linear_newton", "value_n": 40.0}),
+])
+def test_numeric_gripper_position_refuses_other_effort_kind(position, effort) -> None:
+    with pytest.raises(ProgramValidationError, match="unit kind does not match"):
+        _gripper_effort_program(position, effort)
+
+
 @pytest.mark.parametrize(
     "node_id",
     (

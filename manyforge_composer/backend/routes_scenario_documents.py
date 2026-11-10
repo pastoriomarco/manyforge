@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import logging
 from pathlib import Path
 from typing import Any, Callable, NoReturn
 import uuid
@@ -80,6 +81,7 @@ from .scenario_artifacts import (
 )
 from .state import ComposerState, canonical_project_path
 
+_LOGGER = logging.getLogger(__name__)
 
 _DTO = ConfigDict(populate_by_name=True, extra="forbid", allow_inf_nan=False)
 
@@ -593,7 +595,8 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
         empty cell, with the unsaved-Draft protection) then removes every
         component if it succeeds. The requested Scenario is prepared and
         applied afterward; if that later preparation fails, the cell remains
-        empty. A failed New is the Load's result.
+        empty. A failed New is the Load's result. A Manager Apply that fails
+        before any effect restores the Drafts its commit replaced.
 
         A Load whose workspace install failed contains the workspace: the
         status stays 503 and the body is the failed ApplyResult.
@@ -867,8 +870,20 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         status_code=409,
                     )
 
+            # The workspace this Load replaces, captured under the claim right
+            # before the commit: a Manager Apply that then fails with no effect
+            # restores it (OD-87), so a failed Load keeps the operator's Drafts.
+            previous: dict[str, Any] = {}
+
             def commit_load() -> None:
                 nonlocal committed_snapshot
+                previous.update(
+                    program=state.draft_session.retained_state(),
+                    deployment=state.deployment_draft_session.retained_state(),
+                    source_root=state.deployment_draft_session.source_project_root,
+                    project=state.authoring_workspace.project_facts(),
+                    notice=state.startup_scenario_notice,
+                )
                 committed_snapshot = state.authoring_workspace.replace(
                     expected_identity=captured_workspace.identity,
                     install=install_load,
@@ -882,6 +897,50 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 )
                 # An opened Scenario supersedes a refused startup project.
                 state.startup_scenario_notice = None
+
+            def restore_previous_workspace() -> None:
+                """Reinstall the captured workspace in one fenced commit, under
+                fresh Draft ids so no stale client fence matches it again."""
+                nonlocal committed_snapshot
+                assert committed_snapshot is not None
+                program_restore = state.draft_session.prepare_load_replacement(
+                    {**previous["program"], "draft_id": f"draft-scenario-{uuid.uuid4().hex}"},
+                    authoring_catalog,
+                )
+                deployment_restore = state.deployment_draft_session.prepare_load_replacement(
+                    {
+                        **previous["deployment"],
+                        "draft_id": f"deployment-draft-scenario-{uuid.uuid4().hex}",
+                    },
+                    source_project_root=previous["source_root"],
+                )
+
+                def install() -> bool:
+                    program_changed = state.draft_session.install_prepared_replacement(
+                        program_restore
+                    )
+                    deployment_changed = (
+                        state.deployment_draft_session.install_prepared_replacement(
+                            deployment_restore
+                        )
+                    )
+                    return program_changed or deployment_changed
+
+                expected = committed_snapshot.identity
+                try:
+                    committed_snapshot = coordinator.submit_workspace_fenced(
+                        lambda: state.authoring_workspace.replace(
+                            expected_identity=expected,
+                            install=install,
+                            project=previous["project"],
+                        )
+                    )
+                except AuthoringWorkspaceError as error:
+                    # A Draft edit after the Load's commit is newer than the
+                    # captured workspace: keep it.
+                    _LOGGER.warning("Load workspace not restored: %s", error)
+                    return
+                state.startup_scenario_notice = previous["notice"]
 
             def submit_load(claim: dict[str, Any]) -> dict[str, Any]:
                 return state.execute_authored_deployment_candidate(
@@ -904,31 +963,41 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     )
                     current["intent"] = activation_intent(generation)
                     current["prepared"] = prepare(current["intent"])
-                    activation = coordinator.execute_external_submission(
-                        AuthoringMutationEnvelope(
-                            expected_admission_generation=generation,
-                            request_owner_epoch=body.request_owner_epoch,
-                            request_id=body.request_id,
-                        ),
-                        operation_kind="load_scenario_document",
-                        draft_id=body.draft_id,
-                        draft_revision=body.expected_draft_revision,
-                        payload={
-                            "path": source_path,
-                            "source_document_digest": source_digest,
-                            "captured_input_digest": captured_digest,
-                            "scenario_content_digest": _document_content_digest(
-                                scenario_document
+                    try:
+                        activation = coordinator.execute_external_submission(
+                            AuthoringMutationEnvelope(
+                                expected_admission_generation=generation,
+                                request_owner_epoch=body.request_owner_epoch,
+                                request_id=body.request_id,
                             ),
-                        },
-                        validate_under_claim=validate_load,
-                        submit=submit_load,
-                        commit_before_submit=commit_load,
-                        workspace=state.authoring_workspace,
-                        after_release=state.authoring_workspace.publish_commit_wake,
-                        effects=effects,
-                    )
-                    self.wait_for_manager_apply(activation)
+                            operation_kind="load_scenario_document",
+                            draft_id=body.draft_id,
+                            draft_revision=body.expected_draft_revision,
+                            payload={
+                                "path": source_path,
+                                "source_document_digest": source_digest,
+                                "captured_input_digest": captured_digest,
+                                "scenario_content_digest": _document_content_digest(
+                                    scenario_document
+                                ),
+                            },
+                            validate_under_claim=validate_load,
+                            submit=submit_load,
+                            commit_before_submit=commit_load,
+                            workspace=state.authoring_workspace,
+                            after_release=state.authoring_workspace.publish_commit_wake,
+                            effects=effects,
+                        )
+                        self.wait_for_manager_apply(activation)
+                    except Exception as error:
+                        # Only an owner-stated no-effect failure restores: the
+                        # cell still runs the previous Scenario.
+                        if committed_snapshot is not None and (
+                            getattr(error, "before_effect", False) is True
+                            or getattr(error, "code", None) == "manager_apply_rejected"
+                        ):
+                            restore_previous_workspace()
+                        raise
                     if program is None:
                         self.wait_for_scene_clear(activation)
 

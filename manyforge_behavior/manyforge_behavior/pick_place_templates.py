@@ -191,9 +191,9 @@ def build_pick_place_subtree(
 
     def motion_parameters(phase: str) -> dict[str, Any]:
         result = deepcopy(common_motion)
-        result["velocity_scale"] = motion_options.get(
-            f"{phase}_velocity_scale", 0.35
-        )
+        # Without a phase speed the move inherits the Program motion default.
+        if f"{phase}_velocity_scale" in motion_options:
+            result["velocity_scale"] = motion_options[f"{phase}_velocity_scale"]
         return result
 
     approach_parameters = motion_parameters("approach")

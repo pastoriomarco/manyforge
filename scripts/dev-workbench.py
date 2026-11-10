@@ -41,9 +41,21 @@ WORKSPACE = Path("/workspace")
 CACHE_ROOT = Path("/runner")
 BUILD_ROOT = CACHE_ROOT / "build"
 STATE_ROOT = Path(os.environ.get("MANYFORGE_DEV_STATE_ROOT", "/tmp/manyforge-state"))
-ASSISTANT_BRIDGE_PORT = 8100
 HEADLESS_BUILD = BUILD_ROOT / "headless"
 DEPLOYMENT_AUTHORING_BUILD = BUILD_ROOT / "deployment-authoring"
+# The Core Python module (manyforge_core_py): Headless reference validation
+# (the GUI's and the assistant's) prepares candidates with it.
+CORE_BINDINGS_CORE_BUILD = BUILD_ROOT / "core-bindings-core"
+CORE_PYTHON_BUILD = BUILD_ROOT / "core-python"
+# Python packages the workbench services import from the source tree.
+SERVED_PYTHON_PACKAGES = (
+    "manyforge_behavior/manyforge_behavior",
+    "manyforge_headless_api",
+    "manyforge_program_runner",
+    "manyforge_composer/backend",
+    "manyforge_assistant_bridge",
+    "manyforge_ros",
+)
 BOOTSTRAP_ROOT = CACHE_ROOT / "repository-bootstrap-package"
 # Installation configuration, independent of the optional startup project.
 # Preserve the existing workbench identity; never mint one per Load or restart.
@@ -64,10 +76,16 @@ ALARM_CATALOG = (
     WORKSPACE / "manyforge_headless/resources/operator-alarm-catalog.v1.yaml"
 )
 FRONTEND_ROOT = WORKSPACE / "manyforge_composer/frontend"
+# Written by the native build step; serve reports it beside its readiness time.
+NATIVE_BUILD_TIMING = BUILD_ROOT / "native-build-timing.json"
 
 
 class WorkbenchError(RuntimeError):
     """One precise orchestration failure."""
+
+
+class NativeBuildMissingError(WorkbenchError):
+    """serve found a native artifact the separate build step must produce."""
 
 
 def _project_scenario_id(raw_path: str, *, allowed_root: Path) -> str:
@@ -216,12 +234,12 @@ def _ensure_current_backend() -> Path:
             "0",
         )
     )
-    _regular_file(MANAGER_BINARY, "current Manager", executable=True)
-    extensions = sorted(HEADLESS_BUILD.glob("manyforge_headless_py*.so"))
-    if len(extensions) != 1:
-        raise WorkbenchError("current Headless Python extension is absent or ambiguous")
-    _regular_file(extensions[0], "current Headless Python extension")
-    return extensions[0]
+    return _current_backend()
+
+
+def _current_backend() -> Path:
+    _built_file(MANAGER_BINARY, "current Manager", executable=True)
+    return _built_extension(HEADLESS_BUILD, "manyforge_headless_py", "current Headless Python extension")
 
 
 def _ros_setup_environment(
@@ -248,12 +266,10 @@ def _ros_setup_environment(
     return imported
 
 
-def _ensure_current_ros_backend() -> tuple[Path, Path]:
-    """Prepare the separately installed ROS product; never launch a provider."""
+def _ros_backend_environment() -> dict[str, str]:
+    """The ROS build and runtime environment, before the application overlay."""
 
     build_root = BUILD_ROOT / "isaac"
-    ros_build = BUILD_ROOT / "ros-integration"
-    overlay = build_root / "ros-overlay/install/setup.bash"
     environment = os.environ.copy()
     configured_setups = environment.get("MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS", "")
     if configured_setups:
@@ -269,7 +285,7 @@ def _ensure_current_ros_backend() -> tuple[Path, Path]:
     environment.update(
         WORKSPACE=str(WORKSPACE),
         MANYFORGE_ROS2_CONTROL_BUILD_ROOT=str(build_root),
-        MANYFORGE_ROBOPLAN_BUILD_DIR=str(ros_build),
+        MANYFORGE_ROBOPLAN_BUILD_DIR=str(BUILD_ROOT / "ros-integration"),
         MANYFORGE_ISAAC_ROS_OVERLAY=str(build_root / "ros-overlay"),
         CMAKE_BUILD_PARALLEL_LEVEL=_build_jobs(),
         CMAKE_GENERATOR="Ninja",
@@ -277,6 +293,13 @@ def _ensure_current_ros_backend() -> tuple[Path, Path]:
             "MANYFORGE_ROS2_CONTROL_BUILD_TESTING", "OFF"
         ),
     )
+    return environment
+
+
+def _ensure_current_ros_backend() -> tuple[Path, Path]:
+    """Build the separately installed ROS product; never launch a provider."""
+
+    environment = _ros_backend_environment()
     _run(
         (
             str(WORKSPACE / "scripts/ros/build-ros2-control-runtime.sh"),
@@ -285,14 +308,21 @@ def _ensure_current_ros_backend() -> tuple[Path, Path]:
         ),
         env=environment,
     )
-    host = ros_build / "manyforge_ros2_control_execution_host"
+    return _current_ros_backend(environment)
+
+
+def _current_ros_backend(environment: dict[str, str]) -> tuple[Path, Path]:
+    """Check the built ROS product and import its overlay into this process."""
+
+    ros_build = BUILD_ROOT / "ros-integration"
+    overlay = BUILD_ROOT / "isaac/ros-overlay/install/setup.bash"
     targets = (
         ros_build / "manyforge_roboplan_candidate_worker",
-        host,
+        ros_build / "manyforge_ros2_control_execution_host",
     )
     for target in targets:
-        _regular_file(target, f"current {target.name}", executable=True)
-    _regular_file(overlay, "current ROS overlay setup")
+        _built_file(target, f"current {target.name}", executable=True)
+    _built_file(overlay, "current ROS overlay setup")
     # The build helper's exports belong to its subprocess. Import the generated
     # overlay before spawning the Runner or Manager; Manager's installed-target
     # children inherit this same environment through their existing protocol.
@@ -311,6 +341,60 @@ def _stage_runtime_targets(sources: Sequence[Path], installed: Path) -> None:
         target = installed / source.name
         shutil.copy2(source, target)
         _regular_file(target, f"installed {source.name}", executable=True)
+
+
+def _ensure_core_bindings() -> Path:
+    """Build the Core Python module against the authoring Deployment build.
+
+    Same inputs as scripts/ci/run-core-bindings.sh: the Core and Deployment
+    static archives, then the module itself.
+    """
+
+    if not (CORE_BINDINGS_CORE_BUILD / "CMakeCache.txt").is_file():
+        _run((
+            "cmake", "-G", "Ninja", "-S", str(WORKSPACE / "manyforge_core"),
+            "-B", str(CORE_BINDINGS_CORE_BUILD),
+            "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_TESTING=OFF",
+        ))
+    _run((
+        "cmake", "--build", str(CORE_BINDINGS_CORE_BUILD), "--parallel", _build_jobs(),
+        "--target", "manyforge_content_identity", "manyforge_core",
+    ))
+    _run((
+        "cmake", "--build", str(DEPLOYMENT_AUTHORING_BUILD), "--parallel", _build_jobs(),
+        "--target", "manyforge_content_identity", "manyforge_deployment",
+        "manyforge_deployment_admission", "manyforge_deployment_canonical_package_generator",
+        "manyforge_deployment_verification_core", "manyforge_expression",
+        "manyforge_preparation_support",
+    ))
+    if not (CORE_PYTHON_BUILD / "CMakeCache.txt").is_file():
+        completed = subprocess.run(
+            (sys.executable, "-c", "import pybind11; print(pybind11.get_cmake_dir())"),
+            check=False, capture_output=True, text=True,
+        )
+        pybind11_dir = completed.stdout.strip()
+        if completed.returncode != 0 or not pybind11_dir:
+            raise WorkbenchError("cannot resolve the development pybind11 CMake package")
+        _run((
+            "cmake", "-G", "Ninja", "-S", str(WORKSPACE / "manyforge_core/python"),
+            "-B", str(CORE_PYTHON_BUILD), "-DCMAKE_BUILD_TYPE=Release",
+            f"-DPython3_EXECUTABLE={sys.executable}", f"-DPython_EXECUTABLE={sys.executable}",
+            f"-Dpybind11_DIR={pybind11_dir}",
+            f"-DMANYFORGE_CORE_DIR={CORE_BINDINGS_CORE_BUILD}",
+            f"-DMANYFORGE_CORE_INCLUDE_DIR={WORKSPACE / 'manyforge_core/include'}",
+            f"-DMANYFORGE_DEPLOYMENT_DIR={DEPLOYMENT_AUTHORING_BUILD}",
+            f"-DMANYFORGE_DEPLOYMENT_INCLUDE_DIR={WORKSPACE / 'manyforge_deployment/include'}",
+            f"-DMANYFORGE_CONTENT_IDENTITY_SOURCE_DIR={WORKSPACE / 'manyforge_content_identity'}",
+        ))
+    _run((
+        "cmake", "--build", str(CORE_PYTHON_BUILD), "--parallel", _build_jobs(),
+        "--target", "manyforge_core_py",
+    ))
+    return _current_core_bindings()
+
+
+def _current_core_bindings() -> Path:
+    return _built_extension(CORE_PYTHON_BUILD, "manyforge_core_py", "current Core Python extension")
 
 
 def _ensure_activation_preparer() -> Path:
@@ -345,13 +429,31 @@ def _ensure_activation_preparer() -> Path:
             "0",
         )
     )
-    _regular_file(ACTIVATION_PREPARER, "activation preparer", executable=True)
-    _regular_file(
-        CANONICAL_EMPTY_GENERATOR,
-        "canonical-empty generator",
-        executable=True,
-    )
+    return _current_activation_preparer()
+
+
+def _current_activation_preparer() -> Path:
+    _built_file(ACTIVATION_PREPARER, "activation preparer", executable=True)
+    _built_file(CANONICAL_EMPTY_GENERATOR, "canonical-empty generator", executable=True)
     return ACTIVATION_PREPARER
+
+
+def build_native() -> None:
+    """The native build step; serve only checks its artifacts."""
+
+    started = time.monotonic()
+    _ensure_current_backend()
+    _ensure_current_ros_backend()
+    _ensure_activation_preparer()
+    _ensure_core_bindings()
+    # Bytecode for the served Python packages, compiled by the same
+    # interpreter the services use: a cold first start then reaches
+    # readiness within its bounded reconciliation wait.
+    _run((sys.executable, "-m", "compileall", "-q", "-j", "0",
+          *(str(WORKSPACE / package) for package in SERVED_PYTHON_PACKAGES)))
+    NATIVE_BUILD_TIMING.write_text(
+        _json({"build_elapsed_seconds": time.monotonic() - started}) + "\n", encoding="utf-8"
+    )
 
 
 def _ensure_repository_bootstrap_package() -> Path:
@@ -496,6 +598,34 @@ def _regular_file(path: Path, label: str, *, executable: bool = False) -> None:
         raise WorkbenchError(f"{label} is not a regular file: {path}")
     if executable and not os.access(path, os.X_OK):
         raise WorkbenchError(f"{label} is not executable: {path}")
+
+
+_NATIVE_BUILD_HINT = (
+    "run the native build step first: python3 scripts/dev-workbench.py build "
+    "(scripts/compose-dev.sh start runs it before serve)"
+)
+
+
+def _built_file(path: Path, label: str, *, executable: bool = False) -> None:
+    try:
+        _regular_file(path, label, executable=executable)
+    except WorkbenchError as error:
+        raise NativeBuildMissingError(f"{error}; {_NATIVE_BUILD_HINT}") from error
+
+
+def _built_extension(build: Path, module: str, label: str) -> Path:
+    extensions = sorted(build.glob(f"{module}*.so"))
+    if len(extensions) != 1:
+        raise NativeBuildMissingError(f"{label} is absent or ambiguous in {build}; {_NATIVE_BUILD_HINT}")
+    _built_file(extensions[0], label)
+    return extensions[0]
+
+
+def _native_build_elapsed() -> float | None:
+    try:
+        return json.loads(NATIVE_BUILD_TIMING.read_text(encoding="utf-8"))["build_elapsed_seconds"]
+    except FileNotFoundError:
+        return None
 
 
 def _remove_stale_socket(path: Path, label: str) -> None:
@@ -769,8 +899,6 @@ class Workbench:
             base_url,
             "--headless-api-timeout-s",
             "20",
-            "--assistant-bridge-url",
-            f"http://127.0.0.1:{ASSISTANT_BRIDGE_PORT}",
         ]
         if self.composer_static_dir is not None:
             command.extend(("--static-dir", str(self.composer_static_dir)))
@@ -778,26 +906,8 @@ class Workbench:
             command.extend(("--startup-scenario-document", self.project_path))
         return command
 
-    def _assistant_bridge_environment(self, base_url: str) -> dict[str, str]:
-        # The bridge always runs; it serves only when the active Deployment has
-        # an AI model component, whose endpoint it reads per request.
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "MANYFORGE_HEADLESS_API_URL": base_url,
-                "MANYFORGE_COMPOSER_URL": f"http://127.0.0.1:{self.composer_port}",
-                "MANYFORGE_ASSISTANT_BRIDGE_HOST": "127.0.0.1",
-                "MANYFORGE_ASSISTANT_BRIDGE_PORT": str(ASSISTANT_BRIDGE_PORT),
-                # 10 MiB per file; active plus three backups (four files, 40 MiB total by default).
-                "MANYFORGE_ASSISTANT_AUDIT_LOG": str(
-                    self.runtime_root / "assistant-bridge" / "audit.jsonl"
-                ),
-            }
-        )
-        return environment
-
     def _runtime_targets(self) -> tuple[Path, ...]:
-        return _ensure_current_ros_backend()
+        return _current_ros_backend(_ros_backend_environment())
 
     def _simulation_control_arguments(self) -> tuple[str, ...]:
         if not self.ros2_control:
@@ -854,7 +964,6 @@ class Workbench:
             self.headless_port,
             self.runner_port,
             self.composer_port,
-            ASSISTANT_BRIDGE_PORT,
             *((self.frontend_port,) if not operator_mode else ()),
         ):
             if not _port_available(port):
@@ -862,13 +971,16 @@ class Workbench:
                     f"required development port {port} is already in use"
                 )
         self.runtime_root.mkdir(parents=True, exist_ok=True)
+        # Timing is diagnostic only; status always reads the actual owners.
+        # The separate build step records the build time; serve never builds.
+        timing = {"build_elapsed_seconds": _native_build_elapsed(),
+                  "readiness_elapsed_seconds": None}
         timing_path = self.runtime_root / "workbench-startup-timing.json"
-        timing_path.write_text(_json({"build_elapsed_seconds": None,
-                                      "readiness_elapsed_seconds": None}) + "\n", encoding="utf-8")
-        build_started = time.monotonic()
-        current_headless_extension = _ensure_current_backend()
+        timing_path.write_text(_json(timing) + "\n", encoding="utf-8")
+        current_headless_extension = _current_backend()
         current_runtime_targets = self._runtime_targets()
-        activation_preparer = _ensure_activation_preparer()
+        activation_preparer = _current_activation_preparer()
+        _current_core_bindings()
         bootstrap_root: Path
         bootstrap_admission = self.operator_admission or BOOTSTRAP_ADMISSION
         cell_id = self.operator_cell_id or WORKBENCH_CELL_ID
@@ -886,16 +998,11 @@ class Workbench:
             "current Headless Python extension",
         )
         os.environ["PYTHONPATH"] = (
-            f"{HEADLESS_BUILD}:{os.environ.get('PYTHONPATH', '')}"
+            f"{HEADLESS_BUILD}:{CORE_PYTHON_BUILD}:{os.environ.get('PYTHONPATH', '')}"
         )
         if not operator_mode:
             _ensure_frontend_dependencies()
         paths = self._paths()
-        # Timing is diagnostic only; status always reads the actual owners.
-        timing = {"build_elapsed_seconds": time.monotonic() - build_started,
-                  "readiness_elapsed_seconds": None}
-        timing_path = self.runtime_root / "workbench-startup-timing.json"
-        timing_path.write_text(_json(timing) + "\n", encoding="utf-8")
         readiness_started = time.monotonic()
         if operator_mode:
             self._readiness_deadline = readiness_started + self.operator_readiness_timeout
@@ -1056,10 +1163,12 @@ class Workbench:
                 "--scene-asset-root",
                 str(WORKSPACE),
             ) + self._site_manager_arguments(),
-            # The execution host and its component processes inherit it: a
-            # point-cloud source sends its clouds to this Composer.
+            # The execution host and its component processes inherit them: a
+            # point-cloud source sends its clouds to this Composer; the
+            # assistant's bridge reads Headless and calls back into Composer.
             environment={
-                "MANYFORGE_COMPOSER_URL": f"http://127.0.0.1:{self.composer_port}"
+                "MANYFORGE_COMPOSER_URL": f"http://127.0.0.1:{self.composer_port}",
+                "MANYFORGE_HEADLESS_API_URL": base_url,
             },
         )
         self._wait_until(
@@ -1110,13 +1219,6 @@ class Workbench:
                 self.processes,
                 timeout_seconds=None,
             )
-
-        print("starting Assistant bridge", flush=True)
-        bridge = subprocess.Popen(
-            [sys.executable, "-m", "manyforge_assistant_bridge.bridge"],
-            env=self._assistant_bridge_environment(base_url),
-        )
-        self.processes.append(("Assistant bridge", bridge))
 
         composer_environment = os.environ.copy()
         previous_report = self._previous_session_report()
@@ -1386,6 +1488,7 @@ class Workbench:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dev-workbench.py")
     subcommands = parser.add_subparsers(dest="command", required=True)
+    subcommands.add_parser("build", help="build the native artifacts serve requires")
     for name in ("serve", "status"):
         command = subcommands.add_parser(name)
         projects = command.add_mutually_exclusive_group()
@@ -1418,6 +1521,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.command == "build":
+            build_native()
+            return 0
         if args.command == "status" and args.operator_runtime:
             result = query_operator_status(headless_port=args.headless_port,
                                            runner_port=args.runner_port,

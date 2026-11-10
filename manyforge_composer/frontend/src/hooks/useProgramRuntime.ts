@@ -41,6 +41,9 @@ import {
   runtimeScaleSelectorIdentity,
 } from './useRobotControl';
 
+/** The Composer refuses these starts with `execution_assistant_turn_in_progress` meanwhile. */
+export const ASSISTANT_TURN_IN_PROGRESS = 'An assistant request is running: wait or cancel it';
+
 const CURRENT_STATES = new Set([
   'running',
   'intervention_required',
@@ -590,6 +593,7 @@ export function useProgramRuntime(
   workspace: ProgramWorkspaceResponse | null = null,
   controlSource: HeadlessStateSource | null = null,
   deploymentPending = false,
+  assistantTurnRunning = false,
 ) {
   const [state, setState] = useState<ProgramRuntimeState>(INITIAL_STATE);
   // The backend's run readiness and cell latch, pushed on /ws/control.
@@ -1010,8 +1014,9 @@ export function useProgramRuntime(
   }, []);
 
   // Execute, Run, Resume and Retry use only what is applied: while a Draft
-  // has unapplied changes they are refused (the Composer backend enforces the
-  // same rule where it admits them). Stop, Halt and Reset stay available.
+  // has unapplied changes they are refused, and while this page's assistant
+  // chat turn runs (the Composer backend enforces both where it admits them).
+  // Stop, Halt and Reset stay available.
   const programPending = state.applied !== null && workspace !== null
     && workspace.draft.programLoaded
     && workspace.draft.programRevision !== state.applied.programRevision;
@@ -1019,9 +1024,9 @@ export function useProgramRuntime(
     ...(programPending ? ['Program (Scene edits included)'] : []),
     ...(deploymentPending ? ['Deployment'] : []),
   ];
-  const draftUnappliedReason = pendingDocuments.length === 0
-    ? null
-    : `Apply or Discard first: unapplied changes in ${pendingDocuments.join(' and ')}. Execute, Run, Resume and Retry use only what is applied.`;
+  const composerRefusalReason = pendingDocuments.length > 0
+    ? `Apply or Discard first: unapplied changes in ${pendingDocuments.join(' and ')}. Execute, Run, Resume and Retry use only what is applied.`
+    : assistantTurnRunning ? ASSISTANT_TURN_IN_PROGRESS : null;
 
   const ordinaryRun = useCallback(async () => {
     const requestId = identity('program-run-start');
@@ -1119,7 +1124,7 @@ export function useProgramRuntime(
     const resume = pending === 'resume-motion';
     const controls = state.controls;
     if (
-      ((start || resume) && draftUnappliedReason !== null)
+      ((start || resume) && composerRefusalReason !== null)
       || groupIds.length === 0
       || !state.run
       || !['running', 'intervention_required'].includes(state.run.state)
@@ -1179,7 +1184,7 @@ export function useProgramRuntime(
       }));
     }
   }, [
-    beginProgramCommand, controlSource, draftUnappliedReason,
+    beginProgramCommand, controlSource, composerRefusalReason,
     recordCommandFailure,
     state.pending, state.selectionPending, state.controlPending, state.controls,
     state.run, state.runnerAvailable,
@@ -1549,7 +1554,7 @@ export function useProgramRuntime(
 
   const resumeFullStop = useCallback(async () => {
     if (
-      draftUnappliedReason !== null
+      composerRefusalReason !== null
       || !state.run
       || state.run.state !== 'full_stopped'
       || !state.runnerAvailable
@@ -1580,7 +1585,7 @@ export function useProgramRuntime(
       );
     }
   }, [
-    beginProgramCommand, controlSource, draftUnappliedReason,
+    beginProgramCommand, controlSource, composerRefusalReason,
     recordCommandFailure,
     state.pending, state.run, state.runnerAvailable,
   ]);
@@ -1650,7 +1655,7 @@ export function useProgramRuntime(
       offer === null || action?.enabled !== true
       || state.controlPending !== null
       // Retry and continue resume the run; only a Reset ends it.
-      || (!action.performsBackendReset && draftUnappliedReason !== null)
+      || (!action.performsBackendReset && composerRefusalReason !== null)
     ) return;
     const requestId = identity('program-recovery');
     const body = {
@@ -1671,7 +1676,7 @@ export function useProgramRuntime(
       body,
       'The recovery action was rejected.',
     );
-  }, [draftUnappliedReason, performRuntimeControl, state.controlPending, state.controls]);
+  }, [composerRefusalReason, performRuntimeControl, state.controlPending, state.controls]);
 
   /** Resolves to null when written, otherwise to why the write was refused. */
   const writeRuntimeBlackboard = useCallback((
@@ -1789,7 +1794,7 @@ export function useProgramRuntime(
     runnerRefusal,
     readiness,
     cellLatch,
-    draftUnappliedReason,
+    composerRefusalReason,
     active,
     refresh,
     dismissError,
@@ -1819,7 +1824,7 @@ export function useProgramRuntime(
     runnerRefusal,
     readiness,
     cellLatch,
-    draftUnappliedReason,
+    composerRefusalReason,
     persistentValues,
     refresh,
     reset,

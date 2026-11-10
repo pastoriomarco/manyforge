@@ -1,9 +1,14 @@
 {
-  "api_version": "manyforge.maintained_assistant_profiles.v1",
+  "api_version": "manyforge.maintained_assistant_profiles.v2",
   "mode_profiles": {
     "scene_authoring": {
       "composer-assistant": {
         "enabled": true,
+        "runs_in": [
+          "no_program_active"
+        ],
+        "stuck_loop_recovery": true,
+        "constrained_regeneration": true,
         "description": "Scene and Program authoring mode for Composer: edits land in the Program Draft.",
         "grant_policy": {
           "session_kind": null,
@@ -20,7 +25,9 @@
             "catalog_read",
             "deployment_capabilities_read",
             "inspect_isaac_scene",
+            "program_draft_remove_contact_policies",
             "program_draft_remove_parameters",
+            "program_draft_upsert_contact_policies",
             "program_draft_upsert_parameters",
             "program_read",
             "scene_draft_add_object",
@@ -37,31 +44,6 @@
             "tree_draft_replace_subtree",
             "tree_draft_update_node_params",
             "tree_draft_wrap_node"
-          ],
-          "nodes": [
-            "fallback",
-            "gripper.command_position",
-            "inverter",
-            "logic.set_value",
-            "logic.wait_for_value",
-            "motion.follow_cartesian_path",
-            "motion.move_to_joint_target",
-            "motion.move_to_pose",
-            "parallel",
-            "repeat",
-            "retry",
-            "scene.add_object",
-            "scene.attach_carried_object",
-            "scene.detach_carried_object",
-            "scene.remove_object",
-            "scene.update_object_pose",
-            "scene.upsert_object",
-            "sequence",
-            "simulation.reset",
-            "simulation.set_entity_pose",
-            "simulation.set_state",
-            "simulation.step",
-            "timer"
           ]
         }
       }
@@ -90,17 +72,11 @@
             "supports_image_input": false,
             "supports_json_object": true,
             "supports_response_tools": true,
-            "tool_call_family": "openai_chat_tools"
+            "tool_call_family": "openai_chat_tools",
+            "reasoning": "off"
           }
         }
       ],
-      "provider_alias": {
-        "provider_alias_id": "assistant_provider",
-        "provider_kind": "nemoclaw",
-        "bridge_external_resource_alias": "assistant_bridge",
-        "site_overlay_value_ref": "resources.assistant_scene_authoring.assistant_bridge",
-        "endpoint_value": "http://127.0.0.1:8100/v1/manyforge/assistant"
-      },
       "mode_profile_id": "scene_authoring"
     },
     {
@@ -163,13 +139,6 @@
           }
         }
       ],
-      "provider_alias": {
-        "provider_alias_id": "assistant_provider",
-        "provider_kind": "direct",
-        "bridge_external_resource_alias": "assistant_bridge",
-        "site_overlay_value_ref": "resources.semantic_shape_selection.assistant_bridge",
-        "endpoint_value": "http://127.0.0.1:8200/v1/manyforge/assistant"
-      },
       "mode_profile_id": "scene_authoring"
     },
     {
@@ -210,7 +179,6 @@
           }
         }
       ],
-      "provider_alias": null,
       "mode_profile_id": null
     },
     {
@@ -270,13 +238,6 @@
           }
         }
       ],
-      "provider_alias": {
-        "provider_alias_id": "assistant_provider",
-        "provider_kind": "direct",
-        "bridge_external_resource_alias": "assistant_bridge",
-        "site_overlay_value_ref": "resources.vision_pose_selection.assistant_bridge",
-        "endpoint_value": "http://127.0.0.1:8200/v1/manyforge/assistant"
-      },
       "mode_profile_id": "scene_authoring"
     }
   ]

@@ -8,7 +8,7 @@ import type {
 import type { ComposerHeadlessState } from '../types/headless';
 import type { RuntimeScaleControlSelector, RuntimeScaleControlStatus } from '../types/robotControl';
 import { heldRun } from '../testFixtures/heldRun';
-import { useProgramRuntime, type ProgramRuntimeController } from './useProgramRuntime';
+import { ASSISTANT_TURN_IN_PROGRESS, useProgramRuntime, type ProgramRuntimeController } from './useProgramRuntime';
 import { CommandDeliveryUnconfirmedError, type HeadlessStateSource } from './useHeadlessState';
 import { CommandRefusalError } from '../state/commandRefusal';
 
@@ -72,7 +72,7 @@ let cleanup: (() => Promise<void>) | null = null;
 afterEach(async () => {
   await cleanup?.(); cleanup = null; vi.unstubAllGlobals(); vi.useRealTimers();
 });
-async function mount(resumed = false) {
+async function mount(resumed = false, assistantTurnRunning = false) {
   vi.useFakeTimers();
   for (const section of Object.values(apiMock)) for (const method of Object.values(section)) method.mockReset();
   const host = domHost();
@@ -99,7 +99,7 @@ async function mount(resumed = false) {
   const source = { sendExecutionCommand: send } as unknown as HeadlessStateSource;
   let runtime!: ProgramRuntimeController;
   function Harness() {
-    const value = useProgramRuntime(true, snapshot, workspace, source, false);
+    const value = useProgramRuntime(true, snapshot, workspace, source, false, assistantTurnRunning);
     useLayoutEffect(() => { runtime = value; }, [value]);
     return null;
   }
@@ -124,6 +124,28 @@ it('Execute sends one ordinary run request and shows an authoritative refusal', 
   expect(test.send).toHaveBeenCalledTimes(1);
   expect(test.send.mock.calls[0]?.[0]).toBe('program_run');
   expect(test.runtime.state.error).toContain('Simulator unavailable');
+});
+
+it('refuses Execute, Run and Resume while this page\'s assistant request runs', async () => {
+  const idle = await mount();
+  expect(idle.runtime.composerRefusalReason).toBeNull();
+  await idle.unmount(); cleanup = null;
+  const test = await mount(false, true);
+  expect(test.runtime.composerRefusalReason).toBe(ASSISTANT_TURN_IN_PROGRESS);
+});
+
+it('shows the Composer\'s typed refusal of an Execute during an assistant request', async () => {
+  const test = await mount();
+  const refusal = {
+    code: 'execution_assistant_turn_in_progress',
+    message: 'an assistant request is in progress',
+    details: null,
+    origin: null,
+  };
+  test.send.mockRejectedValueOnce(new CommandRefusalError(refusal));
+  await act(async () => { await test.runtime.run(); });
+  expect(test.runtime.state.errorRefusal).toEqual(refusal);
+  expect(test.runtime.state.error).toContain('an assistant request is in progress');
 });
 
 it('retains the owner refusal code for a holding rule until dismissed', async () => {

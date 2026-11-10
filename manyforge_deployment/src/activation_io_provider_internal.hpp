@@ -44,4 +44,16 @@ prepare_activation_sensor_types(
     const ActivationDeploymentIntent &intent,
     std::span<const ActivationComponentProfile> profiles);
 
+/// One derived component type for the assistant (tag `assistant`, no
+/// command targets), a lane-free adapter component like a sensor, with its
+/// `sensors` runtime row: `settings` `{assistant_profile_id,
+/// model_component_id, model_base_url, model_api_key_env}`, the last two
+/// copied from the AI model component it names (so they are part of its
+/// spec). Fails `assistant_model_component_unresolved` when that names no AI
+/// model component.
+[[nodiscard]] std::vector<ActivationPreparedIoType>
+prepare_activation_assistant_types(
+    const ActivationDeploymentIntent &intent,
+    std::span<const ActivationComponentProfile> profiles);
+
 } // namespace manyforge::deployment::detail

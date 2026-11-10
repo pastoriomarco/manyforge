@@ -71,7 +71,7 @@ describe('ProgramContactPolicyEditor', () => {
         body_a: { kind: 'component_model_body', body: { component_id: 'tool', collision_body_id: 'jaw' } },
       }] }],
     };
-    const facts: ReferenceSelectorFacts = { components: [], targets: [], signals: [], frames: [], bodies: [
+    const facts: ReferenceSelectorFacts = { components: [], rules: [], targets: [], signals: [], frames: [], bodies: [
       { reference: { component_id: 'tool', collision_body_id: 'jaw' }, ambiguous: false, moving_targets: [] },
     ] };
     const mounted = await mount([explicitPolicy as unknown as JsonValue], facts);
@@ -83,7 +83,7 @@ describe('ProgramContactPolicyEditor', () => {
   });
 
   it('disables a body identity shared by multiple model occurrences', () => {
-    const facts: ReferenceSelectorFacts = { components: [], targets: [], signals: [], frames: [], bodies: [
+    const facts: ReferenceSelectorFacts = { components: [], rules: [], targets: [], signals: [], frames: [], bodies: [
       { reference: { component_id: 'tool', collision_body_id: 'jaw' }, ambiguous: true, moving_targets: [] },
     ] };
     const markup = renderToStaticMarkup(<ProgramContactPolicyEditor

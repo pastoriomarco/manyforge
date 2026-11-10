@@ -9,18 +9,17 @@
 
 namespace manyforge::core {
 
-enum class AssistantProviderKind : std::uint8_t {
-  kDirect = 0,
-  kNemoclaw,
+/// A cell state an assistant mode may run in (each mode declares its own):
+/// `no_program_active`, no Program run exists (also no paused or held one).
+enum class AssistantModeRunState : std::uint8_t {
+  kNoProgramActive = 0,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(
-    AssistantProviderKind value) noexcept {
+    AssistantModeRunState value) noexcept {
   switch (value) {
-    case AssistantProviderKind::kDirect:
-      return "direct";
-    case AssistantProviderKind::kNemoclaw:
-      return "nemoclaw";
+    case AssistantModeRunState::kNoProgramActive:
+      return "no_program_active";
   }
   return {};
 }
@@ -149,6 +148,17 @@ enum class AssistantReviewPolicy : std::uint8_t {
   return {};
 }
 
+// Optional sampling parameters for the model server. Only the fields that are
+// set are sent; everything else keeps the model's or server's defaults.
+struct AssistantModelSamplingDTO final {
+  std::optional<double> temperature;
+  std::optional<double> top_p;
+  std::optional<std::uint32_t> top_k;
+
+  friend bool operator==(const AssistantModelSamplingDTO&,
+                         const AssistantModelSamplingDTO&) = default;
+};
+
 struct AssistantModelEndpointRequestContractDTO final {
   double default_timeout_s;
   std::uint32_t max_output_tokens;
@@ -157,6 +167,12 @@ struct AssistantModelEndpointRequestContractDTO final {
   bool supports_image_input{false};
   std::vector<AssistantImageTransport> supported_image_transports;
   AssistantToolCallFamily tool_call_family;
+  // EXPERIMENTAL (pending maintainer decision): `reasoning: on|off` asks the
+  // model server to enable or disable its reasoning (thinking) mode; absent
+  // keeps the model's default.
+  std::optional<bool> reasoning;
+  // Absent sends no sampling parameters at all.
+  std::optional<AssistantModelSamplingDTO> sampling;
 
   friend bool operator==(const AssistantModelEndpointRequestContractDTO&,
                          const AssistantModelEndpointRequestContractDTO&) =
@@ -213,15 +229,6 @@ struct AssistantPromptTemplateDTO final {
                          const AssistantPromptTemplateDTO&) = default;
 };
 
-struct AssistantProviderAliasDTO final {
-  std::string provider_alias;
-  AssistantProviderKind provider_kind;
-  ExternalResourceAlias bridge_external_resource_alias;
-
-  friend bool operator==(const AssistantProviderAliasDTO&,
-                         const AssistantProviderAliasDTO&) = default;
-};
-
 struct AssistantGrantPolicyDTO final {
   std::optional<AssistantSessionKind> session_kind;
   std::optional<AssistantApprovalMode> approval_mode;
@@ -231,10 +238,12 @@ struct AssistantGrantPolicyDTO final {
                          const AssistantGrantPolicyDTO&) = default;
 };
 
+// The authorable node set is not listed per mode: it is derived from the
+// node catalog and the active Deployment's capabilities where the mode
+// projection is built.
 struct AssistantModeCatalogDTO final {
   std::vector<std::string> skill_ids;
   std::vector<std::string> tool_ids;
-  std::vector<std::string> node_ids;
 
   friend bool operator==(const AssistantModeCatalogDTO&,
                          const AssistantModeCatalogDTO&) = default;
@@ -244,10 +253,22 @@ struct AssistantModeDTO final {
   std::string mode_id;
   bool enabled{false};
   std::string description;
-  std::string provider_alias;
+  /// The Deployment's assistant component, whose bridge serves the mode.
+  std::string assistant_component_id;
   std::string model_endpoint_alias;
+  /// The cell states the mode may run in (sorted, non-empty).
+  std::vector<AssistantModeRunState> runs_in;
   AssistantGrantPolicyDTO grant_policy;
   AssistantModeCatalogDTO catalog;
+  // Repeated same-class tool failures get a recovery hint, then end the
+  // request with a clarification (OD-76).
+  bool stuck_loop_recovery{true};
+  // EXPERIMENTAL: the bridge keeps completed requests in the conversation
+  // history as request, answer and edit summary only.
+  bool compact_history{false};
+  // EXPERIMENTAL (E1): an argument-validation failure gets one extra model
+  // call constrained to the full JSON Schema of that exact call.
+  bool constrained_regeneration{false};
 
   friend bool operator==(const AssistantModeDTO&,
                          const AssistantModeDTO&) = default;
@@ -257,12 +278,11 @@ struct AssistantSettingsDTO final {
   AssistantModelAuditPolicyDTO audit_policy;
   std::vector<AssistantPromptTemplateDTO> prompt_templates;
   std::vector<AssistantModelEndpointAliasDTO> model_endpoint_aliases;
-  std::vector<AssistantProviderAliasDTO> provider_aliases;
   std::vector<AssistantModeDTO> modes;
 
   [[nodiscard]] bool enabled() const noexcept {
     return !prompt_templates.empty() || !model_endpoint_aliases.empty() ||
-           !provider_aliases.empty() || !modes.empty();
+           !modes.empty();
   }
 
   friend bool operator==(const AssistantSettingsDTO&,
@@ -277,22 +297,14 @@ struct AssistantSkillDescriptorDTO final {
                          const AssistantSkillDescriptorDTO&) = default;
 };
 
+// Tool identity and effect only: descriptions and input schemas are built
+// from the loaded node catalog where the mode projection is built.
 struct AssistantToolDescriptorDTO final {
   std::string tool_id;
   AssistantToolEffect effect;
-  std::string description;
-  std::string canonical_input_schema;
-  ContentDigest input_schema_digest;
 
   friend bool operator==(const AssistantToolDescriptorDTO&,
                          const AssistantToolDescriptorDTO&) = default;
-};
-
-struct AssistantNodeDescriptorDTO final {
-  std::string node_id;
-
-  friend bool operator==(const AssistantNodeDescriptorDTO&,
-                         const AssistantNodeDescriptorDTO&) = default;
 };
 
 struct AssistantInstrumentRegistryDTO final {
@@ -300,7 +312,6 @@ struct AssistantInstrumentRegistryDTO final {
   ContentDigest registry_digest;
   std::vector<AssistantSkillDescriptorDTO> skills;
   std::vector<AssistantToolDescriptorDTO> tools;
-  std::vector<AssistantNodeDescriptorDTO> nodes;
 
   friend bool operator==(const AssistantInstrumentRegistryDTO&,
                          const AssistantInstrumentRegistryDTO&) = default;

@@ -66,7 +66,7 @@ export function ProgramAuthoringTemplate({
   const [blackboardKey, setBlackboardKey] = useState('planning.pick_plan');
   const [instancePrefix, setInstancePrefix] = useState('pick_sequence');
   const [placePosition, setPlacePosition] = useState([0, 0, 0.1]);
-  const [placeOrientation, setPlaceOrientation] = useState([0, 0, 0]);
+  const [placeOrientation, setPlaceOrientation] = useState([180, 0, 0]);
 
   const arm = armTargets.find((row) => refKey(row.target) === armTargetId && row.capability?.available)
     ?? armTargets.find((row) => row.capability?.available);
@@ -248,7 +248,7 @@ export function ProgramAuthoringTemplate({
           {operation === 'pick' && <label><span>Contact policy</span><select value={effectivePolicy} onChange={(event) => setPolicyId(event.target.value)}>{policies.map((id) => <option key={id}>{id}</option>)}</select></label>}
           {operation === 'place' && (
             <fieldset>
-              <legend>Place target in arm base frame</legend>
+              <legend>Gripper (TCP) pose at release, in arm base frame</legend>
               <div className="program-template-grid">
                 {(['X (m)', 'Y (m)', 'Z (m)'] as const).map((label, index) => <label key={label}><span>{label}</span><input type="number" step="any" value={placePosition[index]} onChange={(event) => setPlacePosition((current) => current.map((value, position) => position === index ? event.currentTarget.valueAsNumber : value))} /></label>)}
                 {(['Roll (deg)', 'Pitch (deg)', 'Yaw (deg)'] as const).map((label, index) => <label key={label}><span>{label}</span><input type="number" step="any" value={placeOrientation[index]} onChange={(event) => setPlaceOrientation((current) => current.map((value, position) => position === index ? event.currentTarget.valueAsNumber : value))} /></label>)}

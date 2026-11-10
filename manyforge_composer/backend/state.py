@@ -47,6 +47,8 @@ from .deployment_intent import (
     DeploymentIntentError,
     rebase_deployment_intent_sources,
 )
+from .assistant_mode_client import AssistantContextCache
+from .assistant_provider_client import AssistantProviderHttpClient
 from .authoring_workspace import AuthoringWorkspace
 from .node_environment_client import read_active_node_environment
 from .program_artifacts import (
@@ -61,17 +63,13 @@ from .execution_observation_stream import ExecutionObservationSource
 if TYPE_CHECKING:
     from manyforge_headless_api.client import HeadlessHttpClient
 
-    from .assistant_provider_client import AssistantProviderHttpClient
-
 
 RUNTIME_UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
 RUNTIME_UNAVAILABLE_MESSAGE = (
     "Composer is not a runtime owner; configure the headless API for owner-issued "
     "status, scene, alarm/history, preview, operation, Program Apply/Run, and "
     "explicit operation/Program Stop facts. The structural-only Composer profile "
-    "does not launch those owners. The "
-    "assistant operator workflow also requires a configured "
-    "assistant bridge"
+    "does not launch those owners"
 )
 
 _CURRENT_SCENARIO_FIELDS = (
@@ -246,7 +244,7 @@ class ComposerState:
         allowed_program_write_roots: list[str] | None = None,
         allowed_deployment_write_roots: list[str] | None = None,
         headless_client: "HeadlessHttpClient | None" = None,
-        assistant_client: "AssistantProviderHttpClient | None" = None,
+        assistant_client: AssistantProviderHttpClient | None = None,
     ) -> None:
         resolved_program_source = (
             Path(program_source_path).resolve()
@@ -305,7 +303,18 @@ class ComposerState:
             if headless_client is not None
             else None
         )
-        self.assistant_client = assistant_client
+        # The bridge URL is resolved per request from the assistant
+        # component's published endpoint; one HTTP client serves every call.
+        self.assistant_client = (
+            assistant_client or AssistantProviderHttpClient()
+            if headless_client is not None
+            else None
+        )
+        self.assistant_context_cache = AssistantContextCache()
+        # Composer's in-flight chat turns (request ids answered `running`);
+        # Execute admission refuses while one is still running.
+        self.assistant_turns: set[str] = set()
+        self.assistant_turns_lock = Lock()
         # Presentation-cache identity only. Runtime and Apply truth remain in
         # Headless/Manager; this value solely rejects an old browser mesh URL
         # after Composer has observed a successor viewer manifest.
@@ -563,7 +572,6 @@ class ComposerState:
         allowed_program_write_roots: list[str] | None = None,
         allowed_deployment_write_roots: list[str] | None = None,
         headless_client: "HeadlessHttpClient | None" = None,
-        assistant_client: "AssistantProviderHttpClient | None" = None,
     ) -> "ComposerState":
         node_environment = build_node_environment()
         resolved_program = (
@@ -586,7 +594,6 @@ class ComposerState:
             allowed_program_write_roots=allowed_program_write_roots,
             allowed_deployment_write_roots=allowed_deployment_write_roots,
             headless_client=headless_client,
-            assistant_client=assistant_client,
         )
 
     @property

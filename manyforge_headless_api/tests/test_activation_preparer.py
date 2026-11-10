@@ -453,7 +453,7 @@ def test_reference_candidate_uses_server_config_and_preserves_empty_result(
             return json.dumps({"code": "program_reference_validation_failed", "diagnostics": [],
                                "total_count": 0, "truncated": False})
         def selector_facts_json(self):
-            return json.dumps({key: [] for key in ("components", "targets", "signals", "frames", "bodies")})
+            return json.dumps({key: [] for key in ("components", "targets", "signals", "frames", "bodies", "rules")})
     def factory(*args):
         calls.append(("factory", args))
         return Candidate()
@@ -467,11 +467,110 @@ def test_reference_candidate_uses_server_config_and_preserves_empty_result(
         deployment={"components": []}, model_source_closure=_CLOSURE,
         program=program, program_content_digest=digest, draft=True,
     )
-    assert result == {"diagnostics": [], "total_count": 0, "truncated": False, "selector_facts": {key: [] for key in ("components", "targets", "signals", "frames", "bodies")}}
+    assert result == {"diagnostics": [], "total_count": 0, "truncated": False, "selector_facts": {key: [] for key in ("components", "targets", "signals", "frames", "bodies", "rules")}}
     assert calls[0][1][0] == str(tmp_path / "capabilities")
     assert calls[0][1][-1] == "cell_a"
     assert calls[1] == ("validate", program, True)
     assert list((tmp_path / "artifacts").iterdir()) == []
+
+
+def test_reference_candidate_is_reused_until_the_deployment_or_sources_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparer = _preparer(tmp_path)
+    monkeypatch.setattr(activation_preparer, "_validate_raw_reference_program", lambda *_args: None)
+    monkeypatch.setattr(activation_preparer, "_prepare_model_closure", lambda **_kwargs: {})
+    prepared: list[tuple] = []
+    class CandidateError(RuntimeError): pass
+    class ContractError(ValueError): pass
+    class Incomplete(RuntimeError): pass
+    class Candidate:
+        def __init__(self, deployment: str) -> None:
+            self.deployment = deployment
+        def validate_program_references(self, program, _draft):
+            return json.dumps({"code": "program_reference_validation_failed",
+                               "diagnostics": [], "total_count": 0, "truncated": False})
+        def selector_facts_json(self):
+            return json.dumps({key: [self.deployment] if key == "components" else []
+                               for key in ("components", "targets", "signals", "frames", "bodies", "rules")})
+    def factory(_root, deployment, _sources, _prepared, _cell):
+        prepared.append(deployment)
+        return Candidate(deployment)
+    monkeypatch.setitem(sys.modules, "manyforge_core_py", SimpleNamespace(
+        prepare_activation_candidate=factory, PreparedActivationCandidateError=CandidateError,
+        ProgramContractError=ContractError, ProgramReferenceValidationIncomplete=Incomplete,
+    ))
+
+    def validate(deployment, program, closure=_CLOSURE):
+        digest = "sha256:" + hashlib.sha256(rfc8785.dumps(program)).hexdigest()
+        return preparer.validate_program_references(
+            deployment=deployment, model_source_closure=closure,
+            program=program, program_content_digest=digest, draft=True)
+
+    first = validate({"components": []}, {"forest": []})
+    # A Program edit reuses the candidate and gives the fresh result.
+    edited = validate({"components": []}, {"forest": [{"node_id": "timer"}]})
+    assert len(prepared) == 1
+    assert edited == first
+    # A Deployment change prepares again.
+    changed = validate({"components": ["robot"]}, {"forest": []})
+    assert len(prepared) == 2 and changed != first
+    # So does a model-source change.
+    validate({"components": ["robot"]}, {"forest": []}, {**_CLOSURE, "components": [{"id": "a"}]})
+    assert len(prepared) == 3
+
+
+def test_reference_candidate_digest_only_hits_the_held_candidate_or_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(activation_preparer, "_validate_raw_reference_program", lambda *_args: None)
+    monkeypatch.setattr(activation_preparer, "_prepare_model_closure", lambda **_kwargs: {})
+    prepared: list[str] = []
+    class CandidateError(RuntimeError): pass
+    class ContractError(ValueError): pass
+    class Incomplete(RuntimeError): pass
+    class Candidate:
+        def __init__(self, deployment: str) -> None:
+            self.deployment = deployment
+        def validate_program_references(self, program, _draft):
+            return json.dumps({"code": "program_reference_validation_failed",
+                               "diagnostics": [], "total_count": 0, "truncated": False})
+        def selector_facts_json(self):
+            return json.dumps({key: [self.deployment] if key == "components" else []
+                               for key in ("components", "targets", "signals", "frames", "bodies", "rules")})
+    def factory(_root, deployment, _sources, _prepared, _cell):
+        prepared.append(deployment)
+        return Candidate(deployment)
+    monkeypatch.setitem(sys.modules, "manyforge_core_py", SimpleNamespace(
+        prepare_activation_candidate=factory, PreparedActivationCandidateError=CandidateError,
+        ProgramContractError=ContractError, ProgramReferenceValidationIncomplete=Incomplete,
+    ))
+    closure_digest = "sha256:" + hashlib.sha256(rfc8785.dumps(_CLOSURE)).hexdigest()
+
+    def validate(preparer, deployment, program, **sources):
+        digest = "sha256:" + hashlib.sha256(rfc8785.dumps(program)).hexdigest()
+        return preparer.validate_program_references(
+            deployment=deployment, program=program, program_content_digest=digest, draft=True, **sources)
+
+    def refused(preparer, deployment, source_digest) -> None:
+        with pytest.raises(HeadlessApiError) as caught:
+            validate(preparer, deployment, {"forest": []}, model_source_closure_digest=source_digest)
+        assert caught.value.code == "model_sources_unknown"
+
+    preparer = _preparer(tmp_path)
+    # Nothing held yet: the digest names no candidate.
+    refused(preparer, {"components": []}, closure_digest)
+    full = validate(preparer, {"components": []}, {"forest": [1]}, model_source_closure=_CLOSURE)
+    # A digest-only request reuses the held candidate with the same result.
+    assert validate(preparer, {"components": []}, {"forest": [1]}, model_source_closure_digest=closure_digest) == full
+    assert len(prepared) == 1
+    # An unknown closure digest, or a changed Deployment with the old digest, misses.
+    refused(preparer, {"components": []}, "sha256:" + "f" * 64)
+    refused(preparer, {"components": ["robot"]}, closure_digest)
+    assert len(prepared) == 1
+    # A restarted Headless holds no candidate.
+    (tmp_path / "restarted").mkdir()
+    refused(_preparer(tmp_path / "restarted"), {"components": []}, closure_digest)
 
 
 def test_reference_candidate_incomplete_is_not_valid(
@@ -926,7 +1025,7 @@ def test_candidate_selector_facts_are_forwarded_from_same_candidate(tmp_path: Pa
     monkeypatch.setattr(activation_preparer, "_validate_raw_reference_program", lambda *_args: None)
     facts = {"components": [{"component_id": "tool"}], "targets": [], "signals": [],
              "frames": [{"reference": {"component_id": "tool", "frame_id": "tip"},
-                         "ambiguous": True, "moving_targets": []}], "bodies": []}
+                         "ambiguous": True, "moving_targets": []}], "bodies": [], "rules": []}
     class CandidateError(RuntimeError): pass
     class ContractError(ValueError): pass
     class Incomplete(RuntimeError): pass

@@ -220,7 +220,6 @@ function mountedHost() {
 async function mountGripper(
   actuationKind: 'position_commanded' | 'pneumatic',
   outputMode: 'commanded' | 'none' = 'commanded',
-  timeoutSource?: JsonValue,
   pneumaticIo?: JsonValue,
   { scenarioTool = false, graspConfirmation, stopFinishTolerance }: {
     scenarioTool?: boolean;
@@ -233,7 +232,6 @@ async function mountGripper(
   const runtime = (graph.runtime_units as Array<Record<string, JsonValue>>)[0];
   const configuration = runtime.configuration as Record<string, JsonValue>;
   const sourceRow = (configuration.gripper_target_configurations as Array<Record<string, JsonValue>>)[0];
-  if (timeoutSource !== undefined) sourceRow.delivery_result_timeout_s = timeoutSource;
   if (pneumaticIo !== undefined) sourceRow.pneumatic_io = pneumaticIo;
   if (graspConfirmation !== undefined) sourceRow.grasp_confirmation = graspConfirmation;
   if (stopFinishTolerance !== undefined) sourceRow.stop_finish_tolerance = stopFinishTolerance;
@@ -369,7 +367,7 @@ describe('DeploymentFocusedEditor', () => {
   });
 
   it('edits the gripper row of a mounted tool in a Scenario Draft (nested runtime_configuration)', async () => {
-    const mounted = await mountGripper('pneumatic', 'commanded', undefined, undefined, { scenarioTool: true });
+    const mounted = await mountGripper('pneumatic', 'commanded', undefined, { scenarioTool: true });
     try {
       expect(mounted.field('Program dwell')).toBeDefined();
       await mounted.setDuration(0.25);
@@ -383,12 +381,11 @@ describe('DeploymentFocusedEditor', () => {
   });
 
   it.each(['commanded', 'none'] as const)(
-    'preserves explicit pneumatic timeout through edits and %s output changes', async (mode) => {
-      const mounted = await mountGripper('pneumatic', mode, 2.5);
+    'preserves the pneumatic row through edits and %s output changes', async (mode) => {
+      const mounted = await mountGripper('pneumatic', mode);
       try {
         expect(mounted.field('Program dwell')).toBeDefined();
         expect(() => mounted.field('Motion time')).toThrow('Mounted control not found');
-        expect(() => mounted.field('Delivery result timeout')).toThrow('Mounted control not found');
         await mounted.setDuration(0.25);
         await mounted.update();
         expect(mounted.value.mutate).toHaveBeenLastCalledWith(
@@ -416,7 +413,7 @@ describe('DeploymentFocusedEditor', () => {
         workpiece_grasped: { signal: { controllable_component_id: 'sensors', signal_name: 'part' } },
       },
     };
-    const mounted = await mountGripper('pneumatic', 'commanded', undefined, io);
+    const mounted = await mountGripper('pneumatic', 'commanded', io);
     try {
       await mounted.setDuration(0.25);
       await mounted.update();
@@ -428,7 +425,7 @@ describe('DeploymentFocusedEditor', () => {
   });
 
   it.each(['position_commanded', 'pneumatic'] as const)(
-    'retains timeout omission and the existing row fields for %s', async (kind) => {
+    'retains the existing row fields for %s', async (kind) => {
       const mounted = await mountGripper(kind);
       try {
         expect(Object.keys(mounted.sourceRow)).toHaveLength(13);
@@ -442,36 +439,14 @@ describe('DeploymentFocusedEditor', () => {
     },
   );
 
-  it('drops the pneumatic-only timeout on an intentional switch to position', async () => {
-    const mounted = await mountGripper('pneumatic', 'commanded', 2.5);
+  it('writes an intentional pneumatic switch to position as one row', async () => {
+    const mounted = await mountGripper('pneumatic');
     try {
       await act(() => mounted.field('Actuation kind').onChange?.({ target: { value: 'position_commanded' } }));
-      const positionRow = { ...mounted.sourceRow };
-      delete positionRow.delivery_result_timeout_s;
       expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
         ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
-        'set', { ...positionRow, actuation_kind: 'position_commanded' },
+        'set', { ...mounted.sourceRow, actuation_kind: 'position_commanded' },
       );
-    } finally { await mounted.unmount(); }
-  });
-
-  it.each([0, -1, null, '2.5', true, NaN, Infinity, -Infinity])(
-    'does not repair an invalid authored pneumatic timeout %s', async (timeout) => {
-      const mounted = await mountGripper('pneumatic', 'commanded', timeout);
-      try {
-        expect(() => mounted.field('Program dwell')).toThrow('Mounted control not found');
-        expect(mounted.value.mutate).not.toHaveBeenCalled();
-        expect(mounted.sourceRow.delivery_result_timeout_s).toBe(timeout);
-      } finally { await mounted.unmount(); }
-    },
-  );
-
-  it('does not silently strip a foreign timeout from an authored position row', async () => {
-    const mounted = await mountGripper('position_commanded', 'commanded', 2.5);
-    try {
-      expect(() => mounted.field('Motion time')).toThrow('Mounted control not found');
-      expect(mounted.value.mutate).not.toHaveBeenCalled();
-      expect(mounted.sourceRow.delivery_result_timeout_s).toBe(2.5);
     } finally { await mounted.unmount(); }
   });
 
@@ -572,7 +547,7 @@ describe('DeploymentFocusedEditor', () => {
   });
 
   it('clears Stop finish tolerance text and validation on its scoped reset without blurring', async () => {
-    const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+    const mounted = await mountGripper('position_commanded', 'commanded', undefined,
       { stopFinishTolerance: 0.018 });
     const stopInput = () => (
       (mounted.field('Stop finish tolerance').children as Array<{ props: Props }>)[0].props
@@ -1485,7 +1460,7 @@ describe('Grasp confirmation on the gripper settings', () => {
 
   it('clears an invalid stall window on its scoped reset without blurring', async () => {
     const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
-    const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+    const mounted = await mountGripper('position_commanded', 'commanded', undefined,
       { graspConfirmation: authored });
     try {
       const input = windowInput(mounted, 'Stall window min');
@@ -1538,7 +1513,7 @@ describe('Grasp confirmation on the gripper settings', () => {
 
   it('commits a window limit on Enter like the other number fields', async () => {
     const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
-    const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+    const mounted = await mountGripper('position_commanded', 'commanded', undefined,
       { graspConfirmation: authored });
     try {
       await act(() => {
@@ -1558,7 +1533,7 @@ describe('Grasp confirmation on the gripper settings', () => {
 
   it('Escape restores the Draft window without a Draft edit', async () => {
     const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
-    const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+    const mounted = await mountGripper('position_commanded', 'commanded', undefined,
       { graspConfirmation: authored });
     try {
       await act(() => {
@@ -1576,7 +1551,7 @@ describe('Grasp confirmation on the gripper settings', () => {
 
   it('writes nothing when the value equals the Draft', async () => {
     const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
-    const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+    const mounted = await mountGripper('position_commanded', 'commanded', undefined,
       { graspConfirmation: authored });
     try {
       await act(() => windowInput(mounted, 'Stall window min').onBlur?.());
@@ -1587,7 +1562,7 @@ describe('Grasp confirmation on the gripper settings', () => {
 
   it('turns Required off at once: keeps a window as not_required, and removes the field without one', async () => {
     const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
-    const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+    const mounted = await mountGripper('position_commanded', 'commanded', undefined,
       { graspConfirmation: authored });
     try {
       expect(mounted.field('Grasp confirmation').value).toBe('required');
@@ -1609,7 +1584,7 @@ describe('Grasp confirmation on the gripper settings', () => {
   it('selecting Off always writes Off, dropping an incomplete or invalid window', async () => {
     const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
     for (const [min, max] of [['', '0.03'], ['0.04', '0.005']]) {
-      const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+      const mounted = await mountGripper('position_commanded', 'commanded', undefined,
         { graspConfirmation: authored });
       try {
         await setWindow(mounted, min, max);
@@ -1657,7 +1632,7 @@ describe('Grasp confirmation on the gripper settings', () => {
         open_value: true, close_value: false,
       }],
     };
-    const mounted = await mountGripper('pneumatic', 'commanded', undefined, io);
+    const mounted = await mountGripper('pneumatic', 'commanded', io);
     const warning = () => mounted.find((props) => props.className === 'inline-message severity-warning');
     try {
       expect(() => mounted.field('Stall window min')).toThrow('Mounted control not found');
@@ -1670,7 +1645,7 @@ describe('Grasp confirmation on the gripper settings', () => {
   });
 
   it('writes Off on a pneumatic gripper on the select, removing the field', async () => {
-    const mounted = await mountGripper('pneumatic', 'commanded', undefined, undefined, {
+    const mounted = await mountGripper('pneumatic', 'commanded', undefined, {
       graspConfirmation: { policy: 'required' },
     });
     try {
@@ -1687,7 +1662,7 @@ describe('Grasp confirmation on the gripper settings', () => {
       }],
       inputs: { workpiece_grasped: { signal: { controllable_component_id: 'sensors', signal_name: 'part' } } },
     };
-    const mounted = await mountGripper('pneumatic', 'commanded', undefined, io, {
+    const mounted = await mountGripper('pneumatic', 'commanded', io, {
       graspConfirmation: { policy: 'required' },
     });
     try {
@@ -1702,7 +1677,7 @@ describe('Grasp confirmation on the gripper settings', () => {
 
   it('writes a valid gripper field directly without resubmitting the row', async () => {
     const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
-    const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+    const mounted = await mountGripper('position_commanded', 'commanded', undefined,
       { graspConfirmation: authored });
     try {
       await mounted.setDuration(0.25);
@@ -1714,7 +1689,7 @@ describe('Grasp confirmation on the gripper settings', () => {
   });
 
   it('writes the nested row of a mounted tool in a Scenario Draft', async () => {
-    const mounted = await mountGripper('pneumatic', 'commanded', undefined, undefined, { scenarioTool: true });
+    const mounted = await mountGripper('pneumatic', 'commanded', undefined, { scenarioTool: true });
     try {
       await setPolicy(mounted, 'required');
       expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(

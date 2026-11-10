@@ -2312,7 +2312,6 @@ TEST(RetainedExecutionHostUnitAdapter,
   EXPECT_EQ(authored.actuation_kind, "position_commanded");
   EXPECT_EQ(authored.output_mode, core::GripperOutputMode::kCommanded);
   EXPECT_EQ(authored.command_duration_s, 1.0);
-  EXPECT_FALSE(authored.delivery_result_timeout_s.has_value());
   EXPECT_EQ(authored.mount_frame, "robotiq_85_base_link");
   EXPECT_EQ(authored.attach_frame, "robotiq_85_base_link");
   EXPECT_EQ(authored.tcp_frame, "robotiq_85_base_link");

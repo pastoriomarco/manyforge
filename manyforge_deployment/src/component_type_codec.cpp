@@ -726,10 +726,11 @@ void validate_semantics(
     std::span<const QualifiedCapabilityDefinition> capabilities) {
   // A machine owner (tag `machine`) has neither: it holds the
   // machine's connection and process, its members the targets. Neither has
-  // a sensor (tag `sensor`): it only observes.
+  // a sensor (tag `sensor`): it only observes, nor the assistant (tag
+  // `assistant`): it serves the chat.
   const bool target_less =
       std::any_of(type.tags.begin(), type.tags.end(), [](const auto &tag) {
-        return tag == "machine" || tag == "sensor";
+        return tag == "machine" || tag == "sensor" || tag == "assistant";
       });
   if (type.model_roles.empty() && type.command_targets.empty() &&
       !target_less) {

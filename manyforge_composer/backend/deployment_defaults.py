@@ -32,9 +32,10 @@ from .robot_defaults import (
 )
 
 # COMPONENT_DEFAULTS (same source): per component with its own lifecycle
-# (robots, tools, pose sources, AI models, sensors); optional (absent = this
-# default, the host's kDefaultLifecycleBudgetNs). An I/O device authors its
-# own in `io_provider_devices`; a machine owner and an I/O member have none.
+# (robots, tools, pose sources, AI models, sensors, the assistant); optional
+# (absent = this default, the host's kDefaultLifecycleBudgetNs). An I/O device
+# authors its own in `io_provider_devices`; a machine owner and an I/O member
+# have none.
 # Per point-cloud source (a `kind: sensor` component, runtime_kind `sensor`):
 # the bridge's former defaults. The compiler requires them, so they are
 # filled before compile.
@@ -115,7 +116,7 @@ def _defaulted(
 def _has_own_lifecycle_budget(component: dict[str, Any]) -> bool:
     """Whether `configuration.lifecycle_command_timeout_s` belongs to this row:
     every component with `target_settings` (robots, tools, pose sources, AI
-    models, sensors), except an I/O device."""
+    models, sensors, the assistant), except an I/O device."""
 
     configuration = component.get("configuration")
     return (

@@ -38,12 +38,13 @@ function nodeEnvironment() {
 describe('assistant wire parsers', () => {
   it('accepts the exact owner-issued enabled-mode index', () => {
     const parsed = parseAssistantModeIndex({
-      schema_version: 'manyforge.assistant_mode_index.v1',
+      schema_version: 'manyforge.assistant_mode_index.v2',
       retained_bundle_id: 'bundle.1',
       graph_revision: 'graph.1',
       assistant_projection_digest: `sha256:${'3'.repeat(64)}`,
       instrument_registry_digest: `sha256:${'4'.repeat(64)}`,
       ai_model_component_id: 'assistant_model',
+      assistant_component_id: 'assistant',
       node_environment: nodeEnvironment(),
       modes: [{
         mode: 'composer-assistant',
@@ -53,38 +54,68 @@ describe('assistant wire parsers', () => {
           review_policy: 'required',
           session_kind: null,
         },
+        runs_in: ['no_program_active'],
       }],
       source: source(),
     });
     expect(parsed.modes[0]?.mode).toBe('composer-assistant');
+    expect(parsed.modes[0]?.runsIn).toEqual(['no_program_active']);
     expect(parsed.aiModelComponentId).toBe('assistant_model');
+    expect(parsed.assistantComponentId).toBe('assistant');
   });
 
-  it('reports a Deployment without an AI model component as null', () => {
+  it('accepts the empty index of a Deployment without assistant settings', () => {
     const parsed = parseAssistantModeIndex({
-      schema_version: 'manyforge.assistant_mode_index.v1',
+      schema_version: 'manyforge.assistant_mode_index.v2',
       retained_bundle_id: 'bundle.1',
       graph_revision: 'graph.1',
-      assistant_projection_digest: `sha256:${'3'.repeat(64)}`,
+      assistant_projection_digest: null,
       instrument_registry_digest: `sha256:${'4'.repeat(64)}`,
       ai_model_component_id: null,
+      assistant_component_id: null,
       node_environment: nodeEnvironment(),
       modes: [],
       source: source(),
     });
     expect(parsed.aiModelComponentId).toBeNull();
+    expect(parsed.assistantComponentId).toBeNull();
+    expect(parsed.assistantProjectionDigest).toBeNull();
+  });
+
+  it('rejects a mode without runs_in and the v1 index', () => {
+    const index = {
+      schema_version: 'manyforge.assistant_mode_index.v2',
+      retained_bundle_id: 'bundle.1',
+      graph_revision: 'graph.1',
+      assistant_projection_digest: `sha256:${'3'.repeat(64)}`,
+      instrument_registry_digest: `sha256:${'4'.repeat(64)}`,
+      ai_model_component_id: 'assistant_model',
+      assistant_component_id: 'assistant',
+      node_environment: nodeEnvironment(),
+      modes: [{
+        mode: 'composer-assistant',
+        description: 'Draft authoring',
+        grant_policy: { approval_mode: null, review_policy: 'required', session_kind: null },
+      }],
+      source: source(),
+    };
+    expect(() => parseAssistantModeIndex(index)).toThrow(/exact/);
+    expect(() => parseAssistantModeIndex({
+      ...index, schema_version: 'manyforge.assistant_mode_index.v1', modes: [],
+    })).toThrow(/supported version/);
   });
 
   it('rejects stale mode discovery and undeclared fields', () => {
     const stale = source();
     stale.freshness = 'stale';
     expect(() => parseAssistantModeIndex({
-      schema_version: 'manyforge.assistant_mode_index.v1',
+      schema_version: 'manyforge.assistant_mode_index.v2',
       retained_bundle_id: 'bundle.1',
       graph_revision: 'graph.1',
       assistant_projection_digest: `sha256:${'3'.repeat(64)}`,
       instrument_registry_digest: `sha256:${'4'.repeat(64)}`,
       ai_model_component_id: null,
+      assistant_component_id: null,
       node_environment: nodeEnvironment(),
       modes: [],
       source: stale,

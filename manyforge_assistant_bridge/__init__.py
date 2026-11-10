@@ -1,9 +1,8 @@
-"""Bounded assistant bridge plus owner-neutral client/reducer inputs.
+"""Bounded assistant bridge plus its owner-neutral read client.
 
-``bridge`` is the current direct/``nemoclaw`` provider mediator. ``headless``
-exposes the closed read client, ``protocol`` exports the strict current wire,
-and ``supervisor`` keeps only the pure reducer from the superseded fixed
-launcher.
+``bridge`` is the assistant-provider mediator. ``headless``
+exposes the closed read client and ``protocol`` exports the strict current
+wire.
 """
 
-__all__ = ["bridge", "headless", "protocol", "supervisor"]
+__all__ = ["bridge", "headless", "protocol"]

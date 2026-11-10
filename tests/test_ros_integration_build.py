@@ -187,9 +187,9 @@ def test_graph_library_types_survive_identical_reconfigure(
     (graph / "CMakeLists.txt").write_text(
         (ROOT / "scripts/ros/ros-integration/CMakeLists.txt").read_text())
     targets = []
+    # The graph adds these packages; RoboPlan adds the adapter packages itself.
     for package in ("manyforge_core", "manyforge_deployment",
-                    "manyforge_ros2_control_execution", "manyforge_xarm_control",
-                    "manyforge_roboplan"):
+                    "manyforge_ros2_control_execution", "manyforge_roboplan"):
         directory = source / package
         directory.mkdir()
         (directory / "source.cpp").write_text("int main() { return 0; }\n")

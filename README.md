@@ -148,7 +148,7 @@ retention is limited, see the
 [session note](docs/operations/FRESH_CHECKOUT_CHECKLIST.md).
 
 The optional Composer AI tab uses your OpenAI-compatible model server,
-configured through an `ai_model` component and an assistant profile. See the
+configured through an `ai_model` component and an AI assistant component. See the
 [assistant setup guide](docs/operations/ASSISTANT_E2E_COOKBOOK.md).
 
 The [documentation index](docs/INDEX.md) covers the workbench, authoring and

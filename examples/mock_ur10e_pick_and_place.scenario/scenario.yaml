@@ -7,12 +7,12 @@
   "description": "Mock UR10e pick and place with a Robotiq 2F-140 gripper using RoboPlan planning. Load and Execute the Program to watch the arm pick the part and place it.",
   "members": {
     "deployment.yaml": "sha256:7b811cc8af39195a622f9d817a03979b195b02d33dcee40aa39e7acdecdb5f18",
-    "program.yaml": "sha256:be5ae87ece2a239c48fad23d90713f00467ce4821de06b3c824fbaae9f61e987"
+    "program.yaml": "sha256:64329f524be272df93c2db7d6d0c9fc23687eed05444446d76e8b22c3fd6f67b"
   },
   "name": "mock_ur10e_pick_and_place",
   "saved_status": {
-    "checked_content_digest": "sha256:a37d1f3a4b7ee962f554c8d6c8ec1227360506e4eb304e73f4392ef6f3d1aca7",
-    "last_known_status": "ready",
+    "checked_content_digest": "sha256:b5e4bb67556bbaee9b55b5ed7ca4889b631cb20948f64f13af1df59e7f038af2",
+    "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },
   "scenario_id": "mock_ur10e_pick_and_place",

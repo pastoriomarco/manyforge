@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { ComponentStreamsSection } from './ComponentStreamsSection';
 import { PoseSourceComponentSection } from './PoseSourceComponentForm';
 import { AiModelComponentSection } from './AiModelComponentForm';
+import { AssistantComponentSection } from './AssistantComponentForm';
 import { LifecycleBudgetField } from './LifecycleBudgetField';
 import { effectiveField, useEffectiveValues } from '../hooks/useEffectiveValues';
 import type { EffectiveValues } from '../types/components';
@@ -128,11 +129,14 @@ interface RuntimeConfiguration {
   aiModel: boolean;
   /** A sensor (runtime_kind sensor, e.g. the point-cloud source): edited in its own section. */
   sensor: boolean;
+  /** The AI assistant (runtime_kind assistant): edited in its own section. */
+  assistant: boolean;
 }
 
 const POSE_SOURCE_RUNTIME_KIND = 'pose_source';
 const AI_MODEL_RUNTIME_KIND = 'ai_model';
 const SENSOR_RUNTIME_KIND = 'sensor';
+const ASSISTANT_RUNTIME_KIND = 'assistant';
 /** An absolute ROS topic name (the compiler checks it fully). */
 const ROS_TOPIC = /^\/[A-Za-z0-9_/~{}]*$/;
 
@@ -165,7 +169,6 @@ interface GripperTargetConfigurationDraft {
   openStateRef: string;
   closedStateRef: string;
   commandDurationS: number;
-  deliveryResultTimeoutS?: number;
   pneumaticIo?: JsonValue;
   // Opt-in grasp confirmation, kept verbatim; the owner validates it.
   graspConfirmation?: JsonValue;
@@ -224,6 +227,7 @@ function runtimeConfigurations(
         poseSource: configuration.runtime_kind === POSE_SOURCE_RUNTIME_KIND,
         aiModel: configuration.runtime_kind === AI_MODEL_RUNTIME_KIND,
         sensor: configuration.runtime_kind === SENSOR_RUNTIME_KIND,
+        assistant: configuration.runtime_kind === ASSISTANT_RUNTIME_KIND,
       }];
     });
   }
@@ -247,6 +251,7 @@ function runtimeConfigurations(
         poseSource: false,
         aiModel: false,
         sensor: false,
+        assistant: false,
       }]
       : [];
   });
@@ -368,7 +373,6 @@ function gripperTargetConfigurations(
       const openStateRef = row?.open_state_ref;
       const closedStateRef = row?.closed_state_ref;
       const commandDurationS = numberValue(row?.command_duration_s);
-      const deliveryResultTimeoutS = row?.delivery_result_timeout_s;
       const pneumaticIo = row?.pneumatic_io;
       const graspConfirmation = row?.grasp_confirmation;
       const stopFinishTolerance = row?.stop_finish_tolerance;
@@ -386,11 +390,6 @@ function gripperTargetConfigurations(
         || typeof openStateRef !== 'string'
         || typeof closedStateRef !== 'string'
         || commandDurationS === null
-        || (deliveryResultTimeoutS !== undefined
-          && (actuationKind !== 'pneumatic'
-            || typeof deliveryResultTimeoutS !== 'number'
-            || !Number.isFinite(deliveryResultTimeoutS)
-            || deliveryResultTimeoutS <= 0))
         || (stopFinishTolerance !== undefined
           && (actuationKind !== 'position_commanded'
             || typeof stopFinishTolerance !== 'number'
@@ -415,7 +414,6 @@ function gripperTargetConfigurations(
         openStateRef,
         closedStateRef,
         commandDurationS,
-        ...(deliveryResultTimeoutS === undefined ? {} : { deliveryResultTimeoutS }),
         ...(pneumaticIo === undefined ? {} : { pneumaticIo }),
         ...(graspConfirmation === undefined ? {} : { graspConfirmation }),
         ...(stopFinishTolerance === undefined ? {} : { stopFinishTolerance }),
@@ -441,8 +439,6 @@ function gripperConfigurationValue(
     open_state_ref: draft.openStateRef,
     closed_state_ref: draft.closedStateRef,
     command_duration_s: draft.commandDurationS,
-    ...(draft.actuationKind === 'pneumatic' && draft.deliveryResultTimeoutS !== undefined
-      ? { delivery_result_timeout_s: draft.deliveryResultTimeoutS } : {}),
     ...(draft.pneumaticIo === undefined ? {} : { pneumatic_io: draft.pneumaticIo }),
     ...(draft.graspConfirmation === undefined ? {} : { grasp_confirmation: draft.graspConfirmation }),
     ...(draft.actuationKind === 'position_commanded' && draft.stopFinishTolerance !== undefined
@@ -2426,11 +2422,11 @@ export function DeploymentFocusedEditor({
   const runtimes = useMemo(() => runtimeConfigurations(document).filter((runtime) => (
     componentId === null || runtimeHoldsComponent(runtime, componentId)
   )), [componentId, document]);
-  // Model-free components (I/O devices, pose sources, AI models) and sensors
-  // have no robot model, motion, gripper, frame or Stop inputs.
+  // Model-free components (I/O devices, pose sources, AI models, the AI
+  // assistant) and sensors have no robot model, motion, gripper, frame or Stop inputs.
   const motionRuntimes = useMemo(
     () => runtimes.filter((runtime) => (
-      !runtime.ioProvider && !runtime.poseSource && !runtime.aiModel && !runtime.sensor)),
+      !runtime.ioProvider && !runtime.poseSource && !runtime.aiModel && !runtime.sensor && !runtime.assistant)),
     [runtimes]);
   const sensorRuntimes = useMemo(() => runtimes.filter((runtime) => runtime.sensor), [runtimes]);
   const limits = useMemo(() => motionTargetLimits(motionRuntimes)
@@ -2445,7 +2441,7 @@ export function DeploymentFocusedEditor({
   )), [componentId, gripperDescriptors]);
   const effective = useEffectiveValues(controller);
   const ioRuntimes = useMemo(() => runtimes.filter((runtime) => (
-    !runtime.poseSource && !runtime.aiModel && !runtime.sensor)).map((runtime) => ({
+    !runtime.poseSource && !runtime.aiModel && !runtime.sensor && !runtime.assistant)).map((runtime) => ({
     index: runtime.index,
     runtimeUnitId: runtime.runtimeUnitId,
     configuration: runtime.configuration,
@@ -2499,6 +2495,7 @@ export function DeploymentFocusedEditor({
       <PoseSourceComponentSection controller={controller} effective={effective} programSceneIds={programSceneIds}
         scope={scope} />
       <AiModelComponentSection controller={controller} effective={effective} scope={scope} />
+      <AssistantComponentSection controller={controller} effective={effective} scope={scope} />
       {sensorRuntimes.length > 0 && scope !== 'cell' && (
         <SensorSection controller={controller} runtimes={sensorRuntimes} effective={effective} />
       )}

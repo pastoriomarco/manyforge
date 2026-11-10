@@ -3917,7 +3917,7 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
     return Result<ValidatedMotionPlan>::Err(ErrorDTO{
         std::string(to_string(code)), std::move(message), {{"reason", std::move(reason)}}});
   };
-  const auto failure = [&](ErrorDTO error, const char* phase) {
+  const auto phase_failure = [&](ErrorDTO error, const char* phase) {
     if (replacement) {
       error.details.try_emplace("takeover_compute_phase", phase);
       error.details.try_emplace("takeover_preparation_budget_ns",
@@ -3960,7 +3960,7 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
     error.details["planning_elapsed_ns"] =
         std::to_string(std::max<std::int64_t>(0, planning_elapsed_ns));
     error.details["planning_budget_ns"] = std::to_string(planning_timeout_ns);
-    return failure(std::move(error), "candidate_compute");
+    return phase_failure(std::move(error), "candidate_compute");
   }
   if (stop_token.stop_requested()) {
     return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during planning",
@@ -3970,7 +3970,7 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
     const auto original_error = planned.error();
     const auto deadline = planning_start_ns + planning_timeout_ns;
     const auto remaining = deadline - clock_.now();
-    if (!failed_planning) return failure(original_error, "candidate_compute");
+    if (!failed_planning) return phase_failure(original_error, "candidate_compute");
     const auto& result = failed_planning->result;
     const auto reason = original_error.details.find("reason");
     const auto* pose = std::get_if<PoseGoalDTO>(&failed_planning->request.motion);
@@ -3994,7 +3994,7 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
           solved.positions_rad.size() != solved.joint_names.size() ||
           !std::all_of(solved.positions_rad.begin(), solved.positions_rad.end(),
                        [](double value) { return std::isfinite(value); }))
-        return failure(original_error, "candidate_compute");
+        return phase_failure(original_error, "candidate_compute");
 
       // This one-state projection is only input to the collision observer. It
       // is never admitted as an executable or validated motion trajectory.
@@ -4005,17 +4005,17 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
       auto expanded = collision_projector_.expand_for_collision(state, start_state);
       const auto& world_policy = projection_inventory.bundle;
       if (!expanded.ok() || !world_policy.world || !world_policy.policy || clock_.now() >= deadline)
-        return failure(original_error, "candidate_compute");
+        return phase_failure(original_error, "candidate_compute");
       const auto resources = collision_resources_.snapshot();
       const auto engine = std::find_if(resources.validation_engines.begin(), resources.validation_engines.end(),
                                        [](const auto& value) { return static_cast<bool>(value); });
-      if (engine == resources.validation_engines.end()) return failure(original_error, "candidate_compute");
+      if (engine == resources.validation_engines.end()) return phase_failure(original_error, "candidate_compute");
       auto cancel = std::make_shared<CollisionCancellationToken>();
       std::stop_callback stop_collision(stop_token, [cancel]() { cancel->request_cancel("motion_preview_cancelled"); });
       const auto handle = schedule_scoped_deadline_if_attached(deadline,
           [cancel]() { cancel->request_cancel("motion_preview_deadline"); }, SchedulerPriority::Monitoring);
-      if (!handle) return failure(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
-                                          {{"reason", "scheduler_not_ready"}}}, "candidate_compute");
+      if (!handle) return phase_failure(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                                {{"reason", "scheduler_not_ready"}}}, "candidate_compute");
       struct PoseDeadlineGuard {
         ExecutionKernel& owner;
         ScheduleHandle handle;
@@ -4058,7 +4058,7 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
           path_request.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
           path_request.diagnostic_qualified_target = target;
           const auto path_budget = deadline - clock_.now();
-          if (path_budget <= 0) return failure(original_error, "candidate_compute");
+          if (path_budget <= 0) return phase_failure(original_error, "candidate_compute");
           path_request.planning_timeout_s = static_cast<double>(path_budget) / 1e9;
           auto path_result = planner_.plan(path_request);
           if (stop_token.stop_requested()) {
@@ -4089,7 +4089,7 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
           }
         }
       }
-      return failure(original_error, "candidate_compute");
+      return phase_failure(original_error, "candidate_compute");
     }
     const bool cartesian = std::holds_alternative<CartesianPathDTO>(failed_planning->request.motion);
     const bool cartesian_failure = cartesian &&
@@ -4101,7 +4101,7 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
         result.target_qualified && result.qualified_target.has_value();
     const bool eligible = path_preview != nullptr && replacement == nullptr && remaining > 0 &&
         (cartesian_failure || qualified_failure);
-    if (!eligible) return failure(original_error, "candidate_compute");
+    if (!eligible) return phase_failure(original_error, "candidate_compute");
     auto fallback_request = failed_planning->request;
     if (!cartesian) {
       const auto& target = *result.qualified_target;
@@ -4110,20 +4110,20 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
       identity.velocities = fallback_request.start_state.velocities;
       if (identity != fallback_request.start_state || !validate_controlled_state(target).ok() ||
           !angular_position_projection(target).ok())
-        return failure(original_error, "candidate_compute");
+        return phase_failure(original_error, "candidate_compute");
       fallback_request.diagnostic_qualified_target = target;
     }
     fallback_request.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
     const auto fallback_budget = deadline - clock_.now();
-    if (fallback_budget <= 0) return failure(original_error, "candidate_compute");
+    if (fallback_budget <= 0) return phase_failure(original_error, "candidate_compute");
     fallback_request.planning_timeout_s = static_cast<double>(fallback_budget) / 1e9;
     auto fallback = planner_.plan(fallback_request);
     if (stop_token.stop_requested())
       return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during planning",
                     "motion_preview_cancelled");
-    if (clock_.now() >= deadline) return failure(original_error, "candidate_compute");
+    if (clock_.now() >= deadline) return phase_failure(original_error, "candidate_compute");
     if (!fallback.trajectory) {
-      if (!fallback.error) return failure(original_error, "candidate_compute");
+      if (!fallback.error) return phase_failure(original_error, "candidate_compute");
       auto error = *fallback.error;
       const auto diagnostic_reason = error.details.find("reason");
       const auto planner_error = error.details.find("planner_error");
@@ -4142,12 +4142,12 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
       error.details["original_error_message"] = original_error.message;
       if (const auto reason = original_error.details.find("reason"); reason != original_error.details.end())
         error.details["original_error_reason"] = reason->second;
-      return failure(std::move(error), "candidate_compute");
+      return phase_failure(std::move(error), "candidate_compute");
     }
     if (fallback.projection_revision != projection_inventory.projection_binding.projection_revision ||
         fallback.trajectory->resources != request.binding.resources ||
         fallback.trajectory->joint_names != request.binding.model_group_binding.compiled_joint_names) {
-      return failure(ErrorDTO{kErrorInvariantViolation,
+      return phase_failure(ErrorDTO{kErrorInvariantViolation,
           "Diagnostic planner changed the retained projection or resources",
           {{"reason", "diagnostic_planner_projection_mismatch"},
            {"original_error_code", original_error.code},
@@ -4163,7 +4163,7 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
     }
     if (clock_.now() >= deadline) {
       path_preview->reset();
-      return failure(original_error, "candidate_compute");
+      return phase_failure(original_error, "candidate_compute");
     }
     if (*path_preview) (*path_preview)->diagnostic_kind = "collision_disabled_path";
     if (!diagnostic_validation.ok() && diagnostic_validation.error().code != kErrorValidationCollision) {
@@ -4171,9 +4171,9 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
       auto error = diagnostic_validation.error();
       error.details["original_error_code"] = original_error.code;
       error.details["original_error_message"] = original_error.message;
-      return failure(std::move(error), "candidate_compute");
+      return phase_failure(std::move(error), "candidate_compute");
     }
-    return failure(original_error, "candidate_compute");
+    return phase_failure(original_error, "candidate_compute");
   }
 
   auto validated = validate_trajectory(
@@ -4184,7 +4184,7 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
     return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during validation",
                   "motion_preview_cancelled");
   }
-  if (!validated.ok()) return failure(validated.error(), "core_validation");
+  if (!validated.ok()) return phase_failure(validated.error(), "core_validation");
   return Result<ValidatedMotionPlan>::Ok(
       ValidatedMotionPlan{std::move(planned.value()), std::move(validated.value())});
 }
@@ -5912,19 +5912,21 @@ Result<bool> ExecutionKernel::retire_prepared_motion_membership_for_recovery(
   }
   if (!pending || pending->execution_id != candidate_id)
     return Result<bool>::Err(ErrorCode::kMissingReference);
-  const auto rebuilt_capture = rebuilt_source_id != 0U
-      ? std::optional(capture_recovery_authority_locked()) : std::nullopt;
-  const bool rebuilt_unknown = rebuilt_capture &&
-      rebuilt_capture->execution_id == rebuilt_source_id &&
-      rebuilt_capture->execution_state == ExecutionState::kInterventionRequired &&
-      rebuilt_capture->terminal_effect == ParticipantEffectKnowledge::kEffectUncertain &&
-      rebuilt_capture->owner_rebuild_rest_qualified && rebuilt_capture->terminal_cleanup_complete &&
-      !rebuilt_capture->fault_preempt_stop_active && !rebuilt_capture->fault_preempt_worker_active &&
-      !rebuilt_capture->operator_stop_active && !rebuilt_capture->motion_trip_stop_active &&
-      !rebuilt_capture->stronger_authority_active && source &&
-      source->execution_id == rebuilt_source_id && pending->authority.replacement &&
-      pending->authority.replacement->source.execution_id == rebuilt_source_id &&
-      execution_backend_.owner_rebuild_unknown_candidate(rebuilt_source_id, candidate_id);
+  bool rebuilt_unknown = false;
+  if (rebuilt_source_id != 0U) {
+    const auto rebuilt_capture = capture_recovery_authority_locked();
+    rebuilt_unknown =
+        rebuilt_capture.execution_id == rebuilt_source_id &&
+        rebuilt_capture.execution_state == ExecutionState::kInterventionRequired &&
+        rebuilt_capture.terminal_effect == ParticipantEffectKnowledge::kEffectUncertain &&
+        rebuilt_capture.owner_rebuild_rest_qualified && rebuilt_capture.terminal_cleanup_complete &&
+        !rebuilt_capture.fault_preempt_stop_active && !rebuilt_capture.fault_preempt_worker_active &&
+        !rebuilt_capture.operator_stop_active && !rebuilt_capture.motion_trip_stop_active &&
+        !rebuilt_capture.stronger_authority_active && source &&
+        source->execution_id == rebuilt_source_id && pending->authority.replacement &&
+        pending->authority.replacement->source.execution_id == rebuilt_source_id &&
+        execution_backend_.owner_rebuild_unknown_candidate(rebuilt_source_id, candidate_id);
+  }
   if (rebuilt_source_id != 0U && !rebuilt_unknown)
     return Result<bool>::Err(ErrorCode::kExecutionRejected);
   std::optional<StopCertificateRefDTO> settled_certificate;

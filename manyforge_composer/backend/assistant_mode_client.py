@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
+from threading import Lock
 import unicodedata
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 from manyforge_behavior.canonical_artifact import (
     CONTENT_IDENTITY_PREFIX,
@@ -13,6 +14,7 @@ from manyforge_behavior.canonical_artifact import (
     raw_sha256_digest,
 )
 
+from .assistant_catalog_narrowing import resolve_assistant_catalog
 from .node_environment_client import (
     VerifiedActiveNodeEnvironment,
     verify_active_node_environment,
@@ -26,12 +28,15 @@ if TYPE_CHECKING:
     from .state import ComposerState
 
 
-_PROJECTION_VERSION = "manyforge.assistant_mode_projection.v1"
+_PROJECTION_VERSION = "manyforge.assistant_mode_projection.v2"
 _CONTEXT_VERSION = "manyforge.assistant_mode_context.v1"
 _CATALOG_VERSION = "manyforge.assistant_mode_catalog.v1"
 _PROJECTION_FIELDS = {
+    "assistant_component_id",
     "assistant_projection_digest",
     "catalog_hash",
+    "compact_history",
+    "constrained_regeneration",
     "description",
     "grant_policy",
     "graph_revision",
@@ -40,12 +45,22 @@ _PROJECTION_FIELDS = {
     "model_endpoint",
     "node_environment",
     "nodes",
-    "provider",
     "retained_bundle_id",
+    "runs_in",
     "schema_version",
     "skills",
     "source",
+    "stuck_loop_recovery",
     "tools",
+    "types",
+}
+_NODE_FIELDS = {
+    "children",
+    "node_id",
+    "node_schema",
+    "replacement_schema",
+    "summary",
+    "update_schema",
 }
 _SOURCE_FIELDS = {
     "available",
@@ -229,9 +244,17 @@ def _tools(value: Any, mode: str) -> dict[str, dict[str, Any]]:
         tool = _object(raw, path)
         _closed(
             tool,
-            {"description", "effect", "input_schema", "input_schema_hash", "tool_id"},
+            {
+                "argument_types",
+                "description",
+                "effect",
+                "input_schema",
+                "input_schema_hash",
+                "tool_id",
+            },
             path,
         )
+        _object(tool["argument_types"], f"{path}.argument_types")
         tool_id = _text(tool["tool_id"], f"{path}.tool_id", maximum_bytes=256)
         if tool_id <= previous:
             raise _invalid("tools must be unique and canonical-sorted")
@@ -253,12 +276,18 @@ def _nodes(value: Any, node_environment: VerifiedActiveNodeEnvironment) -> list[
     previous = ""
     catalog_ids = {entry.id for entry in node_environment.catalog.entries}
     for index, raw in enumerate(_array(value, "nodes")):
-        row = _object(raw, f"nodes[{index}]")
-        _closed(row, {"node_id"}, f"nodes[{index}]")
-        node_id = _text(row["node_id"], f"nodes[{index}].node_id")
+        path = f"nodes[{index}]"
+        row = _object(raw, path)
+        _closed(row, _NODE_FIELDS, path)
+        node_id = _text(row["node_id"], f"{path}.node_id")
         if node_id <= previous or node_id not in catalog_ids:
             raise _invalid("nodes are unsorted, duplicated, or absent from the catalog")
         previous = node_id
+        _text(row["summary"], f"{path}.summary", maximum_bytes=16_384)
+        children = _object(row["children"], f"{path}.children")
+        _closed(children, {"max", "min"}, f"{path}.children")
+        for field in ("node_schema", "replacement_schema", "update_schema"):
+            _object(row[field], f"{path}.{field}")
         result.append(row)
     return result
 
@@ -296,9 +325,33 @@ def _model_request_contract(value: Any) -> dict[str, Any]:
             "supports_json_object",
             "supports_response_tools",
             "tool_call_family",
-        },
+        }
+        # EXPERIMENTAL optional `reasoning: on|off`; optional `sampling`.
+        | ({"reasoning", "sampling"} & set(contract)),
         "model_endpoint.request_contract",
     )
+    if "sampling" in contract:
+        sampling = _object(contract["sampling"], "model sampling")
+        if not sampling or not set(sampling) <= {"temperature", "top_k", "top_p"}:
+            raise _invalid("model sampling has an unsupported shape")
+        if "temperature" in sampling and not (
+            type(sampling["temperature"]) in {int, float}
+            and math.isfinite(sampling["temperature"])
+            and 0 <= sampling["temperature"] <= 2
+        ):
+            raise _invalid("model sampling temperature is outside its bound")
+        if "top_p" in sampling and not (
+            type(sampling["top_p"]) in {int, float}
+            and math.isfinite(sampling["top_p"])
+            and 0 < sampling["top_p"] <= 1
+        ):
+            raise _invalid("model sampling top_p is outside its bound")
+        if "top_k" in sampling and not (
+            type(sampling["top_k"]) is int and 1 <= sampling["top_k"] <= 1_048_576
+        ):
+            raise _invalid("model sampling top_k is outside its bound")
+    if contract.get("reasoning", "on") not in {"on", "off"}:
+        raise _invalid("model reasoning must be on or off")
     timeout = contract["default_timeout_s"]
     if (
         type(timeout) not in {int, float}
@@ -379,10 +432,9 @@ def verify_active_assistant_mode(
         if environment[field] != expected:
             raise _invalid("assistant mode node environment identities disagree")
 
-    provider = _object(projection["provider"], "provider")
-    _closed(provider, {"provider_alias", "provider_kind"}, "provider")
-    _text(provider["provider_alias"], "provider.provider_alias")
-    _text(provider["provider_kind"], "provider.provider_kind")
+    _text(projection["assistant_component_id"], "assistant_component_id")
+    for cell_state in _array(projection["runs_in"], "runs_in"):
+        _text(cell_state, "runs_in state")
     model = _object(projection["model_endpoint"], "model_endpoint")
     _closed(
         model,
@@ -406,6 +458,10 @@ def verify_active_assistant_mode(
     if request_contract["tool_call_family"] != "openai_chat_tools":
         raise _invalid("direct bridge requires the openai_chat_tools parser family")
 
+    for flag in ("stuck_loop_recovery", "compact_history", "constrained_regeneration"):
+        if type(projection[flag]) is not bool:
+            raise _invalid(f"{flag} must be boolean")
+    _object(projection["types"], "types")
     policy = _grant_policy(projection["grant_policy"], mode)
     tools = _tools(projection["tools"], mode)
     if tools and request_contract["supports_response_tools"] is not True:
@@ -498,31 +554,100 @@ def verify_active_assistant_context(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _VerifiedContextSlot:
+    mode: str
+    etag: str | None
+    context: VerifiedActiveAssistantContext
+    catalog_key: bytes | None = None
+    catalog: dict[str, Any] | None = None
+
+
+class AssistantContextCache:
+    """The last verified assistant-mode context, one slot (OD-93).
+
+    Keyed by the Headless ETag of the context read: the content digests of
+    the mode projection, node environment and source model. Headless answers
+    304 while they are unchanged, so verification and catalog resolution run
+    again only on a change. The lock guards the slot only; reads and
+    verification run outside it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._slot: _VerifiedContextSlot | None = None
+
+    def _current(self) -> _VerifiedContextSlot | None:
+        with self._lock:
+            return self._slot
+
+    def read(self, state: "ComposerState", *, mode: str) -> VerifiedActiveAssistantContext:
+        client = state.headless_client
+        if client is None:
+            raise _invalid("Composer has no configured headless client")
+        slot = self._current()
+        if slot is not None and slot.mode != mode:
+            slot = None
+        try:
+            payload, etag = client.assistant_mode_context_if_changed(
+                mode, slot.etag if slot is not None else None
+            )
+        except Exception as error:
+            code = getattr(error, "code", None)
+            if isinstance(code, str) and code:
+                status_code = getattr(error, "status_code", None)
+                raise ActiveAssistantModeProjectionError(
+                    code,
+                    str(error),
+                    status_code if isinstance(status_code, int) else 503,
+                ) from error
+            raise
+        if payload is None:
+            # A 304 only answers the tag this slot sent.
+            return slot.context
+        context = verify_active_assistant_context(state, payload, mode=mode)
+        with self._lock:
+            self._slot = _VerifiedContextSlot(mode=mode, etag=etag, context=context)
+        return context
+
+    def resolved_catalog(
+        self,
+        context: VerifiedActiveAssistantContext,
+        *,
+        requested_tools: Sequence[str],
+        field_policy: dict[str, Any],
+    ) -> dict[str, Any]:
+        """``resolve_assistant_catalog`` once per verified context and request shape."""
+
+        key = canonical_json_bytes(
+            {"field_policy": field_policy, "requested_tools": list(requested_tools)}
+        )
+        slot = self._current()
+        if slot is not None and slot.context is context and slot.catalog_key == key:
+            return slot.catalog
+        catalog = resolve_assistant_catalog(
+            context.assistant_mode.payload,
+            requested_tools=requested_tools,
+            field_policy=field_policy,
+        )
+        if slot is not None and slot.context is context:
+            with self._lock:
+                if self._slot is slot:
+                    self._slot = replace(slot, catalog_key=key, catalog=catalog)
+        return catalog
+
+
 def read_active_assistant_context(
     state: "ComposerState",
     *,
     mode: str,
 ) -> VerifiedActiveAssistantContext:
-    client = state.headless_client
-    if client is None:
-        raise _invalid("Composer has no configured headless client")
-    try:
-        payload = client.assistant_mode_context(mode)
-    except Exception as error:
-        code = getattr(error, "code", None)
-        if isinstance(code, str) and code:
-            status_code = getattr(error, "status_code", None)
-            raise ActiveAssistantModeProjectionError(
-                code,
-                str(error),
-                status_code if isinstance(status_code, int) else 503,
-            ) from error
-        raise
-    return verify_active_assistant_context(state, payload, mode=mode)
+    return state.assistant_context_cache.read(state, mode=mode)
 
 
 __all__ = [
     "ActiveAssistantModeProjectionError",
+    "AssistantContextCache",
     "VerifiedActiveAssistantContext",
     "VerifiedActiveAssistantMode",
     "read_active_assistant_context",

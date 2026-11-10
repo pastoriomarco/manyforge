@@ -378,7 +378,6 @@ def _load_scenario(
     scenario_id: str,
     *,
     scenario_path: Path | None = None,
-    executable: bool = True,
     on_configuration_applied: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], str]:
     with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer:
@@ -433,21 +432,11 @@ def _load_scenario(
         assert deployment["draft"]["document"]["deployment_artifact_id"] == (
             "ur5e_lite6_wall"
         )
-        if executable:
-            applied = composer.program_applied()
-        else:
-            with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-                applied = headless.request("GET", "/api/program/applied/status")
-            assert applied["executable"] is False
-            assert applied["program_binding_id"] is None
-            assert applied["non_executable"]["unresolved_roles"]
-        origin = applied if executable else applied["origin"]
-        if not executable:
-            assert origin["kind"] == "scenario", applied
-        assert origin["scenario_id"] == scenario_id
+        applied = composer.program_applied()
+        assert applied["scenario_id"] == scenario_id
         return (
             applied,
-            origin["source_document_digest"],
+            applied["source_document_digest"],
         )
 
 
@@ -825,11 +814,47 @@ def test_repeated_project_activation_replaces_one_coherent_publication() -> None
         assert observed[0] != observed[1]
 
 
+@pytest.mark.parametrize("enabled", ["none", "some", "all"])
+def test_reload_works_whatever_was_enabled(enabled: str) -> None:
+    # OD-86: Load is New then Apply, and New always works. A controller domain
+    # whose component was only Prepared has no reconciled active configuration;
+    # the Apply fence pins none for it instead of refusing the New. Covers a
+    # cell with nothing, part (one arm and its gripper; the other arm, its
+    # gripper and I/O members only Prepared) or everything Enabled.
+    with _dual_robot_stack() as stack:
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer:
+            rows = {row["scenario_id"]: row
+                    for row in composer.request("GET", "/api/scenario-documents")["entries"]}
+        path = rows[GROUPED_SCENARIO]["path"]
+
+        def load() -> dict[str, Any]:
+            with _load_request_client(stack.composer_url) as loader:
+                return loader.request("POST", "/api/scenario/load", body={"path": path})
+
+        first = load()
+        assert first["outcome"] == "succeeded", first
+        if enabled == "all":
+            _activate_loaded_components(stack)
+        elif enabled == "some":
+            for component_id in ("ur5e_robot", MOUNTED_GRIPPER["ur5e_robot"]):
+                with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+                    headless.component_actions("enable", [component_id])
+                _wait_lifecycle(stack, [component_id], "enabled")
+        stack.wait_authoring_admission(expected_allowed=True)
+
+        reloaded = load()
+        assert reloaded["outcome"] == "succeeded", reloaded
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            states = _component_states(headless)
+        assert states and all(row["lifecycle"] == "prepared" for row in states.values()), states
+
+
 def _write_mixed_variants(
     stack: ProcessStack, kinds: tuple[str, ...]
 ) -> dict[str, Path]:
-    """Writes GROUPED variants: `single` keeps only lite6, `solo` also keeps
-    only lite6's Program branch so the survivor stays executable, `replace`
+    """Writes GROUPED variants: `single` keeps only lite6 and its Program
+    branch (a Program may not reference a removed component), `solo` also adds
+    a target-scoped FK check, `replace`
     changes only ur5e's controller input so lite6 is retained by the
     component delta, and `move` changes only ur5e's root pose, which is
     shared cell planning model rather than controller identity, so both
@@ -879,13 +904,14 @@ def _write_mixed_variants(
                 row for row in candidate["deployment_draft"]["attachments"]
                 if row["parent"]["component_id"] in kept and row["child"]["component_id"] in kept
             ]
-        if kind in ("solo", "solo_cartesian"):
             program = candidate["program_draft"]
             for root in program["forest"]:
                 root["children"] = [
                     child for child in root["children"]
                     if child["instance_id"] != "ur5e_joint_motion"
                 ]
+        if kind in ("solo", "solo_cartesian"):
+            program = candidate["program_draft"]
             # This maintained node has a real target-scoped FK requirement;
             # its direct references also retain the exact base used below.
             program["forest"][0]["children"].append({
@@ -1332,7 +1358,6 @@ def test_mixed_apply_preserves_survivor_and_observations_during_publication() ->
                         _load_scenario(
                             stack, GROUPED_SCENARIO,
                             scenario_path=None if kind == "restore" else paths[kind],
-                            executable=kind != "single",
                         )
                         # _load_scenario enabled the rebuilt components again.
                         assert _component_states(headless)["lite6_robot"]["lifecycle"] == "enabled"

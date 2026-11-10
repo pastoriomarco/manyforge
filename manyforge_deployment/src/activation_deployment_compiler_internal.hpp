@@ -44,8 +44,7 @@ namespace manyforge::deployment::detail {
     const std::vector<QualifiedRuntimeProfile> &runtime_profiles,
     const std::vector<ActivationPreparedIoType> &io_types = {},
     std::span<const QualifiedProviderManifest> provider_manifests = {},
-    const std::optional<ActivationAssistantProfile> &assistant_profile =
-        std::nullopt,
+    const ActivationAssistantProfiles &assistant_profiles = {},
     std::span<const QualifiedComponentType> component_types = {});
 
 /// The default TCP compiled into a component's graph row. Its

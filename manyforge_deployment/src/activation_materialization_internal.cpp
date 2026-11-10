@@ -934,10 +934,8 @@ qualify_catalog(const std::filesystem::path &root,
       target_capabilities.push_back(capability);
     }
   }
-  // One native component type per model family plus the fixed-scale ROS type
-  // of every family with an Isaac or offline mock controller profile,
-  // and the arm-only fixed-scale type of every family with a Real
-  // profile. Generated per family, so no fixed count; each
+  // One component type per model family, plus an arm-only type where a Real
+  // profile needs one. Generated per family, so no fixed count; each
   // file is still fully qualified and must find every target capability it
   // selects (a missing one is refused by its qualification).
   for (const auto &path : source_files(catalog_root / "component_type")) {
@@ -1170,8 +1168,12 @@ PreparedActivationMaterialization materialize_prepared_activation(
   for (auto &prepared :
        prepare_activation_sensor_types(intent, component_profiles))
     io_types.push_back(std::move(prepared));
-  const auto assistant_profile =
-      resolve_activation_assistant_profile(workspace_root, intent);
+  // The assistant: likewise.
+  for (auto &prepared :
+       prepare_activation_assistant_types(intent, component_profiles))
+    io_types.push_back(std::move(prepared));
+  const auto assistant_profiles =
+      resolve_activation_assistant_profiles(workspace_root, intent, component_profiles);
   for (const auto &prepared : io_types) {
     const auto &reference = prepared.type.reference();
     input_source.add(reference.content_addressed_store_key,
@@ -1192,7 +1194,7 @@ PreparedActivationMaterialization materialize_prepared_activation(
     compiled = compile_activation_deployment(
         intent, runtime_cell_id, component_profiles, prepared_models,
         catalog_records, catalog.runtime_profiles, io_types,
-        catalog.provider_manifests, assistant_profile, catalog.component_types);
+        catalog.provider_manifests, assistant_profiles, catalog.component_types);
   } catch (const std::bad_alloc &) {
     throw std::runtime_error(
         "activation Deployment compiler exhausted memory");

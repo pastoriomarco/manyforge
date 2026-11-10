@@ -46,7 +46,11 @@ from manyforge_headless_api.models import (
 )
 from manyforge_headless_api.native import HeadlessApiError, ViewerModelAsset
 from manyforge_headless_api.program_runner_client import ProgramRunnerClientError
-from manyforge_headless_api.service import HeadlessService, TrustedAttribution
+from manyforge_headless_api.service import (
+    HeadlessService,
+    TrustedAttribution,
+    _assistant_mode,
+)
 
 
 def test_scene_clear_unknown_preserves_typed_cause() -> None:
@@ -268,6 +272,7 @@ def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("invalid_request") == 400
     assert _error_status("full_stack_restart_required") == 409
     assert _error_status("assistant_ai_model_absent") == 503
+    assert _error_status("assistant_component_absent") == 409
     assert _error_status("operator_alarm_interlock_active") == 409
     # Preparation refuses the input before any claim or effect.
     assert _error_status("activation_preparation_failed") == 409
@@ -619,9 +624,12 @@ class FakeCore:
             },
         }
 
+    capability_offers: list[str] = []
+
     def node_environment_projection(self) -> dict[str, Any]:
         return {
-            "capability_offers": [],
+            "availability": {"implementations": [], "manager_runtime_converged": True},
+            "capability_offers": list(self.capability_offers),
             "schema_version": "manyforge.node_environment_projection.v2",
             "retained_bundle_id": "bundle.1",
             "graph_revision": "graph.1",
@@ -652,6 +660,7 @@ class FakeCore:
                 "available": True,
                 "freshness": "fresh",
                 "known_gaps": [],
+                "source_content_digest": "sha256:" + "d" * 64,
                 "source_owner_id": "headless-api.source-model",
             },
         }
@@ -752,29 +761,47 @@ class FakeCore:
 
     def assistant_mode_projection(self, mode_id: str) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.assistant_mode_projection.v1",
+            "schema_version": "manyforge.assistant_mode_projection.v2",
             "mode": mode_id,
+            "assistant_component_id": "assistant",
+            "runs_in": ["no_program_active"],
             "retained_bundle_id": "bundle.1",
             "graph_revision": "graph.1",
+            "grant_policy": {
+                "approval_mode": None,
+                "review_policy": "required",
+                "session_kind": None,
+            },
+            "skills": [],
+            "compact_history": False,
+            "constrained_regeneration": False,
+            "stuck_loop_recovery": True,
+            "tools": [
+                {"effect": "read_only", "tool_id": "catalog_read"},
+                {"effect": "composer_draft_mutating", "tool_id": "tree_draft_insert_node"},
+            ],
             "source": {
                 "available": True,
                 "freshness": "fresh",
                 "known_gaps": [],
+                "source_content_digest": "sha256:" + "c" * 64,
                 "source_owner_id": "headless-api.assistant-mode",
             },
         }
 
     def assistant_mode_index(self) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.assistant_mode_index.v1",
+            "schema_version": "manyforge.assistant_mode_index.v2",
             "retained_bundle_id": "bundle.1",
             "graph_revision": "graph.1",
             "ai_model_component_id": "assistant_model",
+            "assistant_component_id": "assistant",
             "modes": [
                 {
                     "mode": "composer-assistant",
                     "description": "Draft authoring",
                     "grant_policy": {},
+                    "runs_in": ["no_program_active"],
                 }
             ],
             "source": {
@@ -1859,9 +1886,16 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         assert [row["mode"] for row in assistant_modes["modes"]] == [
             "composer-assistant"
         ]
+        # Index and projection v2 carry the assistant component and each
+        # mode's cell states unchanged from the native core; no provider.
+        assert assistant_modes["assistant_component_id"] == "assistant"
+        assert assistant_modes["modes"][0]["runs_in"] == ["no_program_active"]
         assistant_mode = client.get("/api/assistant/modes/composer-assistant").json()
         assert assistant_mode["mode"] == "composer-assistant"
         assert assistant_mode["retained_bundle_id"] == "bundle.1"
+        assert assistant_mode["assistant_component_id"] == "assistant"
+        assert assistant_mode["runs_in"] == ["no_program_active"]
+        assert "provider" not in assistant_mode
         assistant_context = client.get(
             "/api/assistant/modes/composer-assistant/context"
         ).json()
@@ -1869,6 +1903,13 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
             "manyforge.assistant_mode_context.v1"
         )
         assert assistant_context["assistant_mode"]["mode"] == ("composer-assistant")
+        assert assistant_context["assistant_mode"] == assistant_mode | {
+            "source": assistant_context["assistant_mode"]["source"]
+        }
+        assert "capability_offers" not in assistant_context["node_environment"]
+        assert assistant_modes["instrument_registry_digest"] == (
+            assistant_mode["instrument_registry_digest"]
+        )
         assert client.get("/api/scene").status_code == 200
         assert client.get("/api/execution/alarms").json()["requested_limit"] == 32
         alarms = client.get(
@@ -2029,33 +2070,46 @@ def _palette_row(projection: dict[str, Any], node_id: str) -> dict[str, Any]:
                 if row["node_id"] == node_id)
 
 
-def test_palette_model_api_uses_applied_endpoint_and_model_configuration() -> None:
+_ASSISTANT_NODE_IDS = (
+    "assistant.build_scene_selection",
+    "assistant.query_model",
+    "assistant.validate_scene_selection",
+)
+
+
+def test_palette_assistant_nodes_need_the_model_query_offer() -> None:
     applied = _applied_projection(_program_document())
-    absent = _palette_projection(applied)
-    row = _palette_row(absent, "assistant.query_model")
-    assert row["authoring_available"] is True
-    assert row["binding_available"] is False
-    assert row["reasons"] == [{"code": "model_not_configured",
-                                "message": "No model is configured",
-                                "details": {}}]
-    for node_id in ("assistant.build_scene_selection", "assistant.validate_scene_selection"):
-        row = _palette_row(absent, node_id)
-        assert row["authoring_available"] is True
-        assert row["binding_available"] is True
-        assert row["execution_available"] is True
-        assert row["reasons"] == []
-    applied["assistant_mode"] = "optional"
-    applied["assistant_projection"] = {
-        "model_endpoint_aliases": [{"external_resource_alias": "model.1"}],
-        "ai_models": [{"controllable_component_id": "model.1"}],
-    }
-    configured = _palette_projection(applied)
-    row = _palette_row(configured, "assistant.query_model")
-    assert row["binding_available"] is True
-    assert row["execution_available"] is True
-    assert row["reasons"] == []
-    applied["assistant_projection"]["ai_models"][0]["controllable_component_id"] = "other"
-    assert _palette_row(_palette_projection(applied), "assistant.query_model")["binding_available"] is False
+    all_offers = _node_availability_fixture(applied)[0]["capability_offers"]
+    assert "assistant.model.query" in all_offers
+    without = [offer for offer in all_offers if offer != "assistant.model.query"]
+    for offers, available in ((without, False), (all_offers, True)):
+        palette = _palette_projection(applied, offers)
+        # The palette and the assistant node set read the same offers.
+        assistant_nodes = {
+            row["node_id"]
+            for row in _assistant_mode(
+                {
+                    "grant_policy": {},
+                    "mode": "composer-assistant",
+                    "schema_version": "manyforge.assistant_mode_projection.v2",
+                    "skills": [],
+                    "tools": [],
+                    "source": {"available": True},
+                },
+                offers,
+            )["nodes"]
+        }
+        for node_id in _ASSISTANT_NODE_IDS:
+            row = _palette_row(palette, node_id)
+            assert row["authoring_available"] is True
+            assert row["binding_available"] is available
+            assert row["execution_available"] is available
+            assert (node_id in assistant_nodes) is available
+            assert row["reasons"] == ([] if available else [{
+                "code": "capability_not_offered",
+                "message": "No component offers assistant.model.query",
+                "details": {"capability": "assistant.model.query"},
+            }])
 
 
 def test_palette_gripper_and_multiple_capability_requirements() -> None:
@@ -3889,6 +3943,18 @@ def test_request_body_bound_is_enforced_before_model_decode() -> None:
         )
     assert response.status_code == 413, response.text
     assert response.json()["detail"]["code"] == "headless_request_body_oversized"
+
+
+def test_reference_validation_takes_candidate_sized_bodies() -> None:
+    # The Deployment's model sources make this body larger than a standard one.
+    client, _core, _manager = _client()
+    with client:
+        response = client.post(
+            "/api/program/reference-validation",
+            content=b"x" * (1024 * 1024 + 1),
+            headers={"content-type": "application/json"},
+        )
+    assert response.status_code != 413, response.text
 
 
 def test_streamed_request_body_bound_is_enforced_without_content_length() -> None:
@@ -5748,7 +5814,7 @@ def test_cartesian_diagnostic_failure_details_survive_http() -> None:
 def test_reference_validation_is_read_only_and_preserves_generation() -> None:
     class CandidatePreparer:
         def validate_program_references(self, **_kwargs):
-            return {"diagnostics": [], "total_count": 0, "truncated": False, "selector_facts": {key: [] for key in ("components", "targets", "signals", "frames", "bodies")}}
+            return {"diagnostics": [], "total_count": 0, "truncated": False, "selector_facts": {key: [] for key in ("components", "targets", "signals", "frames", "bodies", "rules")}}
 
     service = _service(FakeCore(), FakeManager(), activation_preparer=CandidatePreparer())
     def unexpected_admission():
@@ -5760,7 +5826,7 @@ def test_reference_validation_is_read_only_and_preserves_generation() -> None:
     digest = "sha256:" + "0" * 64
     response = TestClient(create_app(service=service)).post(
         "/api/program/reference-validation",
-        json={"schema_version": "manyforge.program_reference_validation_request.v2",
+        json={"schema_version": "manyforge.program_reference_validation_request.v3",
               "workspace_generation": generation, "program_content_digest": digest,
               "program": {}, "draft": True, "deployment": {}, "model_source_closure": {}},
     )
@@ -5769,8 +5835,35 @@ def test_reference_validation_is_read_only_and_preserves_generation() -> None:
         "schema_version": "manyforge.program_reference_validation_response.v2",
         "workspace_generation": generation, "program_content_digest": digest,
         "diagnostics": [], "total_count": 0, "truncated": False,
-        "selector_facts": {key: [] for key in ("components", "targets", "signals", "frames", "bodies")},
+        "selector_facts": {key: [] for key in ("components", "targets", "signals", "frames", "bodies", "rules")},
     }
+
+
+def test_reference_validation_takes_exactly_one_model_source_form() -> None:
+    forwarded = []
+    class CandidatePreparer:
+        def validate_program_references(self, **kwargs):
+            forwarded.append(kwargs)
+            if kwargs["model_source_closure"] is None:
+                raise HeadlessApiError("model_sources_unknown", "unknown")
+            return {"diagnostics": [], "total_count": 0, "truncated": False, "selector_facts": {key: [] for key in ("components", "targets", "signals", "frames", "bodies", "rules")}}
+
+    client = TestClient(create_app(service=_service(FakeCore(), FakeManager(), activation_preparer=CandidatePreparer())))
+    base = {"schema_version": "manyforge.program_reference_validation_request.v3",
+            "workspace_generation": {"workspace_epoch": "epoch", "workspace_revision": 1,
+                                     "program_draft_id": "program", "program_draft_revision": 2,
+                                     "deployment_draft_id": "deployment", "deployment_draft_revision": 3},
+            "program_content_digest": "sha256:" + "0" * 64, "program": {}, "draft": True, "deployment": {}}
+    source_digest = "sha256:" + "1" * 64
+    for extra in ({}, {"model_source_closure": {}, "model_source_closure_digest": source_digest},
+                  {"model_source_closure_digest": "1" * 64}):
+        assert client.post("/api/program/reference-validation", json={**base, **extra}).status_code == 422
+    assert forwarded == []
+    assert client.post("/api/program/reference-validation", json={**base, "model_source_closure": {}}).status_code == 200
+    response = client.post("/api/program/reference-validation", json={**base, "model_source_closure_digest": source_digest})
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "model_sources_unknown"
+    assert [(row["model_source_closure"], row["model_source_closure_digest"]) for row in forwarded] == [({}, None), (None, source_digest)]
 
 
 def test_component_frame_lookup_is_correlated_and_read_only() -> None:
@@ -5802,9 +5895,9 @@ def test_candidate_response_overflow_is_typed_and_never_truncated() -> None:
         def validate_program_references(self, **_kwargs):
             return {"diagnostics": [], "total_count": 0, "truncated": False,
                     "selector_facts": {"components": [{"component_id": "x" * (16 * 1024 * 1024)}],
-                                       "targets": [], "signals": [], "frames": [], "bodies": []}}
+                                       "targets": [], "signals": [], "frames": [], "bodies": [], "rules": []}}
     request = ProgramReferenceValidationRequest.model_validate({
-        "schema_version": "manyforge.program_reference_validation_request.v2",
+        "schema_version": "manyforge.program_reference_validation_request.v3",
         "workspace_generation": {"workspace_epoch": "e", "workspace_revision": 1,
             "program_draft_id": "p", "program_draft_revision": 0,
             "deployment_draft_id": "d", "deployment_draft_revision": 0},
@@ -5859,3 +5952,130 @@ def test_manager_reference_refusal_crosses_socket_to_http(tmp_path: Path, monkey
         server.close()
         worker.join(timeout=2)
     assert not worker.is_alive()
+
+
+# OD-93: assistant projection reads carry a strong content ETag.
+
+
+def _fresh_source(digest: str, epoch: str = "headless.epoch.1") -> dict[str, Any]:
+    return {
+        "available": True,
+        "freshness": "fresh",
+        "known_gaps": [],
+        "projection_owner_epoch": epoch,
+        "receiver_age_ns": 7,
+        "source_content_digest": digest,
+    }
+
+
+def _conditional_app(reads: dict[str, Any]) -> TestClient:
+    from types import SimpleNamespace
+
+    # Only the three routes are exercised (no lifespan): a read-only stub.
+    service = SimpleNamespace(
+        assistant_mode=lambda mode_id: copy.deepcopy(reads["mode"]),
+        node_environment=lambda: copy.deepcopy(reads["environment"]),
+        assistant_mode_context=lambda mode_id: copy.deepcopy(reads["context"]),
+    )
+    return TestClient(create_app(service=service))  # type: ignore[arg-type]
+
+
+def _conditional_reads(epoch: str = "headless.epoch.1") -> dict[str, Any]:
+    mode = {"mode": "composer-assistant", "source": _fresh_source("sha256:" + "1" * 64, epoch)}
+    environment = {
+        "availability": {"execution_available": True},
+        "source": _fresh_source("sha256:" + "2" * 64, epoch),
+    }
+    source_model = {"source": _fresh_source("sha256:" + "3" * 64, epoch)}
+    return {
+        "mode": mode,
+        "environment": environment,
+        "context": {
+            "assistant_mode": mode,
+            "node_environment": environment,
+            "schema_version": "manyforge.assistant_mode_context.v1",
+            "source_model": source_model,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/assistant/modes/composer-assistant",
+        "/api/assistant/modes/composer-assistant/context",
+        "/api/node-environment",
+    ],
+)
+def test_assistant_projection_reads_answer_304_for_the_same_content(path: str) -> None:
+    reads = _conditional_reads()
+    client = _conditional_app(reads)
+    first = client.get(path)
+    assert first.status_code == 200
+    etag = first.headers["etag"]
+    assert etag.startswith('"') and etag.endswith('"') and len(etag) == 66
+    assert first.json() == reads["context" if path.endswith("/context") else (
+        "environment" if path == "/api/node-environment" else "mode")]
+
+    again = client.get(path, headers={"If-None-Match": etag})
+    assert again.status_code == 304
+    assert again.content == b""
+    assert again.headers["etag"] == etag
+
+    # A restarted Headless (new epoch and ages, same content) keeps the tag.
+    restarted = _conditional_app(_conditional_reads("headless.epoch.2"))
+    assert restarted.get(path, headers={"If-None-Match": etag}).status_code == 304
+
+    # Different content: a full answer with a different tag.
+    changed = _conditional_reads()
+    changed["mode"]["source"]["source_content_digest"] = "sha256:" + "4" * 64
+    changed["environment"]["source"]["source_content_digest"] = "sha256:" + "4" * 64
+    moved = _conditional_app(changed).get(path, headers={"If-None-Match": etag})
+    assert moved.status_code == 200
+    assert moved.headers["etag"] != etag
+
+    # A source that is not fresh is never answered from the reader's copy.
+    stale = _conditional_reads()
+    stale["mode"]["source"]["freshness"] = "stale"
+    stale["environment"]["source"]["freshness"] = "stale"
+    refused = _conditional_app(stale).get(path, headers={"If-None-Match": etag})
+    assert refused.status_code == 200
+    assert "etag" not in refused.headers
+
+
+def test_node_environment_etag_covers_the_runner_joined_availability() -> None:
+    reads = _conditional_reads()
+    etag = _conditional_app(reads).get("/api/node-environment").headers["etag"]
+    reads["environment"]["availability"] = {"execution_available": False}
+    joined = _conditional_app(reads).get(
+        "/api/node-environment", headers={"If-None-Match": etag}
+    )
+    assert joined.status_code == 200
+    assert joined.headers["etag"] != etag
+
+
+def test_headless_client_conditional_reads_return_none_on_304() -> None:
+    from manyforge_headless_api.client import HeadlessHttpClient
+
+    reads = _conditional_reads()
+    client = HeadlessHttpClient("http://testserver", client=_conditional_app(reads))
+    payload, etag = client.assistant_mode_context_if_changed("composer-assistant", None)
+    assert payload == reads["context"] and etag is not None
+    assert client.assistant_mode_context_if_changed("composer-assistant", etag) == (
+        None,
+        etag,
+    )
+    mode, mode_etag = client.assistant_mode_if_changed("composer-assistant", None)
+    assert mode == reads["mode"]
+    assert client.assistant_mode_if_changed("composer-assistant", mode_etag) == (
+        None,
+        mode_etag,
+    )
+    environment, environment_etag = client.node_environment_if_changed(None)
+    assert environment == reads["environment"]
+    assert client.node_environment_if_changed(environment_etag) == (
+        None,
+        environment_etag,
+    )
+    # Plain reads are unchanged.
+    assert client.assistant_mode("composer-assistant") == reads["mode"]

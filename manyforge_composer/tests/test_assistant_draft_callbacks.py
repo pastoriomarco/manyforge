@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import pytest
 
 from manyforge_behavior.canonical_artifact import (
     CONTENT_IDENTITY_PREFIX,
@@ -20,8 +21,10 @@ from manyforge_composer.backend.assistant_catalog_narrowing import (
     resolve_assistant_catalog,
 )
 from manyforge_composer.backend.assistant_mode_client import (
+    ActiveAssistantModeProjectionError,
     VerifiedActiveAssistantContext,
     VerifiedActiveAssistantMode,
+    _model_request_contract,
     verify_active_assistant_mode,
 )
 from manyforge_composer.backend.node_environment_client import (
@@ -37,13 +40,6 @@ _PROGRAM_PATH = (
 )
 _ASSISTANT_FORBIDDEN_PROGRAM_PATH = (
     _REPOSITORY_ROOT / "examples" / "pick_and_place_minimal.program.yaml"
-)
-_REGISTRY_PATH = (
-    _REPOSITORY_ROOT
-    / "manyforge_deployment"
-    / "resources"
-    / "assistant"
-    / "assistant_instrument_registry_source.v1.json"
 )
 _MANAGER_DIGEST = "sha256:" + "1" * 64
 _NODE_PROJECTION_DIGEST = "sha256:" + "2" * 64
@@ -142,30 +138,26 @@ def _source_model(node_environment: VerifiedActiveNodeEnvironment):
 def _assistant_context(
     node_environment: VerifiedActiveNodeEnvironment,
     tool_id: str = "scene_draft_add_object",
+    node_ids: list[str] | None = None,
 ) -> VerifiedActiveAssistantContext:
     return VerifiedActiveAssistantContext(
         node_environment=node_environment,
         source_model=_source_model(node_environment),
-        assistant_mode=_assistant_mode(node_environment, tool_id),
+        assistant_mode=_assistant_mode(node_environment, tool_id, node_ids or []),
     )
 
 
 def _assistant_mode(
     node_environment: VerifiedActiveNodeEnvironment,
     tool_id: str = "scene_draft_add_object",
+    node_ids: list[str] | None = None,
 ) -> VerifiedActiveAssistantMode:
-    registry = json.loads(_REGISTRY_PATH.read_text(encoding="utf-8"))
-    source_tool = next(
-        row for row in registry["tools"] if row["tool_id"] == tool_id
-    )
-    schema = source_tool["input_schema"]
-    tool = {
-        "description": source_tool["description"],
-        "effect": source_tool["effect"],
-        "input_schema": schema,
-        "input_schema_hash": raw_sha256_digest(canonical_json_bytes(schema)),
-        "tool_id": source_tool["tool_id"],
-    }
+    from manyforge_headless_api.service import _assistant_instruments
+
+    # The tool descriptor as Headless builds it from the loaded catalog.
+    effect = ("read_only" if tool_id.endswith(("_read", "_validate", "_inspect"))
+              else "composer_draft_mutating")
+    tool = _assistant_instruments()._tool_row(tool_id, effect, node_ids or [])
     policy = {
         "approval_mode": None,
         "review_policy": "required",
@@ -180,7 +172,8 @@ def _assistant_mode(
     }
     environment = node_environment.payload
     projection = {
-        "schema_version": "manyforge.assistant_mode_projection.v1",
+        "schema_version": "manyforge.assistant_mode_projection.v2",
+        "assistant_component_id": "assistant",
         "assistant_projection_digest": _ASSISTANT_PROJECTION_DIGEST,
         "catalog_hash": _framed(
             "assistant-mode-catalog",
@@ -210,17 +203,18 @@ def _assistant_mode(
         },
         "node_environment": dict(environment["package_environment"]),
         "nodes": [],
-        "provider": {
-            "provider_alias": "assistant_provider",
-            "provider_kind": "direct",
-        },
         "retained_bundle_id": "bundle.1",
+        "runs_in": ["no_program_active"],
         "skills": [],
+        "compact_history": False,
+        "constrained_regeneration": False,
+        "stuck_loop_recovery": True,
         "tools": [tool],
+        "types": _assistant_instruments()._all_types(node_ids or []),
     }
     projection_digest = _framed(
         "manyforge-assistant-mode-projection-semantic",
-        "manyforge.assistant_mode_projection.v1",
+        "manyforge.assistant_mode_projection.v2",
         projection,
     )
     projection["source"] = _selection_source(
@@ -512,6 +506,7 @@ def test_allowed_tool_schema_error_is_a_non_mutating_http_200_result(
     assert result["nextAdmissionGeneration"] == 7
     assert result["result"]["kind"] == "validation_error"
     assert result["result"]["httpStatus"] == 400
+    assert result["result"]["detail"]["code"] == "assistant_callback_arguments_invalid"
     assert state.draft_session.snapshot() == before
     assert state.headless_client.claims == []
 
@@ -816,3 +811,424 @@ def test_real_bridge_reports_claimless_draft_edits_and_refuses_a_stale_fence(
     assert responses[2][1]["detail"]["code"] == "composer_workspace_stale"
     assert (stale.get("response") or {}).get("draftMutated") is not True, stale
     assert state.draft_session.snapshot() == after
+
+
+def test_scene_inspect_callback_returns_the_draft_scene(monkeypatch) -> None:
+    node_environment = _node_environment()
+    context = _assistant_context(node_environment, "scene_inspect")
+    state = ComposerState(
+        node_environment=build_node_environment(),
+        headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
+    )
+    draft = state.draft_session.snapshot()
+    draft["program_loaded"] = True
+    draft["authoring"] = {"schema_version": "manyforge.composer_authoring_forest.v2",
+                          "forest": [], "scene": [_resource("draft_only")]}
+    monkeypatch.setattr(state.draft_session, "snapshot", lambda: deepcopy(draft))
+    from manyforge_composer.backend import routes_assistant_draft as route
+    monkeypatch.setattr(route, "read_active_assistant_context", lambda _state, *, mode: context)
+    body = _body(state, node_environment, context.source_model, context.assistant_mode)
+    body["arguments"] = {}
+    response = TestClient(create_app(state)).post(
+        "/api/assistant/bridge/tools/scene_inspect", json=body)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["mutated"] is False
+    assert result["result"]["details"] == {"scene": [_resource("draft_only")]}
+
+
+def _callback_case(tool_id: str, session) -> dict:
+    """Valid arguments for each tool whose named type uses local references."""
+
+    scene = session.snapshot()["authoring"]["scene"][0]
+    return {
+        # node: a real motion node, shape-valid (its target is a Draft diagnostic).
+        "tree_draft_insert_node": {"parent_instance_id": "@root", "node": {
+            "node_id": "motion.move_to_pose", "instance_id": "assistant_approach",
+            "parameters": {"velocity_scale": 0.3}, "children": []}},
+        "blackboard_draft_upsert_keys": {"keys": [{
+            "key": "scratch.flag", "type": "bool", "access": "read_write",
+            "persistence": "run"}]},
+        "program_draft_upsert_parameters": {"parameters": [{
+            "parameter_id": "assistant_speed", "type": "float64", "default": 0.5,
+            "constraints": {}}]},
+        "scene_draft_update_object": {"scene_resource": {
+            "scene_resource_id": scene["scene_resource_id"], "shape": scene["shape"],
+            "pose": scene["pose"]}},
+    }[tool_id]
+
+
+@pytest.mark.parametrize("tool_id", [
+    "tree_draft_insert_node", "blackboard_draft_upsert_keys",
+    "program_draft_upsert_parameters", "scene_draft_update_object",
+])
+def test_typed_arguments_with_local_references_validate_in_composer(
+    monkeypatch, tool_id: str
+) -> None:
+    node_environment = _node_environment()
+    environment = build_node_environment()
+    from manyforge_headless_api.service import _assistant_instruments
+
+    context = _assistant_context(
+        node_environment, tool_id, [entry.id for entry in _assistant_instruments().entries()])
+    state = ComposerState(
+        node_environment=environment,
+        program=Program(_PROGRAM_PATH, environment.catalog),
+        program_source_path=str(_PROGRAM_PATH),
+        headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
+    )
+    if tool_id == "blackboard_draft_upsert_keys":
+        state.draft_session.mutate(
+            tool_id="blackboard_draft_upsert_namespaces",
+            arguments={"namespaces": [{"namespace_id": "scratch", "owner": "program"}]},
+            expected_revision=state.draft_session.revision,
+            catalog=environment.catalog,
+        )
+    from manyforge_composer.backend import routes_assistant_draft as route
+    monkeypatch.setattr(route, "read_active_assistant_context", lambda _state, *, mode: context)
+    body = _body(state, node_environment, context.source_model, context.assistant_mode)
+    body["arguments"] = _callback_case(tool_id, state.draft_session)
+    response = TestClient(create_app(state)).post(
+        f"/api/assistant/bridge/tools/{tool_id}", json=body)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["success"] is True, result["result"]
+    assert result["draftMutated"] is True
+
+
+def _grasp_policy(policy_id: str = "assistant_grasp") -> dict:
+    return {
+        "api_version": "manyforge.contact_policy.v1",
+        "policy_id": policy_id,
+        "mode": "contact_grasp",
+        "sensing_mode": "geometry_only",
+        "default_unmatched_response": "hard_stop",
+        "zones": [{
+            "zone_id": "fingertips",
+            "body_pairs": [{
+                "body_a": {"kind": "motion_endpoint"},
+                "body_b": {"kind": "runtime_object", "runtime_object_id": "pick_target"},
+            }],
+            "max_penetration_m": 0.002,
+            "terminal_window_start_fraction": 0.8,
+            "violation_response": "hard_stop",
+        }],
+    }
+
+
+def _contact_policy_callback(monkeypatch, state, tool_id: str, arguments: dict) -> dict:
+    node_environment = _node_environment()
+    context = _assistant_context(node_environment, tool_id)
+    from manyforge_composer.backend import routes_assistant_draft as route
+    monkeypatch.setattr(route, "read_active_assistant_context", lambda _state, *, mode: context)
+    body = _body(state, node_environment, context.source_model, context.assistant_mode)
+    body["arguments"] = arguments
+    response = TestClient(create_app(state)).post(
+        f"/api/assistant/bridge/tools/{tool_id}", json=body)
+    assert response.status_code == 200
+    return response.json()
+
+
+def _contact_policy_state() -> ComposerState:
+    environment = build_node_environment()
+    return ComposerState(
+        node_environment=environment,
+        program=Program(_PROGRAM_PATH, environment.catalog),
+        program_source_path=str(_PROGRAM_PATH),
+        headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
+    )
+
+
+def test_contact_policy_callbacks_upsert_then_remove(monkeypatch) -> None:
+    state = _contact_policy_state()
+    upserted = _contact_policy_callback(
+        monkeypatch, state, "program_draft_upsert_contact_policies",
+        {"contact_policies": [_grasp_policy()]})
+    assert upserted["success"] is True, upserted["result"]
+    assert upserted["draftMutated"] is True
+    rows = state.draft_session.snapshot()["authoring"]["contact_policies"]
+    assert [row["policy_id"] for row in rows] == ["assistant_grasp"]
+    # Composer computes the version.
+    assert rows[0]["version"].startswith("sha256:")
+
+    removed = _contact_policy_callback(
+        monkeypatch, state, "program_draft_remove_contact_policies",
+        {"contact_policy_ids": ["assistant_grasp"]})
+    assert removed["success"] is True, removed["result"]
+    assert removed["draftMutated"] is True
+    assert state.draft_session.snapshot()["authoring"].get("contact_policies", []) == []
+
+
+def test_contact_policy_callback_refuses_invalid_policy_with_typed_error(monkeypatch) -> None:
+    state = _contact_policy_state()
+    policy = _grasp_policy()
+    # Shape-valid, but two motion_endpoint selectors: no runtime object.
+    policy["zones"][0]["body_pairs"][0]["body_b"] = {"kind": "motion_endpoint"}
+    before = deepcopy(state.draft_session.snapshot())
+    refused = _contact_policy_callback(
+        monkeypatch, state, "program_draft_upsert_contact_policies",
+        {"contact_policies": [policy]})
+    assert refused["success"] is False
+    assert refused["draftMutated"] is False
+    assert refused["result"]["kind"] == "validation_error"
+    assert refused["result"]["httpStatus"] == 400
+    assert refused["result"]["message"] == (
+        "contact pair must join one component body or motion endpoint to one runtime object"
+    )
+    # The Draft session's typed code travels with the result; text stays presentation.
+    assert refused["result"]["detail"] == {
+        "code": "draft_arguments_invalid",
+        "message": refused["result"]["message"],
+    }
+    assert state.draft_session.snapshot() == before
+
+
+def _setup_insert(monkeypatch):
+    node_environment = _node_environment()
+    environment = build_node_environment()
+    from manyforge_headless_api.service import _assistant_instruments
+
+    context = _assistant_context(node_environment, "tree_draft_insert_node",
+                                 [entry.id for entry in _assistant_instruments().entries()])
+    state = ComposerState(
+        node_environment=environment,
+        program=Program(_PROGRAM_PATH, environment.catalog),
+        program_source_path=str(_PROGRAM_PATH),
+        headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
+    )
+    from manyforge_composer.backend import routes_assistant_draft as route
+    monkeypatch.setattr(route, "read_active_assistant_context", lambda _state, *, mode: context)
+    body = _body(state, node_environment, context.source_model, context.assistant_mode)
+    body["arguments"] = {"parent_instance_id": "@root", "node": {
+        "node_id": "scene.attach_carried_object", "instance_id": "assistant_attach",
+        "parameters": {"target": {"component_id": "ghost_robot", "command_target_id": "gripper"}},
+        "children": []}}
+    return state, body
+
+
+def test_committed_edit_reports_reference_diagnostics_of_the_installed_draft(monkeypatch) -> None:
+    from manyforge_composer.backend import routes_draft
+
+    state, body = _setup_insert(monkeypatch)
+    calls = []
+
+    def validate(actual_state, authoring, *, expected_identity):
+        # The validator sees the installed authoring at the post-commit identity.
+        calls.append(expected_identity)
+        assert expected_identity == actual_state.authoring_workspace.identity()
+        text = json.dumps(authoring)
+        rows = [{"code": "component_reference_missing",
+                 "location": {"document": "program", "path": "/tree/children/0/parameters/target",
+                              "node_instance_id": "assistant_attach", "parameter": "target"},
+                 "payload": {"component_id": "ghost_robot"}}] if "ghost_robot" in text else []
+        return {"reference_validation": {"selector_facts": {}, "diagnostics": rows}}
+
+    monkeypatch.setattr(routes_draft, "validate_captured_program_source", validate)
+    response = TestClient(create_app(state)).post(
+        "/api/assistant/bridge/tools/tree_draft_insert_node", json=body)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["draftMutated"] is True, result["result"]
+    assert [row["code"] for row in result["result"]["referenceDiagnostics"]] == ["component_reference_missing"]
+    assert len(calls) == 1
+
+
+def test_committed_edit_reports_unavailable_reference_validation_as_one_row(monkeypatch) -> None:
+    state, body = _setup_insert(monkeypatch)  # no Deployment Draft source root
+    response = TestClient(create_app(state)).post(
+        "/api/assistant/bridge/tools/tree_draft_insert_node", json=body)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["draftMutated"] is True, result["result"]
+    rows = result["result"]["referenceDiagnostics"]
+    assert [row["code"] for row in rows] == ["deployment_draft_unavailable"]
+
+
+
+def test_diagnostic_paths_resolve_to_the_node_they_point_into() -> None:
+    from manyforge_composer.backend.routes_assistant_draft import _with_node
+
+    forest = [{"instance_id": "pick_and_place", "node_id": "sequence", "children": [
+        {"instance_id": "a", "node_id": "timer", "children": []},
+        {"instance_id": "b", "node_id": "timer", "children": []},
+        {"instance_id": "retry_pick", "node_id": "retry", "children": [
+            {"instance_id": "move_to_pick", "node_id": "motion.move_to_pose", "children": []}]}]}]
+    nested = _with_node({"path": "forest[0].children[2].children[0].value_sources.velocity_scale"},
+                        forest)
+    assert nested["node"] == {"instance_id": "move_to_pick", "node_id": "motion.move_to_pose",
+                              "path": "value_sources.velocity_scale"}
+    pointer = _with_node({"location": {"path": "/forest/0/children/1/parameters/target"}}, forest)
+    assert pointer["node"] == {"instance_id": "b", "node_id": "timer", "path": "parameters.target"}
+    assert _with_node({"path": "forest[0]"}, forest)["node"]["instance_id"] == "pick_and_place"
+    assert "node" not in _with_node({"path": "forest"}, forest)
+    assert "node" not in _with_node({"path": "forest[0].children[9]"}, forest)
+
+
+# OD-93: the last verified context is kept by its Headless identity (ETag).
+
+
+def _context_headless(reads: dict, *, epoch: str = "headless.epoch.1"):
+    """A real Headless app (stub service) behind the real HTTP client."""
+
+    from types import SimpleNamespace
+
+    from manyforge_headless_api.app import create_app as create_headless_app
+    from manyforge_headless_api.client import HeadlessHttpClient
+
+    def source(digest: str) -> dict:
+        return {
+            "available": True,
+            "freshness": "fresh",
+            "known_gaps": [],
+            "projection_owner_epoch": epoch,
+            "source_content_digest": digest,
+        }
+
+    def context(_mode: str) -> dict:
+        reads["count"] += 1
+        return {
+            "assistant_mode": {"source": source(reads["mode_digest"])},
+            "node_environment": {"source": source("sha256:" + "2" * 64)},
+            "schema_version": "manyforge.assistant_mode_context.v1",
+            "source_model": {"source": source("sha256:" + "3" * 64)},
+        }
+
+    app = create_headless_app(
+        service=SimpleNamespace(assistant_mode_context=context)  # type: ignore[arg-type]
+    )
+    return HeadlessHttpClient("http://testserver", client=TestClient(app))
+
+
+def _counted_context_verification(monkeypatch) -> dict:
+    from types import SimpleNamespace
+
+    from manyforge_composer.backend import assistant_mode_client
+
+    counts = {"verify": 0, "resolve": 0}
+
+    def verify(_state, payload, *, mode):
+        counts["verify"] += 1
+        return SimpleNamespace(
+            assistant_mode=SimpleNamespace(payload=payload["assistant_mode"]),
+        )
+
+    def resolve(mode_projection, *, requested_tools, field_policy):
+        counts["resolve"] += 1
+        return {"catalogHash": mode_projection["source"]["source_content_digest"]}
+
+    monkeypatch.setattr(assistant_mode_client, "verify_active_assistant_context", verify)
+    monkeypatch.setattr(assistant_mode_client, "resolve_assistant_catalog", resolve)
+    return counts
+
+
+def test_unchanged_identity_reuses_the_verified_context(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from manyforge_composer.backend.assistant_mode_client import (
+        AssistantContextCache,
+        read_active_assistant_context,
+    )
+
+    counts = _counted_context_verification(monkeypatch)
+    reads = {"count": 0, "mode_digest": "sha256:" + "1" * 64}
+    state = SimpleNamespace(
+        headless_client=_context_headless(reads),
+        assistant_context_cache=AssistantContextCache(),
+    )
+    contexts = [
+        read_active_assistant_context(state, mode="composer-assistant")
+        for _ in range(3)
+    ]
+    catalogs = [
+        state.assistant_context_cache.resolved_catalog(
+            context, requested_tools=["program_read"], field_policy={}
+        )
+        for context in contexts
+    ]
+    assert reads["count"] == 3
+    assert counts == {"verify": 1, "resolve": 1}
+    assert all(context is contexts[0] for context in contexts)
+    assert all(catalog is catalogs[0] for catalog in catalogs)
+    # A different request shape resolves again from the same verification.
+    state.assistant_context_cache.resolved_catalog(
+        contexts[0], requested_tools=[], field_policy={}
+    )
+    assert counts == {"verify": 1, "resolve": 2}
+
+
+def test_changed_identity_and_restart_are_handled(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from manyforge_composer.backend.assistant_mode_client import (
+        AssistantContextCache,
+        read_active_assistant_context,
+    )
+
+    counts = _counted_context_verification(monkeypatch)
+    reads = {"count": 0, "mode_digest": "sha256:" + "1" * 64}
+    state = SimpleNamespace(
+        headless_client=_context_headless(reads),
+        assistant_context_cache=AssistantContextCache(),
+    )
+    first = read_active_assistant_context(state, mode="composer-assistant")
+
+    # A restarted Headless serving the same content: 304, no re-verify.
+    state.headless_client = _context_headless(reads, epoch="headless.epoch.2")
+    assert read_active_assistant_context(state, mode="composer-assistant") is first
+    assert counts["verify"] == 1
+
+    # An Apply changes the content: full verify of the new context.
+    reads["mode_digest"] = "sha256:" + "4" * 64
+    changed = read_active_assistant_context(state, mode="composer-assistant")
+    assert counts["verify"] == 2
+    assert changed.assistant_mode.payload["source"]["source_content_digest"] == (
+        "sha256:" + "4" * 64
+    )
+    assert state.assistant_context_cache.resolved_catalog(
+        changed, requested_tools=[], field_policy={}
+    ) == {"catalogHash": "sha256:" + "4" * 64}
+
+
+def test_context_read_failures_keep_their_typed_codes() -> None:
+    from types import SimpleNamespace
+
+    from manyforge_composer.backend.assistant_mode_client import (
+        ActiveAssistantModeProjectionError,
+        AssistantContextCache,
+        read_active_assistant_context,
+    )
+    from manyforge_headless_api.client import HeadlessClientError
+
+    class Unavailable:
+        def assistant_mode_context_if_changed(self, mode, etag):
+            raise HeadlessClientError(
+                "assistant_mode_projection_unavailable", "down", 503
+            )
+
+    state = SimpleNamespace(
+        headless_client=Unavailable(),
+        assistant_context_cache=AssistantContextCache(),
+    )
+    with pytest.raises(ActiveAssistantModeProjectionError) as error:
+        read_active_assistant_context(state, mode="composer-assistant")
+    assert error.value.code == "assistant_mode_projection_unavailable"
+    assert error.value.status_code == 503
+
+
+def test_model_sampling_is_optional_bounded_and_kept() -> None:
+    contract = {
+        "default_timeout_s": 30,
+        "max_output_tokens": 512,
+        "supported_image_transports": [],
+        "supports_image_input": False,
+        "supports_json_object": True,
+        "supports_response_tools": True,
+        "tool_call_family": "openai_chat_tools",
+    }
+    assert "sampling" not in _model_request_contract(dict(contract))
+    sampling = {"temperature": 0.7, "top_k": 20, "top_p": 0.8}
+    assert _model_request_contract({**contract, "sampling": sampling})["sampling"] == sampling
+    for bad in ({}, {"min_p": 0.1}, {"temperature": 2.5}, {"temperature": -0.1},
+                {"top_p": 0}, {"top_p": 1.5}, {"top_k": 0}, {"top_k": 1.5}):
+        with pytest.raises(ActiveAssistantModeProjectionError):
+            _model_request_contract({**contract, "sampling": bad})

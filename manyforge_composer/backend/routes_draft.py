@@ -85,7 +85,9 @@ _AUTHORING_MUTATIONS = frozenset(
         "blackboard_draft_remove_namespaces",
         "blackboard_draft_upsert_keys",
         "blackboard_draft_upsert_namespaces",
+        "program_draft_remove_contact_policies",
         "program_draft_remove_parameters",
+        "program_draft_upsert_contact_policies",
         "program_draft_upsert_parameters",
         "program_draft_update_motion_defaults",
         "scene_draft_add_object",
@@ -1202,7 +1204,7 @@ def validate_captured_program_source(
         snapshot = state.authoring_workspace.snapshot()
         identity = snapshot.identity
         if expected_identity is not None and identity != expected_identity:
-            raise DraftSessionError("composer_draft_stale", "Draft changed before reference validation", status_code=409)
+            raise DraftSessionError("composer_workspace_stale", "Draft changed before reference validation", status_code=409)
         deployment = snapshot.as_dict()["deployment"]["document"]
         source_root = state.deployment_source_project_path
         if not isinstance(deployment, dict) or not isinstance(source_root, str):
@@ -1213,7 +1215,7 @@ def validate_captured_program_source(
         program_digest = raw_sha256_digest(canonical_json_bytes(authoring))
         source_closure = capture_deployment_model_sources(deployment, project_root=Path(source_root))
         if state.authoring_workspace.identity() != identity or state.deployment_source_project_path != source_root:
-            raise DraftSessionError("composer_draft_stale", "Draft changed during reference capture", status_code=409)
+            raise DraftSessionError("composer_workspace_stale", "Draft changed during reference capture", status_code=409)
         candidate, diagnostics = derive_candidate(authoring, state.node_catalog)
         generation = {
             "workspace_epoch": identity.workspace_epoch,
@@ -1223,19 +1225,29 @@ def validate_captured_program_source(
             "deployment_draft_id": identity.deployment_draft_id,
             "deployment_draft_revision": identity.deployment_draft_revision,
         }
-        reference = state.headless_client.request("POST", "/api/program/reference-validation", body={
-            "schema_version": "manyforge.program_reference_validation_request.v2",
+        body = {
+            "schema_version": "manyforge.program_reference_validation_request.v3",
             "workspace_generation": generation, "program_content_digest": program_digest,
             "program": authoring, "draft": True, "deployment": deployment,
-            "model_source_closure": source_closure,
-        })
+            "model_source_closure_digest": raw_sha256_digest(canonical_json_bytes(source_closure)),
+        }
+        # Headless usually holds the prepared candidate for these model sources;
+        # the full closure (megabytes with meshes) goes only when it does not.
+        try:
+            reference = state.headless_client.request("POST", "/api/program/reference-validation", body=body)
+        except HeadlessClientError as error:
+            if error.code != "model_sources_unknown":
+                raise
+            del body["model_source_closure_digest"]
+            body["model_source_closure"] = source_closure
+            reference = state.headless_client.request("POST", "/api/program/reference-validation", body=body)
         if (not isinstance(reference, dict)
                 or set(reference) != {"schema_version", "workspace_generation", "program_content_digest", "diagnostics", "total_count", "truncated", "selector_facts"}
                 or reference.get("schema_version") != "manyforge.program_reference_validation_response.v2"
                 or reference.get("workspace_generation") != generation
                 or reference.get("program_content_digest") != program_digest
                 or not isinstance(reference.get("selector_facts"), dict)
-                or set(reference["selector_facts"]) != {"components", "targets", "signals", "frames", "bodies"}
+                or set(reference["selector_facts"]) != {"components", "targets", "signals", "frames", "bodies", "rules"}
                 or any(not isinstance(rows, list) for rows in reference["selector_facts"].values())
                 or not isinstance(reference.get("diagnostics"), list)
                 or type(reference.get("total_count")) is not int
@@ -1246,7 +1258,7 @@ def validate_captured_program_source(
         if (state.authoring_workspace.identity() != identity
                 or state.deployment_source_project_path != source_root
                 or capture_deployment_model_sources(deployment, project_root=Path(source_root)) != source_closure):
-            raise DraftSessionError("composer_draft_stale", "Draft changed during reference validation", status_code=409)
+            raise DraftSessionError("composer_workspace_stale", "Draft changed during reference validation", status_code=409)
     except AuthoringForestError as error:
         raise HTTPException(status_code=422, detail={
             "code": error.code, "message": str(error), "context": error.detail,
@@ -1263,6 +1275,24 @@ def validate_captured_program_source(
         "candidate": candidate.to_dict() if candidate is not None else None,
         "reference_validation": reference,
     }
+
+
+def assistant_reference_validation(
+    state: ComposerState, authoring: dict[str, Any], identity: AuthoringWorkspaceIdentity,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """The assistant's one reference validation: (selector facts, reference diagnostics).
+
+    A refused validation (for example ``activation_preparer_unavailable``) is
+    one typed diagnostic row with its error code, and no selector facts.
+    """
+
+    try:
+        reference = validate_captured_program_source(state, authoring, expected_identity=identity)["reference_validation"]
+    except HTTPException as error:
+        return None, [{"code": error.detail["code"],
+                       "location": {"document": "program", "path": "", "node_instance_id": None, "parameter": None},
+                       "payload": {"message": error.detail["message"]}}]
+    return reference["selector_facts"], reference["diagnostics"]
 
 
 def create_draft_router(state: ComposerState) -> APIRouter:
@@ -1744,7 +1774,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 )
                 if state.draft_session.retained_state() != retained:
                     raise DraftSessionError(
-                        "composer_draft_stale",
+                        "composer_draft_revision_stale",
                         "Program Draft changed before activation submission",
                         status_code=409,
                     )
@@ -1867,7 +1897,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 body.require_workspace_fence(state.authoring_workspace.identity())
                 if state.draft_session.retained_state() != retained:
                     raise DraftSessionError(
-                        "composer_draft_stale",
+                        "composer_draft_revision_stale",
                         "Program Draft changed before Revert submission",
                         status_code=409,
                     )

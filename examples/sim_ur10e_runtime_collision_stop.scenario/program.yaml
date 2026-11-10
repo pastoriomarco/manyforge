@@ -84,7 +84,8 @@
                 "target": {
                   "command_target_id": "gripper",
                   "component_id": "robotiq_2f_140"
-                }
+                },
+                "completion_timeout_s": 15.0
               }
             },
             {

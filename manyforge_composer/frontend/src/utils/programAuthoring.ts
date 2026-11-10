@@ -165,9 +165,19 @@ export interface ProgramMotionValues {
 }
 
 export interface ProgramMotionConfiguration {
-  bindings: Record<ProgramMotionField, string>;
-  values: ProgramMotionValues;
+  /**
+   * The Program parameter each motion-default field inherits: the one of the
+   * same name, when the Program declares it. An undeclared field has no
+   * binding, and nodes use their own or the catalog value.
+   */
+  bindings: Partial<Record<ProgramMotionField, string>>;
+  /** The declared finite numeric default of each bound field. */
+  values: Partial<ProgramMotionValues>;
+  /** Nodes whose field inherits the Program parameter. */
   usageCounts: Record<ProgramMotionField, number>;
+  /** Nodes whose field reads another value source (checked when the move starts). */
+  dynamicCounts: Record<ProgramMotionField, number>;
+  /** Nodes that accept the field. */
   applicableCounts: Record<ProgramMotionField, number>;
 }
 
@@ -186,11 +196,16 @@ export type ProgramSemanticCreateTarget =
   | 'program_parameter'
   | 'scene_resource';
 
+function motionFieldCounts(): Record<ProgramMotionField, number> {
+  return Object.fromEntries(
+    PROGRAM_MOTION_FIELDS.map((field) => [field, 0]),
+  ) as Record<ProgramMotionField, number>;
+}
+
 /**
- * Resolve Program-wide motion semantics from the exact catalog fields and
- * their authored Program-parameter sources. Parameter IDs are deliberately
- * not part of this contract: a Program may call its velocity parameter
- * `cycle_speed` as long as motion-node velocity_scale fields bind to it.
+ * Resolve Program-wide motion defaults per field: a motion-default field
+ * inherits the Program parameter of the same name, when the Program declares
+ * one. Each field stands alone; an undeclared field leaves the others usable.
  */
 export function deriveProgramMotionConfiguration(
   program: Pick<ProgramAuthoringDocument, 'parameters' | 'forest'>,
@@ -203,15 +218,9 @@ export function deriveProgramMotionConfiguration(
     };
   }
   const catalog = new Map(entries.map((entry) => [entry.id, entry]));
-  const references = new Map<ProgramMotionField, Set<string>>(
-    PROGRAM_MOTION_FIELDS.map((field) => [field, new Set<string>()]),
-  );
-  const usageCounts = Object.fromEntries(
-    PROGRAM_MOTION_FIELDS.map((field) => [field, 0]),
-  ) as Record<ProgramMotionField, number>;
-  const applicableCounts = Object.fromEntries(
-    PROGRAM_MOTION_FIELDS.map((field) => [field, 0]),
-  ) as Record<ProgramMotionField, number>;
+  const usageCounts = motionFieldCounts();
+  const dynamicCounts = motionFieldCounts();
+  const applicableCounts = motionFieldCounts();
   const unknownNodes = new Set<string>();
   const declarations = new Map(
     (program.parameters ?? []).map((parameter) => [parameter.parameter_id, parameter]),
@@ -228,9 +237,12 @@ export function deriveProgramMotionConfiguration(
       if (!fields.has(field)) continue;
       applicableCounts[field] += 1;
       const source = node.value_sources?.[field];
-      if (source?.kind !== 'program_parameter') continue;
-      references.get(field)?.add(source.reference);
-      usageCounts[field] += 1;
+      if (source === undefined) continue;
+      if (source.kind === 'program_parameter' && source.reference === field) {
+        usageCounts[field] += 1;
+      } else {
+        dynamicCounts[field] += 1;
+      }
     }
   }
 
@@ -240,59 +252,24 @@ export function deriveProgramMotionConfiguration(
       reason: `Catalog definitions are missing for ${[...unknownNodes].sort().join(', ')}.`,
     };
   }
-  const missingFields = PROGRAM_MOTION_FIELDS.filter(
-    (field) => applicableCounts[field] === 0 && !declarations.has(field),
-  );
-  if (missingFields.length > 0) {
-    return {
-      available: false,
-      reason: `This Program has no catalog motion fields for ${missingFields.join(', ')}.`,
-    };
-  }
 
-  const bindings = {} as Record<ProgramMotionField, string>;
+  const bindings: Partial<Record<ProgramMotionField, string>> = {};
+  const values: Partial<ProgramMotionValues> = {};
   for (const field of PROGRAM_MOTION_FIELDS) {
-    const candidates = references.get(field) ?? new Set<string>();
-    if (candidates.size === 0 && applicableCounts[field] === 0 && declarations.has(field)) {
-      bindings[field] = field;
-      continue;
-    }
-    if (candidates.size !== 1) {
-      return {
-        available: false,
-        reason: candidates.size === 0
-          ? `No ${field} field is bound to a Program parameter.`
-          : `${field} fields use more than one Program parameter.`,
-      };
-    }
-    bindings[field] = [...candidates][0];
-  }
-  if (new Set(Object.values(bindings)).size !== PROGRAM_MOTION_FIELDS.length) {
-    return {
-      available: false,
-      reason: 'Program motion defaults must use distinct Program parameters.',
-    };
-  }
-
-  const values = {} as ProgramMotionValues;
-  for (const field of PROGRAM_MOTION_FIELDS) {
-    const declaration = declarations.get(bindings[field]);
+    const declaration = declarations.get(field);
+    if (declaration === undefined) continue;
+    bindings[field] = field;
     if (
-      declaration === undefined
-      || !['float64', 'int64'].includes(declaration.type)
-      || typeof declaration.default !== 'number'
-      || !Number.isFinite(declaration.default)
+      ['float64', 'int64'].includes(declaration.type)
+      && typeof declaration.default === 'number'
+      && Number.isFinite(declaration.default)
     ) {
-      return {
-        available: false,
-        reason: `${field} is not bound to a finite numeric Program parameter.`,
-      };
+      values[field] = declaration.default;
     }
-    values[field] = declaration.default;
   }
   return {
     available: true,
-    configuration: { bindings, values, usageCounts, applicableCounts },
+    configuration: { bindings, values, usageCounts, dynamicCounts, applicableCounts },
   };
 }
 
@@ -325,7 +302,9 @@ export function programMotionDefaultRoles(
   if (!result.available) return roles;
   const { bindings, usageCounts, applicableCounts } = result.configuration;
   for (const field of PROGRAM_MOTION_FIELDS) {
-    roles.set(bindings[field], {
+    const binding = bindings[field];
+    if (binding === undefined) continue;
+    roles.set(binding, {
       field,
       bound: usageCounts[field],
       applicable: applicableCounts[field],

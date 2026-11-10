@@ -324,8 +324,22 @@ component_type_id(const ActivationComponentProfile &profile,
   // target as the Mock component. Split arm models have no fingers.
   if (profile.lane == std::optional<std::string>("real") && !has_gripper &&
       !source_joints(profile, "fingers").empty())
-    return profile.model_asset_id + ".fixed_scale.arm_only.component";
-  return profile.model_asset_id + ".fixed_scale.component";
+    return profile.model_asset_id + ".arm_only.component";
+  return profile.model_asset_id + ".component";
+}
+
+// An arm's lane row declares whether its adapter's controller accepts
+// runtime speed scaling (`runtime_scale: supported | unsupported`); the
+// arm's motion binding carries a runtime-scale qualification only when it
+// does.
+[[nodiscard]] bool runtime_scale_supported(const ActivationComponentProfile &profile) {
+  const auto &declared =
+      text(member(*profile.lane_row, "runtime_scale", profile.component_profile_id + " lane row"),
+           "runtime_scale");
+  if (declared != "supported" && declared != "unsupported")
+    fail(profile.component_profile_id + " lane row runtime_scale must be supported or "
+         "unsupported");
+  return declared == "supported";
 }
 
 // A pneumatic tool profile runs on no lane (its row declares no
@@ -604,23 +618,15 @@ struct ComponentProjection final {
       &member(*selected, "command_duration_s", "gripper target").storage());
   const auto &output = text(member(*selected, "output_mode", "gripper target"),
                             "gripper output mode");
-  const auto *timeout = selected->find_object_member("delivery_result_timeout_s");
   const auto *pneumatic_io = selected->find_object_member("pneumatic_io");
-  const auto *timeout_seconds =
-      timeout == nullptr ? nullptr : std::get_if<double>(&timeout->storage());
-  if (fields.size() != 13U + static_cast<std::size_t>(timeout != nullptr) +
-                           static_cast<std::size_t>(pneumatic_io != nullptr) +
+  if (fields.size() != 13U + static_cast<std::size_t>(pneumatic_io != nullptr) +
                            static_cast<std::size_t>(
                                selected->find_object_member("grasp_confirmation") != nullptr) +
                            static_cast<std::size_t>(
                                selected->find_object_member("stop_finish_tolerance") != nullptr) ||
       duration == nullptr ||
       !execution_gripper_command_duration_is_valid(actuation, *duration) ||
-      !ros_gripper_output_mode_is_valid(actuation, output) ||
-      (timeout != nullptr &&
-       (timeout_seconds == nullptr ||
-        !ros_gripper_delivery_result_timeout_is_valid(actuation,
-                                                     *timeout_seconds)))) {
+      !ros_gripper_output_mode_is_valid(actuation, output)) {
     fail(component.component_id + " has invalid authored gripper target semantics");
   }
   // The normal graph schema and strict applicability decoder verify the
@@ -1093,7 +1099,6 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
           capability == "execution.contact.geometric_signed_penetration" ||
           capability.starts_with("execution.feedback.") ||
           capability == "execution.reset" ||
-          capability == "execution.runtime_scale.operation_scoped" ||
           capability == "execution.stop.soft" ||
           capability == "execution.trajectory.execute" ||
           capability == "state.observed.current" ||
@@ -1152,9 +1157,8 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
               {"stop_evidence_policy_revision", CanonicalValue(revision(stop))},
               {"containment_granularity", CanonicalValue("resource")},
           });
-      if (target == "arm" &&
-          (capability == "execution.trajectory.execute" ||
-           capability == "execution.runtime_scale.operation_scoped")) {
+      if (target == "arm" && capability == "execution.trajectory.execute" &&
+          runtime_scale_supported(profile)) {
         binding.emplace_back("runtime_scale_route_qualifications",
                              CanonicalValue(Array{CanonicalValue(Object{
                                  {"control_route_id", CanonicalValue("arm_position")},
@@ -1248,90 +1252,117 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
   });
 }
 
-/// C++ port of the maintained generator's `assistant_projection`, without
-/// external resources or site overlays: every model alias is served by one
-/// AI model component of the Deployment (`external_resource_alias` is its
-/// component id, `model_id` its served model). An alias selects
-/// `mapping[alias]`, else the only AI model component. Typed refusals:
+/// The chat alias: the model alias every chat mode uses, bound by the
+/// assistant component (never by `assistant_model_components`).
+constexpr std::string_view kChatModelAlias = "assistant_model";
+
+/// The Deployment's `assistant` member, without external resources or site
+/// overlays: every model alias is served by one AI model component of the
+/// Deployment (`external_resource_alias` is its component id, `model_id` its
+/// served model).
+/// - The runtime aliases and prompt templates come from the Deployment-level
+///   profile (`runtime`); an alias selects `mapping[alias]`, else the only AI
+///   model component. Its chat alias is no runtime alias.
+/// - The chat (the assistant component, `chat`) adds the chat alias, bound to
+///   the component's `model_component_id`, and its profile's modes, each
+///   served by that component.
+/// The audit policy is the Deployment-level profile's, else the chat's. Null
+/// when there is nothing to retain. Refusals:
 /// `assistant_ai_model_component_missing` (no AI model component),
 /// `assistant_model_component_unresolved` (unknown mapping key or component,
-/// or several components without a mapping entry).
-[[nodiscard]] CanonicalValue assistant_member(
-    const ActivationAssistantProfile &source,
+/// the chat alias mapped, or several components without a mapping entry).
+[[nodiscard]] std::optional<CanonicalValue> assistant_member(
+    const ActivationAssistantProfiles &profiles,
     const std::map<std::string, std::string, std::less<>> &mapping,
     const std::map<std::string, std::string, std::less<>> &ai_models) {
-  const auto &profile = source.profile;
-  const auto &endpoints =
-      array(member(profile, "model_endpoints", "assistant profile"),
-            "assistant profile.model_endpoints");
-  for (const auto &[alias, unused] : mapping) {
-    static_cast<void>(unused);
-    if (std::none_of(endpoints.begin(), endpoints.end(),
-                     [&](const auto &endpoint) {
-                       return text(member(endpoint, "model_endpoint_alias",
-                                          "model endpoint"),
-                                   "model_endpoint_alias") == alias;
-                     }))
-      fail("assistant_model_component_unresolved: " + alias +
-           " is not a model alias of the assistant profile");
-  }
   Object model_aliases;
-  for (const auto &endpoint : endpoints) {
-    const auto &alias =
-        text(member(endpoint, "model_endpoint_alias", "model endpoint"),
-             "model_endpoint_alias");
-    const auto mapped = mapping.find(alias);
-    if (mapped == mapping.end() && ai_models.empty())
-      fail("assistant_ai_model_component_missing: the assistant profile needs "
-           "an AI model component");
-    if (mapped == mapping.end() && ai_models.size() != 1U)
-      fail("assistant_model_component_unresolved: " + alias +
-           " needs an assistant_model_components entry");
-    const auto selected = mapped == mapping.end()
-                              ? ai_models.begin()
-                              : ai_models.find(mapped->second);
-    if (selected == ai_models.end())
-      fail("assistant_model_component_unresolved: " + mapped->second +
-           " is not an AI model component");
-    model_aliases.emplace_back(
-        alias, CanonicalValue(Object{
-                   {"external_resource_alias", CanonicalValue(selected->first)},
-                   {"model_id", CanonicalValue(selected->second)},
-                   {"request_contract",
-                    member(endpoint, "request_contract", "model endpoint")},
-               }));
-  }
-  Object provider_aliases;
-  const auto &provider = member(profile, "provider_alias", "assistant profile");
-  if (!provider.is_null()) {
-    provider_aliases.emplace_back(
-        text(member(provider, "provider_alias_id", "provider alias"),
-             "provider_alias_id"),
-        CanonicalValue(Object{
-            {"provider_kind",
-             member(provider, "provider_kind", "provider alias")},
-            {"bridge_external_resource_alias",
-             member(provider, "bridge_external_resource_alias",
-                    "provider alias")},
-        }));
+  const auto alias_of = [](const CanonicalValue &endpoint) -> const std::string & {
+    return text(member(endpoint, "model_endpoint_alias", "model endpoint"),
+                "model_endpoint_alias");
+  };
+  if (const auto found = mapping.find(kChatModelAlias); found != mapping.end())
+    fail("assistant_model_component_unresolved: " + std::string(kChatModelAlias) +
+         " is the chat alias; the assistant component binds it");
+  if (profiles.runtime) {
+    const auto &endpoints =
+        array(member(profiles.runtime->profile, "model_endpoints", "assistant profile"),
+              "assistant profile.model_endpoints");
+    for (const auto &[alias, unused] : mapping) {
+      static_cast<void>(unused);
+      if (std::none_of(endpoints.begin(), endpoints.end(),
+                       [&](const auto &endpoint) { return alias_of(endpoint) == alias; }))
+        fail("assistant_model_component_unresolved: " + alias +
+             " is not a model alias of the assistant profile");
+    }
+    for (const auto &endpoint : endpoints) {
+      const auto &alias = alias_of(endpoint);
+      if (alias == kChatModelAlias) continue;
+      const auto mapped = mapping.find(alias);
+      if (mapped == mapping.end() && ai_models.empty())
+        fail("assistant_ai_model_component_missing: the assistant profile needs "
+             "an AI model component");
+      if (mapped == mapping.end() && ai_models.size() != 1U)
+        fail("assistant_model_component_unresolved: " + alias +
+             " needs an assistant_model_components entry");
+      const auto selected = mapped == mapping.end()
+                                ? ai_models.begin()
+                                : ai_models.find(mapped->second);
+      if (selected == ai_models.end())
+        fail("assistant_model_component_unresolved: " + mapped->second +
+             " is not an AI model component");
+      model_aliases.emplace_back(
+          alias, CanonicalValue(Object{
+                     {"external_resource_alias", CanonicalValue(selected->first)},
+                     {"model_id", CanonicalValue(selected->second)},
+                     {"request_contract",
+                      member(endpoint, "request_contract", "model endpoint")},
+                 }));
+    }
   }
   Object modes;
-  for (const auto &[mode_id, mode] : object(source.modes, "assistant modes")) {
-    if (provider.is_null() ||
-        std::none_of(model_aliases.begin(), model_aliases.end(),
-                     [](const auto &row) { return row.first == "assistant_model"; }))
+  if (profiles.chat) {
+    const auto &chat = *profiles.chat;
+    const auto model = ai_models.find(chat.model_component_id);
+    if (model == ai_models.end())
+      fail("assistant_model_component_unresolved: " + chat.model_component_id +
+           " is not an AI model component");
+    const auto &endpoints =
+        array(member(chat.profile.profile, "model_endpoints", "assistant profile"),
+              "assistant profile.model_endpoints");
+    const auto endpoint = std::find_if(endpoints.begin(), endpoints.end(),
+                                       [&](const auto &row) {
+                                         return alias_of(row) == kChatModelAlias;
+                                       });
+    if (endpoint == endpoints.end())
       fail("assistant profile has incomplete mode aliases");
-    auto row = object(mode, "assistant mode");
-    row.emplace_back("provider_alias", provider_aliases.front().first);
-    row.emplace_back("model_endpoint_alias", CanonicalValue("assistant_model"));
-    modes.emplace_back(mode_id, CanonicalValue(std::move(row)));
+    model_aliases.emplace_back(
+        std::string(kChatModelAlias),
+        CanonicalValue(Object{
+            {"external_resource_alias", CanonicalValue(model->first)},
+            {"model_id", CanonicalValue(model->second)},
+            {"request_contract", member(*endpoint, "request_contract", "model endpoint")},
+        }));
+    for (const auto &[mode_id, mode] : object(chat.profile.modes, "assistant modes")) {
+      auto row = object(mode, "assistant mode");
+      row.emplace_back("assistant_component_id", CanonicalValue(chat.component_id));
+      row.emplace_back("model_endpoint_alias", CanonicalValue(std::string(kChatModelAlias)));
+      modes.emplace_back(mode_id, CanonicalValue(std::move(row)));
+    }
   }
+  const auto *source = profiles.runtime ? &profiles.runtime->profile
+                       : profiles.chat  ? &profiles.chat->profile.profile
+                                        : nullptr;
+  const auto &templates = profiles.runtime
+                              ? member(profiles.runtime->profile, "prompt_templates",
+                                       "assistant profile")
+                              : CanonicalValue(Object{});
+  if (source == nullptr ||
+      (model_aliases.empty() && modes.empty() && object(templates, "prompt_templates").empty()))
+    return std::nullopt;
   return CanonicalValue(Object{
-      {"audit_policy", member(profile, "audit_policy", "assistant profile")},
-      {"prompt_templates",
-       member(profile, "prompt_templates", "assistant profile")},
+      {"audit_policy", member(*source, "audit_policy", "assistant profile")},
+      {"prompt_templates", templates},
       {"model_endpoint_aliases", CanonicalValue(std::move(model_aliases))},
-      {"provider_aliases", CanonicalValue(std::move(provider_aliases))},
       {"modes", CanonicalValue(std::move(modes))},
   });
 }
@@ -1442,7 +1473,7 @@ CanonicalValue compile_activation_deployment(
     const std::vector<QualifiedRuntimeProfile> &runtime_profiles,
     const std::vector<ActivationPreparedIoType> &io_types,
     std::span<const QualifiedProviderManifest> provider_manifests,
-    const std::optional<ActivationAssistantProfile> &assistant_profile,
+    const ActivationAssistantProfiles &assistant_profiles,
     std::span<const QualifiedComponentType> component_types) {
   const auto physical_count = static_cast<std::size_t>(std::count_if(
       component_profiles.begin(), component_profiles.end(),
@@ -2185,14 +2216,15 @@ CanonicalValue compile_activation_deployment(
              "definition");
     }
   };
-  // A machine owner and a sensor have no targets and no
-  // provider binding.
+  // A machine owner, a sensor and the assistant have no targets and no
+  // target provider binding.
   const auto target_less = [&](std::string_view component_id) {
     return std::any_of(component_profiles.begin(), component_profiles.end(),
                        [&](const auto &row) {
                          return row.component_id == component_id &&
                                 (row.runtime_kind == ActivationRuntimeKind::kMachine ||
-                                 row.runtime_kind == ActivationRuntimeKind::kSensor);
+                                 row.runtime_kind == ActivationRuntimeKind::kSensor ||
+                                 row.runtime_kind == ActivationRuntimeKind::kAssistant);
                        });
   };
   for (const auto &prepared : io_types) {
@@ -2350,6 +2382,94 @@ CanonicalValue compile_activation_deployment(
                                         "gripper.command_position"));
       break;
     }
+  std::optional<CanonicalValue> assistant;
+  if (intent.assistant_profile_id.has_value() != assistant_profiles.runtime.has_value())
+    fail("assistant profile has no repository-owned source");
+  if (assistant_profiles.runtime || assistant_profiles.chat) {
+    // Component id -> served model of every AI model component.
+    std::map<std::string, std::string, std::less<>> ai_models;
+    for (std::size_t index = 0; index != component_profiles.size(); ++index) {
+      if (component_profiles[index].runtime_kind !=
+          ActivationRuntimeKind::kAiModel)
+        continue;
+      const auto found = std::find_if(
+          io_types.begin(), io_types.end(), [&](const auto &value) {
+            return value.component_id == component_profiles[index].component_id;
+          });
+      if (found == io_types.end())
+        fail("AI model component has no prepared configuration");
+      ai_models.emplace(
+          found->component_id,
+          text(member(array(member(found->normalized_configuration,
+                                   "ai_models", "AI model configuration"),
+                            "ai_models")
+                          .front(),
+                      "model", "AI model row"),
+               "model"));
+    }
+    assistant = assistant_member(assistant_profiles,
+                                 intent.assistant_model_components, ai_models);
+    // A usable model query: a prompt template and a runtime model alias
+    // (every alias is bound to an AI model component above).
+    if (assistant &&
+        !object(member(*assistant, "prompt_templates", "assistant"),
+                "prompt_templates").empty() &&
+        std::any_of(object(member(*assistant, "model_endpoint_aliases", "assistant"),
+                           "model_endpoint_aliases").begin(),
+                    object(member(*assistant, "model_endpoint_aliases", "assistant"),
+                           "model_endpoint_aliases").end(),
+                    [](const auto &row) { return row.first != kChatModelAlias; })) {
+      const auto &model_query = catalog.require(
+          core::CatalogRecordKind::kProviderManifest,
+          "manyforge.provider.assistant_model_query");
+      Object row{
+          {"capability_provider_binding_id", CanonicalValue(
+              runtime_cell_id.value() + ".assistant-model-query.provider")},
+          {"capability_provider_binding_revision", CanonicalValue(std::string(kZeroDigest))},
+      };
+      const auto selected_capability = selector(catalog, "assistant.model.query");
+      for (const auto &selected : object(selected_capability, "selector"))
+        row.push_back(selected);
+      row.insert(row.end(), {
+          {"scope", CanonicalValue("cell_global")},
+          {"target", CanonicalValue(Object{{"cell_id", CanonicalValue(runtime_cell_id.value())}})},
+          {"provider_instance_id", CanonicalValue(runtime_cell_id.value() + ".assistant_model_query")},
+          {"provider_manifest_id", CanonicalValue("manyforge.provider.assistant_model_query")},
+          {"provider_manifest_revision", CanonicalValue(revision(model_query))},
+          {"endpoint_bindings", CanonicalValue(Array{})},
+      });
+      providers.emplace_back(std::move(row));
+    }
+      // The chat: the assistant component provides the bridge request (its
+    // endpoint is published at runtime in its state, role
+    // `assistant_request`) and its lifecycle.
+    if (assistant_profiles.chat) {
+      const auto &bridge = catalog.require(core::CatalogRecordKind::kProviderManifest,
+                                           "manyforge.provider.assistant_bridge");
+      for (const auto capability :
+           {"component.lifecycle.observe", "component.lifecycle.prepare",
+            "component.lifecycle.enable", "component.lifecycle.disable",
+            "component.lifecycle.recover"})
+        static_cast<void>(selector(catalog, capability));
+      Object row{
+          {"capability_provider_binding_id", CanonicalValue(
+              runtime_cell_id.value() + ".assistant-bridge-request.provider")},
+          {"capability_provider_binding_revision", CanonicalValue(std::string(kZeroDigest))},
+      };
+      const auto selected_capability = selector(catalog, "assistant.bridge.request");
+      for (const auto &selected : object(selected_capability, "selector"))
+        row.push_back(selected);
+      row.insert(row.end(), {
+          {"scope", CanonicalValue("cell_global")},
+          {"target", CanonicalValue(Object{{"cell_id", CanonicalValue(runtime_cell_id.value())}})},
+          {"provider_instance_id", CanonicalValue(runtime_cell_id.value() + ".assistant_bridge")},
+          {"provider_manifest_id", CanonicalValue("manyforge.provider.assistant_bridge")},
+          {"provider_manifest_revision", CanonicalValue(revision(bridge))},
+          {"endpoint_bindings", CanonicalValue(Array{})},
+      });
+      providers.emplace_back(std::move(row));
+    }
+  }
   std::sort(desired.begin(), desired.end(), by("control_domain_id"));
   std::sort(providers.begin(), providers.end(), by("capability_provider_binding_id"));
   std::sort(stop_stages.begin(), stop_stages.end(), [](const auto &left, const auto &right) {
@@ -2412,35 +2532,8 @@ CanonicalValue compile_activation_deployment(
     root.emplace_back("description", CanonicalValue(*intent.description));
   if (intent.compatibility.has_value())
     root.emplace_back("compatibility", *intent.compatibility);
-  if (intent.assistant_profile_id.has_value()) {
-    if (!assistant_profile.has_value())
-      fail("assistant profile has no repository-owned source");
-    // Component id -> served model of every AI model component.
-    std::map<std::string, std::string, std::less<>> ai_models;
-    for (std::size_t index = 0; index != component_profiles.size(); ++index) {
-      if (component_profiles[index].runtime_kind !=
-          ActivationRuntimeKind::kAiModel)
-        continue;
-      const auto found = std::find_if(
-          io_types.begin(), io_types.end(), [&](const auto &value) {
-            return value.component_id == component_profiles[index].component_id;
-          });
-      if (found == io_types.end())
-        fail("AI model component has no prepared configuration");
-      ai_models.emplace(
-          found->component_id,
-          text(member(array(member(found->normalized_configuration,
-                                   "ai_models", "AI model configuration"),
-                            "ai_models")
-                          .front(),
-                      "model", "AI model row"),
-               "model"));
-    }
-    root.emplace_back("assistant",
-                      assistant_member(*assistant_profile,
-                                       intent.assistant_model_components,
-                                       ai_models));
-  }
+  if (assistant.has_value())
+    root.emplace_back("assistant", std::move(*assistant));
   CanonicalValue authored(std::move(root));
   const auto preliminary = compute_deployment_artifact_revision(
       parse_strict_json_model_yaml(canonical_json(authored)),

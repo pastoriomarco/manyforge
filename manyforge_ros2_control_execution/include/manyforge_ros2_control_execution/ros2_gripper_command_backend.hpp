@@ -78,8 +78,6 @@ struct Ros2GripperActionConfig {
   /// staleness judgement (the readiness snapshot no longer ages feedback).
   std::shared_ptr<core::StreamRecorder> feedback_stream{};
   double wait_for_action_server_timeout_s = 2.0;
-  // Omission uses the typed default: pneumatic 1s, position 5s.
-  std::optional<double> result_timeout_s;
   core::GripperActuationKind actuation_kind{
       core::GripperActuationKind::kPositionCommanded};
   /// Display-only callback for pneumatic paths with feedback or no model group.

@@ -1,6 +1,6 @@
 api_version: manyforge.program.v3
 program_id: semantic_shape_pick
-program_revision: sha256:8ac581e4ff1a8df8437f8abd7fe096544d276abf3316169fddb96782ba661322
+program_revision: sha256:b337631267104c2383f626df2003deb5fa41a5ac8923614793548cf0501b0b95
 program_profile: composable-cell-v1
 name: semantic_shape_pick
 description: Semantic object-selection demo. Deterministic nodes build and validate a retained scene-selection
@@ -237,6 +237,7 @@ tree:
   - node_id: planning.plan_pick_sequence
     instance_id: plan_selected_object_pick
     parameters:
+      tool_completion_timeout_s: 15.0
       target:
         component_id: ur5_robot
         command_target_id: arm
@@ -344,6 +345,7 @@ tree:
   - node_id: gripper.command_position
     instance_id: close_gripper
     parameters:
+      completion_timeout_s: 15.0
       target:
         component_id: robotiq_2f_85
         command_target_id: gripper
@@ -464,6 +466,7 @@ tree:
   - node_id: gripper.command_position
     instance_id: open_gripper
     parameters:
+      completion_timeout_s: 15.0
       target:
         component_id: robotiq_2f_85
         command_target_id: gripper

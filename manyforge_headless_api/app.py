@@ -6,6 +6,7 @@ import asyncio
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, Protocol
+import hashlib
 import json
 import re
 import threading
@@ -382,6 +383,7 @@ def _error_status(code: str) -> int:
             "program_run_draft_applied_mismatch",
             "deployment_candidate_compiler_busy",
             "activation_preparer_busy",
+            "model_sources_unknown",
             "program_node_preview_busy",
             "deployment_candidate_cell_mismatch",
             "persistent_key_request_replayed",
@@ -398,6 +400,8 @@ def _error_status(code: str) -> int:
             "io_output_controller_owned",
             # A position reset while the simulation isn't playing.
             "simulation_not_playing",
+            # An assistant mode read while the Deployment has no assistant.
+            "assistant_component_absent",
         }
         # RunReadiness reasons and run refusals.
         or code in RUN_REFUSAL_CODES
@@ -439,6 +443,39 @@ def _error_status(code: str) -> int:
     if code == "operator_alarm_membership_mismatch":
         return 409
     return 500
+
+
+def _conditional_projection(
+    request: Request,
+    payload: dict[str, Any],
+    sources: tuple[dict[str, Any], ...],
+    identity: list[Any],
+) -> dict[str, Any] | Response:
+    """Answer a projection read with a strong ETag and honour If-None-Match.
+
+    ``identity`` holds content digests only (no owner epoch or generation), so
+    a restarted Headless serving the same content keeps the same tag and a 304
+    stays correct. A source that is not fresh and complete gets no tag: the
+    reader then sees the full body and fails closed as before.
+    """
+
+    if not all(
+        source.get("available") is True
+        and source.get("freshness") == "fresh"
+        and source.get("known_gaps") == []
+        for source in sources
+    ):
+        return payload
+    etag = (
+        '"'
+        + hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        + '"'
+    )
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+    return JSONResponse(payload, headers={"ETag": etag})
 
 
 def _trusted_attribution(
@@ -735,6 +772,11 @@ def create_app(
             "/api/activation-preparations": (
                 MAX_ACTIVATION_PREPARATION_REQUEST_BYTES
             ),
+            # The same candidate inputs (Deployment, model sources, Program);
+            # the preparer applies this bound to them again.
+            "/api/program/reference-validation": (
+                MAX_ACTIVATION_PREPARATION_REQUEST_BYTES
+            ),
             "/api/program/model-attempts": MAX_PROGRAM_MODEL_ATTEMPT_BYTES,
             "/api/program/diagnostics": 64 * 1024,
         },
@@ -973,8 +1015,15 @@ def create_app(
         return service.manager_diff()
 
     @app.get("/api/node-environment")
-    def node_environment() -> dict[str, Any]:
-        return service.node_environment()
+    def node_environment(request: Request) -> dict[str, Any]:
+        projection = service.node_environment()
+        # The Runner join rewrites ``availability`` outside the core digest.
+        return _conditional_projection(
+            request,
+            projection,
+            (projection["source"],),
+            [projection["source"]["source_content_digest"], projection["availability"]],
+        )
 
     @app.get("/api/skills")
     def skills() -> dict[str, Any]:
@@ -1400,21 +1449,37 @@ def create_app(
 
     @app.get("/api/assistant/modes/{mode_id}")
     def assistant_mode(
+        request: Request,
         mode_id: Annotated[
             str,
             Path(min_length=1, max_length=256, pattern=r"^[a-z][a-z0-9.-]*$"),
         ],
     ) -> dict[str, Any]:
-        return service.assistant_mode(mode_id)
+        projection = service.assistant_mode(mode_id)
+        source = projection["source"]
+        return _conditional_projection(
+            request, projection, (source,), [source["source_content_digest"]]
+        )
 
     @app.get("/api/assistant/modes/{mode_id}/context")
     def assistant_mode_context(
+        request: Request,
         mode_id: Annotated[
             str,
             Path(min_length=1, max_length=256, pattern=r"^[a-z][a-z0-9.-]*$"),
         ],
     ) -> dict[str, Any]:
-        return service.assistant_mode_context(mode_id)
+        context = service.assistant_mode_context(mode_id)
+        sources = tuple(
+            context[part]["source"]
+            for part in ("assistant_mode", "node_environment", "source_model")
+        )
+        return _conditional_projection(
+            request,
+            context,
+            sources,
+            [source["source_content_digest"] for source in sources],
+        )
 
     @app.post("/api/manager/deployment-candidates/preview")
     def manager_deployment_candidate_preview(

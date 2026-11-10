@@ -1,6 +1,6 @@
 {
   "api_version": "manyforge.deployment_intent.v2",
-  "assistant_profile_id": "assistant_scene_authoring",
+  "assistant_profile_id": null,
   "attachments": [
     {
       "child": {
@@ -27,6 +27,18 @@
   },
   "components": [
     {
+      "component_id": "assistant",
+      "component_profile_id": "manyforge.assistant",
+      "configuration": {
+        "runtime_configuration": {
+          "assistant_profile_id": "assistant_scene_authoring",
+          "model_component_id": "assistant_model"
+        },
+        "runtime_kind": "assistant"
+      },
+      "target_settings": {}
+    },
+    {
       "component_id": "assistant_model",
       "component_profile_id": "ai_model_v0",
       "configuration": {
@@ -36,6 +48,156 @@
           "model": "gemma4-12b-it-gguf"
         },
         "runtime_kind": "ai_model"
+      },
+      "target_settings": {}
+    },
+    {
+      "component_id": "cell_io",
+      "component_profile_id": "io_device_v0",
+      "configuration": {
+        "runtime_configuration": {
+          "io_provider_devices": [
+            {
+              "controllable_component_id": "cell_io"
+            }
+          ],
+          "io_signals": [
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "cell_io",
+              "direction": "output",
+              "provider": {
+                "channel": "alarm_light",
+                "profile": "mock_output"
+              },
+              "resource_role_id": "alarm_light",
+              "signal_name": "alarm_light",
+              "source_id": "cell_io.alarm_light",
+              "value_type": "bool"
+            },
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "cell_io",
+              "direction": "output",
+              "provider": {
+                "channel": "clamp_valve",
+                "profile": "mock_output"
+              },
+              "resource_role_id": "clamp_valve",
+              "signal_name": "clamp_valve",
+              "source_id": "cell_io.clamp_valve",
+              "value_type": "bool"
+            },
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "cell_io",
+              "direction": "input",
+              "freshness": {
+                "mode": "provider_validity"
+              },
+              "provider": {
+                "echo": {
+                  "delay_ms": 300,
+                  "output_signal_name": "clamp_valve"
+                },
+                "initial_value": false,
+                "profile": "mock"
+              },
+              "resource_role_id": "clamp_pressure_ok",
+              "signal_name": "clamp_pressure_ok",
+              "source_id": "cell_io.clamp_pressure_ok",
+              "transition_capability": "sampled_only",
+              "update_mode": "change_only",
+              "value_type": "bool"
+            },
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "cell_io",
+              "direction": "input",
+              "freshness": {
+                "mode": "provider_validity"
+              },
+              "provider": {
+                "initial_value": true,
+                "profile": "mock"
+              },
+              "resource_role_id": "part_present",
+              "signal_name": "part_present",
+              "source_id": "cell_io.part_present",
+              "transition_capability": "sampled_only",
+              "update_mode": "change_only",
+              "value_type": "bool"
+            },
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "cell_io",
+              "direction": "output",
+              "provider": {
+                "channel": "ready_light",
+                "profile": "mock_output"
+              },
+              "resource_role_id": "ready_light",
+              "signal_name": "ready_light",
+              "source_id": "cell_io.ready_light",
+              "value_type": "bool"
+            },
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "cell_io",
+              "direction": "input",
+              "freshness": {
+                "mode": "provider_validity"
+              },
+              "provider": {
+                "initial_value": false,
+                "profile": "mock"
+              },
+              "resource_role_id": "start_button",
+              "signal_name": "start_button",
+              "source_id": "cell_io.start_button",
+              "transition_capability": "sampled_only",
+              "update_mode": "change_only",
+              "value_type": "bool"
+            },
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "cell_io",
+              "direction": "input",
+              "freshness": {
+                "mode": "provider_validity"
+              },
+              "provider": {
+                "initial_value": false,
+                "profile": "mock"
+              },
+              "resource_role_id": "touch_probe",
+              "signal_name": "touch_probe",
+              "source_id": "cell_io.touch_probe",
+              "transition_capability": "sampled_only",
+              "update_mode": "change_only",
+              "value_type": "bool"
+            },
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "cell_io",
+              "direction": "input",
+              "freshness": {
+                "mode": "provider_validity"
+              },
+              "provider": {
+                "initial_value": false,
+                "profile": "mock"
+              },
+              "resource_role_id": "zone_occupied",
+              "signal_name": "zone_occupied",
+              "source_id": "cell_io.zone_occupied",
+              "transition_capability": "sampled_only",
+              "update_mode": "change_only",
+              "value_type": "bool"
+            }
+          ]
+        },
+        "runtime_kind": "io_provider"
       },
       "target_settings": {}
     },
@@ -220,7 +382,30 @@
     }
   ],
   "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
-  "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to composer-assistant requests.",
+  "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack, set up as a Mock pick-and-place workcell. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to composer-assistant requests. The Mock cell_io device carries the cell signals: inputs part_present (pick-table part sensor, starts true), clamp_pressure_ok (drop-fixture clamp pressure switch, follows clamp_valve after 300 ms), touch_probe (fixture touch probe), start_button (operator start) and zone_occupied (area scanner); outputs clamp_valve, alarm_light and ready_light. The global rule zone_intrusion stops all motion while the area scanner reports the zone occupied.",
   "name": "ur10e_robotiq_assistant_modes_scene_authoring",
-  "policies": {}
+  "policies": {
+    "interrupt_rules": [
+      {
+        "active_at_start": true,
+        "after_stop": "hold",
+        "condition": {
+          "compare": {
+            "op": "==",
+            "operand": {
+              "signal": {
+                "controllable_component_id": "cell_io",
+                "signal_name": "zone_occupied"
+              }
+            },
+            "value": true
+          }
+        },
+        "on_trip": "stop",
+        "priority": 0,
+        "rule_id": "zone_intrusion",
+        "scope": "all_motion"
+      }
+    ]
+  }
 }

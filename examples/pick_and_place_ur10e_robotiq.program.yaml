@@ -1,6 +1,6 @@
 api_version: manyforge.program.v3
 program_id: pick_and_place_ur10e_robotiq_demo
-program_revision: sha256:a696d0e82af2945ab363c961734956675fb4fc54bb6071348f1fa3971ca7ccac
+program_revision: sha256:40ab2f7b8a921052c4565dac6176796da687f3c1e6718e5cdfdc024955b0e0ac
 program_profile: composable-cell-v1
 name: pick_and_place_ur10e_robotiq_demo
 description: Pick-and-place demo for the source-local UR10e and Robotiq 2F-140 model. It preserves the
@@ -77,6 +77,7 @@ tree:
   - node_id: gripper.command_position
     instance_id: command_gripper
     parameters:
+      completion_timeout_s: 15.0
       target:
         component_id: robotiq_2f_140
         command_target_id: gripper
@@ -155,6 +156,7 @@ tree:
   - node_id: gripper.command_position
     instance_id: close_gripper
     parameters:
+      completion_timeout_s: 15.0
       target:
         component_id: robotiq_2f_140
         command_target_id: gripper
@@ -302,6 +304,7 @@ tree:
   - node_id: gripper.command_position
     instance_id: open_gripper
     parameters:
+      completion_timeout_s: 15.0
       target:
         component_id: robotiq_2f_140
         command_target_id: gripper

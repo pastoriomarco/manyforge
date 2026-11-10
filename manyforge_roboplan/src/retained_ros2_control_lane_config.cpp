@@ -493,8 +493,6 @@ void configure_retained_gripper_output_mode(
   }
   if (config.gripper->actuation_kind ==
       core::GripperActuationKind::kPneumatic) {
-    config.gripper->result_timeout_s =
-        found->delivery_result_timeout_s.value_or(1.0);
     config.gripper->completion_policy =
         config.gripper->output_mode == core::GripperOutputMode::kNone
             ? "no_output"
@@ -549,7 +547,6 @@ void configure_retained_mock_gripper_action(
   // transport; the action transport carries the request's own target.
   gripper_config.publish_nominal_position = false;
   gripper_config.wait_for_action_server_timeout_s = 2.0;
-  gripper_config.result_timeout_s = row_number(row, "gripper_result_timeout_s");
   gripper_config.stop_finish_tolerance =
       row_number(row, "gripper_stop_finish_tolerance");
   config.gripper = std::move(gripper_config);
@@ -605,7 +602,7 @@ make_retained_mock_ros2_control_backend_config(
       row_number(row, "hard_stop_completion_timeout_s"),
       retained_ros2_control_measured_joints_budget_ns(measured_lane,
           motion_binding.value().controllable_component_id, stream_overrides),
-      jtc_accepts_speed_scaling(artifacts.arm_command_interfaces));
+      row.runtime_scale_supported.value());
   config.arm.measured_joint_state_lane = std::move(measured_lane);
   config.arm.mock_reset_position = artifacts.mock_reset_position;
   // Only the generated Mock controllers enable stock JTC scheduled replacement.
@@ -701,7 +698,7 @@ make_retained_real_ros2_control_backend_config(
       row_number(row, "hard_stop_completion_timeout_s"),
       retained_ros2_control_measured_joints_budget_ns(measured_lane,
           motion_binding.value().controllable_component_id, stream_overrides),
-      jtc_accepts_speed_scaling(artifacts.arm_command_interfaces));
+      row.runtime_scale_supported.value());
   config.participant.stop.trip_authority = core::StateAuthorityClass::kMeasured;
   // The component's Deployment setting: the soft Stop lead-in starts at the
   // controller's command position (absent or `commanded`) or at the measured

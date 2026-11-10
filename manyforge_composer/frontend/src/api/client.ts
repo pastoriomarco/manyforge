@@ -88,6 +88,7 @@ import {
   type ComposerSettingsSnapshot,
 } from '../state/composerSettings';
 import {
+  parseAssistantModeDetail,
   parseAssistantModeIndex,
   parseAssistantProviderStatus,
 } from './assistantParsers';
@@ -154,6 +155,7 @@ import type {
 import type { ComponentCatalog } from '../types/componentCatalog';
 import { parseComponentCatalog } from './componentCatalogParser';
 import type {
+  AssistantModeDetail,
   AssistantModeIndex,
   AssistantProviderStatus,
   AssistantRequestInput,
@@ -534,22 +536,33 @@ function persistentValuesPath(suffix = ''): string {
   return `/api/program/persistent-values${suffix}`;
 }
 
-/** Maintained assistant profile id -> its model endpoint aliases. */
-export type AssistantProfileAliases = Record<string, string[]>;
+/** A maintained assistant profile: whether it has a chat mode, and its runtime model aliases. */
+export interface AssistantProfile {
+  chat: boolean;
+  /** The runtime (`query_model`) aliases; the chat alias is bound by the assistant component. */
+  modelEndpointAliases: string[];
+}
 
-function parseAssistantProfileAliases(value: unknown): AssistantProfileAliases {
+/** Maintained assistant profile id -> its facts. */
+export type AssistantProfiles = Record<string, AssistantProfile>;
+
+function parseAssistantProfiles(value: unknown): AssistantProfiles {
   const root = value as { schemaVersion?: unknown; profiles?: unknown } | null;
-  if (root?.schemaVersion !== 'manyforge.composer_assistant_profile_aliases.v1'
+  if (root?.schemaVersion !== 'manyforge.composer_assistant_profile_aliases.v2'
     || !Array.isArray(root.profiles)) {
     throw new Error('assistantProfiles must be the supported alias listing');
   }
   return Object.fromEntries(root.profiles.map((row: unknown) => {
-    const profile = row as { profileId?: unknown; modelEndpointAliases?: unknown };
-    if (typeof profile.profileId !== 'string' || !Array.isArray(profile.modelEndpointAliases)
+    const profile = row as { profileId?: unknown; chat?: unknown; modelEndpointAliases?: unknown };
+    if (typeof profile.profileId !== 'string' || typeof profile.chat !== 'boolean'
+      || !Array.isArray(profile.modelEndpointAliases)
       || profile.modelEndpointAliases.some((alias) => typeof alias !== 'string')) {
       throw new Error('assistantProfiles.profiles must name aliases per profile');
     }
-    return [profile.profileId, profile.modelEndpointAliases as string[]];
+    return [profile.profileId, {
+      chat: profile.chat,
+      modelEndpointAliases: profile.modelEndpointAliases as string[],
+    }];
   }));
 }
 
@@ -971,8 +984,8 @@ export const api = {
     ),
   },
   deploymentWorkspace: {
-    assistantProfiles: (signal?: AbortSignal): Promise<AssistantProfileAliases> =>
-      requestJson('/api/deployment/assistant-profiles', parseAssistantProfileAliases, signal),
+    assistantProfiles: (signal?: AbortSignal): Promise<AssistantProfiles> =>
+      requestJson('/api/deployment/assistant-profiles', parseAssistantProfiles, signal),
     get: (signal?: AbortSignal): Promise<DeploymentWorkspaceResponse> =>
       requestJson(
         '/api/deployment/workspace',
@@ -1238,6 +1251,8 @@ export const api = {
   assistant: {
     modes: (signal?: AbortSignal): Promise<AssistantModeIndex> =>
       requestJson('/api/assistant/modes', parseAssistantModeIndex, signal),
+    mode: (mode: string, signal?: AbortSignal): Promise<AssistantModeDetail> =>
+      requestJson(`/api/assistant/modes/${encodeURIComponent(mode)}`, parseAssistantModeDetail, signal),
     submit: (
       body: AssistantRequestInput,
       signal?: AbortSignal,

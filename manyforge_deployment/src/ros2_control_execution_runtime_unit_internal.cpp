@@ -489,37 +489,17 @@ bool ros_gripper_output_mode_is_valid(const std::string_view actuation_kind,
          (actuation_kind == "position_commanded" && output_mode == "commanded");
 }
 
-bool ros_gripper_delivery_result_timeout_is_valid(
-    const std::string_view actuation_kind, const double timeout_s) noexcept {
-  return actuation_kind == "pneumatic" && std::isfinite(timeout_s) &&
-         timeout_s > 0.0;
-}
-
 namespace {
 
 // Shared by strict retained extraction and the pre-Draft required-row hook.
 // This leaves the archival neutral twelve-field decoder unchanged.
-std::optional<double> require_ros_gripper_delivery_result_timeout(
-    const core::JsonObjectDTO &fields, const std::string_view actuation_kind) {
-  const auto timeout = fields.find("delivery_result_timeout_s");
-  const bool present = timeout != fields.end();
-  if (fields.size() != 13U + static_cast<std::size_t>(present) +
-                           static_cast<std::size_t>(fields.contains("pneumatic_io")) +
+void require_ros_gripper_target_field_count(const core::JsonObjectDTO &fields) {
+  if (fields.size() != 13U + static_cast<std::size_t>(fields.contains("pneumatic_io")) +
                            static_cast<std::size_t>(fields.contains("grasp_confirmation")) +
                            static_cast<std::size_t>(fields.contains("stop_finish_tolerance"))) {
     fail_retained_bundle(
         "ros2_control runtime has an invalid gripper target configuration");
   }
-  if (!present) {
-    return std::nullopt;
-  }
-  const auto *seconds = std::get_if<double>(&timeout->second.value);
-  if (seconds == nullptr ||
-      !ros_gripper_delivery_result_timeout_is_valid(actuation_kind, *seconds)) {
-    fail_retained_bundle(
-        "ros2_control runtime has invalid pneumatic delivery result timeout");
-  }
-  return *seconds;
 }
 
 using PneumaticIo = ros2_control_execution_runtime_contract::Configuration::PneumaticIo;
@@ -667,14 +647,12 @@ decode_ros2_control_execution_gripper_target_configurations(
     if (mode == nullptr || kind == nullptr || !ros_gripper_output_mode_is_valid(*kind, *mode)) {
       fail_retained_bundle("ros2_control runtime has invalid gripper output semantics");
     }
-    const auto delivery_timeout =
-        require_ros_gripper_delivery_result_timeout(*fields, *kind);
+    require_ros_gripper_target_field_count(*fields);
     auto pneumatic_io = decode_pneumatic_io(*fields, *kind, *mode);
     auto grasp_confirmation = decode_grasp_confirmation(*fields, *kind, pneumatic_io);
     const auto stop_finish_tolerance = decode_stop_finish_tolerance(*fields, *kind);
     auto common = *fields;
     common.erase("output_mode");
-    common.erase("delivery_result_timeout_s");
     common.erase("pneumatic_io");
     common.erase("grasp_confirmation");
     common.erase("stop_finish_tolerance");
@@ -683,7 +661,7 @@ decode_ros2_control_execution_gripper_target_configurations(
         "ros2_control runtime configuration");
     result.push_back(Typed{std::move(decoded.front()), *mode == "none"
                             ? core::GripperOutputMode::kNone
-                            : core::GripperOutputMode::kCommanded, delivery_timeout,
+                            : core::GripperOutputMode::kCommanded,
                             std::move(pneumatic_io), std::move(grasp_confirmation),
                             stop_finish_tolerance});
   }
@@ -984,7 +962,7 @@ bool require_ros2_control_execution_runtime_required_rows(
         fail_retained_bundle(
             "ros2_control runtime configuration has invalid gripper target semantics");
       }
-      (void)require_ros_gripper_delivery_result_timeout(*fields, *kind);
+      require_ros_gripper_target_field_count(*fields);
       auto io = decode_pneumatic_io(*fields, *kind, *mode);
       (void)decode_grasp_confirmation(*fields, *kind, io);
       if (io)

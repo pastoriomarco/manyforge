@@ -179,6 +179,17 @@ def test_parse_keeps_the_adapters_details_and_refuses_non_text_pairs() -> None:
             _model(component_states=[_state("robot", details=bad)])
 
 
+def test_parse_keeps_the_adapters_endpoints_and_refuses_non_text_pairs() -> None:
+    endpoints = [{"role_id": "assistant_request", "url": "http://127.0.0.1:40123"}]
+    (assistant,) = _model(
+        component_states=[_state("assistant", "enabled", endpoints=endpoints)]
+    ).component_states
+    assert assistant["endpoints"] == endpoints
+    for bad in ({"role_id": "a"}, [{"role_id": "a", "url": 1}], ["http://x"]):
+        with pytest.raises(HeadlessApiError):
+            _model(component_states=[_state("assistant", endpoints=bad)])
+
+
 def test_parse_keeps_owner_role_concerns_and_owner_unavailable() -> None:
     owner_fault = {**_FAULT, "concerns": ["lite6_arm", "lite6_controller_io"]}
     member = _state(

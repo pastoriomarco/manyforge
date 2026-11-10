@@ -1,4 +1,4 @@
-"""Bounded conversation and request-state storage for the direct bridge."""
+"""Bounded conversation and request-state storage for the bridge."""
 
 from __future__ import annotations
 
@@ -105,6 +105,70 @@ class SessionHistory:
         while bounded and bounded[0].get("role") != "user":
             bounded.pop(0)
         return bounded
+
+
+# Argument fields that name what a Draft edit touched.
+_EDITED_ID_FIELDS = frozenset({
+    "instance_id", "new_instance_id", "scene_resource_id", "scene_resource_ids",
+    "parameter_id", "parameter_ids", "key", "keys", "namespace_id", "namespace_ids",
+    "policy_id", "contact_policy_ids",
+})
+# Node parameter values and bindings are not names of edited Draft items.
+_NOT_EDITED_IDS = frozenset({"value_sources"})
+
+
+def _edited_ids(value: Any, found: list[str]) -> None:
+    if isinstance(value, dict):
+        for name, item in value.items():
+            if name in _NOT_EDITED_IDS or (name == "parameters" and isinstance(item, dict)):
+                continue
+            if name in _EDITED_ID_FIELDS and isinstance(item, str):
+                found.append(item)
+            elif name in _EDITED_ID_FIELDS and isinstance(item, list):
+                found.extend(entry for entry in item if isinstance(entry, str))
+            _edited_ids(item, found)
+    elif isinstance(value, list):
+        for item in value:
+            _edited_ids(item, found)
+
+
+def _change_verb(tool_id: str) -> str:
+    words = set(tool_id.split("_"))
+    if words & {"insert", "add"}:
+        return "added"
+    if words & {"remove", "delete"}:
+        return "removed"
+    if "upsert" in words:
+        return "added or updated"
+    return "updated"
+
+
+def change_summary(calls: list[dict[str, Any]]) -> str:
+    """One line per Draft edit the request committed, from its tool calls."""
+
+    lines = []
+    for call in calls:
+        if call.get("draftMutated") is not True:
+            continue
+        found: list[str] = []
+        _edited_ids(call.get("arguments"), found)
+        names = ", ".join(dict.fromkeys(found)) or "Draft"
+        lines.append(f"- {_change_verb(call['toolId'])} {names} ({call['toolId']})")
+    return "Draft changes:\n" + "\n".join(lines) if lines else "Draft changes: none."
+
+
+def compact_exchange(
+    user_message: dict[str, Any], answer: str, calls: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """A completed request as history: the request, the answer and its edits.
+
+    Intermediate tool calls, their results and failed calls are left out.
+    """
+
+    return [
+        deepcopy(user_message),
+        {"role": "assistant", "content": f"{answer}\n\n{change_summary(calls)}"},
+    ]
 
 
 @dataclass(slots=True)
@@ -224,6 +288,12 @@ class RequestLedger:
             self._records.move_to_end(request_id)
             return record.status()
 
+    def busy(self) -> bool:
+        """Whether any record is running. A plain read on the event loop: every
+        lock holder changes record states without awaiting in between."""
+
+        return any(record.state == "running" for record in self._records.values())
+
     async def close(self) -> None:
         async with self._lock:
             tasks = [record.task for record in self._records.values() if record.task]
@@ -257,4 +327,6 @@ __all__ = [
     "RequestLedger",
     "RequestRecord",
     "SessionHistory",
+    "change_summary",
+    "compact_exchange",
 ]

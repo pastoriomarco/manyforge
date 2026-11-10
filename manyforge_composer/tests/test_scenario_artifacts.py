@@ -1431,9 +1431,13 @@ class _RunnerKernelCell:
 
     def manager_apply_status(self, _apply_id, _generation) -> dict:
         if self.apply_failure is not None:
+            failure, self.apply_failure = self.apply_failure, None
+            if failure.get("effect_boundary") == "before_effect":
+                # Refused before any effect: the Manager releases the claim.
+                self.claimed = False
+                return {"ok": True, "state": "failed", "failure": failure}
             # An Apply that ended after it started changing the cell: the
             # Manager keeps its adopted claim.
-            failure, self.apply_failure = self.apply_failure, None
             self.held_by_failed_apply = True
             return {"ok": True, "state": "unknown_effect", "failure": failure}
         self.claimed = False  # the Manager releases the adopted claim
@@ -1547,6 +1551,61 @@ def test_new_releases_an_unknown_effect_apply_and_load_works_again(
     assert loaded.json()["scenario_id"] == "loaded-project"
     # Its New found nothing left to release.
     assert len(cell.release_requests) == 3 and len(cell.applies) == applies + 2
+
+
+@pytest.mark.parametrize("boundary", ["before_effect", "unknown"])
+def test_load_failed_before_any_effect_restores_the_previous_drafts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    # OD-87: the Load commits its workspace before the Manager submission. A
+    # Manager Apply that then fails before any effect leaves the cell running
+    # the previous Scenario, so the previous Drafts come back and the typed
+    # failure is the Load's result. An unknown effect restores nothing.
+    target = save_scenario_artifact(
+        _document("loaded-project"), str(tmp_path / "loaded-project.scenario"),
+        allowed_roots=[str(tmp_path)], overwrite=False,
+    )
+    cell = _RunnerKernelCell("idle_after_reset")
+    state = ComposerState(allowed_fs_roots=[str(tmp_path), str(UNTITLED_SCENARIO_PATH.parent)])
+    state.authoring_admission = AuthoringAdmissionCoordinator(cell)  # type: ignore[arg-type]
+    state.headless_client = cell  # type: ignore[assignment]
+    monkeypatch.setattr(state, "published_scenario", lambda: {"published_scenario": None})
+    monkeypatch.setattr(routes_scenario_documents, "program_workspace",
+                        lambda _state: {"authoringWorkspace": {"workspaceEpoch": "test"}})
+    from manyforge_composer.backend.routes_deployment_draft import HeadlessApplyPorts
+
+    monkeypatch.setattr(HeadlessApplyPorts, "_POLL_SECONDS", 0.0)
+    client = _scenario_client(state)
+    loaded = client.post("/api/scenario/load", json={"path": target, "discard_unsaved": True})
+    assert loaded.json()["outcome"] == "succeeded", loaded.json()
+
+    def drafts() -> tuple[dict, dict, dict]:
+        program = state.draft_session.retained_state()
+        deployment = state.deployment_draft_session.retained_state()
+        program.pop("draft_id")
+        deployment.pop("draft_id")
+        return program, deployment, state.authoring_workspace.project_facts()
+
+    before = drafts()
+    assert before[2]["document_id"] == "loaded-project"
+    cell.apply_failure = {
+        "code": "apply_fence_evidence_failed", "effect_boundary": boundary,
+        "message": "Managed Kernel Apply-fence owner: no reconciled active configuration",
+        "cause_details": {"cause_code": "kernel_apply_fence_request_failed",
+                          "cause": "the execution owner has no reconciled active configuration"},
+    }
+    failed = client.post("/api/scenario/load", json={"path": target, "discard_unsaved": True})
+    assert failed.status_code == 200, failed.text
+    result = failed.json()
+    assert result["outcome"] == "failed"
+    assert result["error"]["code"] == "kernel_apply_fence_request_failed"
+    if boundary == "before_effect":
+        assert drafts() == before
+        assert result["authoringWorkspace"]["project"]["document_id"] == "loaded-project"
+        assert cell.authoring_admission()["authoring_allowed"] is True
+    else:
+        assert drafts() != before
+        assert state.authoring_workspace.project_facts()["document_id"] != "loaded-project"
 
 
 class _FailedStopKernel:

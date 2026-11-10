@@ -11,7 +11,7 @@ import logging
 import math
 from threading import Event, Lock, Thread
 import time
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Sequence
 
 import rfc8785
 from starlette.responses import JSONResponse
@@ -19,6 +19,11 @@ from starlette.responses import JSONResponse
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.skill_loader import default_skills_dir, load_skill_catalog
 
+from .assistant_instruments import (
+    INDEX_VERSION as ASSISTANT_MODE_INDEX_VERSION,
+    MODE_PROJECTION_VERSION as ASSISTANT_MODE_PROJECTION_VERSION,
+    AssistantInstruments,
+)
 from .activity_history import apply_record, component_action_record, record_activity
 from .client import MAX_HTTP_RESPONSE_BYTES
 from .execution import ExecutionPort
@@ -332,6 +337,29 @@ def _palette_environment():
     return build_node_environment()
 
 
+@lru_cache(maxsize=1)
+def _assistant_instruments() -> AssistantInstruments:
+    """Assistant node and tool descriptors, built once from the loaded catalog."""
+    return AssistantInstruments(_palette_environment().catalog)
+
+
+def _assistant_mode(
+    native: dict[str, Any], offers: Any
+) -> dict[str, Any]:
+    """Join the catalog part: the stable nodes this Deployment can run."""
+    instruments = _assistant_instruments()
+    offer_set = set(offers)
+    return instruments.compose_mode(
+        native,
+        (
+            entry.id
+            for entry in instruments.entries()
+            if _palette_missing_capability(entry, offer_set) is None
+        ),
+        offer_set,
+    )
+
+
 def warm_builtin_node_environment() -> None:
     """Build the immutable built-in node environment once, before serving.
 
@@ -347,6 +375,7 @@ def warm_builtin_node_environment() -> None:
     try:
         _build_skills()
         _program_catalog()
+        _assistant_instruments()
     except (OSError, ValueError) as error:  # unreadable or invalid build inputs
         logging.getLogger(__name__).warning(
             "built-in node environment is unavailable: %s", error
@@ -376,27 +405,6 @@ def _palette_missing_capability(entry: Any, offers: set[str]) -> str | None:
                 if capability not in offers
             )
     return None
-
-
-def _palette_model_configured(applied: Mapping[str, Any]) -> bool:
-    assistant = applied.get("assistant_projection")
-    if not isinstance(assistant, Mapping):
-        return False
-    models = assistant.get("ai_models")
-    endpoints = assistant.get("model_endpoint_aliases")
-    if not isinstance(models, list) or not isinstance(endpoints, list):
-        return False
-    components = {
-        row["controllable_component_id"]
-        for row in models
-        if isinstance(row, Mapping)
-        and isinstance(row.get("controllable_component_id"), str)
-    }
-    return any(
-        isinstance(row, Mapping)
-        and row.get("external_resource_alias") in components
-        for row in endpoints
-    )
 
 
 def _strip_palette_offers(projection: dict[str, Any]) -> Any:
@@ -1621,7 +1629,6 @@ class HeadlessService:
         catalog = environment.catalog
         offer_set = set(offers)
         required_nodes = set(runner_availability["required_node_ids"])
-        model_configured = _palette_model_configured(applied)
         palette_reasons: set[str] = set()
         for row in projected_rows:
             entry = catalog.get(row["node_id"])
@@ -1632,15 +1639,6 @@ class HeadlessService:
                     "code": "capability_not_offered",
                     "message": f"No component offers {missing}",
                     "details": {"capability": missing},
-                })
-            if (
-                entry.execution.owner_api == "assistant.model_request"
-                and not model_configured
-            ):
-                reasons.append({
-                    "code": "model_not_configured",
-                    "message": "No model is configured",
-                    "details": {},
                 })
             row["reasons"] = reasons
             if reasons:
@@ -1725,7 +1723,7 @@ class HeadlessService:
             or not isinstance(context.get("node_environment"), dict)
             or not isinstance(context.get("source_model"), dict)
             or context["assistant_mode"].get("schema_version")
-            != "manyforge.assistant_mode_projection.v1"
+            != ASSISTANT_MODE_PROJECTION_VERSION
             or context["assistant_mode"].get("mode") != mode_id
             or context["node_environment"].get("schema_version")
             != "manyforge.node_environment_projection.v2"
@@ -1736,7 +1734,8 @@ class HeadlessService:
                 "assistant_mode_context_invalid",
                 "native core returned an unsupported assistant-mode context",
             )
-        _strip_palette_offers(context["node_environment"])
+        offers = _strip_palette_offers(context["node_environment"])
+        context["assistant_mode"] = _assistant_mode(context["assistant_mode"], offers)
         return context
 
     def program_applied(self) -> dict[str, Any]:
@@ -3028,7 +3027,7 @@ class HeadlessService:
         projection = self.core.assistant_mode_projection(mode_id)
         source = projection.get("source")
         if (
-            projection.get("schema_version") != "manyforge.assistant_mode_projection.v1"
+            projection.get("schema_version") != ASSISTANT_MODE_PROJECTION_VERSION
             or projection.get("mode") != mode_id
             or not isinstance(source, dict)
         ):
@@ -3036,13 +3035,14 @@ class HeadlessService:
                 "assistant_mode_projection_invalid",
                 "native core returned an unsupported assistant mode projection",
             )
-        return projection
+        offers = self.core.node_environment_projection().get("capability_offers")
+        return _assistant_mode(projection, offers)
 
     def assistant_modes(self) -> dict[str, Any]:
         projection = self.core.assistant_mode_index()
         source = projection.get("source")
         if (
-            projection.get("schema_version") != "manyforge.assistant_mode_index.v1"
+            projection.get("schema_version") != ASSISTANT_MODE_INDEX_VERSION
             or not isinstance(projection.get("modes"), list)
             or not isinstance(source, dict)
         ):
@@ -3050,7 +3050,7 @@ class HeadlessService:
                 "assistant_mode_projection_invalid",
                 "native core returned an unsupported assistant mode index",
             )
-        return projection
+        return _assistant_instruments().compose_index(projection)
 
     def scene(self) -> dict[str, Any]:
         runtime = self.runtime()
@@ -3393,6 +3393,7 @@ class HeadlessService:
             raise HeadlessApiError("activation_preparer_unavailable", "Reference validation is not configured")
         diagnostics = self.activation_preparer.validate_program_references(
             deployment=request.deployment, model_source_closure=request.model_source_closure,
+            model_source_closure_digest=request.model_source_closure_digest,
             program=request.program, program_content_digest=request.program_content_digest,
             draft=request.draft,
         )

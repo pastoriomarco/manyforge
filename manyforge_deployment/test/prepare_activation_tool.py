@@ -749,7 +749,7 @@ def _unmounted_ids(deployment: dict[str, object]) -> list[str]:
             and not ("owner" in row and "model_source" not in row)]
 
 
-def _require_gripper_delivery_timeout_semantics(
+def _require_gripper_target_semantics(
     args: argparse.Namespace, request: dict[str, object], root: Path
 ) -> None:
     """Prepare actual pneumatic/Position rows through the authored selector."""
@@ -770,43 +770,24 @@ def _require_gripper_delivery_timeout_semantics(
     # Each robot's tool owns its gripper row.
     pneumatic = target(request, "lite_gripper")
     position = target(request, "robotiq_2f_85")
-    assert pneumatic["actuation_kind"] == "pneumatic" and len(pneumatic) == 14
-    assert pneumatic["delivery_result_timeout_s"] == 1.0
+    assert pneumatic["actuation_kind"] == "pneumatic" and len(pneumatic) == 13
     assert position["actuation_kind"] == "position_commanded" and len(position) == 13
-    assert "delivery_result_timeout_s" not in position
 
-    for name, timeout in (("authored", 1.0), ("absent", None), ("override", 2.5)):
-        accepted = copy.deepcopy(request)
-        row = target(accepted, "lite_gripper")
-        if timeout is None:
-            del row["delivery_result_timeout_s"]
-        else:
-            row["delivery_result_timeout_s"] = timeout
-        _rehash_request(accepted)
-        prepared = _run(args, accepted, root / name)
-        assert prepared is not None
-        units = prepared["activation_payload"]["retained_bundle"]["cell_graph"][
-            "runtime_units"
-        ]
-        (unit,) = units
-        assert unit["runtime_profile_id"] == "manyforge.ros2_control_execution_runtime"
-        retained = unit["configuration"]["gripper_target_configurations"]
-        assert retained == [row, position]
+    accepted = copy.deepcopy(request)
+    _rehash_request(accepted)
+    prepared = _run(args, accepted, root / "authored")
+    assert prepared is not None
+    units = prepared["activation_payload"]["retained_bundle"]["cell_graph"][
+        "runtime_units"
+    ]
+    (unit,) = units
+    assert unit["runtime_profile_id"] == "manyforge.ros2_control_execution_runtime"
+    retained = unit["configuration"]["gripper_target_configurations"]
+    assert retained == [pneumatic, position]
 
     invalid_rows = []
-    for name, timeout in (
-        ("zero", 0.0), ("negative", -1.0), ("text", "1.0"),
-        ("boolean", True), ("null", None),
-    ):
-        rejected = copy.deepcopy(request)
-        target(rejected, "lite_gripper")["delivery_result_timeout_s"] = timeout
-        invalid_rows.append((name, rejected))
-    foreign_position = copy.deepcopy(request)
-    target(foreign_position, "robotiq_2f_85")["delivery_result_timeout_s"] = 1.0
-    invalid_rows.append(("position-timeout", foreign_position))
     foreign_field = copy.deepcopy(request)
-    row = target(foreign_field, "lite_gripper")
-    row["foreign_timeout_s"] = row.pop("delivery_result_timeout_s")
+    target(foreign_field, "lite_gripper")["foreign_timeout_s"] = 1.0
     invalid_rows.append(("foreign-fourteenth-field", foreign_field))
     missing_base = copy.deepcopy(request)
     del target(missing_base, "lite_gripper")["description"]
@@ -914,7 +895,7 @@ def _check_tool_split(
     tool = components["lite_gripper"]
     assert "root_pose_in_cell" not in tool
     assert "root_pose_in_cell" in components["lite6_robot"]
-    assert tool["component_type_id"] == "lite_gripper.fixed_scale.component"
+    assert tool["component_type_id"] == "lite_gripper.component"
     assert [row["model_role_id"] for row in tool["model_role_bindings"]] == ["tool_model"]
     # The robot no longer owns a gripper; the tool owns `gripper` only, as a
     # commanded display without its own controller.
@@ -1180,7 +1161,7 @@ def _check_ros_preparation(
     # The cell-wide `mode` lane flag is deleted.
     assert "mode" not in runtime["configuration"]
     assert [row["component_type_id"] for row in graph["controllable_components"]] == [
-        "ur10e.fixed_scale.component", "robotiq_2f_140.fixed_scale.component"]
+        "ur10e.component", "robotiq_2f_140.component"]
     assert {row["control_coordinator_endpoint_role"] for row in graph["control_domains"]} == {
         "ros2_control_execution_status"
     }
@@ -1212,7 +1193,6 @@ def _check_ros_preparation(
             }]
         else:
             assert not row.get("runtime_scale_route_qualifications")
-        assert row["capability_id"] != "execution.runtime_scale.operation_scoped"
     arm = next(row for row in bindings if row["capability_id"] == "execution.trajectory.execute")
     gripper = next(row for row in bindings if row["capability_id"] == "tool.gripper.command")
     assert len(arm["resource_bindings"]) == 6
@@ -1931,7 +1911,7 @@ def main() -> int:
             (component,) = [row for row in graph["controllable_components"]
                             if row["controllable_component_id"] == robot_id]
             # The split arm model has no fingers; its type is arm-only.
-            assert component["component_type_id"] == "lite6.fixed_scale.component"
+            assert component["component_type_id"] == "lite6.component"
             (unit,) = graph["runtime_units"]
             configuration = unit["configuration"]
             assert "mode" not in configuration
@@ -1976,8 +1956,8 @@ def main() -> int:
                 row["controllable_component_id"]: row["component_type_id"]
                 for row in new_graph["controllable_components"]
                 if row["controllable_component_id"] != owner_id
-            } == {robot_id: "lite6.fixed_scale.component",
-                  tool_id: "lite_gripper.fixed_scale.component"}
+            } == {robot_id: "lite6.component",
+                  tool_id: "lite_gripper.component"}
             gripper_bindings = [
                 row for row in new_graph["control_bindings"]
                 if row["command_target_id"] == "gripper"
@@ -2110,8 +2090,8 @@ def main() -> int:
             _run(args, request, temporary / "empty", expected_program_outcome_kind="no_program")
             return 0
         if args.intent_rejections:
-            _require_gripper_delivery_timeout_semantics(
-                args, request, temporary / "gripper-delivery-timeout"
+            _require_gripper_target_semantics(
+                args, request, temporary / "gripper-target"
             )
             # Launch-time Program parameter overrides were removed; the former
             # request form is refused by version, never reinterpreted.

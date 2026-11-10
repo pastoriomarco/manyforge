@@ -28,7 +28,8 @@ From a fresh checkout, at the repository root:
 
 Then open **http://localhost:3000**. The first start also compiles the
 ManyForge C++ targets into the image-keyed cache under `.manyforge-dev/`, which
-takes a while; later starts are incremental.
+takes a while; later starts are incremental. This build runs before the
+workbench starts, so it never counts against the startup timeout.
 
 `build` prepares the pinned RoboPlan sources under `.docker/`
 (`scripts/setup-docker.sh --prepare-only`), then builds
@@ -94,8 +95,8 @@ them once, when it creates the container.
 | `MANYFORGE_DEV_RUNTIME_STATE_ROOT` | `<cache base>/runtime/<container name>` | Absolute host path of the runtime state root. |
 | `MANYFORGE_DEV_SITE_SETTINGS` | unset | Absolute host path of the [site settings](#site-settings) file. |
 | `MANYFORGE_DEV_CONTAINER_NAME` | `manyforge-development-workbench` | Container name; use it for diagnosis too. |
-| `MANYFORGE_DEV_BUILD_JOBS` | CPU count, at most 8 | Parallel C++ build jobs at start; lower it if compilation runs out of memory. |
-| `MANYFORGE_DEV_START_TIMEOUT_SECONDS` | `900` | How long `start` waits for readiness. |
+| `MANYFORGE_DEV_BUILD_JOBS` | CPU count, at most 8 | Parallel C++ build jobs in the native build step at start; lower it if compilation runs out of memory. |
+| `MANYFORGE_DEV_START_TIMEOUT_SECONDS` | `900` | How long `start` waits for readiness after the native build step; build time does not count. |
 | `ROS_DOMAIN_ID`, `ROS_AUTOMATIC_DISCOVERY_RANGE`, `ROS_STATIC_PEERS`, `RMW_IMPLEMENTATION` | ROS defaults (domain 0, `SUBNET`) | DDS topology; see [ROS and DDS](#ros-and-dds). |
 | `MANYFORGE_AI_*` | unset | Tokens for `ai_model` components, forwarded by name ([assistant cookbook](ASSISTANT_E2E_COOKBOOK.md)). |
 | `MANYFORGE_MOTION_TRACE_DIR` | `/tmp/manyforge-state/motion-traces` | Motion-trace snapshots for the debug export, in a capped store; empty keeps traces inline ([Reference](#reference)). |
@@ -339,13 +340,23 @@ These are snapshots of the bounded volatile window (16 goals, 1,024 controller
 samples), with explicit coverage and omission counts, not complete Run journals.
 Unavailable or invalid diagnostic files do not fail motion or the debug export.
 
-Frontend source edits update through HMR. Backend
-startup incrementally builds the current `manyforge_manager_daemon`,
-`manyforge_headless_py`, `manyforge_ros2_control_execution_host`,
-`manyforge_roboplan_candidate_worker` and Deployment authoring compiler targets
-with their dependencies. It deliberately runs no tests, sanitizers, qualification
-matrices, package materializers, or proof generators. `status` reports the exact
-owner-issued active tuple.
+Frontend source edits update through HMR. Before it starts the workbench
+container, `start` runs the native build step,
+`python3 scripts/dev-workbench.py build`, in a short-lived container with the
+same image, user, build settings and source/cache mounts. It incrementally
+builds the current `manyforge_manager_daemon`, `manyforge_headless_py`,
+`manyforge_ros2_control_execution_host`, `manyforge_roboplan_candidate_worker`,
+Deployment authoring compiler and `manyforge_core_py` targets with their
+dependencies. Its output goes to the `start` console (stderr); if it fails,
+`start` exits without starting the workbench. Only then does the readiness wait
+(`MANYFORGE_DEV_START_TIMEOUT_SECONDS`) begin. The workbench itself never
+builds: it checks these artifacts and refuses, naming the missing file and the
+build step to run, when one is absent. Apply and Load never build.
+`./scripts/compose-dev.sh build-native` runs the same build step on its own,
+for example to build before a timed start. The build
+step deliberately runs no tests, sanitizers, qualification matrices, package
+materializers, or proof generators. `status` reports the exact owner-issued
+active tuple.
 
 Every removal path (plain stop, failed developer start, exited-container
 replacement and operator stop) first stops the container and confirms it is
@@ -654,6 +665,17 @@ listed by name; write the row in a Scenario first
 AI model that no example has is written by hand under **Custom I/O device or
 AI model**.
 
+**AI assistant.** The chat is a component: **Add component > AI assistant**
+adds it (one per cell; pick its **AI model** and **Assistant profile** on its
+card). It needs an AI model component that names your OpenAI-compatible model
+server (Base URL, Model, optional token variable `MANYFORGE_AI_*`, exported
+before `start`). Prepare starts its host, Enable starts the assistant bridge on
+a loopback port the host picks, Disable stops it; the workbench starts no
+bridge itself. The Composer AI tab works while the assistant and its AI model
+are enabled and no Program run exists. Edits from the AI tab land in the
+Program Draft; Apply or Discard them. Setup, model-server examples and failure
+codes: [assistant cookbook](ASSISTANT_E2E_COOKBOOK.md).
+
 Scripts and assistants use the same routes: `GET
 /api/deployment/component-catalog` lists the entries (MCP
 `manyforge_deployment` action `component_catalog`); `POST
@@ -746,7 +768,7 @@ procedure for physical equipment.
 | Slow first start | Inspect build output. Lower `MANYFORGE_DEV_BUILD_JOBS` if compilation exhausts memory; avoid repeated startup attempts. |
 | `status` says stopped after a failed start | The launcher removed the container it created, with its logs. Read the start output you kept (`tee`), or start again with its output captured. |
 | `Scenario project is outside allowed roots` (exit 69) | Pass a project folder inside `examples/`, the only root startup accepts; a scratch folder such as `.manyforge-dev/` is refused. |
-| Start refuses with `… assistant instrument source is invalid or stale` or `… node environment manifest is stale` | A generated source is out of date after a catalog or covered source change. Run `python3 scripts/regen.py --update` in the workbench image, review the diff, then `python3 scripts/regen.py --check` ([Identities and pins](../reference/IDENTITY_AND_PINNING.md)). |
+| Start refuses with `… node environment manifest is stale` | A generated source is out of date after a catalog or covered source change. Run `python3 scripts/regen.py --update` in the workbench image, review the diff, then `python3 scripts/regen.py --check` ([Identities and pins](../reference/IDENTITY_AND_PINNING.md)). |
 | Error-looking `Execution event pump unavailable` lines during start | Expected before the ROS host is up; see the everyday workflow. Investigate only if they continue after the start reports ready. |
 | Isaac robot shows **Simulation not playing** | Play the simulation, or check that the workbench reaches Isaac ([Troubleshooting](TROUBLESHOOTING.md#simulation-not-playing)). |
 | Real robot does not connect | See [Real robot setup](REAL_ROBOT_SETUP.md#troubleshooting). |

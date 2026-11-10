@@ -70,7 +70,7 @@ function independentExecutionGroups(program: ProgramAuthoringDocument): string {
     .join(', ');
 }
 
-type MotionDefaults = ProgramMotionValues;
+type MotionDefaults = Partial<ProgramMotionValues>;
 
 interface MotionHistory {
   before: JsonValue;
@@ -229,18 +229,23 @@ export function ProgramSettingsEditor({
     }
   };
   const motionDirty = motion !== null && appliedMotion !== null
-    && PROGRAM_MOTION_FIELDS.some((field) => (
-    Math.abs(
-      motion[field]
-      - appliedMotion[field],
-    ) > 1e-12
-    ));
+    && PROGRAM_MOTION_FIELDS.some((field) => {
+      const edited = motion[field];
+      const applied = appliedMotion[field];
+      return edited !== undefined && applied !== undefined
+        && Math.abs(edited - applied) > 1e-12;
+    });
+  // Only literals conflict; a node reading another source is checked when
+  // its move starts.
   const motionConflictCount = (values: MotionDefaults): number => (
     flattenProgramForest(program.forest).reduce((count, { node }) => (
       count + PROGRAM_MOTION_CEILING_FIELDS.filter((field) => {
         const value = node.parameters[field];
+        const ceiling = values[field];
         return typeof value === 'number'
-          && value > values[field];
+          && node.value_sources?.[field] === undefined
+          && ceiling !== undefined
+          && value > ceiling;
       }).length
     ), 0)
   );
@@ -252,13 +257,14 @@ export function ProgramSettingsEditor({
       setMotionError(motionConfiguration.reason);
       return;
     }
+    // Each declared field updates the Program parameter of the same name.
+    const declared = Object.fromEntries(PROGRAM_MOTION_FIELDS.flatMap((field) => {
+      const value = values[field];
+      return value === undefined ? [] : [[field, value]];
+    }));
     const response = await onMutate('program_draft_update_motion_defaults', {
       mode: 'update',
-      velocity_scale: values.velocity_scale,
-      acceleration_scale: values.acceleration_scale,
-      translation_tol_m: values.translation_tol_m,
-      blend_radius_m: values.blend_radius_m,
-      parameter_bindings: motionConfiguration.configuration.bindings,
+      ...declared,
       conflict_resolution: conflictResolution,
     });
     if (!response) return;
@@ -273,17 +279,14 @@ export function ProgramSettingsEditor({
   };
   const submitMotion = () => {
     if (busy || !motionDirty || motion === null) return;
+    const outside = (value: number | undefined, valid: (value: number) => boolean) => (
+      value !== undefined && (!Number.isFinite(value) || !valid(value))
+    );
     if (
-      !Number.isFinite(motion.velocity_scale)
-      || motion.velocity_scale <= 0
-      || motion.velocity_scale > 1
-      || !Number.isFinite(motion.acceleration_scale)
-      || motion.acceleration_scale <= 0
-      || motion.acceleration_scale > 1
-      || !Number.isFinite(motion.translation_tol_m)
-      || motion.translation_tol_m <= 0
-      || !Number.isFinite(motion.blend_radius_m)
-      || motion.blend_radius_m < 0
+      outside(motion.velocity_scale, (value) => value > 0 && value <= 1)
+      || outside(motion.acceleration_scale, (value) => value > 0 && value <= 1)
+      || outside(motion.translation_tol_m, (value) => value > 0)
+      || outside(motion.blend_radius_m, (value) => value >= 0)
     ) {
       setMotionError('Scales must be in (0, 1], translation tolerance must be positive, and corner blend radius must be non-negative.');
       return;
@@ -379,7 +382,8 @@ export function ProgramSettingsEditor({
       <section className="dcard program-motion-defaults">
         <h3>Motion defaults</h3>
         <p>
-          These are portable Program defaults. Velocity, acceleration and TCP
+          These are portable Program defaults: a motion node field left unset
+          inherits the Program parameter of the same name. Velocity, acceleration and TCP
           speed remain ceilings; Cartesian nodes may override the inherited
           path tolerance and corner blend radius. The live command-bar Velocity
           control further scales current and subsequent compatible moves for
@@ -395,86 +399,110 @@ export function ProgramSettingsEditor({
         ) : (
           <>
             <dl className="program-motion-bindings">
-              {PROGRAM_MOTION_FIELDS.map((field) => (
-                <div key={field}>
-                  <dt><BreakableId text={field} /></dt>
-                  <dd>
-                    <code><BreakableId text={motionConfiguration.configuration.bindings[field]} /></code>
-                    {' · '}{motionConfiguration.configuration.usageCounts[field]}
-                    /{motionConfiguration.configuration.applicableCounts[field]} bound nodes
-                  </dd>
-                </div>
-              ))}
+              {PROGRAM_MOTION_FIELDS.map((field) => {
+                const configuration = motionConfiguration.configuration;
+                const binding = configuration.bindings[field];
+                const dynamic = configuration.dynamicCounts[field];
+                return (
+                  <div key={field}>
+                    <dt><BreakableId text={field} /></dt>
+                    <dd>
+                      {binding === undefined ? (
+                        'No Program parameter of this name; nodes use their own or catalog values'
+                      ) : (
+                        <>
+                          <code><BreakableId text={binding} /></code>
+                          {' · '}{configuration.usageCounts[field]}
+                          /{configuration.applicableCounts[field]} bound nodes
+                          {dynamic > 0 && (
+                            <span title="These nodes read another value source; the value is checked against this Program value when the move starts.">
+                              {' · '}{dynamic} dynamic
+                            </span>
+                          )}
+                        </>
+                      )}
+                    </dd>
+                  </div>
+                );
+              })}
             </dl>
             <div className="drows">
-              <label>
-                Velocity scale
-                <input
-                  aria-label="Program global velocity scale"
-                  type="number"
-                  min="0.01"
-                  max="1"
-                  step="0.01"
-                  value={motion.velocity_scale}
-                  disabled={busy}
-                  onChange={(event) => setMotion((current) => current === null ? null : ({
-                    ...current,
-                    velocity_scale: event.currentTarget.valueAsNumber,
-                  }))}
-                />
-              </label>
-              <label>
-                Acceleration scale
-                <input
-                  aria-label="Program global acceleration scale"
-                  type="number"
-                  min="0.01"
-                  max="1"
-                  step="0.01"
-                  value={motion.acceleration_scale}
-                  disabled={busy}
-                  onChange={(event) => setMotion((current) => current === null ? null : ({
-                    ...current,
-                    acceleration_scale: event.currentTarget.valueAsNumber,
-                  }))}
-                />
-              </label>
-              <label>
-                Translation tolerance
-                <span className="dunit">
+              {motion.velocity_scale !== undefined && (
+                <label>
+                  Velocity scale
                   <input
-                    aria-label="Program Cartesian translation tolerance"
+                    aria-label="Program global velocity scale"
                     type="number"
-                    min="0.000001"
-                    step="0.001"
-                    value={motion.translation_tol_m}
+                    min="0.01"
+                    max="1"
+                    step="0.01"
+                    value={motion.velocity_scale}
                     disabled={busy}
                     onChange={(event) => setMotion((current) => current === null ? null : ({
                       ...current,
-                      translation_tol_m: event.currentTarget.valueAsNumber,
+                      velocity_scale: event.currentTarget.valueAsNumber,
                     }))}
                   />
-                  <span>m</span>
-                </span>
-              </label>
-              <label title="0 keeps exact corners; the tool stops at sharp corners.">
-                Corner blend radius
-                <span className="dunit">
+                </label>
+              )}
+              {motion.acceleration_scale !== undefined && (
+                <label>
+                  Acceleration scale
                   <input
-                    aria-label="Program Cartesian corner blend radius"
+                    aria-label="Program global acceleration scale"
                     type="number"
-                    min="0"
-                    step="0.001"
-                    value={motion.blend_radius_m}
+                    min="0.01"
+                    max="1"
+                    step="0.01"
+                    value={motion.acceleration_scale}
                     disabled={busy}
                     onChange={(event) => setMotion((current) => current === null ? null : ({
                       ...current,
-                      blend_radius_m: event.currentTarget.valueAsNumber,
+                      acceleration_scale: event.currentTarget.valueAsNumber,
                     }))}
                   />
-                  <span>m</span>
-                </span>
-              </label>
+                </label>
+              )}
+              {motion.translation_tol_m !== undefined && (
+                <label>
+                  Translation tolerance
+                  <span className="dunit">
+                    <input
+                      aria-label="Program Cartesian translation tolerance"
+                      type="number"
+                      min="0.000001"
+                      step="0.001"
+                      value={motion.translation_tol_m}
+                      disabled={busy}
+                      onChange={(event) => setMotion((current) => current === null ? null : ({
+                        ...current,
+                        translation_tol_m: event.currentTarget.valueAsNumber,
+                      }))}
+                    />
+                    <span>m</span>
+                  </span>
+                </label>
+              )}
+              {motion.blend_radius_m !== undefined && (
+                <label title="0 keeps exact corners; the tool stops at sharp corners.">
+                  Corner blend radius
+                  <span className="dunit">
+                    <input
+                      aria-label="Program Cartesian corner blend radius"
+                      type="number"
+                      min="0"
+                      step="0.001"
+                      value={motion.blend_radius_m}
+                      disabled={busy}
+                      onChange={(event) => setMotion((current) => current === null ? null : ({
+                        ...current,
+                        blend_radius_m: event.currentTarget.valueAsNumber,
+                      }))}
+                    />
+                    <span>m</span>
+                  </span>
+                </label>
+              )}
             </div>
             <div className="dactions">
               <button type="button" disabled={busy || !motionDirty} onClick={submitMotion}>

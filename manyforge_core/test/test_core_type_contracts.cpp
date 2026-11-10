@@ -495,6 +495,15 @@ TEST(CoreTypeContracts, CapabilityDefinitionRegistryPinsRepresentativeSemantics)
   EXPECT_EQ(model->capability_definition_revision,
             "sha256:f900f43ad7bbc61f49c09295a2a63e5fabe93eb57bc9c5f44c26e3c4eeeac158");
 
+  const auto* query =
+      find_builtin_capability_definition("assistant.model.query");
+  ASSERT_NE(query, nullptr);
+  EXPECT_EQ(query->scope, CapabilityScope::kCellGlobal);
+  EXPECT_EQ(query->provider_binding_kind,
+            CapabilityProviderBindingKind::kCapabilityProviderBinding);
+  EXPECT_EQ(query->capability_definition_revision,
+            "sha256:b136ad03b4ca732ee49c4ec34cfb00bb79f1bd1dcd3961784affa51417e23806");
+
   const auto* bridge =
       find_builtin_capability_definition("assistant.bridge.request");
   ASSERT_NE(bridge, nullptr);

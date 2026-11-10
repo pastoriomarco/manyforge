@@ -180,6 +180,15 @@ export function parseComponentState(value: unknown, path: string): ComponentStat
         };
       }),
     }),
+    ...(record.endpoints === undefined || record.endpoints === null ? {} : {
+      endpoints: arrayAt(record.endpoints, `${path}.endpoints`).map((item, index) => {
+        const row = objectAt(item, `${path}.endpoints[${index}]`);
+        return {
+          role_id: stringAt(row.role_id, `${path}.endpoints[${index}].role_id`),
+          url: stringAt(row.url, `${path}.endpoints[${index}].url`),
+        };
+      }),
+    }),
     observed_at_ns: numberAt(record.observed_at_ns, `${path}.observed_at_ns`),
   };
 }

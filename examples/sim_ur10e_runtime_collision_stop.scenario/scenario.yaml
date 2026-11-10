@@ -7,12 +7,12 @@
   "description": "Isaac Sim UR10e light scene that triggers a runtime collision. Execute the Program to see the motion stop on the collision and the Stop recorded.",
   "members": {
     "deployment.yaml": "sha256:fd8f2987161ede1089ffa4f8558e24b1e576b7ebbec851037e9c63ca4377e098",
-    "program.yaml": "sha256:42e0a20b93a1dd8e0335acb47417140fabf88ca0db088f04d2974182843653c1"
+    "program.yaml": "sha256:5335667f4e6dcc2fce4fd10d147ea35d3f44c6b651d79fdd785f94a5d8fc14d2"
   },
   "name": "sim_ur10e_runtime_collision_stop",
   "saved_status": {
-    "checked_content_digest": "sha256:c96f16e3b1b160cb8285e5c200d0b6d5a62283319c6f040a9303f3291338ff18",
-    "last_known_status": "ready",
+    "checked_content_digest": "sha256:816597a304febb06b02358795eaf8a608d796ecf0e054a3a079e8aeacfa87431",
+    "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },
   "scenario_id": "sim_ur10e_runtime_collision_stop",

@@ -564,13 +564,22 @@ class ReferenceValidationGeneration(StrictRequest):
 
 
 class ProgramReferenceValidationRequest(StrictRequest):
-    schema_version: Literal["manyforge.program_reference_validation_request.v2"]
+    schema_version: Literal["manyforge.program_reference_validation_request.v3"]
     workspace_generation: ReferenceValidationGeneration
     program_content_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     program: dict[str, Any]
     draft: bool
     deployment: dict[str, Any]
-    model_source_closure: dict[str, Any]
+    # Exactly one: the full closure, or the sha256 of its RFC 8785 bytes when
+    # Headless already holds the prepared candidate for it.
+    model_source_closure: dict[str, Any] | None = None
+    model_source_closure_digest: Annotated[str, Field(pattern=SHA256_PATTERN)] | None = None
+
+    @model_validator(mode="after")
+    def require_one_model_source_form(self) -> "ProgramReferenceValidationRequest":
+        if (self.model_source_closure is None) == (self.model_source_closure_digest is None):
+            raise ValueError("exactly one of model_source_closure and model_source_closure_digest is required")
+        return self
 
 
 class ComponentFrameLookupRequest(StrictRequest):
@@ -3705,23 +3714,6 @@ class RuntimeScaleControlSelectorRequest(StrictRequest):
         if self.command_target_id is None:
             result.pop("command_target_id", None)
         return result
-
-
-class OperationRuntimeScaleRequest(StrictRequest):
-    request_context: CallerAttributionRequest
-    operation_id: str
-    expected_operation_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    expected_runtime_scale_generation: Annotated[
-        int, Field(ge=0, le=9_007_199_254_740_990)
-    ]
-    scale: Annotated[float, Field(gt=0, le=1, allow_inf_nan=False)]
-
-    @field_validator("operation_id")
-    @classmethod
-    def validate_identity(cls, value: str) -> str:
-        return _bounded_nfc(
-            value, label="operation_id", maximum_bytes=MAX_IDENTITY_BYTES
-        )
 
 
 class RuntimeScaleControlRequest(StrictRequest):

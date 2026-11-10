@@ -23,24 +23,32 @@ When the active Deployment has no AI model component, requests fail with
 `assistant_ai_model_absent` (no assistant profile:
 `assistant_mode_projection_unavailable`).
 
-Run `python -m manyforge_assistant_bridge.bridge`. The launchers start it
-automatically and pass `--assistant-bridge-url http://127.0.0.1:8100` to
-Composer. Environment:
+The bridge is the process of the Deployment's `assistant` component. The
+component's host binds a loopback socket on an ephemeral port and starts
+`python -m manyforge_assistant_bridge.bridge --fd <N>` on that inherited
+socket when the component is enabled; there is no fixed port. Composer finds
+the URL in the component's published `assistant_request` endpoint. Disabling
+the component stops the bridge, which cancels every running request (audited
+as `cancelled`).
+
+`GET /health` answers `manyforge.assistant.bridge_health.v2`:
+`{"status": "ready", "activity": "busy" | "idle"}`, `busy` while any request
+is running.
+
+Environment (inherited from the host; the host sets the audit log path under
+the component's run artifacts):
 
 | Variable | Default |
 |---|---|
 | `MANYFORGE_HEADLESS_API_URL` | `http://127.0.0.1:9010` |
 | `MANYFORGE_COMPOSER_URL` | `http://127.0.0.1:9000` |
-| `MANYFORGE_ASSISTANT_BRIDGE_HOST` | `127.0.0.1` |
-| `MANYFORGE_ASSISTANT_BRIDGE_PORT` | `8100` |
 | `MANYFORGE_ASSISTANT_AUDIT_LOG` | `$XDG_STATE_HOME/manyforge/assistant-bridge-audit.jsonl` (10 MiB per file; active plus 3 backups, up to 4 files / 40 MiB total by default) |
 
 The model URL, model name and token variable come only from the Deployment;
 there is no environment override.
 
 `protocol.py` exports the strict wire and projection verification helpers.
-`headless.py` is the closed headless read client. `supervisor.py` holds a pure
-availability reducer.
+`headless.py` is the closed headless read client.
 
 See [`docs/operations/ASSISTANT_E2E_COOKBOOK.md`](../docs/operations/ASSISTANT_E2E_COOKBOOK.md)
 and [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](../docs/reference/ASSISTANT_PROVIDER_CONTRACT.md).

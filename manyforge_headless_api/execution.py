@@ -40,7 +40,6 @@ from .models import (
     ProgramRunStopIntentRequest,
     ProgramOperationQuery,
     RuntimeScaleControlRequest,
-    OperationRuntimeScaleRequest,
     RuntimeScaleControlSelectorRequest,
     SHA256_PATTERN,
     SceneRevisionRequest,
@@ -1043,34 +1042,6 @@ class ExecutionCommandClient:
             raise HeadlessApiError(
                 "execution_operation_context_invalid",
                 "operation context response is malformed",
-            )
-        return response
-
-    def set_operation_runtime_scale(
-        self,
-        request: OperationRuntimeScaleRequest,
-        *,
-        trusted_principal_id: str | None,
-    ) -> dict[str, Any]:
-        response = self.require_success(
-            self._exchange(
-                {
-                    "api_version": EXECUTION_COMMAND_VERSION,
-                    "attribution": self._request_attribution(trusted_principal_id),
-                    "command": "set_operation_runtime_scale",
-                    "request": request.model_dump(mode="json"),
-                }
-            )
-        )
-        accepted = response.get("accepted")
-        if (
-            response.get("command") != "set_operation_runtime_scale"
-            or not isinstance(accepted, dict)
-            or type(accepted.get("runtime_scale_generation")) is not int
-        ):
-            raise HeadlessApiError(
-                "execution_command_response_invalid",
-                "operation scaling acceptance has the wrong kind or shape",
             )
         return response
 

@@ -7,7 +7,8 @@ import { ApiError, api, apiErrorCode } from './api/client';
 import { parseLogicalSceneProjection } from './api/parsers';
 import {
   AssistantOverlay,
-  NO_AI_MODEL_COMPONENT,
+  type AssistantModelSummary,
+  NO_ASSISTANT_COMPONENT,
   assistantAvailability,
 } from './components/AssistantOverlay';
 import { ComponentsWorkspace } from './components/ComponentsWorkspace';
@@ -26,7 +27,6 @@ import {
 import { DocumentControls } from './components/DocumentControls';
 import { programDocumentHeader } from './components/ProgramDocumentControls';
 import { ScenarioDocumentCommands } from './components/ScenarioDocumentCommands';
-import { OverlayPanel } from './components/OverlayPanel';
 import { DraftInputResetProvider } from './components/common/DraftInputs';
 import { PaneDivider } from './components/PaneDivider';
 import { ProgramWorkspace } from './components/ProgramWorkspace';
@@ -41,6 +41,7 @@ import {
 } from './hooks/useHeadlessState';
 import { useAuthoringWorkspace } from './hooks/useAuthoringWorkspace';
 import { useDeploymentWorkspace } from './hooks/useDeploymentWorkspace';
+import { aiModelComponents } from './components/AiModelComponentForm';
 import { useComponentCatalog } from './hooks/useComponentCatalog';
 import { requestOpenSettings } from './state/settingsNavigation';
 import type { ComponentManagerTab } from './utils/componentManager';
@@ -298,7 +299,6 @@ export default function App() {
   const [structuralMode, setStructuralMode] = useState<
     'headless_client' | 'structural_only' | null
   >(null);
-  const [assistantConfigured, setAssistantConfigured] = useState(false);
   const structuralRetryAttempt = useRef(0);
   const headlessEnabled = structuralMode === 'headless_client';
   const [catalog, retryCatalog] = useStructuralResource(api.catalog.list, {
@@ -342,9 +342,6 @@ export default function App() {
     if (health.status === 'ready') {
       structuralRetryAttempt.current = 0;
       setStructuralMode(health.data.mode);
-      setAssistantConfigured(
-        health.data.components.assistant_bridge === 'configured',
-      );
       return undefined;
     }
     if (health.status === 'loading' || structuralMode !== null) return undefined;
@@ -362,14 +359,16 @@ export default function App() {
     failureMessage: 'Could not read the verified active source-model projection.',
   });
   const [assistantModes, retryAssistantModes] = useStructuralResource(api.assistant.modes, {
-    enabled: headlessEnabled && assistantConfigured,
+    enabled: headlessEnabled,
     disabledMessage: 'The assistant bridge is unavailable.',
     absentWhen: isAssistantProfileAbsent,
-    // Without assistant settings the Deployment has no AI model component either.
-    absentMessage: NO_AI_MODEL_COMPONENT,
+    // Without an active configuration there is no assistant component either.
+    absentMessage: NO_ASSISTANT_COMPONENT,
     failureMessage: 'Could not read the assistant modes.',
   });
-  const assistant = assistantAvailability(assistantModes);
+  // This page's chat turn runs: Execute, Run and Resume wait for it.
+  const [assistantTurnRunning, setAssistantTurnRunning] = useState(false);
+  const closeAssistant = useCallback(() => setGlobalPanel(null), []);
   const headlessStateSource = useHeadlessStateSource(headlessEnabled);
   const headlessState = useShellHeadlessState(headlessStateSource);
   const headlessSnapshot = headlessState.snapshot;
@@ -502,6 +501,21 @@ export default function App() {
   // system keys (resolved against the Applied Program).
   const programDraftAuthoring = programController.state.workspace?.draft.authoring ?? null;
   const deploymentDraftDocument = deploymentController.workspace?.draft.document ?? null;
+  const assistantModelComponentId = assistantModes.status === 'ready'
+    ? assistantModes.data.aiModelComponentId : null;
+  const assistantModelUnapplied = deploymentUnapplied(deploymentController.workspace);
+  const assistantModel = useMemo((): AssistantModelSummary | null => {
+    if (assistantModelComponentId === null) return null;
+    const component = aiModelComponents(deploymentDraftDocument)
+      .find((candidate) => candidate.componentId === assistantModelComponentId);
+    const configuration = component?.runtimeConfiguration ?? {};
+    return {
+      componentId: assistantModelComponentId,
+      model: typeof configuration.model === 'string' ? configuration.model : null,
+      baseUrl: typeof configuration.base_url === 'string' ? configuration.base_url : null,
+      draftUnapplied: assistantModelUnapplied,
+    };
+  }, [assistantModelComponentId, assistantModelUnapplied, deploymentDraftDocument]);
   // Null without a Program Draft: a rule's user keys then wait for one.
   const globalRuleProgramKeys = useMemo(() => (programDraftAuthoring === null ? null
     : programBlackboardKeys(programDraftAuthoring, globalRuleIds(deploymentDraftDocument))),
@@ -528,7 +542,9 @@ export default function App() {
     programController.state.workspace,
     headlessStateSource,
     deploymentUnapplied(deploymentController.workspace),
+    assistantTurnRunning,
   );
+  const assistant = assistantAvailability(assistantModes, cellState.components, programRuntime.active);
   // Manual motion uses Applied defaults; Draft changes wait for Apply.
   const appliedProgram = programRuntime.state.applied;
   // A global rule's execution_groups scope names the Applied Program's groups.
@@ -538,9 +554,10 @@ export default function App() {
     if (catalog.status !== 'ready') return null;
     const defaults = (program: Parameters<typeof deriveProgramMotionConfiguration>[0]) => {
       const configuration = deriveProgramMotionConfiguration(program, catalog.data.entries);
-      return configuration.available ? {
-        translationToleranceM: configuration.configuration.values.translation_tol_m,
-      } : null;
+      const translationToleranceM = configuration.available
+        ? configuration.configuration.values.translation_tol_m
+        : undefined;
+      return translationToleranceM === undefined ? null : { translationToleranceM };
     };
     return appliedCartesianDefaults(appliedProgram === null
       ? null
@@ -1522,14 +1539,16 @@ export default function App() {
               </span>
             )}
           </button>
+          {/* An open panel can still be hidden when the assistant becomes unavailable. */}
           <button
             ref={assistantButton}
             type="button"
-            aria-haspopup="dialog"
             aria-expanded={globalPanel === 'assistant'}
-            disabled={assistant.unavailableReason !== null}
-            title={assistant.unavailableReason ?? 'Open the AI assistant.'}
-            onClick={() => setGlobalPanel('assistant')}
+            aria-controls="assistant-dock"
+            disabled={assistant.unavailableReason !== null && globalPanel !== 'assistant'}
+            title={assistant.unavailableReason
+              ?? (globalPanel === 'assistant' ? 'Hide the AI assistant.' : 'Open the AI assistant.')}
+            onClick={() => setGlobalPanel((panel) => (panel === 'assistant' ? null : 'assistant'))}
           >AI</button>
         </div>
       </header>
@@ -1772,21 +1791,21 @@ export default function App() {
         items={runtimeAttentionItems}
         onOpen={openRuntimeAttention}
       />
-      <OverlayPanel
-        open={globalPanel === 'assistant'}
-        title="AI assistant"
-        titleId="assistant-overlay-title"
-        onClose={() => setGlobalPanel(null)}
-        returnFocusRef={assistantButton}
-      >
+      {(assistant.modeIndex !== null || assistant.modeError !== null) && (
         <AssistantOverlay
+          open={globalPanel === 'assistant'}
+          onClose={closeAssistant}
+          returnFocusRef={assistantButton}
           unavailableReason={assistant.unavailableReason}
           modeIndex={assistant.modeIndex}
           modeError={assistant.modeError}
+          modelNotice={assistant.modelNotice}
           onRetryModes={retryAssistantModes}
+          onTurnRunningChange={setAssistantTurnRunning}
           programController={programController}
+          model={assistantModel}
         />
-      </OverlayPanel>
+      )}
     </main>
     </DraftInputResetProvider>
     </AuthoringAdmissionTooltipProvider>

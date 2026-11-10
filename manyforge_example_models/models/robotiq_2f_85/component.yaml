@@ -32,5 +32,4 @@ lanes:
     controller: robotiq_gripper_controller
     controllers_file: mock_controllers.yaml
     hard_stop_completion_timeout_s: 0.5
-    gripper_result_timeout_s: 15.0
     gripper_stop_finish_tolerance: 0.04   # rad of knuckle travel (5% of the 0.8 stroke): a Stop this close lets the command finish

@@ -2,7 +2,7 @@ from manyforge_behavior.reason_codes import ReasonCode
 
 
 def test_shared_reason_codes_retain_machine_values() -> None:
-    assert ReasonCode.RAW_IK_FAILURE.value == "raw_ik_failure"
+    assert ReasonCode.PREVIEW_FAILED.value == "preview_failed"
     assert (
         ReasonCode.COLLISION_VALIDATION_WORKER_EXCEPTION.value
         == "collision_validation_worker_exception"

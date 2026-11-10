@@ -129,6 +129,28 @@ describe('Program canvas interaction intents', () => {
     });
   });
 
+  it('leaves the motion-default fields unset on palette insert and change-kind', () => {
+    const withDefault = (id: string, value: number) => ({
+      id, required: false, schema: { type: 'number' }, schemaHash: id, hasDefault: true, default: value,
+    });
+    const motion: CatalogEntry = {
+      ...leaf,
+      parameters: [
+        withDefault('velocity_scale', 1),
+        withDefault('acceleration_scale', 1),
+        withDefault('translation_tol_m', 0.005),
+        withDefault('blend_radius_m', 0),
+        withDefault('planning_timeout_s', 5),
+      ],
+    };
+    expect(programInsertionMutation(motion, [], { kind: 'root', index: 0 }).args.node)
+      .toMatchObject({ parameters: { planning_timeout_s: 5 } });
+    expect(Object.keys((programInsertionMutation(motion, [], { kind: 'root', index: 0 })
+      .args.node as { parameters: object }).parameters)).toEqual(['planning_timeout_s']);
+    expect(programChangeKindMutation(motion, 'wait', []).args.replacement)
+      .toEqual({ node_id: 'move', parameters: { planning_timeout_s: 5 } });
+  });
+
   it('maps a valid connection to one exact atomic move', () => {
     const result = authoringMoveIntent(
       graphNodes,
@@ -253,6 +275,56 @@ describe('Program canvas subtree edits', () => {
     expect(copy.children[0]?.value_sources).toEqual(subtree.children[0]?.value_sources);
     copy.children[0]!.parameters.speed = 1;
     expect(subtree.children[0]?.parameters.speed).toBe(0.2);
+  });
+
+  it('remaps node outcome references inside the copy and keeps outside ones', () => {
+    const outcomes: ProgramTreeNode = {
+      node_id: 'sequence',
+      instance_id: 'cell',
+      parameters: {},
+      children: [
+        { node_id: 'move', instance_id: 'pick', parameters: {}, children: [] },
+        {
+          node_id: 'check',
+          instance_id: 'gate',
+          parameters: {
+            key: 'node_outcome.pick',
+            other: 'node_outcome.outside',
+            nested: [{ key: 'node_outcome.pick' }],
+            text: 'pick',
+          },
+          value_sources: {
+            expected: { kind: 'blackboard_key', reference: 'node_outcome.pick' },
+            outside: { kind: 'blackboard_key', reference: 'node_outcome.outside' },
+            count: { kind: 'blackboard_key', reference: 'cell.count' },
+            condition: {
+              kind: 'expression',
+              expression: 'key.node_outcome.pick == "completed" && key.node_outcome.picker != "none"',
+            },
+          },
+          children: [],
+        },
+      ],
+    };
+    const copy = programSubtreeCopy(outcomes, ['cell', 'pick', 'gate']);
+    const gate = copy.children[1]!;
+    expect(copy.children[0]?.instance_id).toBe('pick_2');
+    expect(gate.parameters).toEqual({
+      key: 'node_outcome.pick_2',
+      other: 'node_outcome.outside',
+      nested: [{ key: 'node_outcome.pick_2' }],
+      text: 'pick',
+    });
+    expect(gate.value_sources).toEqual({
+      expected: { kind: 'blackboard_key', reference: 'node_outcome.pick_2' },
+      outside: { kind: 'blackboard_key', reference: 'node_outcome.outside' },
+      count: { kind: 'blackboard_key', reference: 'cell.count' },
+      condition: {
+        kind: 'expression',
+        expression: 'key.node_outcome.pick_2 == "completed" && key.node_outcome.picker != "none"',
+      },
+    });
+    expect(outcomes.children[1]?.parameters.key).toBe('node_outcome.pick');
   });
 
   it('inserts a subtree in one edit at the chosen place', () => {

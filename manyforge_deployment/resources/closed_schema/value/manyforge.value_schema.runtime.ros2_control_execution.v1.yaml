@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-schema_revision: sha256:1c557174fd45649c43d2e20239ec614635ca31aa79608d87727e35edcf8c2c90
+schema_revision: sha256:b37e963e21f9c72c47f713d7bc6b5f24fb680e2126d0f29e4cc4ed86fc9155ba
 schema_purpose: value
 root_definition_id: ros2_control_execution_runtime_configuration
 definitions:
@@ -686,16 +686,6 @@ definitions:
                         values:
                           - commanded
                           - none
-                - field_id: delivery_result_timeout_s
-                  presence: optional
-                  default:
-                    kind: absent
-                  value_schema:
-                    kind: scalar
-                    scalar_type: number
-                    constraints:
-                      - kind: exclusive_minimum
-                        value: 0
                 - field_id: pneumatic_io
                   presence: optional
                   default:

@@ -6,9 +6,9 @@ cannot remain as a permanently skipped compatibility test. Its exact source is
 manyforge@08222188293df8e12f90dc72e204c21f22f92ea1, blob
 2db2411ab47a78eb24300711e799f6c157cd877e.
 
-The owner-neutral lock-order assertion remains active. Every other historical
-case family is assigned below to the addressed C++ runtime, Kernel Stop,
-headless scene, lifecycle, Isaac, real-robot, or tool restoration gate.
+Every historical case family is assigned below to the addressed C++ runtime,
+Kernel Stop, headless scene, lifecycle, Isaac, real-robot, or tool restoration
+gate.
 """
 
 from __future__ import annotations
@@ -84,21 +84,6 @@ REMOVED_FACTORY_SYMBOLS = (
     "create_ros2_control_kernel_from_paths",
     "NativeKernelBundle",
 )
-
-
-def test_ros2_control_backend_documents_lock_order_contract() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    header = (
-        repo_root
-        / "manyforge_ros2_control_execution"
-        / "include"
-        / "manyforge_ros2_control_execution"
-        / "ros2_control_execution_backend.hpp"
-    ).read_text(encoding="utf-8")
-
-    assert "Lock-order contract:" in header
-    assert "Do not hold state_mutex_ while taking execution_mutex_" in header
-    assert "best-effort execution-state sink updates" in header
 
 
 def test_all_historical_ros2_control_case_families_remain_assigned() -> None:

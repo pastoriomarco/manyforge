@@ -213,9 +213,6 @@ bool ResourceAddressedExecutionKernel::evict_oldest_historical_operation_locked(
   std::erase_if(control_replay_ledger_, [&](const ControlReplayEntry& entry) {
     return entry.accepted.operation_id == retired_id;
   });
-  std::erase_if(runtime_scale_replay_ledger_, [&](const RuntimeScaleReplayEntry& entry) {
-    return entry.accepted.operation_id == retired_id;
-  });
   std::erase_if(operation_recovery_replay_ledger_, [&](const OperationRecoveryReplayEntry& entry) {
     return entry.operation_id == retired_id;
   });
@@ -335,7 +332,6 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
   replay_ledger_.reserve(config_.request_replay_capacity);
   control_replay_ledger_.reserve(config_.request_replay_capacity);
   stop_replay_ledger_.reserve(config_.request_replay_capacity);
-  runtime_scale_replay_ledger_.reserve(config_.request_replay_capacity);
   runtime_scale_control_replay_ledger_.reserve(config_.request_replay_capacity);
   runtime_scale_control_settings_.reserve(registrations_.size());
   operation_recovery_replay_ledger_.reserve(config_.request_replay_capacity);

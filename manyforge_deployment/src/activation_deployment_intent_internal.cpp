@@ -349,14 +349,16 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     if (kind->as_string() == "ai_model") return "ai_model_v0";
     return std::nullopt;
   };
-  // A sensor (`runtime_kind: sensor`, a `kind: sensor` model) owns no model
-  // source and has no lane.
-  const auto is_sensor = [](const CanonicalValue &component) {
+  // A lane-free adapter component (a sensor, `runtime_kind: sensor`, or the
+  // assistant, `runtime_kind: assistant`) owns no model source and has no
+  // lane.
+  const auto is_lane_free = [](const CanonicalValue &component) {
     const auto *configuration = component.find_object_member("configuration");
     const auto *kind =
         configuration ? configuration->find_object_member("runtime_kind")
                       : nullptr;
-    return kind != nullptr && kind->is_string() && kind->as_string() == "sensor";
+    return kind != nullptr && kind->is_string() &&
+           (kind->as_string() == "sensor" || kind->as_string() == "assistant");
   };
   // A member names its owner; an owner is a row with neither
   // an owner, a model source nor a runtime kind; an I/O member has no model
@@ -374,7 +376,7 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
   };
   const auto has_source = [&](const CanonicalValue &component) {
     return !is_owner(component) && !model_free_profile(component) &&
-           !is_sensor(component) &&
+           !is_lane_free(component) &&
            (!is_member(component) ||
             component.find_object_member("model_source") != nullptr);
   };
@@ -500,8 +502,8 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     const bool member_row = is_member(component);
     const bool owner_row = is_owner(component);
     const bool io_member = member_row && !has_source(component);
-    const bool sensor_row = !member_row && is_sensor(component);
-    if (sensor_row)
+    const bool lane_free_row = !member_row && is_lane_free(component);
+    if (lane_free_row)
       require_fields(component,
                      {"component_id", "component_profile_id", "configuration",
                       "target_settings"},
@@ -598,7 +600,7 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
            owner, role});
       continue;
     }
-    if (sensor_row) {
+    if (lane_free_row) {
       // Its settings are checked against its model when it is compiled.
       const auto &configuration = member(component, "configuration", label);
       require_fields(configuration, {"runtime_kind", "runtime_configuration"},
@@ -610,7 +612,7 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
       if (!object(member(component, "target_settings", label),
                   label + ".target_settings")
                .empty())
-        fail(label + " is a sensor and requires empty target_settings");
+        fail(label + " is a lane-free component and requires empty target_settings");
       parsed_components.push_back(
           {component_id, profile_id, std::nullopt, CanonicalValue(Object{}),
            configuration, std::nullopt, std::string{}, {}, std::nullopt,

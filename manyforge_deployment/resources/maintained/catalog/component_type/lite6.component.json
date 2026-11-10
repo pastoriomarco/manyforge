@@ -35,10 +35,6 @@
           "capability_id": "execution.reset"
         },
         {
-          "capability_definition_revision": "sha256:4ee00df7b3510c1490c83e247d12b73553ab53e4e6673da53ebea475fb756fad",
-          "capability_id": "execution.runtime_scale.operation_scoped"
-        },
-        {
           "capability_definition_revision": "sha256:3ed811803c31726c758e227fc52bd57854cc6e7fa09dff0fd117d41800d4f8b9",
           "capability_id": "execution.stop.soft"
         },
@@ -123,7 +119,7 @@
     "model_role_id": "arm_model"
   },
   "component_type_id": "lite6.component",
-  "component_type_revision": "sha256:e6dc38effafd693c813eae6947485cef627dd0f6dbfdf856c026831d98bf55c9",
+  "component_type_revision": "sha256:23a35c0bafa074d08cdf9d1f177a25dbe319b2efed3456f6fd633838529a1587",
   "model_mounts": [],
   "model_roles": [
     {

@@ -86,7 +86,7 @@ def _assistant_projection() -> dict[str, Any]:
                 "model": "vision-model-v1",
             },
         ],
-        "api_version": "manyforge.retained_assistant.v1",
+        "api_version": "manyforge.retained_assistant.v3",
         "projection_digest": _DIGEST_D,
         "audit_policy": {
             "redact_argument_values": True,
@@ -109,7 +109,6 @@ def _assistant_projection() -> dict[str, Any]:
                 },
             }
         ],
-        "provider_aliases": [],
         "modes": [],
         "prompt_templates": [
             {

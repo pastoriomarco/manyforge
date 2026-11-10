@@ -910,9 +910,7 @@ if(BUILD_TESTING)
     MANYFORGE_CORE_LOOKAHEAD_TIMING
     MANYFORGE_CORE_TEST_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/golden")
   target_link_libraries(test_execution_kernel_timing PRIVATE manyforge_core GTest::gtest_main)
-  add_test(NAME execution_kernel_retirement_timing
-    COMMAND test_execution_kernel_timing --gtest_filter=ExecutionKernelTiming.*)
-  set_tests_properties(execution_kernel_retirement_timing PROPERTIES TIMEOUT 30)
+  gtest_discover_tests(test_execution_kernel_timing PROPERTIES TIMEOUT 30)
 
   add_executable(test_execution_kernel test/test_execution_kernel.cpp)
   target_link_libraries(test_execution_kernel PRIVATE manyforge_core GTest::gtest_main)

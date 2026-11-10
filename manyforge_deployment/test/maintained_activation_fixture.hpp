@@ -85,7 +85,8 @@ MaterializeMaintainedInterruptDeployment(
     const CanonicalValue &configuration,
     const std::filesystem::path &scenario_relative_path =
         "examples/mock_lite6_pick_and_place.scenario",
-    void (*authored_mapper)(CanonicalValue::Object &) = nullptr) {
+    void (*authored_mapper)(CanonicalValue::Object &) = nullptr,
+    void (*profile_mapper)(std::vector<detail::ActivationComponentProfile> &) = nullptr) {
   using namespace maintained_activation_fixture_detail;
   const std::filesystem::path workspace(MANYFORGE_WORKSPACE_ROOT);
   const auto scenario = workspace / scenario_relative_path;
@@ -166,8 +167,9 @@ MaterializeMaintainedInterruptDeployment(
   }
   const auto intent =
       detail::parse_activation_deployment_intent(authored, std::move(captured));
-  const auto profiles =
+  auto profiles =
       detail::resolve_activation_component_profiles(workspace, intent);
+  if (profile_mapper != nullptr) profile_mapper(profiles);
   auto models = detail::qualify_activation_prepared_models(
       intent, profiles, std::move(prepared_sources));
   auto result = detail::materialize_prepared_activation(

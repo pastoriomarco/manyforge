@@ -8,9 +8,9 @@ describe('reference validation capture', () => {
   const row = { code: 'frame_missing', location: { document: 'program', path: '/forest/0/parameters/frame',
     node_instance_id: 'move', parameter: 'frame' }, payload: { component_id: 'robot', frame_id: 'tool' } };
   const response = { reference_validation: { schema_version: 'manyforge.program_reference_validation_response.v2',
-    workspace_generation: generation, program_content_digest: digest, diagnostics: [row], total_count: 2, truncated: true, selector_facts: { components: [], targets: [], signals: [], frames: [], bodies: [] } } };
+    workspace_generation: generation, program_content_digest: digest, diagnostics: [row], total_count: 2, truncated: true, selector_facts: { components: [], targets: [], signals: [], frames: [], bodies: [], rules: [] } } };
   it('preserves diagnostics and bounded count for the same capture', () => {
-    expect(referenceResult(response, digest, generation)).toEqual({ issues: [row], total: 2, truncated: true, selectorFacts: { components: [], targets: [], signals: [], frames: [], bodies: [] } });
+    expect(referenceResult(response, digest, generation)).toEqual({ issues: [row], total: 2, truncated: true, selectorFacts: { components: [], targets: [], signals: [], frames: [], bodies: [], rules: [] } });
   });
   it('rejects stale generation and mismatched body digest', () => {
     expect(() => referenceResult(response, digest, { ...generation, workspace_revision: 2 })).toThrow();

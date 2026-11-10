@@ -1503,11 +1503,6 @@ struct ResourceAddressedExecutionKernel::StopReplayEntry final {
   }
 };
 
-struct ResourceAddressedExecutionKernel::RuntimeScaleReplayEntry final {
-  RuntimeScaleRequestDTO request;
-  RuntimeScaleAcceptedDTO accepted;
-};
-
 struct ResourceAddressedExecutionKernel::RuntimeScaleControlResolution final {
   RuntimeScaleControlSelectorDTO selector;
   ControlDomainId control_domain_id;

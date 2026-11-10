@@ -1,0 +1,20 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md): the AI
+# assistant, the process of the Composer AI tab's chat. Its adapter (family
+# `assistant`) runs the assistant host as the component's own process: Prepare
+# starts the host, which binds a loopback port; Enable starts the chat bridge
+# on it and publishes its URL in the component state; Disable stops the bridge
+# (cancelling a running chat request). Like a sensor it has no lane. The
+# Deployment row names the AI model component that serves the chat and the
+# assistant profile (its chat mode); one per cell.
+api_version: manyforge.component_package.v1
+kind: assistant
+id: manyforge.assistant
+version: 1.0.0
+title: AI assistant (Composer chat bridge)
+license: Apache-2.0
+# Its one adapter row. backend: where the bridge runs (`local_process`: a
+# child process of the host). health_period_s: how often the host reads the
+# bridge's /health (its busy/idle activity lags by up to this). stream_budget_s:
+# the `bridge` stream is fresh while a /health answer arrived within this time
+# (freshness only, never a fault).
+adapter_row: {adapter: assistant, backend: local_process, health_period_s: 1.0, stream_budget_s: 5.0}

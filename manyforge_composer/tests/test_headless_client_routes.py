@@ -523,12 +523,13 @@ def headless_client() -> (
             )
         elif path == "/api/assistant/modes":
             payload = {
-                "schema_version": "manyforge.assistant_mode_index.v1",
-                "modes": [{"mode": "composer-assistant"}],
+                "schema_version": "manyforge.assistant_mode_index.v2",
+                "assistant_component_id": "assistant",
+                "modes": [{"mode": "composer-assistant", "runs_in": ["no_program_active"]}],
             }
         elif path == "/api/assistant/modes/composer-assistant":
             payload = {
-                "schema_version": "manyforge.assistant_mode_projection.v1",
+                "schema_version": "manyforge.assistant_mode_projection.v2",
                 "mode": "composer-assistant",
             }
         elif path == "/api/manager/apply":
@@ -945,6 +946,7 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
         health = composer.get("/api/health").json()
         assert health["mode"] == "headless_client"
         assert health["components"]["headless_projection"] == "degraded"
+        assert "assistant_bridge" not in health["components"]
         assert health["headless"]["headless_projection_ready"] is False
         assert "ready" not in health["headless"]
         assert "robot_readiness" not in health["headless"]
@@ -957,8 +959,10 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
             composer.get("/api/assistant/modes/composer-assistant").json()["mode"]
             == "composer-assistant"
         )
-        assert composer.get("/api/assistant/modes").json()["modes"] == [
-            {"mode": "composer-assistant"}
+        modes = composer.get("/api/assistant/modes").json()
+        assert modes["assistant_component_id"] == "assistant"
+        assert modes["modes"] == [
+            {"mode": "composer-assistant", "runs_in": ["no_program_active"]}
         ]
         assert composer.get("/api/source-model").json()["schema_version"] == (
             "manyforge.source_model_projection.v3"

@@ -64,7 +64,9 @@ SUPPORTED_DRAFT_MUTATIONS = (
     "blackboard_draft_remove_namespaces",
     "blackboard_draft_upsert_keys",
     "blackboard_draft_upsert_namespaces",
+    "program_draft_remove_contact_policies",
     "program_draft_remove_parameters",
+    "program_draft_upsert_contact_policies",
     "program_draft_upsert_parameters",
     "scene_draft_add_object",
     "scene_draft_remove_objects",
@@ -81,12 +83,10 @@ SUPPORTED_DRAFT_MUTATIONS = (
 )
 OPERATOR_DRAFT_MUTATIONS = (
     "program_draft_expand_authoring_macro",
-    "program_draft_remove_contact_policies",
     "program_draft_update_motion_defaults",
     "program_draft_replace_support_contacts",
     "program_draft_store_observed_move",
     "program_draft_store_observed_scene_resource",
-    "program_draft_upsert_contact_policies",
     "program_draft_update_settings",
     "program_draft_update_node_policies",
     "program_draft_update_node_presentation",
@@ -373,6 +373,25 @@ def _tree_ref(
     return None
 
 
+def _existing_node_message(tree: list[dict[str, Any]], instance_id: str) -> str | None:
+    """Say where `instance_id` already sits in the Draft and both ways out."""
+
+    found = _tree_ref(tree, instance_id)
+    if found is None:
+        return None
+    node, parent, index = found
+    where = (
+        f"child {index} of {parent.get('instance_id')}"
+        if parent is not None
+        else f"top-level node {index}"
+    )
+    return (
+        f"{instance_id} already exists ({node.get('node_id')}, {where}): to use that "
+        "node inside the new subtree, insert the subtree without it and then "
+        f"tree_draft_move_node it in; to add a new node, give it a new instance_id"
+    )
+
+
 def _tree_ids(roots: list[dict[str, Any]]) -> list[str]:
     result: list[str] = []
     pending = list(reversed(roots))
@@ -397,12 +416,21 @@ def _lookup(
 ) -> tuple[dict[str, Any], dict[str, Any] | None, int | None]:
     found = _tree_ref(tree, instance_id)
     if found is None:
+        message = f"{label} does not name a Draft node: {instance_id}"
+        if instance_id == _ROOT_ALIAS:
+            # @root names the single top-level node; say why it is unresolved.
+            tops = [str(root.get("instance_id")) for root in tree]
+            message = (
+                f"{label} {_ROOT_ALIAS} names the Program's one root node, but the "
+                + (f"Draft has {len(tops)} top-level nodes: {', '.join(tops)}"
+                   if tops else "Draft has no node")
+            )
         _error(
             "draft_node_not_found",
-            f"{label} does not name a Draft node: {instance_id}",
+            message,
             status_code=404,
             detail={
-                "message": f"{label} does not name a Draft node: {instance_id}",
+                "message": message,
                 "validNodeNames": _tree_ids(tree),
                 "rootAlias": _ROOT_ALIAS,
             },
@@ -528,6 +556,15 @@ def _node_policy_arguments(
             "operator_stop_policy must be inherit, hold, or continue",
         )
     return instance_id, recovery, operator_stop
+
+
+def _neighbours(children: list[dict[str, Any]], index: int) -> list[str | None]:
+    """The siblings now before and after the node at `index` (None at an end)."""
+
+    return [
+        children[index - 1].get("instance_id") if index > 0 else None,
+        children[index + 1].get("instance_id") if index + 1 < len(children) else None,
+    ]
 
 
 def _insert_index(arguments: dict[str, Any], child_count: int) -> int:
@@ -1688,11 +1725,13 @@ class ComposerDraftSession:
         try:
             candidate, diagnostics = derive_candidate(document, catalog)
         except AuthoringForestError as error:
-            _error(
-                error.code,
-                str(error),
-                detail=error.detail,
-            )
+            message = str(error)
+            if error.code == "composer_authoring_node_duplicate":
+                # A new node reuses an id the Draft already has: say where.
+                message = _existing_node_message(
+                    base_authoring.get("forest") or [], error.detail["instanceId"]
+                ) or message
+            _error(error.code, message, detail=error.detail)
         return PreparedProgramMutation(
             tool_id=mutation,
             details=details,
@@ -2543,74 +2582,74 @@ class ComposerDraftSession:
             pending.extend(reversed(node.get("children", [])))
         return result
 
+    @staticmethod
+    def _program_motion_declared(document: dict[str, Any]) -> tuple[str, ...]:
+        """The motion-default fields the Program declares a parameter for.
+
+        A motion-default field inherits the Program parameter of the same
+        name (decision Q1.1-a); there is no other binding.
+        """
+
+        declared = {
+            row.get("parameter_id")
+            for row in document.get("parameters", [])
+            if type(row) is dict
+        }
+        return tuple(field for field in _PROGRAM_MOTION_DEFAULTS if field in declared)
+
     @classmethod
-    def _program_motion_binding_ids(
+    def _inherit_program_motion_defaults(
         cls,
         document: dict[str, Any],
+        roots: list[dict[str, Any]],
         catalog: NodeCatalog,
-    ) -> dict[str, str]:
-        """Resolve semantic motion fields from actual Program bindings."""
+        *,
+        descendants: bool = True,
+    ) -> None:
+        """Bind every unset motion-default field in ``roots`` to the Program.
 
-        declarations = {
-            row.get("parameter_id"): row
-            for row in document.get("parameters", [])
-            if type(row) is dict and type(row.get("parameter_id")) is str
-        }
-        references: dict[str, set[str]] = {
-            field: set() for field in _PROGRAM_MOTION_DEFAULTS
-        }
-        applicable: dict[str, int] = {
-            field: 0 for field in _PROGRAM_MOTION_DEFAULTS
-        }
-        for node, fields in cls._program_motion_nodes(document, catalog):
+        Applies at every depth unless ``descendants`` is false. A field with a
+        literal or a value source is kept exactly; a field the Program does
+        not declare stays unset.
+        """
+
+        declared = set(cls._program_motion_declared(document))
+        if not declared:
+            return
+        pending = list(roots)
+        while pending:
+            node = pending.pop()
+            if descendants:
+                pending.extend(node.get("children", []))
+            available = {
+                parameter.id for parameter in catalog.get(node["node_id"]).parameters
+            }
+            parameters = node.get("parameters", {})
             sources = node.get("value_sources", {})
-            if type(sources) is not dict:
-                continue
-            for field in fields:
-                applicable[field] += 1
-                source = sources.get(field)
-                if (
-                    type(source) is dict
-                    and source.get("kind") == "program_parameter"
-                    and type(source.get("reference")) is str
-                ):
-                    references[field].add(source["reference"])
-        resolved: dict[str, str] = {}
-        for field, candidates in references.items():
-            if not candidates and applicable[field] == 0:
-                declaration = declarations.get(field)
-                if (
-                    type(declaration) is dict
-                    and declaration.get("type") in {"float64", "int64"}
-                    and type(declaration.get("default")) in {int, float}
-                    and not isinstance(declaration.get("default"), bool)
-                ):
-                    resolved[field] = field
-                continue
-            if len(candidates) != 1:
-                continue
-            reference = next(iter(candidates))
-            declaration = declarations.get(reference)
-            if (
-                type(declaration) is dict
-                and declaration.get("type") in {"float64", "int64"}
-                and type(declaration.get("default")) in {int, float}
-                and not isinstance(declaration.get("default"), bool)
-            ):
-                resolved[field] = reference
-        return resolved
+            unset = sorted(
+                field
+                for field in declared & available
+                if field not in parameters and field not in sources
+            )
+            if unset:
+                node["value_sources"] = dict(sorted({
+                    **sources,
+                    **{
+                        field: {"kind": "program_parameter", "reference": field}
+                        for field in unset
+                    },
+                }.items()))
 
     @classmethod
     def _program_motion_config(
         cls, document: dict[str, Any], catalog: NodeCatalog
     ) -> dict[str, Any]:
-        bindings = cls._program_motion_binding_ids(document, catalog)
         declarations_by_id = {
             row["parameter_id"]: row for row in document["parameters"]
         }
         declarations = {
-            field: deepcopy(declarations_by_id[reference])
-            for field, reference in bindings.items()
+            field: deepcopy(declarations_by_id[field])
+            for field in cls._program_motion_declared(document)
         }
         nodes: list[dict[str, Any]] = []
         for node, fields in cls._program_motion_nodes(document, catalog):
@@ -2632,7 +2671,6 @@ class ComposerDraftSession:
                     values[field] = {"kind": "omitted"}
             nodes.append({"instance_id": node["instance_id"], "values": values})
         return {
-            "bindings": bindings,
             "declarations": declarations,
             "nodes": nodes,
         }
@@ -2644,39 +2682,27 @@ class ComposerDraftSession:
         config: Any,
         catalog: NodeCatalog,
     ) -> None:
-        if type(config) is not dict or set(config) != {
-            "bindings", "declarations", "nodes"
-        }:
+        if type(config) is not dict or set(config) != {"declarations", "nodes"}:
             _error("draft_arguments_invalid", "motion restore config is invalid")
-        bindings = config["bindings"]
         declarations = config["declarations"]
         rows = config["nodes"]
-        if (
-            type(bindings) is not dict
-            or type(declarations) is not dict
-            or type(rows) is not list
-            or set(bindings) != set(_PROGRAM_MOTION_DEFAULTS)
-            or set(declarations) != set(_PROGRAM_MOTION_DEFAULTS)
-            or any(type(value) is not str or not value for value in bindings.values())
-            or len(set(bindings.values())) != len(bindings)
-        ):
+        if type(declarations) is not dict or type(rows) is not list:
             _error("draft_arguments_invalid", "motion restore config is invalid")
-        current_bindings = cls._program_motion_binding_ids(document, catalog)
-        replaced_ids = {*current_bindings.values(), *bindings.values()}
+        if set(declarations) != set(cls._program_motion_declared(document)):
+            _error("draft_arguments_invalid", "motion restore parameter scope is stale")
         retained = [
             row
             for row in document["parameters"]
-            if row.get("parameter_id") not in replaced_ids
+            if row.get("parameter_id") not in declarations
         ]
-        for field in _PROGRAM_MOTION_DEFAULTS:
-            declaration = declarations[field]
+        for field, declaration in declarations.items():
             if (
                 type(declaration) is not dict
-                or declaration.get("parameter_id") != bindings[field]
+                or declaration.get("parameter_id") != field
             ):
                 _error(
                     "draft_arguments_invalid",
-                    "motion restore declaration changed binding identity",
+                    "motion restore declaration changed parameter identity",
                 )
             retained.append(deepcopy(declaration))
         document["parameters"] = sorted(retained, key=lambda row: row["parameter_id"])
@@ -2717,11 +2743,6 @@ class ComposerDraftSession:
                 node["value_sources"] = sources
             else:
                 node.pop("value_sources", None)
-        if cls._program_motion_binding_ids(document, catalog) != bindings:
-            _error(
-                "draft_arguments_invalid",
-                "motion restore bindings do not match the restored nodes",
-            )
 
     @classmethod
     def _program_motion_defaults_update(
@@ -2740,58 +2761,40 @@ class ComposerDraftSession:
                 "previous_config": previous,
                 "current_config": cls._program_motion_config(document, catalog),
             }
-        if mode != "update" or set(arguments) != {
-            "mode",
-            "velocity_scale",
-            "acceleration_scale",
-            "translation_tol_m",
-            "blend_radius_m",
-            "parameter_bindings",
-            "conflict_resolution",
-        }:
-            _error("draft_arguments_invalid", "motion-default arguments are invalid")
+        # Each given field updates the Program parameter of the same name.
         values = {
-            "velocity_scale": arguments["velocity_scale"],
-            "acceleration_scale": arguments["acceleration_scale"],
-            "translation_tol_m": arguments["translation_tol_m"],
-            "blend_radius_m": arguments["blend_radius_m"],
+            field: arguments[field]
+            for field in _PROGRAM_MOTION_DEFAULTS
+            if field in arguments
         }
+        if (
+            mode != "update"
+            or not values
+            or set(arguments) != {"mode", "conflict_resolution", *values}
+        ):
+            _error("draft_arguments_invalid", "motion-default arguments are invalid")
         if any(type(value) not in {int, float} or not math.isfinite(float(value)) for value in values.values()):
             _error("draft_arguments_invalid", "motion defaults must be finite numbers")
-        if not 0.0 < float(values["velocity_scale"]) <= 1.0:
+        if "velocity_scale" in values and not 0.0 < float(values["velocity_scale"]) <= 1.0:
             _error("draft_arguments_invalid", "velocity scale must be in (0, 1]")
-        if not 0.0 < float(values["acceleration_scale"]) <= 1.0:
+        if "acceleration_scale" in values and not 0.0 < float(values["acceleration_scale"]) <= 1.0:
             _error("draft_arguments_invalid", "acceleration scale must be in (0, 1]")
-        if not float(values["translation_tol_m"]) > 0.0:
+        if "translation_tol_m" in values and not float(values["translation_tol_m"]) > 0.0:
             _error("draft_arguments_invalid", "Cartesian translation tolerance must be positive")
-        if float(values["blend_radius_m"]) < 0.0:
+        if "blend_radius_m" in values and float(values["blend_radius_m"]) < 0.0:
             _error("draft_arguments_invalid", "Cartesian blend radius must be non-negative")
         resolution = arguments["conflict_resolution"]
         if resolution not in {"reject", "reduce"}:
             _error("draft_arguments_invalid", "motion conflict resolution is invalid")
-        requested_bindings = arguments["parameter_bindings"]
-        actual_bindings = cls._program_motion_binding_ids(document, catalog)
-        if (
-            type(requested_bindings) is not dict
-            or set(requested_bindings) != set(_PROGRAM_MOTION_DEFAULTS)
-            or any(
-                type(reference) is not str or not reference
-                for reference in requested_bindings.values()
-            )
-            or len(set(requested_bindings.values())) != len(requested_bindings)
-        ):
-            _error(
-                "draft_arguments_invalid",
-                "motion parameter bindings must identify distinct Program parameters",
-            )
-        if requested_bindings != actual_bindings:
+        declared = cls._program_motion_declared(document)
+        if not set(values) <= set(declared):
             _error(
                 "program_motion_binding_stale",
-                "Program motion controls do not match the current catalog-field bindings",
+                "Program motion controls do not match the declared Program parameters",
                 status_code=409,
                 detail={
-                    "actual_bindings": actual_bindings,
-                    "requested_bindings": requested_bindings,
+                    "declared_fields": list(declared),
+                    "requested_fields": sorted(values),
                 },
             )
 
@@ -2803,9 +2806,17 @@ class ComposerDraftSession:
             for field in fields:
                 literal = parameters.get(field)
                 source = sources.get(field)
-                if field in _PROGRAM_MOTION_CEILINGS and literal is not None and (
-                    type(literal) not in {int, float}
-                    or float(literal) > float(values[field])
+                # A dynamic source is checked against the Program value when
+                # its move starts (decision Q1.2-b), not here.
+                if (
+                    field in _PROGRAM_MOTION_CEILINGS
+                    and field in values
+                    and literal is not None
+                    and source is None
+                    and (
+                        type(literal) not in {int, float}
+                        or float(literal) > float(values[field])
+                    )
                 ):
                     conflicts.append({
                         "instance_id": node["instance_id"],
@@ -2813,15 +2824,6 @@ class ComposerDraftSession:
                         "current_value": deepcopy(literal),
                         "new_ceiling": float(values[field]),
                     })
-                if source is not None and source != {
-                    "kind": "program_parameter",
-                    "reference": actual_bindings[field],
-                }:
-                    _error(
-                        "program_motion_source_conflict",
-                        f"{node['instance_id']}.{field} uses another dynamic source",
-                        status_code=409,
-                    )
         if conflicts and resolution == "reject":
             _error(
                 "program_motion_limit_conflict",
@@ -2831,29 +2833,18 @@ class ComposerDraftSession:
             )
 
         by_id = {row["parameter_id"]: row for row in document["parameters"]}
-        for field, reference in actual_bindings.items():
-            declaration = deepcopy(by_id[reference])
-            declaration["default"] = float(values[field])
-            by_id[reference] = declaration
+        for field, value in values.items():
+            declaration = deepcopy(by_id[field])
+            declaration["default"] = float(value)
+            by_id[field] = declaration
         document["parameters"] = [by_id[key] for key in sorted(by_id)]
 
         conflict_keys = {(row["instance_id"], row["field"]) for row in conflicts}
-        for node, fields in motion_nodes:
-            parameters = node.setdefault("parameters", {})
-            sources = deepcopy(node.get("value_sources", {}))
-            for field in fields:
+        for node, _fields in motion_nodes:
+            for field in _PROGRAM_MOTION_CEILINGS:
                 if (node["instance_id"], field) in conflict_keys:
-                    parameters[field] = float(values[field])
-                    sources.pop(field, None)
-                elif field not in parameters and field not in sources:
-                    sources[field] = {
-                        "kind": "program_parameter",
-                        "reference": actual_bindings[field],
-                    }
-            if sources:
-                node["value_sources"] = sources
-            else:
-                node.pop("value_sources", None)
+                    node["parameters"][field] = float(values[field])
+        cls._inherit_program_motion_defaults(document, document["forest"], catalog)
         return {
             "reduced_node_fields": conflicts,
             "previous_config": previous,
@@ -3086,33 +3077,16 @@ class ComposerDraftSession:
     ) -> dict[str, Any]:
         tree = self._tree(document)
         node = deepcopy(arguments["node"])
-        motion_bindings = self._program_motion_binding_ids(document, catalog)
         entry = catalog.get(node["node_id"])
-        motion_fields = {
-            parameter.id
-            for parameter in entry.parameters
-            if parameter.id in _PROGRAM_MOTION_DEFAULTS
-            and parameter.id in motion_bindings
-        }
-        if motion_fields:
-            parameters = node.setdefault("parameters", {})
-            sources = deepcopy(node.get("value_sources", {}))
-            for field in sorted(motion_fields):
-                parameters.pop(field, None)
-                sources[field] = {
-                    "kind": "program_parameter",
-                    "reference": motion_bindings[field],
-                }
-            node["value_sources"] = sources
+        # Set values and sources are kept at every depth; unset motion
+        # defaults inherit the Program parameter of the same name.
+        self._inherit_program_motion_defaults(document, [node], catalog)
         _prefill_motion_endpoint(
             document, node, {parameter.id for parameter in entry.parameters}
         )
-        if _tree_ref(tree, node["instance_id"]) is not None:
-            _error(
-                "draft_node_exists",
-                f"Draft node already exists: {node['instance_id']}",
-                status_code=409,
-            )
+        exists = _existing_node_message(tree, node["instance_id"])
+        if exists is not None:
+            _error("draft_node_exists", exists, status_code=409)
         parent_id = arguments.get("parent_instance_id")
         index: int
         parent: dict[str, Any] | None
@@ -3146,6 +3120,7 @@ class ComposerDraftSession:
             "inserted_instance_id": node["instance_id"],
             "index": index,
             "parent_instance_id": parent["instance_id"] if parent is not None else None,
+            "now_between": _neighbours(children, index),
         }
 
     def _tree_update(
@@ -3253,6 +3228,7 @@ class ComposerDraftSession:
                 new_parent["instance_id"] if new_parent is not None else None
             ),
             "index": index,
+            "now_between": _neighbours(children, index),
         }
 
     def _tree_rename(
@@ -3299,13 +3275,14 @@ class ComposerDraftSession:
         }
 
     def _tree_replace(
-        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+        self, document: dict[str, Any], arguments: dict[str, Any], catalog: NodeCatalog
     ) -> dict[str, Any]:
         tree = self._tree(document)
         old_node, parent, index = _lookup(
             tree, arguments["instance_id"], label="instance_id"
         )
         subtree = deepcopy(arguments["subtree"])
+        self._inherit_program_motion_defaults(document, [subtree], catalog)
         if parent is None:
             assert index is not None
             tree[index] = subtree
@@ -3383,6 +3360,9 @@ class ComposerDraftSession:
             node["value_sources"] = dict(sorted(sources.items()))
         else:
             node.pop("value_sources", None)
+        self._inherit_program_motion_defaults(
+            document, [node], catalog, descendants=False
+        )
         return {
             "instance_id": node["instance_id"],
             "old_node_id": previous,
@@ -3405,12 +3385,9 @@ class ComposerDraftSession:
                 "draft_wrap_intent_invalid",
                 "wrapper.children is forbidden; the target becomes its only child",
             )
-        if _tree_ref(tree, wrapper["instance_id"]) is not None:
-            _error(
-                "draft_node_exists",
-                f"Draft node already exists: {wrapper['instance_id']}",
-                status_code=409,
-            )
+        exists = _existing_node_message(tree, wrapper["instance_id"])
+        if exists is not None:
+            _error("draft_node_exists", exists, status_code=409)
         wrapper["children"] = [target]
         if parent is None:
             assert index is not None

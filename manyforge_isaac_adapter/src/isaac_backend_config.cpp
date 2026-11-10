@@ -123,7 +123,6 @@ void configure_isaac_gripper_action(
   gripper_config.publish_nominal_position = facts.publish_nominal_position;
   gripper_config.wait_for_action_server_timeout_s =
       settings.gripper_wait_for_action_server_timeout_s;
-  gripper_config.result_timeout_s = facts.result_timeout_s;
   gripper_config.stop_finish_tolerance = facts.stop_finish_tolerance;
   config.gripper = std::move(gripper_config);
   roboplan_backend::configure_retained_gripper_output_mode(config, configuration, gripper);

@@ -6,13 +6,13 @@
   },
   "description": "Isaac Sim Lite6 trocar pick that takes the trocar pose from a FoundationPose Detection3D client. Start Isaac and the FoundationPose service, then Load and Execute the Program.",
   "members": {
-    "deployment.yaml": "sha256:48a793f0ea7557b6004b43a1ff125fc44db92ccc2649b3d82715ba5f59d4df58",
+    "deployment.yaml": "sha256:9bb1b2db3a3fbc75b812c7acd6c23de7d05dba01ee1c2d3c778e662442338556",
     "program.yaml": "sha256:974784cdc95d966133c753d5a229c04fccfc42f250e1da4fbd295a54bd68419c"
   },
   "name": "sim_lite6_foundationpose_trocar_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:106cdfed78674b5361ff9de524811ba1fb27c35a61dc38e0d3cf30133309110d",
-    "last_known_status": "ready",
+    "checked_content_digest": "sha256:db2850ed0852151284284326c385180b174870c00955e2359970ab0f7d78ffd4",
+    "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },
   "scenario_id": "sim_lite6_foundationpose_trocar_pick",

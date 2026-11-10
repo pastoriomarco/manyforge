@@ -4743,8 +4743,11 @@ def test_timer_input_failure_pauses_and_operator_retry_re_resolves_inputs() -> N
     run_id = owner.start(
         _timer_with_sourced_duration_admission(admission)
     ).capture.program_run_id
+    # The catalog declares the timer's input failure (OD-77); this run pauses
+    # on it instead of failing.
     assert set(admission.environment.catalog.get("timer").outcomes) == {
         "success",
+        "failure",
         "interrupted",
     }
 

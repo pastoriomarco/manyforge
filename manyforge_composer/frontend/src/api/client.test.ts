@@ -648,12 +648,13 @@ describe('structural API client', () => {
   it('uses the owner mode index and bridge-owned request status routes', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response({
-        schema_version: 'manyforge.assistant_mode_index.v1',
+        schema_version: 'manyforge.assistant_mode_index.v2',
         retained_bundle_id: 'bundle.1',
         graph_revision: 'graph.1',
         assistant_projection_digest: `sha256:${'1'.repeat(64)}`,
         instrument_registry_digest: `sha256:${'2'.repeat(64)}`,
         ai_model_component_id: 'assistant_model',
+        assistant_component_id: 'assistant',
         node_environment: {
           catalog_digest: `sha256:${'5'.repeat(64)}`,
           catalog_id: 'manyforge',

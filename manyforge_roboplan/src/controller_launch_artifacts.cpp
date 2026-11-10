@@ -18,6 +18,8 @@
 #include <vector>
 
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/types/error_catalog.generated.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -610,7 +612,31 @@ ControllerLaunchArtifacts write_launch_artifacts(const ModelLaneRow &row,
     result.gripper_controller_name = row.controller;
   }
   result.rates = controller_lane_rates(controllers);
-  if (arm) result.arm_command_interfaces = controller_command_interfaces(controllers);
+  if (arm) {
+    result.arm_command_interfaces = controller_command_interfaces(controllers);
+    // The adapter's declared runtime scaling matches its written arm
+    // controller (Mock, Isaac and every vendor adapter write it here).
+    if (!row.runtime_scale_supported.has_value()) {
+      fail(component + "the lane row of a robot needs runtime_scale");
+    }
+    if (*row.runtime_scale_supported !=
+        jtc_accepts_speed_scaling(result.arm_command_interfaces)) {
+      std::string claimed;
+      for (const auto &name : result.arm_command_interfaces) {
+        claimed += (claimed.empty() ? "" : ",") + name;
+      }
+      const std::string declared =
+          *row.runtime_scale_supported ? "supported" : "unsupported";
+      throw core::TypedError(
+          std::string(core::error_codes::kComponentRuntimeScaleMismatch),
+          component + "the lane row declares runtime_scale: " + declared +
+              ", but its arm controller claims [" + claimed +
+              "] (only a position-only claim accepts runtime speed scaling)",
+          {{"component_id", instance.controllable_component_id},
+           {"runtime_scale", declared},
+           {"command_interfaces", claimed}});
+    }
+  }
 
   result.directory = instance.artifacts_root / instance.controllable_component_id;
   std::error_code error;

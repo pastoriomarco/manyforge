@@ -28,7 +28,8 @@ MAXIMUM_DEPTH = 256
 MAXIMUM_POSITIONS = MAXIMUM_NODES
 MAXIMUM_POSITION_MAGNITUDE = 10_000_000.0
 _PROGRAM_REVISION_PLACEHOLDER = "sha256:" + ("0" * 64)
-_PROGRAM_PATH = re.compile(r"^(?P<path>[^ ]+)(?: (?P<message>.*))?$")
+# "<path>: <message>"; the colon closing the path is not part of it.
+_PROGRAM_PATH = re.compile(r"^(?P<path>[^ ]+?):?(?: (?P<message>.*))?$")
 
 
 class AuthoringForestError(RuntimeError):

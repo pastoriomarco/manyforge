@@ -21,6 +21,10 @@ struct ManagedKernelAdmissionObservation final {
       active_control_configurations;
   std::uint64_t affected_queued_operation_count;
   std::uint64_t affected_active_operation_count;
+  /// Domains with an authoritative Kernel route publication; a domain here is
+  /// commandable or externally owned even without a reconciled configuration.
+  std::vector<manyforge::core::DomainActiveControlConfigurationDTO>
+      route_published_active_control_configurations{};
 
   friend bool operator==(const ManagedKernelAdmissionObservation &,
                          const ManagedKernelAdmissionObservation &) = default;

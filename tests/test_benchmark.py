@@ -58,7 +58,6 @@ class _Transport:
         return {"ok": True, "accepted": {"operation_id": operation_id, "request": body}}
 
     acknowledge_completed = reset
-    set_runtime_scale = reset
 
     def stop(self, body):
         operation_id = body["operations"][0]["operation_id"]

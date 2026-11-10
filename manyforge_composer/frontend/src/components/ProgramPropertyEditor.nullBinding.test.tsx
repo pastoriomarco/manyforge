@@ -43,7 +43,7 @@ describe('ProgramPropertyEditor without a compiled binding', () => {
     const catalog = entry('motion.move_to_pose', [param('target', { type: 'object', 'x-manyforge-semantic-type': 'target_reference' })]);
     catalog.requiredCapabilities = [{ capabilityId: 'execution.trajectory.execute', scope: 'target_binding', effectful: true, targetParameter: 'target' }];
     const node: ProgramTreeNode = { node_id: catalog.id, instance_id: 'direct', children: [], parameters: {} };
-    const facts: ReferenceSelectorFacts = { components: [], frames: [], bodies: [], signals: [], targets: [
+    const facts: ReferenceSelectorFacts = { components: [], rules: [], frames: [], bodies: [], signals: [], targets: [
       { target: { component_id: 'arm', command_target_id: 'motion' }, capabilities: [{ capability_id: 'execution.trajectory.execute', available: true, reason: null }], source_joint_names: [], tcp_entries: [], default_tcp: null, stop_routes: [] },
       { target: { component_id: 'io', command_target_id: 'port' }, capabilities: [], source_joint_names: [], tcp_entries: [], default_tcp: null, stop_routes: [] },
     ] };
@@ -99,7 +99,7 @@ describe('ProgramPropertyEditor without a compiled binding', () => {
     catalog.requiredCapabilities = [{ capabilityId: 'execution.trajectory.execute', scope: 'target_binding', effectful: true, targetParameter: 'target' }];
     const node: ProgramTreeNode = { node_id: 'motion.move_until_signal', instance_id: 'seek', children: [],
       parameters: { target: { component_id: 'lite6_robot', command_target_id: 'arm' } } };
-    const facts: ReferenceSelectorFacts = { components: [], signals: [], frames: [], bodies: [], targets: [{
+    const facts: ReferenceSelectorFacts = { components: [], rules: [], signals: [], frames: [], bodies: [], targets: [{
       target: { component_id: 'lite6_robot', command_target_id: 'arm' }, capabilities: [], source_joint_names: [], tcp_entries: [], default_tcp: null,
       stop_routes: [{ capability_id: 'execution.trajectory.execute', control_binding_id: 'c', control_binding_revision: 'r', control_route_id: 'route', available: true, reason: null,
         stages: [{ stage_id: 'motion_controlled_stop', stage_kind: 'nominal', command_kind: 'controlled_stop', stop_action_class: 'controlled_stop' }] }],
@@ -126,7 +126,7 @@ describe('ProgramPropertyEditor without a compiled binding', () => {
     const gripper = { component_id: 'tool', command_target_id: 'gripper' };
     const body = (componentId: string, bodyId: string, moving: typeof arm[]) => (
       { reference: { component_id: componentId, collision_body_id: bodyId }, ambiguous: false, moving_targets: moving });
-    const facts: ReferenceSelectorFacts = { components: [], targets: [], signals: [], frames: [], bodies: [
+    const facts: ReferenceSelectorFacts = { components: [], rules: [], targets: [], signals: [], frames: [], bodies: [
       body('robot', 'arm_collision', [arm]),
       body('tool', 'finger', [arm, gripper]),
       body('tool', 'gripper_collision', [arm, gripper]),
@@ -147,7 +147,7 @@ describe('ProgramPropertyEditor without a compiled binding', () => {
     const wait = entry('io.wait_for_input', [param('signal', { type: 'object', 'x-manyforge-semantic-type': 'signal_reference' })]);
     const node: ProgramTreeNode = { node_id: 'io.wait_for_input', instance_id: 'wait', children: [],
       parameters: { signal: { component_id: 'station_io', signal_name: 'probe_contact' } } };
-    const facts: ReferenceSelectorFacts = { components: [], targets: [], frames: [], bodies: [], signals: [
+    const facts: ReferenceSelectorFacts = { components: [], rules: [], targets: [], frames: [], bodies: [], signals: [
       { reference: { component_id: 'station_io', signal_name: 'probe_contact' }, ambiguous: false, target: { component_id: 'station_io', command_target_id: 'gpio' }, value_type: 'bool', direction: 'input', transition_capability: null, update_mode: null, liveness: 'change_only', provider_profile: 'ros_bool' },
       { reference: { component_id: 'station_io', signal_name: 'clamp' }, ambiguous: false, target: { component_id: 'station_io', command_target_id: 'gpio' }, value_type: 'bool', direction: 'output', transition_capability: null, update_mode: null, liveness: null, provider_profile: 'ros_bool' },
     ] };

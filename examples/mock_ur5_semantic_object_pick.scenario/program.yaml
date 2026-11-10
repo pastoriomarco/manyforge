@@ -335,7 +335,8 @@
             "tool_target": {
               "command_target_id": "gripper",
               "component_id": "robotiq_2f_85"
-            }
+            },
+            "tool_completion_timeout_s": 15.0
           },
           "value_sources": {
             "selected_object_id": {
@@ -409,7 +410,8 @@
             "target": {
               "command_target_id": "gripper",
               "component_id": "robotiq_2f_85"
-            }
+            },
+            "completion_timeout_s": 15.0
           }
         },
         {
@@ -583,7 +585,8 @@
             "target": {
               "command_target_id": "gripper",
               "component_id": "robotiq_2f_85"
-            }
+            },
+            "completion_timeout_s": 15.0
           }
         },
         {

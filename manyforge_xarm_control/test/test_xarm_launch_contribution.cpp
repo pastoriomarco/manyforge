@@ -139,6 +139,9 @@ TEST(XArmLaunchContribution, EverySupportedModelGeneratesItsTemplate) {
     ASSERT_EQ(arm["command_interfaces"].size(), 1U) << yaml;
     EXPECT_EQ(arm["command_interfaces"][0].as<std::string>(), "position");
     EXPECT_EQ(count("__command_interfaces__"), 0U) << yaml;
+    // The row declares what that position-only claim gives (the launch
+    // check holds it to it), so the Real lane fact `supports_scale` stays true.
+    EXPECT_EQ(YAML::Load(text)["lanes"]["real"]["runtime_scale"].as<std::string>(), "supported");
     EXPECT_DOUBLE_EQ(arm["action_monitor_rate"].as<double>(), 20.0);
     EXPECT_TRUE(arm["constraints"]["decelerate_on_cancel"].as<bool>());
 

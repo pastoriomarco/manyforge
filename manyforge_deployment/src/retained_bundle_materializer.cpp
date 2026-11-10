@@ -858,6 +858,23 @@ void require_qualified_structural_subset_before_store(
   const auto controller_domain_count = static_cast<std::size_t>(std::count_if(
       graph.control_domains.begin(), graph.control_domains.end(),
       [](const auto &domain) { return domain.provider() == nullptr; }));
+  // A lane-free adapter component (a sensor, the assistant) has no domain:
+  // its execution unit lists it under `sensors`.
+  std::set<std::string> lane_free;
+  for (const auto &unit : graph.runtime_units) {
+    const auto listed = unit.configuration.find("sensors");
+    if (listed == unit.configuration.end()) continue;
+    const auto *rows = std::get_if<core::JsonValueDTO::Array>(&listed->second.value);
+    if (rows == nullptr) continue;
+    for (const auto &row : *rows) {
+      const auto *object = std::get_if<core::JsonObjectDTO>(&row.value);
+      if (object == nullptr) continue;
+      const auto id = object->find("controllable_component_id");
+      if (id == object->end()) continue;
+      if (const auto *text = std::get_if<std::string>(&id->second.value))
+        lane_free.insert(*text);
+    }
+  }
   const bool provider_only_subset =
       graph.model_instances.empty() && !graph.controllable_components.empty() &&
       !graph.control_domains.empty() && controller_domain_count == 0U &&
@@ -867,12 +884,13 @@ void require_qualified_structural_subset_before_store(
           graph.controllable_components.begin(),
           graph.controllable_components.end(), [&](const auto &component) {
             return component.model_role_bindings.empty() &&
-                   std::any_of(
-                       graph.control_domains.begin(),
-                       graph.control_domains.end(), [&](const auto &domain) {
-                         return domain.provider()->controllable_component_id ==
-                                component.controllable_component_id;
-                       });
+                   (lane_free.contains(component.controllable_component_id.value()) ||
+                    std::any_of(
+                        graph.control_domains.begin(),
+                        graph.control_domains.end(), [&](const auto &domain) {
+                          return domain.provider()->controllable_component_id ==
+                                 component.controllable_component_id;
+                        }));
           });
   const bool passive_subset =
       graph.runtime_units.empty() && graph.controllable_components.empty() &&

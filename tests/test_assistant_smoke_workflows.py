@@ -64,20 +64,19 @@ class _ProviderHttp:
         path = urlsplit(url).path
         self.calls.append((method, path))
 
-        if method == "GET" and path == "/api/health":
-            return _JsonResponse({"components": {"assistant_bridge": "configured"}})
         if method == "GET" and path == "/api/assistant/modes":
             return _JsonResponse(
                 {
-                    "schema_version": "manyforge.assistant_mode_index.v1",
+                    "schema_version": "manyforge.assistant_mode_index.v2",
                     "modes": [{"mode": PROVIDER.ASSISTANT_MODE}],
                     "ai_model_component_id": "mock_chat_model",
+                    "assistant_component_id": "assistant",
                 }
             )
         if method == "GET" and path == "/api/assistant/modes/composer-assistant":
             return _JsonResponse(
                 {
-                    "schema_version": "manyforge.assistant_mode_projection.v1",
+                    "schema_version": "manyforge.assistant_mode_projection.v2",
                     "mode": PROVIDER.ASSISTANT_MODE,
                     "model_endpoint": {
                         "model_endpoint_alias": "assistant_model",

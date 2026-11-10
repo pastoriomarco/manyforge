@@ -107,6 +107,13 @@ class ComponentDetail(TypedDict):
     value: str
 
 
+class ComponentEndpoint(TypedDict):
+    """One endpoint the component's adapter publishes (e.g. `assistant_request`)."""
+
+    role_id: str
+    url: str
+
+
 class ComponentState(TypedDict):
     component_id: str
     # The machine this component is a member of, and its member slot.
@@ -125,6 +132,9 @@ class ComponentState(TypedDict):
     last_action: NotRequired[ActionResult]
     # The adapter's read-only diagnostics, display only.
     details: NotRequired[list[ComponentDetail]]
+    # Adapter-published endpoints, present only while enabled; unlike
+    # `details`, logic may read it.
+    endpoints: NotRequired[list[ComponentEndpoint]]
     observed_at_ns: int
 
 
@@ -255,6 +265,14 @@ def parse_component_model(response: Mapping[str, Any]) -> ComponentModel:
             for row in details
         ):
             raise _invalid("component state details must be name/value text pairs")
+        endpoints = state.get("endpoints", [])
+        if not isinstance(endpoints, list) or not all(
+            isinstance(row, dict)
+            and isinstance(row.get("role_id"), str)
+            and isinstance(row.get("url"), str)
+            for row in endpoints
+        ):
+            raise _invalid("component state endpoints must be role_id/url text pairs")
     required = response.get("required_signal_ids", [])
     if not isinstance(required, list) or not all(isinstance(v, str) for v in required):
         raise _invalid("component model required_signal_ids is invalid")

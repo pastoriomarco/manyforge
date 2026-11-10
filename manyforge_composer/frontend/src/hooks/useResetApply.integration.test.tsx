@@ -620,7 +620,7 @@ describe('Resume, Retry and Execute with an unapplied Draft', () => {
   it('are refused until the Draft is Applied or Discarded; Reset is not', async () => {
     const render = await mount(HELD);
     const runtime = hooks!.runtime;
-    expect(runtime.draftUnappliedReason).toMatch(/^Apply or Discard first: unapplied changes in Program/);
+    expect(runtime.composerRefusalReason).toMatch(/^Apply or Discard first: unapplied changes in Program/);
     expect(runtime.runnerAllows('program_reset')).toBe(true);
     const currentOffer = () => hooks!.runtime.state.controls!.recoveryHolds[0].offer;
     await act(async () => {
@@ -632,7 +632,7 @@ describe('Resume, Retry and Execute with an unapplied Draft', () => {
     // Discarded: the Draft is exactly what is Applied again.
     await render({ ...HELD, draftRevision: 4, programRevision: digest('a') });
     await flush();
-    expect(hooks!.runtime.draftUnappliedReason).toBeNull();
+    expect(hooks!.runtime.composerRefusalReason).toBeNull();
     await act(async () => {
       hooks!.runtime.applyRecoveryAction(currentOffer(), 'retry_motion_from_current_state');
     });
@@ -747,14 +747,14 @@ describe('Resume, Retry and Execute with an unapplied Draft', () => {
   it('refuse Run of a run Executed but never Run until the Draft is Applied', async () => {
     await mount({ ...HELD, hold: 'never_run' });
     const runtime = hooks!.runtime;
-    expect(runtime.draftUnappliedReason).toMatch(/^Apply or Discard first/);
+    expect(runtime.composerRefusalReason).toMatch(/^Apply or Discard first/);
     await act(async () => { await runtime.resumeMotion('all'); });
     expect(transport.sendExecutionCommand).not.toHaveBeenCalled();
   });
 
   it('also refuse with an unapplied Deployment edit', async () => {
     await mount({ ...HELD, programRevision: digest('a'), deploymentRevision: 2, deploymentContent: digest('e') });
-    expect(hooks!.runtime.draftUnappliedReason).toContain('unapplied changes in Deployment');
+    expect(hooks!.runtime.composerRefusalReason).toContain('unapplied changes in Deployment');
   });
 });
 
@@ -1169,7 +1169,7 @@ describe('Applied view after an Apply settles', () => {
       cycle: { allowedCommands: programRun } as Partial<ProgramCycleStatus>,
     };
     const render = await mount(before);
-    expect(hooks!.runtime.draftUnappliedReason).toMatch(/^Apply or Discard first/);
+    expect(hooks!.runtime.composerRefusalReason).toMatch(/^Apply or Discard first/);
     expect(programActionUnavailableReason(hooks!.program.state.workspace, 'apply', null)).toBeNull();
 
     apiMock.programWorkspace.apply.mockResolvedValue({
@@ -1196,7 +1196,7 @@ describe('Applied view after an Apply settles', () => {
     await flush();
     expect(apiMock.programs.applied.mock.calls.length).toBeGreaterThan(appliedReads);
     expect(hooks!.runtime.state.applied?.programRevision).toBe(digest('f'));
-    expect(hooks!.runtime.draftUnappliedReason).toBeNull();
+    expect(hooks!.runtime.composerRefusalReason).toBeNull();
     // Nothing is left to apply or discard.
     expect(programActionUnavailableReason(hooks!.program.state.workspace, 'apply', null))
       .toMatch(/^Nothing to apply/);

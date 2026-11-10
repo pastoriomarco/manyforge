@@ -3,9 +3,11 @@ import type { JsonValue } from './api';
 /**
  * What one Add component entry adds; a tool mounts on a robot's flange; a
  * machine is an owner with its members; a sensor (e.g. the
- * point-cloud source) is a `kind: sensor` model without a lane.
+ * point-cloud source) is a `kind: sensor` model without a lane; so is the
+ * AI assistant (`kind: assistant`, the AI tab's chat).
  */
-export type ComponentCatalogKind = 'machine' | 'robot' | 'tool' | 'io_device' | 'pose_source' | 'ai_model' | 'sensor';
+export type ComponentCatalogKind = 'machine' | 'robot' | 'tool' | 'io_device' | 'pose_source' | 'ai_model' | 'sensor'
+  | 'assistant';
 
 /**
  * A model's own payload (TOOLCTX), from its model asset: package data, not

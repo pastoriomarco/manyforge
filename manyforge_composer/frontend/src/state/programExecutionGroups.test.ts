@@ -208,7 +208,7 @@ describe('hardware-acting node rule', () => {
       const id = entry.split('\n', 1)[0].trim();
       const owner = /^ {4}owner_api: (\S+)$/m.exec(entry)?.[1];
       const kernelControl = new Set([
-        'kernel.stop', 'kernel.full_stop', 'kernel.reset', 'kernel.runtime_scaling']);
+        'kernel.stop', 'kernel.full_stop', 'kernel.reset']);
       if ((/^ {4}effectful: true$/m.test(entry)
           && (owner === 'kernel.operation' || owner === 'kernel.command_target'))
           || (owner !== undefined && kernelControl.has(owner))) derived.add(id);

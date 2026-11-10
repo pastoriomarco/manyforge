@@ -385,7 +385,6 @@ int main(int argc, char **argv) {
       }
       const auto &target = config.gripper_target_configurations.front();
       if (target.actuation_kind != "position_commanded" ||
-          target.delivery_result_timeout_s.has_value() ||
           target.output_mode != core::GripperOutputMode::kCommanded ||
           target.command_duration_s != 1.0 ||
           target.controllable_component_id != graph.control_bindings.front().controllable_component_id ||

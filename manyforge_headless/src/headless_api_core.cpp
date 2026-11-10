@@ -53,8 +53,6 @@ constexpr std::string_view kNodeEnvironmentProjectionIdentityDomain =
     "manyforge-node-environment-projection-semantic";
 constexpr std::string_view kSourceModelProjectionIdentityDomain =
     "manyforge-source-model-projection-semantic";
-constexpr std::string_view kAssistantModeProjectionIdentityDomain =
-    "manyforge-assistant-mode-projection-semantic";
 constexpr std::string_view kAssistantModeIndexIdentityDomain =
     "manyforge-assistant-mode-index-semantic";
 constexpr std::string_view kHistorianOwnerHealthCode =
@@ -3847,9 +3845,9 @@ CanonicalValue HeadlessApiCore::AssistantModeProjectionLocked(
     }
     assistant_mode_projection_cache_.emplace(mode_key, projection);
   }
-  const auto semantic_digest = content_identity::framed_sha256(
-      kAssistantModeProjectionIdentityDomain,
-      kAssistantModeProjectionApiVersion, projection);
+  // The node catalog part (tool descriptors, the derived node set, their
+  // digests and source_content_digest) is joined by the Python service of
+  // this process, which owns the loaded catalog.
   CanonicalValue::Object result = projection.as_object();
   result.emplace_back(
       "source",
@@ -3872,7 +3870,6 @@ CanonicalValue HeadlessApiCore::AssistantModeProjectionLocked(
            RequiredMember(manager_section, "source_owner_epoch")},
           {"selection_source_owner_id",
            RequiredMember(manager_section, "source_owner_id")},
-          {"source_content_digest", CanonicalValue(semantic_digest)},
           {"source_generation",
            RequiredMember(manager_section, "projection_generation")},
           {"source_owner_epoch", CanonicalValue(config_.owner_epoch)},

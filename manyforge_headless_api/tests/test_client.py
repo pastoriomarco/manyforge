@@ -606,7 +606,7 @@ def test_client_uses_the_selected_assistant_mode_route() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json={"schema_version": "manyforge.assistant_mode_projection.v1"},
+            json={"schema_version": "manyforge.assistant_mode_projection.v2"},
             request=request,
         )
 
@@ -617,7 +617,7 @@ def test_client_uses_the_selected_assistant_mode_route() -> None:
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
         assert client.assistant_mode("composer-assistant")["schema_version"].endswith(
-            "projection.v1"
+            "projection.v2"
         )
         with pytest.raises(ValueError, match="assistant mode ID is invalid"):
             client.assistant_mode("../runtime")
@@ -635,7 +635,7 @@ def test_client_uses_the_owner_issued_assistant_mode_index() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json={"schema_version": "manyforge.assistant_mode_index.v1", "modes": []},
+            json={"schema_version": "manyforge.assistant_mode_index.v2", "modes": []},
             request=request,
         )
 

@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
+import { ASSISTANT_TURN_IN_PROGRESS, type ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type {
   ProgramBindingDocument,
@@ -204,7 +204,7 @@ function controller(
         motion_clear: true,
         blocked_reasons: [{ code: 'run_in_progress', message: 'A run is in progress.' }] },
     cellLatch: null,
-    draftUnappliedReason: null,
+    composerRefusalReason: null,
     state: {
       currentScenario: null,
       applied: {
@@ -1598,6 +1598,15 @@ describe('Program runtime projection', () => {
     expect(haltedMarkup()).toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""/);
     halted.readiness = { can_execute: false, can_resume: true, motion_clear: true, blocked_reasons: [] };
     expect(haltedMarkup()).toMatch(/class="transport-run transport-unique-control"(?![^>]*disabled)[^>]*title="Resume the halted Program tree/);
+  });
+
+  it('disables Execute with its reason while this page\'s assistant request runs', () => {
+    const program = controller('succeeded', 'idle_after_reset');
+    program.state.run = null;
+    program.state.controls = null;
+    program.composerRefusalReason = ASSISTANT_TURN_IN_PROGRESS;
+    expect(renderToStaticMarkup(<ProgramTransportControls enabled program={program} robot={robotController()} />))
+      .toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""[^>]*title="An assistant request is running: wait or cancel it"/);
   });
 
   it('offers "Activate components and execute?" only when components not enabled are the only blockers', () => {

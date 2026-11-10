@@ -21,7 +21,6 @@ from manyforge_headless_api.models import (
     MAX_OPERATION_PARTICIPANTS,
     StrictRequest,
     OperationControlRequest,
-    OperationRuntimeScaleRequest,
     OperationIntentRequest,
     OperationParticipantRequest,
     OperationRecoveryActionRequest,
@@ -901,11 +900,6 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
     def full_stop(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return super().full_stop(
             self._request(FullStopIntentRequest, body), trusted_principal_id=None
-        )
-
-    def set_operation_runtime_scale(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return super().set_operation_runtime_scale(
-            self._request(OperationRuntimeScaleRequest, body), trusted_principal_id=None
         )
 
     def apply_operation_recovery(

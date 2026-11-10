@@ -1,7 +1,6 @@
 {
   "api_version": "manyforge.deployment_intent.v2",
   "assistant_model_components": {
-    "assistant_model": "assistant_model",
     "vision_model": "vision_model"
   },
   "assistant_profile_id": "vision_pose_selection",

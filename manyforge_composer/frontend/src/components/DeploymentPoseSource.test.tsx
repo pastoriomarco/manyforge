@@ -396,9 +396,10 @@ describe('Deployment pose sources', () => {
     } finally { await mounted.unmount(); }
   });
 
-  it('maps each assistant profile alias to an AI model component', async () => {
+  it('maps each runtime model alias of the assistant profile to an AI model component', async () => {
+    // The route lists runtime aliases only: the chat alias is bound by the assistant component.
     vi.spyOn(api.deploymentWorkspace, 'assistantProfiles').mockResolvedValue({
-      semantic_shape_selection: ['assistant_model', 'selection_model'],
+      semantic_shape_selection: { chat: true, modelEndpointAliases: ['pose_model', 'selection_model'] },
     });
     const selection = { ...aiModel, component_id: 'selection_model' };
     const mounted = await mount([arm, aiModel, selection], null, {
@@ -408,12 +409,13 @@ describe('Deployment pose sources', () => {
     try {
       await act(async () => { await Promise.resolve(); });
       expect(mounted.control('Model alias selection_model').value).toBe('selection_model');
-      expect(mounted.control('Model alias assistant_model').value).toBe('');
+      expect(mounted.control('Model alias pose_model').value).toBe('');
+      expect(mounted.all((props) => props['aria-label'] === 'Model alias assistant_model')).toHaveLength(0);
       expect(mounted.all((props) => props.children === 'Choose the AI model for this alias.')).toHaveLength(1);
-      await act(() => mounted.control('Model alias assistant_model').onChange?.({
+      await act(() => mounted.control('Model alias pose_model').onChange?.({
         target: { value: 'assistant_model' } }));
       expect(mounted.controller.mutate).toHaveBeenLastCalledWith(['assistant_model_components'], 'set', {
-        selection_model: 'selection_model', assistant_model: 'assistant_model',
+        selection_model: 'selection_model', pose_model: 'assistant_model',
       });
     } finally { await mounted.unmount(); }
   });

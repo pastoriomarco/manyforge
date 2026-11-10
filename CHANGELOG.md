@@ -7,6 +7,230 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Before 1.0, a minor release (0.x.0) may change public interfaces and file
 formats; such changes are listed explicitly.
 
+## Unreleased
+
+### Added
+
+- **The AI assistant is a component** (kind `assistant`,
+  `manyforge.assistant`, at most one per cell; Add component > AI assistant).
+  Its row names the chat's `ai_model` (`model_component_id`) and an assistant
+  profile with a chat mode (`assistant_profile_id`). Prepare starts its host,
+  Enable starts the bridge on a loopback socket with an ephemeral port and
+  publishes the URL, Disable stops it (running requests end `cancelled`, the
+  history is dropped); activity is `busy` during a request, the `bridge`
+  stream shows its health, and a host or bridge exit is `fault_process_exited`.
+  The AI tab says why it is disabled. Chat and Program runs never overlap:
+  Composer refuses a chat request while a run exists
+  (`assistant_program_active`) and Execute while a chat request runs
+  (`execution_assistant_turn_in_progress`). New refusals:
+  `assistant_component_absent`, `assistant_component_not_enabled`,
+  `assistant_ai_model_not_enabled`, `assistant_component_duplicate`,
+  `assistant_profile_has_no_chat_mode`. See the
+  [assistant cookbook](docs/operations/ASSISTANT_E2E_COOKBOOK.md).
+- **`ComponentState.endpoints`** (`[{role_id, url}]`, only while enabled):
+  the URLs a component serves; clients may act on them, unlike `details`.
+- **The assistant declares Program contact policies.** The `composer-assistant`
+  mode offers `program_draft_upsert_contact_policies` and
+  `program_draft_remove_contact_policies` (26 tools), the Draft edits of the
+  Program contact policy editor, so it can author a planned pick
+  (`planning.plan_pick_sequence` needs a `contact_grasp` policy). The edits
+  stay in the Draft for review and Apply. See
+  [Assistant provider contract](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md#mode-and-tools).
+
+### Changed
+
+- **Motion defaults inherit by name; inserts keep what is set; copies keep
+  their internal references.** A motion node's `velocity_scale`,
+  `acceleration_scale`, `translation_tol_m` and `blend_radius_m` inherit the
+  Program parameter of the same name, field by field. A Program parameter
+  with another name (for example `cycle_velocity`) is no longer recognised as
+  a motion default. Inserting a node or subtree (also replace, change kind
+  and the Pick/Place subtree) keeps every literal and value source it brings,
+  at every depth, and binds only unset fields; the palette and change kind
+  leave the four fields unset. Copy, Paste and Duplicate rename
+  `node_outcome.<node>` references between the copied nodes. These fields may
+  now read any numeric value source; when the move starts, a value above the
+  Program `velocity_scale`/`acceleration_scale` refuses the move with
+  `motion_value_above_program_limit` (never clamped). The Motion defaults
+  panel works per declared field and counts dynamic nodes;
+  `program_draft_update_motion_defaults` takes only the declared fields and no
+  `parameter_bindings`. See [Motion defaults](docs/authoring/MOTION_DEFAULTS.md).
+- **Assistant formats**: the mode projection
+  (`manyforge.assistant_mode_projection.v2`) names `assistant_component_id`
+  and each mode's `runs_in` instead of `provider`; the mode index
+  (`manyforge.assistant_mode_index.v2`) adds `assistant_component_id` and is
+  empty without an assistant component; the profiles file is
+  `maintained_assistant_profiles.v2.json` (no `provider_alias`); bridge
+  `/health` is `manyforge.assistant.bridge_health.v2` `{status, activity}`;
+  `GET /api/deployment/assistant-profiles` is
+  `manyforge.composer_assistant_profile_aliases.v2`
+  (`{profileId, chat, modelEndpointAliases}`). The Deployment-level
+  `assistant_profile_id` now only carries runtime prompt templates and model
+  aliases; the chat alias `assistant_model` is bound by the assistant
+  component and refused in `assistant_model_components`. A saved Deployment
+  with a Deployment-level chat profile and no assistant component loads
+  without chat; nothing is converted.
+- **The assistant sends no sampling parameters by default** (it sent
+  `temperature: 0`), so the model's or server's defaults apply. The assistant
+  profile's optional `request_contract.sampling: {temperature?, top_p?,
+  top_k?}` sends exactly the fields it sets; out-of-range values are refused.
+  See [Assistant provider contract](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md).
+- **A constrained regeneration does not think.** With `reasoning: on`, the
+  assistant's one-call argument repair sends
+  `chat_template_kwargs: {enable_thinking: false}`.
+- **Reference validation sends model sources by digest.** The Composer sends
+  `model_source_closure_digest` instead of the full model-source closure when
+  Headless holds the prepared candidate (request
+  `manyforge.program_reference_validation_request.v3`, exactly one of the two
+  fields); Headless refuses an unknown digest with `model_sources_unknown` and
+  the Composer resends the full closure once.
+- **An emergency stop is a normal event on UFACTORY machines.** Load (Prepare)
+  only connects, works with the e-stop pressed, and leaves the latched
+  controller error (C1–C3) as reported: a stop that gates motion, not a fault.
+  Clearing it is explicit: Recover the machine, or Enable the arm. Enable is
+  refused with `robot_estop_active` while the e-stop stays pressed, and a
+  member's Enable or Reset position with `owner_estop_active` while its machine
+  is stopped. **Enable all** recovers a stopped machine first and prepares what
+  is not prepared. See
+  [Troubleshooting](docs/operations/TROUBLESHOOTING.md).
+- **Speed changes apply to motion already running.** A new speed value goes
+  straight to the joint trajectory controller's speed scaling input with a
+  rate-limited ramp; the motion's time limit follows the applied speed.
+- **Grippers on `parallel_gripper_action_controller`** (ros2_controllers). A
+  command completes on its action result, not on feedback.
+- **ROS 2 Lyrical built from source** (sync 2026-10-05) in the workbench image,
+  with ros2_controllers 6.10.1 and ros2_control_cmake 1.0.0; the UFACTORY
+  driver is pinned to the fork commit `3654c9a`.
+- **AI assistant panel** restored to the 0.1.0 layout as a dock: conversation
+  with Draft-change summaries, the model in use, orientation fields and tool
+  calls; it stays open beside the 3D view and keeps the conversation when
+  closed.
+- **The node catalog documents every node.** Each entry says what it does and
+  when it completes or fails; every parameter and every value type
+  (`schema_types`) has a description. Parameters and type properties accept
+  `description`; a catalog test fails when one is missing.
+- **The AI assistant sees nodes through the catalog.** It may author every
+  stable node whose capabilities the active Deployment offers (the palette's
+  nodes; no per-mode node list). Headless builds the node and tool
+  descriptors from the loaded catalog at startup; the stored
+  `assistant_instrument_registry_source.v1.json`, its generator and the
+  profile `nodes` list are gone. The prompt lists `id: summary` per node; the
+  tree tools take one generic node shape and are a few KB instead of about
+  60 KB each; `catalog_read` returns full descriptions, parameters and the
+  value types they use.
+- **The assistant's input is generated and concise.** The system prompt is
+  rules, the cell, an outline of the Draft and the nodes by category (about
+  2k tokens instead of about 20k with the full Draft JSON); tools are
+  top-level (about 13 KB instead of 45 KB) and name their argument types,
+  which `catalog_read` resolves; `program_read` reads one subtree by
+  `instance_id`; edit results show `{ok, changed, diagnostics_new, diagnostics_other}` (diagnostics this edit caused, and the count already open). The bridge
+  checks shapes and types only: an incomplete node is a Draft diagnostic, as
+  in the GUI.
+- **The assistant sees the cell's real ids and rules.** Composer runs one reference validation per assistant request; the prompt lists each component's targets, frames, input and output signals and mount, and the Deployment's interrupt rules, from the candidate's selector facts, which gain `rules` (`rule_id`, `scope`, `on_trip`, `active_at_start`, `condition`).
+- **Assistant edits report reference diagnostics.** A committed assistant edit returns `referenceDiagnostics` from the same reference validator as the GUI (OD-28); the model sees the new ones in `diagnostics_new` and counts the open ones, including those open at the request's start.
+- **Assistant argument errors name the field.** A rejected call gives
+  `assistant_tool_arguments_invalid` listing every error with its field path
+  and expected shape, e.g. `node.parameters.position: expected
+  coordinate_position {…}`. Argument text that is not valid JSON quotes where
+  it breaks (or the trailing text to remove); a placeholder such as `""` or
+  `"null"` for an optional id says to omit it; a type name in
+  `catalog_read entry_ids` points to `types`; `@root` given while the Draft
+  has no single root node names the top-level nodes.
+- **Stuck-loop recovery** (mode setting `stuck_loop_recovery`, default on):
+  the second same-class failure of a tool adds a typed `recovery` hint to the
+  tool result; the fifth ends the request with a clarification.
+- **Node catalog matches what the nodes do:** `io.wait_for_input` `edge`
+  offers only `level`; `assistant.build_scene_selection` offers only
+  `image_source: none` and no longer lists the unused `image_snapshot_*`
+  parameters; `assistant.query_model` `timeout_s` has no catalog default, so
+  an omitted value uses the endpoint's `default_timeout_s`; `timer` declares
+  its failure outcome (`input_unavailable`); the pick synthesis and motion
+  option types carry their defaults (catalog schemas accept `default`).
+- **The gripper node owns its completion deadline.** `gripper.command_position`
+  fails with `gripper_result_timeout` when the gripper has not reported done
+  `completion_timeout_s` after `command_duration_s` (pneumatic: after the
+  delivery alone). The default is 5 s (was 30 s, never enforced);
+  `tool_completion_timeout_s` of the Pick and Place planning nodes follows the
+  same rule. The component lane key `gripper_result_timeout_s` is removed; the
+  Robotiq example Programs set 15 s.
+- The unused gripper target key `delivery_result_timeout_s` is removed from
+  Deployments; a Deployment that still sets it is refused.
+- **Assistant nodes need a usable model query.** `assistant.query_model`,
+  `assistant.build_scene_selection` and `assistant.validate_scene_selection`
+  require the new cell capability `assistant.model.query`, offered when the
+  Deployment's assistant settings have a model endpoint and at least one
+  prompt template. The palette, the AI assistant and Program validation
+  derive it like any other capability; the palette reason
+  `model_not_configured` is replaced by `capability_not_offered`.
+- Retained assistant settings are `manyforge.retained_assistant.v2`; a
+  Deployment applied by an earlier build is refused until it is loaded again.
+- **A robot's lane row declares `runtime_scale: supported | unsupported`**
+  (required in every robot `lanes.<lane>` row; a tool row has none): whether
+  its adapter's arm controller accepts runtime speed scaling. The arm's
+  runtime-scale qualification in the Deployment follows the declaration, and
+  so does the lane's speed scaling. Load refuses with
+  `component_runtime_scale_mismatch` when the declaration differs from the
+  generated arm controller (only a position-only JointTrajectoryController
+  accepts speed scaling). The Mock, Isaac and xArm rows declare `supported`;
+  behaviour is unchanged.
+
+- Reference validation reuses its prepared candidate while the Deployment and
+  its model sources are unchanged (one cached candidate, replaced on change),
+  so a Program edit re-runs only the reference checks.
+- **Native builds run before the workbench starts, not inside its startup
+  timeout.** `scripts/compose-dev.sh start` (workbench and operator runtime)
+  first runs `python3 scripts/dev-workbench.py build` in the workbench image;
+  `MANYFORGE_DEV_START_TIMEOUT_SECONDS` then bounds readiness only.
+  `compose-dev.sh build-native` runs that step alone; the Isaac operator runs
+  it as its own call (45 min bound) before start. `serve` no longer builds: it
+  refuses with the build step to run when a native artifact is missing. Apply
+  and Load never build.
+- **Assistant Draft refusals keep their typed code.** A refused assistant
+  Draft call's `validation_error` result carries `detail.code` (for example
+  `draft_arguments_invalid`, or `assistant_callback_arguments_invalid` for
+  Composer's schema check). The model's tool result shows that code, and
+  stuck-loop recovery counts repeats per code instead of per
+  `validation_error`.
+- **The assistant prompt's Draft outline lists contact policies** (`id: mode`,
+  each zone's body pairs and its maximum penetration or release evidence), so
+  the model no longer needs `program_read` to see them.
+
+### Removed
+
+- **The launcher-started assistant bridge**: the workbench and the operator
+  launcher no longer start it, port 8100 is no longer used, and Composer's
+  `--assistant-bridge-url`, `MANYFORGE_ASSISTANT_BRIDGE_HOST`/`_PORT`,
+  `components.assistant_bridge` in Composer's `/api/health` and the
+  `direct`/`nemoclaw` provider kinds are gone.
+- **`manyforge_assistant_bridge/supervisor.py`**, the unused availability
+  reducer of the superseded assistant supervisor.
+- **The `kernel.set_runtime_scale` Program node** and its capability
+  `execution.runtime_scale.operation_scoped`. The speed control in the GUI
+  (runtime scale control) is unchanged.
+- **The `.fixed_scale` component-type variants.** Each robot and tool has one
+  component type, `<model>.component`; the compiler selects it directly.
+- **The operation-scoped speed command `set_operation_runtime_scale`**
+  (execution host, Headless and Program Runner clients, Kernel
+  `set_runtime_scale`). Speed changes go through runtime scale control.
+
+### Fixed
+- The operator launcher creates its state directories owner-only, so it no
+  longer refuses a directory it created itself on hosts whose umask is 0002.
+- Program reference validation works in the workbench and the operator
+  runtime: the launcher builds the Core Python module that Headless uses for
+  it, and Headless accepts candidate-sized reference-validation requests (the
+  Deployment's model sources made them exceed the standard body bound).
+
+- Every AI assistant request failed with `assistant_projection_stale`; scene
+  tools offered stale frame references.
+- Experimental constrained regeneration (`constrained_regeneration`): an
+  upstream failure of the regeneration call (e.g. vLLM refusing an oversized
+  grammar with HTTP 400, or a timeout) no longer ends the request; the
+  original call and its error stand. A node without a known `node_id` and
+  further children use a compact generic node shape, and container children
+  carry no item bound in the grammar (the validator still enforces it), so
+  the grammar stays small.
+
 ## 0.2.0 – 2026-11-02
 
 0.2.0 rebuilds how a cell is modelled and run: every lane runs on ROS 2 with

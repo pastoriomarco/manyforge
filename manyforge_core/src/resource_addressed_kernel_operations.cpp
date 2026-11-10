@@ -674,11 +674,6 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                     [&](const StopReplayEntry& entry) {
                       return entry.request_id() == intent.request_context.request_id;
                     }) ||
-        std::any_of(runtime_scale_replay_ledger_.begin(), runtime_scale_replay_ledger_.end(),
-                    [&](const RuntimeScaleReplayEntry& entry) {
-                      return entry.request.request_context.request_id ==
-                             intent.request_context.request_id;
-                    }) ||
         std::any_of(runtime_scale_control_replay_ledger_.begin(),
                     runtime_scale_control_replay_ledger_.end(),
                     [&](const RuntimeScaleControlReplayEntry& entry) {
@@ -1237,11 +1232,6 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
         std::any_of(stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
                     [&](const StopReplayEntry& entry) {
                       return entry.request_id() == intent.request_context.request_id;
-                    }) ||
-        std::any_of(runtime_scale_replay_ledger_.begin(), runtime_scale_replay_ledger_.end(),
-                    [&](const RuntimeScaleReplayEntry& entry) {
-                      return entry.request.request_context.request_id ==
-                             intent.request_context.request_id;
                     }) ||
         std::any_of(runtime_scale_control_replay_ledger_.begin(),
                     runtime_scale_control_replay_ledger_.end(),
@@ -2057,11 +2047,6 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
                     [&](const StopReplayEntry& entry) {
                       return entry.request_id() == intent.request_context.request_id;
                     }) ||
-        std::any_of(runtime_scale_replay_ledger_.begin(), runtime_scale_replay_ledger_.end(),
-                    [&](const RuntimeScaleReplayEntry& entry) {
-                      return entry.request.request_context.request_id ==
-                             intent.request_context.request_id;
-                    }) ||
         std::any_of(runtime_scale_control_replay_ledger_.begin(),
                     runtime_scale_control_replay_ledger_.end(),
                     [&](const RuntimeScaleControlReplayEntry& entry) {
@@ -2460,11 +2445,6 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
     if (std::any_of(stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
                     [&](const StopReplayEntry& entry) {
                       return entry.request_id() == request.request_context.request_id;
-                    }) ||
-        std::any_of(runtime_scale_replay_ledger_.begin(), runtime_scale_replay_ledger_.end(),
-                    [&](const RuntimeScaleReplayEntry& entry) {
-                      return entry.request.request_context.request_id ==
-                             request.request_context.request_id;
                     }) ||
         std::any_of(runtime_scale_control_replay_ledger_.begin(),
                     runtime_scale_control_replay_ledger_.end(),
@@ -4489,14 +4469,8 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::recognized_malformed_s
   return accept_stop(EmergencyStopProjectedIntentDTO{std::monostate{}}, nullptr, &ingress);
 }
 
-Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_scale(
-    const RuntimeScaleRequestDTO& request) {
-  return set_runtime_scale_impl(request, true);
-}
-
 Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_scale_impl(
-    const RuntimeScaleRequestDTO& request, const bool retain_public_replay,
-    std::uint64_t value_sequence) {
+    const RuntimeScaleRequestDTO& request, const std::uint64_t value_sequence) {
   if (request.request_context.request_id.empty() ||
       request.request_context.request_owner_epoch.empty() ||
       request.request_context.source_label.empty() || request.operation_id.empty() ||
@@ -4531,23 +4505,6 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
       return Result<RuntimeScaleAcceptedDTO>::Err(
           error("request_id_conflict", "runtime-scale request ID is retained by emergency Stop",
                 "request_id_conflict"));
-    }
-    if (retain_public_replay) {
-      const auto replay = std::find_if(
-          runtime_scale_replay_ledger_.begin(), runtime_scale_replay_ledger_.end(),
-          [&](const RuntimeScaleReplayEntry& entry) {
-            return entry.request.request_context.request_id == request.request_context.request_id;
-          });
-      if (replay != runtime_scale_replay_ledger_.end()) {
-        if (replay->request != request) {
-          return Result<RuntimeScaleAcceptedDTO>::Err(error(
-              "request_id_conflict", "runtime-scale request ID was reused with different intent",
-              "request_id_conflict"));
-        }
-        auto replayed = replay->accepted;
-        replayed.replay_status = RequestReplayStatusDTO::kReplayedExact;
-        return Result<RuntimeScaleAcceptedDTO>::Ok(std::move(replayed));
-      }
     }
     const auto request_id = request.request_context.request_id;
     const bool used_elsewhere =
@@ -4633,7 +4590,6 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
     }
 
     const RuntimeScaleGeneration next_generation(current_generation.value() + 1U);
-    if (value_sequence == 0U) value_sequence = next_runtime_scale_value_sequence();
     accepted = RuntimeScaleAcceptedDTO{request.request_context.request_id,
                                        RequestReplayStatusDTO::kAcceptedNew,
                                        request.operation_id,
@@ -4668,12 +4624,6 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
           "runtime_scale_accepted", durable_acceptance.error(), &accepted_state,
           request.request_context.request_id);
       return Result<RuntimeScaleAcceptedDTO>::Err(durable_acceptance.error());
-    }
-    if (retain_public_replay) {
-      std::erase_if(runtime_scale_replay_ledger_, [&](const RuntimeScaleReplayEntry& entry) {
-        return entry.accepted.operation_id == request.operation_id;
-      });
-      runtime_scale_replay_ledger_.push_back(RuntimeScaleReplayEntry{request, accepted});
     }
     active_operation = find_active_operation_locked(request.operation_id);
     if (active_operation == nullptr ||
@@ -4874,11 +4824,7 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
                     }) ||
         std::any_of(
             stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-            [&](const StopReplayEntry& entry) { return entry.request_id() == request_id; }) ||
-        std::any_of(runtime_scale_replay_ledger_.begin(), runtime_scale_replay_ledger_.end(),
-                    [&](const RuntimeScaleReplayEntry& entry) {
-                      return entry.request.request_context.request_id == request_id;
-                    });
+            [&](const StopReplayEntry& entry) { return entry.request_id() == request_id; });
     if (used_elsewhere) {
       return Result<RuntimeScaleControlAcceptedDTO>::Err(
           error("request_id_conflict",
@@ -5131,7 +5077,7 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
   // applicable; the retained setting is still authoritative.
   std::optional<RuntimeScaleAcceptedDTO> only_live_acceptance;
   for (auto& exact : live_requests) {
-    auto applied = set_runtime_scale_impl(exact, false, value_sequence);
+    auto applied = set_runtime_scale_impl(exact, value_sequence);
     if (applied.ok() && live_requests.size() == 1U)
       only_live_acceptance = std::move(applied.value());
   }

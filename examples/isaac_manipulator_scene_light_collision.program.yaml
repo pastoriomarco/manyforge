@@ -1,6 +1,6 @@
 api_version: manyforge.program.v3
 program_id: isaac_manipulator_scene_light_collision
-program_revision: sha256:344c6818f6a32e44260f31be9128f0c1833efaed1cdd71a0277dddeacd65642d
+program_revision: sha256:865d9a81f783fbbb864b81daf2cb16e17f70d29b217932bf64fb8eef47604b18
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light_collision
 description: Retained Isaac UR10e runtime-collision scenario. It starts from the exact light-scene geometry,
@@ -237,6 +237,7 @@ tree:
       - node_id: gripper.command_position
         instance_id: open_gripper_start
         parameters:
+          completion_timeout_s: 15.0
           target:
             component_id: robotiq_2f_140
             command_target_id: gripper

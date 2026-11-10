@@ -15,7 +15,7 @@ const arm: CandidateTarget = { component_id: 'arm', command_target_id: 'motion' 
 const peer: CandidateTarget = { component_id: 'peer', command_target_id: 'motion' };
 
 const facts: ReferenceSelectorFacts = {
-  components: [], targets: [], signals: [],
+  components: [], targets: [], signals: [], rules: [],
   frames: [
     { reference: { component_id: 'arm', frame_id: 'base' }, ambiguous: false, moving_targets: [arm] },
     { reference: { component_id: 'tool', frame_id: 'tcp' }, ambiguous: false, moving_targets: [arm] },

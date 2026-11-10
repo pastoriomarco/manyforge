@@ -83,6 +83,33 @@ const sensor: ComponentCatalogEntry = {
   components: [sensorRow],
 };
 
+const assistantRow = {
+  component_id: 'assistant',
+  component_profile_id: 'manyforge.assistant',
+  target_settings: {},
+  configuration: { runtime_kind: 'assistant', runtime_configuration: {} },
+};
+
+const assistant: ComponentCatalogEntry = {
+  entryId: 'model/manyforge.assistant',
+  kind: 'assistant',
+  componentId: 'assistant',
+  componentProfileId: 'manyforge.assistant',
+  modelFamilyId: null,
+  tags: [],
+  lane: null,
+  description: 'AI assistant (Composer chat bridge)',
+  sources: ['components/assistant/manyforge.assistant/component.yaml'],
+  components: [assistantRow],
+};
+
+const aiModelRow = (componentId: string) => ({
+  component_id: componentId,
+  component_profile_id: 'ai_model_v0',
+  target_settings: {},
+  configuration: { runtime_kind: 'ai_model', runtime_configuration: { base_url: 'http://127.0.0.1:8000/v1', model: 'm' } },
+});
+
 const mountRow = (robotId: string, toolId: string) => ({
   parent: { component_id: robotId, interface: 'flange' },
   child: { component_id: toolId, interface: 'mount' },
@@ -91,7 +118,7 @@ const mountRow = (robotId: string, toolId: string) => ({
 const catalog: ComponentCatalog = {
   schemaVersion: 'manyforge.composer_component_catalog.v1',
   projectRoot: '/projects/cell.scenario',
-  entries: [robot, tool, sensor],
+  entries: [robot, tool, sensor, assistant],
   machines: [{
     modelId: 'ufactory.lite6_machine', title: 'UFactory Lite 6', lanes: ['mock', 'real'],
     defaultOwnerId: 'lite6',
@@ -218,6 +245,43 @@ describe('Add component', () => {
       }], []);
       expect(mounted.onAdded).toHaveBeenCalledExactlyOnceWith('pointcloud_source');
     } finally { await mounted.unmount(); }
+  });
+
+  it('adds the AI assistant with the only AI model and the default chat profile; refuses without an AI model', async () => {
+    const none = await mount([]);
+    try {
+      await none.click('Add component');
+      await none.kind('AI assistant');
+      await none.pick();
+      await none.click('Add to Draft');
+      expect(none.controller.addComponents).not.toHaveBeenCalled();
+      expect(alerts(none.all)).toEqual(['Add an AI model component first.']);
+    } finally { await none.unmount(); }
+    const one = await mount([aiModelRow('assistant_model')]);
+    try {
+      await one.click('Add component');
+      await one.kind('AI assistant');
+      await one.pick();
+      await one.click('Add to Draft');
+      expect(one.controller.addComponents).toHaveBeenCalledExactlyOnceWith([{
+        ...assistantRow,
+        configuration: { runtime_kind: 'assistant', runtime_configuration: {
+          model_component_id: 'assistant_model', assistant_profile_id: 'assistant_scene_authoring' } },
+      }], []);
+    } finally { await one.unmount(); }
+    // Several AI models: the model is chosen on the assistant's page.
+    const two = await mount([aiModelRow('chat_model'), aiModelRow('selection_model')]);
+    try {
+      await two.click('Add component');
+      await two.kind('AI assistant');
+      await two.pick();
+      await two.click('Add to Draft');
+      expect(two.controller.addComponents).toHaveBeenCalledExactlyOnceWith([{
+        ...assistantRow,
+        configuration: { runtime_kind: 'assistant',
+          runtime_configuration: { assistant_profile_id: 'assistant_scene_authoring' } },
+      }], []);
+    } finally { await two.unmount(); }
   });
 
   it('adds a catalog robot to the Draft with one edit and opens its page', async () => {

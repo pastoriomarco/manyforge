@@ -135,6 +135,18 @@ class NodeInputError(ProgramValueError):
         self.details = details
 
 
+# A velocity or acceleration scale read from a value source is above the
+# Program parameter of the same name, its ceiling (decision Q1.2-b).
+MOTION_VALUE_ABOVE_PROGRAM_LIMIT = "motion_value_above_program_limit"
+_PROGRAM_MOTION_CEILINGS = frozenset({"velocity_scale", "acceleration_scale"})
+
+
+class MotionLimitInputError(NodeInputError):
+    """A dynamic speed scale exceeds its Program ceiling; never clamped."""
+
+    reason_code = MOTION_VALUE_ABOVE_PROGRAM_LIMIT
+
+
 class ExpressionEvaluationError(ProgramValueError):
     """An expression could not be evaluated from the attempt's snapshot."""
 
@@ -194,8 +206,8 @@ RESTORED_VALUE_INVALID = "value_invalid"
 def input_failure_reason(error: Exception) -> str:
     """The node failure reason for an input that could not be resolved."""
 
-    if isinstance(error, ExpressionEvaluationError):
-        return ExpressionEvaluationError.reason_code
+    if isinstance(error, (ExpressionEvaluationError, NodeInputError)):
+        return error.reason_code
     return NODE_INPUT_UNAVAILABLE
 
 
@@ -1496,6 +1508,22 @@ class NodeAttemptInputResolver:
                         str(exc), INPUT_INVALID, parameter_id, *origin(parameter_id),
                         frame_error=exc if isinstance(exc, ProgramFrameReferenceError) else None,
                     ) from exc
+        # A sourced speed scale (in range, checked above) may not exceed the
+        # Program parameter of the same name: refused, never clamped.
+        for parameter_id in sorted(_PROGRAM_MOTION_CEILINGS & set(value_sources)):
+            ceiling = program_parameters.get(parameter_id)
+            if ceiling is not None and float(resolved[parameter_id]) > float(ceiling):
+                kind, reference = origin(parameter_id)
+                raise MotionLimitInputError(
+                    f"{parameter_id}={float(resolved[parameter_id]):g} exceeds "
+                    f"Program {parameter_id}={float(ceiling):g}",
+                    details=input_failure_details(
+                        input_problem=INPUT_INVALID,
+                        path=parameter_id,
+                        source_kind=kind,
+                        source_reference=reference,
+                    ),
+                )
         declared_blackboard = {
             parameter_id: _copy_runtime_value(blackboard_snapshot[resolved[parameter_id]])
             for parameter_id in blackboard_read_parameters
@@ -1519,6 +1547,8 @@ __all__ = [
     "ExpressionEvaluationError",
     "INPUT_INVALID",
     "INPUT_MISSING",
+    "MOTION_VALUE_ABOVE_PROGRAM_LIMIT",
+    "MotionLimitInputError",
     "NODE_INPUT_UNAVAILABLE",
     "ProgramValueUncertainError",
     "NodeAttemptInputResolver",

@@ -393,6 +393,26 @@ struct DomainActiveControlConfigurationDTO final {
                          const DomainActiveControlConfigurationDTO&) = default;
 };
 
+/// The predecessor rows an Apply fence pins: at most one valid row per
+/// controller-predecessor domain of `scope`, in scope order. A domain with no
+/// reconciled active configuration (its component was never Enabled, or was
+/// Disabled) has no row; the execution owner decides which domains those are.
+[[nodiscard]] inline bool PredecessorConfigurationRowsValid(
+    const ConfigurationFenceScopeDTO& scope,
+    const std::vector<DomainActiveControlConfigurationDTO>& rows) noexcept {
+  std::size_t index = 0U;
+  for (const auto& domain : scope.domains) {
+    if (!domain.has_controller_predecessor() || index >= rows.size() ||
+        rows[index].control_domain_id != domain.control_domain_id) {
+      continue;
+    }
+    if (!rows[index++].valid()) {
+      return false;
+    }
+  }
+  return index == rows.size();
+}
+
 /// Apply-specific projection of the generic configuration-fence intent.
 ///
 /// The generic `ConfigurationFenceIntentDTO` name remains reserved for spec
@@ -415,13 +435,7 @@ struct ApplyConfigurationFenceIntentDTO final {
         owner_request_context.request_owner_epoch.empty() ||
         owner_request_context.source_label.empty() || !owner_transaction.valid() ||
         !scope.valid() || !IsKnownApplyFenceBusyDisposition(busy_disposition) ||
-        expected_retained_bundle_id.empty() || expected_graph_revision.empty() || reason.empty() ||
-        expected_active_control_configurations.size() !=
-            static_cast<std::size_t>(
-                std::count_if(scope.domains.begin(), scope.domains.end(),
-                              [](const ConfigurationFenceDomainScopeDTO& domain) {
-                                return domain.has_controller_predecessor();
-                              }))) {
+        expected_retained_bundle_id.empty() || expected_graph_revision.empty() || reason.empty()) {
       return false;
     }
 
@@ -440,17 +454,7 @@ struct ApplyConfigurationFenceIntentDTO final {
       return false;
     }
 
-    std::size_t configuration_index = 0U;
-    for (const auto& domain : scope.domains) {
-      if (!domain.has_controller_predecessor()) {
-        continue;
-      }
-      const auto& configuration = expected_active_control_configurations[configuration_index++];
-      if (!configuration.valid() || configuration.control_domain_id != domain.control_domain_id) {
-        return false;
-      }
-    }
-    return true;
+    return PredecessorConfigurationRowsValid(scope, expected_active_control_configurations);
   }
 
   friend bool operator==(const ApplyConfigurationFenceIntentDTO&,
@@ -561,20 +565,8 @@ struct ConfigurationFenceAdmissionSnapshotDTO final {
       return false;
     }
 
-    std::size_t configuration_index = 0U;
-    for (const auto& domain : echoed_query.affected_scope.domains) {
-      if (!domain.has_controller_predecessor()) {
-        continue;
-      }
-      if (configuration_index >= active_control_configurations.size()) {
-        return false;
-      }
-      const auto& configuration = active_control_configurations[configuration_index++];
-      if (!configuration.valid() || configuration.control_domain_id != domain.control_domain_id) {
-        return false;
-      }
-    }
-    return configuration_index == active_control_configurations.size();
+    return PredecessorConfigurationRowsValid(echoed_query.affected_scope,
+                                             active_control_configurations);
   }
 
   [[nodiscard]] bool matches(const ConfigurationFenceAdmissionQueryDTO& query) const noexcept {

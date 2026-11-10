@@ -39,5 +39,4 @@ lanes:                            # the Mock lane's simulated fingers
     controller: <TODO>              # the parallel gripper action controller name, e.g. acme_gripper_controller
     controllers_file: mock_controllers.yaml   # in this folder
     hard_stop_completion_timeout_s: 1.5
-    gripper_result_timeout_s: 5.0
     gripper_stop_finish_tolerance: <TODO>   # finger position units; ~5% of the stroke: a Stop this close lets the command finish

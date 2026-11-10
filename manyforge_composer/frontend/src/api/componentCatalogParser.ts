@@ -21,7 +21,7 @@ import {
   vector3At,
 } from './parsers/shared';
 
-const KINDS: readonly ComponentCatalogKind[] = ['robot', 'tool', 'io_device', 'pose_source', 'ai_model', 'sensor'];
+const KINDS: readonly ComponentCatalogKind[] = ['robot', 'tool', 'io_device', 'pose_source', 'ai_model', 'sensor', 'assistant'];
 
 function strings(value: unknown, path: string): string[] {
   return arrayAt(value, path).map((item, index) => stringAt(item, `${path}[${index}]`));

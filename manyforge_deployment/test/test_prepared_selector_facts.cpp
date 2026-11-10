@@ -119,6 +119,37 @@ TEST(PreparedSelectorFacts, IncludesComponentAliasesAndOwnedModelIds) {
       check_body({*body.owner_component_id, body.collision_body_role_id});
 }
 
+TEST(PreparedSelectorFacts, ProjectsDeploymentInterruptRulesAndSignalDirections) {
+  TemporaryRoot root;
+  const auto candidate = deployment::test::MaterializeMaintainedInterruptDeployment(
+      root.path, V(V::Object{}), "examples/mock_lite6_light_curtain_rule.scenario");
+  const auto facts = deployment::detail::prepared_selector_facts(candidate);
+  const auto* rules = facts.find_object_member("rules");
+  ASSERT_NE(rules, nullptr);
+  ASSERT_EQ(rules->as_array().size(), 1U);
+  const auto& rule = rules->as_array().front();
+  ASSERT_EQ(rule.as_object().size(), 5U);
+  EXPECT_EQ(rule.find_object_member("rule_id")->as_string(), "light_curtain");
+  EXPECT_EQ(rule.find_object_member("scope")->as_string(), "all_motion");
+  EXPECT_EQ(rule.find_object_member("on_trip")->as_string(), "stop");
+  EXPECT_TRUE(rule.find_object_member("active_at_start")->as_bool());
+  const auto* compare = rule.find_object_member("condition")->find_object_member("compare");
+  ASSERT_NE(compare, nullptr);
+  EXPECT_TRUE(compare->find_object_member("value")->as_bool());
+
+  const auto* signal = FindRow(facts.find_object_member("signals")->as_array(), "station_io",
+                               "signal_name", "curtain_blocked");
+  ASSERT_NE(signal, nullptr);
+  EXPECT_EQ(signal->find_object_member("direction")->as_string(), "input");
+  EXPECT_EQ(signal->find_object_member("value_type")->as_string(), "bool");
+
+  TemporaryRoot empty_root;
+  const auto empty = deployment::test::MaterializeMaintainedInterruptDeployment(
+      empty_root.path, deployment::parse_strict_json_model_yaml(R"({"interrupt_rules":[]})").root(),
+      "examples/mock_lite6_light_curtain_rule.scenario");
+  EXPECT_TRUE(deployment::detail::prepared_selector_facts(empty).find_object_member("rules")->as_array().empty());
+}
+
 TEST(PreparedSelectorFacts, DefaultTcpUsesDeclaredAliasFromQualifiedTarget) {
   TemporaryRoot root;
   const auto fixture = deployment::test::materialize_lite6_retained_consumer_fixture_from(

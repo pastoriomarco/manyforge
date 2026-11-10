@@ -6,13 +6,13 @@
   },
   "description": "Mock Lite6 example of a lost part: set part_lost by hand while the Program runs to see the scoped global gate close and the Program recover.",
   "members": {
-    "deployment.yaml": "sha256:9538e44a355d2c37cbc3f2e111155901da297e04c11b259ca36a40dcaf696a2d",
+    "deployment.yaml": "sha256:f0ea4a043f810b9edc4cc318b8675d15c3151072e1fc0d52608897e8ac055451",
     "program.yaml": "sha256:9bf68631c06a5f6ee854a9dbab8085e026041656235efba930ce40247c0e5dbf"
   },
   "name": "mock_lite6_part_lost_recovery",
   "saved_status": {
-    "checked_content_digest": "sha256:ba6d8bbad4ffc3270656d454c53f68012c243ddd1b62d859cb8f593096337883",
-    "last_known_status": "ready",
+    "checked_content_digest": "sha256:5aa81be998fb96c950d8fc66912d6bcbad0f6f6ce49bce1a1de66b4b2fb93800",
+    "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },
   "scenario_id": "mock_lite6_part_lost_recovery",

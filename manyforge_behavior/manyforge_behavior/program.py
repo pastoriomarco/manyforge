@@ -4541,7 +4541,14 @@ def _validate_node_cross_fields(
             )
     position = parameters.get("position")
     effort = parameters.get("max_effort")
-    if type(position) is dict and type(effort) is dict:
+    # A named preset takes the gripper's own coordinate kind from its facts at
+    # run time; the kernel refuses an effort of the other kind there
+    # (gripper_command_effort_unit_mismatch), so only numeric pairs are checked here.
+    if (
+        type(position) is dict
+        and type(effort) is dict
+        and position.get("kind") != "named_preset"
+    ):
         compatible = {
             "angular_rad": "angular_newton_meter",
             "linear_m": "linear_newton",
@@ -4812,17 +4819,14 @@ def _validate_program_tree_node(
                     f"{path}.parameters.{parameter_id}",
                     f"must not exceed Program {parameter_id}={float(ceiling):g}",
                 )
-            if parameter_id not in value_sources:
-                continue
-        source = value_sources.get(parameter_id)
-        if source != {
-            "kind": "program_parameter",
-            "reference": parameter_id,
-        }:
+        elif parameter_id not in value_sources:
             _program_error(
                 f"{path}.value_sources.{parameter_id}",
-                f"must default to the Program {parameter_id} parameter",
+                f"must be set or inherit the Program {parameter_id} parameter",
             )
+        # Any typed value source is accepted (decision Q1.2-b); a dynamic
+        # value is checked against its range and the Program ceiling when
+        # the move resolves it (`orchestration_values`).
 
     _validate_node_capabilities(entry, parameters, path=path, context=context)
     _validate_catalog_blackboard_bindings(entry, parameters, path=path, context=context)

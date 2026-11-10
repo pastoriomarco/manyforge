@@ -2037,25 +2037,6 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     decoded.io_output_manual = origin == "manual";
     return decoded;
   }
-  if (command == "set_operation_runtime_scale") {
-    RequireExactObjectSize(root, 4U, "operation runtime-scale command");
-    const auto &value = Member(root, "request");
-    RequireExactObjectSize(value, 5U, "operation runtime-scale request");
-    const double scale = Number(value, "scale");
-    Require(scale > 0.0 && scale <= 1.0,
-            "node runtime scale must be in (0, 1]");
-    Command decoded{CommandKind::kSetOperationRuntimeScale};
-    decoded.operation_runtime_scale = core::RuntimeScaleRequestDTO{
-        DecodeRequestContext(Member(value, "request_context")),
-        core::OperationId(Text(value, "operation_id")),
-        core::OperationRevision(
-            Counter(value, "expected_operation_revision", 1U)),
-        core::RuntimeScaleGeneration(
-            Counter(value, "expected_runtime_scale_generation", 0U)),
-        scale,
-        DecodeRequestAttribution(Member(root, "attribution"))};
-    return decoded;
-  }
   if (command == "set_runtime_scale_control") {
     RequireExactObjectSize(root, 4U, "runtime-scale control command");
     const auto attribution =

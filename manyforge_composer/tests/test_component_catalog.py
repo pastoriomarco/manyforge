@@ -423,6 +423,40 @@ def test_sensor_entries_come_from_the_sensor_models() -> None:
     assert validate_deployment_intent(_intent([row]), source="sensor")["components"] == [row]
 
 
+def test_the_assistant_model_is_offered_like_a_sensor(monkeypatch) -> None:
+    path = "components/assistant/manyforge.assistant/component.yaml"
+    descriptor = {
+        "kind": "assistant",
+        "id": "manyforge.assistant",
+        "title": "AI assistant (Composer chat bridge)",
+        "adapter_row": {"adapter": "assistant", "backend": "local_process",
+                        "health_period_s": 1.0, "stream_budget_s": 5.0},
+    }
+    read = catalog_module._descriptor
+    monkeypatch.setattr(catalog_module, "_descriptor",
+                        lambda name: descriptor if name == path else read(name))
+    sources = json.loads(catalog_module._SOURCES.read_text(encoding="utf-8"))
+    sources["component_models"] = [
+        name for name in sources["component_models"] if name != path
+    ] + [path]
+
+    entries = catalog_module._lane_free_entries(sources)
+
+    assert [entry["kind"] for entry in entries] == ["sensor", "assistant"]
+    entry = entries[-1]
+    assert entry["entryId"] == "model/manyforge.assistant"
+    assert entry["componentId"] == "assistant"
+    assert entry["lane"] is None and entry["modelFamilyId"] is None
+    # No sensor defaults: the Add panel asks for the model and the profile.
+    assert entry["components"] == [{
+        "component_id": "assistant",
+        "component_profile_id": "manyforge.assistant",
+        "target_settings": {},
+        "configuration": {"runtime_kind": "assistant", "runtime_configuration": {}},
+    }]
+    assert _kind(entry["components"][0], []) == "assistant"
+
+
 def test_machine_rows_are_not_offered_alone_and_owner_is_not_followed() -> None:
     catalog = component_catalog(None)
     real = [

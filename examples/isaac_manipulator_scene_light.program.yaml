@@ -1,6 +1,6 @@
 api_version: manyforge.program.v3
 program_id: isaac_manipulator_scene_light
-program_revision: sha256:edaa9a8a73943cebc17404fd4c684050abcffaababba9d0d486a6e5518f8d581
+program_revision: sha256:5bd30172683f2ff305ee628a6cd5ad7342fa8ef13b21c1ea86a1dea8b9560831
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light
 description: Retained Isaac Sim light-scene pick-and-place Program for the UR10e and Robotiq 2F-140. It
@@ -179,6 +179,7 @@ tree:
   - node_id: gripper.command_position
     instance_id: open_gripper_start
     parameters:
+      completion_timeout_s: 15.0
       target:
         component_id: robotiq_2f_140
         command_target_id: gripper
@@ -273,6 +274,7 @@ tree:
     - node_id: gripper.command_position
       instance_id: close_gripper
       parameters:
+        completion_timeout_s: 15.0
         target:
           component_id: robotiq_2f_140
           command_target_id: gripper
@@ -435,6 +437,7 @@ tree:
     - node_id: gripper.command_position
       instance_id: open_gripper_release
       parameters:
+        completion_timeout_s: 15.0
         target:
           component_id: robotiq_2f_140
           command_target_id: gripper

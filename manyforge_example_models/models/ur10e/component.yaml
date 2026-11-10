@@ -33,13 +33,14 @@ lanes:
     adapter: mock
     controller: joint_trajectory_controller
     arrival_tolerance_rad: 0.01     # every arm joint's JTC goal
+    runtime_scale: supported        # the arm's controller accepts runtime speed scaling
     controllers_file: mock_controllers.yaml
     hard_stop_completion_timeout_s: 0.5
-    gripper_result_timeout_s: 15.0
   isaac:                          # Isaac lane adapter (manyforge_isaac_adapter/lane/README.md)
     adapter: isaac
     controller: isaac_arm_controller
     arrival_tolerance_rad: 0.1      # the working Isaac value (written as every arm joint's JTC `goal`)
+    runtime_scale: supported        # the arm's controller accepts runtime speed scaling
     goal_time_s: 1.0                # the working Isaac value (JTC `goal_time`)
     hard_stop_completion_timeout_s: 0.5
 defaults:

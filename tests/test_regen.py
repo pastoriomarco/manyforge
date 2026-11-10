@@ -28,8 +28,7 @@ def _module():
 def test_steps_run_in_dependency_order() -> None:
     names = [step.name for step in _module().STEPS]
     assert names.index("catalog-pin") < names.index("node-catalog")
-    assert names.index("node-catalog") < names.index("assistant-registry")
-    assert names.index("assistant-registry") < names.index("node-environment")
+    assert names.index("node-catalog") < names.index("node-environment")
     assert names.index("program-revisions") < names.index("maintained-occurrences")
     assert names.index("maintained-occurrences") < names.index("scenario-pins")
     assert names[-1] == "rest-contracts"

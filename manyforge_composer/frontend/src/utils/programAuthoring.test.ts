@@ -14,6 +14,7 @@ import {
   deriveProgramMotionConfiguration,
   nextProgramInstanceId,
   programDiagnosticNodeId,
+  programMotionDefaultRoles,
   programSemanticChoices,
   programSemanticExpectedAccess,
   programSemanticExpectedType,
@@ -291,7 +292,7 @@ describe('Program parameter binding continuity', () => {
     expect(programSemanticExpectedAccess(attach, 'on_grasp_lost')).toBe('read_write');
   });
 
-  it('derives motion settings from catalog-field bindings with arbitrary parameter names', () => {
+  it('binds each motion field to the Program parameter of the same name, per field', () => {
     const motionEntry: CatalogEntry = {
       ...entry,
       parameters: [
@@ -311,30 +312,16 @@ describe('Program parameter binding continuity', () => {
         content_version: '2.4.0',
       },
       parameters: [
-        { ...declaration, parameter_id: 'cycle_velocity', default: 0.35 },
         { ...declaration, parameter_id: 'cycle_acceleration', default: 0.7 },
-        { ...declaration, parameter_id: 'path_tolerance', default: 0.005 },
-        { ...declaration, parameter_id: 'path_blend', default: 0.01 },
+        { ...declaration, parameter_id: 'translation_tol_m', default: 0.005 },
+        { ...declaration, parameter_id: 'velocity_scale', default: 0.35 },
       ],
       schema_version: 'manyforge.composer_authoring_forest.v2',
       forest: [tree({
+        parameters: { translation_tol_m: 0.002 },
         value_sources: {
-          velocity_scale: {
-            kind: 'program_parameter',
-            reference: 'cycle_velocity',
-          },
-          acceleration_scale: {
-            kind: 'program_parameter',
-            reference: 'cycle_acceleration',
-          },
-          translation_tol_m: {
-            kind: 'program_parameter',
-            reference: 'path_tolerance',
-          },
-          blend_radius_m: {
-            kind: 'program_parameter',
-            reference: 'path_blend',
-          },
+          velocity_scale: { kind: 'program_parameter', reference: 'velocity_scale' },
+          acceleration_scale: { kind: 'program_parameter', reference: 'cycle_acceleration' },
         },
       })],
       positions: {},
@@ -344,22 +331,24 @@ describe('Program parameter binding continuity', () => {
       available: true,
       configuration: {
         bindings: {
-          velocity_scale: 'cycle_velocity',
-          acceleration_scale: 'cycle_acceleration',
-          translation_tol_m: 'path_tolerance',
-          blend_radius_m: 'path_blend',
+          velocity_scale: 'velocity_scale',
+          translation_tol_m: 'translation_tol_m',
         },
         values: {
           velocity_scale: 0.35,
-          acceleration_scale: 0.7,
           translation_tol_m: 0.005,
-          blend_radius_m: 0.01,
         },
         usageCounts: {
           velocity_scale: 1,
+          acceleration_scale: 0,
+          translation_tol_m: 0,
+          blend_radius_m: 0,
+        },
+        dynamicCounts: {
+          velocity_scale: 0,
           acceleration_scale: 1,
-          translation_tol_m: 1,
-          blend_radius_m: 1,
+          translation_tol_m: 0,
+          blend_radius_m: 0,
         },
         applicableCounts: {
           velocity_scale: 1,
@@ -371,22 +360,16 @@ describe('Program parameter binding continuity', () => {
     });
   });
 
-  it('reports a missing binding instead of inventing motion defaults', () => {
+  it('never treats a renamed parameter as a motion default', () => {
     const motionEntry: CatalogEntry = {
       ...entry,
-      parameters: [
-        parameter('velocity_scale', 'number'),
-        parameter('acceleration_scale', 'number'),
-        parameter('max_tcp_linear_speed_mps', 'number'),
-        parameter('translation_tol_m', 'number'),
-        parameter('blend_radius_m', 'number'),
-      ],
+      parameters: [parameter('velocity_scale', 'number')],
     };
     const program = {
       api_version: 'manyforge.program.v3',
-      program_id: 'incomplete_motion',
+      program_id: 'renamed_motion',
       program_profile: 'composable-cell-v1',
-      name: 'Incomplete motion',
+      name: 'Renamed motion',
       catalog: {
         api_version: 'manyforge.node_catalog.v3',
         content_version: '2.4.0',
@@ -401,10 +384,12 @@ describe('Program parameter binding continuity', () => {
       positions: {},
     } satisfies ProgramAuthoringDocument;
 
-    expect(deriveProgramMotionConfiguration(program, [motionEntry])).toEqual({
-      available: false,
-      reason: 'No acceleration_scale field is bound to a Program parameter.',
-    });
+    const result = deriveProgramMotionConfiguration(program, [motionEntry]);
+    expect(result.available).toBe(true);
+    if (!result.available) return;
+    expect(result.configuration.bindings).toEqual({});
+    expect(result.configuration.dynamicCounts.velocity_scale).toBe(1);
+    expect(programMotionDefaultRoles(result).size).toBe(0);
   });
 
   it('retains a declared Cartesian default when this Program has no Cartesian node', () => {

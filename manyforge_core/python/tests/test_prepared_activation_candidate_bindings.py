@@ -111,7 +111,7 @@ def test_real_candidate_selector_facts_are_stable_and_candidate_owned() -> None:
     first = candidate.selector_facts_json()
     assert candidate.selector_facts_json() == first
     facts = json.loads(first)
-    assert set(facts) == {"components", "targets", "signals", "frames", "bodies"}
+    assert set(facts) == {"components", "targets", "signals", "frames", "bodies", "rules"}
     assert all(isinstance(rows, list) for rows in facts.values())
     assert {row["component_id"] for row in facts["components"]} >= {"station"}
 

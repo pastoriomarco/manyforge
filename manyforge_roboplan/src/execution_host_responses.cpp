@@ -2767,6 +2767,13 @@ CanonicalValue ComponentStateValue(const core::ComponentState &state) {
                                                   {"value", CanonicalValue(detail.value)}});
     object.emplace_back("details", CanonicalValue(std::move(details)));
   }
+  if (!state.endpoints.empty()) {
+    CanonicalValue::Array endpoints;
+    for (const auto &endpoint : state.endpoints)
+      endpoints.emplace_back(CanonicalValue::Object{{"role_id", CanonicalValue(endpoint.role_id)},
+                                                    {"url", CanonicalValue(endpoint.url)}});
+    object.emplace_back("endpoints", CanonicalValue(std::move(endpoints)));
+  }
   if (state.action)
     object.emplace_back("action", CanonicalValue(CanonicalValue::Object{
                                       {"action", Text(core::to_string(state.action->action))},

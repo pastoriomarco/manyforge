@@ -97,5 +97,7 @@ def test_existing_health_path_preserves_notice_without_changing_readiness(tmp_pa
     actual = response.json()
     assert actual["workbench_session_notice"] == (value if visible else None)
     assert actual["status"] == ("ready" if mode == "headless_ready" else "degraded")
+    # The assistant is a Deployment component; health no longer reports a bridge.
+    assert "assistant_bridge" not in actual["components"]
     if mode == "headless_failed":
         assert actual["runtimeAvailability"]["code"] == "projection_unavailable"

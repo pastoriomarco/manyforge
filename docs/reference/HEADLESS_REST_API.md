@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-11-03 23:00:44 UTC
+  Last regenerated: 2026-11-09 11:41:10 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -27,7 +27,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/cell/latch` |  | Cell Latch |
 | `GET` | `/api/components` |  | Components |
 | `POST` | `/api/components/actions` |  | Component Group Action |
+| `POST` | `/api/components/recover-enable` |  | Component Recover Enable Group |
 | `POST` | `/api/components/{component_id}/actions` |  | Component Action |
+| `POST` | `/api/components/{component_id}/recover-enable` |  | Component Recover Enable |
+| `GET` | `/api/components/{component_id}/recover-enable/preflight` |  | Component Recovery Preflight |
 | `POST` | `/api/control/commands` |  | Execution Control Command |
 | `GET` | `/api/control/diagnostics` |  | Execution Control Diagnostics |
 | `GET` | `/api/control/state` |  | Execution Control Projection |
@@ -86,6 +89,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/authoring-transactions/recovery-receipt` |  | Recover Authoring Transaction |
 | `POST` | `/api/program/authoring-transactions/settle` |  | Settle Authoring Transaction |
 | `GET` | `/api/program/committed-activation` |  | Program Committed Activation |
+| `POST` | `/api/program/component-frame-lookup` |  | Lookup Component Frame |
 | `POST` | `/api/program/cycle/reset` |  | Program Cycle Reset |
 | `POST` | `/api/program/diagnostics` |  | Program Diagnostic |
 | `GET` | `/api/program/diagnostics/health` |  | Program Diagnostic Health |
@@ -95,6 +99,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/persistent-values/clear` |  | Clear Program Persistent Values |
 | `POST` | `/api/program/persistent-values/reset` |  | Reset Program Persistent Value |
 | `GET` | `/api/program/readiness` |  | Program Readiness |
+| `POST` | `/api/program/reference-validation` |  | Validate Program References |
 | `GET` | `/api/program/runs` |  | Program Runs |
 | `POST` | `/api/program/runs` |  | Program Run Start |
 | `GET` | `/api/program/runs/{program_run_id}` |  | Program Run Read |

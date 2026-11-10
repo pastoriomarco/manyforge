@@ -172,6 +172,15 @@ struct ComponentDetail final {
   friend bool operator==(const ComponentDetail&, const ComponentDetail&) = default;
 };
 
+/// One endpoint the component's adapter publishes (e.g. the assistant's
+/// `assistant_request` URL); `role_id` is the provider manifest's endpoint role.
+struct ComponentEndpoint final {
+  std::string role_id;
+  std::string url;
+
+  friend bool operator==(const ComponentEndpoint&, const ComponentEndpoint&) = default;
+};
+
 struct ComponentState final {
   std::string component_id;
   /// The machine (owner component) this component is a member
@@ -189,6 +198,9 @@ struct ComponentState final {
   std::optional<ActionResult> last_action;
   /// Adapter-reported, display only; no logic may read it.
   std::vector<ComponentDetail> details;
+  /// Adapter-published endpoints, present only while enabled; unlike
+  /// `details`, logic may read it.
+  std::vector<ComponentEndpoint> endpoints;
   std::int64_t observed_at_ns{};
   std::optional<ComponentStop> stop{};
 

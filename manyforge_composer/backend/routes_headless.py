@@ -83,6 +83,9 @@ from .source_model_client import (
     ActiveSourceModelProjectionError,
     read_active_source_model_context,
 )
+from .routes_assistant import (
+    require_no_assistant_turn as _require_no_assistant_turn,
+)
 from .state import ComposerState
 
 
@@ -460,6 +463,7 @@ def create_headless_router(
                     },
                 )
             _require_applied_authoring_drafts(state)
+            _require_no_assistant_turn(state)
             return client.program_run_start(body.model_dump(mode="json"))
 
         assert state.authoring_admission is not None
@@ -573,6 +577,7 @@ def create_headless_router(
         def submit():
             if _resumes_execution("execution_recovery", payload):
                 _require_applied_authoring_drafts(state)
+                _require_no_assistant_turn(state)
             return client.cycle_recovery_action(payload)
 
         assert state.authoring_admission is not None
@@ -643,6 +648,7 @@ def create_headless_router(
             )
         def submit():
             _require_applied_authoring_drafts(state)
+            _require_no_assistant_turn(state)
             return client.program_run_motion_start(
                 program_run_id, body.model_dump(mode="json")
             )
@@ -667,6 +673,7 @@ def create_headless_router(
             )
         def submit():
             _require_applied_authoring_drafts(state)
+            _require_no_assistant_turn(state)
             return client.program_run_motion_resume(
                 program_run_id, body.model_dump(mode="json")
             )
@@ -712,6 +719,7 @@ def create_headless_router(
             )
         def submit():
             _require_applied_authoring_drafts(state)
+            _require_no_assistant_turn(state)
             return client.program_run_resume_full_stop(
                 program_run_id, body.model_dump(mode="json")
             )
@@ -818,6 +826,7 @@ def create_headless_router(
         def submit():
             if start and _resumes_execution(kind, request.get("payload")):
                 _require_applied_authoring_drafts(state)
+                _require_no_assistant_turn(state)
             return client.submit_control_command(request)
 
         assert state.authoring_admission is not None

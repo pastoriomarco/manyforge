@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -17,6 +18,8 @@
 #include <unistd.h>
 
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/types/error_catalog.generated.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 
 namespace {
 
@@ -81,10 +84,10 @@ const std::string kIdentity = "sha256:" + std::string(64, 'c');
   row.adapter = "mock";
   row.controller = "lite6_traj_controller";
   row.arrival_tolerance_rad = 0.01;
+  row.runtime_scale_supported = true;  // the generated JTC claims position only
   row.adapter_keys = {{"vendor", "xarm"},
                       {"vendor_model", "lite6"},
-                      {"hard_stop_completion_timeout_s", "1.5"},
-                      {"gripper_result_timeout_s", "5.0"}};
+                      {"hard_stop_completion_timeout_s", "1.5"}};
   row.vendor_controllers_yaml =
       "/**/controller_manager:\n"
       "  ros__parameters:\n"
@@ -117,6 +120,7 @@ const std::string kIdentity = "sha256:" + std::string(64, 'c');
   row.adapter = "mock";
   row.controller = "joint_trajectory_controller";
   row.arrival_tolerance_rad = 0.05;
+  row.runtime_scale_supported = true;
   row.controllers_file =
       repository("manyforge_example_models/models/ur10e/mock_controllers.yaml");
   return row;
@@ -281,6 +285,7 @@ TEST(LaunchArtifacts, VendorContributionGetsItsInstanceValues) {
   row.adapter = "xarm";
   row.controller = "lite6_traj_controller";
   row.arrival_tolerance_rad = 0.01;
+  row.runtime_scale_supported = false;  // the test vendor JTC claims position and velocity
   row.goal_time_s = 1.0;
   auto instance = lite6_instance(root, urdf);
   instance.initial_joint_positions_rad.clear();  // the robot reports its own state
@@ -320,6 +325,7 @@ TEST(LaunchArtifacts, HardwareCommandInterfacesAndWorldParentFrameReachTheRunFil
   row.adapter = "xarm";
   row.controller = "lite6_traj_controller";
   row.arrival_tolerance_rad = 0.01;
+  row.runtime_scale_supported = false;  // the test vendor JTC claims position and velocity
   auto instance = lite6_instance(root, urdf);
   instance.initial_joint_positions_rad.clear();
   instance.address = "192.168.1.150";
@@ -365,6 +371,7 @@ TEST(LaunchArtifacts, ArmDeactivatedMachineProcessLoadsNoArmController) {
   row.adapter = "xarm";
   row.controller = "lite6_traj_controller";
   row.arrival_tolerance_rad = 0.01;
+  row.runtime_scale_supported = false;  // the test vendor JTC claims position and velocity
   auto instance = lite6_instance(root, urdf);
   instance.controllable_component_id = "lite6";
   instance.initial_joint_positions_rad.clear();
@@ -428,6 +435,7 @@ TEST(LaunchArtifacts, TheStrictProfileLocksEveryControllerManagersMemory) {
   vendor_row.adapter = "xarm";
   vendor_row.controller = "lite6_traj_controller";
   vendor_row.arrival_tolerance_rad = 0.01;
+  vendor_row.runtime_scale_supported = false;
   auto vendor_instance = lite6_instance(root, urdf);
   vendor_instance.initial_joint_positions_rad.clear();
   vendor_instance.address = "192.168.1.150";
@@ -461,6 +469,7 @@ TEST(LaunchArtifacts, MissingInstanceValuesFailClosed) {
   row.adapter = "xarm";
   row.controller = "lite6_traj_controller";
   row.arrival_tolerance_rad = 0.01;
+  row.runtime_scale_supported = false;  // the test vendor JTC claims position and velocity
   auto instance = lite6_instance(root, urdf);
   instance.initial_joint_positions_rad.clear();
   EXPECT_THROW(static_cast<void>(write_launch_artifacts(row, vendor_contribution(), instance)),
@@ -477,6 +486,56 @@ TEST(LaunchArtifacts, MissingInstanceValuesFailClosed) {
   row.arrival_tolerance_rad.reset();
   EXPECT_THROW(static_cast<void>(write_launch_artifacts(row, vendor_contribution(), instance)),
                ControllerLaunchArtifactError);  // a robot row without its arrival tolerance
+  row.arrival_tolerance_rad = 0.01;
+  row.runtime_scale_supported.reset();
+  EXPECT_THROW(static_cast<void>(write_launch_artifacts(row, vendor_contribution(), instance)),
+               ControllerLaunchArtifactError);  // a robot row without its runtime_scale
+}
+
+/// The written arm controller must match the row's declared `runtime_scale`
+/// (a position-only JTC accepts runtime speed scaling); a mismatch refuses
+/// the launch with its typed code before any file is written.
+TEST(LaunchArtifacts, DeclaredRuntimeScaleMustMatchTheWrittenArmController) {
+  TemporaryRoot root;
+  const auto urdf = read_file(repository("manyforge_example_models/models/lite6/lite6.urdf"));
+  const auto refusal_code = [](auto &&write) {
+    try {
+      static_cast<void>(write());
+    } catch (const manyforge::core::TypedError &error) {
+      return error.code();
+    }
+    return std::string{};
+  };
+  // Mock: the JTC claims position only, so `unsupported` mismatches.
+  auto mock_row = lite6_mock_row();
+  mock_row.runtime_scale_supported = false;
+  EXPECT_EQ(refusal_code([&] {
+              return write_launch_artifacts(mock_row, mock_launch_contribution(mock_row, true),
+                                            lite6_instance(root, urdf));
+            }),
+            manyforge::core::error_codes::kComponentRuntimeScaleMismatch);
+  EXPECT_FALSE(std::filesystem::exists(root.path() / "lite6_robot" / "controllers.yaml"));
+  // A vendor JTC claiming position and velocity cannot scale: `supported`
+  // mismatches.
+  ModelLaneRow vendor_row;
+  vendor_row.adapter = "xarm";
+  vendor_row.controller = "lite6_traj_controller";
+  vendor_row.arrival_tolerance_rad = 0.01;
+  vendor_row.runtime_scale_supported = true;
+  auto instance = lite6_instance(root, urdf);
+  instance.initial_joint_positions_rad.clear();
+  instance.address = "192.168.1.150";
+  EXPECT_EQ(refusal_code([&] {
+              return write_launch_artifacts(vendor_row, vendor_contribution(), instance);
+            }),
+            manyforge::core::error_codes::kComponentRuntimeScaleMismatch);
+  // Matching declarations write the launch.
+  EXPECT_NO_THROW(static_cast<void>(write_launch_artifacts(
+      lite6_mock_row(), mock_launch_contribution(lite6_mock_row(), true),
+      lite6_instance(root, urdf))));
+  vendor_row.runtime_scale_supported = false;
+  EXPECT_NO_THROW(
+      static_cast<void>(write_launch_artifacts(vendor_row, vendor_contribution(), instance)));
 }
 
 TEST(LaunchArtifacts, MockRowNeedsAVendorOrItsControllersFile) {
@@ -554,6 +613,26 @@ TEST(LaunchArtifacts, EvidenceNamesTheWrittenFiles) {
   const auto evidence = controller_launch_artifacts_evidence(written);
   EXPECT_NE(evidence.find("\"lane\":\"ros2_control\""), std::string::npos);
   EXPECT_NE(evidence.find(written.controllers_sha256), std::string::npos);
+}
+
+// The lane fact `supports_scale` is the row's declared `runtime_scale`, held
+// to the written arm controller: the Mock lane's arm (a vendor's or a model's
+// own controllers) claims position only, so it stays true as before.
+TEST(LaunchArtifacts, MockArmsDeclareAndWriteAScalableController) {
+  TemporaryRoot root;
+  const auto urdf = read_file(repository("manyforge_example_models/models/lite6/lite6.urdf"));
+  const auto lite6 = lite6_mock_row();
+  const auto vendor =
+      write_launch_artifacts(lite6, mock_launch_contribution(lite6, true), lite6_instance(root, urdf));
+  EXPECT_EQ(vendor.arm_command_interfaces, std::vector<std::string>{"position"});
+  EXPECT_TRUE(jtc_accepts_speed_scaling(vendor.arm_command_interfaces));
+  EXPECT_EQ(lite6.runtime_scale_supported, std::optional<bool>(true));
+  const auto ur10e = ur10e_mock_row();
+  EXPECT_TRUE(jtc_accepts_speed_scaling(controller_command_interfaces(
+      mock_launch_contribution(ur10e, true).controllers_yaml)));
+  const auto descriptor =
+      read_file(repository("manyforge_example_models/models/ur10e/component.yaml"));
+  EXPECT_NE(descriptor.find("    runtime_scale: supported"), std::string::npos);
 }
 
 // OD-62 (a): a lane can scale only when its JTC claims position and no

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -170,6 +171,46 @@ TEST(ActivationCatalogPresence, CellsWithComponentsHaveQualifiedExecutionInterru
   const auto empty = MaterializeEmptyCell(copy.root());
   ASSERT_NE(empty.bundle, nullptr);
   EXPECT_TRUE(empty.bundle->value().capability_provider_bindings.empty());
+}
+
+// The arm's motion binding carries its runtime-scale qualification exactly
+// when its lane row declares `runtime_scale: supported` (the maintained Lite6
+// declares it; an adapter may declare `unsupported`).
+std::size_t ArmScaleQualifications(const detail::PreparedActivationMaterialization &value) {
+  const auto &bindings = value.bundle->value().cell_graph.control_bindings;
+  const auto arm = std::find_if(bindings.begin(), bindings.end(), [](const auto &row) {
+    return row.command_target_id.value() == "arm" &&
+           row.capability_id.value() == "execution.trajectory.execute";
+  });
+  if (arm == bindings.end()) throw std::logic_error("maintained Lite6 has no arm motion binding");
+  return arm->runtime_scale_route_qualifications.size();
+}
+
+void DeclareRuntimeScaleUnsupported(std::vector<detail::ActivationComponentProfile> &profiles) {
+  for (auto &profile : profiles) {
+    if (!profile.lane_row || profile.lane_row->find_object_member("runtime_scale") == nullptr)
+      continue;
+    auto row = profile.lane_row->as_object();
+    for (auto &[key, value] : row)
+      if (key == "runtime_scale") value = CanonicalValue("unsupported");
+    profile.lane_row = CanonicalValue(std::move(row));
+  }
+}
+
+TEST(ActivationCatalogPresence, ArmScaleQualificationFollowsTheLaneRowDeclaration) {
+  const auto rules = deployment::parse_strict_json_model_yaml(R"({"interrupt_rules":[]})").root();
+  const CatalogCopy supported("runtime_scale_supported");
+  const auto declared =
+      deployment::test::MaterializeMaintainedInterruptDeployment(supported.root(), rules);
+  ASSERT_NE(declared.bundle, nullptr);
+  EXPECT_EQ(ArmScaleQualifications(declared), 1U);
+
+  const CatalogCopy unsupported("runtime_scale_unsupported");
+  const auto omitted = deployment::test::MaterializeMaintainedInterruptDeployment(
+      unsupported.root(), rules, "examples/mock_lite6_pick_and_place.scenario", nullptr,
+      &DeclareRuntimeScaleUnsupported);
+  ASSERT_NE(omitted.bundle, nullptr);
+  EXPECT_EQ(ArmScaleQualifications(omitted), 0U);
 }
 
 constexpr std::string_view kRos2ControlManifest =

@@ -2028,13 +2028,13 @@ TEST(HeadlessApiCore,
     static_cast<void>(core.AssistantModeProjection("composer-assistant"));
     FAIL() << "canonical-empty selection produced an assistant mode";
   } catch (const OperatorAlarmError &error) {
-    EXPECT_EQ(error.code(), "assistant_mode_projection_unavailable");
+    EXPECT_EQ(error.code(), "assistant_component_absent");
   }
   try {
     static_cast<void>(core.AssistantModeContext("composer-assistant"));
     FAIL() << "canonical-empty selection produced an assistant context";
   } catch (const OperatorAlarmError &error) {
-    EXPECT_EQ(error.code(), "assistant_mode_projection_unavailable");
+    EXPECT_EQ(error.code(), "assistant_component_absent");
   }
 }
 

@@ -483,5 +483,23 @@ TEST(ComponentStateResponseTest, CarriesAdapterDetailsInOrderOnlyWhenPresent) {
   EXPECT_EQ(details->as_array()[1].find_object_member("value")->as_string(), "ready");
 }
 
+TEST(ComponentStateResponseTest, CarriesEndpointsOnlyWhenPresent) {
+  core::ComponentState state;
+  state.component_id = "assistant";
+  state.lifecycle = core::ComponentLifecycle::kPrepared;
+  EXPECT_EQ(ComponentStateValue(state).find_object_member("endpoints"), nullptr);
+
+  state.lifecycle = core::ComponentLifecycle::kEnabled;
+  state.endpoints = {{"assistant_request", "http://127.0.0.1:40123"}};
+  const auto value = ComponentStateValue(state);
+  const auto *endpoints = value.find_object_member("endpoints");
+  ASSERT_NE(endpoints, nullptr);
+  ASSERT_EQ(endpoints->as_array().size(), 1U);
+  EXPECT_EQ(endpoints->as_array()[0].find_object_member("role_id")->as_string(),
+            "assistant_request");
+  EXPECT_EQ(endpoints->as_array()[0].find_object_member("url")->as_string(),
+            "http://127.0.0.1:40123");
+}
+
 } // namespace
 } // namespace manyforge::roboplan_backend::host_detail

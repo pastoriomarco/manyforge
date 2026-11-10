@@ -103,6 +103,8 @@ export interface ComponentState {
   last_action?: ActionResult;
   /** The adapter's read-only status lines (e.g. xArm mode, state, error codes); display only. */
   details?: ComponentDetail[];
+  /** The endpoints it serves while enabled (e.g. the assistant's `assistant_request` URL). */
+  endpoints?: ComponentEndpoint[];
   observed_at_ns: number;
 }
 
@@ -110,6 +112,12 @@ export interface ComponentState {
 export interface ComponentDetail {
   name: string;
   value: string;
+}
+
+/** One endpoint a component serves, by its provider role. */
+export interface ComponentEndpoint {
+  role_id: string;
+  url: string;
 }
 
 /** A member's reason while its owner isn't usable. */

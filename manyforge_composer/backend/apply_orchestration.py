@@ -58,11 +58,22 @@ class ApplyRefused(Exception):
 class ApplyStepFailed(Exception):
     """A step failed after the Apply started; the Apply ends `failed`."""
 
-    def __init__(self, code: str, message: str, component_id: str | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        component_id: str | None = None,
+        *,
+        before_effect: bool = False,
+    ) -> None:
         super().__init__(message)
         self.code = code
         # The component the failure names, if any: reported on its row.
         self.component_id = component_id
+        # The owner stated that this failure made no configuration, runtime,
+        # component or Scene change (a Manager ``failed`` terminal whose
+        # failure has ``effect_boundary: before_effect``).
+        self.before_effect = before_effect
 
 
 @contextmanager

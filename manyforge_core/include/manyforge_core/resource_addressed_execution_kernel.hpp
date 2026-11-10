@@ -501,8 +501,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// Kernel's locks, so the host interrupts every component action in
   /// progress. Set once by the execution host before the Kernel runs.
   void set_stop_listener(std::function<void()> on_stop_accepted);
-  [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale(
-      const RuntimeScaleRequestDTO& request);
   [[nodiscard]] Result<RuntimeScaleStatusDTO> get_runtime_scale(
       const OperationId& operation_id) const;
   [[nodiscard]] Result<RuntimeScaleControlAcceptedDTO> set_runtime_scale_control(
@@ -845,7 +843,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct ReplayEntry;
   struct ControlReplayEntry;
   struct StopReplayEntry;
-  struct RuntimeScaleReplayEntry;
   struct RuntimeScaleControlReplayEntry;
   struct RuntimeScaleControlSetting;
   struct RuntimeScaleControlResolution;
@@ -1130,11 +1127,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> retain_runtime_scale_observation_locked(
       std::unique_lock<std::mutex>& state_lock, ActiveOperation& operation,
       RuntimeScaleStatusDTO status, const char* reason);
-  /// `value_sequence`: the order of this value at the participant (OD-72);
-  /// 0 allocates one with the acceptance (a direct operation-scale request).
+  /// Applies the control setting to one live operation (`set_runtime_scale_control`).
+  /// `value_sequence`: the order of this value at the participant (OD-72).
   [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale_impl(
-      const RuntimeScaleRequestDTO& request, bool retain_public_replay,
-      std::uint64_t value_sequence = 0U);
+      const RuntimeScaleRequestDTO& request, std::uint64_t value_sequence);
   [[nodiscard]] Result<RuntimeScaleControlResolution> resolve_runtime_scale_control_target_locked(
       const RuntimeScaleControlSelectorDTO& selector) const;
   [[nodiscard]] Result<RuntimeScaleControlScope> resolve_runtime_scale_control_locked(
@@ -1331,7 +1327,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::vector<ReplayEntry> replay_ledger_;
   std::vector<ControlReplayEntry> control_replay_ledger_;
   std::vector<StopReplayEntry> stop_replay_ledger_;
-  std::vector<RuntimeScaleReplayEntry> runtime_scale_replay_ledger_;
   std::vector<RuntimeScaleControlReplayEntry> runtime_scale_control_replay_ledger_;
   std::vector<RuntimeScaleControlSetting> runtime_scale_control_settings_;
   struct OperationRecoveryReplayEntry;

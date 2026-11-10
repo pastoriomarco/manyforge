@@ -11,7 +11,7 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -184,6 +184,11 @@ class CatalogSchema:
     nullable: bool = False
     value_type_from_key: str | None = None
     value_types: tuple[str, ...] = ()
+    # The value the consuming code uses when this field is omitted. It is
+    # catalog documentation (and checked against the schema); it is not
+    # emitted into the generated JSON Schema.
+    has_default: bool = False
+    default: Any = None
 
     def is_ref(self) -> bool:
         return self.ref is not None
@@ -256,9 +261,11 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
             "schema_ref",
             "required_when",
             "allowed_when",
+            "description",
         }:
             raise CatalogSchemaError(
-                f"{path}: schema_ref form permits only conditional annotations"
+                f"{path}: schema_ref form permits only conditional annotations "
+                "and a description"
             )
         if not isinstance(ref, str) or not ref.strip():
             raise CatalogSchemaError(
@@ -272,9 +279,17 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
             raise CatalogSchemaError(f"{path}.allowed_when must be a mapping")
         return CatalogSchema(
             ref=ref,
+            description=_optional_string(raw_schema, "description", path),
             required_when=_freeze_json_value(required_when),
             allowed_when=_freeze_json_value(allowed_when),
         )
+
+    if "default" in raw_schema:
+        parsed = parse_schema(
+            {key: value for key, value in raw_schema.items() if key != "default"},
+            path=path,
+        )
+        return replace(parsed, has_default=True, default=raw_schema["default"])
 
     unknown_keys = sorted(set(raw_schema) - _ALLOWED_INLINE_SCHEMA_KEYS)
     if unknown_keys:
@@ -592,6 +607,10 @@ def _validate_schema(
     if schema.is_ref():
         registry.resolve(schema, stack=stack)
         return
+    if schema.has_default:
+        issues = validate_value(schema, schema.default, registry=registry, path=f"{path}.default")
+        if issues:
+            raise CatalogSchemaError(f"{issues[0].path}: {issues[0].message}")
     if schema.schema_type == "object":
         declared = set(schema.properties)
         for field_name in schema.required:

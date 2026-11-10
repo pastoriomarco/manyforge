@@ -858,17 +858,12 @@ void Ros2GripperCommandBackend::configure_gripper_action(
   }
   const bool pneumatic =
       config.actuation_kind == core::GripperActuationKind::kPneumatic;
-  if (!config.result_timeout_s)
-    config.result_timeout_s = pneumatic ? 1.0 : 5.0;
   if (!std::isfinite(config.state_freshness_timeout_s) ||
       !std::isfinite(config.wait_for_action_server_timeout_s) ||
-      !std::isfinite(*config.result_timeout_s) ||
       (config.state_freshness_timeout_s <= 0.0 &&
        !(no_output && config.state_topic.empty() &&
          config.state_freshness_timeout_s == 0.0)) ||
-      config.wait_for_action_server_timeout_s < 0.0 ||
-      *config.result_timeout_s < 0.0 ||
-      (pneumatic && *config.result_timeout_s == 0.0)) {
+      config.wait_for_action_server_timeout_s < 0.0) {
     throw std::invalid_argument("gripper action timing config is invalid");
   }
   if (!std::isfinite(config.stop_finish_tolerance) ||
@@ -2471,9 +2466,12 @@ core::Result<void> Ros2GripperCommandBackend::validate_gripper_command(
   const double max_effort = request.max_effort.value_or(0.0);
   if (request.gripper_id.empty() || !std::isfinite(request.target_position) ||
       !std::isfinite(request.duration_s) || !std::isfinite(max_effort) ||
-      request.duration_s < 0.0) {
+      request.duration_s < 0.0 ||
+      !std::isfinite(request.completion_timeout_s) ||
+      request.completion_timeout_s <= 0.0) {
     return rejected(ros2_control_fault_reason::kGripperInvalidCommand,
-                    "Invalid gripper command target, duration, or max effort");
+                    "Invalid gripper command target, duration, completion "
+                    "timeout, or max effort");
   }
 
   std::shared_ptr<GripperRuntime> runtime;
@@ -2570,10 +2568,13 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
   const double max_effort = request.max_effort.value_or(0.0);
   if (request.gripper_id.empty() || !std::isfinite(request.target_position) ||
       !std::isfinite(request.duration_s) || !std::isfinite(max_effort) ||
-      request.duration_s < 0.0) {
+      request.duration_s < 0.0 ||
+      !std::isfinite(request.completion_timeout_s) ||
+      request.completion_timeout_s <= 0.0) {
     return rejected_gripper_command(
         ros2_control_fault_reason::kGripperInvalidCommand,
-        "Invalid gripper command target, duration, or max effort");
+        "Invalid gripper command target, duration, completion timeout, or "
+        "max effort");
   }
   std::shared_ptr<GripperRuntime> runtime;
   const bool owner_proof_supplied =
@@ -2880,8 +2881,10 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
     runtime->started_at_ns = clock_.now();
     runtime->deadline_at_ns.reset();
     runtime->delivered_at_ns.reset();
-    if (runtime_config.transport_kind == "ros_gripper_command" &&
-        *runtime->config.result_timeout_s > 0.0) {
+    // The node's deadline: command_duration_s (position grippers) plus the
+    // node's completion_timeout_s for the gripper to report done. A
+    // pneumatic delivery is bounded by completion_timeout_s alone.
+    if (runtime_config.transport_kind == "ros_gripper_command") {
       runtime->deadline_at_ns = gripper_deadline(
           runtime->started_at_ns,
           gripper_duration_sum(
@@ -2889,7 +2892,7 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
                       core::GripperActuationKind::kPneumatic
                   ? 0
                   : gripper_duration_ns(request.duration_s),
-              gripper_duration_ns(*runtime->config.result_timeout_s)));
+              gripper_duration_ns(request.completion_timeout_s)));
     }
     retired_goal = std::move(runtime->active_goal_handle);
     runtime->commanded_state = request.commanded_state;

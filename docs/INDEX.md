@@ -11,19 +11,20 @@ workbench.
 | Connect a real robot (xArm, Lite 6) | [Real robot setup](operations/REAL_ROBOT_SETUP.md) |
 | Check a fresh-checkout setup | [Fresh-checkout checklist](operations/FRESH_CHECKOUT_CHECKLIST.md) |
 | Overview of lanes, dependencies and the assistant | [Stack setup](operations/STACK_SETUP.md) |
-| Diagnose a failure (site file, Isaac, real robot, e-stop) | [Troubleshooting](operations/TROUBLESHOOTING.md) |
+| Diagnose a failure (site file, Isaac, real robot, e-stop, AI assistant) | [Troubleshooting](operations/TROUBLESHOOTING.md) |
 | Find logs, status endpoints and capture a bug report | [Observability](operations/OBSERVABILITY.md) |
 | Mirror an Isaac Sim stage in a Scene | [Isaac scene authoring](operations/ISAAC_SCENE_AUTHORING.md) |
 | Run the Isaac Lite 6 trocar FoundationPose workflow | [Trocar FoundationPose runbook](operations/ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md) |
 | Run from a digest-checked package or a remote host | [Operator launcher](operations/MANYFORGE_OPERATOR_RUNBOOK.md) |
 | Use Program data | [Blackboard keys](authoring/BLACKBOARD_KEYS.md) and [Expressions](authoring/EXPRESSIONS.md) |
+| Set Program speeds and tolerances, override them per node, copy nodes | [Motion defaults](authoring/MOTION_DEFAULTS.md) |
 | Author signal and interrupt rules | [Interrupts](authoring/INTERRUPTS.md) |
 | Understand gripper position without feedback | [Grippers](authoring/GRIPPERS.md) |
 | Choose TCPs in Programs and Robot Control | [TCPs](authoring/TCPS.md) |
 | Add a robot (Mock), tool or I/O device | [Adding a component](authoring/ADDING_A_COMPONENT.md) |
 | Choose a controlled Stop profile | [Controlled Stop profiles](operations/STOP_PROFILES.md) |
 | Understand the system and its component model | [Architecture](reference/ARCHITECTURE.md) |
-| Set up the AI assistant | [Assistant cookbook](operations/ASSISTANT_E2E_COOKBOOK.md) |
+| Set up and use the AI assistant (model server, AI model and assistant components, AI tab, failure codes) | [Assistant cookbook](operations/ASSISTANT_E2E_COOKBOOK.md) |
 | Review the model-server interface | [Assistant provider contract](reference/ASSISTANT_PROVIDER_CONTRACT.md) |
 | Integrate with Composer | [Composer REST API](reference/REST_API.md) |
 | Integrate with Headless | [Headless REST API](reference/HEADLESS_REST_API.md) |

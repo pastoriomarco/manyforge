@@ -74,7 +74,6 @@ struct IsaacGripperFacts final {
   double open_effort{};
   double close_effort{};
   bool publish_nominal_position{};
-  double result_timeout_s{};
   /// `gripper_stop_finish_tolerance` (finger position units); only for
   /// `ros_gripper_command`, whose Stop may let a nearly finished goal finish.
   double stop_finish_tolerance{};

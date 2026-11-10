@@ -102,6 +102,11 @@ struct ModelLaneRow final {
   /// lane family makes its contribution, so every lane runs the vendor's
   /// controller configuration.
   std::optional<std::string> vendor_controllers_yaml;
+  /// `runtime_scale` (robots only; a tool row has none): the adapter's
+  /// declaration that the arm's controller accepts runtime speed scaling
+  /// (`supported`) or not (`unsupported`). The written launch must match it
+  /// (`write_launch_artifacts`); the arm's lane fact `supports_scale` is it.
+  std::optional<bool> runtime_scale_supported;
 
   friend bool operator==(const ModelLaneRow &, const ModelLaneRow &) = default;
 };

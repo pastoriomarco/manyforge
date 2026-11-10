@@ -140,7 +140,7 @@ description: Vision-guided pick-and-place Program. A bounded model request selec
 name: vision_guided_bin_pick
 program_id: vision_guided_bin_pick
 program_profile: composable-cell-v1
-program_revision: sha256:b65d86a2056961fd986e0d7a91a7f31f905c24f19c1a120a600800f8cf2c4b59
+program_revision: sha256:2d99d16828a772ce31d46a8108999c4f5f19d7945781b1622c55f5c901bf9e92
 scene:
 - pose:
     frame_ref:
@@ -255,6 +255,7 @@ tree:
         - node_id: planning.plan_pick_sequence
           instance_id: pick_left_part.plan
           parameters:
+            tool_completion_timeout_s: 15.0
             base_frame:
               component_id: ur5_robot
               frame_id: base
@@ -365,6 +366,7 @@ tree:
         - node_id: gripper.command_position
           instance_id: pick_left_part.close
           parameters:
+            completion_timeout_s: 15.0
             target:
               component_id: robotiq_2f_85
               command_target_id: gripper
@@ -417,6 +419,7 @@ tree:
         - node_id: planning.plan_place_sequence
           instance_id: place_left_part.plan
           parameters:
+            tool_completion_timeout_s: 15.0
             approach_offset_m:
             - 0
             - 0
@@ -499,6 +502,7 @@ tree:
         - node_id: gripper.command_position
           instance_id: place_left_part.open
           parameters:
+            completion_timeout_s: 15.0
             target:
               component_id: robotiq_2f_85
               command_target_id: gripper
@@ -557,6 +561,7 @@ tree:
         - node_id: planning.plan_pick_sequence
           instance_id: pick_right_part.plan
           parameters:
+            tool_completion_timeout_s: 15.0
             base_frame:
               component_id: ur5_robot
               frame_id: base
@@ -667,6 +672,7 @@ tree:
         - node_id: gripper.command_position
           instance_id: pick_right_part.close
           parameters:
+            completion_timeout_s: 15.0
             target:
               component_id: robotiq_2f_85
               command_target_id: gripper
@@ -719,6 +725,7 @@ tree:
         - node_id: planning.plan_place_sequence
           instance_id: place_right_part.plan
           parameters:
+            tool_completion_timeout_s: 15.0
             approach_offset_m:
             - 0
             - 0
@@ -801,6 +808,7 @@ tree:
         - node_id: gripper.command_position
           instance_id: place_right_part.open
           parameters:
+            completion_timeout_s: 15.0
             target:
               component_id: robotiq_2f_85
               command_target_id: gripper

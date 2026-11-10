@@ -1415,6 +1415,43 @@ TEST(ProgramBindingCompilerTest, NoProgramReadbackProvesAbsenceWithoutInventingA
       manyforge::deployment::PreparedActivationInputError);
 }
 
+TEST(ProgramBindingCompilerTest, AssemblesANoProgramActivationWithoutAProgramClosure) {
+  ScopedTrustedRoot root;
+  const auto product = make_pneumatic_product(root.path());
+  ASSERT_TRUE(product.model_map);
+  manyforge::deployment::FilesystemRawArtifactStore raw(root.path());
+  const manyforge::deployment::PreparedActivationAssemblyInput input{
+      manyforge::deployment::PreparedScenarioOrigin{
+          "scenario.close", manyforge::core::ContentDigest("sha256:" + std::string(64U, '1')),
+          "/fixtures/scenario.close.scenario"},
+      manyforge::core::ContentDigest("sha256:" + std::string(64U, '2')), "optional"};
+  const auto prepared = manyforge::deployment::assemble_prepared_activation_without_program(
+      input, *product.bundle, product.model_map, raw);
+  EXPECT_EQ(prepared.retained_bundle_id(), product.bundle->retained_bundle_id());
+  EXPECT_EQ(prepared.closure().program, nullptr);
+  EXPECT_EQ(prepared.closure().program_binding, nullptr);
+  EXPECT_TRUE(prepared.closure().catalog_artifacts.empty());
+  EXPECT_TRUE(prepared.closure().retained_model_map.has_value());
+  EXPECT_FALSE(prepared.program_id().has_value());
+  EXPECT_FALSE(prepared.program_revision().has_value());
+  EXPECT_FALSE(prepared.program_binding_id().has_value());
+  EXPECT_FALSE(prepared.program_outcome().has_value());
+  EXPECT_EQ(*prepared.normalized_root().find_object_member("program_outcome"),
+            CanonicalValue(CanonicalValue::Object{{"kind", CanonicalValue("no_program")}}));
+  EXPECT_NO_THROW(manyforge::deployment::verify_prepared_program_outcome(prepared));
+  const manyforge::deployment::FilesystemPreparedActivationRepository repository(root.path());
+  ASSERT_TRUE(repository.put_if_absent(prepared));
+  EXPECT_NE(repository.get_verified(prepared.prepared_activation_id()), nullptr);
+
+  // no_program admits only the optional assistant mode.
+  auto required = input;
+  required.assistant_mode = "required";
+  EXPECT_THROW(static_cast<void>(
+                   manyforge::deployment::assemble_prepared_activation_without_program(
+                       required, *product.bundle, product.model_map, raw)),
+               manyforge::deployment::PreparedActivationInputError);
+}
+
 TEST(ProgramBindingCompilerTest,
      ReadbackRefusesTheRemovedParameterOverrideForm) {
   ScopedTrustedRoot root;

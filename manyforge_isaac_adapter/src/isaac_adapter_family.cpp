@@ -39,7 +39,7 @@ RetainedRos2ControlBackendConfig isaac_arm_backend_config(const Ros2ControlArmLa
   auto config = isaac::make_isaac_ros2_control_backend_config(
       input.configuration, input.motion_binding, isaac::isaac_arm_facts(input.row),
       lane_settings(), input.artifacts.rates.value(),
-      jtc_accepts_speed_scaling(input.artifacts.arm_command_interfaces),
+      input.row.runtime_scale_supported.value(),
       input.max_deceleration_on_cancel_by_source_joint, input.stream_overrides);
   config.arm.mock_reset_position = input.artifacts.mock_reset_position;
   return config;

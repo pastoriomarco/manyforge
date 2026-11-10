@@ -35,7 +35,7 @@ EXPECTED_API_VERSION = "manyforge.node_catalog.v3"
 EXPECTED_CONTENT_VERSION = "3.0.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:659f9172886b2d524166e3b6defca9791e8b29d04bdb93842fc7b362af675380"
+    "sha256:59fa3d425937116723fbb04ae19c8775fae761ae3061d5da5eac5f328889fef5"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -71,7 +71,6 @@ _OWNER_APIS = {
     "kernel.recovery",
     "kernel.reset",
     "kernel.rules",
-    "kernel.runtime_scaling",
     "kernel.stop",
     "model.kinematics",
     "orchestration.blackboard",
@@ -94,7 +93,6 @@ _TARGET_CAPABILITIES = {
     "execution.feedback.phase_events",
     "execution.feedback.state_snapshots",
     "execution.reset",
-    "execution.runtime_scale.operation_scoped",
     "execution.stop.motion.hard_deceleration",
     "execution.stop.motion.soft_on_path",
     "execution.stop.motion.spring_back_hold",
@@ -117,6 +115,7 @@ _TARGET_CAPABILITIES = {
     "validation.trajectory.non_collision",
 }
 _CELL_CAPABILITIES = {
+    "assistant.model.query",
     "collision.query.detailed",
     "collision.query.pre_execution",
     "collision.query.runtime",
@@ -276,6 +275,7 @@ class CatalogParameter:
     schema: CatalogSchema
     has_default: bool = False
     default: Any = None
+    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -995,7 +995,7 @@ class NodeCatalog:
             _closed(
                 parameter,
                 required={"id", "required"},
-                allowed={"id", "required", "schema", "schema_ref", "default"},
+                allowed={"id", "required", "description", "schema", "schema_ref", "default"},
                 label=parameter_label,
             )
             parameter_id = _identifier(parameter["id"], f"{parameter_label}.id")
@@ -1055,6 +1055,11 @@ class NodeCatalog:
                     schema=schema,
                     has_default=has_default,
                     default=_freeze_json_value(default),
+                    description=(
+                        _text(parameter["description"], f"{parameter_label}.description")
+                        if "description" in parameter
+                        else ""
+                    ),
                 )
             )
         return tuple(parameters)

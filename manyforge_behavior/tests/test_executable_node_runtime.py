@@ -341,8 +341,8 @@ def test_closed_resolver_exactly_disposes_all_effective_rows() -> None:
     resolver = build_executable_node_resolver(environment)
     dispositions = resolver.dispositions
 
-    assert len(dispositions) == len(environment.registry.rows) == 52  # + rules.set_active, io.clear_outside_change
-    assert sum(item.adapter_build_qualified for item in dispositions) == 52
+    assert len(dispositions) == len(environment.registry.rows) == 51  # + rules.set_active, io.clear_outside_change
+    assert sum(item.adapter_build_qualified for item in dispositions) == 51
     assert sum(not item.adapter_build_qualified for item in dispositions) == 0
     assert all(
         (
@@ -2752,11 +2752,12 @@ def test_timer_with_a_missing_or_invalid_sourced_duration_fails_by_name(
     failure = run.terminal_failure()
     assert failure.reason_code == "node_input_unavailable"
     timer = _leaf_node(run, "delay")
-    # The timer's catalog declares only success and interrupted; its inputs
-    # still fail, before the wait starts, and the run presents that failure.
-    assert set(run._environment.catalog.get("timer").outcomes) == {  # noqa: SLF001
-        "success",
-        "interrupted",
+    # The timer fails only here, before the wait starts; its catalog declares
+    # that failure outcome.
+    assert dict(run._environment.catalog.get("timer").outcomes) == {  # noqa: SLF001
+        "success": "elapsed",
+        "failure": "input_unavailable",
+        "interrupted": "cancelled",
     }
     assert timer.outcome == "failure"
     assert run.node_statuses["delay"] == "failure"

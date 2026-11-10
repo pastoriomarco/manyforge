@@ -3868,30 +3868,6 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
            RuntimeScaleControlStatusValue(status.value())},
       });
     }
-    if (command.kind == CommandKind::kSetOperationRuntimeScale) {
-      const auto result =
-          composition.active_addressed_kernel()->set_runtime_scale(
-              *command.operation_runtime_scale);
-      if (!result.ok())
-        return ErrorResponse(result.error().code, result.error().message);
-      const auto &value = result.value();
-      return CanonicalValue(CanonicalValue::Object{
-          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"command", CanonicalValue("set_operation_runtime_scale")},
-          {"ok", CanonicalValue(true)},
-          {"accepted",
-           CanonicalValue(CanonicalValue::Object{
-               {"request_id", CanonicalValue(value.request_id.value())},
-               {"operation_id", CanonicalValue(value.operation_id.value())},
-               {"operation_revision", CanonicalValue(static_cast<double>(
-                                          value.operation_revision.value()))},
-               {"runtime_scale_generation",
-                CanonicalValue(static_cast<double>(
-                    value.runtime_scale_generation.value()))},
-               {"requested_scale", CanonicalValue(value.requested_scale)},
-           })},
-      });
-    }
     if (command.kind == CommandKind::kSetRuntimeScaleControl) {
       const auto result =
           composition.active_addressed_kernel()
@@ -3988,7 +3964,6 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
       case CommandKind::kClearOutsideChange:
       case CommandKind::kSetIoOutput:
       case CommandKind::kSetRuntimeScaleControl:
-      case CommandKind::kSetOperationRuntimeScale:
       case CommandKind::kGetRuntimeScaleControl:
       case CommandKind::kPlanPick:
       case CommandKind::kPlanPlace:

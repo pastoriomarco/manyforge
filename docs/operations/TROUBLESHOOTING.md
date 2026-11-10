@@ -20,7 +20,7 @@ API, `http://127.0.0.1:9020`.
 | Retry/Resume/Reset only works on the second press | Stale recovery offer or a lifecycle command still pending; this is not expected UX | Save cycle status, alarm snapshot, and execution history; see [§Alarm and recovery behavior](#alarm-and-recovery-behavior) |
 | Motion refused with `validation_collision` | Stale pose source, scene drift, or genuine collision | See [§Collision rejection](#collision-rejection) below |
 | Motion stopped with **Robot position feedback lost** (`runtime_monitor_observation_lost`) | The robot's measured joint states stopped arriving or became too old during motion, typically because the robot controller faulted or its connection dropped; nothing was detected in contact | Inspect the operation alarm in Runtime and its History entry; check the robot component's state and controller connection, then Recover the component |
-| AI tab disabled or chat request fails | No `ai_model` component / assistant profile, model server down, token variable unset | See [§AI assistant](#ai-assistant) below |
+| AI tab disabled or chat request fails | No AI assistant or `ai_model` component, one of them not enabled, a Program run exists, model server down or still loading, wrong model name (HTTP 404), token variable unset, slow model (timeout) | See [§AI assistant](#ai-assistant) below |
 | Isaac robot shows **Simulation not playing**; the run holds with "Waiting for Run · Simulation not playing" | Simulation paused or stopped, or the workbench can't reach Isaac (DDS) | See [§Simulation not playing](#simulation-not-playing) below |
 | Isaac moves abort with `aborted_path_tolerance` ("State tolerances failed for joint …") although the plan is slow | Isaac runs slower than real time (overloaded host); the arm controller runs on wall-clock time | See [§Isaac slower than real time](#isaac-slower-than-real-time) |
 | Isaac arm stays not prepared or offline | Controller not active, DDS isolation | See [§Isaac controller discovery failing](#isaac-controller-discovery-failing) below |
@@ -94,16 +94,74 @@ Control's Advanced settings, or lower the Deployment `collision_clearance_m`.
 
 ### AI assistant
 
-**Symptom**: the AI tab says "No AI model component in this Deployment", or a
-chat request fails with a typed code.
+**Symptom**: the AI tab is disabled; its tooltip says why ("Add an Assistant
+component", "A Program run exists: …", "Assistant faulted: Recover it",
+"Assistant is prepared: Enable it", "AI model `<id>` is …").
 
-**Cause and step**: the tab needs an assistant profile and an `ai_model`
-component for its chat alias in the active Deployment; requests need the model
-server to serve the component's `model` and, when `api_key_env` is set, that
-`MANYFORGE_AI_*` variable exported before starting the workbench. Check
-`GET /api/assistant/modes` (`ai_model_component_id`), the `endpoint` component
-stream, and `curl {base_url}/models`. Codes are listed in
-[`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md) §"Failure codes".
+**Cause and step**: the tab needs an Applied Deployment with an AI assistant
+component and the `ai_model` component it names, both enabled, and no Program
+run (a paused or held run counts). Check `GET /api/assistant/modes`
+(`assistant_component_id` and `ai_model_component_id` are set) and
+`GET /api/components`. Add the components and Apply
+([cookbook §2](ASSISTANT_E2E_COOKBOOK.md#2-add-the-ai-model-and-assistant-components-to-the-deployment)),
+Enable them, or Stop or finish the run. A faulted assistant (its host or
+bridge exited, `fault_process_exited`) blocks Execute like any component
+fault: Recover, then Enable. The tab uses the Applied model: a model changed
+only in the Deployment Draft shows a warning until Apply.
+
+**Symptom**: a request fails with `upstream_unavailable` (model not reachable).
+
+**Cause and step**: the model server is down, still loading, or `base_url` is
+wrong. Run `curl -fsS {base_url}/models` on the ManyForge host; the workbench
+uses host networking, so `127.0.0.1` means that host. A large model can take
+several minutes before `/models` answers. The component's `endpoint` stream
+is stale meanwhile (a warning, not a fault); its log names the reason
+(`ai_model_unreachable`, `ai_model_not_served`, `ai_model_token_unavailable`).
+
+**Symptom**: `upstream_http_error` with HTTP 404.
+
+**Cause and step**: the server does not serve the component's `model` name.
+Compare `curl {base_url}/models` with the component's Model field; set the
+server's served name (vLLM `--served-model-name`, llama.cpp `--alias`) or
+change Model and Apply. HTTP 401/403: the token variable is wrong or missing;
+HTTP 400: the server refused the request (check its tool-call parser and its
+log).
+
+**Symptom**: `ai_model_token_unavailable`.
+
+**Cause and step**: `api_key_env` names a `MANYFORGE_AI_*` variable that was
+not exported when the workbench started. Export it on the host and restart the
+workbench; nothing was sent to the server.
+
+**Symptom**: `upstream_timeout` or `assistant_timeout`.
+
+**Cause and step**: one model call exceeded the profile's `default_timeout_s`
+(`upstream_timeout`), or the whole request exceeded 180 s (`assistant_timeout`).
+Check the server's load and decode speed, retry once it is ready, and split
+large requests ("first add the sequence, then its children").
+
+**Symptom**: a tool call shows `regenerationFailed` (for example
+`upstream_http_error` or `truncated`).
+
+**Cause and step**: the constrained repair of an invalid edit failed, for
+example because the server refused the JSON Schema grammar. Nothing else is
+affected: the original error went back to the model, and the request
+continues. If it happens on every repair, the server lacks a compatible
+structured-output backend.
+
+**Symptom**: the reply is marked **needs your answer** and lists repeated
+attempts.
+
+**Cause and step**: stuck-loop recovery stopped the request after the same
+tool failed the same way (or repeated the same edit) five times. Rephrase the
+request, name the node or object, or ask for a smaller step.
+
+**Symptom**: `assistant_callback_timeout`.
+
+**Cause and step**: Composer did not confirm a Draft edit in time, so its
+effect is unknown. Inspect the Draft before retrying.
+
+All codes: [`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md) §"Failure codes".
 
 ### Isaac slower than real time
 

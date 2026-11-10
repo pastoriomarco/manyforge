@@ -137,6 +137,9 @@ export function ScenarioDocumentCommands({
   const [scenarioName, setScenarioName] = useState('');
   const [scenarioDescription, setScenarioDescription] = useState('');
   const [newError, setNewError] = useState<string | null>(null);
+  // The Scenario whose Load ran and failed: the dialog offers Retry Load and
+  // Load empty scenario (New) for it; neither runs by itself.
+  const [failedLoadPath, setFailedLoadPath] = useState<string | null>(null);
   const [replacementPending, setReplacementPending] = useState(false);
   const replacementInFlight = useRef(false);
   const [confirmation, setConfirmation] = useState<ReplacementConfirmation | null>(null);
@@ -287,6 +290,7 @@ export function ScenarioDocumentCommands({
     if (replacementInFlight.current) return;
     setConfirmation(null);
     setNewError(null);
+    setFailedLoadPath(null);
     setAction(null);
     setConfirmOverwrite(false);
   }, []);
@@ -296,6 +300,7 @@ export function ScenarioDocumentCommands({
   ) => {
     returnFocus.current = event.currentTarget;
     setNewError(null);
+    setFailedLoadPath(null);
     setConfirmOverwrite(false);
     setLoadPickerOpen(false);
     if (next === 'save_as') {
@@ -326,6 +331,9 @@ export function ScenarioDocumentCommands({
   // New and Load replace the Scenario through the server's one Apply path:
   // New is the Apply of the empty cell; Load is New, then Apply of the file.
   const replacesScenario = action === 'new' || action === 'load';
+  // The selected Scenario's Load ran and failed (not refused).
+  const loadFailed = failedLoadPath !== null && failedLoadPath === selectedScenarioPath
+    && !replacementPending;
   const replacementReason = newError ?? (replacementPending ? null
     : replacesScenario ? replacementEntryReason : blockReason);
   const completeReplacement = async (kind: 'new' | 'load', acknowledged = false) => {
@@ -342,15 +350,20 @@ export function ScenarioDocumentCommands({
     replacementInFlight.current = true;
     setReplacementPending(true);
     setNewError(null);
+    setFailedLoadPath(null);
     let refusal: string | null = null;
-    const onRefusal = (message: string) => { refusal = message; };
+    let failedOutcome = false as boolean;
+    const onRefusal = (message: string, failed = false) => { refusal = message; failedOutcome = failed; };
     try {
       const result = kind === 'new' ? await newScenarioDocument(onRefusal)
         : await loadScenarioDocument(path as string, onRefusal);
       if (!replacementMounted.current) return;
       if (result !== null) setAction(null);
-      else setNewError(refusal ?? latestError.current
-        ?? `${kind === 'new' ? 'New' : 'Load'} was refused; nothing was retried.`);
+      else {
+        setNewError(refusal ?? latestError.current
+          ?? `${kind === 'new' ? 'New' : 'Load'} was refused; nothing was retried.`);
+        if (kind === 'load' && failedOutcome) setFailedLoadPath(path);
+      }
     } finally {
       replacementInFlight.current = false;
       if (replacementMounted.current) setReplacementPending(false);
@@ -680,6 +693,16 @@ export function ScenarioDocumentCommands({
             {replacementReason && <p className="inline-message severity-error" role="status">{replacementReason}</p>}
             <div className="dialog-actions new-scenario-actions">
               <button type="button" onClick={closeAction} disabled={replacementPending}>Cancel</button>
+              {loadFailed && (
+                <button
+                  type="button"
+                  disabled={busy || replacementEntryReason !== null}
+                  title={replacementEntryReason ?? 'Empty the cell and open the empty Untitled Scenario.'}
+                  onClick={() => void completeReplacement('new')}
+                >
+                  Load empty scenario
+                </button>
+              )}
               <button
                 type="button"
                 className="primary-action"
@@ -690,7 +713,7 @@ export function ScenarioDocumentCommands({
                   void completeReplacement('load');
                 }}
               >
-                {busyLabel(operation, 'load', 'Load Scenario')}
+                {loadFailed ? 'Retry Load' : busyLabel(operation, 'load', 'Load Scenario')}
               </button>
             </div>
           </div>

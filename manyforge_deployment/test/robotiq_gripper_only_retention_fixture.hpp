@@ -125,7 +125,7 @@ inline void map_robotiq_gripper_only_graph(CanonicalValue::Object &members) {
               if (field == "lane_row")
                 entry = CanonicalValue(
                     R"({"adapter":"mock","controller":"robotiq_gripper_controller",)"
-                    R"("controllers_file":"mock_controllers.yaml","gripper_result_timeout_s":15,)"
+                    R"("controllers_file":"mock_controllers.yaml",)"
                     R"("gripper_stop_finish_tolerance":0.04,)"
                     R"("hard_stop_completion_timeout_s":0.5})");
             }

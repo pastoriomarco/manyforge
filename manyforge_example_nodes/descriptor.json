@@ -13,7 +13,7 @@
       "id": "example.check_frame_height",
       "name": "Check frame height",
       "category": "model",
-      "description": "Build-owned extension example: compare a freshly observed frame height in the cell frame.",
+      "description": "Build-owned experimental example that checks the cell-frame height of a component frame against an inclusive range. Fails when the height is outside the range or the observed state is unavailable.",
       "stability": "experimental",
       "tags": [
         "example",
@@ -31,6 +31,7 @@
         {
           "id": "target",
           "required": true,
+          "description": "Component and command target whose frame height is read.",
           "schema": {
             "schema_ref": "#/schema_types/target_reference"
           }
@@ -38,6 +39,7 @@
         {
           "id": "frame",
           "required": true,
+          "description": "Component frame whose height in the cell frame is checked.",
           "schema": {
             "schema_ref": "#/schema_types/frame_reference"
           }
@@ -45,6 +47,7 @@
         {
           "id": "minimum_height_m",
           "required": true,
+          "description": "Lower bound of the allowed height in meters, inclusive.",
           "schema": {
             "type": "float"
           }
@@ -52,6 +55,7 @@
         {
           "id": "maximum_height_m",
           "required": true,
+          "description": "Upper bound of the allowed height in meters, inclusive.",
           "schema": {
             "type": "float"
           }

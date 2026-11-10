@@ -31,6 +31,7 @@ lanes:
     vendor_model: lite6                   # xarm_controller/config/lite6_controllers.yaml
     controller: lite6_traj_controller     # the arm's JTC
     arrival_tolerance_rad: 0.01           # every arm joint's JTC goal
+    runtime_scale: supported              # the arm's JTC claims position only
     hard_stop_completion_timeout_s: 1.5
 ```
 
@@ -47,7 +48,7 @@ A model without a vendor adapter (UR, the tools) names its own
 
 ### A tool's Stop finish tolerance
 
-A tool row also carries `gripper_result_timeout_s` and
+A tool row also carries
 `gripper_stop_finish_tolerance` (the gripper's position unit). On a Stop the
 gripper command backend does not cancel when the finger position is already
 within this tolerance of the commanded target; it lets the goal finish and

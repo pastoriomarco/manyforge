@@ -38,10 +38,6 @@ class ExecutionTransport(Protocol):
 
     def full_stop(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def set_operation_runtime_scale(
-        self, body: Mapping[str, Any]
-    ) -> dict[str, Any]: ...
-
     def submit(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def register_program_run_capture(
@@ -491,12 +487,6 @@ class KernelClient:
 
     def full_stop(self, request: Mapping[str, Any]) -> dict[str, Any]:
         return self._successful(self._transport.full_stop(request), label="Full Stop")
-
-    def set_operation_runtime_scale(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        return self._successful(
-            self._transport.set_operation_runtime_scale(request),
-            label="operation runtime scale",
-        )
 
     def reset(self, operation_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
         return self._successful(

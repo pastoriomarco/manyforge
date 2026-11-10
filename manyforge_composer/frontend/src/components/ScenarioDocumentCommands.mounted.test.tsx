@@ -171,6 +171,42 @@ it('keeps the dialog with the refusal after a refused Load and does not resend i
   expect(test.find((p) => p.className === 'inline-message severity-error')).toBeDefined();
 });
 
+it('a failed Load offers Retry Load and Load empty scenario; neither runs by itself', async () => {
+  const test = await mount();
+  vi.mocked(test.controller.loadScenarioDocument).mockImplementation(async (_path, onRefusal) => {
+    onRefusal?.('Scenario Load: Apply failed: kernel_apply_fence_request_failed.', true);
+    return null;
+  });
+  await test.open('Load Scenario'); await test.choose('other');
+  await test.click(test.primary('Load Scenario')); await test.ack();
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledOnce();
+  expect(test.find((p) => p.className === 'inline-message severity-error')).toBeDefined();
+  const empty = test.find((p) => p.type === 'button' && p.children === 'Load empty scenario');
+  expect(test.primary('Retry Load')).toBeDefined();
+  expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
+
+  await test.click(test.primary('Retry Load')); await test.ack();
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledTimes(2);
+  expect(vi.mocked(test.controller.loadScenarioDocument).mock.calls[1]![0]).toBe('/projects/other');
+
+  await test.click(test.find((p) => p.type === 'button' && p.children === 'Load empty scenario'));
+  expect(empty).toBeDefined();
+  await test.ack();
+  expect(test.controller.newScenarioDocument).toHaveBeenCalledOnce();
+});
+
+it('a refused Load offers no Retry Load', async () => {
+  const test = await mount();
+  vi.mocked(test.controller.loadScenarioDocument).mockImplementation(async (_path, onRefusal) => {
+    onRefusal?.('Scenario Load refused: authoring_not_ready.');
+    return null;
+  });
+  await test.open('Load Scenario'); await test.choose('other');
+  await test.click(test.primary('Load Scenario')); await test.ack();
+  expect(test.primary('Load Scenario')).toBeDefined();
+  expect(() => test.find((p) => p.children === 'Load empty scenario')).toThrow();
+});
+
 it('the read-only Untitled Scenario disables Save; Save As places it in the Scenario folder', async () => {
   const test = await mount(null, false, '/opt/manyforge/resources/Untitled.scenario', true);
   const save = test.find((p) => p['aria-label'] === 'Save Scenario');

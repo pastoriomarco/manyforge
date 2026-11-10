@@ -149,7 +149,7 @@ type SignalFact = ReferenceSelectorFacts['signals'][number];
 
 /** The qualified Draft candidate facts the direct-reference pickers read. */
 function selectorFacts(facts: Partial<ReferenceSelectorFacts> = {}): ReferenceSelectorFacts {
-  return { components: [], targets: [], signals: [], frames: [], bodies: [], ...facts };
+  return { components: [], targets: [], signals: [], frames: [], bodies: [], rules: [], ...facts };
 }
 
 function targetFact(
@@ -402,9 +402,9 @@ describe('Program authoring panels', () => {
       category: sequence.category,
     };
     const modelReason = {
-      code: 'model_not_configured',
-      message: 'No model is configured',
-      details: {},
+      code: 'capability_not_offered',
+      message: 'No component offers assistant.model.query',
+      details: { capability: 'assistant.model.query' },
     };
     const missingCapability = {
       code: 'capability_not_offered',
@@ -423,7 +423,7 @@ describe('Program authoring panels', () => {
           authoringAvailable: true,
           executionAvailable: false,
           reasons: [modelReason],
-          reasonCodes: ['model_not_configured'],
+          reasonCodes: ['capability_not_offered'],
           restorationGates: [],
         },
       ],
@@ -463,7 +463,7 @@ describe('Program authoring panels', () => {
     });
     expect(executionAvailability(modelQuery, modelEnvironment)).toEqual({
       available: false,
-      note: 'Authorable · unavailable · No model configured',
+      note: 'Authorable · unavailable · Required capability unavailable (assistant.model.query)',
     });
     expect(executionAvailability(gripperNode, gripperEnvironment)).toEqual({
       available: false,
@@ -1616,7 +1616,7 @@ describe('Program authoring panels', () => {
       active: false,
       runnerAllows: vi.fn(() => false),
       runnerRefusal: vi.fn(() => null),
-      draftUnappliedReason: null,
+      composerRefusalReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
       run: vi.fn(),
@@ -1804,7 +1804,7 @@ describe('Program authoring panels', () => {
       active: false,
       runnerAllows: vi.fn(() => false),
       runnerRefusal: vi.fn(() => null),
-      draftUnappliedReason: null,
+      composerRefusalReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
       run: vi.fn(),

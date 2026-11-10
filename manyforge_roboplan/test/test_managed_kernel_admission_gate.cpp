@@ -669,6 +669,92 @@ TEST(ManagedKernelApplyFenceOwner,
 }
 
 TEST(ManagedKernelApplyFenceOwner,
+     NeverEnabledPredecessorDomainPinsNoConfigurationButARoutedOneRefuses) {
+  // OD-86: a Prepared-but-never-Enabled (or Disabled) component's domain has
+  // neither a reconciled configuration nor a route publication. Its Apply
+  // fence pins no row for it, as a release already does, so New/Load works.
+  OwnerFixture fixture(true);
+  ManagedKernelAdmissionGate gate;
+  const auto scope = AffectedScope();
+  ASSERT_TRUE(scope.domains.front().has_controller_predecessor());
+  auto table = std::make_shared<core::ResourceSlotTable>(
+      scope.resources, std::vector<core::DomainActiveControlConfigurationDTO>{},
+      gate.shared_admission_mutex());
+  gate.BindResourceTable(table);
+  ManagedKernelApplyFenceOwner owner(fixture.Config("never-enabled"), gate);
+  const core::RuntimeEpoch manager_epoch("manager.never-enabled");
+  const auto observed = owner.ObserveAdmission({scope, manager_epoch});
+  ASSERT_TRUE(observed.presence_valid());
+  EXPECT_TRUE(observed.active_control_configurations.empty());
+  const core::ApplyConfigurationFenceIntentDTO intent{
+      {core::RequestId("request.never-enabled"),
+       core::RequestOwnerEpoch("manager-owner.never-enabled"),
+       "never-enabled-test", std::nullopt},
+      {core::ApplyId("apply.never-enabled"), core::ApplyGeneration(1U)},
+      scope,
+      core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
+      fixture.bundle->retained_bundle_id(),
+      fixture.bundle->value().cell_graph.graph_revision,
+      observed.operation_resource_generation,
+      observed.configuration_fence_generation,
+      {},
+      "empty the cell while its robot was only prepared"};
+  ASSERT_TRUE(intent.valid());
+  const auto accepted = owner.Acquire(intent);
+  ASSERT_TRUE(accepted.matches(intent));
+  const core::ConfigurationFenceStatusQueryDTO query{
+      intent.owner_transaction, accepted.configuration_fence_id,
+      accepted.configuration_fence_generation, scope, manager_epoch};
+  EXPECT_TRUE(owner.QueryStatus(query)
+                  .reconciliation_evidence.active_control_configurations.empty());
+  gate.ReleaseFence(accepted.configuration_fence_id, scope);
+
+  // Enabled: the reconciled configuration is pinned exactly, as before.
+  ASSERT_TRUE(table->reconfigure_runtime_inventory(
+                       scope.resources, ActiveConfigurations(),
+                       ActiveConfigurations())
+                  .ok());
+  EXPECT_EQ(owner.ObserveAdmission({scope, manager_epoch})
+                .active_control_configurations,
+            ActiveConfigurations());
+
+  // A domain that still has a route publication but no reconciled
+  // configuration is live (e.g. an unreconciled external route): refuse.
+  OwnerFixture routed_fixture(true);
+  ManagedKernelAdmissionGate routed_gate;
+  auto routed_table = std::make_shared<core::ResourceSlotTable>(
+      scope.resources, std::vector<core::DomainActiveControlConfigurationDTO>{},
+      routed_gate.shared_admission_mutex());
+  ASSERT_TRUE(routed_table
+                  ->reconfigure_runtime_inventory(scope.resources, {},
+                                                  ActiveConfigurations())
+                  .ok());
+  routed_gate.BindResourceTable(routed_table);
+  ManagedKernelApplyFenceOwner routed(routed_fixture.Config("routed"),
+                                      routed_gate);
+  const auto refuses = [](const auto &call) {
+    try {
+      call();
+    } catch (const std::runtime_error &error) {
+      return std::string_view(error.what()).find("route publication") !=
+             std::string_view::npos;
+    }
+    return false;
+  };
+  EXPECT_TRUE(refuses(
+      [&] { static_cast<void>(routed.ObserveAdmission({scope, manager_epoch})); }));
+  auto routed_intent = intent;
+  routed_intent.expected_retained_bundle_id =
+      routed_fixture.bundle->retained_bundle_id();
+  routed_intent.expected_graph_revision =
+      routed_fixture.bundle->value().cell_graph.graph_revision;
+  routed_intent.expected_operation_resource_generation =
+      routed_gate.Observe(scope).operation_resource_generation;
+  EXPECT_TRUE(refuses([&] { static_cast<void>(routed.Acquire(routed_intent)); }));
+  EXPECT_FALSE(routed_gate.has_held_configuration_fences());
+}
+
+TEST(ManagedKernelApplyFenceOwner,
      InitialHeldPresenceNeedsNoCandidateConfigurationsAndReleasedRowsRefuse) {
   OwnerFixture fixture(true);
   ASSERT_TRUE(fixture.bundle->value().cell_graph.controllable_components.empty());

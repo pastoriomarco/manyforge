@@ -1398,6 +1398,43 @@ content_identity::CanonicalValue PublishTestPreparedActivation(
   }
   return content_identity::CanonicalValue(std::move(summary));
 }
+
+/// Assemble and publish the prepared activation of the fixture's Close (the
+/// Apply of the empty intent) applied without a Program, and return its id.
+std::string PublishTestCloseWithoutProgram(
+    const DaemonDirectory &directory,
+    const ManagerApplyFixtureMetadata &fixture) {
+  const auto package_root = directory.apply_package_root();
+  const auto close =
+      deployment::FilesystemVerifiedRetainedBundleSource(package_root)
+          .get_verified(core::RetainedBundleId(fixture.close_retained_bundle_id));
+  if (close == nullptr) {
+    throw std::runtime_error("Manager Apply fixture lost its Close bundle");
+  }
+  const auto &map_products = close->value().compiled_products.symbol_role_maps;
+  std::optional<deployment::VerifiedRetainedModelMap> model_map;
+  if (!map_products.empty()) {
+    model_map =
+        deployment::FilesystemVerifiedRetainedModelMapSource(package_root)
+            .get_verified({close->retained_bundle_id(),
+                           map_products.front().product_id});
+  }
+  deployment::FilesystemRawArtifactStore raw_artifacts(package_root);
+  const auto prepared = deployment::assemble_prepared_activation_without_program(
+      {deployment::PreparedScenarioOrigin{
+           "scenario.close",
+           core::ContentDigest(
+               "sha256:1515151515151515151515151515151515151515151515"
+               "151515151515151515"),
+           "/fixtures/scenario.close.scenario"},
+       core::ContentDigest(
+           "sha256:2121212121212121212121212121212121212121212121"
+           "212121212121212121"),
+       "optional"},
+      *close, model_map, raw_artifacts);
+  PublishPreparedActivationClosure(directory, prepared);
+  return prepared.prepared_activation_id().value();
+}
 #endif
 
 std::string ApplyRequest(
@@ -3338,10 +3375,42 @@ TEST(ManagerDaemonProcess,
                                              "manager-source.json");
   const auto before = manager_source.Read();
   ASSERT_TRUE(before.has_value());
+  // First Apply the physical fixture cell with its Program.
+  const auto physical_submitted = SendCommand(
+      directory.socket_path(),
+      ApplyRequest(directory, before->source_owner_epoch,
+                   WaitForAuthoringAdmission(directory).admission_generation,
+                   fixture.physical_deployment_artifact_id,
+                   fixture.physical_deployment_revision,
+                   fixture.predecessor_graph_revision,
+                   fixture.predecessor_retained_bundle_id,
+                   "impact-physical-apply.1"));
+  const auto physical_status_request = ApplyStatusRequest(physical_submitted);
+  auto physical_applied = physical_submitted;
+  const auto physical_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  while (physical_applied.find("\"state\":\"succeeded\"") == std::string::npos &&
+         std::chrono::steady_clock::now() < physical_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    physical_applied = SendCommand(directory.socket_path(), physical_status_request);
+  }
+  ASSERT_NE(physical_applied.find("\"state\":\"succeeded\""), std::string::npos)
+      << physical_applied << "\nmanager stderr:\n" << ReadStartupStderr(directory);
+  const auto physical =
+      deployment::FilesystemVerifiedRetainedBundleSource(
+          directory.apply_package_root())
+          .get_verified(core::RetainedBundleId(
+              fixture.physical_candidate_retained_bundle_id));
+  ASSERT_NE(physical, nullptr);
+  const auto physical_graph_revision =
+      physical->value().cell_graph.graph_revision.value();
+
+  // Then Close (the Apply of the empty intent) without a Program: the active
+  // physical cell's components are removed, a destructive impact.
+  const auto close_prepared_activation_id =
+      PublishTestCloseWithoutProgram(directory, fixture);
   const auto admission =
       WaitForAuthoringAdmission(directory).admission_generation;
-  // Close (the Apply of the empty intent) has none of the fixture Program's
-  // components: the Program becomes non-executable, a destructive impact.
   std::string last_request;
   const auto submit = [&](const std::string_view request_id,
                           const std::string_view accepted) {
@@ -3349,9 +3418,9 @@ TEST(ManagerDaemonProcess,
         ApplyRequest(directory, before->source_owner_epoch, admission,
                      fixture.close_deployment_artifact_id,
                      fixture.close_deployment_revision,
-                     fixture.predecessor_graph_revision,
-                     fixture.predecessor_retained_bundle_id, request_id, {},
-                     false, accepted);
+                     physical_graph_revision,
+                     fixture.physical_candidate_retained_bundle_id, request_id,
+                     {}, false, accepted, close_prepared_activation_id);
     const auto response = SendCommand(directory.socket_path(), last_request);
     return response;
   };
@@ -3960,15 +4029,15 @@ TEST(ManagerDaemonProcess,
                         directory.apply_package_root(),
                         std::filesystem::copy_options::recursive);
   // The package and daemon activation repositories are distinct capabilities.
-  // Reuse the genuine stored product exactly as the gripper-only fixture does.
+  // Publish the genuine stored product with its whole closure, as the
+  // preparer does: the host reads the selected Program, its Binding and their
+  // catalog bytes from the activation root.
   const deployment::FilesystemPreparedActivationRepository package_activations(
       directory.apply_package_root());
   const auto prepared_activation = package_activations.get_verified(
       core::ContentDigest(RequiredText(metadata, "prepared_activation_id")));
   ASSERT_NE(prepared_activation, nullptr);
-  const deployment::FilesystemPreparedActivationRepository daemon_activations(
-      directory.activation_root());
-  ASSERT_TRUE(daemon_activations.put_if_absent(*prepared_activation));
+  PublishPreparedActivationClosure(directory, *prepared_activation);
   // Reuse the real installed-target loader and Program runner with only the
   // selected ROS executable and its actual shared candidate worker.
   const auto installed_manager = PrepareManagerApplyInstalledTargets(

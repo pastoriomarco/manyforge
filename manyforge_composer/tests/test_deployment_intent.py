@@ -679,12 +679,48 @@ def test_assistant_profile_aliases_come_from_the_maintained_profiles() -> None:
         assistant_profile_aliases,
     )
 
-    profiles = {
-        row["profileId"]: row["modelEndpointAliases"]
-        for row in assistant_profile_aliases()["profiles"]
+    aliases = assistant_profile_aliases()
+    assert aliases["schemaVersion"] == "manyforge.composer_assistant_profile_aliases.v2"
+    profiles = {row["profileId"]: row for row in aliases["profiles"]}
+    # The chat alias is bound by the assistant component's row, never listed.
+    assert profiles["assistant_scene_authoring"] == {
+        "profileId": "assistant_scene_authoring",
+        "chat": True,
+        "modelEndpointAliases": [],
     }
-    assert profiles["assistant_scene_authoring"] == ["assistant_model"]
-    assert profiles["semantic_shape_selection"] == ["assistant_model", "selection_model"]
+    assert profiles["semantic_shape_selection"]["chat"] is True
+    assert profiles["semantic_shape_selection"]["modelEndpointAliases"] == ["selection_model"]
+    assert profiles["vision_bin_selection"]["chat"] is False
+    assert profiles["vision_bin_selection"]["modelEndpointAliases"] == ["vision_model"]
+
+
+def test_an_assistant_row_is_a_lane_free_component() -> None:
+    intent = _intent()
+    row = {
+        "component_id": "assistant",
+        "component_profile_id": "manyforge.assistant",
+        "target_settings": {},
+        "configuration": {
+            "runtime_kind": "assistant",
+            "runtime_configuration": {
+                "model_component_id": "assistant_model",
+                "assistant_profile_id": "assistant_scene_authoring",
+            },
+            "lifecycle_command_timeout_s": 20.0,
+        },
+    }
+    intent["components"].append(row)
+    normalized = validate_deployment_intent(intent, source="test")
+    assert next(
+        component for component in normalized["components"]
+        if component["component_id"] == "assistant"
+    ) == row
+    intent["components"][-1] = {**row, "target_settings": {"arm": {}}}
+    with pytest.raises(DeploymentIntentError, match="must be empty for a lane-free component"):
+        validate_deployment_intent(intent, source="test")
+    intent["components"][-1] = {**row, "lane": "mock"}
+    with pytest.raises(DeploymentIntentError):
+        validate_deployment_intent(intent, source="test")
 
 
 def _with_fallbacks(primary: str, fallbacks: object) -> dict:

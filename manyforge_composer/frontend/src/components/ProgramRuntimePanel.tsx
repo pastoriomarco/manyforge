@@ -1645,13 +1645,13 @@ export function ProgramTransportControls({
   const programFullStopped = state.run?.state === 'full_stopped';
   // Execute and Resume follow the backend's RunReadiness. The
   // GUI adds only the in-flight guard, the Applied Program the request names,
-  // the unapplied-Draft reason (Composer-side, not part of RunReadiness) and,
+  // the Composer-side refusal (unapplied Draft, running assistant turn; not part of RunReadiness) and,
   // the Runner's own Run gate (scene preparation, Apply, runner).
   const readiness = program.readiness;
   const canRun = enabled
     && state.applied !== null
     && state.pending === null
-    && program.draftUnappliedReason === null
+    && program.composerRefusalReason === null
     && program.runnerAllows('program_run')
     && readiness?.can_execute === true;
   const stopCommandPending = ['stop', 'full-stop', 'reset']
@@ -1659,7 +1659,7 @@ export function ProgramTransportControls({
   const canResumeFullStop = enabled
     && programFullStopped
     && state.pending === null
-    && program.draftUnappliedReason === null
+    && program.composerRefusalReason === null
     && readiness?.can_resume === true;
   const readinessReasons = (readiness?.blocked_reasons ?? []).map(blockedReasonText);
   const runRefusalCode = program.runnerAllows('program_run') ? null : program.runnerRefusal('program_run');
@@ -1669,7 +1669,7 @@ export function ProgramTransportControls({
   const canActivateExecute = enabled
     && state.applied !== null
     && state.pending === null
-    && program.draftUnappliedReason === null
+    && program.composerRefusalReason === null
     && program.runnerAllows('program_run')
     && program.activation.available;
   const authoringAdmissionBlocked = authoringAdmissionAllowed === false;
@@ -1699,7 +1699,7 @@ export function ProgramTransportControls({
   const recoveryCommandAllowed = enabled
     && state.pending === null
     && state.controlPending === null
-    && program.draftUnappliedReason === null
+    && program.composerRefusalReason === null
     && readiness?.motion_clear === true;
   const offerControls = (
     offer: CycleRecoveryOffer,
@@ -1752,7 +1752,7 @@ export function ProgramTransportControls({
         ? 'Retry waits until stopping the Program\'s other motion is confirmed.'
         : `Retry is unavailable: ${(retryAction.disabledReasonCode ?? 'not allowed').replaceAll('_', ' ')}.`;
     }
-    return program.draftUnappliedReason
+    return program.composerRefusalReason
       ?? (controls.interventionStopScope === 'own_groups'
         ? `Retry ${offer.nodeInstanceId} and let its groups continue.`
         : recoveryHolds.length > 1
@@ -1964,7 +1964,7 @@ export function ProgramTransportControls({
       label: focusedHoldControls.continuePending ? 'Continuing' : 'Continue',
       enabled: focusedHoldControls.canContinue,
       reason: focusedHoldControls.canContinue ? null
-        : program.draftUnappliedReason
+        : program.composerRefusalReason
           ?? (focusedHoldControls.continueAction.enabled ? null
             : `Continue is unavailable: ${(focusedHoldControls.continueAction.disabledReasonCode ?? 'not allowed').replaceAll('_', ' ')}.`),
       run: () => requestContinue(focusedHoldControls),
@@ -2068,7 +2068,7 @@ export function ProgramTransportControls({
               && group.resumeAllowed
               && !releasePending
               && state.controlPending === null
-              && program.draftUnappliedReason === null
+              && program.composerRefusalReason === null
               && readiness?.motion_clear === true
               && ruleHold === null;
             const releaseLabel = group.state === 'ready' ? 'Run' : 'Resume';
@@ -2139,7 +2139,7 @@ export function ProgramTransportControls({
                         ? `${releaseLabel} ${group.groupId}: its stopped and not-yet-started motion continues.`
                         : group.state === 'running'
                           ? `${group.groupId} motion is running.`
-                          : program.draftUnappliedReason
+                          : program.composerRefusalReason
                             ?? group.resumeUnavailableReason?.replaceAll('_', ' ')
                             ?? `${releaseLabel} is unavailable for this group.`}
                   onClick={() => {
@@ -2225,7 +2225,7 @@ export function ProgramTransportControls({
                   ? 'Execute the exact Applied Program without starting robot motion.'
                   : canActivateExecute
                     ? `Activate the components that are not enabled, then execute the Program once.\n${readinessReasons.join('\n')}`
-                    : program.draftUnappliedReason
+                    : program.composerRefusalReason
                       ?? (readinessReasons.length > 0 ? readinessReasons.join('\n') : null)
                       ?? runRefusal
                       ?? blockedReason
@@ -2544,7 +2544,7 @@ export function ProgramTransportControls({
                   && retryTarget?.retryAction == null && !waitsForHold
                   && group?.resumeAllowed && group.state !== 'stopping'
                   && group.resumeUnavailableReason !== 'selected_motion_stop_settling'
-                  && program.draftUnappliedReason === null
+                  && program.composerRefusalReason === null
                   && readiness?.motion_clear === true) {
                 setResumeIntent(null);
                 void program.resumeMotion([resumeIntent.groupId]);

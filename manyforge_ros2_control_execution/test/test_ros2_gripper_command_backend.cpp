@@ -2145,11 +2145,12 @@ TEST(Ros2GripperCommandBackendTest,
     auto request = make_gripper_request(0.0, 0.2, 1.0, "ros_gripper_command",
                                         "driver_result");
     request.wait_for_duration = order != Case::kNoWait;
+    request.completion_timeout_s = 0.1;  // The node's bound after duration_s.
     ASSERT_TRUE(backend.command_gripper(request).accepted);
     ASSERT_TRUE(server.wait_for_goal());
     const auto state = [&] { return backend.get_gripper_status("tool").state; };
     if (order == Case::kDurationFirst) {
-      // Within the result deadline (duration + 0.1 s result timeout).
+      // Within the node's deadline (duration + 0.1 s completion timeout).
       clock.advance(250'000'000);
       scheduler.advance_to(clock.now());
       EXPECT_EQ(state(), core::GripperCommandState::kExecuting);
@@ -2417,7 +2418,6 @@ Ros2GripperActionConfig pneumatic_mock_config(const std::string &endpoint) {
   config.group_id = "gripper";
   config.joint_name = "finger_joint";
   config.wait_for_action_server_timeout_s = 1.0;
-  config.result_timeout_s = 0.1;
   return config;
 }
 
@@ -3487,10 +3487,11 @@ TEST(Ros2GripperCommandBackendTest,
   Ros2GripperCommandBackend backend(resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   auto config = pneumatic_none_config();
-  config.result_timeout_s = 0.001; // None has no delivery deadline.
   backend.configure_gripper_action("tool", config, 1'000'000'000);
   clock.advance(150'000'000);
-  const auto command = backend.command_gripper(pneumatic_none_request(0.2));
+  auto request = pneumatic_none_request(0.2);
+  request.completion_timeout_s = 0.001;  // None has no delivery deadline.
+  const auto command = backend.command_gripper(request);
   ASSERT_TRUE(command.accepted);
   const auto completed = backend.get_gripper_status("tool");
   EXPECT_EQ(completed.state, core::GripperCommandState::kCompleted);
@@ -3986,10 +3987,8 @@ TEST(Ros2GripperCommandBackendTest,
 
 TEST(
     Ros2GripperCommandBackendTest,
-    PneumaticTimeoutOmissionAndExplicitValuesRemainDistinctAndIgnoreProgramDwell) {
-  for (const std::optional<double> timeout :
-       {std::optional<double>{}, std::optional<double>{0.25},
-        std::optional<double>{5.0}, std::optional<double>{15.0}}) {
+    PneumaticDeliveryDeadlineIsTheNodeCompletionTimeoutAndIgnoresProgramDwell) {
+  for (const double timeout : {0.25, 5.0, 15.0}) {
     auto sink = std::make_shared<RecordingExecutionStateSink>();
     core::FakeClock clock;
     core::ManualScheduler scheduler;
@@ -4001,20 +4000,18 @@ TEST(
     ControlledPneumaticServer server(*resources, endpoint);
     TestTransportLifetime lifetime(*resources, backend);
     auto config = pneumatic_mock_config(endpoint);
-    config.result_timeout_s = timeout;
     backend.configure_gripper_action("tool", config, 1'000'000'000);
     backend.complete_ros_configuration();
     lifetime.start();
     ASSERT_TRUE(wait_for_gripper_fact(
         [&] { return backend.gripper_transport_readiness("tool").ready; }));
-    ASSERT_TRUE(backend
-                    .command_gripper(make_gripper_request(0.0, 90.0, 0.0,
-                                                          "ros_gripper_command",
-                                                          "output_delivery"))
-                    .accepted);
+    auto request = make_gripper_request(0.0, 90.0, 0.0, "ros_gripper_command",
+                                        "output_delivery");
+    request.completion_timeout_s = timeout;
+    ASSERT_TRUE(backend.command_gripper(request).accepted);
     ASSERT_TRUE(server.wait_for_goal());
     const auto deadline =
-        static_cast<core::Duration>(timeout.value_or(1.0) * 1e9);
+        static_cast<core::Duration>(timeout * 1e9);
     clock.advance(deadline - 1);
     scheduler.advance_to(clock.now());
     EXPECT_EQ(backend.get_gripper_status("tool").state,
@@ -4038,22 +4035,21 @@ TEST(
 }
 
 TEST(Ros2GripperCommandBackendTest,
-     PneumaticTimingRejectsZeroNegativeAndNonfiniteValuesIncludingNone) {
+     InvalidNodeCompletionTimeoutIsRefusedAndStalePneumaticPoliciesAreRejected) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   std::shared_ptr<Ros2TransportResources> resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
-  for (bool none : {false, true}) {
-    for (double timeout : {0.0, -1.0, std::numeric_limits<double>::infinity(),
-                           std::numeric_limits<double>::quiet_NaN()}) {
-      auto config = none ? pneumatic_none_config()
-                         : pneumatic_mock_config("/manyforge_invalid_timeout");
-      config.result_timeout_s = timeout;
-      EXPECT_THROW(backend.configure_gripper_action("invalid", config, 1'000'000'000),
-                   std::invalid_argument);
-    }
+  backend.configure_gripper_action("none", pneumatic_none_config(), 1'000'000'000);
+  for (double timeout : {0.0, -1.0, std::numeric_limits<double>::infinity(),
+                         std::numeric_limits<double>::quiet_NaN()}) {
+    auto request = pneumatic_none_request(0.0);
+    request.gripper_id = "none";
+    request.completion_timeout_s = timeout;
+    EXPECT_FALSE(backend.validate_gripper_command(request).ok());
+    EXPECT_FALSE(backend.command_gripper(request).accepted);
   }
   auto config = pneumatic_mock_config("/manyforge_stale_pneumatic_policy");
   for (const char *policy : {"position_reached", "driver_result",
@@ -4066,10 +4062,8 @@ TEST(Ros2GripperCommandBackendTest,
 
 TEST(
     Ros2GripperCommandBackendTest,
-    PositionTimeoutOmissionZeroFiveAndFifteenKeepDurationPlusTimeoutAndZeroDisable) {
-  for (const std::optional<double> timeout :
-       {std::optional<double>{}, std::optional<double>{0.0},
-        std::optional<double>{5.0}, std::optional<double>{15.0}}) {
+    PositionDeadlineIsDurationPlusTheNodeCompletionTimeout) {
+  for (const double timeout : {0.5, 5.0, 15.0}) {
     auto sink = std::make_shared<RecordingExecutionStateSink>();
     sink->set_joint_position("gripper", "finger_joint", 0.7);
     core::FakeClock clock;
@@ -4084,37 +4078,27 @@ TEST(
     auto config = pneumatic_mock_config(endpoint);
     config.actuation_kind = core::GripperActuationKind::kPositionCommanded;
     config.completion_policy = "position_reached";
-    config.result_timeout_s = timeout;
     backend.configure_gripper_action("tool", config, 1'000'000'000);
     backend.complete_ros_configuration();
     lifetime.start();
-    ASSERT_TRUE(backend
-                    .command_gripper(make_gripper_request(0.0, 0.25, 0.0,
-                                                          "ros_gripper_command",
-                                                          "position_reached"))
-                    .accepted);
+    auto request = make_gripper_request(0.0, 0.25, 0.0, "ros_gripper_command",
+                                        "position_reached");
+    request.completion_timeout_s = timeout;
+    ASSERT_TRUE(backend.command_gripper(request).accepted);
     ASSERT_TRUE(server.wait_for_goal());
-    const double effective = timeout.value_or(5.0);
-    if (effective == 0.0) {
-      clock.advance(90'000'000'000);
-      scheduler.advance_to(clock.now());
-      EXPECT_EQ(backend.get_gripper_status("tool").state,
-                core::GripperCommandState::kExecuting);
-    } else {
       const auto deadline =
-          static_cast<core::Duration>((effective + 0.25) * 1e9);
-      clock.advance(deadline - 1);
-      scheduler.advance_to(clock.now());
-      EXPECT_EQ(backend.get_gripper_status("tool").state,
-                core::GripperCommandState::kExecuting);
-      clock.advance(1);
-      scheduler.advance_to(clock.now());
-      const auto failed = backend.get_gripper_status("tool");
-      EXPECT_EQ(failed.state, core::GripperCommandState::kFailed);
-      ASSERT_TRUE(failed.error);
-      EXPECT_EQ(failed.error->code,
-                ros2_control_fault_reason::kGripperResultTimeout);
-    }
+        static_cast<core::Duration>((timeout + 0.25) * 1e9);
+    clock.advance(deadline - 1);
+    scheduler.advance_to(clock.now());
+    EXPECT_EQ(backend.get_gripper_status("tool").state,
+              core::GripperCommandState::kExecuting);
+    clock.advance(1);
+    scheduler.advance_to(clock.now());
+    const auto failed = backend.get_gripper_status("tool");
+    EXPECT_EQ(failed.state, core::GripperCommandState::kFailed);
+    ASSERT_TRUE(failed.error);
+    EXPECT_EQ(failed.error->code,
+              ros2_control_fault_reason::kGripperResultTimeout);
   }
 }
 

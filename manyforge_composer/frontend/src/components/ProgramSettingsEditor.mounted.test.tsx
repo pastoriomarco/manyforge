@@ -137,3 +137,31 @@ it('validates the Program corner blend radius as a non-negative distance', async
       expect.objectContaining({ blend_radius_m: 0.02, translation_tol_m: 0.005 }));
   } finally { await mounted.unmount(); }
 });
+
+it('updates only the motion defaults the Program declares by name', async () => {
+  const motionEntry = {
+    id: 'move', name: 'Move', category: 'motion', description: '', stability: 'stable',
+    kind: 'leaf', childrenMin: 0, childrenMax: 0, parameters: [], requiredCapabilities: [],
+    execution: { blocking: true, cancellable: true, ownerApi: 'kernel.operation' },
+    runners: { py_trees: 'move_v1' }, tags: [], minProgramProfile: 'composable-cell-v1',
+    blackboard: { reads: [], writes: [] }, ownerContext: null, outcomes: {},
+    eventFamily: 'manyforge.program.node',
+  } as CatalogEntry;
+  const mounted = await mountSettings({
+    ...program,
+    parameters: [
+      { parameter_id: 'cycle_velocity', type: 'float64', default: 0.2 },
+      { parameter_id: 'velocity_scale', type: 'float64', default: 0.5 },
+    ],
+  }, [motionEntry]);
+  try {
+    const velocity = () => mounted.find((p) => p['aria-label'] === 'Program global velocity scale');
+    expect(() => mounted.find((p) => p['aria-label'] === 'Program global acceleration scale')).toThrow();
+    await act(() => (velocity().onChange as (event: unknown) => void)(
+      { currentTarget: { valueAsNumber: 0.4 } }));
+    await act(() => mounted.find((p) => p.children === 'Update motion defaults').onClick?.());
+    expect(mounted.onMutate).toHaveBeenCalledWith('program_draft_update_motion_defaults', {
+      mode: 'update', velocity_scale: 0.4, conflict_resolution: 'reject',
+    });
+  } finally { await mounted.unmount(); }
+});

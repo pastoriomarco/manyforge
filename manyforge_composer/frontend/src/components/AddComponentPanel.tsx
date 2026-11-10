@@ -21,8 +21,10 @@ import {
   toolMountRow,
   withMountRobot,
 } from '../utils/componentManager';
+import { aiModelComponents } from './AiModelComponentForm';
+import { DEFAULT_ASSISTANT_PROFILE_ID, NO_AI_MODEL_FOR_ASSISTANT } from './AssistantComponentForm';
 
-const KINDS: readonly ComponentCatalogKind[] = ['machine', 'robot', 'tool', 'io_device', 'pose_source', 'ai_model', 'sensor'];
+const KINDS: readonly ComponentCatalogKind[] = ['machine', 'robot', 'tool', 'io_device', 'pose_source', 'ai_model', 'sensor', 'assistant'];
 
 /** An absolute ROS topic name (the compiler checks it fully). */
 const ROS_TOPIC = /^\/[A-Za-z0-9_/~{}]*$/;
@@ -131,6 +133,7 @@ function withId(draft: AddDraft, original: string, id: string): AddDraft {
 function addedComponentRows(
   draft: AddDraft,
   catalog: ComponentCatalog | null,
+  document: Record<string, JsonValue> | null,
 ): Array<Record<string, JsonValue>> | string {
   const entry = draft.machine === null ? draft.entry
     : machineCatalogEntry(draft.machine, draft.lane, catalog?.componentProfiles ?? {});
@@ -150,6 +153,8 @@ function addedComponentRows(
   if (entry.kind === 'sensor' && draft.sourceFrame.trim() === '') {
     return 'Enter the frame the cloud is published in.';
   }
+  const aiModels = aiModelComponents(document);
+  if (entry.kind === 'assistant' && aiModels.length === 0) return NO_AI_MODEL_FOR_ASSISTANT;
   const renamed = renameComponentRows(entry.components, draft.ids);
   const rows = entry.kind === 'tool' ? withMountRobot(renamed, draft.mountOn) : renamed;
   return rows.map((row) => {
@@ -165,6 +170,21 @@ function addedComponentRows(
             ...(object(configuration.runtime_configuration) ?? {}),
             topic: draft.topic.trim(),
             source_frame_id: draft.sourceFrame.trim(),
+          },
+        },
+      };
+    }
+    if (entry.kind === 'assistant') {
+      // Its AI model (the only one; several: chosen on its page) and the default chat profile.
+      const configuration = object(row.configuration) ?? {};
+      return {
+        ...row,
+        configuration: {
+          ...configuration,
+          runtime_configuration: {
+            ...(object(configuration.runtime_configuration) ?? {}),
+            ...(aiModels.length === 1 ? { model_component_id: aiModels[0].componentId } : {}),
+            assistant_profile_id: DEFAULT_ASSISTANT_PROFILE_ID,
           },
         },
       };
@@ -225,7 +245,7 @@ export function AddComponentPanel({ controller, catalog, catalogError, onAdded }
 
   const add = async () => {
     if (draft === null) return;
-    const rows = addedComponentRows(draft, catalog);
+    const rows = addedComponentRows(draft, catalog, document);
     if (typeof rows === 'string') {
       setError({ message: rows, refused: false });
       return;
@@ -254,7 +274,7 @@ export function AddComponentPanel({ controller, catalog, catalogError, onAdded }
     return (
       <div className="dactions">
         <button type="button" className="primary-action" disabled={disabled}
-          title={unavailable ?? 'Add a machine, robot, tool, I/O device, pose source, AI model or sensor to the Deployment Draft.'}
+          title={unavailable ?? 'Add a machine, robot, tool, I/O device, pose source, AI model, sensor or AI assistant to the Deployment Draft.'}
           onClick={() => { setOpen(true); setError(null); }}>Add component</button>
       </div>
     );
@@ -303,13 +323,14 @@ export function AddComponentPanel({ controller, catalog, catalogError, onAdded }
                   {entry.componentId}
                   {others.length > 0 ? ` + ${others.join(', ')}` : ''}
                   {machine !== null ? ` · ${machine.modelId}` : entry.lane !== null ? ` · ${entry.lane}` : ''}
-                  {entry.kind === 'sensor' ? ` · ${entry.description ?? ''}` : ''}
+                  {entry.kind === 'sensor' || entry.kind === 'assistant' ? ` · ${entry.description ?? ''}` : ''}
                   {entry.tags.length > 0 ? ` · ${entry.tags.join(', ')}` : ''}
                 </small>
               </span>
               <small>
                 {machine !== null ? `${machine.members.length} members`
                     : entry.kind === 'sensor' ? 'sensor model'
+                    : entry.kind === 'assistant' ? 'assistant model'
                     : `from ${entry.sources[0]}${entry.sources.length > 1 ? ` +${entry.sources.length - 1}` : ''}`}
               </small>
             </button>

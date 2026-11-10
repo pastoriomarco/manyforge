@@ -78,6 +78,7 @@ lanes:
     adapter: xarm
     controller: xarm6_traj_controller   # the vendor controller file's arm controller
     arrival_tolerance_rad: 0.01
+    runtime_scale: supported            # the arm controller claims position only
     vendor_model: xarm6                 # xarm_controller/config/xarm6_controllers.yaml
     robot_type: xarm
     dof: 6

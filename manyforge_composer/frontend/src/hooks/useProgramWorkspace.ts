@@ -261,7 +261,7 @@ export function useProgramWorkspace(
   const run = useCallback(async (
     action: ProgramWorkspaceActionName,
     request: () => Promise<ProgramWorkspaceRunResult>,
-    onAuthoringRefusal?: (message: string) => void,
+    onAuthoringRefusal?: (message: string, failed?: boolean) => void,
   ): Promise<ProgramWorkspaceRunResult | null> => {
     // A Scenario Discard is a Draft edit; whether any Scenario document has
     // unapplied changes is decided by its route and by the backend, never by
@@ -322,8 +322,9 @@ export function useProgramWorkspace(
       if (mounted.current) {
         dispatch({ type: 'request_failed', generation: current, error: failure });
       }
-      // New and Load show the server's typed refusal in their dialog.
-      if (replace) onAuthoringRefusal?.(failure);
+      // New and Load show the server's typed refusal in their dialog;
+      // `failed`: the reply stated a failed outcome, not a refusal.
+      if (replace) onAuthoringRefusal?.(failure, error instanceof KnownOutcomeError);
       // Another client's accepted edit moved the workspace ahead of this
       // request, or a Save wrote its document without adopting it as Saved.
       // Refresh both owners' truth once and never repeat the request; the
@@ -644,7 +645,7 @@ export function useProgramWorkspace(
   const activateScenarioDocument = useCallback((
     kind: 'new' | 'load',
     path: string | null,
-    onRefusal?: (message: string) => void,
+    onRefusal?: (message: string, failed?: boolean) => void,
   ) => {
     const label = kind === 'new' ? 'New Scenario' : 'Scenario Load';
     return run(`${kind}_scenario_document`, async () => {
@@ -671,9 +672,12 @@ export function useProgramWorkspace(
       };
     }, onRefusal);
   }, [run]);
-  /** `onRefusal` receives the reason when Load is refused before any effect. */
+  /**
+   * `onRefusal` receives the reason when Load is refused before any effect,
+   * or (`failed`) when the Load ran and its reply stated a failed outcome.
+   */
   const loadScenarioDocument = useCallback(
-    (path: string, onRefusal?: (message: string) => void) => activateScenarioDocument('load', path, onRefusal),
+    (path: string, onRefusal?: (message: string, failed?: boolean) => void) => activateScenarioDocument('load', path, onRefusal),
     [activateScenarioDocument],
   );
   /** New always works; the Scene is initialized. */

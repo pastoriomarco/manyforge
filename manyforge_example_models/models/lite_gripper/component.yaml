@@ -32,7 +32,6 @@ lanes:
     controller: lite_gripper_controller
     controllers_file: mock_controllers.yaml
     hard_stop_completion_timeout_s: 1.5
-    gripper_result_timeout_s: 5.0
     gripper_stop_finish_tolerance: 0.0004 # m of finger travel (5% of the 8.1 mm stroke): a Stop this close lets the command finish
   isaac:                          # Isaac lane adapter: the finger joint is in the robot's articulation
     adapter: isaac
@@ -46,4 +45,3 @@ lanes:
     open_effort: 5.0
     close_effort: -5.0
     publish_nominal_position: true
-    gripper_result_timeout_s: 5.0

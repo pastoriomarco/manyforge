@@ -1,6 +1,6 @@
 api_version: manyforge.program.v3
 program_id: ur5e_lite6_wall_grouped
-program_revision: sha256:f3c661528d8dbde16c3ebb901ec43818b1cb37a610a7dc9b5b2b146e6439b09e
+program_revision: sha256:dbcf2c9d29e8636d774a7904204043c96e6d95ae01daab1a806c4a19746b3d39
 program_profile: composable-cell-v1
 name: ur5e_lite6_wall_grouped
 description: Two independent joint trajectories in the UR5e + Lite6 wall cell, in one shared control group
@@ -104,7 +104,8 @@ tree:
       target: {component_id: lite6_robot, command_target_id: arm}
       base_frame: {component_id: lite6_robot, frame_id: base}
       tcp_endpoint:
-        kind: current
+        kind: default_of_target
+        target: {component_id: lite_gripper, command_target_id: gripper}
       goal:
       - joint_name: joint1
         position_rad: 0.3
@@ -142,7 +143,8 @@ tree:
       target: {component_id: ur5e_robot, command_target_id: arm}
       base_frame: {component_id: ur5e_robot, frame_id: base}
       tcp_endpoint:
-        kind: current
+        kind: default_of_target
+        target: {component_id: robotiq_2f_85, command_target_id: gripper}
       goal:
       - joint_name: shoulder_pan_joint
         position_rad: -0.45

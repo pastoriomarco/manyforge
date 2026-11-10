@@ -4,21 +4,36 @@ The Composer AI tab lets a chat model edit the Program Draft through a fixed
 set of tools. This page covers setup, the checks to run, and common failures.
 
 ```text
-AI tab -> Composer /api/assistant/requests -> manyforge_assistant_bridge (:8100)
+AI tab -> Composer /api/assistant/requests -> assistant component's bridge (loopback)
        -> your OpenAI-compatible model server ({base_url}/chat/completions)
-model tool calls -> bridge -> Composer /api/assistant/bridge/tools/{tool}
+model tool calls -> bridge (checks arguments) -> Composer /api/assistant/bridge/tools/{tool}
        -> Program Draft (same Draft and fences as manual edits)
+operator -> reviews the Draft -> Apply (or Discard)
 ```
+
+The model server is yours (§1). The Deployment names it with an `ai_model`
+component, and an AI assistant component runs the bridge with the model loop
+(§2, §3). You review and Apply (§4).
 
 ## 1. Run a model server
 
 ManyForge never starts or manages the model server. Run any OpenAI-compatible
 server that supports tool calling (`tools`, `tool_choice: "auto"`), reachable
-from the ManyForge host.
+from the ManyForge host. Nothing in ManyForge is tied to a particular model:
+the Deployment names the server and the model.
 
 - The served model name must equal the component's `model`.
 - `base_url` is the `/v1` root: ManyForge calls `{base_url}/models` and
   `{base_url}/chat/completions`.
+- Requests are non-streaming chat completions. They carry no sampling
+  parameters unless the profile sets `request_contract.sampling`, so the
+  model's or server's defaults apply.
+- With constrained regeneration on (the default `composer-assistant` profile),
+  a repair call also uses `response_format: {type: "json_schema"}`
+  ([§5](#5-what-the-assistant-does-for-you)). A server without structured
+  output still works; that repair call just falls back.
+- The workbench uses host networking, so `127.0.0.1` in `base_url` is the
+  host running ManyForge.
 
 llama.cpp (GGUF):
 
@@ -33,10 +48,43 @@ calls are not parsed.
 vLLM:
 
 ```bash
-vllm serve <model path or HF id> --served-model-name gemma4-12b-it-gguf \
+vllm serve <model path or HF id> --served-model-name <served name> \
   --enable-auto-tool-choice --tool-call-parser <parser for the model family> \
   --host 127.0.0.1 --port 8000
 ```
+
+Use the tool-call parser (and, for a reasoning model, the reasoning parser)
+that the model family documents.
+
+### Example: vLLM on a Jetson AGX Thor
+
+An example only; pick the model and its parsers for your own hardware. It runs
+the official `vllm/vllm-openai` container (v0.33) with a Qwen3-family NVFP4
+checkpoint:
+
+```bash
+docker run --rm --name model-server --runtime nvidia --network host --ipc=host \
+  -v <hf cache>:/root/.cache/huggingface \
+  -v <flashinfer cache>:/root/.cache/flashinfer \
+  vllm/vllm-openai:<v0.33 tag or digest> \
+  --model <checkpoint> --served-model-name <served name> \
+  --host 127.0.0.1 --port 8000 \
+  --gpu-memory-utilization 0.85 --max-num-seqs 4 \
+  --kv-cache-dtype bfloat16 --enable-prefix-caching \
+  --reasoning-parser qwen3 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --disable-flashinfer-autotune
+```
+
+- `--disable-flashinfer-autotune`: FlashInfer's autotune can stall a Jetson
+  for a long time at startup. Keep the FlashInfer cache mounted so compiled
+  kernels persist across restarts.
+- A 27B-class model takes about 5–8 minutes to become ready; `/v1/models`
+  answers only then.
+- Speculative decoding (a draft model or an MTP head) changes only speed,
+  not the output distribution.
+- Lower `--gpu-memory-utilization` when other GPU work (perception, Isaac Sim)
+  shares the device.
 
 Check:
 
@@ -44,10 +92,12 @@ Check:
 curl -fsS http://127.0.0.1:8000/v1/models   # must list the model name
 ```
 
-## 2. Add the AI model component to the Deployment
+## 2. Add the AI model and assistant components to the Deployment
 
-The Deployment needs an assistant profile (`assistant_profile_id`, for example
-`assistant_scene_authoring`) and at least one component of kind `ai_model`:
+The Deployment needs at least one component of kind `ai_model` and one AI
+assistant component (kind `assistant`, one per cell) that names it. The
+example Scenarios name `gemma4-12b-it-gguf`; set `model` to whatever your
+server serves:
 
 ```json
 {
@@ -65,8 +115,41 @@ The Deployment needs an assistant profile (`assistant_profile_id`, for example
 }
 ```
 
-You can also add it in Composer: **Components > Custom I/O device or AI model >
-Add AI model** (fields Component id, Base URL, Model, Token environment variable).
+The assistant component chooses the chat's AI model and its assistant
+profile ([Assistant profile](#assistant-profile)); the profile must have a
+chat mode:
+
+```json
+{
+  "component_id": "assistant",
+  "component_profile_id": "manyforge.assistant",
+  "configuration": {
+    "runtime_kind": "assistant",
+    "runtime_configuration": {
+      "model_component_id": "assistant_model",
+      "assistant_profile_id": "assistant_scene_authoring"
+    }
+  },
+  "target_settings": {}
+}
+```
+
+In Composer:
+
+1. **Components > Custom I/O device or AI model > Add AI model.** Fill in
+   Component id (default `assistant_model`), Base URL, Model and, optionally,
+   Token environment variable, then **Create AI model**. This adds the
+   component to the Deployment Draft only.
+2. **Components > Add component > AI assistant.** Pick the entry and **Add to
+   Draft**. On its **AI assistant** card choose the **AI model** (preset when
+   there is only one) and the **Assistant profile** (profiles with a chat
+   mode; default `assistant_scene_authoring`).
+3. Edit the AI model fields later in its **AI models** section; with several
+   AI models, choose one per runtime alias under **AI model aliases**
+   ([Several AI models](#several-ai-models)).
+4. **Apply** the Deployment, then Enable the components. Nothing changes for
+   the assistant until Apply: until then the AI tab keeps using the Applied
+   model and warns "The Deployment Draft names … ; Apply it to use it."
 
 - `base_url`: absolute `http(s)` URL of the `/v1` root.
 - `model`: the served model name.
@@ -83,16 +166,17 @@ Add AI model** (fields Component id, Base URL, Model, Token environment variable
 
 ### Several AI models
 
-An assistant profile names one or more model aliases (for example
-`assistant_model` for the chat and `selection_model` for a Program's model
-query). With exactly one `ai_model` component, it serves every alias. With
-several, choose the component for each alias in Composer
-(**Deployment > Cell settings > AI model aliases**), which writes the Deployment member
-`assistant_model_components`:
+The chat alias `assistant_model` is always the AI assistant component's
+`model_component_id`; it cannot be mapped in `assistant_model_components`.
+The Deployment's own `assistant_profile_id` names the runtime model aliases
+of a Program's model query (for example `selection_model` for
+`query_model`). With exactly one `ai_model` component, it serves every such
+alias. With several, choose the component for each alias in Composer
+(**Deployment > Cell settings > AI model aliases**), which writes the
+Deployment member `assistant_model_components`:
 
 ```json
 "assistant_model_components": {
-  "assistant_model": "chat_model",
   "selection_model": "selection_model"
 }
 ```
@@ -101,12 +185,69 @@ An alias without an entry uses the only `ai_model` component. Compile
 refusals: no `ai_model` component gives `assistant_ai_model_component_missing`;
 an alias left unmapped with several components, or an entry that names an
 unknown alias or a component that is not an `ai_model`, gives
-`assistant_model_component_unresolved`.
+`assistant_model_component_unresolved` (also for an assistant component whose
+`model_component_id` names no `ai_model`).
 
 ## 3. Start and check
 
-The launcher always starts the bridge on `127.0.0.1:8100` and passes
-`--assistant-bridge-url` to Composer. Nothing else needs configuring.
+The bridge is the AI assistant component's process; no launcher starts it.
+The component follows the usual lifecycle:
+
+- **Prepare** (or Recover) starts the component's host, which binds a
+  loopback socket on a free port.
+- **Enable** starts the bridge on that socket
+  (`python -m manyforge_assistant_bridge.bridge --fd <N>`), waits until its
+  `/health` answers and publishes its URL as the component endpoint
+  `assistant_request`. Composer reads the URL from there for every call.
+- **Disable** stops the bridge: running requests end `cancelled` and the
+  conversation history is dropped. After a restart (about 1–2 s, on a new
+  port) the old request ids answer `assistant_request_not_found`.
+- While a request runs, the component's activity is `busy` (it may lag by up
+  to 1 s). Its `bridge` stream is fresh while `/health` answers (budget 5 s;
+  stale is a warning).
+- If the host or the bridge exits, the component faults
+  (`fault_process_exited`); like any component fault it latches the cell and
+  blocks Execute. Recover, then Enable.
+
+Enabling the assistant does not depend on the AI model being enabled; the AI
+tab and Composer check the model separately. The bridge reads the model
+endpoint from the Applied Deployment for every request, so a new model URL or
+token variable takes effect after Apply. Its other settings are environment
+variables it inherits from the execution host:
+
+| Variable | Default |
+|---|---|
+| `MANYFORGE_HEADLESS_API_URL` | `http://127.0.0.1:9010` (the launchers pass the Headless URL) |
+| `MANYFORGE_COMPOSER_URL` | `http://127.0.0.1:9000` (the launchers pass the Composer port) |
+| `MANYFORGE_ASSISTANT_AUDIT_LOG` | Set by the host: `controller-launch-artifacts/<component_id>/assistant-audit.jsonl` under the execution run root |
+
+### Assistant profile
+
+The assistant component's `assistant_profile_id` selects the chat profile from
+`manyforge_deployment/resources/maintained/maintained_assistant_profiles.v2.json`;
+the example Scenarios use `assistant_scene_authoring`. Only a profile with a
+chat mode is accepted. The Deployment's own `assistant_profile_id` selects a
+profile only for the prompt templates and model aliases of runtime model
+queries ([Several AI models](#several-ai-models)). The profile holds no
+endpoint (that is the `ai_model` component); it sets the request limits and
+the chat mode's behaviour:
+
+| Field | Meaning | `assistant_scene_authoring` |
+|---|---|---|
+| `request_contract.default_timeout_s` | Time limit of one model call (`upstream_timeout`); at most 3600 | 180 |
+| `request_contract.max_output_tokens` | `max_tokens` of each model call; at most 65536 | 8192 |
+| `request_contract.reasoning` | Optional, experimental: `on`/`off` sends `chat_template_kwargs: {enable_thinking: true/false}`; absent sends nothing, so the server's default applies. A constrained-regeneration call always sends `false` when `on` | `off` |
+| `request_contract.sampling` | Optional: `{temperature?, top_p?, top_k?}` (`temperature` 0–2, `top_p` above 0 up to 1, `top_k` a positive integer; at least one field) sends exactly the fields set; absent sends no sampling parameters, so the model's or server's defaults apply | not set |
+| `stuck_loop_recovery` | Hints after repeated failures and a clarification stop ([§5](#5-what-the-assistant-does-for-you)); default on | on |
+| `constrained_regeneration` | Experimental: one schema-constrained repair of an invalid edit ([§5](#5-what-the-assistant-does-for-you)); default off | on |
+| `compact_history` | Experimental: keep each finished exchange as request, answer and a list of Draft changes; default off | off |
+| `catalog.tools` | The tools the mode offers | 26 tools ([contract](../reference/ASSISTANT_PROVIDER_CONTRACT.md#mode-and-tools)) |
+
+Independently of the profile, one request is limited to 16 model turns and
+180 s in total (`assistant_timeout`). A limit above the bridge's caps fails
+with `assistant_provider_configuration_invalid`. The profiles ship with
+ManyForge; changing one is a source change
+([Identities and pins](../reference/IDENTITY_AND_PINNING.md)).
 
 Program model requests that attach an image require a connected Composer
 3D viewer. Both Program runner launch paths provide the Composer
@@ -136,33 +277,94 @@ again when the server returns. Override the budget with a
 Quick checks:
 
 ```bash
-curl -fsS http://127.0.0.1:3000/api/health          # assistant_bridge: configured
-curl -fsS http://127.0.0.1:3000/api/assistant/modes # ai_model_component_id set
+curl -fsS http://127.0.0.1:3000/api/assistant/modes # assistant_component_id, ai_model_component_id set
+curl -fsS http://127.0.0.1:3000/api/components      # the assistant is enabled, with an assistant_request endpoint
 ```
 
 ## 4. Use the AI tab
 
-- The AI tab is enabled when the bridge is configured and the active
-  Deployment has an AI model component and an assistant profile. Otherwise
-  it shows "No AI model component in this Deployment".
-- There is one mode, `composer-assistant`. The model can read the node
-  catalog, skills, Deployment capabilities, Program and scene, and edit the
-  scene objects, tree, parameters and blackboard of the Draft.
+- The AI tab is enabled while the active Deployment's AI assistant component
+  and its AI model are enabled and no Program run exists (a paused or held
+  run counts). Otherwise its tooltip says why, the first that applies: "Add
+  an Assistant component"; "A Program run exists: the assistant runs only
+  while no run exists"; "Assistant faulted: Recover it"; "Assistant is
+  prepared: Enable it" (or "not prepared"); "Assistant is offline"; "AI model
+  `<id>` is …". When the AI model's `endpoint` stream is stale, a yellow
+  notice says "AI model `<id>`: endpoint not answering"; sending still works.
+- Chat and Program runs never overlap. A chat request is refused while a run
+  exists (`assistant_program_active`). While a request from the AI tab runs,
+  Execute (also Run, Resume and Retry) is disabled with "An assistant request
+  is running: wait or cancel it", and Composer refuses it with
+  `execution_assistant_turn_in_progress`. Nothing is cancelled automatically.
+  Composer is the only gate: clients that call Headless or the Program runner
+  directly must follow the same rule.
+- The panel docks at the bottom; the 3D view stays visible. Closing it keeps
+  the conversation.
+- There is one mode, `composer-assistant` (shown as **Read/Write**). The model
+  can read the node catalog, Deployment capabilities, the Program and the
+  scene, and edit the scene objects, tree, Program parameters and blackboard
+  of the Draft.
+- The model may insert any node the palette offers for this cell: every
+  stable catalog node whose capabilities the Deployment provides. The set
+  follows the Applied Deployment.
+- Type a request; Enter sends, Shift+Enter adds a line. While it runs, the
+  header shows Working and the elapsed time, and **Cancel** stops it. If the
+  outcome is unclear, **Recheck** reads the request status again. **Retry**
+  sends the last message again as a new request.
+- Each reply shows a summary (tool calls, whether the Draft changed) and a
+  list of the Draft changes in plain words. The side column shows the model,
+  endpoint and timeout, the mode, the orientation forms the model may use
+  (RPY, Delta, Local, World, Quat, Ref), and the tool calls of the last reply
+  with their arguments and results.
+- A reply marked **needs your answer** means the assistant stopped to ask
+  ([§5](#5-what-the-assistant-does-for-you)); answer in the next message.
+- **New conversation** clears the context the model sees.
+
+### Review and Apply
+
 - Edits land in the Program Draft immediately, through the same Draft engine
-  and revision fences as manual edits. There is no separate accept step:
-  review the Draft, then Apply it, or Discard/Revert it, as for manual edits.
-- The chat may insert the motion, gripper, scene, logic, composite, timer and
-  simulation nodes of its allowlist. It cannot insert pick/place planning
-  nodes (`planning.plan_pick_sequence`, `planning.plan_place_sequence`); add
-  those by hand.
+  and revision fences as manual edits. A banner says so: "The assistant edited
+  the Program Draft. Apply to use the changes, or Discard the Draft to undo
+  them."
+- Review the Draft as for any edit: the tree, the scene, and the Draft
+  diagnostics. The assistant may leave a composite incomplete while building
+  step by step; it shows as a diagnostic, and Apply refuses an incomplete
+  Program.
+- Apply makes the Draft the active Program. Discard/Revert undoes the
+  assistant's edits. There is no separate accept step.
 - The model never receives the MCP operator adapter, and it cannot save,
   Apply, run a Program or move a robot.
-- Cancel stops an in-flight request. New conversation clears the history.
 
-## 5. Run the Mock smoke scripts
+## 5. What the assistant does for you
 
-Use a Mock Scenario with an applied assistant Deployment and a loaded Program
-Draft, such as `examples/mock_ur10e_assistant_scene_authoring.scenario`. Keep the
+These run inside one request and need no action:
+
+- **Field-level corrections.** An invalid tool call is not run. The model gets
+  the field path and the expected shape (for example
+  `node.parameters.position: expected coordinate_position {kind: ...}`) and
+  corrects it in the next turn. The failed call shows as `failed` in the Tool
+  calls list; the request continues.
+- **Constrained regeneration** (profile `constrained_regeneration`,
+  experimental). When a Draft edit has invalid arguments, the assistant asks
+  the model once more for that one call, with the call's full JSON Schema as
+  a structured-output constraint. A repaired call is checked and run like any
+  other and shows `regenerated: true` in its result. If the repair fails (the
+  server refuses the schema, times out, or the reply is cut off or not JSON),
+  the original error stands and the result shows `regenerationFailed` with
+  the reason; the request goes on as usual.
+- **Stuck-loop recovery** (profile `stuck_loop_recovery`). When the same tool
+  fails with the same kind of error a second time, or the same edit is
+  repeated with identical arguments, the model gets a hint to change approach.
+  At the fifth repeat the request stops and the assistant asks you for
+  clarification, listing what it tried. Rephrase or simplify the request.
+- **Turn limit.** After 16 model turns without an answer the request stops
+  with "The assistant reached its bounded turn limit before completing." and
+  needs your answer.
+
+## 6. Run the Mock smoke scripts
+
+Use a Mock Scenario with an applied Deployment that has an enabled AI
+assistant component and a loaded Program Draft, such as `examples/mock_ur10e_assistant_scene_authoring.scenario`. Keep the
 Composer and ManyForge services on the same host where the smoke command runs.
 For the local setup above, configure the chat component's `base_url` as
 `http://127.0.0.1:8000/v1` and set its `model` to the exact served name.
@@ -199,9 +401,9 @@ python3 scripts/smoke-assistant-scene-authoring.py --confirm-draft-only
 
 All scripts accept `--composer-url` (default `http://127.0.0.1:3000`, the
 Composer frontend proxy; the internal Composer API defaults to port 9020),
-`--expected-component-id` to check a multi-model chat alias mapping, and
-`--timeout-seconds` (1–900, default 180). For example, if
-`assistant_model` maps to `chat_model`, pass
+`--expected-component-id` to check which AI model serves the chat, and
+`--timeout-seconds` (1–900, default 180). For example, if the assistant
+component's `model_component_id` is `chat_model`, pass
 `--expected-component-id chat_model`.
 
 The full check leaves its new object in the Program Draft. It verifies that
@@ -214,7 +416,7 @@ the scripts submit each request once and do not retry an uncertain outcome.
 
 ## Recipes
 
-Run each on a Mock Scenario with an assistant profile, for example
+Run each on a Mock Scenario with an AI assistant component, for example
 `examples/mock_ur10e_assistant_scene_authoring.scenario`.
 
 | Recipe | Prompt | Pass signal |
@@ -222,26 +424,63 @@ Run each on a Mock Scenario with an assistant profile, for example
 | Read | "What objects are in the scene?" | Answer names the scene objects; no Draft change |
 | Scene edit + Discard | "Add a 10 cm box named `crate` at x=0.5, y=0, z=0.05." | Box appears in the Draft; Discard removes it; Saved/Applied unchanged |
 | Tree edit + Apply | "Insert a move to joint target `home` at the start of the tree." | Node appears in the Draft; Apply makes it the active Program |
-| Refused node | "Insert a plan_pick_sequence node." | The model reports it cannot; Draft unchanged |
+| Clarification | "Delete it." (with several candidates) | The assistant asks which one; Draft unchanged |
 | Cancel | Send a long request, press Cancel | Status `cancelled`; no further Draft change |
+| Disable mid-request | Send a long request, Disable the assistant | The reply fails with a typed reason; the audit records `cancelled`; Enable starts a new, empty conversation |
 | Model down | Stop the model server | the `endpoint` stream shows stale on the component; a chat request fails with `upstream_unavailable`; the stream turns fresh after restart |
 
 ## Failure codes
 
+A request that fails shows a red reply with a typed code. Codes that end a
+request:
+
+| Code | Meaning | What to do |
+|---|---|---|
+| `assistant_component_absent` | The active Deployment has no AI assistant component | Add one and Apply ([§2](#2-add-the-ai-model-and-assistant-components-to-the-deployment)) |
+| `assistant_component_not_enabled` | The assistant is not enabled (or faulted), so no bridge serves | Enable it; Recover it first if it faulted |
+| `assistant_program_active` | A Program run exists (also paused or held); the chat runs only while none does | Stop or finish the run |
+| `assistant_ai_model_not_enabled` | The assistant's AI model component is not enabled | Enable it |
+| `assistant_mode_projection_unavailable` | No Applied Deployment, or its assistant projection is not available | Apply the Deployment and retry |
+| `assistant_ai_model_absent` | No `ai_model` component serves the chat alias in the active Deployment | Add one and Apply ([§2](#2-add-the-ai-model-and-assistant-components-to-the-deployment)) |
+| `ai_model_token_unavailable` | `api_key_env` names a variable that was not exported before starting the workbench; nothing was sent | Export it, restart the workbench |
+| `upstream_unavailable` | The model server cannot be reached | Start it; check `base_url` with `curl {base_url}/models` |
+| `upstream_http_error` | The server answered with an HTTP error; the message gives the status (404: wrong model name; 401/403: token; 400: request refused) | See [Troubleshooting](TROUBLESHOOTING.md#ai-assistant) |
+| `upstream_timeout` | One model call took longer than `default_timeout_s` | Check the server load; retry when the model is ready |
+| `assistant_timeout` | The whole request took longer than 180 s | Ask for less at once, or retry |
+| `upstream_response_invalid` / `upstream_response_oversized` | The reply is not one standard chat completion, or exceeds its size bound | Check the server's tool-call parser; try a model with reliable tool calling |
+| `assistant_projection_stale` / `assistant_catalog_mismatch` | The active Deployment changed during the request | Retry |
+| `assistant_projection_unavailable` | The Applied Deployment is not fully available yet | Wait until Apply completes, then retry |
+| `assistant_provider_configuration_invalid` | The profile's limits exceed the bridge's caps | Use a maintained profile |
+| `assistant_callback_timeout` | Composer did not answer a Draft edit in time; whether it took effect is unknown | Check the Draft before retrying |
+| `assistant_provider_unavailable` / `assistant_provider_timeout` | Composer cannot reach the bridge | Check the assistant component's state and its `bridge` stream (`GET /api/components`) |
+| `assistant_request_not_found` | The bridge restarted (Disable/Enable or Recover); its old requests are gone | Send the request again |
+| `assistant_request_capacity_exhausted` | Too many requests are running | Wait or cancel one |
+
+Shown inside a reply's Tool calls, not as a failure (the model corrects
+itself): `assistant_tool_arguments_invalid` (with field path and expected
+shape), `assistant_callback_arguments_invalid`,
+`assistant_owner_response_oversized` (read less at once),
+`assistant_node_not_found`, an unknown tool name, `regenerationFailed`, and the
+`assistant_repeated_tool_failure` recovery hint.
+
+Deployment compile refusals (shown at Apply):
+
 | Code | Meaning |
 |---|---|
-| `assistant_mode_projection_unavailable` | The active Deployment has no assistant profile |
-| `assistant_ai_model_absent` (chat) | No `ai_model` component serves the chat alias in the active bundle |
-| `ai_model_token_unavailable` | `api_key_env` names a variable that was not exported before starting the workbench |
-| `ai_model_api_key_env_invalid` (compile) | `api_key_env` does not start with `MANYFORGE_AI_` |
-| `assistant_model_component_unresolved` (compile) | Several `ai_model` components and an alias without a mapping, or a mapping to an unknown alias or component |
-| `upstream_unavailable` / `upstream_timeout` / `upstream_http_error` | The model server is down, slow, or refused the request (check URL, token, served name) |
-| `upstream_response_invalid` / `response_rejected` | The model returned malformed output or called a tool outside the mode; try a model with reliable tool calling |
-| `assistant_projection_stale` / `assistant_catalog_mismatch` | The active Deployment changed during the request; retry |
+| `ai_model_api_key_env_invalid` | `api_key_env` does not start with `MANYFORGE_AI_` |
+| `ai_model_configuration_invalid` | `base_url` is not an absolute `http(s)` URL, or `model` is empty |
+| `assistant_ai_model_component_missing` | The assistant profile needs an `ai_model` component |
+| `assistant_model_component_unresolved` | Several `ai_model` components and an alias without a mapping, a mapping to an unknown alias or component, or an assistant component whose `model_component_id` names no `ai_model` |
+| `assistant_component_duplicate` | More than one AI assistant component; a cell has at most one |
+| `assistant_profile_has_no_chat_mode` | The assistant component's profile has no chat mode |
 
-The bridge writes a bounded audit log (`MANYFORGE_ASSISTANT_AUDIT_LOG`, 10 MB x
-3 files; in the workbench under the runtime root's
-`current/assistant-bridge/audit.jsonl`, see
+Execute refusal: `execution_assistant_turn_in_progress` (a chat request from
+Composer is running; wait for it or cancel it).
+
+The bridge writes a bounded audit log (`MANYFORGE_ASSISTANT_AUDIT_LOG`, 10 MiB per
+file, the active file plus 3 backups;
+`controller-launch-artifacts/<component_id>/assistant-audit.jsonl` under the
+execution run root, see
 [Observability](OBSERVABILITY.md#assistant-bridge-audit)). It
 holds identities, hashes and outcomes, never prompt text, responses or
 argument values.

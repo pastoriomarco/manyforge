@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <exception>
 #include <filesystem>
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/assistant_settings_codec.hpp>
+#include <manyforge_deployment/component_spec.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -42,6 +44,21 @@ Value AiModel(std::string id, std::string model = "gemma4-12b-it-gguf",
                                   {"api_key_env", std::move(api_key_env)}})}})}});
 }
 
+/// Authored assistant component (`manyforge.assistant`).
+Value Assistant(std::string model_component_id,
+                std::string profile_id = "assistant_scene_authoring",
+                std::string id = "assistant") {
+  return Value(Object{
+      {"component_id", Value(std::move(id))},
+      {"component_profile_id", Value("manyforge.assistant")},
+      {"target_settings", Value(Object{})},
+      {"configuration",
+       Value(Object{{"runtime_kind", Value("assistant")},
+                    {"runtime_configuration",
+                     Value(Object{{"model_component_id", Value(std::move(model_component_id))},
+                                  {"assistant_profile_id", Value(std::move(profile_id))}})}})}});
+}
+
 Value Intent(Array components,
              std::optional<std::string> assistant_profile_id = std::nullopt,
              Object assistant_model_components = {}) {
@@ -69,6 +86,15 @@ detail::PreparedActivationMaterialization Materialize(const Value &authored) {
       detail::resolve_activation_component_profiles(root, intent);
   return detail::materialize_prepared_activation(
       root, {}, intent, c::CellId("authored_ai_model_cell"), profiles, false);
+}
+
+template <class Call> std::string TypedCode(Call call) {
+  try {
+    call();
+  } catch (const c::TypedError &error) {
+    return error.code();
+  }
+  return {};
 }
 
 std::string Refusal(const Value &authored) {
@@ -184,10 +210,9 @@ TEST(ActivationAiModel, InvalidComponentsAreRefused) {
                std::invalid_argument);
 }
 
-TEST(ActivationAiModel, AssistantProfileCompilesWithTheAiModelComponent) {
-  const auto materialized =
-      Materialize(Intent(Array{AiModel("assistant_model", "served-model")},
-                         "assistant_scene_authoring"));
+TEST(ActivationAiModel, AssistantComponentCompilesTheChatWithItsAiModel) {
+  const auto materialized = Materialize(Intent(
+      Array{Assistant("assistant_model"), AiModel("assistant_model", "served-model")}));
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &bundle = *materialized.bundle;
   ASSERT_TRUE(bundle.value().assistant.has_value());
@@ -205,9 +230,28 @@ TEST(ActivationAiModel, AssistantProfileCompilesWithTheAiModelComponent) {
   ASSERT_EQ(settings.modes.size(), 1U);
   EXPECT_EQ(settings.modes.front().mode_id, "composer-assistant");
   EXPECT_EQ(settings.modes.front().model_endpoint_alias, "assistant_model");
-  ASSERT_EQ(settings.provider_aliases.size(), 1U);
-  EXPECT_EQ(settings.modes.front().provider_alias,
-            settings.provider_aliases.front().provider_alias);
+  EXPECT_EQ(settings.modes.front().assistant_component_id, "assistant");
+  EXPECT_EQ(settings.modes.front().runs_in,
+            (std::vector<c::AssistantModeRunState>{
+                c::AssistantModeRunState::kNoProgramActive}));
+  // The assistant component provides the chat's bridge request.
+  const auto &providers = bundle.value().capability_provider_bindings;
+  const auto bridge = std::find_if(providers.begin(), providers.end(), [](const auto &row) {
+    return row.capability_id.value() == "assistant.bridge.request";
+  });
+  ASSERT_NE(bridge, providers.end());
+  EXPECT_EQ(bridge->provider_manifest_id.value(), "manyforge.provider.assistant_bridge");
+  EXPECT_EQ(bridge->scope, c::CapabilityScope::kCellGlobal);
+  EXPECT_TRUE(bridge->endpoint_bindings.empty());
+}
+
+TEST(ActivationAiModel, ADeploymentLevelChatProfileAloneHasNoChat) {
+  // The chat alias is bound by the assistant component only: a Deployment
+  // with a chat-only profile and no assistant component retains nothing.
+  const auto materialized = Materialize(
+      Intent(Array{AiModel("assistant_model")}, "assistant_scene_authoring"));
+  ASSERT_NE(materialized.bundle, nullptr);
+  EXPECT_FALSE(materialized.bundle->value().assistant.has_value());
 }
 
 TEST(ActivationAiModel, OneComponentServesEveryModelAlias) {
@@ -219,9 +263,49 @@ TEST(ActivationAiModel, OneComponentServesEveryModelAlias) {
       materialized.bundle->normalized_root().find_object_member("assistant");
   ASSERT_NE(retained, nullptr);
   const auto qualified = d::verify_retained_assistant_projection(*retained);
-  ASSERT_EQ(qualified.value().model_endpoint_aliases.size(), 2U);
-  for (const auto &alias : qualified.value().model_endpoint_aliases)
-    EXPECT_EQ(alias.model_id, "qwen-served") << alias.model_endpoint_alias;
+  // Its runtime alias only: the chat alias is the assistant component's.
+  ASSERT_EQ(qualified.value().model_endpoint_aliases.size(), 1U);
+  EXPECT_EQ(qualified.value().model_endpoint_aliases.front().model_endpoint_alias,
+            "selection_model");
+  EXPECT_EQ(qualified.value().model_endpoint_aliases.front().model_id, "qwen-served");
+  EXPECT_TRUE(qualified.value().modes.empty());
+}
+
+/// The `assistant.model.query` provider rows of a compiled bundle.
+std::vector<c::CapabilityProviderBindingDTO>
+ModelQueryRows(const detail::PreparedActivationMaterialization &materialized) {
+  std::vector<c::CapabilityProviderBindingDTO> rows;
+  for (const auto &row : materialized.bundle->value().capability_provider_bindings)
+    if (row.capability_id.value() == "assistant.model.query") rows.push_back(row);
+  return rows;
+}
+
+// A usable model query (prompt templates and a model endpoint) compiles to
+// one cell-global assistant.model.query binding; a profile without prompt
+// templates offers none.
+TEST(ActivationAiModel, PromptTemplatesCompileToTheModelQueryCapability) {
+  const auto with_templates = Materialize(
+      Intent(Array{AiModel("assistant_model")}, "semantic_shape_selection"));
+  ASSERT_NE(with_templates.bundle, nullptr);
+  EXPECT_TRUE(d::verify_retained_bundle_identity(*with_templates.bundle));
+  const auto rows = ModelQueryRows(with_templates);
+  ASSERT_EQ(rows.size(), 1U);
+  const auto &row = rows.front();
+  EXPECT_EQ(row.capability_provider_binding_id.value(),
+            "authored_ai_model_cell.assistant-model-query.provider");
+  EXPECT_EQ(row.scope, c::CapabilityScope::kCellGlobal);
+  EXPECT_EQ(row.provider_instance_id.value(),
+            "authored_ai_model_cell.assistant_model_query");
+  EXPECT_EQ(row.provider_manifest_id.value(), "manyforge.provider.assistant_model_query");
+  EXPECT_TRUE(row.endpoint_bindings.empty());
+
+  const auto without_templates = Materialize(
+      Intent(Array{AiModel("assistant_model")}, "assistant_scene_authoring"));
+  ASSERT_NE(without_templates.bundle, nullptr);
+  EXPECT_TRUE(ModelQueryRows(without_templates).empty());
+  const auto without_profile = Materialize(Intent(Array{AiModel("assistant_model")}));
+  ASSERT_NE(without_profile.bundle, nullptr);
+  EXPECT_TRUE(ModelQueryRows(without_profile).empty());
 }
 
 TEST(ActivationAiModel, TwoComponentsCompileToTwoDomainsAndStreams) {
@@ -305,11 +389,13 @@ TEST(ActivationAiModel, LifecycleBudgetCompilesToTheComponentsOwnRow) {
 }
 
 TEST(ActivationAiModel, MappingSelectsTheComponentOfEachAlias) {
+  // The chat alias resolves to the assistant row's model; the runtime aliases
+  // through `assistant_model_components`.
   const auto materialized = Materialize(Intent(
-      Array{AiModel("chat_model", "cosmos"), AiModel("selection_model", "qwen")},
+      Array{Assistant("chat_model"), AiModel("chat_model", "cosmos"),
+            AiModel("selection_model", "qwen")},
       "semantic_shape_selection",
-      Object{{"assistant_model", Value("chat_model")},
-             {"selection_model", Value("selection_model")}}));
+      Object{{"selection_model", Value("selection_model")}}));
   ASSERT_NE(materialized.bundle, nullptr);
   const auto *retained =
       materialized.bundle->normalized_root().find_object_member("assistant");
@@ -328,15 +414,17 @@ TEST(ActivationAiModel, MappingSelectsTheComponentOfEachAlias) {
 TEST(ActivationAiModel, UnresolvedAliasComponentsAreRefused) {
   const Array two{AiModel("chat_model"), AiModel("selection_model")};
   // Two components and no mapping entry for an alias.
-  ExpectRefused(Intent(two, "assistant_scene_authoring"),
+  ExpectRefused(Intent(two, "semantic_shape_selection"),
                 "assistant_model_component_unresolved");
+  // The chat alias is bound by the assistant component, never mapped.
   ExpectRefused(Intent(two, "semantic_shape_selection",
-                       Object{{"assistant_model", Value("chat_model")}}),
+                       Object{{"assistant_model", Value("chat_model")},
+                              {"selection_model", Value("selection_model")}}),
                 "assistant_model_component_unresolved");
   // The mapping names a component that is not an AI model component.
-  ExpectRefused(Intent(Array{AiModel("assistant_model")},
-                       "assistant_scene_authoring",
-                       Object{{"assistant_model", Value("other_model")}}),
+  ExpectRefused(Intent(Array{AiModel("selection_model")},
+                       "semantic_shape_selection",
+                       Object{{"selection_model", Value("other_model")}}),
                 "assistant_model_component_unresolved");
   // The mapping key is not an alias of the profile.
   ExpectRefused(Intent(Array{AiModel("assistant_model")},
@@ -349,6 +437,57 @@ TEST(ActivationAiModel, UnresolvedAliasComponentsAreRefused) {
                           Object{{"assistant_model", Value("assistant_model")}}),
                    {}),
                std::invalid_argument);
+}
+
+TEST(ActivationAiModel, AssistantComponentRefusals) {
+  // Its model reference names no AI model component.
+  ExpectRefused(Intent(Array{Assistant("other_model"), AiModel("chat_model")}),
+                "assistant_model_component_unresolved");
+  // One assistant per cell.
+  EXPECT_EQ(TypedCode([] {
+              (void)Materialize(Intent(Array{Assistant("chat_model"), AiModel("chat_model"),
+                                             Assistant("chat_model", "assistant_scene_authoring",
+                                                       "second_assistant")}));
+            }),
+            "assistant_component_duplicate");
+  // Its profile has no chat mode.
+  EXPECT_EQ(TypedCode([] {
+              (void)Materialize(
+                  Intent(Array{Assistant("chat_model", "vision_bin_selection"), AiModel("chat_model")}));
+            }),
+            "assistant_profile_has_no_chat_mode");
+  // Its configuration is exactly the model and the profile.
+  auto extra = Assistant("chat_model").as_object();
+  for (auto &[name, value] : extra) {
+    if (name != "configuration") continue;
+    auto configuration = value.as_object();
+    for (auto &[field, settings] : configuration)
+      if (field == "runtime_configuration") {
+        auto row = settings.as_object();
+        row.emplace_back("port", Value(8100.0));
+        settings = Value(std::move(row));
+      }
+    value = Value(std::move(configuration));
+  }
+  EXPECT_FALSE(Refusal(Intent(Array{Value(std::move(extra)), AiModel("chat_model")})).empty());
+}
+
+// The assistant row and its model's endpoint are its spec: a profile change
+// or a changed model URL replaces it, an unrelated edit retains it.
+TEST(ActivationAiModel, AssistantSpecCoversItsProfileAndItsModelsEndpoint) {
+  const auto spec = [](Array components) {
+    const auto materialized = Materialize(Intent(std::move(components)));
+    return d::component_spec_fingerprint(d::component_spec(
+        *materialized.bundle, d::SiteFacts{}, c::ControllableComponentId("assistant")));
+  };
+  const auto base = spec(Array{Assistant("chat_model"), AiModel("chat_model")});
+  EXPECT_NE(base, spec(Array{Assistant("chat_model", "semantic_shape_selection"),
+                             AiModel("chat_model")}));
+  EXPECT_NE(base, spec(Array{Assistant("chat_model"),
+                             AiModel("chat_model", "gemma4-12b-it-gguf", Value(nullptr),
+                                     "http://127.0.0.1:8001/v1")}));
+  EXPECT_EQ(base, spec(Array{Assistant("chat_model"), AiModel("chat_model"),
+                             AiModel("other_model")}));
 }
 
 TEST(ActivationAiModel, AssistantProfileWithoutAiModelIsRefused) {

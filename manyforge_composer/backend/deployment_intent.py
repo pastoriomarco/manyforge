@@ -421,22 +421,25 @@ def _validate_model_free_component(
     }
 
 
-SENSOR_RUNTIME_KIND = "sensor"
+# Runtime kinds of lane-free adapter components: their own model (no lane,
+# no model asset): a sensor (e.g. the point-cloud source) or the assistant.
+LANE_FREE_RUNTIME_KINDS = frozenset({"sensor", "assistant"})
 
 
-def _is_sensor_component(component: dict[str, Any]) -> bool:
+def _is_lane_free_component(component: dict[str, Any]) -> bool:
     configuration = component.get("configuration")
     return (
         isinstance(configuration, dict)
-        and configuration.get("runtime_kind") == SENSOR_RUNTIME_KIND
+        and configuration.get("runtime_kind") in LANE_FREE_RUNTIME_KINDS
     )
 
 
-def _validate_sensor_component(component: dict[str, Any], label: str) -> dict[str, Any]:
-    """A sensor component (`kind: sensor` model, e.g. the point-cloud
-    source): its model (no lane), empty target settings and an optional
-    lifecycle time; its runtime configuration (topic, source frame, limits)
-    is checked by the compiler."""
+def _validate_lane_free_component(component: dict[str, Any], label: str) -> dict[str, Any]:
+    """A lane-free adapter component (`kind: sensor` or `kind: assistant`
+    model): its model (no lane), empty target settings and an optional
+    lifecycle time; its runtime configuration (a sensor's topic, source frame
+    and limits; the assistant's model and profile) is checked by the
+    compiler."""
 
     _require_exact_fields(
         component,
@@ -449,7 +452,7 @@ def _validate_sensor_component(component: dict[str, Any], label: str) -> dict[st
         label=label,
     )
     if component["target_settings"] != {}:
-        _fail(f"{label}.target_settings must be empty for a sensor")
+        _fail(f"{label}.target_settings must be empty for a lane-free component")
     configuration = _require_object(component["configuration"], f"{label}.configuration")
     _require_exact_fields(
         configuration,
@@ -610,12 +613,12 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
         label = f"{source}: components[{index}]"
         component = _require_object(raw_component, label)
         model_free = _is_model_free_component(component)
-        sensor = _is_sensor_component(component)
-        if model_free or sensor or _is_machine_owner(component) or (
+        lane_free = _is_lane_free_component(component)
+        if model_free or lane_free or _is_machine_owner(component) or (
             "owner" in component and "model_source" not in component
         ):
-            if sensor:
-                normalized = _validate_sensor_component(component, label)
+            if lane_free:
+                normalized = _validate_lane_free_component(component, label)
             elif model_free:
                 normalized = _validate_model_free_component(component, label)
             elif "owner" in component:

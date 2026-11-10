@@ -353,8 +353,12 @@ def _validate(
                 _fail(path, f"number violates {keyword}")
 
 
-def validate_callback_arguments(value: Any, schema: Any) -> None:
-    """Validate one detached callback payload against one generated schema."""
+def validate_callback_arguments(value: Any, schema: Any, *, path: str = "$") -> None:
+    """Validate one detached callback payload against one generated schema.
+
+    `schema` is its own root: local references resolve inside it. `path`
+    names the payload's location in the call's arguments.
+    """
 
     if type(schema) is not dict:
         raise CallbackSchemaValidationError("$schema", "schema must be an object")
@@ -362,7 +366,7 @@ def validate_callback_arguments(value: Any, schema: Any) -> None:
         value,
         schema,
         root=schema,
-        path="$",
+        path=path,
         depth=0,
         budget=_Budget(),
         ref_stack=(),

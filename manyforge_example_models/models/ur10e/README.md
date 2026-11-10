@@ -24,8 +24,10 @@ Contents:
 - `component.yaml`: the component descriptor. Kind `robot` (`universal_robots.ur10e`), lanes `mock` and `isaac`.
 - `mock_controllers.yaml`: the controllers of its Mock lane row (`controllers_file`).
 
-Element text, geometry, origins, limits and vendor tags are copied unchanged;
-only `<robot name>` and the mount joint's parent link differ. The cut drops the
+Element text, geometry, origins, limits and vendor tags are copied unchanged,
+except that `<robot name>` and the mount joint's parent link differ and the arm
+URDF adds `version="1.2"` and the joint acceleration limits documented below
+(`<limit acceleration>`). The cut drops the
 combined SRDF's collision pairs that cross the mount. Apply disables collisions
 between the two rigid link groups that meet at a mount; any other arm-tool
 pairs that never touch are listed on the Deployment's attachment row

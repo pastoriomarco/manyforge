@@ -28,13 +28,13 @@ from check_maintained_deployment_sources import (
 
 
 DESCRIPTION_API: Final = "manyforge.maintained_deployment_sources.v1"
-ASSISTANT_API: Final = "manyforge.maintained_assistant_profiles.v1"
+ASSISTANT_API: Final = "manyforge.maintained_assistant_profiles.v2"
 CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1\0"
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:1c557174fd45649c43d2e20239ec614635ca31aa79608d87727e35edcf8c2c90"
+    "sha256:b37e963e21f9c72c47f713d7bc6b5f24fb680e2126d0f29e4cc4ed86fc9155ba"
 )
 EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.empty.v1"
@@ -115,6 +115,11 @@ CAPABILITIES: Final = {
         "cell_global",
         "capability_provider_binding",
     ),
+    "assistant.model.query": (
+        "sha256:b136ad03b4ca732ee49c4ec34cfb00bb79f1bd1dcd3961784affa51417e23806",
+        "cell_global",
+        "capability_provider_binding",
+    ),
     "ai.model.invoke": (
         "sha256:c458ea512ad5b71be1a3a9f92908d8a36b2a9a8f5cb3b31556c42e0d468c9270",
         "target_binding",
@@ -162,11 +167,6 @@ CAPABILITIES: Final = {
     ),
     "execution.reset": (
         "sha256:24fa527d5e81814f8a395d1d3eeae3c3236c1249b05d84d2cd48abf3f2a27ebb",
-        "target_binding",
-        "control_binding",
-    ),
-    "execution.runtime_scale.operation_scoped": (
-        "sha256:4ee00df7b3510c1490c83e247d12b73553ab53e4e6673da53ebea475fb756fad",
         "target_binding",
         "control_binding",
     ),
@@ -332,12 +332,6 @@ ARM_CAPABILITIES: Final = tuple(
             "validation.trajectory.non_collision",
         }
     )
-)
-# The historical closure is the original 36 facilities less the removed
-# operation Pause/Resume (maintainer, 2026-10-08). Scaling is an
-# additional native-qualified realization, not an unqualified ROS claim.
-NATIVE_ARM_CAPABILITIES: Final = tuple(
-    sorted((*ARM_CAPABILITIES, "execution.runtime_scale.operation_scoped"))
 )
 GRIPPER_CAPABILITIES: Final = tuple(
     sorted(
@@ -581,9 +575,7 @@ def capability_selector(capability_id: str) -> dict[str, str]:
     }
 
 
-def component_type_document(
-    family: dict[str, Any], *, runtime_scaling: bool = True
-) -> dict[str, Any]:
+def component_type_document(family: dict[str, Any]) -> dict[str, Any]:
     """Return a component type of one model family.
 
     A family without arm joints is a tool (its `gripper` target
@@ -594,7 +586,7 @@ def component_type_document(
     family_id = family["model_family_id"]
     semantics = family["semantics"]
     if not source_joint_names(family, "arm_joints"):
-        return tool_component_type_document(family, runtime_scaling=runtime_scaling)
+        return tool_component_type_document(family)
     collision_roles = {
         row["collision_body_role_id"]
         for row in semantics["collision_body_role_bindings"]
@@ -614,9 +606,7 @@ def component_type_document(
     ]
     value = {
         "api_version": "manyforge.component_type.v1",
-        "component_type_id": (
-            f"{family_id}{'' if runtime_scaling else '.fixed_scale'}.component"
-        ),
+        "component_type_id": f"{family_id}.component",
         "tags": ["articulated-arm"],
         "model_roles": [{"model_role_id": "arm_model", "cardinality": "exactly_one"}],
         "component_root": {
@@ -656,9 +646,7 @@ def component_type_document(
                 "collision_body_roles": arm_collision_roles,
                 "capabilities": [
                     capability_selector(capability_id)
-                    for capability_id in (
-                        NATIVE_ARM_CAPABILITIES if runtime_scaling else ARM_CAPABILITIES
-                    )
+                    for capability_id in ARM_CAPABILITIES
                 ],
             },
         ],
@@ -685,9 +673,7 @@ def component_type_document(
     )
 
 
-def tool_component_type_document(
-    family: dict[str, Any], *, runtime_scaling: bool = True
-) -> dict[str, Any]:
+def tool_component_type_document(family: dict[str, Any]) -> dict[str, Any]:
     """Return the component type of a tool family.
 
     One `gripper` target on model role `tool_model`; the component root and
@@ -710,9 +696,7 @@ def tool_component_type_document(
     )
     value = {
         "api_version": "manyforge.component_type.v1",
-        "component_type_id": (
-            f"{family_id}{'' if runtime_scaling else '.fixed_scale'}.component"
-        ),
+        "component_type_id": f"{family_id}.component",
         "tags": ["gripper", "tool"],
         "model_roles": [{"model_role_id": "tool_model", "cardinality": "exactly_one"}],
         "component_root": {"model_role_id": "tool_model", "frame_role_id": root},
@@ -1562,7 +1546,7 @@ def catalog_sources(
     control_capabilities = tuple(
         sorted(
             capability_id
-            for capability_id in set(NATIVE_ARM_CAPABILITIES + GRIPPER_CAPABILITIES)
+            for capability_id in set(ARM_CAPABILITIES + GRIPPER_CAPABILITIES)
             if CAPABILITIES[capability_id][2] == "control_binding"
         )
     )
@@ -1578,7 +1562,7 @@ def catalog_sources(
     native_arm_capabilities = tuple(
         sorted(
             capability_id
-            for capability_id in NATIVE_ARM_CAPABILITIES
+            for capability_id in ARM_CAPABILITIES
             if CAPABILITIES[capability_id][2] == "control_binding"
         )
     )
@@ -1622,25 +1606,31 @@ def catalog_sources(
             CELL_CAPABILITIES,
             ["logical_scene_services"],
         ),
+        # The assistant component: its bridge's endpoint is published at
+        # runtime in its component state (role `assistant_request`), not
+        # bound statically.
         "assistant_bridge": provider_manifest(
             "manyforge.provider.assistant_bridge",
-            ("assistant.bridge.request",),
-            ["assistant_request"],
+            ("assistant.bridge.request",
+             *(f"component.lifecycle.{intent}" for intent in LIFECYCLE_INTENTS)),
+            [],
         ),
         "model_endpoint": provider_manifest(
             "manyforge.provider.model_endpoint",
             ("assistant.model.invoke",),
             ["model_inference"],
         ),
+        # The compiled fact that a model query is usable (prompt templates
+        # and a model endpoint); it calls no endpoint itself.
+        "assistant_model_query": provider_manifest(
+            "manyforge.provider.assistant_model_query",
+            ("assistant.model.query",),
+            [],
+        ),
         "lite6_arm": native_arm_manifest,
         "lite6_gripper": native_gripper_manifest,
         "ros2_control": ros2_control_provider_manifest(
-            tuple(
-                value
-                for value in control_capabilities
-                if value != "execution.runtime_scale.operation_scoped"
-            ),
-            planner_capabilities,
+            control_capabilities, planner_capabilities
         ),
     }
     for key, document in manifests.items():
@@ -1696,12 +1686,6 @@ def catalog_sources(
     )
 
     component_references: dict[str, dict[str, str]] = {}
-    # Every family with a ROS controller profile (Isaac or offline mock, also
-    # those only composed by generated multi-robot cells) has the fixed-scale
-    # ROS component type. Every family has one.
-    fixed_scale_families = {
-        family["model_family_id"] for family in description["model_families"]
-    }
     for family in description["model_families"]:
         document = component_type_document(family)
         family_id = family["model_family_id"]
@@ -1720,24 +1704,6 @@ def catalog_sources(
         )
         sources[f"component:{family_id}"] = source
         component_references[family_id] = source[2]
-        if family_id in fixed_scale_families:
-            # A target declaration is a required capability set, not optional
-            # advertising. Reuse the generator for the fixed-scale profile;
-            # never promise native scaling through an unqualified ROS provider.
-            fixed = component_type_document(family, runtime_scaling=False)
-            sources[f"component:fixed_scale:{family_id}"] = generated_catalog_document(
-                root=root,
-                relative_path=(
-                    "manyforge_deployment/resources/maintained/catalog/"
-                    f"component_type/{fixed['component_type_id']}.json"
-                ),
-                kind="component_type",
-                record_id=fixed["component_type_id"],
-                record_revision=fixed["component_type_revision"],
-                schema_id="manyforge.component_type.v1",
-                schema_revision=schemas["component_type"],
-                value=fixed,
-            )
 
     command_path = (
         root / "manyforge_deployment/resources/catalog/gripper.command_position.v1.yaml"
@@ -1820,18 +1786,6 @@ def site_overlay(
                 "value": {
                     "value_kind": "string",
                     "value": endpoint["endpoint_value"],
-                },
-            }
-        provider = profile["provider_alias"]
-        if provider is not None:
-            reference = provider["site_overlay_value_ref"]
-            values[reference] = {
-                "site_overlay_value_ref": reference,
-                "semantic_kind": "external_resource",
-                "resource_kind": "service_endpoint",
-                "value": {
-                    "value_kind": "string",
-                    "value": provider["endpoint_value"],
                 },
             }
     value = revisioned_document(

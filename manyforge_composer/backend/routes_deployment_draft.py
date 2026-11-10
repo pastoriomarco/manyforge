@@ -588,21 +588,26 @@ def discard_deployment_draft(state: ComposerState, body: Any) -> None:
 
 _ASSISTANT_PROFILES = (
     Path(__file__).resolve().parents[2]
-    / "manyforge_deployment/resources/maintained/maintained_assistant_profiles.v1.json"
+    / "manyforge_deployment/resources/maintained/maintained_assistant_profiles.v2.json"
 )
+# Bound by the assistant component's row, never by the Deployment's aliases.
+_CHAT_MODEL_ALIAS = "assistant_model"
 
 
 def assistant_profile_aliases() -> dict[str, Any]:
-    """The model aliases of each maintained assistant profile (read-only)."""
+    """Each maintained assistant profile: its chat mode and runtime aliases."""
 
     profiles = json.loads(_ASSISTANT_PROFILES.read_text(encoding="utf-8"))["profiles"]
     return {
-        "schemaVersion": "manyforge.composer_assistant_profile_aliases.v1",
+        "schemaVersion": "manyforge.composer_assistant_profile_aliases.v2",
         "profiles": [
             {
                 "profileId": row["profile_id"],
+                "chat": row["mode_profile_id"] is not None,
                 "modelEndpointAliases": sorted(
-                    endpoint["model_endpoint_alias"] for endpoint in row["model_endpoints"]
+                    endpoint["model_endpoint_alias"]
+                    for endpoint in row["model_endpoints"]
+                    if endpoint["model_endpoint_alias"] != _CHAT_MODEL_ALIAS
                 ),
             }
             for row in sorted(profiles, key=lambda row: row["profile_id"])
@@ -1560,16 +1565,21 @@ def manager_apply_failure(failure: dict[str, Any], terminal: str) -> ApplyStepFa
 
     details = failure.get("cause_details")
     details = details if isinstance(details, dict) else {}
+    before_effect = (
+        terminal == "failed" and failure.get("effect_boundary") == "before_effect"
+    )
     if details.get("cause_code"):
         return ApplyStepFailed(
             str(details["cause_code"]),
             str(details.get("cause") or failure.get("message") or ""),
             str(details["component_id"]) if details.get("component_id") else None,
+            before_effect=before_effect,
         )
     return ApplyStepFailed(
         str(failure.get("cause_code") or failure.get("code") or f"manager_apply_{terminal}"),
         str(failure.get("message") or f"Manager Apply ended {terminal}"),
         str(details["component_id"]) if details.get("component_id") else None,
+        before_effect=before_effect,
     )
 
 

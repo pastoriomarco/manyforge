@@ -72,7 +72,11 @@
                   "component_id": "lite6_robot"
                 },
                 "tcp_endpoint": {
-                  "kind": "current"
+                  "kind": "default_of_target",
+                  "target": {
+                    "command_target_id": "gripper",
+                    "component_id": "lite_gripper"
+                  }
                 }
               },
               "value_sources": {
@@ -139,7 +143,11 @@
                   "component_id": "lite6_robot"
                 },
                 "tcp_endpoint": {
-                  "kind": "current"
+                  "kind": "default_of_target",
+                  "target": {
+                    "command_target_id": "gripper",
+                    "component_id": "lite_gripper"
+                  }
                 }
               },
               "value_sources": {
@@ -213,7 +221,11 @@
                   "component_id": "ur5e_robot"
                 },
                 "tcp_endpoint": {
-                  "kind": "current"
+                  "kind": "default_of_target",
+                  "target": {
+                    "command_target_id": "gripper",
+                    "component_id": "robotiq_2f_85"
+                  }
                 }
               },
               "value_sources": {
@@ -280,7 +292,11 @@
                   "component_id": "ur5e_robot"
                 },
                 "tcp_endpoint": {
-                  "kind": "current"
+                  "kind": "default_of_target",
+                  "target": {
+                    "command_target_id": "gripper",
+                    "component_id": "robotiq_2f_85"
+                  }
                 }
               },
               "value_sources": {

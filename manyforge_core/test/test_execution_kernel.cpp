@@ -7484,9 +7484,11 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
   // backend handle itself completes.
   const auto* progress = controlled_execution.execution_progress_publication();
   ASSERT_NE(progress, nullptr);
+  EXPECT_TRUE(progress->acquire().valid);
   controlled_execution.complete();
+  // Once the backend completes, the kernel worker may already have retired
+  // the generation (invalid, non-terminal); either way no terminal marker.
   const auto after_late_completion = progress->acquire();
-  EXPECT_TRUE(after_late_completion.valid);
   EXPECT_FALSE(after_late_completion.terminal);
 
   for (int attempt = 0; attempt < 1000; ++attempt) {

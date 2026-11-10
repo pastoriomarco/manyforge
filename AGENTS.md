@@ -51,7 +51,8 @@ cd manyforge
 driver); it may recreate stale/modified dependency trees under `.docker/`.
 The `dev` Compose service is the ROS-free test toolchain, not the workbench.
 Do not run it over dependency edits you need to preserve. Startup incrementally
-builds required native targets and starts one workbench; an optional project is
+builds required native targets in a separate step, then starts one workbench
+(the start timeout bounds readiness only); an optional project is
 loaded through the ordinary application path;
 it does not run tests or qualify a release. Subsequent starts reuse the cache:
 

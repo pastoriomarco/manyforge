@@ -74,6 +74,16 @@ struct PreparedActivationAssemblyInput final {
     const ProgramBindingContract &program,
     const ICatalogArtifactSource &catalog, const IRawArtifactStore &raw_artifacts);
 
+/// Assemble the `no_program` prepared activation of a candidate applied
+/// without a Program (for example a Close): no Program, binding or catalog
+/// artifacts; the candidate's model-map artifact (if any) and the global I/O
+/// Stop products qualified without a Program. `input.assistant_mode` must be
+/// "optional". Verified like any stored value.
+[[nodiscard]] PreparedActivationInput assemble_prepared_activation_without_program(
+    const PreparedActivationAssemblyInput &input, const RetainedBundle &bundle,
+    const std::optional<VerifiedRetainedModelMap> &model_map,
+    const IRawArtifactStore &raw_artifacts);
+
 /// Immutable content-addressed store of prepared activations under one
 /// trusted activation root (`prepared-activations/<hex>.json`).
 ///

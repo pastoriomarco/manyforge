@@ -969,12 +969,12 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             active_graph = stack.fixture_metadata["physical_graph_revision"]
 
             # The UR10e + Robotiq 2F-140 example cell: one model per physical
-            # component; the assistant's AI model has its model-free endpoint.
+            # component; the cell I/O and the assistant's AI model are model-free.
             assert {row["model_instance_id"] for row in source_model["occurrences"]} == {
                 "ur10e_robot.model", "robotiq_2f_140.model"
             }
             assert {row["component_id"] for row in source_model["targets"]} == {
-                "ur10e_robot", "robotiq_2f_140", "assistant_model"
+                "ur10e_robot", "robotiq_2f_140", "cell_io", "assistant_model"
             }
             assert node_environment["retained_bundle_id"] == active_bundle
             assert node_environment["graph_revision"] == active_graph
@@ -1183,9 +1183,11 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 for row in replacement_draft["program"].get("scene", [])
             }
 
+            # The bridge's callback timeout: a committed edit also runs the
+            # reference validation, which a fresh Composer prepares cold.
             def invoke(body: dict) -> tuple[str, str]:
                 try:
-                    with HeadlessHttpClient(stack.composer_url) as client:
+                    with HeadlessHttpClient(stack.composer_url, timeout_seconds=10.0) as client:
                         result = client.request(
                             "POST",
                             "/api/assistant/bridge/tools/scene_draft_add_object",

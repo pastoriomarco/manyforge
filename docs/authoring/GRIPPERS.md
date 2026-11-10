@@ -202,15 +202,15 @@ with a position gripper set it. In a Pick or Place template,
 `tool_wait_for_duration` sets it on the template's gripper node, like
 `tool_command_duration_s`.
 
-If the controller's report doesn't come, the command fails after its result
-timeout (`gripper_result_timeout`):
+The node owns the command's deadline: `completion_timeout_s` (default 5 s;
+`tool_completion_timeout_s` in a Pick or Place template). If the gripper has
+not reported done (goal result or confirming signal) by then, the command
+fails with `gripper_result_timeout`:
 
-- controlled grippers: `gripper_result_timeout_s` in the component model's
-  lane row (5 s in the component template; the Robotiq examples use 15 s),
-  counted after `command_duration_s`;
-- pneumatic grippers: `delivery_result_timeout_s` on the gripper's row of the
-  Deployment's Current gripper configuration, default 1 s, for the output
-  write's delivery result.
+- controlled grippers: `command_duration_s` plus `completion_timeout_s`
+  (the Robotiq example Programs set 15 s);
+- pneumatic grippers: `completion_timeout_s` alone bounds the output write's
+  delivery result; the `command_duration_s` dwell follows it.
 
 **Stop.** A Stop sends no cancel when a controlled gripper's command is
 already done: the controller reported it reached the goal, the fingers are

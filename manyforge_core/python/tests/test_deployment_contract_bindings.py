@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -874,7 +875,7 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
     assert len({row.capability_id for row in registry}) == len(registry)
     assert all(row.requirement_parameters_schema_ref is None for row in registry)
     assert core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY_DIGEST == (
-        "sha256:5f7eedf93f5bafe37e49149ceb32d09a7794b5792a823e7e786f0d288d4d5883"
+        "sha256:a8cd4531c38c0e4dafcc44193968bdbc25a4fe9036c711c190b4dcd896701794"
     )
     assert core.find_builtin_capability_definition("context.state.current") is None
 
@@ -1811,7 +1812,7 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
-            "sha256:1c557174fd45649c43d2e20239ec614635ca31aa79608d87727e35edcf8c2c90",
+            "sha256:b37e963e21f9c72c47f713d7bc6b5f24fb680e2126d0f29e4cc4ed86fc9155ba",
         ),
         (
             "manyforge.value_schema.runtime.io_provider_execution.v1",
@@ -1967,8 +1968,8 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
         },
         "modes": {
             "inspect": {
+                "assistant_component_id": "assistant",
                 "catalog": {
-                    "nodes": [],
                     "skills": [],
                     "tools": ["scene_inspect", "status_read"],
                 },
@@ -1980,16 +1981,10 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
                     "session_kind": None,
                 },
                 "model_endpoint_alias": "primary_model",
-                "provider_alias": "direct_local",
+                "runs_in": ["no_program_active"],
             }
         },
         "prompt_templates": {},
-        "provider_aliases": {
-            "direct_local": {
-                "bridge_external_resource_alias": "assistant_bridge",
-                "provider_kind": "direct",
-            }
-        },
     }
     external_resources = [
         {
@@ -2027,7 +2022,10 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
     assistant_candidate = candidate.assistant_settings
     assert assistant_candidate.source_was_present
     assert assistant_candidate.enabled
-    assert json.loads(assistant_candidate.normalized_source_canonical_json) == assistant
+    # Normalization writes the mode's stuck-loop recovery default (OD-76).
+    normalized = copy.deepcopy(assistant)
+    normalized["modes"]["inspect"]["stuck_loop_recovery"] = True
+    assert json.loads(assistant_candidate.normalized_source_canonical_json) == normalized
 
     qualified = core.qualify_assistant_settings(assistant_candidate)
     projection = json.loads(qualified.normalized_projection_canonical_json)
@@ -2062,7 +2060,9 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
         "deployment_capabilities_read",
         "history_read",
         "inspect_isaac_scene",
+        "program_draft_remove_contact_policies",
         "program_draft_remove_parameters",
+        "program_draft_upsert_contact_policies",
         "program_draft_upsert_parameters",
         "program_read",
         "program_validate",

@@ -21,14 +21,13 @@ API_VERSION: Final = "manyforge.maintained_deployment_sources.v1"
 _ID = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 
 _EXPECTED_ASSISTANT_PROFILES_SOURCE: Final = (
-    "manyforge_deployment/resources/maintained/maintained_assistant_profiles.v1.json"
+    "manyforge_deployment/resources/maintained/maintained_assistant_profiles.v2.json"
 )
 _EXPECTED_ASSISTANT_PROFILE_CONTRACTS: Final = {
     "assistant_scene_authoring": {
         "mode_profile_id": "scene_authoring",
         "endpoint_aliases": ("assistant_model",),
         "historical_profiles": ("thor_gemma4_12b_gguf",),
-        "provider_kind": "nemoclaw",
     },
     "semantic_shape_selection": {
         "mode_profile_id": "scene_authoring",
@@ -37,13 +36,11 @@ _EXPECTED_ASSISTANT_PROFILE_CONTRACTS: Final = {
             "thor_cosmos_reason2_8b",
             "thor_manyforge_qwen36",
         ),
-        "provider_kind": "direct",
     },
     "vision_bin_selection": {
         "mode_profile_id": None,
         "endpoint_aliases": ("vision_model",),
         "historical_profiles": ("thor_manyforge_qwen36",),
-        "provider_kind": None,
     },
     "vision_pose_selection": {
         "mode_profile_id": "scene_authoring",
@@ -52,7 +49,6 @@ _EXPECTED_ASSISTANT_PROFILE_CONTRACTS: Final = {
             "thor_cosmos_reason2_8b",
             "thor_cosmos_reason2_8b",
         ),
-        "provider_kind": "direct",
     },
 }
 _EXPECTED_ASSISTANT_REQUEST_CONTRACTS: Final = {
@@ -394,9 +390,9 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
         required=frozenset({"api_version", "mode_profiles", "profiles"}),
         path="assistant_profiles",
     )
-    if top["api_version"] != "manyforge.maintained_assistant_profiles.v1":
+    if top["api_version"] != "manyforge.maintained_assistant_profiles.v2":
         raise SourceDescriptionError(
-            "assistant_profiles.api_version is not the maintained v1 contract"
+            "assistant_profiles.api_version is not the maintained v2 contract"
         )
 
     mode_profiles = _object(
@@ -416,11 +412,33 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
         )
     for mode_id, raw_mode in modes.items():
         mode_path = f"assistant_profiles.mode_profiles.scene_authoring.{mode_id}"
+        # EXPERIMENTAL optional `compact_history` (bridge history compaction)
+        # and `constrained_regeneration` (E1).
+        experimental = ("compact_history", "constrained_regeneration")
+        for flag in experimental:
+            if type(raw_mode) is dict and type(raw_mode.get(flag, False)) is not bool:
+                raise SourceDescriptionError(f"{mode_path}.{flag} must be boolean")
         mode = _exact(
-            raw_mode,
-            required=frozenset({"enabled", "description", "grant_policy", "catalog"}),
+            {k: v for k, v in raw_mode.items() if k not in experimental}
+            if type(raw_mode) is dict else raw_mode,
+            required=frozenset(
+                {
+                    "enabled",
+                    "runs_in",
+                    "description",
+                    "grant_policy",
+                    "catalog",
+                    "stuck_loop_recovery",
+                }
+            ),
             path=mode_path,
         )
+        if mode["runs_in"] != ["no_program_active"]:
+            raise SourceDescriptionError(
+                f"{mode_path}.runs_in changes the chat's reserved run states"
+            )
+        if type(mode["stuck_loop_recovery"]) is not bool:
+            raise SourceDescriptionError(f"{mode_path}.stuck_loop_recovery must be boolean")
         if mode["enabled"] is not True:
             raise SourceDescriptionError(f"{mode_path}.enabled must remain true")
         _text(mode["description"], path=f"{mode_path}.description")
@@ -439,10 +457,10 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
             )
         catalog = _exact(
             mode["catalog"],
-            required=frozenset({"skills", "tools", "nodes"}),
+            required=frozenset({"skills", "tools"}),
             path=f"{mode_path}.catalog",
         )
-        for kind in ("skills", "tools", "nodes"):
+        for kind in ("skills", "tools"):
             ids = [
                 _identifier(item, path=f"{mode_path}.catalog.{kind}[{index}]")
                 for index, item in enumerate(
@@ -465,7 +483,6 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
                     "audit_policy",
                     "prompt_templates",
                     "model_endpoints",
-                    "provider_alias",
                     "mode_profile_id",
                 }
             ),
@@ -652,8 +669,12 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
                 )
             )
             request_path = f"{endpoint_path}.request_contract"
+            # EXPERIMENTAL optional `reasoning: on|off` (model reasoning switch).
+            reasoning = endpoint["request_contract"].get("reasoning")
+            if reasoning not in (None, "on", "off"):
+                raise SourceDescriptionError(f"{request_path}.reasoning must be on or off")
             request = _exact(
-                endpoint["request_contract"],
+                {k: v for k, v in endpoint["request_contract"].items() if k != "reasoning"},
                 required=frozenset(
                     {
                         "default_timeout_s",
@@ -740,53 +761,6 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
                 f"{profile_path} changes the maintained endpoint/mode mapping"
             )
 
-        provider = profile["provider_alias"]
-        if provider is None:
-            provider_kind = None
-        else:
-            provider_path = f"{profile_path}.provider_alias"
-            provider_row = _exact(
-                provider,
-                required=frozenset(
-                    {
-                        "provider_alias_id",
-                        "provider_kind",
-                        "bridge_external_resource_alias",
-                        "site_overlay_value_ref",
-                        "endpoint_value",
-                    }
-                ),
-                path=provider_path,
-            )
-            _identifier(
-                provider_row["provider_alias_id"],
-                path=f"{provider_path}.provider_alias_id",
-            )
-            _identifier(
-                provider_row["bridge_external_resource_alias"],
-                path=f"{provider_path}.bridge_external_resource_alias",
-            )
-            site_overlay_value_ref = _identifier(
-                provider_row["site_overlay_value_ref"],
-                path=f"{provider_path}.site_overlay_value_ref",
-            )
-            if site_overlay_value_ref in site_overlay_value_refs:
-                raise SourceDescriptionError(
-                    f"{provider_path}.site_overlay_value_ref is duplicated"
-                )
-            site_overlay_value_refs.add(site_overlay_value_ref)
-            _text(
-                provider_row["endpoint_value"], path=f"{provider_path}.endpoint_value"
-            )
-            provider_kind = provider_row["provider_kind"]
-            if provider_kind not in {"direct", "nemoclaw"}:
-                raise SourceDescriptionError(
-                    f"{provider_path}.provider_kind is outside the closed v1 set"
-                )
-        if provider_kind != expected["provider_kind"]:
-            raise SourceDescriptionError(
-                f"{profile_path}.provider_alias changes the maintained provider kind"
-            )
 
     if profile_ids != sorted(profile_ids) or set(profile_ids) != set(
         _EXPECTED_ASSISTANT_PROFILE_CONTRACTS
@@ -1012,8 +986,8 @@ def _validate_component_models(
     value: object, root: Path, model_ids: set[str]
 ) -> None:
     """`component_models`: sorted, distinct descriptor paths of machines,
-    model-form I/O devices (an `io_device` with `lanes`) and sensors, each a
-    distinct id."""
+    model-form I/O devices (an `io_device` with `lanes`), sensors and the
+    assistant, each a distinct id."""
     if value is None:
         return
     paths = _array(value, path="$.component_models")
@@ -1032,11 +1006,12 @@ def _validate_component_models(
         model_id = _identifier(descriptor.get("id"), path=f"{path}.id")
         kind = descriptor.get("kind")
         if model_id in model_ids or not (
-            kind in ("machine", "sensor")
+            kind in ("machine", "sensor", "assistant")
             or (kind == "io_device" and isinstance(descriptor.get("lanes"), dict))
         ):
             raise SourceDescriptionError(
-                f"{path} must name one distinct machine, model-form io_device or sensor"
+                f"{path} must name one distinct machine, model-form io_device, sensor"
+                " or assistant"
             )
         model_ids.add(model_id)
 

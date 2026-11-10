@@ -2292,7 +2292,7 @@ class NativeKernelProgramPort:
                 "position": parameters.get("tool_position"),
                 "max_effort": parameters.get("tool_max_effort"),
                 "command_duration_s": parameters.get("tool_command_duration_s", 0.0),
-                "completion_timeout_s": parameters.get("tool_completion_timeout_s", 30.0),
+                "completion_timeout_s": parameters.get("tool_completion_timeout_s", 5.0),
             },
             identity,
             expected_owner_epoch=owner_epoch,
@@ -4387,7 +4387,6 @@ class _NativeKernelControlTaskPort:
     _CAPABILITIES = {
         "kernel.reset_operation": "execution.reset",
         "kernel.stop_operation": "execution.stop.soft",
-        "kernel.set_runtime_scale": "execution.runtime_scale.operation_scoped",
         # Recovery authority is the exact current offer, not a capability.
         "recovery.apply_offered_action": None,
     }
@@ -4501,16 +4500,6 @@ class _NativeKernelControlTaskPort:
                             "reason": "Program Stop node",
                         }
                     )
-                elif node_id == "kernel.set_runtime_scale":
-                    response = kernel.set_operation_runtime_scale(
-                        {
-                            **request,
-                            "expected_runtime_scale_generation": operation.get(
-                                "runtime_scale_generation"
-                            ),
-                            "scale": _number(inputs.parameters.get("scale"), field="scale"),
-                        }
-                    )
                 else:
                     method = {
                         "kernel.reset_operation": kernel.reset,
@@ -4616,18 +4605,6 @@ class _NativeKernelControlTaskPort:
                 state = OwnerTaskState.SUCCEEDED
             elif stop.get("state") not in {"accepted", "stopping", "certifying"}:
                 state, reason = OwnerTaskState.FAILED, "stop_not_certified"
-        elif task.node_id == "kernel.set_runtime_scale":
-            response = kernel.query_operation(task.query)
-            operation = _mapping(response.get("operation"), field="operation")
-            scale = _mapping(response.get("runtime_scale"), field="runtime scale")
-            if operation.get("operation_id") != task.operation["operation_id"] or scale.get(
-                "generation"
-            ) != task.accepted.get("runtime_scale_generation"):
-                state, reason = OwnerTaskState.FAILED, "runtime_scale_superseded"
-            elif scale.get("state") == "applied":
-                state = OwnerTaskState.SUCCEEDED
-            elif scale.get("state") != "pending":
-                state, reason = OwnerTaskState.FAILED, "runtime_scale_not_applied"
         else:
             envelope = kernel.operation(task.operation["operation_id"])
             operation = _mapping(envelope.get("operation"), field="operation")

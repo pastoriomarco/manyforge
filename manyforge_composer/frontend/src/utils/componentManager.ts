@@ -54,6 +54,7 @@ export const COMPONENT_KIND_LABELS: Record<ComponentCatalogKind, string> = {
   pose_source: 'Pose source',
   ai_model: 'AI model',
   sensor: 'Sensor',
+  assistant: 'AI assistant',
 };
 
 /** The kind a row's `runtime_kind` names (other rows carry a robot or tool model). */
@@ -62,6 +63,7 @@ const RUNTIME_KINDS: Record<string, ComponentCatalogKind> = {
   pose_source: 'pose_source',
   ai_model: 'ai_model',
   sensor: 'sensor',
+  assistant: 'assistant',
 };
 
 /** The Deployment intent's component id rule (`deployment_intent.py`). */
